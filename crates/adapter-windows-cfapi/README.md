@@ -16,6 +16,21 @@ It is responsible for:
 
 - Files are created as cloud placeholders and hydrate on demand when Windows requests file data.
 - The adapter does not hydrate placeholders eagerly during normal sync-root registration.
+- Fetch callbacks copy their arguments and enqueue the download work; they do not hold the CFAPI callback thread while network I/O runs.
+
+### Object Identity And Concurrency
+
+The adapter follows one identity model throughout snapshot polling, placeholder metadata, reconciliation, and remote mutations:
+
+- `object_id` answers which object is being synchronized and remains stable across content changes and moves.
+- `revision` answers which version is being observed and is sent as `expected_revision` for compare-and-swap protection.
+- `path` answers where the object currently appears and can change independently of its identity.
+
+Remote placeholders store all three values in their CFAPI FileIdentity. Upload, rename, and delete operations for existing files use `{object_id, expected_revision}` and never fall back to a path-only mutation after a conflict. A replacement created at the same path therefore receives a different `object_id`, while a rename keeps the original one.
+
+Snapshot absence alone is not treated as a tombstone. A local placeholder is removed only after deletion of its `object_id` is confirmed and its stored revision still matches the predecessor revision. Likewise, remote moves are applied only to a clean placeholder with the same object ID and expected predecessor revision. Dirty or ambiguous local state is preserved as a conflict.
+
+Version-2 placeholder identities without `object_id` remain readable. Reconciliation upgrades one only when the current remote entry has an object ID and exactly matches both its path and revision; otherwise it is preserved for conservative reconciliation.
 
 ### Manual Hydration Cancel For Testing
 
@@ -36,11 +51,11 @@ What this does not do:
 
 ### Rename And Move Within The Same Sync Root
 
-- Local file rename or move inside the same sync root is optimized as a remote metadata operation when the adapter can match the destination back to the original placeholder or file identity.
-- The monitor detects this in [`src/monitor.rs`](./src/monitor.rs) and calls the uploader's `rename_path` hook instead of falling back to upload-plus-delete.
-- The live implementation maps that directly to the server-side rename API in [`src/live.rs`](./src/live.rs).
+- Local file rename or move inside the same sync root is a remote metadata operation only when the destination carries the same placeholder `object_id` as the source.
+- The monitor detects this in [`src/monitor.rs`](./src/monitor.rs) and calls the uploader's `rename_object(object_id, expected_revision, to_path)` hook. A rejected or ambiguous rename is kept as a conflict; it never falls back to upload-plus-delete.
+- The live implementation maps that directly to the object-ID server API in [`src/live.rs`](./src/live.rs).
 - The server-side rename keeps the remote object identity and only updates namespace metadata in [`../server-node-sdk/src/storage.rs`](../server-node-sdk/src/storage.rs).
-- A same-sync-root move is expected to use the same path-to-path rename primitive as a same-directory rename because both end up as `from_path -> to_path` namespace changes.
+- A same-sync-root move and a same-directory rename therefore use the same stable-identity mutation.
 
 What is verified today:
 

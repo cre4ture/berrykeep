@@ -43,10 +43,11 @@ pub use ironmesh_client::{
     ClientEndpointDiagnostics, ClientRouteMaintenancePolicy, ClientSnapshotInfo, GalleryMapBounds,
     GalleryMapCluster, GalleryMapClusterEntriesResponse, GalleryMapClustersRequest,
     GalleryMapClustersResponse, GallerySummaryStatus, IronMeshClient, ObjectHeadInfo,
-    PreferredHeadReason, RequestedRange, SnapshotRestoreResponse, StoreIndexDeltaResponse,
-    StoreIndexEntry, StoreIndexMediaFilter, StoreIndexMediaSummary, StoreIndexRequestOptions,
-    StoreIndexResponse, StoreIndexSortOrder, StoreIndexView, StoreIndexViewport, UploadMode,
-    UploadResult, UploadSessionChunkRef, UploadSessionChunkStatus, UploadSessionCompleteInfo,
+    ObjectMutationConflict, ObjectMutationResult, ObjectMutationUploadResult, PreferredHeadReason,
+    RequestedRange, SnapshotRestoreResponse, StoreIndexDeltaResponse, StoreIndexEntry,
+    StoreIndexMediaFilter, StoreIndexMediaSummary, StoreIndexRequestOptions, StoreIndexResponse,
+    StoreIndexSortOrder, StoreIndexView, StoreIndexViewport, UploadMode, UploadResult,
+    UploadSessionChunkRef, UploadSessionChunkStatus, UploadSessionCompleteInfo,
     UploadSessionStatus, VersionConsistencyState, VersionGraphSummary, VersionRecordSummary,
     WebServiceProxyConnection, WebServiceSummary, normalize_server_base_url,
     set_connection_diagnostics_observer, snapshot_from_store_index_entries,
@@ -63,8 +64,9 @@ pub use managed_client::{
     RouteRefreshOutcome, RouteRefreshReason,
 };
 pub use remote_sync::{
-    RemoteSnapshotFetchProgress, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
-    RemoteSnapshotUpdate, RemoteSyncScheduler, RemoteSyncStrategy, changed_paths_between,
+    RemoteObjectChange, RemoteSnapshotFetchProgress, RemoteSnapshotFetcher, RemoteSnapshotPoller,
+    RemoteSnapshotScope, RemoteSnapshotUpdate, RemoteSyncScheduler, RemoteSyncStrategy,
+    changed_paths_between, object_changes_between,
 };
 pub use session_pool::TransportSessionPoolSnapshot;
 pub use transport_sdk::{

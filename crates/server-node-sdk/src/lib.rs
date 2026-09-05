@@ -934,6 +934,10 @@ struct UploadSessionRecord {
     parent_version_ids: Vec<String>,
     explicit_version_id: Option<String>,
     #[serde(default)]
+    object_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<String>,
+    #[serde(default)]
     assembly_mode: UploadAssemblyMode,
     #[serde(default)]
     received_chunks: Vec<Option<UploadChunkRef>>,
@@ -1004,6 +1008,10 @@ struct UploadSessionStartRequest {
     #[serde(default)]
     parent: Vec<String>,
     version_id: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<String>,
     #[serde(default)]
     chunk_refs: Vec<UploadChunkRef>,
 }
@@ -14622,6 +14630,43 @@ async fn rename_object_path_response(
         .await
     {
         Ok(PathMutationResult::Applied) => {
+            let object_mutation = if let Some(object_id) = request.object_id.as_deref() {
+                match store.list_versions_by_object_id(object_id).await {
+                    Ok(Some(summary)) => {
+                        let Some(revision) = summary.preferred_head_version_id else {
+                            tracing::error!(object_id, "renamed object has no preferred revision");
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        };
+                        if summary.key != request.to_path {
+                            tracing::error!(
+                                object_id,
+                                expected_path = %request.to_path,
+                                actual_path = %summary.key,
+                                "renamed object resolved to an unexpected path"
+                            );
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                        Some(ObjectMutationResponse {
+                            object_id: summary.object_id,
+                            path: summary.key,
+                            revision,
+                        })
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            object_id,
+                            "renamed object identity disappeared after mutation"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, object_id, "failed resolving renamed object revision");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            } else {
+                None
+            };
             info!(
                 from_path = %request.from_path,
                 to_path = %request.to_path,
@@ -14658,7 +14703,10 @@ async fn rename_object_path_response(
                 total_elapsed_ms = started.elapsed().as_millis(),
                 "store path rename response ready after queueing background availability refresh"
             );
-            StatusCode::NO_CONTENT.into_response()
+            match object_mutation {
+                Some(mutation) => (StatusCode::OK, Json(mutation)).into_response(),
+                None => StatusCode::NO_CONTENT.into_response(),
+            }
         }
         Ok(PathMutationResult::SourceMissing) => {
             info!(
@@ -15394,6 +15442,8 @@ async fn start_upload_session_response(
         state: version_state,
         parent_version_ids: request.parent,
         explicit_version_id: request.version_id,
+        object_id: request.object_id,
+        expected_revision: request.expected_revision,
         assembly_mode: UploadAssemblyMode::FixedSequence,
         received_chunks,
         multipart_parts: BTreeMap::new(),
@@ -15694,6 +15744,21 @@ async fn complete_upload_session_route(
     .await
 }
 
+async fn reset_upload_session_finalizing(state: &ServerState, upload_id: &str) {
+    let mut sessions = write_upload_sessions(state, "upload_sessions.complete.reset").await;
+    if let Some(session) = sessions.sessions.get_mut(upload_id)
+        && !session.completed
+    {
+        session.finalizing = false;
+        session.updated_at_unix = unix_ts();
+        session.expires_at_unix = session
+            .updated_at_unix
+            .saturating_add(UPLOAD_SESSION_TTL_SECS);
+    }
+    drop(sessions);
+    persist_upload_session_store_after_mutation(state, "complete_upload_session_reset").await;
+}
+
 async fn complete_upload_session_response(
     state: &ServerState,
     headers: &HeaderMap,
@@ -15702,11 +15767,13 @@ async fn complete_upload_session_response(
     let finalize_started_at = Instant::now();
     let requester_device_id = request_device_id(headers);
     let (
-        key,
+        mut key,
         total_size_bytes,
         parent_version_ids,
         version_state,
         explicit_version_id,
+        object_id,
+        expected_revision,
         owner_device_id,
         chunk_refs,
     ) = {
@@ -15744,6 +15811,8 @@ async fn complete_upload_session_response(
             session.parent_version_ids.clone(),
             session.state.clone(),
             session.explicit_version_id.clone(),
+            session.object_id.clone(),
+            session.expected_revision.clone(),
             session.owner_device_id.clone(),
             session
                 .received_chunks
@@ -15763,6 +15832,46 @@ async fn complete_upload_session_response(
     let mut store = lock_store(state, "upload_session.complete.put_object_from_chunks").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_finalize_started_at = Instant::now();
+    if let Some(object_id) = object_id.as_deref() {
+        match store.current_path_for_object_id(object_id).await {
+            Ok(Some(current_path)) => key = current_path,
+            Ok(None) => {
+                let object_history = store.list_versions_by_object_id(object_id).await;
+                drop(store);
+                reset_upload_session_finalizing(state, upload_id).await;
+                return match object_history {
+                    Ok(Some(_)) => StatusCode::CONFLICT.into_response(),
+                    Ok(None) => StatusCode::NOT_FOUND.into_response(),
+                    Err(err) => {
+                        tracing::error!(error = %err, object_id, "failed checking absent object identity before finalizing upload session");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                };
+            }
+            Err(err) => {
+                tracing::error!(error = %err, object_id, "failed resolving object identity before finalizing upload session");
+                drop(store);
+                reset_upload_session_finalizing(state, upload_id).await;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
+    if let Some(expected_revision) = expected_revision.as_deref() {
+        let current_revision = match store.list_versions(&key).await {
+            Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
+            Err(err) => {
+                tracing::error!(error = %err, key = %key, "failed resolving revision before finalizing upload session");
+                drop(store);
+                reset_upload_session_finalizing(state, upload_id).await;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        if current_revision.as_deref() != Some(expected_revision) {
+            drop(store);
+            reset_upload_session_finalizing(state, upload_id).await;
+            return StatusCode::CONFLICT.into_response();
+        }
+    }
     let outcome = match store
         .put_object_from_chunks(
             &key,
@@ -17431,8 +17540,8 @@ async fn list_store_index_response_attempt(
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
     let modified_time_lookup_started_at = Instant::now();
-    let key_modified_times = match store_index_inspector
-        .object_modified_at_by_key(
+    let (key_modified_times, key_revisions) = match store_index_inspector
+        .object_modified_at_and_revisions_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
@@ -17445,17 +17554,16 @@ async fn list_store_index_response_attempt(
                 tracing::error!(
                     snapshot = snapshot_label,
                     error = %err,
-                    "failed to compute snapshot key modified times"
+                "failed to compute snapshot key modified times and revisions"
                 );
             } else {
-                tracing::error!(error = %err, "failed to compute current key modified times");
+                tracing::error!(error = %err, "failed to compute current key modified times and revisions");
             }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     let modified_time_lookup_ms = modified_time_lookup_started_at.elapsed().as_millis();
     let metadata_lookup_ms = content_summary_lookup_ms + modified_time_lookup_ms;
-
     let mut entries = build_store_index_entries_from_plan(
         &entry_plan,
         Some(&visible_object_ids),
@@ -17464,6 +17572,9 @@ async fn list_store_index_response_attempt(
         Some(&key_content_fingerprints),
         Some(&key_modified_times),
     );
+    for entry in &mut entries {
+        entry.version = key_revisions.get(&entry.path).cloned();
+    }
     let media_entry_count = entries
         .iter()
         .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
@@ -17887,8 +17998,8 @@ async fn list_store_index_response_cursor_mode(
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
     let modified_time_lookup_started_at = Instant::now();
-    let key_modified_times = match store_index_inspector
-        .object_modified_at_by_key(
+    let (key_modified_times, key_revisions) = match store_index_inspector
+        .object_modified_at_and_revisions_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
@@ -17901,17 +18012,16 @@ async fn list_store_index_response_cursor_mode(
                 tracing::error!(
                     snapshot = snapshot_label,
                     error = %err,
-                    "failed to compute snapshot key modified times"
+                "failed to compute snapshot key modified times and revisions"
                 );
             } else {
-                tracing::error!(error = %err, "failed to compute current key modified times");
+                tracing::error!(error = %err, "failed to compute current key modified times and revisions");
             }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     let modified_time_lookup_ms = modified_time_lookup_started_at.elapsed().as_millis();
     let metadata_lookup_ms = content_summary_lookup_ms + modified_time_lookup_ms;
-
     let mut entries = page
         .entries
         .iter()
@@ -17929,6 +18039,9 @@ async fn list_store_index_response_cursor_mode(
             }
         })
         .collect::<Vec<_>>();
+    for entry in &mut entries {
+        entry.version = key_revisions.get(&entry.path).cloned();
+    }
 
     let media_entry_count = entries
         .iter()
@@ -18153,17 +18266,19 @@ fn collapse_store_index_entries_for_tree_view(
 ) -> Vec<StoreIndexEntry> {
     let mut collapsed = BTreeMap::new();
 
-    for entry in entries {
+    for mut entry in entries {
         let is_directory_like = entry.entry_type == "prefix" || entry.path.ends_with('/');
         if !is_directory_like {
             collapsed.insert(entry.path.clone(), entry);
             continue;
         }
 
-        let directory_marker_object_id = (entry.entry_type == "key" && entry.path.ends_with('/'))
-            .then(|| entry.object_id.clone())
-            .flatten();
-        let collapsed_entry =
+        if entry.entry_type == "key" && entry.path.ends_with('/') {
+            // An explicit directory marker is a first-class object. Preserve its
+            // complete identity and revision while presenting it as a tree prefix.
+            entry.entry_type = "prefix".to_string();
+            collapsed.insert(entry.path.clone(), entry);
+        } else {
             collapsed
                 .entry(entry.path.clone())
                 .or_insert_with(|| StoreIndexEntry {
@@ -18179,8 +18294,6 @@ fn collapse_store_index_entries_for_tree_view(
                     labels: Vec::new(),
                     labels_resolved: false,
                 });
-        if directory_marker_object_id.is_some() {
-            collapsed_entry.object_id = directory_marker_object_id;
         }
     }
 

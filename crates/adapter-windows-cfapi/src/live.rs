@@ -1,18 +1,24 @@
 use crate::content_fingerprint::FingerprintingReader;
+use crate::placeholder_metadata::{
+    RemoteObjectResolution, RemoteObjectResolver, ResolvedRemoteObject,
+};
 use crate::runtime::{
-    HydrationProgress, HydrationRequest, HydrationResult, Hydrator, UploadReceipt, Uploader,
+    HydrationProgress, HydrationRequest, HydrationResult, Hydrator, ObjectRenameReceipt,
+    UploadReceipt, Uploader,
 };
 use anyhow::{Context, Result, anyhow};
-use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
+use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest, ObjectLookup};
 use client_sdk::{
     ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
 use common::range_chunk_cache::{RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES, RangeChunkCache};
 use reqwest::Url;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -267,33 +273,151 @@ impl Uploader for ServerNodeHydrator {
         reader: &mut dyn std::io::Read,
         length: u64,
     ) -> Result<UploadReceipt> {
+        self.upload_reader_for_object(path, None, None, reader, length)
+    }
+
+    fn upload_reader_for_object(
+        &self,
+        path: &str,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+        reader: &mut dyn std::io::Read,
+        length: u64,
+    ) -> Result<UploadReceipt> {
         let mut fingerprinting_reader = FingerprintingReader::new(reader, length);
-        self.sdk
-            .put_large_aware_reader(path.to_string(), &mut fingerprinting_reader, length)
-            .with_context(|| format!("failed to upload object for path {path}"))?;
+        let mutation = self
+            .sdk
+            .put_reader_with_identity_blocking(
+                path.to_string(),
+                object_id,
+                expected_revision,
+                &mut fingerprinting_reader,
+                length,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to upload object for path {path} object_id={} expected_revision={}",
+                    object_id.unwrap_or("<new>"),
+                    expected_revision.unwrap_or("<none>")
+                )
+            })?;
         let in_sync_content_fingerprint = fingerprinting_reader
             .finish()
             .with_context(|| format!("failed to finalize content fingerprint for {path}"))?;
 
         Ok(UploadReceipt {
-            remote_version: Some(format!("server-head:size={length}")),
+            object_id: Some(mutation.object_id),
+            remote_version: Some(mutation.revision),
             in_sync_content_fingerprint: Some(in_sync_content_fingerprint),
         })
     }
 
-    fn delete_path(&self, path: &str) -> Result<()> {
+    fn delete_object(&self, object_id: &str, expected_revision: &str) -> Result<()> {
         self.sdk
-            .delete_path_blocking(path)
-            .with_context(|| format!("failed to delete remote object for path {path}"))?;
+            .delete_object_by_id_blocking(object_id, Some(expected_revision))
+            .with_context(|| {
+                format!(
+                    "failed to delete remote object object_id={object_id} expected_revision={expected_revision}"
+                )
+            })?;
         Ok(())
     }
 
-    fn rename_path(&self, from_path: &str, to_path: &str) -> Result<bool> {
-        self.sdk
-            .rename_path_blocking(from_path, to_path, false)
-            .with_context(|| format!("failed to rename remote object {from_path} -> {to_path}"))?;
-        Ok(true)
+    fn rename_object(
+        &self,
+        object_id: &str,
+        expected_revision: &str,
+        to_path: &str,
+    ) -> Result<ObjectRenameReceipt> {
+        let mutation = self
+            .sdk
+            .rename_object_by_id_with_result_blocking(
+                object_id,
+                to_path,
+                false,
+                Some(expected_revision),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to rename remote object object_id={object_id} expected_revision={expected_revision} to {to_path}"
+                )
+            })?;
+        if mutation.object_id != object_id || mutation.revision.trim().is_empty() {
+            anyhow::bail!("server returned an inconsistent object-id rename result");
+        }
+        Ok(ObjectRenameReceipt {
+            object_id: mutation.object_id,
+            remote_version: mutation.revision,
+        })
     }
+}
+
+impl RemoteObjectResolver for ServerNodeHydrator {
+    fn resolve_object(&self, object_id: &str) -> Result<Option<ResolvedRemoteObject>> {
+        self.sdk
+            .lookup_object_by_id_blocking(object_id)
+            .map(|resolved| resolved.and_then(active_resolved_remote_object))
+    }
+
+    fn resolve_objects(
+        &self,
+        object_ids: &BTreeSet<String>,
+    ) -> BTreeMap<String, RemoteObjectResolution> {
+        // Reconciliation can contain a large delete or rename batch. Bound
+        // the concurrent identity confirmations so CFAPI's worker thread is
+        // not held hostage by a sequence of round trips, while avoiding an
+        // unbounded request fan-out against the server.
+        const MAX_CONCURRENT_OBJECT_LOOKUPS: usize = 16;
+
+        let object_ids = object_ids.iter().cloned().collect::<Vec<_>>();
+        let next_object = AtomicUsize::new(0);
+        let results = Mutex::new(BTreeMap::new());
+        let worker_count = object_ids.len().min(MAX_CONCURRENT_OBJECT_LOOKUPS);
+
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let sdk = self.sdk.clone();
+                let object_ids = &object_ids;
+                let next_object = &next_object;
+                let results = &results;
+                scope.spawn(move || {
+                    loop {
+                        let index = next_object.fetch_add(1, Ordering::Relaxed);
+                        let Some(object_id) = object_ids.get(index) else {
+                            break;
+                        };
+                        let resolution = match sdk.lookup_object_by_id_blocking(object_id) {
+                            Ok(Some(remote)) => active_resolved_remote_object(remote)
+                                .map(RemoteObjectResolution::Present)
+                                .unwrap_or(RemoteObjectResolution::Absent),
+                            Ok(None) => RemoteObjectResolution::Absent,
+                            Err(error) => RemoteObjectResolution::Unavailable(format!("{error:#}")),
+                        };
+                        let mut results = results
+                            .lock()
+                            .expect("object-resolution results lock should not be poisoned");
+                        results.insert(object_id.clone(), resolution);
+                    }
+                });
+            }
+        });
+
+        results
+            .into_inner()
+            .expect("object-resolution results lock should not be poisoned")
+    }
+}
+
+fn active_resolved_remote_object(resolved: ObjectLookup) -> Option<ResolvedRemoteObject> {
+    // The identity endpoint deliberately retains tombstones so a client can
+    // inspect their final revision.  CFAPI reconciliation needs the active
+    // namespace, though: a tombstone confirms that this object no longer has
+    // a remotely live path.
+    (resolved.entry_type != "tombstone").then_some(ResolvedRemoteObject {
+        object_id: resolved.object_id,
+        path: resolved.path,
+        revision: resolved.revision,
+    })
 }
 
 pub fn normalize_base_url(input: &str) -> Result<Url> {
@@ -337,6 +461,14 @@ mod tests {
 
     fn capture_single_http_request() -> (String, std::thread::JoinHandle<()>, mpsc::Receiver<String>)
     {
+        capture_single_http_request_with_response(
+            b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+    }
+
+    fn capture_single_http_request_with_response(
+        response: Vec<u8>,
+    ) -> (String, std::thread::JoinHandle<()>, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
         let address = listener
             .local_addr()
@@ -355,17 +487,30 @@ mod tests {
                     break;
                 }
                 request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let body_start = header_end + 4;
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= body_start + content_length {
+                        break;
+                    }
                 }
             }
             request_tx
                 .send(String::from_utf8_lossy(&request).into_owned())
                 .expect("captured request should be delivered");
             stream
-                .write_all(
-                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
+                .write_all(&response)
                 .expect("test response should be writable");
         });
         (format!("http://{address}"), handle, request_rx)
@@ -386,10 +531,20 @@ mod tests {
         );
     }
 
-    /// Temporary green characterization of undesired current behavior.
-    /// Remove this test when adapter deletes carry a baseline revision precondition.
     #[test]
-    fn undesired_current_behavior_windows_delete_request_has_no_revision_precondition() {
+    fn object_resolver_interprets_an_identity_tombstone_as_absent() {
+        let tombstone = ObjectLookup {
+            object_id: "object-deleted".to_string(),
+            path: "docs/deleted.txt".to_string(),
+            revision: Some("revision-tombstone".to_string()),
+            entry_type: "tombstone".to_string(),
+        };
+
+        assert!(active_resolved_remote_object(tombstone).is_none());
+    }
+
+    #[test]
+    fn windows_delete_request_uses_object_id_and_revision_precondition() {
         let (base_url, server, request_rx) = capture_single_http_request();
         let client = IronMeshClient::from_direct_base_url(base_url);
         let hydrator = ServerNodeHydrator::with_client(
@@ -397,45 +552,127 @@ mod tests {
             std::env::temp_dir().join(format!("ironmesh-delete-request-{}", uuid::Uuid::new_v4())),
         );
 
-        Uploader::delete_path(&hydrator, "photos/stale.jpg")
-            .expect("current unconditional delete request should be accepted by the test server");
+        Uploader::delete_object(&hydrator, "obj-stale", "revision-7")
+            .expect("conditional delete request should be accepted by the test server");
 
         let request = request_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("delete request should be captured");
         server.join().expect("test server should stop cleanly");
         let request_line = request.lines().next().unwrap_or_default();
-        assert!(request_line.starts_with("POST /api/v1/store/delete?"));
-        assert!(request_line.contains("key=photos%2Fstale.jpg"));
+        assert!(request_line.starts_with("DELETE /api/v1/objects/obj-stale?"));
         assert!(
-            !request_line.contains("expected_revision="),
-            "UNDESIRED CURRENT BEHAVIOR: the Windows adapter sends an unconditional server delete: {request_line}"
+            request_line.contains("expected_revision=revision-7"),
+            "object delete must carry its observed revision: {request_line}"
         );
     }
 
     #[test]
-    #[should_panic(
-        expected = "a remote delete must be conditional on the revision observed before the local disappearance"
-    )]
-    fn desired_behavior_windows_delete_request_contains_revision_precondition() {
-        let (base_url, server, request_rx) = capture_single_http_request();
-        let client = IronMeshClient::from_direct_base_url(base_url);
+    fn windows_rename_request_uses_object_id_and_revision_precondition() {
+        let body =
+            br#"{"object_id":"obj-report","path":"archive/report.txt","revision":"revision-12"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).expect("response body is utf8")
+        )
+        .into_bytes();
+        let (base_url, server, request_rx) = capture_single_http_request_with_response(response);
         let hydrator = ServerNodeHydrator::with_client(
-            client,
-            std::env::temp_dir().join(format!("ironmesh-delete-request-{}", uuid::Uuid::new_v4())),
+            IronMeshClient::from_direct_base_url(base_url),
+            std::env::temp_dir().join(format!("ironmesh-rename-request-{}", uuid::Uuid::new_v4())),
         );
 
-        Uploader::delete_path(&hydrator, "photos/stale.jpg")
-            .expect("delete request should be accepted by the test server");
+        let receipt =
+            Uploader::rename_object(&hydrator, "obj-report", "revision-11", "archive/report.txt")
+                .expect("conditional rename should be accepted by the test server");
+        assert_eq!(receipt.object_id, "obj-report");
+        assert_eq!(receipt.remote_version, "revision-12");
 
         let request = request_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("delete request should be captured");
+            .expect("rename request should be captured");
+        server.join().expect("test server should stop cleanly");
+        assert!(
+            request
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .starts_with("POST /api/v1/objects/obj-report/rename ")
+        );
+        assert!(request.contains(r#""to_path":"archive/report.txt""#));
+        assert!(request.contains(r#""expected_revision":"revision-11""#));
+    }
+
+    #[test]
+    fn windows_modify_request_uses_object_id_and_expected_revision() {
+        let body =
+            br#"{"object_id":"obj-photo","path":"photos/photo.jpg","revision":"revision-8"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).expect("response body is utf8")
+        )
+        .into_bytes();
+        let (base_url, server, request_rx) = capture_single_http_request_with_response(response);
+        let hydrator = ServerNodeHydrator::with_client(
+            IronMeshClient::from_direct_base_url(base_url),
+            std::env::temp_dir().join(format!("ironmesh-upload-request-{}", uuid::Uuid::new_v4())),
+        );
+        let payload = b"new content";
+        let mut reader = std::io::Cursor::new(payload);
+
+        let receipt = Uploader::upload_reader_for_object(
+            &hydrator,
+            "photos/photo.jpg",
+            Some("obj-photo"),
+            Some("revision-7"),
+            &mut reader,
+            payload.len() as u64,
+        )
+        .expect("object-id upload should succeed");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("upload request should be captured");
         server.join().expect("test server should stop cleanly");
         let request_line = request.lines().next().unwrap_or_default();
-        assert!(
-            request_line.contains("expected_revision="),
-            "a remote delete must be conditional on the revision observed before the local disappearance: {request_line}"
+        assert!(request_line.starts_with("PUT /api/v1/objects/obj-photo?"));
+        assert!(request_line.contains("expected_revision=revision-7"));
+        assert_eq!(receipt.object_id.as_deref(), Some("obj-photo"));
+        assert_eq!(receipt.remote_version.as_deref(), Some("revision-8"));
+    }
+
+    #[test]
+    fn stale_expected_revision_is_reported_as_conflict_without_fallback() {
+        let (base_url, server, request_rx) = capture_single_http_request_with_response(
+            b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         );
+        let hydrator = ServerNodeHydrator::with_client(
+            IronMeshClient::from_direct_base_url(base_url),
+            std::env::temp_dir().join(format!("ironmesh-upload-conflict-{}", uuid::Uuid::new_v4())),
+        );
+        let payload = b"local content";
+        let mut reader = std::io::Cursor::new(payload);
+
+        let error = Uploader::upload_reader_for_object(
+            &hydrator,
+            "photos/photo.jpg",
+            Some("obj-photo"),
+            Some("stale-revision"),
+            &mut reader,
+            payload.len() as u64,
+        )
+        .expect_err("stale CAS must not fall back to a path mutation");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("upload request should be captured");
+        server.join().expect("test server should stop cleanly");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(request_line.starts_with("PUT /api/v1/objects/obj-photo?"));
+        assert!(request_line.contains("expected_revision=stale-revision"));
+        assert!(format!("{error:#}").contains("409 Conflict"));
+        assert!(crate::runtime::is_remote_mutation_conflict(&error));
     }
 }

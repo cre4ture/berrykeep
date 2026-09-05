@@ -24,10 +24,13 @@ use crate::hydration_control::{is_active_hydration_marked, request_hydration_can
 use crate::live::ServerNodeHydrator;
 use crate::local_state::local_appdata_desktop_status_path;
 use crate::monitor::SyncRootMonitor;
-use crate::placeholder_metadata::{RemoteDeleteReconcileReport, reconcile_remote_delete_state};
+use crate::placeholder_metadata::{
+    RemoteObjectReconcileReport, reconcile_existing_placeholders_with_resolver,
+    reconcile_remote_object_state_best_effort,
+};
 use crate::runtime::{
-    CfapiRuntime, SyncRootRegistration, apply_action_plan, connect_sync_root,
-    reconcile_sync_states, register_sync_root, unregister_sync_root,
+    CfapiRuntime, SyncRootRegistration, apply_action_plan_with_observed_placeholder_paths,
+    connect_sync_root, reconcile_sync_states, register_sync_root, unregister_sync_root,
 };
 use crate::windows_status::{
     WindowsStatusOptions, WindowsStatusPublisher, WindowsTrayIconHandle, spawn_remote_status_thread,
@@ -56,22 +59,54 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
     let mut hydrate_on_demand = 0usize;
     let mut queue_uploads = 0usize;
     let mut conflicts = 0usize;
+    let mut deferred_remote_objects = 0usize;
     let mut hydrate_sample = Vec::new();
     let mut dirty_sample = Vec::new();
     let mut conflict_sample = Vec::new();
+    let mut deferred_remote_sample = Vec::new();
 
     for action in &plan.actions {
         match action {
             CfapiAction::EnsureDirectory { .. } => {
                 ensure_directories += 1;
             }
-            CfapiAction::EnsurePlaceholder { .. } => {
+            CfapiAction::EnsurePlaceholder {
+                object_id,
+                path,
+                remote_version,
+                ..
+            } => {
                 ensure_placeholders += 1;
+                if object_id
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                    || remote_version.trim().is_empty()
+                {
+                    deferred_remote_objects += 1;
+                    if deferred_remote_sample.len() < 8 {
+                        deferred_remote_sample.push(path.clone());
+                    }
+                }
             }
-            CfapiAction::HydrateOnDemand { path, .. } => {
+            CfapiAction::HydrateOnDemand {
+                object_id,
+                path,
+                remote_version,
+                ..
+            } => {
                 hydrate_on_demand += 1;
                 if hydrate_sample.len() < 8 {
                     hydrate_sample.push(path.clone());
+                }
+                if object_id
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                    || remote_version.trim().is_empty()
+                {
+                    deferred_remote_objects += 1;
+                    if deferred_remote_sample.len() < 8 {
+                        deferred_remote_sample.push(path.clone());
+                    }
                 }
             }
             CfapiAction::QueueUploadOnClose { path, .. } => {
@@ -90,28 +125,37 @@ fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
     }
 
     tracing::info!(
-        "plan-summary: {} total={} directories={} placeholders={} hydrate_on_demand={} queue_uploads={} conflicts={}",
+        "plan-summary: {} total={} directories={} placeholders={} hydrate_on_demand={} queue_uploads={} conflicts={} deferred_unbound_remote_objects={}",
         label,
         plan.actions.len(),
         ensure_directories,
         ensure_placeholders,
         hydrate_on_demand,
         queue_uploads,
-        conflicts
+        conflicts,
+        deferred_remote_objects
     );
-    if !hydrate_sample.is_empty() || !dirty_sample.is_empty() || !conflict_sample.is_empty() {
+    if !hydrate_sample.is_empty()
+        || !dirty_sample.is_empty()
+        || !conflict_sample.is_empty()
+        || !deferred_remote_sample.is_empty()
+    {
         tracing::info!(
-            "plan-summary: {} hydrate_sample={:?} dirty_sample={:?} conflict_sample={:?}",
+            "plan-summary: {} hydrate_sample={:?} dirty_sample={:?} conflict_sample={:?} deferred_unbound_remote_sample={:?}",
             label,
             hydrate_sample,
             dirty_sample,
-            conflict_sample
+            conflict_sample,
+            deferred_remote_sample
         );
     }
 }
 
-fn log_remote_delete_reconcile_summary(label: &str, report: &RemoteDeleteReconcileReport) {
+fn log_remote_object_reconcile_summary(label: &str, report: &RemoteObjectReconcileReport) {
     if report.deleted_paths.is_empty()
+        && report.renamed_paths.is_empty()
+        && report.migrated_paths.is_empty()
+        && report.conflicted_paths.is_empty()
         && report.preserved_paths.is_empty()
         && report.suppressed_startup_paths.is_empty()
     {
@@ -119,17 +163,33 @@ fn log_remote_delete_reconcile_summary(label: &str, report: &RemoteDeleteReconci
     }
 
     tracing::info!(
-        "remote-delete-reconcile: {} deleted={} preserved={} suppressed={}",
+        "remote-object-reconcile: {} deleted={} renamed={} migrated={} conflicted={} preserved={} suppressed={}",
         label,
         report.deleted_paths.len(),
+        report.renamed_paths.len(),
+        report.migrated_paths.len(),
+        report.conflicted_paths.len(),
         report.preserved_paths.len(),
         report.suppressed_startup_paths.len()
     );
     tracing::info!(
-        "remote-delete-reconcile: {} deleted_sample={:?} preserved_sample={:?} suppressed_sample={:?}",
+        "remote-object-reconcile: {} deleted_sample={:?} renamed_sample={:?} migrated_sample={:?} conflict_sample={:?} preserved_sample={:?} suppressed_sample={:?}",
         label,
         report
             .deleted_paths
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>(),
+        report.renamed_paths.iter().take(8).collect::<Vec<_>>(),
+        report
+            .migrated_paths
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>(),
+        report
+            .conflicted_paths
             .iter()
             .take(8)
             .cloned()
@@ -430,18 +490,28 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             RemoteSnapshotScope::new(prefix.clone(), depth, None),
         );
         let initial_snapshot = fetcher.fetch_snapshot_blocking()?;
-        let startup_delete_report = match reconcile_remote_delete_state(
+        let download_stage_root =
+            crate::live::windows_download_stage_root_for_sync_root(&registration.root_path)?;
+        let startup_resolver = ServerNodeHydrator::with_client(
+            client.clone().with_connection_name(windows_connection_name(
+                "startup-resolver",
+                &registration.display_name,
+            )),
+            download_stage_root.clone(),
+        );
+        let startup_reconcile_report = match reconcile_existing_placeholders_with_resolver(
             &registration.root_path,
             &initial_snapshot,
             sync_root_identity.provider_instance_id,
+            &startup_resolver,
         ) {
             Ok(report) => {
-                log_remote_delete_reconcile_summary("startup", &report);
+                log_remote_object_reconcile_summary("startup", &report);
                 report
             }
             Err(err) => {
-                tracing::warn!("startup remote-delete reconciliation failed: {err:#}");
-                RemoteDeleteReconcileReport::default()
+                tracing::warn!("startup remote-object reconciliation failed: {err:#}");
+                RemoteObjectReconcileReport::default()
             }
         };
         let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
@@ -460,8 +530,6 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         }
 
         let runtime = Arc::new(CfapiRuntime::from_action_plan(&action_plan));
-        let download_stage_root =
-            crate::live::windows_download_stage_root_for_sync_root(&registration.root_path)?;
         let hydrator = Box::new(ServerNodeHydrator::with_client(
             client.clone().with_connection_name(windows_connection_name(
                 "hydrator",
@@ -484,11 +552,12 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             uploader.clone(),
         )?;
 
-        apply_action_plan(
+        apply_action_plan_with_observed_placeholder_paths(
             &registration.root_path,
             &action_plan,
             sync_root_identity.provider_instance_id,
             true,
+            Some(&startup_reconcile_report.observed_placeholder_paths_by_object_id),
         )?;
         let _ = runtime.sync_from_action_plan(&action_plan);
         let sync_state_stats = reconcile_sync_states(&registration.root_path, &action_plan);
@@ -515,7 +584,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let refresh_gate = monitor.refresh_gate();
         monitor.seed_remote_entries_with_suppressed_paths(
             &action_plan,
-            &startup_delete_report.suppressed_startup_paths,
+            &startup_reconcile_report.suppressed_startup_paths,
         );
         std::thread::spawn(move || {
             monitor.run();
@@ -564,36 +633,32 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                 let plan = refresh_adapter.plan_actions(&update.snapshot, &SyncPolicy::default());
                 let summary_label = format!("remote-refresh changed_paths={}", update.changed_paths.len());
                 log_action_plan_summary(&summary_label, &plan);
-                let remote_delete_report = {
+                let remote_object_report = {
                     let _monitor_gate = refresh_monitor_gate
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let report = match reconcile_remote_delete_state(
+                    let report = reconcile_remote_object_state_best_effort(
                         &refresh_registration.root_path,
                         &update.snapshot,
+                        &update.object_changes,
                         refresh_provider_instance_id,
-                    ) {
-                        Ok(report) => report,
-                        Err(err) => {
-                            tracing::warn!(
-                                "remote-refresh: remote-delete reconciliation failed: {err:#}"
-                            );
-                            RemoteDeleteReconcileReport::default()
-                        }
-                    };
-                    if let Err(err) = apply_action_plan(
+                        Some(uploader.as_ref()),
+                    );
+                    if let Err(err) = apply_action_plan_with_observed_placeholder_paths(
                         &refresh_registration.root_path,
                         &plan,
                         refresh_provider_instance_id,
                         false,
+                        Some(&report.observed_placeholder_paths_by_object_id),
                     ) {
                         tracing::info!("remote-refresh: apply_action_plan error: {err}");
                         return;
                     }
                     refresh_remote_applied_tracker.record_plan(&plan);
+                    refresh_remote_applied_tracker.record_reconcile_report(&report);
                     report
                 };
-                log_remote_delete_reconcile_summary(&summary_label, &remote_delete_report);
+                log_remote_object_reconcile_summary(&summary_label, &remote_object_report);
                 let reconciled_paths = refresh_runtime.sync_from_action_plan(&plan);
                 let sync_state_stats =
                     reconcile_sync_states(&refresh_registration.root_path, &plan);
@@ -609,10 +674,10 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                         sync_state_stats
                     );
                 }
-                if !remote_delete_report.suppressed_startup_paths.is_empty() {
+                if !remote_object_report.suppressed_startup_paths.is_empty() {
                     tracing::info!(
                         "remote-refresh: preserved {} stale local path(s) after delete because local bytes could not be removed",
-                        remote_delete_report.suppressed_startup_paths.len()
+                        remote_object_report.suppressed_startup_paths.len()
                     );
                 }
                 if let Some(publisher) = refresh_status_publisher.as_ref() {

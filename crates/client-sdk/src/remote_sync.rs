@@ -1,5 +1,5 @@
 use crate::bootstrap::ConnectionBootstrap;
-use crate::ironmesh_client::IronMeshClient;
+use crate::ironmesh_client::{IronMeshClient, namespace_entry_from_store_index_entry};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -99,6 +99,32 @@ impl RemoteSyncScheduler {
 pub struct RemoteSnapshotUpdate {
     pub snapshot: SyncSnapshot,
     pub changed_paths: Vec<String>,
+    /// Object-centric changes derived from two authoritative snapshots. These
+    /// retain the previous object identity and revision for safe reconciliation.
+    pub object_changes: Vec<RemoteObjectChange>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoteObjectChange {
+    Created {
+        current: NamespaceEntry,
+    },
+    Modified {
+        previous: NamespaceEntry,
+        current: NamespaceEntry,
+    },
+    Renamed {
+        previous: NamespaceEntry,
+        current: NamespaceEntry,
+    },
+    Deleted {
+        previous: NamespaceEntry,
+    },
+    /// Compatibility signal for servers that do not expose object identities.
+    /// Consumers must not use this to perform a destructive operation.
+    LegacyPathChanged {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -232,30 +258,14 @@ where
     let mut directory_count = 0u64;
 
     for (index, entry) in entries.into_iter().enumerate() {
-        if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
-            let directory_path = entry.path.trim_end_matches('/').to_string();
-            if !directory_path.is_empty() {
+        let is_directory = (entry.entry_type == "prefix") || entry.path.ends_with('/');
+        if let Some(entry) = namespace_entry_from_store_index_entry(entry) {
+            if is_directory {
                 directory_count += 1;
-                remote.push(NamespaceEntry::directory(directory_path));
+            } else {
+                file_count += 1;
             }
-        } else {
-            let version = entry.version.unwrap_or_else(|| "server-head".to_string());
-            let content_hash = entry
-                .content_hash
-                .unwrap_or_else(|| format!("server-head:{}", entry.path));
-            let mut remote_entry = NamespaceEntry::file_sized(
-                entry.path.clone(),
-                version,
-                content_hash,
-                entry.size_bytes,
-            );
-            remote_entry.content_fingerprint = entry.content_fingerprint;
-            remote_entry.modified_at_unix = entry.modified_at_unix;
-            remote_entry.media = entry
-                .media
-                .map(crate::ironmesh_client::namespace_media_metadata);
-            file_count += 1;
-            remote.push(remote_entry);
+            remote.push(entry);
         }
 
         let processed_entry_count = (index + 1) as u64;
@@ -481,14 +491,120 @@ fn apply_snapshot_update<C>(
     if let Some(previous) = current_snapshot.as_ref() {
         let changed_paths = changed_paths_between(previous, &next_snapshot);
         if !changed_paths.is_empty() {
+            let object_changes = object_changes_between(previous, &next_snapshot);
             on_change(RemoteSnapshotUpdate {
                 snapshot: next_snapshot.clone(),
                 changed_paths,
+                object_changes,
             });
         }
     }
 
     *current_snapshot = Some(next_snapshot);
+}
+
+pub fn object_changes_between(
+    previous: &SyncSnapshot,
+    current: &SyncSnapshot,
+) -> Vec<RemoteObjectChange> {
+    let (previous_by_id, previous_ambiguous_ids) = remote_files_by_object_id(previous);
+    let (current_by_id, current_ambiguous_ids) = remote_files_by_object_id(current);
+    let mut all_object_ids = BTreeSet::new();
+    all_object_ids.extend(previous_by_id.keys().cloned());
+    all_object_ids.extend(current_by_id.keys().cloned());
+
+    let mut changes = Vec::new();
+    for object_id in all_object_ids {
+        if previous_ambiguous_ids.contains(&object_id) || current_ambiguous_ids.contains(&object_id)
+        {
+            continue;
+        }
+        match (
+            previous_by_id.get(&object_id),
+            current_by_id.get(&object_id),
+        ) {
+            (Some(previous), Some(current)) if previous.path != current.path => {
+                changes.push(RemoteObjectChange::Renamed {
+                    previous: (*previous).clone(),
+                    current: (*current).clone(),
+                });
+            }
+            (Some(previous), Some(current)) if *previous != *current => {
+                changes.push(RemoteObjectChange::Modified {
+                    previous: (*previous).clone(),
+                    current: (*current).clone(),
+                });
+            }
+            (Some(previous), None) => changes.push(RemoteObjectChange::Deleted {
+                previous: (*previous).clone(),
+            }),
+            (None, Some(current)) => changes.push(RemoteObjectChange::Created {
+                current: (*current).clone(),
+            }),
+            _ => {}
+        }
+    }
+
+    let previous_legacy = legacy_remote_snapshot_index(previous);
+    let current_legacy = legacy_remote_snapshot_index(current);
+    let mut legacy_paths = BTreeSet::new();
+    legacy_paths.extend(previous_legacy.keys().cloned());
+    legacy_paths.extend(current_legacy.keys().cloned());
+    for path in legacy_paths {
+        if previous_legacy.get(&path) != current_legacy.get(&path) {
+            changes.push(RemoteObjectChange::LegacyPathChanged { path });
+        }
+    }
+
+    changes
+}
+
+fn remote_files_by_object_id(
+    snapshot: &SyncSnapshot,
+) -> (BTreeMap<String, &NamespaceEntry>, BTreeSet<String>) {
+    let mut unique = BTreeMap::<String, &NamespaceEntry>::new();
+    let mut ambiguous = BTreeSet::new();
+    for entry in &snapshot.remote {
+        let Some(object_id) = entry
+            .object_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|object_id| !object_id.is_empty())
+        else {
+            continue;
+        };
+        if ambiguous.contains(object_id) {
+            continue;
+        }
+        if unique
+            .get(object_id)
+            .is_some_and(|existing| existing.path == entry.path)
+        {
+            // Tree listings can expose the directory marker and the matching
+            // common-prefix projection together. They describe the same
+            // namespace entry, not an object-id collision.
+            continue;
+        }
+        if unique.insert(object_id.to_string(), entry).is_some() {
+            unique.remove(object_id);
+            ambiguous.insert(object_id.to_string());
+        }
+    }
+    (unique, ambiguous)
+}
+
+fn legacy_remote_snapshot_index(snapshot: &SyncSnapshot) -> RemoteSnapshotIndex {
+    let mut legacy = BTreeMap::new();
+    for entry in &snapshot.remote {
+        if entry
+            .object_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            legacy.insert(entry.path.clone(), remote_entry_signature(entry));
+        }
+    }
+    legacy
 }
 
 pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) -> Vec<String> {
@@ -507,30 +623,31 @@ pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) ->
     changed_paths
 }
 
-type RemoteSnapshotIndex = BTreeMap<
-    String,
+type RemoteEntrySignature = (
+    EntryKind,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+);
+type RemoteSnapshotIndex = BTreeMap<String, RemoteEntrySignature>;
+
+fn remote_entry_signature(entry: &NamespaceEntry) -> RemoteEntrySignature {
     (
-        EntryKind,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<u64>,
-    ),
->;
+        entry.kind,
+        entry.object_id.clone(),
+        entry.version.clone(),
+        entry.content_hash.clone(),
+        entry.content_fingerprint.clone(),
+        entry.size_bytes,
+    )
+}
 
 fn remote_snapshot_index(snapshot: &SyncSnapshot) -> RemoteSnapshotIndex {
     let mut index = BTreeMap::new();
     for entry in &snapshot.remote {
-        index.insert(
-            entry.path.clone(),
-            (
-                entry.kind,
-                entry.version.clone(),
-                entry.content_hash.clone(),
-                entry.content_fingerprint.clone(),
-                entry.size_bytes,
-            ),
-        );
+        index.insert(entry.path.clone(), remote_entry_signature(entry));
     }
     index
 }
@@ -735,21 +852,13 @@ mod tests {
         assert_eq!(current_snapshot, Some(newer_snapshot));
     }
 
-    /// Characterization only: a removal update identifies only a path and the
-    /// resulting snapshot. It carries neither the preceding revision nor a
-    /// tombstone/operation origin with which a consumer could prove the
-    /// removal is an authoritative remote deletion.
-    ///
-    /// Remove this test when updates carry typed, revision-linked deletions.
     #[test]
-    fn undesired_current_behavior_removal_update_has_no_tombstone_or_predecessor_provenance() {
+    fn removal_update_retains_object_id_and_predecessor_revision() {
+        let previous = NamespaceEntry::file("photos/possibly-stale.jpg", "revision-7", "hash-7")
+            .with_object_id("obj-photo");
         let mut current_snapshot = Some(SyncSnapshot {
             local: Vec::new(),
-            remote: vec![NamespaceEntry::file(
-                "photos/possibly-stale.jpg",
-                "revision-7",
-                "hash-7",
-            )],
+            remote: vec![previous.clone()],
         });
         let mut updates = Vec::new();
 
@@ -762,16 +871,227 @@ mod tests {
             &mut |update| updates.push(update),
         );
 
-        let update = updates.pop().expect("a path-only removal update");
-        // Exhaustive destructuring is intentional: adding deletion provenance
-        // to `RemoteSnapshotUpdate` must break this temporary characterization
-        // at compile time so it cannot silently survive the safety fix.
+        let update = updates.pop().expect("an object deletion update");
         let RemoteSnapshotUpdate {
             snapshot,
             changed_paths,
+            object_changes,
         } = update;
         assert_eq!(changed_paths, vec!["photos/possibly-stale.jpg".to_string()]);
         assert!(snapshot.remote.is_empty());
+        assert_eq!(
+            object_changes,
+            vec![RemoteObjectChange::Deleted { previous }]
+        );
+    }
+
+    #[test]
+    fn object_changes_keep_identity_across_content_revision() {
+        let previous_entry = NamespaceEntry::file("docs/readme.md", "revision-1", "hash-1")
+            .with_object_id("obj-readme");
+        let current_entry = NamespaceEntry::file("docs/readme.md", "revision-2", "hash-2")
+            .with_object_id("obj-readme");
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous_entry.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current_entry.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Modified {
+                previous: previous_entry,
+                current: current_entry,
+            }]
+        );
+    }
+
+    #[test]
+    fn object_changes_recognize_rename_by_stable_identity() {
+        let previous_entry = NamespaceEntry::file("docs/old.md", "revision-1", "hash-1")
+            .with_object_id("obj-readme");
+        let current_entry = NamespaceEntry::file("archive/new.md", "revision-2", "hash-1")
+            .with_object_id("obj-readme");
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous_entry.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current_entry.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Renamed {
+                previous: previous_entry,
+                current: current_entry,
+            }]
+        );
+    }
+
+    #[test]
+    fn object_changes_recognize_directory_rename_by_stable_identity() {
+        let mut previous_entry = NamespaceEntry::directory("docs");
+        previous_entry.object_id = Some("obj-directory".to_string());
+        previous_entry.version = Some("revision-1".to_string());
+        let mut current_entry = NamespaceEntry::directory("archive");
+        current_entry.object_id = Some("obj-directory".to_string());
+        current_entry.version = Some("revision-2".to_string());
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous_entry.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current_entry.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Renamed {
+                previous: previous_entry,
+                current: current_entry,
+            }]
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_directory_marker_identity_and_revision() {
+        let snapshot = snapshot_from_store_index_entries_with_progress(
+            vec![crate::ironmesh_client::StoreIndexEntry {
+                path: "docs/".to_string(),
+                entry_type: "prefix".to_string(),
+                object_id: Some("obj-directory".to_string()),
+                version: Some("revision-7".to_string()),
+                content_hash: Some("directory-marker".to_string()),
+                size_bytes: Some(5),
+                modified_at_unix: Some(1_725_000_000),
+                content_fingerprint: Some("fingerprint-directory".to_string()),
+                media: None,
+                labels: Vec::new(),
+                labels_resolved: false,
+            }],
+            |_| {},
+        );
+
+        let directory = snapshot
+            .remote
+            .first()
+            .expect("directory should be present");
+        assert_eq!(directory.kind, EntryKind::Directory);
+        assert_eq!(directory.path, "docs");
+        assert_eq!(directory.object_id.as_deref(), Some("obj-directory"));
+        assert_eq!(directory.version.as_deref(), Some("revision-7"));
+    }
+
+    #[test]
+    fn snapshot_omits_object_identity_when_store_index_lacks_revision() {
+        let snapshot = snapshot_from_store_index_entries_with_progress(
+            vec![crate::ironmesh_client::StoreIndexEntry {
+                path: "docs/readme.txt".to_string(),
+                entry_type: "key".to_string(),
+                object_id: Some("obj-readme".to_string()),
+                version: None,
+                content_hash: Some("manifest-readme".to_string()),
+                size_bytes: Some(42),
+                modified_at_unix: Some(1_725_000_000),
+                content_fingerprint: None,
+                media: None,
+                labels: Vec::new(),
+                labels_resolved: false,
+            }],
+            |_| {},
+        );
+
+        let entry = snapshot.remote.first().expect("file should be present");
+        assert_eq!(entry.content_hash.as_deref(), Some("manifest-readme"));
+        assert_eq!(entry.object_id, None);
+        assert_eq!(entry.version, None);
+    }
+
+    #[test]
+    fn same_path_with_new_object_id_is_delete_and_recreate() {
+        let deleted = NamespaceEntry::file("docs/readme.md", "revision-1", "hash-1")
+            .with_object_id("obj-old");
+        let created = NamespaceEntry::file("docs/readme.md", "revision-1", "hash-2")
+            .with_object_id("obj-new");
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![deleted.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![created.clone()],
+            },
+        );
+
+        assert!(changes.contains(&RemoteObjectChange::Deleted { previous: deleted }));
+        assert!(changes.contains(&RemoteObjectChange::Created { current: created }));
+        assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_object_id_in_snapshot_suppresses_ambiguous_mutation() {
+        let previous = NamespaceEntry::file("docs/readme.md", "revision-1", "hash-1")
+            .with_object_id("obj-duplicate");
+        let duplicate_a = NamespaceEntry::file("docs/a.md", "revision-2", "hash-1")
+            .with_object_id("obj-duplicate");
+        let duplicate_b = NamespaceEntry::file("docs/b.md", "revision-2", "hash-1")
+            .with_object_id("obj-duplicate");
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![duplicate_a, duplicate_b],
+            },
+        );
+
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn duplicate_directory_projection_at_same_path_keeps_rename_identity() {
+        let mut previous = NamespaceEntry::directory("docs");
+        previous.object_id = Some("obj-directory".to_string());
+        previous.version = Some("revision-1".to_string());
+        let mut current = NamespaceEntry::directory("archive");
+        current.object_id = Some("obj-directory".to_string());
+        current.version = Some("revision-2".to_string());
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current.clone(), current.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Renamed { previous, current }]
+        );
     }
 
     #[test]
@@ -1639,7 +1959,8 @@ mod tests {
             snapshot.remote,
             vec![
                 NamespaceEntry::directory("docs"),
-                NamespaceEntry::file_sized("docs/readme.txt", "v1", "hash-1", Some(42)),
+                NamespaceEntry::file_sized("docs/readme.txt", "v1", "hash-1", Some(42))
+                    .with_object_id("obj-readme"),
             ]
         );
 

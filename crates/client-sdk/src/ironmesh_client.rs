@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sync_core::{NamespaceEntry, SyncSnapshot};
+use sync_core::{EntryKind, NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
     ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
@@ -3459,6 +3459,10 @@ struct UploadSessionStartRequest {
     parent: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     chunk_refs: Vec<UploadSessionChunkRef>,
 }
@@ -3954,12 +3958,50 @@ pub struct ObjectLookup {
     pub entry_type: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ObjectMutationResponse {
-    object_id: String,
-    path: String,
-    revision: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectMutationResult {
+    pub object_id: String,
+    pub path: String,
+    pub revision: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectMutationUploadResult {
+    pub object_id: String,
+    pub path: String,
+    pub revision: String,
+    pub size_bytes: usize,
+}
+
+/// A server-side compare-and-swap or namespace collision rejected an object mutation.
+/// Callers must preserve the local change and reconcile instead of retrying the
+/// mutation as an unguarded path operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMutationConflict {
+    operation: &'static str,
+    target: String,
+}
+
+impl ObjectMutationConflict {
+    fn new(operation: &'static str, target: impl Into<String>) -> Self {
+        Self {
+            operation,
+            target: target.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ObjectMutationConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "409 Conflict during {} for {}",
+            self.operation, self.target
+        )
+    }
+}
+
+impl std::error::Error for ObjectMutationConflict {}
 
 #[derive(Debug, Serialize)]
 struct SnapshotRestoreRequest {
@@ -5124,6 +5166,25 @@ impl IronMeshClient {
         expected_revision: Option<&str>,
     ) -> Result<StorageObjectMeta> {
         let key = key.into();
+        let size_bytes = data.len();
+        let mutation = self
+            .put_with_expected_revision_result(key.clone(), data, expected_revision)
+            .await?;
+        Ok(StorageObjectMeta {
+            key,
+            size_bytes,
+            object_id: mutation.map(|mutation| mutation.object_id),
+        })
+    }
+
+    pub async fn put_with_expected_revision_result(
+        &self,
+        key: impl Into<String>,
+        data: Bytes,
+        expected_revision: Option<&str>,
+    ) -> Result<Option<ObjectMutationUploadResult>> {
+        let key = key.into();
+        let size_bytes = data.len();
         let mut url = self.store_key_url(&key)?;
         append_optional_query(&mut url, "expected_revision", expected_revision);
 
@@ -5131,26 +5192,29 @@ impl IronMeshClient {
             .execute_buffered_request(Method::PUT, url, Vec::new(), Some(data.to_vec()))
             .await
             .with_context(|| format!("failed to PUT object key={key}"))?;
+        if response.status == StatusCode::CONFLICT {
+            return Err(ObjectMutationConflict::new("PUT", format!("path={key}")).into());
+        }
         if !response.status.is_success() {
             bail!("server rejected PUT for key={key}: {}", response.status);
         }
 
-        let object_id = if response.body.is_empty() {
+        let mutation = if response.body.is_empty() {
             None
         } else {
-            let mutation = serde_json::from_slice::<ObjectMutationResponse>(&response.body)
+            let mutation = serde_json::from_slice::<ObjectMutationResult>(&response.body)
                 .context("failed to parse PUT object identity response")?;
             if mutation.path != key || mutation.revision.trim().is_empty() {
                 bail!("server returned an inconsistent PUT object identity response");
             }
-            Some(mutation.object_id)
+            Some(ObjectMutationUploadResult {
+                object_id: mutation.object_id,
+                path: mutation.path,
+                revision: mutation.revision,
+                size_bytes,
+            })
         };
-
-        Ok(StorageObjectMeta {
-            key,
-            size_bytes: data.len(),
-            object_id,
-        })
+        Ok(mutation)
     }
 
     pub async fn lookup_object_by_id(
@@ -5180,28 +5244,51 @@ impl IronMeshClient {
         data: Bytes,
         expected_revision: Option<&str>,
     ) -> Result<StorageObjectMeta> {
+        let mutation = self
+            .put_by_object_id_with_result(object_id, data, expected_revision)
+            .await?;
+        Ok(StorageObjectMeta {
+            key: mutation.path,
+            size_bytes: mutation.size_bytes,
+            object_id: Some(mutation.object_id),
+        })
+    }
+
+    pub async fn put_by_object_id_with_result(
+        &self,
+        object_id: impl AsRef<str>,
+        data: Bytes,
+        expected_revision: Option<&str>,
+    ) -> Result<ObjectMutationUploadResult> {
         let object_id = object_id.as_ref();
+        let size_bytes = data.len();
         let mut url = self.object_url(object_id)?;
         append_optional_query(&mut url, "expected_revision", expected_revision);
         let response = self
             .execute_buffered_request(Method::PUT, url, Vec::new(), Some(data.to_vec()))
             .await
             .with_context(|| format!("failed to PUT object_id={object_id}"))?;
+        if response.status == StatusCode::CONFLICT {
+            return Err(
+                ObjectMutationConflict::new("PUT", format!("object_id={object_id}")).into(),
+            );
+        }
         if !response.status.is_success() {
             bail!(
                 "server rejected PUT for object_id={object_id}: {}",
                 response.status
             );
         }
-        let mutation = serde_json::from_slice::<ObjectMutationResponse>(&response.body)
+        let mutation = serde_json::from_slice::<ObjectMutationResult>(&response.body)
             .context("failed to parse object-id PUT response")?;
         if mutation.object_id != object_id || mutation.revision.trim().is_empty() {
             bail!("server returned an inconsistent object-id PUT response");
         }
-        Ok(StorageObjectMeta {
-            key: mutation.path,
-            size_bytes: data.len(),
-            object_id: Some(mutation.object_id),
+        Ok(ObjectMutationUploadResult {
+            object_id: mutation.object_id,
+            path: mutation.path,
+            revision: mutation.revision,
+            size_bytes,
         })
     }
 
@@ -5212,6 +5299,18 @@ impl IronMeshClient {
         overwrite: bool,
         expected_revision: Option<&str>,
     ) -> Result<()> {
+        self.rename_object_by_id_with_result(object_id, to_path, overwrite, expected_revision)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn rename_object_by_id_with_result(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<ObjectMutationResult> {
         let object_id = object_id.as_ref();
         let to_path = to_path.into();
         let payload = serde_json::to_vec(&ObjectRenameRequest {
@@ -5230,9 +5329,40 @@ impl IronMeshClient {
             .await
             .with_context(|| format!("failed to rename object_id={object_id} to {to_path}"))?;
         match response.status {
-            StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::OK => {
+                let mutation = serde_json::from_slice::<ObjectMutationResult>(&response.body)
+                    .context("failed to parse object-id rename response")?;
+                if mutation.object_id != object_id || mutation.revision.trim().is_empty() {
+                    bail!("server returned an inconsistent object-id rename response");
+                }
+                Ok(mutation)
+            }
+            // Older servers returned 204. Resolve the identity immediately so
+            // callers never mark a locally renamed object in sync with the
+            // predecessor revision that was just consumed by the rename CAS.
+            StatusCode::NO_CONTENT => {
+                let resolved = self
+                    .lookup_object_by_id(object_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("renamed object identity not found: {object_id}"))?;
+                let revision = resolved
+                    .revision
+                    .filter(|revision| !revision.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("renamed object has no concrete revision: {object_id}")
+                    })?;
+                Ok(ObjectMutationResult {
+                    object_id: resolved.object_id,
+                    path: resolved.path,
+                    revision,
+                })
+            }
             StatusCode::NOT_FOUND => bail!("object identity not found: {object_id}"),
-            StatusCode::CONFLICT => bail!("object-id rename conflict for target: {to_path}"),
+            StatusCode::CONFLICT => Err(ObjectMutationConflict::new(
+                "rename",
+                format!("object_id={object_id} target={to_path}"),
+            )
+            .into()),
             status => Err(anyhow!("rename failed for object_id={object_id}: {status}")),
         }
     }
@@ -5265,7 +5395,9 @@ impl IronMeshClient {
         match response.status {
             StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(()),
             StatusCode::NOT_FOUND => bail!("object identity not found: {object_id}"),
-            StatusCode::CONFLICT => bail!("object-id delete revision conflict: {object_id}"),
+            StatusCode::CONFLICT => {
+                Err(ObjectMutationConflict::new("delete", format!("object_id={object_id}")).into())
+            }
             status => Err(anyhow!("delete failed for object_id={object_id}: {status}")),
         }
     }
@@ -6594,6 +6726,18 @@ impl IronMeshClient {
         total_size_bytes: u64,
         chunk_refs: Vec<UploadSessionChunkRef>,
     ) -> Result<UploadSessionView> {
+        self.start_upload_session_with_mutation(key, total_size_bytes, chunk_refs, None, None)
+            .await
+    }
+
+    async fn start_upload_session_with_mutation(
+        &self,
+        key: &str,
+        total_size_bytes: u64,
+        chunk_refs: Vec<UploadSessionChunkRef>,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+    ) -> Result<UploadSessionView> {
         let url = self.store_upload_session_start_url()?;
         let payload = serde_json::to_vec(&UploadSessionStartRequest {
             key: key.to_string(),
@@ -6601,6 +6745,8 @@ impl IronMeshClient {
             state: None,
             parent: Vec::new(),
             version_id: None,
+            object_id: object_id.map(ToString::to_string),
+            expected_revision: expected_revision.map(ToString::to_string),
             chunk_refs,
         })
         .context("failed to encode upload session start payload")?;
@@ -6616,6 +6762,19 @@ impl IronMeshClient {
             .await
             .with_context(|| format!("failed to start upload session for key={key}"))?;
         let response = routed.response;
+        if response.status == StatusCode::CONFLICT {
+            return Err(ObjectMutationConflict::new(
+                "upload-session-start",
+                match (object_id, expected_revision) {
+                    (Some(object_id), Some(expected_revision)) => {
+                        format!("object_id={object_id} expected_revision={expected_revision}")
+                    }
+                    (Some(object_id), None) => format!("object_id={object_id}"),
+                    _ => format!("path={key}"),
+                },
+            )
+            .into());
+        }
         if !response.status.is_success() {
             bail!(
                 "server rejected upload session start for key={key}: {}",
@@ -6744,6 +6903,14 @@ impl IronMeshClient {
             .with_context(|| format!("failed to complete upload session {upload_id}"))?;
         let response = routed.response;
 
+        if response.status == StatusCode::CONFLICT {
+            self.clear_upload_session_affinity(upload_id);
+            return Err(ObjectMutationConflict::new(
+                "upload-session-complete",
+                format!("session={upload_id}"),
+            )
+            .into());
+        }
         if !response.status.is_success() {
             bail!(
                 "upload session completion rejected for session={upload_id}: {}",
@@ -7420,6 +7587,72 @@ impl IronMeshClient {
         ))
     }
 
+    fn put_sized_reader_via_upload_session_with_identity(
+        &self,
+        path: &str,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+        reader: &mut dyn Read,
+        total_size_bytes: u64,
+    ) -> Result<ObjectMutationUploadResult> {
+        let runtime = blocking_runtime()?;
+        let session = runtime.block_on(self.start_upload_session_with_mutation(
+            path,
+            total_size_bytes,
+            Vec::new(),
+            object_id,
+            expected_revision,
+        ))?;
+        let mut buffer = vec![0_u8; session.chunk_size_bytes];
+
+        for index in 0..session.chunk_count {
+            let expected_size = expected_chunk_size(
+                total_size_bytes,
+                session.chunk_size_bytes,
+                session.chunk_count,
+                index,
+            )
+            .context("failed to determine expected upload chunk size")?;
+            reader
+                .read_exact(&mut buffer[..expected_size])
+                .with_context(|| {
+                    format!("failed reading upload chunk index={index} for key={path}")
+                })?;
+            let response = runtime.block_on(self.upload_session_chunk(
+                &session.upload_id,
+                index,
+                buffer[..expected_size].to_vec(),
+            ))?;
+            if response.received_index != index {
+                bail!(
+                    "server acknowledged unexpected upload chunk index={} expected={index}",
+                    response.received_index
+                );
+            }
+        }
+
+        let completed = runtime.block_on(self.complete_upload_session(&session.upload_id))?;
+        self.clear_upload_session_affinity(&session.upload_id);
+        let returned_object_id = completed.object_id.trim();
+        if returned_object_id.is_empty() {
+            bail!("server did not return object identity for chunked upload path={path}");
+        }
+        if let Some(expected_object_id) = object_id
+            && returned_object_id != expected_object_id
+        {
+            bail!(
+                "server returned a different object identity for chunked upload path={path}: expected={expected_object_id} actual={returned_object_id}"
+            );
+        }
+        Ok(ObjectMutationUploadResult {
+            object_id: returned_object_id.to_string(),
+            path: path.to_string(),
+            revision: completed.version_id,
+            size_bytes: usize::try_from(total_size_bytes)
+                .context("chunked upload size exceeds this platform's addressable range")?,
+        })
+    }
+
     pub fn download_file_resumable(
         &self,
         key: impl AsRef<str>,
@@ -7645,6 +7878,111 @@ impl IronMeshClient {
 
         let runtime = blocking_runtime()?;
         runtime.block_on(self.delete_path(key))
+    }
+
+    pub fn lookup_object_by_id_blocking(
+        &self,
+        object_id: impl AsRef<str>,
+    ) -> Result<Option<ObjectLookup>> {
+        let object_id = object_id.as_ref().to_string();
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.lookup_object_by_id(object_id))
+    }
+
+    pub fn put_reader_with_identity_blocking(
+        &self,
+        path: impl Into<String>,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+        reader: &mut dyn std::io::Read,
+        length: u64,
+    ) -> Result<ObjectMutationUploadResult> {
+        let path = path.into();
+        let object_id = object_id.map(str::trim).filter(|value| !value.is_empty());
+        if length > LARGE_UPLOAD_THRESHOLD_BYTES as u64 {
+            return self.put_sized_reader_via_upload_session_with_identity(
+                &path,
+                object_id,
+                expected_revision,
+                reader,
+                length,
+            );
+        }
+        let initial_capacity = usize::try_from(length)
+            .unwrap_or(8_192)
+            .min(LARGE_UPLOAD_THRESHOLD_BYTES);
+        let mut payload = Vec::with_capacity(initial_capacity);
+        reader
+            .take(length)
+            .read_to_end(&mut payload)
+            .with_context(|| format!("failed reading upload payload for {path}"))?;
+        if payload.len() as u64 != length {
+            bail!(
+                "upload payload length changed while reading {path}: expected={length} actual={}",
+                payload.len()
+            );
+        }
+        let runtime = blocking_runtime()?;
+        match object_id {
+            Some(object_id) => runtime.block_on(self.put_by_object_id_with_result(
+                object_id,
+                Bytes::from(payload),
+                expected_revision,
+            )),
+            None => runtime
+                .block_on(self.put_with_expected_revision_result(
+                    path.clone(),
+                    Bytes::from(payload),
+                    expected_revision,
+                ))?
+                .ok_or_else(|| {
+                    anyhow!("server did not return object identity for newly created path {path}")
+                }),
+        }
+    }
+
+    pub fn rename_object_by_id_blocking(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        self.rename_object_by_id_with_result_blocking(
+            object_id,
+            to_path,
+            overwrite,
+            expected_revision,
+        )
+        .map(|_| ())
+    }
+
+    pub fn rename_object_by_id_with_result_blocking(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<ObjectMutationResult> {
+        let object_id = object_id.as_ref().to_string();
+        let to_path = to_path.into();
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.rename_object_by_id_with_result(
+            object_id,
+            to_path,
+            overwrite,
+            expected_revision,
+        ))
+    }
+
+    pub fn delete_object_by_id_blocking(
+        &self,
+        object_id: impl AsRef<str>,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        let object_id = object_id.as_ref().to_string();
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.delete_object_by_id(object_id, expected_revision))
     }
 
     pub fn rename_path_blocking(
@@ -9616,30 +9954,56 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
     let mut remote = Vec::with_capacity(entries.len());
 
     for entry in entries {
-        if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
-            let directory_path = entry.path.trim_end_matches('/').to_string();
-            if !directory_path.is_empty() {
-                remote.push(NamespaceEntry::directory(directory_path));
-            }
-            continue;
+        if let Some(entry) = namespace_entry_from_store_index_entry(entry) {
+            remote.push(entry);
         }
-
-        let version = entry.version.unwrap_or_else(|| "server-head".to_string());
-        let content_hash = entry
-            .content_hash
-            .unwrap_or_else(|| format!("server-head:{}", entry.path));
-        let mut remote_entry =
-            NamespaceEntry::file_sized(entry.path.clone(), version, content_hash, entry.size_bytes);
-        remote_entry.content_fingerprint = entry.content_fingerprint;
-        remote_entry.modified_at_unix = entry.modified_at_unix;
-        remote_entry.media = entry.media.map(namespace_media_metadata);
-        remote.push(remote_entry);
     }
 
     SyncSnapshot {
         local: Vec::new(),
         remote,
     }
+}
+
+/// Converts a store-index result without inventing a revision. A file can
+/// carry its stable object identity only together with the concrete revision
+/// required for a subsequent compare-and-swap mutation.
+pub(crate) fn namespace_entry_from_store_index_entry(
+    entry: StoreIndexEntry,
+) -> Option<NamespaceEntry> {
+    if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
+        let directory_path = entry.path.trim_end_matches('/').to_string();
+        if directory_path.is_empty() {
+            return None;
+        }
+
+        let revision = entry.version.filter(|value| !value.trim().is_empty());
+        let mut directory = NamespaceEntry::directory(directory_path);
+        directory.object_id = revision.is_some().then_some(entry.object_id).flatten();
+        directory.version = revision;
+        directory.content_hash = entry.content_hash;
+        directory.content_fingerprint = entry.content_fingerprint;
+        directory.size_bytes = entry.size_bytes;
+        directory.modified_at_unix = entry.modified_at_unix;
+        directory.media = entry.media.map(namespace_media_metadata);
+        return Some(directory);
+    }
+
+    let revision = entry.version.filter(|value| !value.trim().is_empty());
+    let has_cas_baseline = revision.is_some();
+    Some(NamespaceEntry {
+        path: entry.path,
+        kind: EntryKind::File,
+        // A response without a concrete revision cannot safely be used for a
+        // mutation. Retain neither half of the CAS tuple in the snapshot.
+        object_id: has_cas_baseline.then_some(entry.object_id).flatten(),
+        version: revision,
+        content_hash: entry.content_hash,
+        content_fingerprint: entry.content_fingerprint,
+        size_bytes: entry.size_bytes,
+        modified_at_unix: entry.modified_at_unix,
+        media: entry.media.map(namespace_media_metadata),
+    })
 }
 
 pub fn namespace_media_metadata(media: StoreIndexMedia) -> sync_core::NamespaceMediaMetadata {
