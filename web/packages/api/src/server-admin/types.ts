@@ -1404,3 +1404,16 @@ export type GeoProposalChunk = {
   status: "ready";
   proposals: GeoProposal[];
 };
+
+export type GeoApplyItemOutcome =
+  | "applied"
+  | "already-has-gps"
+  | "skipped-stale"
+  | "failed";
+
+export type GeoApplyItemResult = {
+  proposal_id: string;
+  media_path: string;
+  status: GeoApplyItemOutcome;
+  detail?: string | null;
+};

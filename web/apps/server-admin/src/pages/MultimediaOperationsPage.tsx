@@ -5,6 +5,7 @@ import {
   getOperations,
   listAdminStoreEntries,
   startOperationRun,
+  type GeoApplyItemResult,
   type GeoProposal,
   type GeoProposalChunk,
   type OperationResultChunk,
@@ -55,6 +56,7 @@ export function MultimediaOperationsPage() {
   const [selectedPrefix, setSelectedPrefix] = useState("");
   const [settings, setSettings] = useState(defaultSettings);
   const [selectedAnalysisRunId, setSelectedAnalysisRunId] = useState<string | null>(null);
+  const [selectedApplyRunId, setSelectedApplyRunId] = useState<string | null>(null);
   const [selectedChunkIds, setSelectedChunkIds] = useState<Set<string>>(new Set());
   const [selectedProposalIds, setSelectedProposalIds] = useState<Set<string>>(new Set());
 
@@ -93,9 +95,11 @@ export function MultimediaOperationsPage() {
 
   const runs = historyQuery.data?.runs ?? [];
   const proposalRuns = runs.filter((run) => run.operation_id === PROPOSE_OPERATION_ID);
+  const applyRuns = runs.filter((run) => run.operation_id === APPLY_OPERATION_ID);
   const activeRunIds = new Set(runs.filter(isUnfinishedRun).map((run) => run.run_id));
   const selectedAnalysisRun =
     proposalRuns.find((run) => run.run_id === selectedAnalysisRunId) ?? null;
+  const selectedApplyRun = applyRuns.find((run) => run.run_id === selectedApplyRunId) ?? null;
   const proposalResultsQuery = useQuery({
     queryKey: [
       "multimedia-operations",
@@ -122,6 +126,31 @@ export function MultimediaOperationsPage() {
         .filter((chunk): chunk is GeoProposalChunk => chunk !== null),
     [proposalResultsQuery.data?.chunks]
   );
+  const applyResultsQuery = useQuery({
+    queryKey: [
+      "multimedia-operations",
+      "results",
+      selectedApplyRun?.run_id ?? null,
+      normalizedAdminTokenOverride
+    ],
+    queryFn: () =>
+      getOperationRunResults(
+        selectedApplyRun!.run_id,
+        { limit: RESULTS_LIMIT },
+        normalizedAdminTokenOverride || undefined
+      ),
+    enabled: canInspect && selectedApplyRun !== null,
+    refetchInterval:
+      selectedApplyRun && isUnfinishedRun(selectedApplyRun) ? 3_000 : false
+  });
+  const applyItems = useMemo(
+    () =>
+      (applyResultsQuery.data?.chunks ?? [])
+        .filter((chunk) => chunk.result_type === "multimedia.geolocation.apply_item")
+        .map(asGeoApplyItemResult)
+        .filter((item): item is GeoApplyItemResult => item !== null),
+    [applyResultsQuery.data?.chunks]
+  );
 
   useEffect(() => {
     if (selectedAnalysisRunId || proposalRuns.length === 0) {
@@ -129,6 +158,13 @@ export function MultimediaOperationsPage() {
     }
     setSelectedAnalysisRunId(proposalRuns[0].run_id);
   }, [proposalRuns, selectedAnalysisRunId]);
+
+  useEffect(() => {
+    if (selectedApplyRunId || applyRuns.length === 0) {
+      return;
+    }
+    setSelectedApplyRunId(applyRuns[0].run_id);
+  }, [applyRuns, selectedApplyRunId]);
 
   useEffect(() => {
     setSelectedChunkIds(new Set());
@@ -141,15 +177,7 @@ export function MultimediaOperationsPage() {
         queryKey: ["multimedia-operations", "history", normalizedAdminTokenOverride],
         exact: true
       }),
-      queryClient.invalidateQueries({
-        queryKey: [
-          "multimedia-operations",
-          "results",
-          selectedAnalysisRun?.run_id ?? null,
-          normalizedAdminTokenOverride
-        ],
-        exact: true
-      })
+      queryClient.invalidateQueries({ queryKey: ["multimedia-operations", "results"] })
     ]);
   };
 
@@ -185,7 +213,10 @@ export function MultimediaOperationsPage() {
         normalizedAdminTokenOverride || undefined
       );
     },
-    onSuccess: refresh
+    onSuccess: async ({ run }) => {
+      setSelectedApplyRunId(run.run_id);
+      await refresh();
+    }
   });
 
   const childPrefixes = (prefixQuery.data?.entries ?? []).filter(
@@ -347,9 +378,38 @@ export function MultimediaOperationsPage() {
               Start apply job
             </Button>
           </Group>
-          <MutationError error={proposalResultsQuery.error ?? applyMutation.error} />
+          <MutationError error={applyMutation.error} />
+          <MutationError error={proposalResultsQuery.error} />
         </Stack>
       </Card>
+
+      {applyRuns.length > 0 ? (
+        <Card withBorder>
+          <Stack gap="md">
+            <div>
+              <Title order={3}>Apply results</Title>
+              <Text size="sm" c="dimmed">
+                Each selected proposal is recorded separately, including stale and already-geotagged skips.
+              </Text>
+            </div>
+            <Select
+              label="Apply run"
+              data={applyRuns.map((run) => ({
+                value: run.run_id,
+                label: `${formatUnixTs(run.created_at_unix)} — ${run.status}`
+              }))}
+              value={selectedApplyRunId}
+              onChange={setSelectedApplyRunId}
+              searchable
+              clearable
+            />
+            {selectedApplyRun ? (
+              <ApplyResultReview run={selectedApplyRun} items={applyItems} />
+            ) : null}
+            <MutationError error={applyResultsQuery.error} />
+          </Stack>
+        </Card>
+      ) : null}
     </Stack>
   );
 }
@@ -456,6 +516,52 @@ function RunHistoryTable({ runs }: { runs: OperationRun[] }) {
         </Table.Tbody>
       </Table>
     </Table.ScrollContainer>
+  );
+}
+
+function ApplyResultReview({ run, items }: { run: OperationRun; items: GeoApplyItemResult[] }) {
+  const summary = ["applied", "already_has_gps", "skipped_stale", "failed"]
+    .map((key) => {
+      const value = run.summary?.[key];
+      return typeof value === "number" ? `${key.replaceAll("_", " ")}: ${value}` : null;
+    })
+    .filter((value): value is string => value !== null);
+  if (items.length === 0) {
+    return (
+      <Alert color={isUnfinishedRun(run) ? "blue" : "gray"}>
+        {isUnfinishedRun(run)
+          ? "This apply job has not recorded an item outcome yet."
+          : "This apply job did not record any item outcomes."}
+      </Alert>
+    );
+  }
+  return (
+    <Stack gap="xs">
+      {summary.length > 0 ? <Text size="sm">{summary.join(" · ")}</Text> : null}
+      <Table.ScrollContainer minWidth={720}>
+        <Table striped highlightOnHover>
+          <Table.Thead>
+            <Table.Tr>
+              <Table.Th>File</Table.Th>
+              <Table.Th>Outcome</Table.Th>
+              <Table.Th>Detail</Table.Th>
+            </Table.Tr>
+          </Table.Thead>
+          <Table.Tbody>
+            {items.map((item) => (
+              <Table.Tr key={item.proposal_id}>
+                <Table.Td>
+                  <Text size="sm">{item.media_path}</Text>
+                  <Text size="xs" c="dimmed">{item.proposal_id}</Text>
+                </Table.Td>
+                <Table.Td><ApplyOutcomeBadge outcome={item.status} /></Table.Td>
+                <Table.Td><Text size="sm">{item.detail ?? "—"}</Text></Table.Td>
+              </Table.Tr>
+            ))}
+          </Table.Tbody>
+        </Table>
+      </Table.ScrollContainer>
+    </Stack>
   );
 }
 
@@ -608,10 +714,34 @@ function RunStatusBadge({ status }: { status: OperationRunStatus }) {
   return <Badge color={color}>{status}</Badge>;
 }
 
+function ApplyOutcomeBadge({ outcome }: { outcome: GeoApplyItemResult["status"] }) {
+  const color =
+    outcome === "applied"
+      ? "teal"
+      : outcome === "failed"
+        ? "red"
+        : outcome === "already-has-gps"
+          ? "yellow"
+          : "gray";
+  return <Badge color={color}>{outcome}</Badge>;
+}
+
 function asGeoProposalChunk(chunk: OperationResultChunk): GeoProposalChunk | null {
   const payload = chunk.payload as Partial<GeoProposalChunk>;
   return typeof payload.id === "string" && Array.isArray(payload.proposals)
     ? (payload as GeoProposalChunk)
+    : null;
+}
+
+function asGeoApplyItemResult(chunk: OperationResultChunk): GeoApplyItemResult | null {
+  const payload = chunk.payload as Partial<GeoApplyItemResult>;
+  return typeof payload.proposal_id === "string" &&
+    typeof payload.media_path === "string" &&
+    (payload.status === "applied" ||
+      payload.status === "already-has-gps" ||
+      payload.status === "skipped-stale" ||
+      payload.status === "failed")
+    ? (payload as GeoApplyItemResult)
     : null;
 }
 

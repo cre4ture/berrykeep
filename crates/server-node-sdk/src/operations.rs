@@ -584,6 +584,8 @@ use super::{
 
 const MULTIMEDIA_OPERATION_BATCH_SIZE: usize = 64;
 const MULTIMEDIA_OPERATION_YIELD_MILLIS: u64 = 100;
+const OPERATION_RUN_PERSIST_ATTEMPTS: usize = 3;
+const OPERATION_RUN_PERSIST_RETRY_MILLIS: u64 = 100;
 const OPERATION_RESULT_TYPE_GEO_PROPOSAL_CHUNK: &str = "multimedia.geolocation.proposal_chunk";
 const OPERATION_RESULT_TYPE_GEO_APPLY_ITEM: &str = "multimedia.geolocation.apply_item";
 
@@ -770,7 +772,7 @@ pub(super) async fn start_operation_run(
         error: None,
         termination_reason: None,
     };
-    if let Err(error) = persist_operation_run(&state, &run).await {
+    if let Err(error) = persist_operation_run_with_retry(&state, &run, "queue operation").await {
         warn!(error = %error, operation_id = %run.operation_id, "failed to persist queued operation");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -843,7 +845,7 @@ pub(super) async fn get_operation_run_results(
     {
         return status.into_response();
     }
-    let limit = query.limit.map(|limit| limit.clamp(1, 1_000));
+    let limit = query.limit.map(|limit| limit.clamp(1, 1_000)).or(Some(100));
     let chunks = {
         let store = read_store(&state, "operations.load_results").await;
         store.list_operation_result_chunks(&run_id, limit).await
@@ -1014,9 +1016,11 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
         message: Some("Collecting media metadata in batches.".to_string()),
         ..OperationProgress::default()
     };
-    if let Err(error) = persist_operation_run(&state, &run).await {
+    if let Err(error) =
+        persist_operation_run_with_retry(&state, &run, "start geolocation proposal").await
+    {
+        finish_failed_operation(&state, &mut run, error).await;
         release_multimedia_slot(&state, true).await;
-        warn!(error = %error, run_id = %run.run_id, "failed to start persisted multimedia scan");
         return;
     }
 
@@ -1135,8 +1139,11 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                 "proposal_chunk_count": chunk_count,
                 "proposal_count": proposal_count,
             }));
-            if let Err(error) = persist_operation_run(&state, &run).await {
-                warn!(error = %error, run_id = %run.run_id, "failed to persist completed geo proposal operation");
+            if let Err(error) =
+                persist_operation_run_with_retry(&state, &run, "complete geolocation proposal")
+                    .await
+            {
+                finish_interrupted_operation(&state, &mut run, "persistence_failure", error).await;
             }
         }
         Err(error) => finish_failed_operation(&state, &mut run, error).await,
@@ -1156,9 +1163,11 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
         message: Some("Loading confirmed geolocation proposals.".to_string()),
         ..OperationProgress::default()
     };
-    if let Err(error) = persist_operation_run(&state, &run).await {
+    if let Err(error) =
+        persist_operation_run_with_retry(&state, &run, "start geolocation apply").await
+    {
+        finish_failed_operation(&state, &mut run, error).await;
         release_multimedia_slot(&state, false).await;
-        warn!(error = %error, run_id = %run.run_id, "failed to start persisted multimedia apply");
         return;
     }
 
@@ -1231,8 +1240,10 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
                 "skipped_stale": counters.skipped_stale,
                 "failed": counters.failed,
             }));
-            if let Err(error) = persist_operation_run(&state, &run).await {
-                warn!(error = %error, run_id = %run.run_id, "failed to persist completed geo apply operation");
+            if let Err(error) =
+                persist_operation_run_with_retry(&state, &run, "complete geolocation apply").await
+            {
+                finish_interrupted_operation(&state, &mut run, "persistence_failure", error).await;
             }
         }
         Err(error) => finish_failed_operation(&state, &mut run, error).await,
@@ -1525,6 +1536,30 @@ async fn persist_operation_run(state: &ServerState, run: &OperationRun) -> Resul
     store.persist_operation_run(run).await
 }
 
+async fn persist_operation_run_with_retry(
+    state: &ServerState,
+    run: &OperationRun,
+    action: &str,
+) -> Result<()> {
+    for attempt in 1..=OPERATION_RUN_PERSIST_ATTEMPTS {
+        match persist_operation_run(state, run).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == OPERATION_RUN_PERSIST_ATTEMPTS => return Err(error),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    run_id = %run.run_id,
+                    attempt,
+                    action,
+                    "retrying operation-run persistence after a transient failure"
+                );
+                sleep(Duration::from_millis(OPERATION_RUN_PERSIST_RETRY_MILLIS)).await;
+            }
+        }
+    }
+    unreachable!("operation-run persistence attempts are non-empty")
+}
+
 async fn persist_operation_result_chunk(
     state: &ServerState,
     chunk: &OperationResultChunk,
@@ -1543,10 +1578,32 @@ async fn finish_failed_operation(
     run.error = Some(error.to_string());
     run.progress.phase = Some("failed".to_string());
     run.progress.message = Some("Operation failed; see error for details.".to_string());
-    if let Err(persist_error) = persist_operation_run(state, run).await {
+    if let Err(persist_error) =
+        persist_operation_run_with_retry(state, run, "persist failed operation").await
+    {
         warn!(error = %persist_error, run_id = %run.run_id, "failed to persist failed operation");
     }
     warn!(error = %error, run_id = %run.run_id, operation_id = %run.operation_id, "operation failed");
+}
+
+async fn finish_interrupted_operation(
+    state: &ServerState,
+    run: &mut OperationRun,
+    reason: &str,
+    error: anyhow::Error,
+) {
+    run.status = OperationRunStatus::Interrupted;
+    run.finished_at_unix = Some(super::unix_ts());
+    run.error = Some(error.to_string());
+    run.termination_reason = Some(reason.to_string());
+    run.progress.phase = Some("interrupted".to_string());
+    run.progress.message =
+        Some("Operation interrupted; persisted results remain reviewable.".to_string());
+    if let Err(persist_error) =
+        persist_operation_run_with_retry(state, run, "persist interrupted operation").await
+    {
+        warn!(error = %persist_error, run_id = %run.run_id, "failed to persist interrupted operation");
+    }
 }
 
 async fn acquire_multimedia_slot(state: &ServerState, run_id: &str, is_scan: bool) -> Result<()> {
