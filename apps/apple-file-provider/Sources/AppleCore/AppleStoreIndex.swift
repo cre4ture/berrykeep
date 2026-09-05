@@ -307,6 +307,8 @@ public struct AppleGalleryCaptureDateRange: Equatable, Sendable {
             ?? normalizedEnd.addingTimeInterval(86_400)
         self.startDate = normalizedStart
         self.endDate = normalizedEnd
+        // The server stores capture timestamps as unsigned Unix seconds. A fully
+        // pre-epoch selection becomes the valid empty interval [0, 0).
         capturedFromUnix = UInt64(max(0, normalizedStart.timeIntervalSince1970))
         capturedUntilUnix = UInt64(max(0, exclusiveEnd.timeIntervalSince1970))
     }

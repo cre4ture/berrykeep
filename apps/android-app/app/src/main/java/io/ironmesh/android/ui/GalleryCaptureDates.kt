@@ -14,7 +14,11 @@ internal fun GalleryCaptureDateRange.toTimestampRange(
     val start = startEpochDay ?: return GalleryCaptureTimestampRange(null, null)
     val end = requireNotNull(endEpochDay)
     return GalleryCaptureTimestampRange(
-        fromUnix = LocalDate.ofEpochDay(start).atStartOfDay(zoneId).toEpochSecond(),
-        untilUnix = LocalDate.ofEpochDay(end).plusDays(1).atStartOfDay(zoneId).toEpochSecond(),
+        fromUnix = LocalDate.ofEpochDay(start).atStartOfDay(zoneId).toEpochSecond().coerceAtLeast(0),
+        untilUnix = LocalDate.ofEpochDay(end)
+            .plusDays(1)
+            .atStartOfDay(zoneId)
+            .toEpochSecond()
+            .coerceAtLeast(0),
     )
 }

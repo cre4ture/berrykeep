@@ -28,4 +28,32 @@ class GalleryCaptureDatesTest {
             GalleryCaptureDateRange().toTimestampRange(ZoneId.of("UTC")),
         )
     }
+
+    @Test
+    fun preEpochDateRangeBecomesAnEmptySupportedTimestampRange() {
+        val date = LocalDate.of(1965, 4, 1)
+
+        assertEquals(
+            GalleryCaptureTimestampRange(0, 0),
+            GalleryCaptureDateRange(
+                startEpochDay = date.toEpochDay(),
+                endEpochDay = date.toEpochDay(),
+            ).toTimestampRange(ZoneId.of("UTC")),
+        )
+    }
+
+    @Test
+    fun rangeCrossingEpochClampsOnlyItsLowerBound() {
+        val zone = ZoneId.of("UTC")
+        val start = LocalDate.of(1969, 12, 25)
+        val end = LocalDate.of(1970, 1, 2)
+
+        val timestamps = GalleryCaptureDateRange(
+            startEpochDay = start.toEpochDay(),
+            endEpochDay = end.toEpochDay(),
+        ).toTimestampRange(zone)
+
+        assertEquals(0L, timestamps.fromUnix)
+        assertEquals(end.plusDays(1).atStartOfDay(zone).toEpochSecond(), timestamps.untilUnix)
+    }
 }

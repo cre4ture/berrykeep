@@ -93,7 +93,9 @@ captured_from_unix=1709251200&captured_until_unix=1711929600
 ```
 
 `captured_from_unix` is inclusive and `captured_until_unix` is exclusive. Either bound may be
-used alone; when both are present the lower bound must be earlier than the upper bound. Mobile
+used alone; when both are present the lower bound must not be later than the upper bound. Equal
+bounds form a valid empty interval. Client dates before the unsigned Unix epoch are clamped to
+zero, so a fully pre-epoch range becomes the empty interval `[0, 0)`. Mobile
 clients convert the selected local calendar days to the start of the first day and the start of
 the day after the last day. This keeps an inclusive user-facing date range correct across daylight
 saving transitions.

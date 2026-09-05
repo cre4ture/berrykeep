@@ -387,26 +387,35 @@ fn gallery_index_filters_capture_time_with_inclusive_start_and_exclusive_end() {
     insert_gallery_fixture(&db, "gallery/in-range.jpg", "image", 20, None, None);
     insert_gallery_fixture(&db, "gallery/upper-bound.jpg", "image", 30, None, None);
 
-    let page = query_gallery_index_from_db(
-        &db,
-        &GalleryIndexQuery {
-            prefix: "gallery".to_string(),
-            depth: 2,
-            media_filter: GalleryIndexMediaFilter::Image,
-            captured_sort: GalleryIndexCapturedSort::Desc,
-            captured_from_unix: Some(20),
-            captured_until_unix: Some(30),
-            offset: 0,
-            limit: 10,
-            viewport: None,
-            label_filter: Default::default(),
-        },
-    )
-    .expect("capture-time filtered gallery should load");
+    let query = GalleryIndexQuery {
+        prefix: "gallery".to_string(),
+        depth: 2,
+        media_filter: GalleryIndexMediaFilter::Image,
+        captured_sort: GalleryIndexCapturedSort::Desc,
+        captured_from_unix: Some(20),
+        captured_until_unix: Some(30),
+        offset: 0,
+        limit: 10,
+        viewport: None,
+        label_filter: Default::default(),
+    };
+    let page = query_gallery_index_from_db(&db, &query)
+        .expect("capture-time filtered gallery should load");
 
     assert_eq!(page.total_entry_count, 1);
     assert_eq!(page.media_summary.image_count, 1);
     assert_eq!(page.entries[0].key, "gallery/in-range.jpg");
+
+    let empty_page = query_gallery_index_from_db(
+        &db,
+        &GalleryIndexQuery {
+            captured_until_unix: Some(20),
+            ..query
+        },
+    )
+    .expect("empty capture-time interval should load");
+    assert_eq!(empty_page.total_entry_count, 0);
+    assert!(empty_page.entries.is_empty());
 }
 
 fn gallery_map_query(
@@ -533,7 +542,7 @@ fn gallery_map_filters_capture_time_in_clusters_summary_and_entries() {
     let entries = query_gallery_map_cluster_entries_from_db(
         &db,
         &GalleryMapClusterEntriesQuery {
-            prefix: query.prefix,
+            prefix: query.prefix.clone(),
             depth: query.depth,
             media_filter: query.media_filter,
             captured_from_unix: query.captured_from_unix,
@@ -550,6 +559,14 @@ fn gallery_map_filters_capture_time_in_clusters_summary_and_entries() {
     .expect("capture-time filtered cluster entries should load");
     assert_eq!(entries.total_entry_count, 1);
     assert_eq!(entries.entries[0].key, "gallery/in-range.jpg");
+
+    query.captured_from_unix = Some(0);
+    query.captured_until_unix = Some(0);
+    let empty_clusters = query_gallery_map_clusters_from_db(&db, &query)
+        .expect("empty capture-time interval should load");
+    assert_eq!(empty_clusters.total_entry_count, 0);
+    assert_eq!(empty_clusters.visible_geotagged_count, 0);
+    assert!(empty_clusters.clusters.is_empty());
 }
 
 #[tokio::test]

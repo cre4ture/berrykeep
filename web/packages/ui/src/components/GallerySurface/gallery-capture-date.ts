@@ -15,11 +15,11 @@ export function galleryCaptureDateBounds(
   const from = localDateStart(fromDate);
   const through = localDateStart(throughDate);
   return {
-    ...(from === null ? {} : { capturedFromUnix: unixSeconds(from) }),
+    ...(from === null ? {} : { capturedFromUnix: supportedUnixSeconds(from) }),
     ...(through === null
       ? {}
       : {
-          capturedUntilUnix: unixSeconds(
+          capturedUntilUnix: supportedUnixSeconds(
             new Date(through.getFullYear(), through.getMonth(), through.getDate() + 1)
           )
         })
@@ -45,6 +45,6 @@ function localDateStart(value: string): Date | null {
   return date;
 }
 
-function unixSeconds(date: Date): number {
-  return Math.floor(date.getTime() / 1_000);
+function supportedUnixSeconds(date: Date): number {
+  return Math.max(0, Math.floor(date.getTime() / 1_000));
 }

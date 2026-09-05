@@ -16832,9 +16832,9 @@ fn validate_capture_range(
     }
     if matches!(
         (captured_from_unix, captured_until_unix),
-        (Some(from), Some(until)) if from >= until
+        (Some(from), Some(until)) if from > until
     ) {
-        return Err("captured_from_unix must be earlier than captured_until_unix");
+        return Err("captured_from_unix must not be later than captured_until_unix");
     }
     Ok(())
 }

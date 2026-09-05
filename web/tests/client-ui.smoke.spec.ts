@@ -847,6 +847,16 @@ test("client-ui gallery sends capture-date bounds to grid and map queries", asyn
     request.searchParams.get("captured_until_unix") === String(capturedUntilUnix);
 
   await expect.poll(() => gridRequests.some(includesCaptureBounds)).toBe(true);
+
+  await page.getByLabel("Captured from").fill("1965-04-05");
+  await page.getByLabel("Captured through").fill("1965-04-06");
+  const includesEmptyPreEpochBounds = (request: URL) =>
+    request.searchParams.get("captured_from_unix") === "0" &&
+    request.searchParams.get("captured_until_unix") === "0";
+  await expect.poll(() => gridRequests.some(includesEmptyPreEpochBounds)).toBe(true);
+
+  await page.getByLabel("Captured from").fill("2024-04-05");
+  await page.getByLabel("Captured through").fill("2024-04-06");
   await page.getByRole("button", { name: "Map" }).click();
   await expect.poll(() => mapRequests.some(includesCaptureBounds)).toBe(true);
 });

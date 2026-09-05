@@ -167,6 +167,21 @@ final class AppleStoreIndexTests: XCTestCase {
         )
     }
 
+    func testGalleryCaptureDateRangeUsesEmptyIntervalBeforeUnixEpoch() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let date = calendar.date(from: DateComponents(year: 1965, month: 4, day: 1))!
+
+        let range = AppleGalleryCaptureDateRange(
+            startDate: date,
+            endDate: date,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(range.capturedFromUnix, 0)
+        XCTAssertEqual(range.capturedUntilUnix, 0)
+    }
+
     func testGalleryPaginationAdvancesByServerPageWithoutLoadingWholeCollection() throws {
         var pagination = AppleGalleryPagination()
         let response = try decodeResponse(

@@ -2152,6 +2152,12 @@ fn gallery_sync_token_is_opaque_versioned_and_rejects_malformed_values() {
 }
 
 #[test]
+fn capture_time_range_accepts_empty_intervals_and_rejects_reversed_bounds() {
+    assert_eq!(super::validate_capture_range(Some(0), Some(0)), Ok(()));
+    assert!(super::validate_capture_range(Some(1), Some(0)).is_err());
+}
+
+#[test]
 fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
     let query = |south, west, north, east| super::StoreIndexQuery {
         prefix: Some("gallery".to_string()),
