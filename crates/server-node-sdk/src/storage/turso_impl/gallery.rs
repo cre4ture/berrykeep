@@ -15,10 +15,11 @@ use super::super::{
     GalleryMapClusterEntriesQuery, GalleryMapClusterPage, GalleryMapClusterQuery,
     GallerySummaryCacheValue, GallerySummaryMiss, GallerySummaryProgress,
     GallerySummaryRefreshStatus, GallerySummaryScope, GalleryViewportBounds, ManifestSummary,
-    current_media_cache_metadata, decode_gallery_labels, effective_gallery_captured_at_unix,
-    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
-    gallery_media_type_for_path, gallery_web_mercator_position, sqlite_like_prefix_pattern,
+    MediaGpsCoordinates, current_media_cache_metadata, decode_gallery_labels,
+    effective_gallery_captured_at_unix, encode_gallery_labels, gallery_index_media_status,
+    gallery_index_media_type_from_metadata, gallery_label_filter_matches_json,
+    gallery_label_predicates, gallery_map_bounded_resolution, gallery_media_type_for_path,
+    gallery_web_mercator_position, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload, version_index_head_projection,
 };
 #[cfg(test)]
@@ -54,6 +55,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                 geotagged INTEGER NOT NULL DEFAULT 0,
                 latitude REAL,
                 longitude REAL,
+                sidecar_latitude REAL,
+                sidecar_longitude REAL,
                 spatial_x REAL,
                 spatial_y REAL,
                 labels_json TEXT NOT NULL DEFAULT '[]'
@@ -92,6 +95,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
     .await?;
     add_gallery_projection_column(connection, "spatial_x", "REAL").await?;
     add_gallery_projection_column(connection, "spatial_y", "REAL").await?;
+    add_gallery_projection_column(connection, "sidecar_latitude", "REAL").await?;
+    add_gallery_projection_column(connection, "sidecar_longitude", "REAL").await?;
     connection
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial
@@ -453,6 +458,48 @@ impl TursoMetadataStore {
                 )
                 .await?;
             Ok(())
+        }
+        .await;
+        finish_gallery_transaction(transaction, result).await
+    }
+
+    /// Stores a GPS overlay belonging to one XMP sidecar. This is deliberately
+    /// path-scoped: the media cache is keyed by content fingerprint and may be
+    /// shared by byte-identical objects at unrelated paths.
+    pub(super) async fn store_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<MediaGpsCoordinates>,
+    ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        let connection = &self.connection;
+        let transaction =
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
+        let result = async {
+            let mut rows = connection
+                .query(
+                    "SELECT manifest_hash FROM gallery_objects WHERE key = ?1",
+                    (key,),
+                )
+                .await?;
+            let manifest_hash = match rows.next().await? {
+                Some(row) => row_string(&row, 0, "gallery_objects.manifest_hash")?,
+                None => return Ok(()),
+            };
+            drop(rows);
+            connection
+                .execute(
+                    "UPDATE gallery_objects
+                     SET sidecar_latitude = ?2, sidecar_longitude = ?3
+                     WHERE key = ?1",
+                    params_from_iter(vec![
+                        Value::from(key),
+                        optional_real_value(location.as_ref().map(|location| location.latitude)),
+                        optional_real_value(location.as_ref().map(|location| location.longitude)),
+                    ]),
+                )
+                .await?;
+            refresh_gallery_objects_for_manifest(connection, &manifest_hash).await
         }
         .await;
         finish_gallery_transaction(transaction, result).await
@@ -875,8 +922,8 @@ async fn upsert_gallery_object(
             "INSERT INTO gallery_objects (
                  key, manifest_hash, object_id, inferred_media_type, media_type,
                  captured_at_unix, media_status, geotagged, latitude, longitude,
-                 spatial_x, spatial_y
-             ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL)
+                 sidecar_latitude, sidecar_longitude, spatial_x, spatial_y
+             ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL)
              ON CONFLICT(key) DO UPDATE SET
                  manifest_hash = excluded.manifest_hash,
                  object_id = excluded.object_id,
@@ -887,6 +934,8 @@ async fn upsert_gallery_object(
                  geotagged = 0,
                  latitude = NULL,
                  longitude = NULL,
+                 sidecar_latitude = NULL,
+                 sidecar_longitude = NULL,
                  spatial_x = NULL,
                  spatial_y = NULL
              WHERE gallery_objects.manifest_hash != excluded.manifest_hash
@@ -935,11 +984,13 @@ async fn refresh_gallery_objects_for_manifest(
                 && gps.longitude.is_finite()
                 && (-180.0..=180.0).contains(&gps.longitude)
         });
-    let spatial_position =
-        gps.and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
     let mut rows = connection
         .query(
-            "SELECT gallery_objects.key, version_indexes.index_json
+            "SELECT
+                 gallery_objects.key,
+                 version_indexes.index_json,
+                 gallery_objects.sidecar_latitude,
+                 gallery_objects.sidecar_longitude
              FROM gallery_objects
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
@@ -952,11 +1003,13 @@ async fn refresh_gallery_objects_for_manifest(
         entries.push((
             row_string(&row, 0, "gallery_objects.key")?,
             row_opt_blob(&row, 1, "version_indexes.index_json")?,
+            row_opt_f64(&row, 2, "gallery_objects.sidecar_latitude")?,
+            row_opt_f64(&row, 3, "gallery_objects.sidecar_longitude")?,
         ));
     }
     drop(rows);
 
-    for (key, version_index_payload) in entries {
+    for (key, version_index_payload, sidecar_latitude, sidecar_longitude) in entries {
         let version_created_at_unix =
             version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
         let captured_at_unix = effective_gallery_captured_at_unix(
@@ -967,6 +1020,23 @@ async fn refresh_gallery_objects_for_manifest(
                 .and_then(|metadata| metadata.taken_at_unix),
             version_created_at_unix,
         );
+        let sidecar_gps = match (sidecar_latitude, sidecar_longitude) {
+            (Some(latitude), Some(longitude))
+                if latitude.is_finite()
+                    && (-90.0..=90.0).contains(&latitude)
+                    && longitude.is_finite()
+                    && (-180.0..=180.0).contains(&longitude) =>
+            {
+                Some(MediaGpsCoordinates {
+                    latitude,
+                    longitude,
+                })
+            }
+            _ => None,
+        };
+        let effective_gps = sidecar_gps.as_ref().or(gps);
+        let spatial_position = effective_gps
+            .and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
         connection
             .execute(
                 "UPDATE gallery_objects
@@ -985,10 +1055,12 @@ async fn refresh_gallery_objects_for_manifest(
                         i64::try_from(captured_at_unix).context("gallery capture time overflow")?,
                     ),
                     optional_text_value(media_status),
-                    Value::from(i64::from(gps.is_some())),
-                    gps.map(|gps| Value::from(gps.latitude))
+                    Value::from(i64::from(effective_gps.is_some())),
+                    effective_gps
+                        .map(|gps| Value::from(gps.latitude))
                         .unwrap_or(Value::Null),
-                    gps.map(|gps| Value::from(gps.longitude))
+                    effective_gps
+                        .map(|gps| Value::from(gps.longitude))
                         .unwrap_or(Value::Null),
                     spatial_position
                         .map(|position| Value::from(position.0))
@@ -1310,7 +1382,9 @@ async fn query_gallery_index(
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1344,6 +1418,8 @@ async fn query_gallery_index(
             metadata_payload: row_opt_blob(&row, 5, "media_cache.metadata_json")?,
             version_index_payload: row_opt_blob(&row, 6, "version_indexes.index_json")?,
             labels_json: row_string(&row, 7, "gallery_objects.labels_json")?,
+            gallery_latitude: row_opt_f64(&row, 8, "gallery_objects.latitude")?,
+            gallery_longitude: row_opt_f64(&row, 9, "gallery_objects.longitude")?,
         })?);
     }
     Ok(GalleryIndexPage {
@@ -1591,7 +1667,9 @@ async fn gallery_map_cluster_cells_query(
                  MIN(manifest_summaries.content_fingerprint),
                  MIN(media_cache.metadata_json),
                  MIN(version_indexes.index_json),
-                 MIN(gallery_objects.labels_json)
+                 MIN(gallery_objects.labels_json),
+                 MIN(gallery_objects.latitude),
+                 MIN(gallery_objects.longitude)
              FROM gallery_objects
              LEFT JOIN manifest_summaries
                ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1635,6 +1713,8 @@ async fn gallery_map_cluster_cells_query(
                     metadata_payload: row_opt_blob(&row, 14, "media_cache.metadata_json")?,
                     version_index_payload: row_opt_blob(&row, 15, "version_indexes.index_json")?,
                     labels_json: row_string(&row, 16, "gallery_objects.labels_json")?,
+                    gallery_latitude: row_opt_f64(&row, 17, "gallery_objects.latitude")?,
+                    gallery_longitude: row_opt_f64(&row, 18, "gallery_objects.longitude")?,
                 })?)
             } else {
                 None
@@ -1913,7 +1993,9 @@ async fn query_gallery_map_cluster_entries(
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1943,6 +2025,8 @@ async fn query_gallery_map_cluster_entries(
             metadata_payload: row_opt_blob(&row, 5, "media_cache.metadata_json")?,
             version_index_payload: row_opt_blob(&row, 6, "version_indexes.index_json")?,
             labels_json: row_string(&row, 7, "gallery_objects.labels_json")?,
+            gallery_latitude: row_opt_f64(&row, 8, "gallery_objects.latitude")?,
+            gallery_longitude: row_opt_f64(&row, 9, "gallery_objects.longitude")?,
         })?);
     }
     Ok(GalleryIndexPage {
@@ -2131,6 +2215,8 @@ async fn query_gallery_entry(
             metadata_payload: row_opt_blob(&row, 5, "media_cache.metadata_json")?,
             version_index_payload: row_opt_blob(&row, 6, "version_indexes.index_json")?,
             labels_json: row_string(&row, 10, "gallery_objects.labels_json")?,
+            gallery_latitude: latitude,
+            gallery_longitude: longitude,
         },
     )?))
 }
@@ -2179,6 +2265,8 @@ struct GalleryIndexEntrySource {
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
     labels_json: String,
+    gallery_latitude: Option<f64>,
+    gallery_longitude: Option<f64>,
 }
 
 fn materialize_gallery_index_entry(
@@ -2191,14 +2279,24 @@ fn materialize_gallery_index_entry(
         metadata_payload,
         version_index_payload,
         labels_json,
+        gallery_latitude,
+        gallery_longitude,
     }: GalleryIndexEntrySource,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in Turso"))
         .transpose()?;
-    let media_metadata = metadata_payload
+    let mut media_metadata = metadata_payload
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
+    if let (Some(latitude), Some(longitude), Some(metadata)) =
+        (gallery_latitude, gallery_longitude, media_metadata.as_mut())
+    {
+        metadata.gps = Some(MediaGpsCoordinates {
+            latitude,
+            longitude,
+        });
+    }
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
     let labels = decode_gallery_labels(&labels_json)?;

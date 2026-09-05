@@ -1056,6 +1056,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                 };
                 let capture_time = capture_time_for_geolocation(path, &metadata);
                 let gps = sidecar_gps
+                    .filter(|location| !location.inferred_by_berrykeep)
                     .map(|value| GeoCoordinate {
                         latitude: value.latitude,
                         longitude: value.longitude,

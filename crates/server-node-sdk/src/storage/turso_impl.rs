@@ -25,10 +25,11 @@ use super::{
     GalleryMapClusterQuery, GallerySummaryCache, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
     HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
     METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
-    MetadataStore, OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker,
-    RecoverableHistoryEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
+    MediaGpsCoordinates, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
+    RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord, RepairRunRecord,
+    S3AccessKeyRecord, S3BucketRecord,
     S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
     SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
     StorageStatsSample, StorageStatsState, TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection,
@@ -285,6 +286,14 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()> {
         self.store_gallery_object_labels(key, labels).await
+    }
+
+    async fn set_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<MediaGpsCoordinates>,
+    ) -> Result<()> {
+        self.store_gallery_object_sidecar_gps(key, location).await
     }
 
     async fn gallery_object_labels_by_key(

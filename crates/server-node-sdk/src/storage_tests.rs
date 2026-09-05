@@ -10401,6 +10401,8 @@ async fn gallery_gps_for_key(store: &PersistentStore, key: &str) -> Option<Media
             depth: 8,
             media_filter: GalleryIndexMediaFilter::All,
             captured_sort: GalleryIndexCapturedSort::Desc,
+            captured_from_unix: None,
+            captured_until_unix: None,
             offset: 0,
             limit: 64,
             viewport: None,
@@ -10779,6 +10781,84 @@ run_on_all_metadata_backends!(
     gallery_gps_follows_a_geolocation_sidecar_write_impl,
     gallery_gps_follows_a_geolocation_sidecar_write,
     gallery_gps_follows_a_geolocation_sidecar_write_turso
+);
+
+async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-sidecar-duplicate-content")
+        .await;
+    let primary_key = "trip/photo.jpg";
+    let duplicate_key = "backup/photo.jpg";
+    let media = Bytes::from(sample_media_jpeg_bytes());
+    let primary = store
+        .put_object_versioned(primary_key, media.clone(), PutOptions::default())
+        .await
+        .unwrap();
+    let duplicate = store
+        .put_object_versioned(duplicate_key, media, PutOptions::default())
+        .await
+        .unwrap();
+    store
+        .ensure_media_metadata(&primary.manifest_hash)
+        .await
+        .unwrap()
+        .expect("the source media needs cached metadata");
+    store
+        .ensure_media_metadata(&duplicate.manifest_hash)
+        .await
+        .unwrap()
+        .expect("the duplicate media needs cached metadata");
+
+    store
+        .set_media_geolocation(
+            primary_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .media_sidecar_geo_location(primary_key)
+            .await
+            .unwrap()
+            .is_some(),
+        "the primary media must receive the inferred XMP location"
+    );
+    assert!(gallery_gps_for_key(&store, primary_key).await.is_some());
+    assert!(
+        gallery_gps_for_key(&store, duplicate_key).await.is_none(),
+        "a path-scoped XMP sidecar must not alter a byte-identical copy"
+    );
+    assert!(
+        store
+            .media_sidecar_geo_location(duplicate_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "only the reviewed media key receives an XMP sidecar"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl,
+    sidecar_gps_does_not_leak_to_same_content_at_other_paths,
+    sidecar_gps_does_not_leak_to_same_content_at_other_paths_turso
 );
 
 /// Existing XMP sidecars must populate the new projection column on upgrade;

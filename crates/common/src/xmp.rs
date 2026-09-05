@@ -94,6 +94,10 @@ pub struct XmpGeoInference {
 pub struct XmpGeoLocation {
     pub latitude: f64,
     pub longitude: f64,
+    /// `true` when the sidecar marks this location as a BerryKeep inference.
+    /// Inference runs exclude such locations as anchors so derived positions
+    /// can never become new ground-truth input.
+    pub inferred_by_berrykeep: bool,
 }
 
 impl XmpSidecar {
@@ -834,6 +838,7 @@ fn qualified_name(prefix: &str, local_name: &str) -> String {
 }
 
 fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
+    let inferred_by_berrykeep = has_berrykeep_inference_marker(events);
     let mut latitude = None;
     let mut longitude = None;
     let mut element_property = None;
@@ -901,10 +906,57 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
             Some(XmpGeoLocation {
                 latitude,
                 longitude,
+                inferred_by_berrykeep,
             })
         }
         _ => None,
     }
+}
+
+/// Detects the provenance written by [`XmpSidecar::set_geo_inference`].
+/// Attribute prefixes are resolved from declarations in the packet so a
+/// third-party writer may use a prefix other than `berrykeep`.
+fn has_berrykeep_inference_marker(events: &[ResolvedEvent]) -> bool {
+    let berrykeep_prefixes = events
+        .iter()
+        .flat_map(|resolved| match &resolved.event {
+            Event::Start(element) | Event::Empty(element) => {
+                let mut attributes = element.attributes();
+                attributes.with_checks(false);
+                attributes
+                    .flatten()
+                    .filter_map(|attribute| {
+                        let prefix = attribute.key.as_ref().strip_prefix(b"xmlns:")?;
+                        (attribute.value.as_ref() == BERRYKEEP_NAMESPACE.as_bytes())
+                            .then(|| prefix.to_vec())
+                    })
+                    .collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    events.iter().any(|resolved| {
+        if is_element(resolved, BERRYKEEP_NAMESPACE, b"GeoInferenceMethod") {
+            return true;
+        }
+        match &resolved.event {
+            Event::Start(element) | Event::Empty(element) => {
+                let mut attributes = element.attributes();
+                attributes.with_checks(false);
+                attributes.flatten().any(|attribute| {
+                    let key = attribute.key.as_ref();
+                    let Some(prefix) = key.strip_suffix(b":GeoInferenceMethod") else {
+                        return false;
+                    };
+                    berrykeep_prefixes
+                        .iter()
+                        .any(|declared_prefix| declared_prefix.as_slice() == prefix)
+                })
+            }
+            _ => false,
+        }
+    })
 }
 
 fn parse_xmp_coordinate(value: &str, latitude: bool) -> Option<f64> {
@@ -1168,6 +1220,7 @@ mod tests {
         let location = reparsed.geo_location().expect("GPS must round-trip");
         assert!((location.latitude - 37.808_333_33).abs() < 0.000_001);
         assert!((location.longitude + 122.404_166_67).abs() < 0.000_001);
+        assert!(location.inferred_by_berrykeep);
         Ok(())
     }
 
@@ -1185,6 +1238,7 @@ mod tests {
         let location = sidecar.geo_location().expect("element GPS must be read");
         assert!((location.latitude - 47.3769).abs() < 0.000_001);
         assert!((location.longitude - 8.5417).abs() < 0.000_001);
+        assert!(!location.inferred_by_berrykeep);
         Ok(())
     }
 

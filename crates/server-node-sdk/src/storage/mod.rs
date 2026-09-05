@@ -2776,6 +2776,14 @@ trait MetadataStore: Send + Sync {
     /// for the sidecar ingest, which resolves the labels of a media key from its
     /// XMP sidecar.
     async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()>;
+    /// Replaces a path-scoped XMP GPS overlay on a projected media object. The
+    /// underlying media cache remains content-addressed, so duplicate byte
+    /// streams at other paths cannot inherit this location.
+    async fn set_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<MediaGpsCoordinates>,
+    ) -> Result<()>;
     /// Returns the current complete label list for each requested key. Generic
     /// store listings use this projection too, so gallery label edits never
     /// replace labels that were omitted from a non-gallery query shape.
@@ -5015,6 +5023,19 @@ impl PersistentStore {
     ) -> Result<()> {
         self.metadata_store
             .set_gallery_object_labels(key, labels)
+            .await
+    }
+
+    /// Replaces the path-scoped XMP GPS overlay for `key` in the gallery
+    /// projection. This deliberately does not mutate the content-addressed
+    /// media cache because XMP sidecars belong to one logical path.
+    pub(crate) async fn set_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<MediaGpsCoordinates>,
+    ) -> Result<()> {
+        self.metadata_store
+            .set_gallery_object_sidecar_gps(key, location)
             .await
     }
 
@@ -10000,7 +10021,7 @@ impl PersistentStore {
         }
     }
 
-    /// Clears the labels a removed sidecar contributed to its media object.
+    /// Clears the metadata a removed sidecar contributed to its media object.
     ///
     /// Removing a media object needs no counterpart: its projection row, and
     /// with it the label column, is deleted along with the object.
@@ -10011,7 +10032,8 @@ impl PersistentStore {
         if gallery_media_type_for_path(&media_key).is_none() {
             return Ok(());
         }
-        self.set_gallery_object_labels(&media_key, &[]).await
+        self.set_gallery_object_labels(&media_key, &[]).await?;
+        self.set_gallery_object_sidecar_gps(&media_key, None).await
     }
 
     /// Applies the labels of the sidecar already stored for `media_key`, if any.
@@ -10043,10 +10065,8 @@ impl PersistentStore {
         };
         self.set_gallery_object_labels(media_key, sidecar.keywords())
             .await?;
-        if let Some(location) = sidecar.geo_location() {
-            self.apply_sidecar_gps(media_key, location).await?;
-        }
-        Ok(())
+        self.apply_sidecar_gps(media_key, sidecar.geo_location())
+            .await
     }
 
     /// Reads the keywords of a sidecar object, or `None` when the sidecar cannot
@@ -10084,40 +10104,22 @@ impl PersistentStore {
         }
     }
 
-    /// Merges an XMP GPS overlay into the existing media cache record. The
-    /// cache write refreshes the gallery/map projection for this fingerprint;
-    /// no library-wide media rescan is involved.
-    async fn apply_sidecar_gps(&self, media_key: &str, location: XmpGeoLocation) -> Result<()> {
-        let Some(media_entry) = self.current_object_entry(media_key).await? else {
-            return Ok(());
-        };
-        let inspector = self.store_index_inspector().await?;
-        let Some(lookup) = inspector
-            .lookup_media_cache(&media_entry.manifest_hash)
-            .await?
-        else {
-            return Ok(());
-        };
-        let Some(mut metadata) = lookup.metadata else {
-            return Ok(());
-        };
-        if metadata.source_manifest_hash != media_entry.manifest_hash {
-            return Ok(());
-        }
-        let next = MediaGpsCoordinates {
-            latitude: location.latitude,
-            longitude: location.longitude,
-        };
-        if metadata.gps.as_ref().is_some_and(|current| {
-            (current.latitude - next.latitude).abs() < f64::EPSILON
-                && (current.longitude - next.longitude).abs() < f64::EPSILON
-        }) {
-            return Ok(());
-        }
-        metadata.gps = Some(next);
-        self.metadata_store
-            .persist_media_cache_record(&metadata)
-            .await
+    /// Applies an XMP GPS overlay to exactly one gallery projection row. Sidecars
+    /// are path-scoped while the media cache is content-addressed, so storing the
+    /// overlay in the cache would leak it to byte-identical copies elsewhere.
+    async fn apply_sidecar_gps(
+        &self,
+        media_key: &str,
+        location: Option<XmpGeoLocation>,
+    ) -> Result<()> {
+        self.set_gallery_object_sidecar_gps(
+            media_key,
+            location.map(|location| MediaGpsCoordinates {
+                latitude: location.latitude,
+                longitude: location.longitude,
+            }),
+        )
+        .await
     }
 
     /// Reads a whole sidecar object, refusing packets that are too large to be

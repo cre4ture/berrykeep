@@ -31,10 +31,11 @@ use super::{
     GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
     HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
     METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
-    MetadataStore, OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker,
-    RecoverableHistoryEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
+    MediaGpsCoordinates, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
+    RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord, RepairRunRecord,
+    S3AccessKeyRecord, S3BucketRecord,
     S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
     SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
     StorageStatsSample, StorageStatsState, TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection,
@@ -362,9 +363,11 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              geotagged,
              latitude,
              longitude,
+             sidecar_latitude,
+             sidecar_longitude,
              spatial_x,
              spatial_y
-         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL)
+         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL)
          ON CONFLICT(key) DO UPDATE SET
              manifest_hash = excluded.manifest_hash,
              object_id = excluded.object_id,
@@ -375,6 +378,8 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              geotagged = 0,
              latitude = NULL,
              longitude = NULL,
+             sidecar_latitude = NULL,
+             sidecar_longitude = NULL,
              spatial_x = NULL,
              spatial_y = NULL
          WHERE gallery_objects.manifest_hash != excluded.manifest_hash
@@ -416,10 +421,12 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 && gps.longitude.is_finite()
                 && (-180.0..=180.0).contains(&gps.longitude)
         });
-    let spatial_position =
-        gps.and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
     let mut statement = db.prepare(
-        "SELECT gallery_objects.key, version_indexes.index_json
+        "SELECT
+             gallery_objects.key,
+             version_indexes.index_json,
+             gallery_objects.sidecar_latitude,
+             gallery_objects.sidecar_longitude
          FROM gallery_objects
          LEFT JOIN version_indexes
            ON version_indexes.object_id = gallery_objects.object_id
@@ -427,12 +434,17 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
     )?;
     let entries = statement
         .query_map(params![manifest_hash], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
 
-    for (key, version_index_payload) in entries {
+    for (key, version_index_payload, sidecar_latitude, sidecar_longitude) in entries {
         let version_created_at_unix =
             version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
         let captured_at_unix = effective_gallery_captured_at_unix(
@@ -443,6 +455,23 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 .and_then(|metadata| metadata.taken_at_unix),
             version_created_at_unix,
         );
+        let sidecar_gps = match (sidecar_latitude, sidecar_longitude) {
+            (Some(latitude), Some(longitude))
+                if latitude.is_finite()
+                    && (-90.0..=90.0).contains(&latitude)
+                    && longitude.is_finite()
+                    && (-180.0..=180.0).contains(&longitude) =>
+            {
+                Some(MediaGpsCoordinates {
+                    latitude,
+                    longitude,
+                })
+            }
+            _ => None,
+        };
+        let effective_gps = sidecar_gps.as_ref().or(gps);
+        let spatial_position = effective_gps
+            .and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
         db.execute(
             "UPDATE gallery_objects
              SET media_type = COALESCE(?1, inferred_media_type),
@@ -458,9 +487,9 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 media_type,
                 u64_to_i64(captured_at_unix)?,
                 media_status,
-                if gps.is_some() { 1i64 } else { 0i64 },
-                gps.map(|gps| gps.latitude),
-                gps.map(|gps| gps.longitude),
+                if effective_gps.is_some() { 1i64 } else { 0i64 },
+                effective_gps.map(|gps| gps.latitude),
+                effective_gps.map(|gps| gps.longitude),
                 spatial_position.map(|position| position.0),
                 spatial_position.map(|position| position.1),
                 key,
@@ -967,7 +996,9 @@ fn query_gallery_index_in_transaction(
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -994,6 +1025,8 @@ fn query_gallery_index_in_transaction(
             row.get::<_, Option<Vec<u8>>>(5)?,
             row.get::<_, Option<Vec<u8>>>(6)?,
             row.get::<_, String>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+            row.get::<_, Option<f64>>(9)?,
         ))
     })?;
     let mut entries = Vec::new();
@@ -1007,6 +1040,8 @@ fn query_gallery_index_in_transaction(
             metadata_payload,
             version_index_payload,
             labels_json,
+            gallery_latitude,
+            gallery_longitude,
         ) = row?;
         entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
             key,
@@ -1017,6 +1052,8 @@ fn query_gallery_index_in_transaction(
             metadata_payload,
             version_index_payload,
             labels_json,
+            gallery_latitude,
+            gallery_longitude,
         })?);
     }
     Ok(GalleryIndexPage {
@@ -1279,7 +1316,9 @@ fn gallery_map_cluster_cells_from_db(
                  MIN(manifest_summaries.content_fingerprint),
                  MIN(media_cache.metadata_json),
                  MIN(version_indexes.index_json),
-                 MIN(gallery_objects.labels_json)
+                 MIN(gallery_objects.labels_json),
+                 MIN(gallery_objects.latitude),
+                 MIN(gallery_objects.longitude)
              FROM gallery_objects
              LEFT JOIN manifest_summaries
                ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1320,6 +1359,8 @@ fn gallery_map_cluster_cells_from_db(
                     metadata_payload: row.get(14)?,
                     version_index_payload: row.get(15)?,
                     labels_json: row.get(16)?,
+                    gallery_latitude: row.get(17)?,
+                    gallery_longitude: row.get(18)?,
                 })?)
             } else {
                 None
@@ -1486,7 +1527,9 @@ fn query_gallery_map_cluster_entries_in_transaction(
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1515,6 +1558,8 @@ fn query_gallery_map_cluster_entries_in_transaction(
             row.get::<_, Option<Vec<u8>>>(5)?,
             row.get::<_, Option<Vec<u8>>>(6)?,
             row.get::<_, String>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+            row.get::<_, Option<f64>>(9)?,
         ))
     })?;
     let mut entries = Vec::new();
@@ -1528,6 +1573,8 @@ fn query_gallery_map_cluster_entries_in_transaction(
             metadata,
             version_index,
             labels_json,
+            gallery_latitude,
+            gallery_longitude,
         ) = row?;
         entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
             key,
@@ -1538,6 +1585,8 @@ fn query_gallery_map_cluster_entries_in_transaction(
             metadata_payload: metadata,
             version_index_payload: version_index,
             labels_json,
+            gallery_latitude,
+            gallery_longitude,
         })?);
     }
     Ok(GalleryIndexPage {
@@ -1558,6 +1607,8 @@ struct GalleryIndexEntrySource {
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
     labels_json: String,
+    gallery_latitude: Option<f64>,
+    gallery_longitude: Option<f64>,
 }
 
 fn materialize_gallery_index_entry(
@@ -1570,14 +1621,24 @@ fn materialize_gallery_index_entry(
         metadata_payload,
         version_index_payload,
         labels_json,
+        gallery_latitude,
+        gallery_longitude,
     }: GalleryIndexEntrySource,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
         .transpose()?;
-    let media_metadata = metadata_payload
+    let mut media_metadata = metadata_payload
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
+    if let (Some(latitude), Some(longitude), Some(metadata)) =
+        (gallery_latitude, gallery_longitude, media_metadata.as_mut())
+    {
+        metadata.gps = Some(MediaGpsCoordinates {
+            latitude,
+            longitude,
+        });
+    }
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
     let labels = decode_gallery_labels(&labels_json)?;
@@ -1668,8 +1729,8 @@ fn query_gallery_entry_from_db(
             metadata,
             versions,
             _,
-            _,
-            _,
+            latitude,
+            longitude,
             labels_json,
         )| {
             materialize_gallery_index_entry(GalleryIndexEntrySource {
@@ -1681,6 +1742,8 @@ fn query_gallery_entry_from_db(
                 metadata_payload: metadata,
                 version_index_payload: versions,
                 labels_json,
+                gallery_latitude: latitude,
+                gallery_longitude: longitude,
             })
         },
     )
@@ -2164,6 +2227,38 @@ impl MetadataStore for SqliteMetadataStore {
                 params![key, labels_json],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn set_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<MediaGpsCoordinates>,
+    ) -> Result<()> {
+        let key = key.to_string();
+        self.write_tx(move |db| {
+            let Some(manifest_hash) = db
+                .query_row(
+                    "SELECT manifest_hash FROM gallery_objects WHERE key = ?1",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            else {
+                return Ok(());
+            };
+            db.execute(
+                "UPDATE gallery_objects
+                 SET sidecar_latitude = ?2, sidecar_longitude = ?3
+                 WHERE key = ?1",
+                params![
+                    key,
+                    location.as_ref().map(|location| location.latitude),
+                    location.as_ref().map(|location| location.longitude),
+                ],
+            )?;
+            refresh_gallery_objects_for_manifest(db, &manifest_hash)
         })
         .await
     }
@@ -4991,6 +5086,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             geotagged INTEGER NOT NULL DEFAULT 0,
             latitude REAL,
             longitude REAL,
+            sidecar_latitude REAL,
+            sidecar_longitude REAL,
             spatial_x REAL,
             spatial_y REAL,
             labels_json TEXT NOT NULL DEFAULT '[]'
@@ -5286,6 +5383,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     )?;
     add_sqlite_column_if_missing(db, "gallery_objects", "latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "longitude", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "sidecar_latitude", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "sidecar_longitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "spatial_x", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "spatial_y", "REAL")?;
     add_sqlite_column_if_missing(
