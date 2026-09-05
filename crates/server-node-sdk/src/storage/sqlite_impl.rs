@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,11 +32,12 @@ use super::{
     S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
     S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    compress_snapshot_json, current_media_cache_metadata, decode_gallery_labels,
-    decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
-    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
-    gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
+    TOMBSTONE_MANIFEST_HASH, compress_snapshot_json, current_media_cache_metadata,
+    decode_gallery_labels, decode_version_index, decompress_snapshot_json,
+    effective_gallery_captured_at_unix, encode_gallery_labels, gallery_index_media_status,
+    gallery_index_media_type_from_metadata, gallery_label_filter_matches_json,
+    gallery_label_predicates, gallery_map_bounded_resolution, gallery_media_type_for_path,
+    gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
     sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
 };
@@ -2042,6 +2043,32 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn list_existing_current_object_keys(&self, keys: &[String]) -> Result<HashSet<String>> {
+        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
+        let keys = keys.to_vec();
+        self.read(move |db| {
+            let mut existing_keys = HashSet::new();
+            for keys in keys.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
+                if keys.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=keys.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!("SELECT key FROM current_objects WHERE key IN ({placeholders})");
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement
+                    .query_map(params_from_iter(keys.iter()), |row| row.get::<_, String>(0))?;
+                for key in rows {
+                    existing_keys.insert(key?);
+                }
+            }
+            Ok(existing_keys)
+        })
+        .await
+    }
+
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()> {
         let key = key.to_string();
         let entry = entry.clone();
@@ -2214,6 +2241,42 @@ impl MetadataStore for SqliteMetadataStore {
                 keys.push(row?);
             }
             Ok(keys)
+        })
+        .await
+    }
+
+    async fn list_keys_for_object_ids(
+        &self,
+        object_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
+        let object_ids = object_ids.to_vec();
+        self.read(move |db| {
+            let mut keys_by_object_id = HashMap::new();
+            for object_ids in object_ids.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
+                if object_ids.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=object_ids.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT object_id, key FROM current_objects WHERE object_id IN ({placeholders})"
+                );
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement.query_map(params_from_iter(object_ids.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (object_id, key) = row?;
+                    keys_by_object_id
+                        .entry(object_id)
+                        .or_insert_with(Vec::new)
+                        .push(key);
+                }
+            }
+            Ok(keys_by_object_id)
         })
         .await
     }
@@ -3851,6 +3914,64 @@ impl MetadataStore for SqliteMetadataStore {
             let rows = statement.query_map(params![after_object_id, limit], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
             })?;
+            let mut indexes = Vec::new();
+            for row in rows {
+                let (object_id, payload) = row?;
+                indexes.push(decode_version_index(&object_id, &payload, "sqlite")?);
+            }
+            Ok(indexes)
+        })
+        .await
+    }
+
+    async fn load_recoverable_history_version_indexes_after(
+        &self,
+        prefix: &str,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>> {
+        let prefix = prefix.to_string();
+        let prefix_pattern = if prefix.is_empty() {
+            "%".to_string()
+        } else {
+            sqlite_like_prefix_pattern(&format!("{prefix}/"))
+        };
+        let after_object_id = after_object_id.map(str::to_owned);
+        let limit = i64::try_from(limit.max(1)).context("history index page limit overflow")?;
+        self.read(move |db| {
+            let mut statement = db.prepare(
+                "SELECT version_indexes.object_id, version_indexes.index_json
+                 FROM version_indexes
+                 WHERE (?1 IS NULL OR version_indexes.object_id > ?1)
+                   AND EXISTS (
+                     SELECT 1
+                     FROM json_each(CAST(version_indexes.index_json AS TEXT), '$.versions') AS version
+                     WHERE json_extract(version.value, '$.manifest_hash') = ?2
+                       AND json_extract(version.value, '$.logical_path') IS NOT NULL
+                       AND (
+                         ?3 = ''
+                         OR json_extract(version.value, '$.logical_path') = ?3
+                         OR json_extract(version.value, '$.logical_path') LIKE ?4 ESCAPE '\\'
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM current_objects
+                         WHERE current_objects.key = json_extract(version.value, '$.logical_path')
+                       )
+                   )
+                 ORDER BY version_indexes.object_id
+                 LIMIT ?5",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    after_object_id,
+                    TOMBSTONE_MANIFEST_HASH,
+                    prefix,
+                    prefix_pattern,
+                    limit
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?;
             let mut indexes = Vec::new();
             for row in rows {
                 let (object_id, payload) = row?;

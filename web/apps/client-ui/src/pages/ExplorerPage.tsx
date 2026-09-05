@@ -4,9 +4,11 @@ import {
   getStoreValue,
   getVersionGraph,
   listSnapshots,
+  listStoreHistoryEntries,
   listStoreEntries,
   putStoreValue,
   renameStorePath,
+  restoreStoreHistoryEntries,
   restoreStoreVersion,
   restoreStorePathFromSnapshot
 } from "@ironmesh/api";
@@ -54,6 +56,7 @@ export function ExplorerPage({ queueFilesToPrefix, onOpenStore }: ExplorerPagePr
       <ExplorerSurface
         loadSnapshots={loadSnapshots}
         loadEntries={loadEntries}
+        loadHistoricalEntries={(prefix, depth) => listStoreHistoryEntries(prefix, depth)}
         readValue={readValue}
         getDownloadUrl={(key, snapshotId, versionId) =>
           getBinaryObjectDownloadUrl(key, snapshotId, versionId)
@@ -65,6 +68,7 @@ export function ExplorerPage({ queueFilesToPrefix, onOpenStore }: ExplorerPagePr
           renamePath: (fromPath, toPath) => renameStorePath(fromPath, toPath),
           restoreVersion: (key, versionId, targetPath) =>
             restoreStoreVersion(key, versionId, targetPath),
+          restoreHistoryEntries: restoreStoreHistoryEntries,
           restoreSnapshotPath: restoreStorePathFromSnapshot
         }}
         quickUpload={{

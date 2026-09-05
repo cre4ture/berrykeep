@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,8 +28,8 @@ use super::{
     S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
     S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    compress_snapshot_json, decode_gallery_labels, decode_version_index, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    TOMBSTONE_MANIFEST_HASH, compress_snapshot_json, decode_gallery_labels, decode_version_index,
+    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
     normalize_snapshot_manifest_object_ids,
 };
 
@@ -271,6 +271,31 @@ impl MetadataStore for TursoMetadataStore {
         }))
     }
 
+    async fn list_existing_current_object_keys(&self, keys: &[String]) -> Result<HashSet<String>> {
+        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
+        let mut existing_keys = HashSet::new();
+        for keys in keys.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
+            if keys.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=keys.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!("SELECT key FROM current_objects WHERE key IN ({placeholders})"),
+                    params_from_iter(keys.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                existing_keys.insert(row_string(&row, 0, "current_objects.key")?);
+            }
+        }
+        Ok(existing_keys)
+    }
+
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()> {
         self.upsert_current_object_with_gallery(key, entry).await
     }
@@ -386,6 +411,41 @@ impl MetadataStore for TursoMetadataStore {
             keys.push(row_string(&row, 0, "current_objects.key")?);
         }
         Ok(keys)
+    }
+
+    async fn list_keys_for_object_ids(
+        &self,
+        object_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        const CURRENT_OBJECT_LOOKUP_CHUNK_SIZE: usize = 500;
+        let mut keys_by_object_id = HashMap::new();
+        for object_ids in object_ids.chunks(CURRENT_OBJECT_LOOKUP_CHUNK_SIZE) {
+            if object_ids.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=object_ids.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!(
+                        "SELECT object_id, key FROM current_objects WHERE object_id IN ({placeholders})"
+                    ),
+                    params_from_iter(object_ids.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let object_id = row_string(&row, 0, "current_objects.object_id")?;
+                let key = row_string(&row, 1, "current_objects.key")?;
+                keys_by_object_id
+                    .entry(object_id)
+                    .or_insert_with(Vec::new)
+                    .push(key);
+            }
+        }
+        Ok(keys_by_object_id)
     }
 
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
@@ -1761,6 +1821,88 @@ impl MetadataStore for TursoMetadataStore {
                      ORDER BY object_id
                      LIMIT ?1",
                     (limit,),
+                )
+                .await?
+        };
+
+        let mut indexes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let object_id = row_string(&row, 0, "version_indexes.object_id")?;
+            let payload = row_blob(&row, 1, "version_indexes.index_json")?;
+            indexes.push(decode_version_index(&object_id, &payload, "Turso")?);
+        }
+        Ok(indexes)
+    }
+
+    async fn load_recoverable_history_version_indexes_after(
+        &self,
+        prefix: &str,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>> {
+        let prefix_pattern = if prefix.is_empty() {
+            "%".to_string()
+        } else {
+            super::sqlite_like_prefix_pattern(&format!("{prefix}/"))
+        };
+        let limit = i64::try_from(limit.max(1)).context("history index page limit overflow")?;
+        let mut rows = if let Some(after_object_id) = after_object_id {
+            self.connection
+                .query(
+                    "SELECT version_indexes.object_id, version_indexes.index_json
+                     FROM version_indexes
+                     WHERE version_indexes.object_id > ?1
+                       AND EXISTS (
+                         SELECT 1
+                         FROM json_each(CAST(version_indexes.index_json AS TEXT), '$.versions') AS version
+                         WHERE json_extract(version.value, '$.manifest_hash') = ?2
+                           AND json_extract(version.value, '$.logical_path') IS NOT NULL
+                           AND (
+                             ?3 = ''
+                             OR json_extract(version.value, '$.logical_path') = ?3
+                             OR json_extract(version.value, '$.logical_path') LIKE ?4 ESCAPE '\\'
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1
+                             FROM current_objects
+                             WHERE current_objects.key = json_extract(version.value, '$.logical_path')
+                           )
+                       )
+                     ORDER BY version_indexes.object_id
+                     LIMIT ?5",
+                    (
+                        after_object_id,
+                        TOMBSTONE_MANIFEST_HASH,
+                        prefix,
+                        prefix_pattern.as_str(),
+                        limit,
+                    ),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT version_indexes.object_id, version_indexes.index_json
+                     FROM version_indexes
+                     WHERE EXISTS (
+                         SELECT 1
+                         FROM json_each(CAST(version_indexes.index_json AS TEXT), '$.versions') AS version
+                         WHERE json_extract(version.value, '$.manifest_hash') = ?1
+                           AND json_extract(version.value, '$.logical_path') IS NOT NULL
+                           AND (
+                             ?2 = ''
+                             OR json_extract(version.value, '$.logical_path') = ?2
+                             OR json_extract(version.value, '$.logical_path') LIKE ?3 ESCAPE '\\'
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1
+                             FROM current_objects
+                             WHERE current_objects.key = json_extract(version.value, '$.logical_path')
+                           )
+                       )
+                     ORDER BY version_indexes.object_id
+                     LIMIT ?4",
+                    (TOMBSTONE_MANIFEST_HASH, prefix, prefix_pattern.as_str(), limit),
                 )
                 .await?
         };

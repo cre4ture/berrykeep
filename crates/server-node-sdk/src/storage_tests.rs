@@ -6741,6 +6741,352 @@ run_on_all_metadata_backends!(
     restore_version_same_path_creates_new_head_turso
 );
 
+async fn restore_history_batch_preserves_recreated_target_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("restore-history-batch-target-conflict")
+        .await;
+
+    let deleted = store
+        .put_object_versioned(
+            "docs/readme.txt",
+            Bytes::from_static(b"old content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("docs/readme.txt", PutOptions::default())
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "docs/readme.txt",
+            Bytes::from_static(b"new content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let restore_requests = [(
+        "docs/readme.txt".to_string(),
+        deleted.version_id,
+        None,
+        "docs/readme.txt".to_string(),
+    )];
+    let sources = store
+        .store_history_inspector()
+        .resolve_version_restore_sources(&restore_requests)
+        .await
+        .unwrap();
+    let results = store
+        .restore_resolved_version_paths_batch(&restore_requests, &sources)
+        .await
+        .unwrap();
+    assert!(matches!(
+        results.as_slice(),
+        [Ok(PathMutationResult::TargetExists)]
+    ));
+    assert_eq!(
+        store
+            .get_object("docs/readme.txt", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"new content"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    restore_history_batch_preserves_recreated_target_impl,
+    restore_history_batch_preserves_recreated_target,
+    restore_history_batch_preserves_recreated_target_turso
+);
+
+async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("restore-history-batch-partial-success")
+        .await;
+
+    let restored = store
+        .put_object_versioned(
+            "docs/restored.txt",
+            Bytes::from_static(b"restored content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("docs/restored.txt", PutOptions::default())
+        .await
+        .unwrap();
+    let also_restored = store
+        .put_object_versioned(
+            "docs/also-restored.txt",
+            Bytes::from_static(b"also restored content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("docs/also-restored.txt", PutOptions::default())
+        .await
+        .unwrap();
+    let broken = store
+        .put_object_versioned(
+            "docs/broken.txt",
+            Bytes::from_static(b"broken content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("docs/broken.txt", PutOptions::default())
+        .await
+        .unwrap();
+    fs::remove_file(store.manifest_path_for_test(&broken.manifest_hash))
+        .await
+        .unwrap();
+
+    let restore_requests = [
+        (
+            "docs/restored.txt".to_string(),
+            restored.version_id,
+            None,
+            "docs/restored.txt".to_string(),
+        ),
+        (
+            "docs/also-restored.txt".to_string(),
+            also_restored.version_id,
+            None,
+            "docs/also-restored.txt".to_string(),
+        ),
+        (
+            "docs/broken.txt".to_string(),
+            broken.version_id,
+            None,
+            "docs/broken.txt".to_string(),
+        ),
+    ];
+    let sources = store
+        .store_history_inspector()
+        .resolve_version_restore_sources(&restore_requests)
+        .await
+        .unwrap();
+    let results = store
+        .restore_resolved_version_paths_batch(&restore_requests, &sources)
+        .await
+        .unwrap();
+    assert!(matches!(
+        results.first(),
+        Some(Ok(PathMutationResult::Applied))
+    ));
+    assert!(matches!(
+        results.get(1),
+        Some(Ok(PathMutationResult::Applied))
+    ));
+    assert!(results.get(2).is_some_and(Result::is_err));
+    assert_eq!(
+        store
+            .get_object("docs/restored.txt", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"restored content"
+    );
+    assert_eq!(
+        store
+            .get_object(
+                "docs/also-restored.txt",
+                None,
+                None,
+                ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap()
+            .as_ref(),
+        b"also restored content"
+    );
+    let snapshot_id = store
+        .active_snapshot_batch_id_for_test()
+        .expect("restored history batch should record one snapshot batch");
+    let snapshot = store
+        .load_snapshot_manifest(&snapshot_id)
+        .await
+        .unwrap()
+        .expect("restored history batch snapshot should persist");
+    assert!(snapshot.objects.contains_key("docs/restored.txt"));
+    assert!(snapshot.objects.contains_key("docs/also-restored.txt"));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    restore_history_batch_keeps_partial_successes_impl,
+    restore_history_batch_keeps_partial_successes,
+    restore_history_batch_keeps_partial_successes_turso
+);
+
+async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("recoverable-history-entries").await;
+
+    let deleted = store
+        .put_object_versioned(
+            "deleted.txt",
+            Bytes::from_static(b"deleted payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("deleted.txt", PutOptions::default())
+        .await
+        .unwrap();
+
+    store
+        .put_object_versioned(
+            "recreated.txt",
+            Bytes::from_static(b"original payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("recreated.txt", PutOptions::default())
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            "recreated.txt",
+            Bytes::from_static(b"replacement payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let moved = store
+        .put_object_versioned(
+            "moved/old-name.txt",
+            Bytes::from_static(b"moved payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rename_object_path("moved/old-name.txt", "moved/new-name.txt", false)
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+
+    let history = match store
+        .store_history_inspector()
+        .list_recoverable_history_entries_bounded("", usize::MAX)
+        .await
+        .unwrap()
+    {
+        RecoverableHistoryEntries::Entries(entries) => entries,
+        RecoverableHistoryEntries::ExceedsLimit { .. } => {
+            panic!("unbounded recoverable history scan unexpectedly exceeded its limit")
+        }
+    };
+    let deleted_entry = history
+        .iter()
+        .find(|entry| entry.path == "deleted.txt")
+        .expect("deleted path should remain recoverable");
+    assert_eq!(deleted_entry.restore_source_path, "deleted.txt");
+    assert_eq!(deleted_entry.restore_version_id, deleted.version_id);
+    assert_eq!(deleted_entry.moved_to_path, None);
+    assert!(
+        history.iter().all(|entry| entry.path != "recreated.txt"),
+        "current paths must not be exposed as recoverable history"
+    );
+
+    let moved_entry = history
+        .iter()
+        .find(|entry| entry.path == "moved/old-name.txt")
+        .expect("old renamed path should remain recoverable");
+    assert_eq!(moved_entry.restore_source_path, "moved/old-name.txt");
+    assert_eq!(moved_entry.restore_version_id, moved.version_id);
+    assert_eq!(
+        moved_entry.moved_to_path.as_deref(),
+        Some("moved/new-name.txt")
+    );
+
+    let moved_history = match store
+        .store_history_inspector()
+        .list_recoverable_history_entries_bounded("moved", usize::MAX)
+        .await
+        .unwrap()
+    {
+        RecoverableHistoryEntries::Entries(entries) => entries,
+        RecoverableHistoryEntries::ExceedsLimit { .. } => {
+            panic!("unbounded recoverable history scan unexpectedly exceeded its limit")
+        }
+    };
+    assert_eq!(
+        moved_history
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["moved/old-name.txt"],
+        "history prefix scans must retain only their own subtree"
+    );
+
+    assert_eq!(
+        store
+            .restore_version_path(
+                &deleted_entry.restore_source_path,
+                &deleted_entry.restore_version_id,
+                &deleted_entry.path,
+                false,
+            )
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    assert_eq!(
+        store
+            .restore_version_path(
+                &moved_entry.restore_source_path,
+                &moved_entry.restore_version_id,
+                &moved_entry.path,
+                false,
+            )
+            .await
+            .unwrap(),
+        PathMutationResult::Applied
+    );
+    assert_eq!(
+        store
+            .get_object("deleted.txt", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"deleted payload"
+    );
+    assert_eq!(
+        store
+            .get_object("moved/old-name.txt", None, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"moved payload"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    recoverable_history_entries_include_deleted_and_moved_paths_impl,
+    recoverable_history_entries_include_deleted_and_moved_paths,
+    recoverable_history_entries_include_deleted_and_moved_paths_turso
+);
+
 async fn restore_version_to_custom_target_uses_metadata_copy_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("restore-version-custom-target").await;
 

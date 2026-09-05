@@ -54,6 +54,137 @@ fn reconciliation_object_paths_encode_store_keys_before_transport() {
 }
 
 #[test]
+fn recoverable_history_projection_keeps_folder_markers_and_child_rollups() {
+    let projection = super::project_recoverable_history_entries(
+        &[
+            super::storage::RecoverableHistoryEntry {
+                path: "docs/".to_string(),
+                restore_source_path: "docs/".to_string(),
+                restore_source_object_id: "object-folder".to_string(),
+                restore_version_id: "version-folder".to_string(),
+                removed_at_unix: 10,
+                moved_to_path: None,
+            },
+            super::storage::RecoverableHistoryEntry {
+                path: "docs/a.txt".to_string(),
+                restore_source_path: "docs/a.txt".to_string(),
+                restore_source_object_id: "object-child".to_string(),
+                restore_version_id: "version-child".to_string(),
+                removed_at_unix: 11,
+                moved_to_path: None,
+            },
+        ],
+        "",
+        1,
+        100,
+    );
+
+    assert!(!projection.truncated);
+    assert!(
+        projection
+            .entries
+            .iter()
+            .any(|entry| entry.path == "docs/" && entry.entry_type == "historical")
+    );
+    assert!(
+        projection
+            .entries
+            .iter()
+            .any(|entry| entry.path == "docs/" && entry.entry_type == "prefix")
+    );
+}
+
+#[test]
+fn store_history_cache_retains_entries() {
+    let mut cache = super::StoreHistoryCache::default();
+    cache.insert(
+        "docs",
+        Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())),
+    );
+
+    assert!(cache.get("docs").is_some());
+    assert!(cache.get("").is_none());
+}
+
+#[test]
+fn store_history_cache_removes_restored_entries() {
+    let mut cache = super::StoreHistoryCache::default();
+    cache.insert(
+        "",
+        Arc::new(super::StoreHistoryCacheValue::Entries(vec![
+            super::storage::RecoverableHistoryEntry {
+                path: "deleted.txt".to_string(),
+                restore_source_path: "deleted.txt".to_string(),
+                restore_source_object_id: "object-deleted".to_string(),
+                restore_version_id: "version-deleted".to_string(),
+                removed_at_unix: 1,
+                moved_to_path: None,
+            },
+            super::storage::RecoverableHistoryEntry {
+                path: "other.txt".to_string(),
+                restore_source_path: "other.txt".to_string(),
+                restore_source_object_id: "object-other".to_string(),
+                restore_version_id: "version-other".to_string(),
+                removed_at_unix: 2,
+                moved_to_path: None,
+            },
+        ])),
+    );
+
+    cache.remove_entries_for_paths(&std::collections::HashSet::from(
+        ["deleted.txt".to_string()],
+    ));
+
+    let cached = cache.get("");
+    let Some(super::StoreHistoryCacheValue::Entries(entries)) = cached.as_deref() else {
+        panic!("history cache should retain the remaining entry");
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "other.txt");
+}
+
+#[test]
+fn store_history_cache_retains_an_oversized_history_marker() {
+    let value = super::StoreHistoryCacheValue::Oversized {
+        minimum_entry_count: super::STORE_HISTORY_CACHE_MAX_ENTRY_COUNT + 1,
+    };
+    let mut cache = super::StoreHistoryCache::default();
+    cache.insert("", Arc::new(value));
+
+    assert!(matches!(
+        cache.get("").as_deref(),
+        Some(super::StoreHistoryCacheValue::Oversized { .. })
+    ));
+}
+
+#[test]
+fn store_history_refresh_locks_preserve_an_active_prefix_during_eviction() {
+    let mut locks = super::StoreHistoryRefreshLocks::default();
+    let active = locks.lock_for_prefix("active");
+    for prefix in ["idle-one", "idle-two", "idle-three"] {
+        drop(locks.lock_for_prefix(prefix));
+    }
+
+    let replacement = locks.lock_for_prefix("replacement");
+
+    assert!(Arc::ptr_eq(
+        &active,
+        locks
+            .by_prefix
+            .get("active")
+            .expect("the active prefix lock should not be evicted")
+    ));
+    assert!(Arc::ptr_eq(
+        &replacement,
+        locks
+            .by_prefix
+            .get("replacement")
+            .expect("the replacement prefix lock should be retained")
+    ));
+    assert_eq!(locks.by_prefix.len(), 2);
+}
+
+#[test]
 fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
     let tickets = HashMap::from([
         (
@@ -16349,7 +16480,21 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .unwrap()
         .get(&cached_key, cached_sequence)
         .expect("prepared page should be cached");
+    state.storage.store_history_cache.lock().unwrap().insert(
+        "",
+        Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())),
+    );
     super::publish_namespace_change(&state);
+    assert!(
+        state
+            .storage
+            .store_history_cache
+            .lock()
+            .unwrap()
+            .get("")
+            .is_some(),
+        "ordinary namespace changes retain the short-lived recoverable-history cache"
+    );
     assert!(
         super::cached_store_index_page_response(
             &state,
@@ -18901,6 +19046,16 @@ async fn build_test_state(
             namespace_change_tx,
             store_index_page_cache: Arc::new(std::sync::Mutex::new(
                 super::StoreIndexPageCache::default(),
+            )),
+            store_history_cache: Arc::new(std::sync::Mutex::new(
+                super::StoreHistoryCache::default(),
+            )),
+            store_history_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            store_history_refresh_locks: Arc::new(std::sync::Mutex::new(
+                super::StoreHistoryRefreshLocks::default(),
+            )),
+            store_history_refresh_permits: Arc::new(tokio::sync::Semaphore::new(
+                super::STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
             )),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),

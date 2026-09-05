@@ -120,6 +120,11 @@ const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const STORE_INDEX_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_INDEX_PAGE_CACHE_MAX_SCOPES: usize = 2;
 const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
+const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
+const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
+const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
+const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
+const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -194,6 +199,7 @@ const DATA_SCRUB_HISTORY_RETENTION_SECS: u64 = 12 * 30 * 24 * 60 * 60;
 const MAX_DATA_SCRUB_HISTORY_LIMIT: usize = 4_096;
 const REPAIR_RUN_HISTORY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 const STORE_INDEX_CURSOR_DEFAULT_PAGE_SIZE: usize = 1_000;
+const HISTORY_RESTORE_BATCH_MAX_ENTRIES: usize = 100;
 const MAX_REPAIR_RUN_HISTORY_LIMIT: usize = 4_096;
 const ACTIVE_REPAIR_LIVE_LOG_LIMIT: usize = 1_024;
 const UPLOAD_SESSION_PERSIST_COALESCE_SECS: u64 = 5;
@@ -274,13 +280,13 @@ use storage::{
     MetadataDbLogicalDistribution, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
     ObjectVersionMetadataRecord, PairingAuthorizationRecord, PathMutationResult, PersistentStore,
-    PreferredHeadReason, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult, StoragePathStats,
-    StoragePoolConfig, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef,
-    VersionConsistencyState, grid_thumbnail_profile, media_cache_retry_due,
-    metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
-    thumbnail_profile_from_query,
+    PreferredHeadReason, PutOptions, ReconcileVersionEntry, RecoverableHistoryEntries,
+    RecoverableHistoryEntry, RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle,
+    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
+    SnapshotRestoreMutationResult, StoragePathStats, StoragePoolConfig, StorageStatsSample,
+    StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState,
+    grid_thumbnail_profile, media_cache_retry_due, metadata_db_logical_table_count,
+    promote_cached_media_metadata_to_incomplete, thumbnail_profile_from_query,
 };
 
 tokio::task_local! {
@@ -340,6 +346,10 @@ struct ServerStorageRuntime {
     namespace_change_sequence: Arc<AtomicU64>,
     namespace_change_tx: watch::Sender<u64>,
     store_index_page_cache: Arc<StdMutex<StoreIndexPageCache>>,
+    store_history_cache: Arc<StdMutex<StoreHistoryCache>>,
+    store_history_cache_generation: Arc<AtomicU64>,
+    store_history_refresh_locks: Arc<StdMutex<StoreHistoryRefreshLocks>>,
+    store_history_refresh_permits: Arc<Semaphore>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
@@ -7392,6 +7402,14 @@ async fn run_inner(
             namespace_change_sequence: Arc::new(AtomicU64::new(0)),
             namespace_change_tx: watch::channel(0).0,
             store_index_page_cache: Arc::new(StdMutex::new(StoreIndexPageCache::default())),
+            store_history_cache: Arc::new(StdMutex::new(StoreHistoryCache::default())),
+            store_history_cache_generation: Arc::new(AtomicU64::new(0)),
+            store_history_refresh_locks: Arc::new(StdMutex::new(
+                StoreHistoryRefreshLocks::default(),
+            )),
+            store_history_refresh_permits: Arc::new(Semaphore::new(
+                STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
+            )),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
@@ -7641,6 +7659,8 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/history", get(list_store_history))
+        .route("/store/history/restore", post(restore_history_entries))
         .route("/store/index/delta", get(get_store_index_delta))
         .route("/gallery/map/clusters", get(list_gallery_map_clusters))
         .route(
@@ -7759,6 +7779,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/scrub/run", post(trigger_data_scrub_public))
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
+        .route("/auth/store/history", get(list_store_history_admin))
+        .route(
+            "/auth/store/history/restore",
+            post(restore_history_entries_admin),
+        )
         .route("/auth/store/index/delta", get(get_store_index_delta_admin))
         .route(
             "/auth/gallery/map/clusters",
@@ -13305,6 +13330,65 @@ struct StoreIndexQuery {
     exclude_labels: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct StoreHistoryQuery {
+    prefix: Option<String>,
+    depth: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StoreHistoryEntryResponse {
+    path: String,
+    entry_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_source_object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_to_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StoreHistoryResponse {
+    prefix: String,
+    depth: usize,
+    entry_count: usize,
+    truncated: bool,
+    entries: Vec<StoreHistoryEntryResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HistoryRestoreEntryRequest {
+    path: String,
+    restore_source_path: String,
+    restore_source_object_id: String,
+    restore_version_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HistoryRestoreRequest {
+    entries: Vec<HistoryRestoreEntryRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryRestoreEntryResponse {
+    path: String,
+    restore_source_path: String,
+    restore_version_id: String,
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryRestoreResponse {
+    restored_count: usize,
+    failed_count: usize,
+    entries: Vec<HistoryRestoreEntryResponse>,
+}
+
 fn store_index_label_filter(
     query: &StoreIndexQuery,
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
@@ -13829,6 +13913,88 @@ impl StoreIndexPageCache {
             value,
         });
         self.entries.truncate(STORE_INDEX_PAGE_CACHE_MAX_SCOPES);
+    }
+}
+
+#[derive(Debug, Clone)]
+enum StoreHistoryCacheValue {
+    Entries(Vec<RecoverableHistoryEntry>),
+    Oversized { minimum_entry_count: usize },
+}
+
+#[derive(Debug)]
+struct StoreHistoryCacheEntry {
+    prefix: String,
+    created_at: Instant,
+    value: Arc<StoreHistoryCacheValue>,
+}
+
+#[derive(Debug, Default)]
+struct StoreHistoryCache {
+    entries: VecDeque<StoreHistoryCacheEntry>,
+}
+
+#[derive(Default)]
+struct StoreHistoryRefreshLocks {
+    by_prefix: HashMap<String, Arc<Mutex<()>>>,
+}
+
+impl StoreHistoryRefreshLocks {
+    fn lock_for_prefix(&mut self, prefix: &str) -> Arc<Mutex<()>> {
+        if let Some(lock) = self.by_prefix.get(prefix) {
+            return Arc::clone(lock);
+        }
+        if self.by_prefix.len() >= STORE_HISTORY_CACHE_MAX_SCOPES {
+            // Never evict a lock that is still referenced by an in-flight
+            // refresh. Requests acquire the refresh permit before reaching
+            // this map, so the small fixed map always has an inactive entry
+            // to evict once it reaches capacity.
+            self.by_prefix.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        self.by_prefix.insert(prefix.to_string(), Arc::clone(&lock));
+        lock
+    }
+}
+
+impl StoreHistoryCache {
+    fn get(&self, prefix: &str) -> Option<Arc<StoreHistoryCacheValue>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.prefix == prefix)
+            .and_then(|entry| {
+                (entry.created_at.elapsed() <= STORE_HISTORY_CACHE_TTL)
+                    .then(|| Arc::clone(&entry.value))
+            })
+    }
+
+    fn insert(&mut self, prefix: &str, value: Arc<StoreHistoryCacheValue>) {
+        self.entries.retain(|entry| entry.prefix != prefix);
+        self.entries.push_front(StoreHistoryCacheEntry {
+            prefix: prefix.to_string(),
+            created_at: Instant::now(),
+            value,
+        });
+        self.entries.truncate(STORE_HISTORY_CACHE_MAX_SCOPES);
+    }
+
+    fn remove_entries_for_paths(&mut self, paths: &HashSet<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        for entry in &mut self.entries {
+            let StoreHistoryCacheValue::Entries(entries) = Arc::make_mut(&mut entry.value) else {
+                continue;
+            };
+            entries.retain(|entry| !paths.contains(&entry.path));
+        }
+    }
+}
+
+fn remove_restored_history_entries_from_cache(state: &ServerState, paths: &HashSet<String>) {
+    match state.storage.store_history_cache.lock() {
+        Ok(mut cache) => cache.remove_entries_for_paths(paths),
+        Err(poisoned) => poisoned.into_inner().remove_entries_for_paths(paths),
     }
 }
 
@@ -16219,6 +16385,426 @@ async fn list_store_index_admin(
     }
 
     list_store_index_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_store_history(
+    State(state): State<ServerState>,
+    Query(query): Query<StoreHistoryQuery>,
+) -> Response {
+    list_store_history_response(&state, query).await
+}
+
+async fn list_store_history_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<StoreHistoryQuery>,
+) -> Response {
+    let action = "auth/store/history/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "prefix": query.prefix.clone(),
+            "depth": query.depth,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    list_store_history_response(&state, query).await
+}
+
+async fn list_store_history_response(state: &ServerState, query: StoreHistoryQuery) -> Response {
+    let prefix = query
+        .prefix
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    let depth = query.depth.unwrap_or(1).clamp(1, 64);
+    let cached = match state.storage.store_history_cache.lock() {
+        Ok(cache) => cache.get(&prefix),
+        Err(poisoned) => poisoned.into_inner().get(&prefix),
+    };
+    let history = match cached {
+        Some(cached) => cached,
+        None => {
+            // Coalesce cache misses without holding the store read guard, and
+            // admit only a small number of distinct prefix scans at once. A
+            // short TTL intentionally tolerates concurrent namespace writes
+            // while retaining each recently visited prefix for navigation.
+            let _refresh_permit = match state
+                .storage
+                .store_history_refresh_permits
+                .clone()
+                .acquire_owned()
+                .await
+            {
+                Ok(permit) => permit,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let refresh_lock = match state.storage.store_history_refresh_locks.lock() {
+                Ok(mut locks) => locks.lock_for_prefix(&prefix),
+                Err(poisoned) => poisoned.into_inner().lock_for_prefix(&prefix),
+            };
+            let _refresh_guard = refresh_lock.lock().await;
+            let cached = match state.storage.store_history_cache.lock() {
+                Ok(cache) => cache.get(&prefix),
+                Err(poisoned) => poisoned.into_inner().get(&prefix),
+            };
+            if let Some(cached) = cached {
+                cached
+            } else {
+                // A restore increments this generation before it changes the
+                // cache. Do not let a scan started before that mutation put
+                // obsolete historical entries back into the cache.
+                let cache_generation = state
+                    .storage
+                    .store_history_cache_generation
+                    .load(Ordering::SeqCst);
+                let history_inspector = {
+                    let store = read_store(state, "store_history.clone_inspector").await;
+                    store.store_history_inspector()
+                };
+                let value = match history_inspector
+                    .list_recoverable_history_entries_bounded(
+                        &prefix,
+                        STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
+                    )
+                    .await
+                {
+                    Ok(RecoverableHistoryEntries::Entries(entries)) => {
+                        Arc::new(StoreHistoryCacheValue::Entries(entries))
+                    }
+                    Ok(RecoverableHistoryEntries::ExceedsLimit {
+                        minimum_entry_count,
+                    }) => Arc::new(StoreHistoryCacheValue::Oversized {
+                        minimum_entry_count,
+                    }),
+                    Err(err) => {
+                        tracing::error!(error = %err, prefix = %prefix, depth, "failed to list recoverable history entries");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+                if let StoreHistoryCacheValue::Oversized {
+                    minimum_entry_count,
+                } = value.as_ref()
+                {
+                    tracing::warn!(
+                        minimum_entry_count,
+                        cache_limit = STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
+                        "recoverable history exceeds the interactive explorer cache limit"
+                    );
+                }
+                match state.storage.store_history_cache.lock() {
+                    Ok(mut cache) => {
+                        if state
+                            .storage
+                            .store_history_cache_generation
+                            .load(Ordering::SeqCst)
+                            == cache_generation
+                        {
+                            cache.insert(&prefix, Arc::clone(&value));
+                        }
+                    }
+                    Err(poisoned) => {
+                        let mut cache = poisoned.into_inner();
+                        if state
+                            .storage
+                            .store_history_cache_generation
+                            .load(Ordering::SeqCst)
+                            == cache_generation
+                        {
+                            cache.insert(&prefix, Arc::clone(&value));
+                        }
+                    }
+                }
+                value
+            }
+        }
+    };
+    let entries = match history.as_ref() {
+        StoreHistoryCacheValue::Entries(entries) => entries,
+        StoreHistoryCacheValue::Oversized {
+            minimum_entry_count,
+        } => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": "recoverable history exceeds the interactive explorer limit",
+                    "minimum_entry_count": minimum_entry_count,
+                    "max_entry_count": STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let projection = project_recoverable_history_entries(
+        entries,
+        &prefix,
+        depth,
+        STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT,
+    );
+    Json(StoreHistoryResponse {
+        prefix: prefix.clone(),
+        depth,
+        entry_count: projection.entries.len(),
+        truncated: projection.truncated,
+        entries: projection.entries,
+    })
+    .into_response()
+}
+
+struct StoreHistoryProjection {
+    entries: Vec<StoreHistoryEntryResponse>,
+    truncated: bool,
+}
+
+fn project_recoverable_history_entries(
+    entries: &[RecoverableHistoryEntry],
+    prefix: &str,
+    depth: usize,
+    max_entries: usize,
+) -> StoreHistoryProjection {
+    let max_entries = max_entries.max(1);
+    let mut projected = BTreeMap::<(String, u8), StoreHistoryEntryResponse>::new();
+    let mut truncated = false;
+    let scoped_prefix = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+
+    for entry in entries {
+        let normalized_path = entry.path.trim_matches('/');
+        let relative_path = match scoped_prefix.as_deref() {
+            None => normalized_path,
+            Some(scoped_prefix) => match normalized_path.strip_prefix(scoped_prefix) {
+                Some(relative_path) => relative_path,
+                None => continue,
+            },
+        };
+        let segments = relative_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            continue;
+        }
+
+        if segments.len() > depth {
+            let visible_path = segments[..depth].join("/");
+            let path = if prefix.is_empty() {
+                format!("{visible_path}/")
+            } else {
+                format!("{prefix}/{visible_path}/")
+            };
+            let projection_key = (path.clone(), 0);
+            if projected.len() < max_entries || projected.contains_key(&projection_key) {
+                projected
+                    .entry(projection_key)
+                    .or_insert(StoreHistoryEntryResponse {
+                        path,
+                        entry_type: "prefix",
+                        restore_source_path: None,
+                        restore_source_object_id: None,
+                        restore_version_id: None,
+                        removed_at_unix: None,
+                        moved_to_path: None,
+                    });
+            } else {
+                truncated = true;
+            }
+            continue;
+        }
+
+        let projection_key = (entry.path.clone(), 1);
+        if projected.len() < max_entries || projected.contains_key(&projection_key) {
+            projected.insert(
+                projection_key,
+                StoreHistoryEntryResponse {
+                    path: entry.path.clone(),
+                    entry_type: "historical",
+                    restore_source_path: Some(entry.restore_source_path.clone()),
+                    restore_source_object_id: Some(entry.restore_source_object_id.clone()),
+                    restore_version_id: Some(entry.restore_version_id.clone()),
+                    removed_at_unix: Some(entry.removed_at_unix),
+                    moved_to_path: entry.moved_to_path.clone(),
+                },
+            );
+        } else {
+            truncated = true;
+        }
+    }
+
+    StoreHistoryProjection {
+        entries: projected.into_values().collect(),
+        truncated,
+    }
+}
+
+async fn restore_history_entries(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<HistoryRestoreRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("restore_history_entries", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move { restore_history_entries_response(&state_for_request, request).await },
+    )
+    .await
+}
+
+async fn restore_history_entries_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<HistoryRestoreRequest>,
+) -> Response {
+    let action = "auth/store/history/restore";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "entries": request.entries.clone() }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    restore_history_entries_response(&state, request).await
+}
+
+async fn restore_history_entries_response(
+    state: &ServerState,
+    request: HistoryRestoreRequest,
+) -> Response {
+    if request.entries.is_empty() || request.entries.len() > HISTORY_RESTORE_BATCH_MAX_ENTRIES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if request.entries.iter().any(|entry| {
+        entry.path.trim().is_empty()
+            || entry.restore_source_path.trim().is_empty()
+            || entry.restore_source_object_id.trim().is_empty()
+            || entry.restore_version_id.trim().is_empty()
+    }) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let restore_entries = request
+        .entries
+        .into_iter()
+        .map(|entry| HistoryRestoreEntryRequest {
+            path: entry.path.trim().to_string(),
+            restore_source_path: entry.restore_source_path.trim().to_string(),
+            restore_source_object_id: entry.restore_source_object_id.trim().to_string(),
+            restore_version_id: entry.restore_version_id.trim().to_string(),
+        })
+        .collect::<Vec<_>>();
+    let restore_requests = restore_entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.restore_source_path.clone(),
+                entry.restore_version_id.clone(),
+                Some(entry.restore_source_object_id.clone()),
+                entry.path.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_results = {
+        let history_inspector = {
+            let store = read_store(state, "store_history.clone_restore_inspector").await;
+            store.store_history_inspector()
+        };
+        history_inspector
+            .resolve_version_restore_sources(&restore_requests)
+            .await
+    };
+    let restore_results = match source_results {
+        Ok(sources) => {
+            let mut store = lock_store(state, "store_history.restore_batch").await;
+            store
+                .restore_resolved_version_paths_batch(&restore_requests, &sources)
+                .await
+        }
+        Err(err) => Err(err),
+    };
+    let restore_results: Vec<Result<PathMutationResult>> = match restore_results {
+        Ok(results) => results,
+        Err(err) => {
+            tracing::warn!(error = %err, entry_count = restore_requests.len(), "failed resolving historical restore batch");
+            let error = err.to_string();
+            (0..restore_requests.len())
+                .map(|_| Err(anyhow!(error.clone())))
+                .collect()
+        }
+    };
+
+    let mut restored_count = 0usize;
+    let mut responses = Vec::with_capacity(restore_entries.len());
+    for (entry, restore_result) in restore_entries.into_iter().zip(restore_results) {
+        let status = match restore_result {
+            Ok(PathMutationResult::Applied) => {
+                restored_count = restored_count.saturating_add(1);
+                "restored"
+            }
+            Ok(PathMutationResult::SourceMissing) => "source_missing",
+            Ok(PathMutationResult::TargetExists) => "target_exists",
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %entry.path,
+                    restore_source_path = %entry.restore_source_path,
+                    restore_version_id = %entry.restore_version_id,
+                    "failed restoring historical entry"
+                );
+                "failed"
+            }
+        };
+        responses.push(HistoryRestoreEntryResponse {
+            path: entry.path,
+            restore_source_path: entry.restore_source_path,
+            restore_version_id: entry.restore_version_id,
+            status,
+        });
+    }
+
+    if restored_count > 0 {
+        let restored_paths = responses
+            .iter()
+            .filter(|entry| entry.status == "restored")
+            .map(|entry| entry.path.clone())
+            .collect::<HashSet<_>>();
+        state
+            .storage
+            .store_history_cache_generation
+            .fetch_add(1, Ordering::SeqCst);
+        remove_restored_history_entries_from_cache(state, &restored_paths);
+        publish_namespace_change(state);
+        request_local_availability_refresh(state);
+    }
+
+    let failed_count = responses.len().saturating_sub(restored_count);
+    (
+        StatusCode::OK,
+        Json(HistoryRestoreResponse {
+            restored_count,
+            failed_count,
+            entries: responses,
+        }),
+    )
+        .into_response()
 }
 
 async fn list_gallery_map_clusters(

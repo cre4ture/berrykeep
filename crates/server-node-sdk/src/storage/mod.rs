@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
 const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
+const STORE_HISTORY_VERSION_INDEX_BATCH_SIZE: usize = 256;
+const STORE_HISTORY_RESTORE_FALLBACK_MAX_INDEX_PAGES: usize = 4;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
@@ -1543,6 +1545,22 @@ pub struct TombstonePathResult {
     pub version_id: String,
 }
 
+/// A removed path whose most recent recoverable version can still be restored.
+///
+/// Entries are derived from live tombstone indexes. They intentionally exclude
+/// paths that currently exist, so callers can safely present them as optional
+/// historical items instead of mixing them into the current object tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoverableHistoryEntry {
+    pub path: String,
+    pub restore_source_path: String,
+    pub restore_source_object_id: String,
+    pub restore_version_id: String,
+    pub removed_at_unix: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_to_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreferredHeadReason {
@@ -1574,7 +1592,7 @@ pub struct SnapshotObjectState {
 }
 
 #[derive(Debug, Clone)]
-struct SnapshotRestoreSource {
+pub(crate) struct SnapshotRestoreSource {
     manifest_hash: String,
     object_id: Option<String>,
     version_id: Option<String>,
@@ -2531,6 +2549,16 @@ pub(crate) struct StoreIndexInspector {
     metadata_store: Arc<dyn MetadataStore>,
 }
 
+/// Detached access to the version-index metadata needed by Explorer's
+/// recoverable-history listing and restore-source resolution. It intentionally
+/// owns only clonable handles, so callers can release the main store lock
+/// before a potentially long metadata scan.
+#[derive(Clone)]
+pub(crate) struct StoreHistoryInspector {
+    storage_pool: StoragePool,
+    metadata_store: Arc<dyn MetadataStore>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ClusterReplicasPersister {
     metadata_store: Arc<dyn MetadataStore>,
@@ -2582,6 +2610,9 @@ trait MetadataStore: Send + Sync {
     async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()>;
     async fn load_current_state(&self) -> Result<CurrentState>;
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
+    /// Returns the requested keys that currently exist. Implementations batch
+    /// this lookup so history inspection does not issue one query per path.
+    async fn list_existing_current_object_keys(&self, keys: &[String]) -> Result<HashSet<String>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
     async fn remove_current_object(&self, key: &str) -> Result<()>;
     /// Replaces the user labels of a projected object. This is the entry point
@@ -2617,6 +2648,10 @@ trait MetadataStore: Send + Sync {
     async fn count_current_objects(&self) -> Result<usize>;
     async fn list_current_object_keys(&self) -> Result<Vec<String>>;
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>>;
+    async fn list_keys_for_object_ids(
+        &self,
+        object_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>>;
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>>;
     async fn persist_repair_attempts(
         &self,
@@ -2727,6 +2762,16 @@ trait MetadataStore: Send + Sync {
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
     async fn load_version_indexes_after(
         &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>>;
+    /// Lists recoverable-history candidate indexes under `prefix`. The
+    /// metadata backend applies tombstone, prefix, and current-path filters
+    /// before deserializing indexes; legacy indexes without a preferred head
+    /// are confirmed by the caller.
+    async fn load_recoverable_history_version_indexes_after(
+        &self,
+        prefix: &str,
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileVersionIndex>>;
@@ -3087,6 +3132,406 @@ impl StorageStatsCollector {
             .prune_storage_stats_history_before(collected_before_unix)
             .await
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum RecoverableHistoryEntries {
+    Entries(Vec<RecoverableHistoryEntry>),
+    ExceedsLimit { minimum_entry_count: usize },
+}
+
+impl StoreHistoryInspector {
+    fn new(storage_pool: StoragePool, metadata_store: Arc<dyn MetadataStore>) -> Self {
+        Self {
+            storage_pool,
+            metadata_store,
+        }
+    }
+
+    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    async fn resolve_key_for_version_index(
+        &self,
+        index: &FileVersionIndex,
+    ) -> Result<Option<String>> {
+        if let Some(preferred_head) = index
+            .preferred_head_version_id
+            .as_ref()
+            .and_then(|version_id| index.versions.get(version_id))
+            .and_then(|record| record.logical_path.clone())
+        {
+            return Ok(Some(preferred_head));
+        }
+
+        if let Some(any_logical_path) = index
+            .versions
+            .values()
+            .find_map(|record| record.logical_path.clone())
+        {
+            return Ok(Some(any_logical_path));
+        }
+
+        for record in index.versions.values() {
+            if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving historical restore source key; skipping record"
+                    );
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_key_for_version_record(
+        &self,
+        index: &FileVersionIndex,
+        record: &FileVersionRecord,
+    ) -> Result<Option<String>> {
+        if let Some(logical_path) = record.logical_path.clone() {
+            return Ok(Some(logical_path));
+        }
+
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving historical restore source key; falling back to index lookup"
+                    );
+                }
+            }
+        }
+
+        self.resolve_key_for_version_index(index).await
+    }
+
+    async fn version_restore_source_from_indexes(
+        &self,
+        indexes: &[FileVersionIndex],
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        for index in indexes {
+            let Some(record) = index.versions.get(version_id) else {
+                continue;
+            };
+            let Some(resolved_path) = self.resolve_key_for_version_record(index, record).await?
+            else {
+                continue;
+            };
+            if resolved_path != source_path || record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            return Ok(Some(SnapshotRestoreSource {
+                manifest_hash: record.manifest_hash.clone(),
+                object_id: Some(index.object_id.clone()),
+                version_id: Some(record.version_id.clone()),
+                state: record.state.clone(),
+            }));
+        }
+
+        Ok(None)
+    }
+
+    async fn version_restore_source_from_object_id(
+        &self,
+        source_object_id: &str,
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        let Some(index) = self
+            .metadata_store
+            .load_version_index_by_object_id(source_object_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.version_restore_source_from_indexes(&[index], source_path, version_id)
+            .await
+    }
+
+    /// Resolves a bounded restore batch without holding the main store lock.
+    /// Index pages are scanned once for all unresolved sources, keeping both
+    /// the database work and peak memory bounded on large stores.
+    pub(crate) async fn resolve_version_restore_sources(
+        &self,
+        restore_requests: &[(String, String, Option<String>, String)],
+    ) -> Result<Vec<Option<SnapshotRestoreSource>>> {
+        let mut unresolved = BTreeSet::new();
+        let mut sources = HashMap::<(String, String), SnapshotRestoreSource>::new();
+        for (source_path, version_id, source_object_id, _) in restore_requests {
+            let source = match source_object_id.as_deref() {
+                Some(source_object_id) => {
+                    self.version_restore_source_from_object_id(
+                        source_object_id,
+                        source_path,
+                        version_id,
+                    )
+                    .await?
+                }
+                None => match self.metadata_store.get_current_object(source_path).await? {
+                    Some(current) => {
+                        self.version_restore_source_from_object_id(
+                            &current.object_id,
+                            source_path,
+                            version_id,
+                        )
+                        .await?
+                    }
+                    None => None,
+                },
+            };
+            if let Some(source) = source {
+                sources.insert((source_path.clone(), version_id.clone()), source);
+            } else if source_object_id.is_none() {
+                unresolved.insert((source_path.clone(), version_id.clone()));
+            }
+        }
+
+        let mut after_object_id = None;
+        for _ in 0..STORE_HISTORY_RESTORE_FALLBACK_MAX_INDEX_PAGES {
+            if unresolved.is_empty() {
+                break;
+            }
+            let indexes = self
+                .metadata_store
+                .load_version_indexes_after(
+                    after_object_id.as_deref(),
+                    STORE_HISTORY_VERSION_INDEX_BATCH_SIZE,
+                )
+                .await?;
+            let Some(last_object_id) = indexes
+                .last()
+                .map(|index| index.persisted_object_id.clone())
+            else {
+                break;
+            };
+
+            let candidates = unresolved.iter().cloned().collect::<Vec<_>>();
+            for (source_path, version_id) in candidates {
+                let Some(source) = self
+                    .version_restore_source_from_indexes(&indexes, &source_path, &version_id)
+                    .await?
+                else {
+                    continue;
+                };
+                unresolved.remove(&(source_path.clone(), version_id.clone()));
+                sources.insert((source_path, version_id), source);
+            }
+
+            after_object_id = Some(last_object_id);
+        }
+
+        Ok(restore_requests
+            .iter()
+            .map(|(source_path, version_id, _, _)| {
+                sources
+                    .get(&(source_path.clone(), version_id.clone()))
+                    .cloned()
+            })
+            .collect())
+    }
+
+    pub(crate) async fn list_recoverable_history_entries_bounded(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryEntries> {
+        let prefix = prefix.trim().trim_matches('/');
+        let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
+        let mut after_object_id = None;
+
+        loop {
+            let indexes = self
+                .metadata_store
+                .load_recoverable_history_version_indexes_after(
+                    prefix,
+                    after_object_id.as_deref(),
+                    STORE_HISTORY_VERSION_INDEX_BATCH_SIZE,
+                )
+                .await?;
+            let Some(last_object_id) = indexes
+                .last()
+                .map(|index| index.persisted_object_id.clone())
+            else {
+                break;
+            };
+            let mut page_entries =
+                BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
+
+            for index in indexes {
+                let Some(preferred_head_id) = index
+                    .preferred_head_version_id
+                    .clone()
+                    .or_else(|| choose_preferred_head(&index))
+                else {
+                    continue;
+                };
+                let Some(tombstone) = index.versions.get(&preferred_head_id).cloned() else {
+                    continue;
+                };
+                if tombstone.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+                    continue;
+                }
+
+                let Some(path) = tombstone
+                    .logical_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(ToOwned::to_owned)
+                else {
+                    continue;
+                };
+                if !recoverable_history_path_matches_prefix(&path, prefix) {
+                    continue;
+                }
+                let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
+                    tombstone.copied_from_object_id.as_deref(),
+                    tombstone.copied_from_version_id.as_deref(),
+                ) {
+                    let restore_source_path = tombstone
+                        .copied_from_path
+                        .clone()
+                        .unwrap_or_else(|| path.clone());
+                    Some((
+                        restore_source_path,
+                        source_version_id.to_string(),
+                        source_object_id.to_string(),
+                        Some(source_object_id.to_string()),
+                    ))
+                } else {
+                    recoverable_tombstone_ancestor(&index, &tombstone).map(|record| {
+                        (
+                            record.logical_path.unwrap_or_else(|| path.clone()),
+                            record.version_id,
+                            index.object_id.clone(),
+                            None,
+                        )
+                    })
+                };
+
+                let Some((
+                    restore_source_path,
+                    restore_version_id,
+                    restore_source_object_id,
+                    moved_source_object_id,
+                )) = restore_source
+                else {
+                    continue;
+                };
+                let entry = RecoverableHistoryEntry {
+                    path: path.clone(),
+                    restore_source_path,
+                    restore_source_object_id,
+                    restore_version_id,
+                    removed_at_unix: tombstone.created_at_unix,
+                    moved_to_path: None,
+                };
+                let should_replace = page_entries.get(&path).is_none_or(|(existing, _)| {
+                    (entry.removed_at_unix, &entry.restore_version_id)
+                        > (existing.removed_at_unix, &existing.restore_version_id)
+                });
+                if should_replace {
+                    page_entries.insert(path, (entry, moved_source_object_id));
+                }
+            }
+
+            let existing_paths = self
+                .metadata_store
+                .list_existing_current_object_keys(
+                    &page_entries.keys().cloned().collect::<Vec<_>>(),
+                )
+                .await?;
+            for (path, entry) in page_entries {
+                if existing_paths.contains(&path) {
+                    continue;
+                }
+                let should_replace = entries.get(&path).is_none_or(|(existing, _)| {
+                    (entry.0.removed_at_unix, &entry.0.restore_version_id)
+                        > (existing.removed_at_unix, &existing.restore_version_id)
+                });
+                if should_replace {
+                    entries.insert(path, entry);
+                }
+            }
+            if entries.len() > max_entries {
+                return Ok(RecoverableHistoryEntries::ExceedsLimit {
+                    minimum_entry_count: entries.len(),
+                });
+            }
+            after_object_id = Some(last_object_id);
+        }
+
+        let moved_source_object_ids = entries
+            .values()
+            .filter_map(|(_, object_id)| object_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let current_keys_by_object_id = self
+            .metadata_store
+            .list_keys_for_object_ids(&moved_source_object_ids)
+            .await?;
+        for (entry, moved_source_object_id) in entries.values_mut() {
+            let Some(moved_source_object_id) = moved_source_object_id else {
+                continue;
+            };
+            entry.moved_to_path = current_keys_by_object_id
+                .get(moved_source_object_id)
+                .into_iter()
+                .flatten()
+                .filter(|candidate| *candidate != &entry.path)
+                .min()
+                .cloned();
+        }
+
+        Ok(RecoverableHistoryEntries::Entries(
+            entries.into_values().map(|(entry, _)| entry).collect(),
+        ))
+    }
+}
+
+fn recoverable_history_path_matches_prefix(path: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || path
+            .trim_matches('/')
+            .strip_prefix(prefix)
+            .is_some_and(|relative_path| relative_path.starts_with('/'))
 }
 
 impl StoreIndexInspector {
@@ -4327,6 +4772,10 @@ impl PersistentStore {
             self.storage_pool.clone(),
             self.metadata_store.clone(),
         ))
+    }
+
+    pub(crate) fn store_history_inspector(&self) -> StoreHistoryInspector {
+        StoreHistoryInspector::new(self.storage_pool.clone(), self.metadata_store.clone())
     }
 
     pub(crate) async fn query_gallery_index(
@@ -9776,6 +10225,71 @@ impl PersistentStore {
             .await
     }
 
+    /// Applies an already-resolved historical restore batch. Target existence
+    /// is deliberately checked here, immediately before each mutation.
+    pub(crate) async fn restore_resolved_version_paths_batch(
+        &mut self,
+        restore_requests: &[(String, String, Option<String>, String)],
+        sources: &[Option<SnapshotRestoreSource>],
+    ) -> Result<Vec<Result<PathMutationResult>>> {
+        if restore_requests.len() != sources.len() {
+            bail!(
+                "historical restore request/source count mismatch: {} requests, {} sources",
+                restore_requests.len(),
+                sources.len()
+            );
+        }
+        let touched_paths = restore_requests
+            .iter()
+            .map(|(_, _, _, target_path)| target_path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut before_bindings = HashMap::with_capacity(touched_paths.len());
+        for path in &touched_paths {
+            before_bindings.insert(path.clone(), self.current_state_binding(path).await?);
+        }
+        if !touched_paths.is_empty() {
+            self.maybe_rotate_snapshot_batch(&touched_paths).await?;
+        }
+        let mut results = Vec::with_capacity(restore_requests.len());
+
+        for ((source_path, _version_id, _source_object_id, target_path), source) in
+            restore_requests.iter().zip(sources)
+        {
+            let target_exists = match self.current_object_entry(target_path).await {
+                Ok(entry) => entry.is_some(),
+                Err(err) => {
+                    results.push(Err(err));
+                    continue;
+                }
+            };
+            if target_exists {
+                results.push(Ok(PathMutationResult::TargetExists));
+                continue;
+            }
+            let result = match source {
+                Some(source) => {
+                    self.restore_object_path_from_source(
+                        source.clone(),
+                        source_path,
+                        target_path,
+                        false,
+                        false,
+                    )
+                    .await
+                }
+                None => Ok(PathMutationResult::SourceMissing),
+            };
+            results.push(result);
+        }
+
+        let changed_paths = self.changed_paths_after_bindings(&before_bindings).await?;
+        if !changed_paths.is_empty() {
+            self.record_snapshot_batch(changed_paths, unix_ts()).await?;
+        }
+
+        Ok(results)
+    }
+
     async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {
         if let Some(object_id) = self.object_id_for_key(key).await? {
             return Ok(Some(object_id));
@@ -10815,6 +11329,29 @@ fn recompute_head_version_ids(index: &FileVersionIndex) -> Vec<String> {
     let mut heads: Vec<String> = all_ids.into_iter().collect();
     heads.sort();
     heads
+}
+
+fn recoverable_tombstone_ancestor(
+    index: &FileVersionIndex,
+    tombstone: &FileVersionRecord,
+) -> Option<FileVersionRecord> {
+    let mut pending = tombstone.parent_version_ids.clone();
+    let mut visited = HashSet::new();
+
+    while let Some(version_id) = pending.pop() {
+        if !visited.insert(version_id.clone()) {
+            continue;
+        }
+        let Some(record) = index.versions.get(&version_id) else {
+            continue;
+        };
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            return Some(record.clone());
+        }
+        pending.extend(record.parent_version_ids.iter().cloned());
+    }
+
+    None
 }
 
 fn choose_preferred_head(index: &FileVersionIndex) -> Option<String> {

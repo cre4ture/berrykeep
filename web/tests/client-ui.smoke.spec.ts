@@ -1829,6 +1829,196 @@ test("client-ui explorer fetches result pages instead of the complete index", as
   expect(requestPages.every((request) => request.limit === "100")).toBe(true);
 });
 
+test("client-ui explorer keeps loaded history while paging current entries", async ({ page }) => {
+  let historyRequestCount = 0;
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/history") && request.method() === "GET") {
+      historyRequestCount += 1;
+    }
+  });
+
+  await installClientUiMocks(page, {
+    storeEntries: createGalleryPaginationMockStoreEntries(250),
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted-001",
+        restore_version_id: "version-deleted-001",
+        removed_at_unix: 1_712_345_600
+      }
+    ]
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
+  await expect.poll(() => historyRequestCount).toBe(1);
+
+  await page.locator('[data-explorer-pagination="true"]').getByRole("button", { name: "2" }).click();
+  await expect(page.locator('[data-explorer-pagination="true"]')).toContainText("Showing 101–200 of");
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
+  await page.waitForTimeout(300);
+  expect(historyRequestCount).toBe(1);
+});
+
+test("client-ui explorer only caps depth for historical entries", async ({ page }) => {
+  const currentDepths: string[] = [];
+  const historyDepths: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list")) {
+      currentDepths.push(url.searchParams.get("depth") ?? "");
+    }
+    if (url.pathname === apiV1("/store/history")) {
+      historyDepths.push(url.searchParams.get("depth") ?? "");
+    }
+  });
+
+  await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted",
+        restore_version_id: "version-deleted",
+        removed_at_unix: 1_712_345_600
+      }
+    ]
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await page.getByLabel("Depth").fill("65");
+  await page.getByRole("button", { name: "Refresh entries" }).click();
+
+  await expect.poll(() => currentDepths.includes("65")).toBe(true);
+  await expect.poll(() => historyDepths.includes("64")).toBe(true);
+});
+
+test("client-ui explorer restores selected deleted and moved entries in one batch", async ({
+  page
+}) => {
+  const mockState = await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted-001",
+        restore_version_id: "version-deleted-001",
+        removed_at_unix: 1_712_345_600,
+        moved_to_path: null
+      },
+      {
+        path: "old-name.txt",
+        entry_type: "historical",
+        restore_source_path: "old-name.txt",
+        restore_source_object_id: "object-moved-001",
+        restore_version_id: "version-moved-001",
+        removed_at_unix: 1_712_345_601,
+        moved_to_path: "new-name.txt"
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
+  await expect(page.getByRole("row", { name: /old-name\.txt/ })).toContainText(
+    "moved to new-name.txt"
+  );
+
+  await page.getByLabel("Select historical entry deleted.txt").check();
+  await page.getByLabel("Select historical entry old-name.txt").check();
+  await page.getByRole("button", { name: "Restore selected" }).click();
+
+  await expect
+    .poll(() =>
+      mockState
+        .restoredHistoryEntries()
+        .flat()
+        .map((entry) => entry.path)
+        .sort()
+    )
+    .toEqual(["deleted.txt", "old-name.txt"]);
+  await expect(page.getByText('"requested_count": 2')).toBeVisible();
+
+  await page.getByRole("textbox", { name: "Snapshot" }).click();
+  await page.getByRole("option", { name: "snapshot-001" }).click();
+  await page.getByRole("button", { name: "Load entries" }).click();
+  await expect(page.getByText("Recoverable deleted and moved files")).toBeHidden();
+});
+
+test("client-ui explorer splits historical restores into supported batch sizes", async ({ page }) => {
+  const mockState = await installClientUiMocks(page, {
+    historyEntries: Array.from({ length: 101 }, (_, index) => {
+      const path = `deleted-${String(index + 1).padStart(3, "0")}.txt`;
+      return {
+        path,
+        entry_type: "historical",
+        restore_source_path: path,
+        restore_source_object_id: `object-deleted-${String(index + 1).padStart(3, "0")}`,
+        restore_version_id: `version-deleted-${String(index + 1).padStart(3, "0")}`,
+        removed_at_unix: 1_712_345_600 + index
+      };
+    })
+  });
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted-001.txt", exact: true })).toBeVisible();
+
+  await page.getByLabel("Select all historical entries").check();
+  await expect(page.getByText("101 historical items selected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Restore selected" }).click();
+
+  await expect
+    .poll(() => mockState.restoredHistoryEntries().map((entries) => entries.length))
+    .toEqual([100, 1]);
+});
+
+test("client-ui explorer retains completed historical restore batches after a later request fails", async ({
+  page
+}) => {
+  const mockState = await installClientUiMocks(page, {
+    historyRestoreFailureAtCall: 2,
+    historyEntries: Array.from({ length: 101 }, (_, index) => {
+      const path = `deleted-${String(index + 1).padStart(3, "0")}.txt`;
+      return {
+        path,
+        entry_type: "historical",
+        restore_source_path: path,
+        restore_source_object_id: `object-deleted-${String(index + 1).padStart(3, "0")}`,
+        restore_version_id: `version-deleted-${String(index + 1).padStart(3, "0")}`,
+        removed_at_unix: 1_712_345_600 + index
+      };
+    })
+  });
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted-001.txt", exact: true })).toBeVisible();
+
+  await page.getByLabel("Select all historical entries").check();
+  await page.getByRole("button", { name: "Restore selected" }).click();
+
+  await expect
+    .poll(() => mockState.restoredHistoryEntries().map((entries) => entries.length))
+    .toEqual([100]);
+  await expect(page.getByRole("cell", { name: "deleted-001.txt", exact: true })).toBeHidden();
+  await expect(page.getByRole("cell", { name: "deleted-101.txt", exact: true })).toBeVisible();
+  await expect(page.getByLabel("Select historical entry deleted-101.txt")).toBeChecked();
+  await expect(page.getByText(/restored before a later batch failed/)).toBeVisible();
+});
+
 test("client-ui desktop navigation can collapse and scroll on short viewports", async ({ page }) => {
   test.setTimeout(45_000);
 
@@ -1908,6 +2098,8 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
+  historyEntries?: MockHistoryEntry[];
+  historyRestoreFailureAtCall?: number;
   cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapMetadataCenter?: [number, number, number];
@@ -1916,6 +2108,16 @@ type InstallClientUiMocksOptions = {
   mapClusterRefreshDelayMs?: number;
   mapClusterEntriesDelayMs?: number;
   legacyGalleryMapApiOnly?: boolean;
+};
+
+type MockHistoryEntry = {
+  path: string;
+  entry_type: "historical";
+  restore_source_path: string;
+  restore_source_object_id: string;
+  restore_version_id: string;
+  removed_at_unix: number;
+  moved_to_path?: string | null;
 };
 
 type MockGalleryMapConfiguration = {
@@ -1958,6 +2160,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const diagnosticContexts = new Set<string>();
   let diagnosticContextRequestCount = 0;
   const storeEntries = options?.storeEntries ?? createMockStoreEntries();
+  let historyEntries = options?.historyEntries?.slice() ?? [];
   let cacheScope = options?.cacheScope === undefined ? "a".repeat(64) : options.cacheScope;
   let galleryOffline = false;
   let galleryStoreListRequestCount = 0;
@@ -1966,6 +2169,8 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   let galleryStoreListDelayMs = 0;
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
+  const restoredHistoryEntries: MockHistoryEntry[][] = [];
+  let historyRestoreRequestCount = 0;
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
   const connectionRoutesPayload = {
     generated_at_unix_ms: 1_712_345_600_000,
@@ -2369,6 +2574,47 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       });
     }
 
+    if (pathname === apiV1("/store/history") && method === "GET") {
+      return json(route, {
+        prefix: searchParams.get("prefix") ?? "",
+        depth: Number(searchParams.get("depth") ?? "1"),
+        entry_count: historyEntries.length,
+        truncated: false,
+        entries: historyEntries
+      });
+    }
+
+    if (pathname === apiV1("/store/history/restore") && method === "POST") {
+      historyRestoreRequestCount += 1;
+      if (historyRestoreRequestCount === options?.historyRestoreFailureAtCall) {
+        return route.fulfill({
+          status: 502,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "simulated history restore failure" })
+        });
+      }
+      const body = route.request().postDataJSON() as {
+        entries: Array<{
+          path: string;
+          restore_source_path: string;
+          restore_source_object_id: string;
+          restore_version_id: string;
+        }>;
+      };
+      const restoredPaths = new Set(body.entries.map((entry) => entry.path));
+      const restored = historyEntries.filter((entry) => restoredPaths.has(entry.path));
+      restoredHistoryEntries.push(restored);
+      historyEntries = historyEntries.filter((entry) => !restoredPaths.has(entry.path));
+      return json(route, {
+        restored_count: restored.length,
+        failed_count: body.entries.length - restored.length,
+        entries: body.entries.map((entry) => ({
+          ...entry,
+          status: restoredPaths.has(entry.path) ? "restored" : "failed"
+        }))
+      });
+    }
+
     if (pathname === apiV1("/maps/logical-file")) {
       const rangeHeader = route.request().headers().range;
       const commonHeaders = {
@@ -2740,6 +2986,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     diagnosticContexts: () => Array.from(diagnosticContexts),
     diagnosticContextRequestCount: () => diagnosticContextRequestCount,
     restoredVersions: () => restoredVersions.slice(),
+    restoredHistoryEntries: () => restoredHistoryEntries.slice(),
     galleryStoreListRequestCount: () => galleryStoreListRequestCount,
     replaceStoreEntries: (entries: MockStoreEntry[]) => {
       storeEntries.splice(0, storeEntries.length, ...entries);

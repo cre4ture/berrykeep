@@ -1,5 +1,6 @@
 import {
   Alert,
+  Checkbox,
   Button,
   Card,
   Code,
@@ -42,6 +43,8 @@ import {
 const DEFAULT_EXPLORER_PREVIEW_BYTES = 1024;
 const EXPLORER_RENAME_SCAN_DEPTH = 1024;
 const EXPLORER_PAGE_SIZE = 100;
+const HISTORY_RESTORE_BATCH_MAX_ENTRIES = 100;
+const HISTORY_MAX_DEPTH = 64;
 
 export type ExplorerSnapshot = {
   id: string;
@@ -56,6 +59,11 @@ export type ExplorerEntry = {
   modified_at_unix?: number | null;
   content_fingerprint?: string | null;
   media?: Record<string, unknown> | null;
+  restore_source_path?: string | null;
+  restore_source_object_id?: string | null;
+  restore_version_id?: string | null;
+  removed_at_unix?: number | null;
+  moved_to_path?: string | null;
 };
 
 export type ExplorerListView = "raw" | "tree";
@@ -84,6 +92,31 @@ export type ExplorerListResponse = {
   offset?: number;
   limit?: number | null;
   has_more?: boolean;
+  entries: ExplorerEntry[];
+};
+
+export type ExplorerHistoryRestoreEntry = {
+  path: string;
+  restore_source_path: string;
+  restore_source_object_id: string;
+  restore_version_id: string;
+};
+
+export type ExplorerHistoryRestoreEntryResult = ExplorerHistoryRestoreEntry & {
+  status: "restored" | "source_missing" | "target_exists" | "failed";
+};
+
+export type ExplorerHistoryRestoreResponse = {
+  restored_count: number;
+  failed_count: number;
+  entries: ExplorerHistoryRestoreEntryResult[];
+};
+
+export type ExplorerHistoryListResponse = {
+  prefix: string;
+  depth: number;
+  entry_count: number;
+  truncated: boolean;
   entries: ExplorerEntry[];
 };
 
@@ -124,6 +157,9 @@ export type ExplorerMutationConfig = {
     targetPath: string,
     recursive: boolean
   ) => Promise<unknown>;
+  restoreHistoryEntries?: (
+    entries: ExplorerHistoryRestoreEntry[]
+  ) => Promise<ExplorerHistoryRestoreResponse>;
 };
 
 export type ExplorerQuickUploadConfig = {
@@ -142,6 +178,10 @@ export type ExplorerSurfaceProps = {
     snapshotId: string | null,
     options?: ExplorerLoadEntriesOptions
   ) => Promise<ExplorerListResponse>;
+  loadHistoricalEntries?: (
+    prefix: string,
+    depth: number
+  ) => Promise<ExplorerHistoryListResponse>;
   readValue: (
     key: string,
     snapshotId: string | null,
@@ -169,12 +209,14 @@ type ExplorerMediaViewerState = {
   source: ExplorerMediaViewerSource;
   index: number;
 };
+type ExplorerHistoryLoadState = "idle" | "loading" | "loaded" | "failed";
 
 export function ExplorerSurface({
   intro,
   previewBytes = DEFAULT_EXPLORER_PREVIEW_BYTES,
   loadSnapshots,
   loadEntries,
+  loadHistoricalEntries,
   readValue,
   getDownloadUrl,
   loadVersions,
@@ -190,6 +232,10 @@ export function ExplorerSurface({
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<ExplorerSnapshot[]>([]);
   const [entriesPayload, setEntriesPayload] = useState<ExplorerListResponse | null>(null);
+  const [historyEntriesPayload, setHistoryEntriesPayload] =
+    useState<ExplorerHistoryListResponse | null>(null);
+  const [historyLoadState, setHistoryLoadState] = useState<ExplorerHistoryLoadState>("idle");
+  const [historyLoadError, setHistoryLoadError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedPayload, setSelectedPayload] = useState<unknown>({
     message: "Select an object or version to preview it."
@@ -204,6 +250,8 @@ export function ExplorerSurface({
   const [sortField, setSortField] = useState<ExplorerSortField>("path");
   const [sortDirection, setSortDirection] = useState<ExplorerSortDirection>("asc");
   const [showThumbnails, setShowThumbnails] = useState(true);
+  const [showHistoricalEntries, setShowHistoricalEntries] = useState(false);
+  const [selectedHistoricalEntries, setSelectedHistoricalEntries] = useState<string[]>([]);
   const quickUploadInputRef = useRef<HTMLInputElement | null>(null);
   const canCreateFolder = snapshotId == null && mutations?.createFolderMarker != null;
   const canDeleteCurrentStore = snapshotId == null && mutations?.deletePath != null;
@@ -213,10 +261,15 @@ export function ExplorerSurface({
     (canCreateFolder || canDeleteCurrentStore || canRenameCurrentStore || quickUpload != null);
   const canRestoreVersion = snapshotId == null && mutations?.restoreVersion != null;
   const canRestoreSnapshot = snapshotId != null && mutations?.restoreSnapshotPath != null;
+  const canRestoreHistory =
+    snapshotId == null &&
+    loadHistoricalEntries != null &&
+    mutations?.restoreHistoryEntries != null;
 
-  const sortedEntries = useMemo(() => {
-    return (entriesPayload?.entries ?? []).filter((entry) => shouldDisplayExplorerEntry(entry, prefix));
-  }, [entriesPayload, prefix]);
+  const sortedEntries = useMemo(
+    () => (entriesPayload?.entries ?? []).filter((entry) => shouldDisplayExplorerEntry(entry, prefix)),
+    [entriesPayload, prefix]
+  );
 
   useEffect(() => {
     void refreshSnapshots();
@@ -246,6 +299,7 @@ export function ExplorerSurface({
       snapshotId?: string | null;
       sortField?: ExplorerSortField;
       sortDirection?: ExplorerSortDirection;
+      includeHistorical?: boolean;
     }
   ) {
     setLoading("entries");
@@ -253,21 +307,71 @@ export function ExplorerSurface({
     const targetPrefix = nextPrefix ?? prefix;
     const targetPage = Math.max(1, options?.page ?? currentPage);
     const targetSnapshotId = options?.snapshotId === undefined ? snapshotId : options.snapshotId;
+    const targetDepth = Math.max(1, depth);
+    const targetHistoryDepth = Math.min(HISTORY_MAX_DEPTH, targetDepth);
     const targetSortField = options?.sortField ?? sortField;
     const targetSortDirection = options?.sortDirection ?? sortDirection;
+    const targetHistoryPrefix = targetPrefix.trim().replace(/^\/+|\/+$/g, "");
+    const historicalEntriesEnabled =
+      (options?.includeHistorical ?? showHistoricalEntries) &&
+      targetSnapshotId == null &&
+      loadHistoricalEntries != null;
+    const historyMatchesTarget =
+      historyEntriesPayload?.prefix === targetHistoryPrefix &&
+      historyEntriesPayload.depth === targetHistoryDepth;
+    const includeHistorical =
+      historicalEntriesEnabled && (options?.includeHistorical ?? !historyMatchesTarget);
+    if (includeHistorical) {
+      setHistoryLoadState("loading");
+      setHistoryLoadError(null);
+    } else if (!historicalEntriesEnabled) {
+      setHistoryLoadState("idle");
+      setHistoryLoadError(null);
+    }
     try {
-      const payload = await loadEntries(targetPrefix.trim(), depth, targetSnapshotId, {
-        view: "tree",
-        offset: (targetPage - 1) * EXPLORER_PAGE_SIZE,
-        limit: EXPLORER_PAGE_SIZE,
-        sort: explorerServerSortOrder(targetSortField, targetSortDirection)
-      });
+      const historyRequest =
+        includeHistorical && loadHistoricalEntries
+          ? loadHistoricalEntries(targetPrefix.trim(), targetHistoryDepth).then(
+              (payload) => ({ payload, error: null as string | null }),
+              (historyError) => ({
+                payload: null,
+                error:
+                  historyError instanceof Error
+                    ? historyError.message
+                    : "Unable to load recoverable historical entries."
+              })
+            )
+          : Promise.resolve({ payload: null, error: null as string | null });
+      const [payload, historyResult] = await Promise.all([
+        loadEntries(targetPrefix.trim(), targetDepth, targetSnapshotId, {
+          view: "tree",
+          offset: (targetPage - 1) * EXPLORER_PAGE_SIZE,
+          limit: EXPLORER_PAGE_SIZE,
+          sort: explorerServerSortOrder(targetSortField, targetSortDirection)
+        }),
+        historyRequest
+      ]);
       setEntriesPayload(payload);
+      if (includeHistorical) {
+        setHistoryEntriesPayload(historyResult.payload);
+        if (historyResult.error) {
+          setHistoryLoadState("failed");
+          setHistoryLoadError(historyResult.error);
+          setError(`Failed loading historical entries: ${historyResult.error}`);
+        } else {
+          setHistoryLoadState("loaded");
+        }
+      }
       setCurrentPage(targetPage);
       if (typeof nextPrefix === "string") {
         setPrefix(nextPrefix);
       }
     } catch (nextError) {
+      if (includeHistorical) {
+        setHistoryEntriesPayload(null);
+        setHistoryLoadState("failed");
+        setHistoryLoadError("Current store entries could not be loaded.");
+      }
       setError(nextError instanceof Error ? nextError.message : "Failed to load store entries");
     } finally {
       setLoading(null);
@@ -275,8 +379,13 @@ export function ExplorerSurface({
   }
 
   async function readEntry(entry: ExplorerEntry) {
-    if (entry.entry_type === "prefix" || entry.path.endsWith("/")) {
+    if (isExplorerPrefix(entry)) {
       await refreshEntries(entry.path, { page: 1 });
+      return;
+    }
+
+    if (isHistoricalExplorerEntry(entry)) {
+      await readHistoricalEntry(entry);
       return;
     }
 
@@ -292,8 +401,28 @@ export function ExplorerSurface({
     }
   }
 
+  async function readHistoricalEntry(entry: ExplorerEntry) {
+    const restoreSourcePath = entry.restore_source_path?.trim();
+    const restoreVersionId = entry.restore_version_id?.trim();
+    if (!restoreSourcePath || !restoreVersionId) {
+      setError("This historical entry does not include a recoverable version.");
+      return;
+    }
+
+    setLoading(`read-history:${entry.path}`);
+    setError(null);
+    try {
+      const payload = await readValue(restoreSourcePath, null, restoreVersionId, previewBytes);
+      setSelectedPayload(payload);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed reading historical object");
+    } finally {
+      setLoading(null);
+    }
+  }
+
   function downloadEntry(entry: ExplorerEntry) {
-    if (entry.entry_type === "prefix" || entry.path.endsWith("/")) {
+    if (isExplorerPrefix(entry) || isHistoricalExplorerEntry(entry)) {
       return;
     }
 
@@ -313,7 +442,7 @@ export function ExplorerSurface({
       return;
     }
 
-    const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+    const isPrefix = isExplorerPrefix(entry);
     const sourcePath = normalizeExplorerPath(entry.path, isPrefix);
     if (!sourcePath) {
       setError("Path must not be empty.");
@@ -366,6 +495,118 @@ export function ExplorerSurface({
     }
   }
 
+  function historicalRestoreRequest(entry: ExplorerEntry): ExplorerHistoryRestoreEntry | null {
+    const restoreSourcePath = entry.restore_source_path?.trim();
+    const restoreSourceObjectId = entry.restore_source_object_id?.trim();
+    const restoreVersionId = entry.restore_version_id?.trim();
+    const path = entry.path.trim();
+    if (!path || !restoreSourcePath || !restoreSourceObjectId || !restoreVersionId) {
+      return null;
+    }
+    return {
+      path,
+      restore_source_path: restoreSourcePath,
+      restore_source_object_id: restoreSourceObjectId,
+      restore_version_id: restoreVersionId
+    };
+  }
+
+  async function restoreHistoricalEntries(entries: ExplorerEntry[]) {
+    if (!canRestoreHistory || !mutations?.restoreHistoryEntries) {
+      setError("Historical restore is not available on this surface.");
+      return;
+    }
+
+    const restoreEntries = entries
+      .map(historicalRestoreRequest)
+      .filter((entry): entry is ExplorerHistoryRestoreEntry => entry != null);
+    if (restoreEntries.length === 0) {
+      setError("Select one or more recoverable historical entries first.");
+      return;
+    }
+
+    setLoading("restore-history");
+    setError(null);
+    try {
+      const responses: ExplorerHistoryRestoreResponse[] = [];
+      let requestError: unknown = null;
+      for (
+        let offset = 0;
+        offset < restoreEntries.length;
+        offset += HISTORY_RESTORE_BATCH_MAX_ENTRIES
+      ) {
+        try {
+          responses.push(
+            await mutations.restoreHistoryEntries(
+              restoreEntries.slice(offset, offset + HISTORY_RESTORE_BATCH_MAX_ENTRIES)
+            )
+          );
+        } catch (nextError) {
+          requestError = nextError;
+          break;
+        }
+      }
+      const restoredEntryKeys = new Set(
+        responses
+          .flatMap((response) => response.entries)
+          .filter((entry) => entry.status === "restored")
+          .map(historySelectionKey)
+      );
+      const failedCount = responses.reduce(
+        (count, response) => count + response.failed_count,
+        0
+      );
+      if (responses.length > 0) {
+        setSelectedPayload({
+          action:
+            restoreEntries.length === 1
+              ? "restored_historical_entry"
+              : "restored_historical_entries",
+          requested_count: restoreEntries.length,
+          response: responses.length === 1 ? responses[0] : responses
+        });
+      }
+      setSelectedHistoricalEntries((current) =>
+        current.filter((key) => !restoredEntryKeys.has(key))
+      );
+      await refreshEntries(undefined, { includeHistorical: true });
+      if (requestError) {
+        const message =
+          requestError instanceof Error
+            ? requestError.message
+            : "Failed restoring historical entries";
+        const restoredCount = restoredEntryKeys.size;
+        setError(
+          restoredCount > 0
+            ? `${restoredCount} historical ${restoredCount === 1 ? "item was" : "items were"} restored before a later batch failed. Remaining items stay selected: ${message}`
+            : message
+        );
+      } else if (failedCount > 0) {
+        setError(
+          `${failedCount} historical ${failedCount === 1 ? "item could" : "items could"} not be restored. Items with conflicts remain selected.`
+        );
+      }
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed restoring historical entries");
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  function toggleHistoricalEntrySelection(entry: ExplorerEntry, selected: boolean) {
+    const restoreEntry = historicalRestoreRequest(entry);
+    if (!restoreEntry) {
+      return;
+    }
+    const key = historySelectionKey(restoreEntry);
+    setSelectedHistoricalEntries((current) => {
+      if (selected) {
+        return current.includes(key) ? current : [...current, key];
+      }
+      return current.filter((candidate) => candidate !== key);
+    });
+  }
+
   async function createFolder() {
     if (!canCreateFolder || !mutations?.createFolderMarker) {
       setError("Folder creation is not available on this surface.");
@@ -390,7 +631,7 @@ export function ExplorerSurface({
         marker_key: markerKey,
         response: payload
       });
-      await refreshEntries();
+      await refreshEntries(undefined, { includeHistorical: showHistoricalEntries });
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed creating folder");
     } finally {
@@ -439,7 +680,7 @@ export function ExplorerSurface({
       return;
     }
 
-    const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+    const isPrefix = isExplorerPrefix(entry);
     const targetKey = isPrefix
       ? normalizeExplorerPath(entry.path, true)
       : normalizeExplorerPath(entry.path, false);
@@ -469,7 +710,7 @@ export function ExplorerSurface({
         recursive: isPrefix,
         response: payload
       });
-      await refreshEntries();
+      await refreshEntries(undefined, { includeHistorical: showHistoricalEntries });
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed deleting entry");
     } finally {
@@ -514,7 +755,7 @@ export function ExplorerSurface({
       return;
     }
 
-    const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+    const isPrefix = isExplorerPrefix(entry);
     const fromPath = normalizeExplorerPath(entry.path, isPrefix);
     if (!fromPath) {
       setError("Path must not be empty.");
@@ -585,7 +826,7 @@ export function ExplorerSurface({
           response
         });
       }
-      await refreshEntries();
+      await refreshEntries(undefined, { includeHistorical: showHistoricalEntries });
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed renaming entry");
     } finally {
@@ -634,7 +875,7 @@ export function ExplorerSurface({
       return;
     }
 
-    const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+    const isPrefix = isExplorerPrefix(entry);
     const targetKey = normalizeExplorerPath(entry.path, isPrefix);
     if (!targetKey) {
       setError("Path must not be empty.");
@@ -705,7 +946,7 @@ export function ExplorerSurface({
         target_path: targetPath,
         response
       });
-      await refreshEntries();
+      await refreshEntries(undefined, { includeHistorical: showHistoricalEntries });
       await loadVersionGraph(sourceKey);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed restoring version");
@@ -736,6 +977,27 @@ export function ExplorerSurface({
     });
   }
 
+  const historicalEntries = useMemo(
+    () =>
+      (historyEntriesPayload?.entries ?? [])
+        .filter((entry) => shouldDisplayExplorerEntry(entry, prefix))
+        .sort((left, right) => compareExplorerEntries(left, right, sortField, sortDirection)),
+    [historyEntriesPayload, prefix, sortDirection, sortField]
+  );
+  const historicalEntryKeys = new Set(
+    historicalEntries
+      .map(historicalRestoreRequest)
+      .filter((entry): entry is ExplorerHistoryRestoreEntry => entry != null)
+      .map(historySelectionKey)
+  );
+  const selectedHistoricalEntryKeys = selectedHistoricalEntries.filter((key) =>
+    historicalEntryKeys.has(key)
+  );
+  const selectedHistoricalEntryKeySet = new Set(selectedHistoricalEntryKeys);
+  const selectedHistoricalEntryValues = historicalEntries.filter((entry) => {
+    const restoreEntry = historicalRestoreRequest(entry);
+    return restoreEntry != null && selectedHistoricalEntryKeySet.has(historySelectionKey(restoreEntry));
+  });
   const totalEntryCount = entriesPayload?.total_entry_count ?? entriesPayload?.entry_count ?? 0;
   const pageCount = Math.max(1, Math.ceil(totalEntryCount / EXPLORER_PAGE_SIZE));
   const visibleEntryStart = totalEntryCount === 0 ? 0 : (currentPage - 1) * EXPLORER_PAGE_SIZE + 1;
@@ -838,7 +1100,9 @@ export function ExplorerSurface({
               <Button
                 leftSection={<IconRefresh size={16} />}
                 loading={loading === "entries"}
-                onClick={() => void refreshEntries()}
+                onClick={() =>
+                  void refreshEntries(undefined, { includeHistorical: showHistoricalEntries })
+                }
               >
                 Refresh entries
               </Button>
@@ -858,7 +1122,10 @@ export function ExplorerSurface({
                 label="Depth"
                 min={1}
                 value={depth}
-                onChange={(value) => setDepth(typeof value === "number" && value > 0 ? value : 1)}
+                onChange={(value) => {
+                  const numericValue = typeof value === "number" ? value : Number(value);
+                  setDepth(Number.isFinite(numericValue) && numericValue > 0 ? numericValue : 1);
+                }}
               />
             </Grid.Col>
             <Grid.Col span={{ base: 12, md: 3 }}>
@@ -873,7 +1140,15 @@ export function ExplorerSurface({
                 ]}
                 value={snapshotId ?? ""}
                 onChange={(value) => {
-                  setSnapshotId(value || null);
+                  const nextSnapshotId = value || null;
+                  setSnapshotId(nextSnapshotId);
+                  if (nextSnapshotId != null) {
+                    setShowHistoricalEntries(false);
+                    setHistoryEntriesPayload(null);
+                    setHistoryLoadState("idle");
+                    setHistoryLoadError(null);
+                    setSelectedHistoricalEntries([]);
+                  }
                   setCurrentPage(1);
                 }}
               />
@@ -881,7 +1156,14 @@ export function ExplorerSurface({
           </Grid>
           <Group justify="space-between" align="center">
             <Group gap="sm">
-              <Button onClick={() => void refreshEntries(undefined, { page: 1 })}>
+              <Button
+                onClick={() =>
+                  void refreshEntries(undefined, {
+                    page: 1,
+                    includeHistorical: showHistoricalEntries
+                  })
+                }
+              >
                 Load entries
               </Button>
               <Button
@@ -899,6 +1181,27 @@ export function ExplorerSurface({
               checked={showThumbnails}
               onChange={(event) => setShowThumbnails(event.currentTarget.checked)}
             />
+            {loadHistoricalEntries ? (
+              <Switch
+                label="Show deleted or moved files"
+                checked={showHistoricalEntries && snapshotId == null}
+                disabled={snapshotId != null}
+                onChange={(event) => {
+                  const checked = event.currentTarget.checked;
+                  setShowHistoricalEntries(checked);
+                  setSelectedHistoricalEntries([]);
+                  if (!checked) {
+                    setHistoryEntriesPayload(null);
+                    setHistoryLoadState("idle");
+                    setHistoryLoadError(null);
+                  }
+                  void refreshEntries(undefined, {
+                    page: 1,
+                    includeHistorical: checked
+                  });
+                }}
+              />
+            ) : null}
           </Group>
           {canCreateFolder || quickUpload ? (
             <Grid>
@@ -961,6 +1264,164 @@ export function ExplorerSurface({
           <Text c="dimmed" size="sm">
             {helperText}
           </Text>
+          {showHistoricalEntries && snapshotId == null ? (
+            <Stack gap="xs">
+              <Text fw={600}>Recoverable deleted and moved files</Text>
+              {historyEntriesPayload?.truncated ? (
+                <Alert color="yellow">
+                  Showing the first 1,000 recoverable entries for this prefix. Open a narrower
+                  prefix to find older paths.
+                </Alert>
+              ) : null}
+              {historyLoadState === "failed" ? (
+                <Alert color="red">
+                  {historyLoadError ?? "Unable to load recoverable historical entries."}
+                </Alert>
+              ) : historyLoadState !== "loaded" ? (
+                <Text c="dimmed" size="sm">
+                  Loading historical entries…
+                </Text>
+              ) : historicalEntries.length === 0 ? (
+                <Text c="dimmed" size="sm">
+                  No recoverable deleted or moved files exist at this prefix.
+                </Text>
+              ) : (
+                <Table.ScrollContainer minWidth={640}>
+                  <Table striped highlightOnHover withTableBorder>
+                    <Table.Thead>
+                      <Table.Tr>
+                        {canRestoreHistory ? (
+                          <Table.Th>
+                            <Checkbox
+                              aria-label="Select all historical entries"
+                              checked={
+                                historicalEntryKeys.size > 0 &&
+                                selectedHistoricalEntryKeys.length === historicalEntryKeys.size
+                              }
+                              indeterminate={
+                                selectedHistoricalEntryKeys.length > 0 &&
+                                selectedHistoricalEntryKeys.length < historicalEntryKeys.size
+                              }
+                              disabled={historicalEntryKeys.size === 0}
+                              onChange={(event) => {
+                                setSelectedHistoricalEntries(
+                                  event.currentTarget.checked ? Array.from(historicalEntryKeys) : []
+                                );
+                              }}
+                            />
+                          </Table.Th>
+                        ) : null}
+                        <Table.Th>Path</Table.Th>
+                        <Table.Th>Type</Table.Th>
+                        <Table.Th>Removed</Table.Th>
+                        <Table.Th>Action</Table.Th>
+                      </Table.Tr>
+                    </Table.Thead>
+                    <Table.Tbody>
+                      {historicalEntries.map((entry) => {
+                        const isPrefix = isExplorerPrefix(entry);
+                        const isHistorical = isHistoricalExplorerEntry(entry);
+                        const displayPath = explorerDisplayPath(entry, prefix);
+                        const historicalRestoreEntry = historicalRestoreRequest(entry);
+                        return (
+                          <Table.Tr
+                            key={`${entry.entry_type}:${entry.path}:${entry.restore_version_id ?? ""}`}
+                          >
+                            {canRestoreHistory ? (
+                              <Table.Td>
+                                {isHistorical && historicalRestoreEntry ? (
+                                  <Checkbox
+                                    aria-label={`Select historical entry ${displayPath}`}
+                                    checked={selectedHistoricalEntryKeySet.has(
+                                      historySelectionKey(historicalRestoreEntry)
+                                    )}
+                                    onChange={(event) =>
+                                      toggleHistoricalEntrySelection(
+                                        entry,
+                                        event.currentTarget.checked
+                                      )
+                                    }
+                                  />
+                                ) : null}
+                              </Table.Td>
+                            ) : null}
+                            <Table.Td>
+                              <Code>{displayPath}</Code>
+                            </Table.Td>
+                            <Table.Td>
+                              {isHistorical
+                                ? entry.moved_to_path
+                                  ? `moved to ${entry.moved_to_path}`
+                                  : "deleted"
+                                : "prefix"}
+                            </Table.Td>
+                            <Table.Td>
+                              {formatExplorerModifiedAt(entry.removed_at_unix)}
+                            </Table.Td>
+                            <Table.Td>
+                              {isPrefix ? (
+                                <Button
+                                  size="xs"
+                                  variant="light"
+                                  onClick={() => void readEntry(entry)}
+                                >
+                                  Open
+                                </Button>
+                              ) : (
+                                <Group gap="xs" wrap="nowrap">
+                                  <Button
+                                    size="xs"
+                                    variant="light"
+                                    loading={loading === `read-history:${entry.path}`}
+                                    onClick={() => void readHistoricalEntry(entry)}
+                                  >
+                                    Read
+                                  </Button>
+                                  {canRestoreHistory ? (
+                                    <Button
+                                      size="xs"
+                                      variant="default"
+                                      loading={loading === "restore-history"}
+                                      onClick={() => void restoreHistoricalEntries([entry])}
+                                    >
+                                      Restore
+                                    </Button>
+                                  ) : null}
+                                </Group>
+                              )}
+                            </Table.Td>
+                          </Table.Tr>
+                        );
+                      })}
+                    </Table.Tbody>
+                  </Table>
+                </Table.ScrollContainer>
+              )}
+            </Stack>
+          ) : null}
+          {canRestoreHistory && selectedHistoricalEntryValues.length > 0 ? (
+            <Group justify="space-between" align="center">
+              <Text size="sm">
+                {selectedHistoricalEntryValues.length} historical {selectedHistoricalEntryValues.length === 1 ? "item" : "items"} selected
+              </Text>
+              <Group gap="xs">
+                <Button
+                  size="sm"
+                  variant="default"
+                  onClick={() => setSelectedHistoricalEntries([])}
+                >
+                  Clear selection
+                </Button>
+                <Button
+                  size="sm"
+                  loading={loading === "restore-history"}
+                  onClick={() => void restoreHistoricalEntries(selectedHistoricalEntryValues)}
+                >
+                  Restore selected
+                </Button>
+              </Group>
+            </Group>
+          ) : null}
           <Table.ScrollContainer minWidth={720}>
             <Table striped highlightOnHover withTableBorder>
               <Table.Thead>
@@ -989,7 +1450,7 @@ export function ExplorerSurface({
               </Table.Thead>
               <Table.Tbody>
                 {sortedEntries.map((entry) => {
-                  const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+                  const isPrefix = isExplorerPrefix(entry);
                   const displayPath = explorerDisplayPath(entry, prefix);
                   const historyTargetKey = normalizeExplorerPath(entry.path, isPrefix);
                   const browserMediaIndex = isPrefix ? null : browserMediaIndexByPath.get(entry.path) ?? null;
@@ -1013,9 +1474,13 @@ export function ExplorerSurface({
                       <Table.Td>
                         <Code>{displayPath}</Code>
                       </Table.Td>
-                      <Table.Td>{isPrefix ? "prefix" : entry.entry_type}</Table.Td>
+                      <Table.Td>
+                        {isPrefix ? "prefix" : entry.entry_type}
+                      </Table.Td>
                       <Table.Td>{formatExplorerSize(isPrefix ? null : entry.size_bytes)}</Table.Td>
-                      <Table.Td>{formatExplorerModifiedAt(entry.modified_at_unix)}</Table.Td>
+                      <Table.Td>
+                        {formatExplorerModifiedAt(entry.modified_at_unix)}
+                      </Table.Td>
                       <Table.Td>
                         {isPrefix ? (
                           <Group gap="xs" wrap="nowrap">
@@ -1329,8 +1794,59 @@ function explorerServerSortOrder(
   }
 }
 
+function isExplorerPrefix(entry: ExplorerEntry): boolean {
+  return (
+    entry.entry_type === "prefix" ||
+    (!isHistoricalExplorerEntry(entry) && entry.path.endsWith("/"))
+  );
+}
+
+function isHistoricalExplorerEntry(entry: ExplorerEntry): boolean {
+  return entry.entry_type === "historical";
+}
+
+function historySelectionKey(entry: ExplorerHistoryRestoreEntry): string {
+  return `${entry.path}\u0000${entry.restore_source_path}\u0000${entry.restore_version_id}`;
+}
+
+function compareExplorerEntries(
+  left: ExplorerEntry,
+  right: ExplorerEntry,
+  field: ExplorerSortField,
+  direction: ExplorerSortDirection
+): number {
+  let comparison: number;
+  switch (field) {
+    case "path":
+      comparison = left.path.localeCompare(right.path);
+      break;
+    case "type":
+      comparison = explorerEntryTypeLabel(left).localeCompare(explorerEntryTypeLabel(right));
+      break;
+    case "size":
+      comparison = (left.size_bytes ?? -1) - (right.size_bytes ?? -1);
+      break;
+    case "modified":
+      comparison =
+        (left.modified_at_unix ?? left.removed_at_unix ?? -1) -
+        (right.modified_at_unix ?? right.removed_at_unix ?? -1);
+      break;
+  }
+  if (comparison === 0) {
+    comparison = left.path.localeCompare(right.path);
+  }
+  return direction === "asc" ? comparison : -comparison;
+}
+
+function explorerEntryTypeLabel(entry: ExplorerEntry): string {
+  if (isHistoricalExplorerEntry(entry)) {
+    return entry.moved_to_path ? "moved" : "deleted";
+  }
+  return isExplorerPrefix(entry) ? "prefix" : entry.entry_type;
+}
+
 function shouldDisplayExplorerEntry(entry: ExplorerEntry, prefix: string): boolean {
-  const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+  const isPrefix = isExplorerPrefix(entry);
   const normalizedPrefix = normalizeExplorerPrefix(prefix);
   if (!normalizedPrefix) {
     return true;
@@ -1354,7 +1870,7 @@ function shouldDisplayExplorerEntry(entry: ExplorerEntry, prefix: string): boole
 }
 
 function explorerDisplayPath(entry: ExplorerEntry, prefix: string): string {
-  const isPrefix = entry.entry_type === "prefix" || entry.path.endsWith("/");
+  const isPrefix = isExplorerPrefix(entry);
   const normalizedPrefix = normalizeExplorerPrefix(prefix);
   const normalizedPath = normalizeExplorerPath(entry.path, isPrefix);
 
@@ -1486,7 +2002,7 @@ function buildExplorerEntryLightboxItem(
     | ((key: string, snapshotId: string | null, versionId?: string | null) => string | null)
     | undefined
 ): MediaLightboxItem | null {
-  if (!getDownloadUrl || entry.entry_type === "prefix" || entry.path.endsWith("/")) {
+  if (!getDownloadUrl || isExplorerPrefix(entry) || isHistoricalExplorerEntry(entry)) {
     return null;
   }
 
