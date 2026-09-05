@@ -10233,6 +10233,17 @@ impl PersistentStore {
                 sources.len()
             );
         }
+        let touched_paths = restore_requests
+            .iter()
+            .map(|(_, _, _, target_path)| target_path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut before_bindings = HashMap::with_capacity(touched_paths.len());
+        for path in &touched_paths {
+            before_bindings.insert(path.clone(), self.current_state_binding(path).await?);
+        }
+        if !touched_paths.is_empty() {
+            self.maybe_rotate_snapshot_batch(&touched_paths).await?;
+        }
         let mut results = Vec::with_capacity(restore_requests.len());
 
         for ((source_path, _version_id, _source_object_id, target_path), source) in
@@ -10255,7 +10266,7 @@ impl PersistentStore {
                         source.clone(),
                         source_path,
                         target_path,
-                        true,
+                        false,
                         false,
                     )
                     .await
@@ -10263,6 +10274,11 @@ impl PersistentStore {
                 None => Ok(PathMutationResult::SourceMissing),
             };
             results.push(result);
+        }
+
+        let changed_paths = self.changed_paths_after_bindings(&before_bindings).await?;
+        if !changed_paths.is_empty() {
+            self.record_snapshot_batch(changed_paths, unix_ts()).await?;
         }
 
         Ok(results)

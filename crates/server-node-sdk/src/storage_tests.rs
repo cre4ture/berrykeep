@@ -6821,6 +6821,18 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
         .tombstone_object("docs/restored.txt", PutOptions::default())
         .await
         .unwrap();
+    let also_restored = store
+        .put_object_versioned(
+            "docs/also-restored.txt",
+            Bytes::from_static(b"also restored content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("docs/also-restored.txt", PutOptions::default())
+        .await
+        .unwrap();
     let broken = store
         .put_object_versioned(
             "docs/broken.txt",
@@ -6845,6 +6857,12 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
             "docs/restored.txt".to_string(),
         ),
         (
+            "docs/also-restored.txt".to_string(),
+            also_restored.version_id,
+            None,
+            "docs/also-restored.txt".to_string(),
+        ),
+        (
             "docs/broken.txt".to_string(),
             broken.version_id,
             None,
@@ -6864,7 +6882,11 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
         results.first(),
         Some(Ok(PathMutationResult::Applied))
     ));
-    assert!(results.get(1).is_some_and(Result::is_err));
+    assert!(matches!(
+        results.get(1),
+        Some(Ok(PathMutationResult::Applied))
+    ));
+    assert!(results.get(2).is_some_and(Result::is_err));
     assert_eq!(
         store
             .get_object("docs/restored.txt", None, None, ObjectReadMode::Preferred)
@@ -6873,6 +6895,29 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
             .as_ref(),
         b"restored content"
     );
+    assert_eq!(
+        store
+            .get_object(
+                "docs/also-restored.txt",
+                None,
+                None,
+                ObjectReadMode::Preferred,
+            )
+            .await
+            .unwrap()
+            .as_ref(),
+        b"also restored content"
+    );
+    let snapshot_id = store
+        .active_snapshot_batch_id_for_test()
+        .expect("restored history batch should record one snapshot batch");
+    let snapshot = store
+        .load_snapshot_manifest(&snapshot_id)
+        .await
+        .unwrap()
+        .expect("restored history batch snapshot should persist");
+    assert!(snapshot.objects.contains_key("docs/restored.txt"));
+    assert!(snapshot.objects.contains_key("docs/also-restored.txt"));
 
     let _ = fs::remove_dir_all(root).await;
 }
