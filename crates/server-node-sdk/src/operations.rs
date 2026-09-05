@@ -1816,11 +1816,7 @@ mod tests {
             },
             0.5,
         );
-        assert!(
-            value.longitude.abs() > 179.5,
-            "longitude={}",
-            value.longitude
-        );
+        assert!(value.longitude.abs() > 179.5);
     }
 
     #[test]
