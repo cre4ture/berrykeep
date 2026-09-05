@@ -155,6 +155,10 @@ pub struct CachedMediaMetadata {
     pub height: Option<u32>,
     pub orientation: Option<u16>,
     pub taken_at_unix: Option<u64>,
+    /// Whether `taken_at_unix` came with an explicit UTC offset. A missing
+    /// offset is a floating local wall-clock value, not a trustworthy UTC time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_at_timezone_known: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_encoded_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -772,6 +776,7 @@ fn base_media_metadata(
         height: None,
         orientation: None,
         taken_at_unix: None,
+        taken_at_timezone_known: None,
         date_encoded_unix: None,
         duration_millis: None,
         frame_rate_millihertz: None,
@@ -1578,7 +1583,8 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
     };
 
     let (width, height) = image_dimensions_from_reader(reader, format)?;
-    let (orientation, gps, taken_at_unix, photo) = extract_exif_fields_from_reader(reader);
+    let (orientation, gps, taken_at_unix, taken_at_timezone_known, photo) =
+        extract_exif_fields_from_reader(reader);
     let mut metadata = CachedMediaMetadata {
         status: MediaCacheStatus::Ready,
         media_type: Some("image".to_string()),
@@ -1587,6 +1593,7 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
         height: Some(height),
         orientation,
         taken_at_unix,
+        taken_at_timezone_known,
         gps,
         photo,
         ..base_media_metadata(
@@ -1918,7 +1925,7 @@ fn render_image_thumbnail_payload(
         return Ok(None);
     }
 
-    let (orientation, _, _, _) = extract_exif_fields_from_reader(&mut reader);
+    let (orientation, _, _, _, _) = extract_exif_fields_from_reader(&mut reader);
     let rendered =
         match render_thumbnail_from_reader(&mut reader, format, orientation, profile, image_limits)
         {
@@ -1960,14 +1967,15 @@ fn extract_exif_fields_from_reader<R: BufRead + Seek>(
     Option<u16>,
     Option<MediaGpsCoordinates>,
     Option<u64>,
+    Option<bool>,
     Option<CachedPhotoMetadata>,
 ) {
     if reader.seek(SeekFrom::Start(0)).is_err() {
-        return (None, None, None, None);
+        return (None, None, None, None, None);
     }
     let exif = match ExifReader::new().read_from_container(reader) {
         Ok(value) => value,
-        Err(_) => return (None, None, None, None),
+        Err(_) => return (None, None, None, None, None),
     };
 
     let orientation = exif
@@ -2002,10 +2010,18 @@ fn extract_exif_fields_from_reader<R: BufRead + Seek>(
         _ => None,
     };
 
-    let taken_at_unix = exif_taken_at_unix(&exif);
+    let (taken_at_unix, taken_at_timezone_known) = exif_capture_time(&exif)
+        .map(|(unix, timezone_known)| (Some(unix), Some(timezone_known)))
+        .unwrap_or((None, None));
     let photo = exif_photo_metadata(&exif);
 
-    (orientation, gps, taken_at_unix, photo)
+    (
+        orientation,
+        gps,
+        taken_at_unix,
+        taken_at_timezone_known,
+        photo,
+    )
 }
 
 fn exif_photo_metadata(exif: &exif::Exif) -> Option<CachedPhotoMetadata> {
@@ -2063,24 +2079,27 @@ fn exif_first_f64(exif: &exif::Exif, tag: Tag) -> Option<f64> {
     (value.is_finite() && value > 0.0).then_some(value)
 }
 
-fn exif_taken_at_unix(exif: &exif::Exif) -> Option<u64> {
-    parse_exif_taken_at(
-        exif_ascii_string(exif.get_field(Tag::DateTimeOriginal, In::PRIMARY)),
-        exif_ascii_string(exif.get_field(Tag::OffsetTimeOriginal, In::PRIMARY))
-            .or_else(|| exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY))),
-    )
-    .or_else(|| {
-        parse_exif_taken_at(
+fn exif_capture_time(exif: &exif::Exif) -> Option<(u64, bool)> {
+    [
+        (
+            exif_ascii_string(exif.get_field(Tag::DateTimeOriginal, In::PRIMARY)),
+            exif_ascii_string(exif.get_field(Tag::OffsetTimeOriginal, In::PRIMARY))
+                .or_else(|| exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY))),
+        ),
+        (
             exif_ascii_string(exif.get_field(Tag::DateTimeDigitized, In::PRIMARY)),
             exif_ascii_string(exif.get_field(Tag::OffsetTimeDigitized, In::PRIMARY))
                 .or_else(|| exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY))),
-        )
-    })
-    .or_else(|| {
-        parse_exif_taken_at(
+        ),
+        (
             exif_ascii_string(exif.get_field(Tag::DateTime, In::PRIMARY)),
             exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY)),
-        )
+        ),
+    ]
+    .into_iter()
+    .find_map(|(datetime, offset)| {
+        parse_exif_taken_at(datetime, offset)
+            .map(|unix| (unix, offset.and_then(parse_exif_offset).is_some()))
     })
 }
 

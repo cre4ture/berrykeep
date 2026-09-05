@@ -18811,6 +18811,9 @@ async fn build_test_state(
             manual_repair_activity: Arc::new(Mutex::new(
                 super::ManualRepairActionActivityRuntime::default(),
             )),
+            operations_activity: Arc::new(Mutex::new(
+                super::operations::OperationActivityRuntime::default(),
+            )),
             autonomous_post_write_repair: Arc::new(Mutex::new(
                 super::AutonomousPostWriteRepairRuntime::default(),
             )),
