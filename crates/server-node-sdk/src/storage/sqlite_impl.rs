@@ -112,8 +112,10 @@ impl SqliteMetadataStore {
     /// - Cache hit, fresh: returned as-is, nothing scheduled.
     /// - Cache hit, stale: returned as-is; a background refresh is scheduled unless one is
     ///   already running for this scope.
-    /// - Cache miss: computed synchronously (once) so the first caller for a scope still gets a
-    ///   real answer, then cached for everyone after it.
+    /// - Capture-filtered cache miss with a matching unfiltered value: that approximation is
+    ///   returned immediately while the exact summary is computed in the background.
+    /// - Other cache misses: computed synchronously (once) so the first caller for a scope still
+    ///   gets a real answer, then cached for everyone after it.
     async fn gallery_map_summary(
         &self,
         scope: GallerySummaryScope,
@@ -128,36 +130,18 @@ impl SqliteMetadataStore {
                     GallerySummaryRefreshStatus::default(),
                 ));
             }
-            if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
-                let reader = self.gallery_summary_reader.clone();
-                let cache = self.gallery_map_summary_cache.clone();
-                let refresh_scope = scope.clone();
-                let estimate = Some(cached.total_entry_count);
-                tokio::spawn(async move {
-                    let query_scope = refresh_scope.clone();
-                    let result = reader
-                        .call(move |db| {
-                            Ok(query_gallery_map_summary_from_db(
-                                db,
-                                &query_scope,
-                                estimate,
-                                Some(&progress),
-                            ))
-                        })
-                        .await
-                        .map_err(map_tokio_rusqlite_error)
-                        .and_then(|value| value);
-                    match result {
-                        Ok(value) => cache.store(refresh_scope.clone(), value),
-                        Err(error) => {
-                            warn!(error = %error, "failed to refresh gallery map summary in background")
-                        }
-                    }
-                    cache.finish_refresh(&refresh_scope);
-                });
-            }
+            self.start_gallery_map_summary_refresh(&scope, Some(cached.total_entry_count));
             let status = self.gallery_map_summary_cache.status(&scope);
             return Ok((cached.total_entry_count, cached.media_summary, status));
+        }
+
+        if let Some(fallback) = self
+            .gallery_map_summary_cache
+            .cached_unfiltered_fallback(&scope)
+        {
+            self.start_gallery_map_summary_refresh(&scope, Some(fallback.total_entry_count));
+            let status = self.gallery_map_summary_cache.status(&scope);
+            return Ok((fallback.total_entry_count, fallback.media_summary, status));
         }
 
         let compute_scope = scope.clone();
@@ -170,6 +154,41 @@ impl SqliteMetadataStore {
             value.media_summary,
             GallerySummaryRefreshStatus::default(),
         ))
+    }
+
+    fn start_gallery_map_summary_refresh(
+        &self,
+        scope: &GallerySummaryScope,
+        estimate: Option<usize>,
+    ) {
+        let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(scope) else {
+            return;
+        };
+        let reader = self.gallery_summary_reader.clone();
+        let cache = self.gallery_map_summary_cache.clone();
+        let refresh_scope = scope.clone();
+        tokio::spawn(async move {
+            let query_scope = refresh_scope.clone();
+            let result = reader
+                .call(move |db| {
+                    Ok(query_gallery_map_summary_from_db(
+                        db,
+                        &query_scope,
+                        estimate,
+                        Some(&progress),
+                    ))
+                })
+                .await
+                .map_err(map_tokio_rusqlite_error)
+                .and_then(|value| value);
+            match result {
+                Ok(value) => cache.store(refresh_scope.clone(), value),
+                Err(error) => {
+                    warn!(error = %error, "failed to refresh gallery map summary in background")
+                }
+            }
+            cache.finish_refresh(&refresh_scope);
+        });
     }
 
     async fn write<T, F>(&self, f: F) -> Result<T>

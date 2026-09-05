@@ -721,6 +721,68 @@ async fn gallery_map_summary_cache_serves_stale_value_and_refreshes_in_backgroun
     let _ = std::fs::remove_file(metadata_db_path);
 }
 
+#[tokio::test]
+async fn gallery_map_capture_summary_miss_uses_unfiltered_fallback() {
+    let metadata_db_path = sqlite_test_db_path("gallery-map-capture-summary-fallback");
+    let store = SqliteMetadataStore::open(&metadata_db_path)
+        .await
+        .expect("sqlite metadata store should open");
+    store
+        .write_tx(|db| {
+            insert_gallery_fixture(db, "gallery/a.jpg", "image", 1, Some(47.4), Some(8.5));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let viewport = GalleryViewportBounds {
+        south: -90.0,
+        west: -180.0,
+        north: 90.0,
+        east: 180.0,
+    };
+    let query = gallery_map_query(viewport, 1024, 512);
+    let unfiltered = store
+        .query_gallery_map_clusters(&query)
+        .await
+        .unwrap()
+        .expect("gallery map clusters should be available");
+    assert_eq!(unfiltered.total_entry_count, 1);
+
+    let filtered_query = GalleryMapClusterQuery {
+        captured_from_unix: Some(2),
+        ..query
+    };
+    let fallback = store
+        .query_gallery_map_clusters(&filtered_query)
+        .await
+        .unwrap()
+        .expect("capture-filtered gallery map clusters should be available");
+    assert_eq!(fallback.total_entry_count, 1);
+    assert_eq!(fallback.visible_geotagged_count, 0);
+    assert!(fallback.summary_status.refreshing);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let refreshed = store
+            .query_gallery_map_clusters(&filtered_query)
+            .await
+            .unwrap()
+            .expect("capture-filtered gallery map clusters should be available");
+        if refreshed.total_entry_count == 0 && !refreshed.summary_status.refreshing {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background capture-filtered summary refresh did not complete in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    drop(store);
+    let _ = std::fs::remove_file(metadata_db_path);
+}
+
 #[test]
 fn gallery_map_cluster_entries_are_paginated_in_capture_order() {
     let db = Connection::open_in_memory().expect("in-memory sqlite should open");

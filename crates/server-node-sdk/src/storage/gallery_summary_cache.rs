@@ -72,8 +72,9 @@ impl GallerySummaryProgress {
 /// `map/clusters` endpoint used to recompute with an unbounded aggregate query on every single
 /// viewport pan/zoom. A cached value is served immediately even once stale; staleness only
 /// triggers a single background refresh per scope, never a synchronous recompute on the request
-/// path. The very first request for a scope still pays for one synchronous computation, since
-/// there is nothing to serve from cache yet.
+/// path. A capture-filtered miss can temporarily reuse the corresponding unfiltered summary while
+/// its exact value is computed in the background. Other first requests still pay for one
+/// synchronous computation, since there is nothing useful to serve from cache yet.
 pub(crate) struct GallerySummaryCache {
     values: Mutex<GallerySummaryCacheValues>,
     trackers: Mutex<HashMap<GallerySummaryScope, Arc<GallerySummaryRefreshTracker>>>,
@@ -142,6 +143,22 @@ impl GallerySummaryCache {
             values.touch(scope);
         }
         value
+    }
+
+    /// Returns the same gallery scope without capture bounds as a temporary approximation for a
+    /// capture-filtered cache miss. Callers must expose the value as refreshing rather than as an
+    /// exact result.
+    pub(crate) fn cached_unfiltered_fallback(
+        &self,
+        scope: &GallerySummaryScope,
+    ) -> Option<GallerySummaryCacheValue> {
+        if scope.captured_from_unix.is_none() && scope.captured_until_unix.is_none() {
+            return None;
+        }
+        let mut unfiltered_scope = scope.clone();
+        unfiltered_scope.captured_from_unix = None;
+        unfiltered_scope.captured_until_unix = None;
+        self.cached(&unfiltered_scope)
     }
 
     pub(crate) fn store(&self, scope: GallerySummaryScope, value: GallerySummaryCacheValue) {
@@ -251,6 +268,21 @@ mod tests {
                 .cached(&capture_scope(GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn capture_range_can_reuse_its_unfiltered_scope_as_a_fallback() {
+        let cache = GallerySummaryCache::new();
+        cache.store(scope(0), value(7));
+
+        assert_eq!(
+            cache
+                .cached_unfiltered_fallback(&capture_scope(0))
+                .expect("capture scope should reuse the matching unfiltered value")
+                .revision,
+            7
+        );
+        assert!(cache.cached_unfiltered_fallback(&scope(0)).is_none());
     }
 
     #[test]
