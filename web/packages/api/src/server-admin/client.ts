@@ -61,6 +61,12 @@ import type {
   NodeConnectionPriorityView,
   NodeDescriptor,
   NodeEnrollmentPackage,
+  OperationCatalogResponse,
+  OperationRun,
+  OperationRunHistoryResponse,
+  OperationRunResultsResponse,
+  OperationRunStartRequest,
+  OperationRunStartResponse,
   NaturalEarthImportJobView,
   NaturalEarthImportProfile,
   NaturalEarthImportStatusResponse,
@@ -170,6 +176,73 @@ export async function getAdminSessionStatus(
   adminTokenOverride?: string
 ): Promise<AdminSessionStatus> {
   return fetchAdminJson<AdminSessionStatus>(apiV1("/auth/admin/session"), { adminTokenOverride });
+}
+
+export async function getOperations(
+  adminTokenOverride?: string
+): Promise<OperationCatalogResponse> {
+  return fetchAdminJson<OperationCatalogResponse>(apiV1("/auth/operations"), {
+    adminTokenOverride
+  });
+}
+
+export async function startOperationRun(
+  operationId: string,
+  request: OperationRunStartRequest,
+  adminTokenOverride?: string
+): Promise<OperationRunStartResponse> {
+  return fetchAdminJson<OperationRunStartResponse>(
+    apiV1(`/auth/operations/${encodeURIComponent(operationId)}/runs`),
+    {
+      method: "POST",
+      body: request,
+      adminTokenOverride
+    }
+  );
+}
+
+export async function getOperationRun(
+  runId: string,
+  adminTokenOverride?: string
+): Promise<OperationRun> {
+  return fetchAdminJson<OperationRun>(
+    apiV1(`/auth/operation-runs/${encodeURIComponent(runId)}`),
+    { adminTokenOverride }
+  );
+}
+
+export async function getOperationRunResults(
+  runId: string,
+  options?: { limit?: number },
+  adminTokenOverride?: string
+): Promise<OperationRunResultsResponse> {
+  const query = new URLSearchParams();
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    query.set("limit", String(Math.max(1, Math.min(1_000, Math.trunc(options.limit)))));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return fetchAdminJson<OperationRunResultsResponse>(
+    `${apiV1(`/auth/operation-runs/${encodeURIComponent(runId)}/results`)}${suffix}`,
+    { adminTokenOverride }
+  );
+}
+
+export async function getOperationRunHistory(
+  options?: { operationId?: string; limit?: number },
+  adminTokenOverride?: string
+): Promise<OperationRunHistoryResponse> {
+  const query = new URLSearchParams();
+  if (options?.operationId?.trim()) {
+    query.set("operation_id", options.operationId.trim());
+  }
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    query.set("limit", String(Math.max(1, Math.min(200, Math.trunc(options.limit)))));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return fetchAdminJson<OperationRunHistoryResponse>(
+    `${apiV1("/auth/operation-runs/history")}${suffix}`,
+    { adminTokenOverride }
+  );
 }
 
 export async function listAdminWebServices(

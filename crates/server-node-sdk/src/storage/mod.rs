@@ -75,7 +75,10 @@ use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use common::content_fingerprint::content_fingerprint_from_chunk_refs;
 use common::range_chunk_cache::RangeChunkCache;
-use common::xmp::{XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media};
+use common::xmp::{
+    XmpGeoInference, XmpGeoLocation, XmpSidecar, is_sidecar_key, media_key_for_sidecar,
+    sidecar_key_for_media,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -105,7 +108,10 @@ use self::sqlite_impl::SqliteMetadataStore;
 #[cfg(feature = "turso-metadata")]
 use self::turso_impl::TursoMetadataStore;
 use super::cluster::NodeDescriptor;
-use super::{DataScrubRunRecord, ManualRepairActionRunRecord, RepairRunRecord};
+use super::{
+    DataScrubRunRecord, ManualRepairActionRunRecord, RepairRunRecord,
+    operations::{OperationResultChunk, OperationRun},
+};
 
 pub use data_scrub::DataScrubReport;
 pub use media_cache::{
@@ -117,8 +123,10 @@ pub use media_tools::{HostDependencyReport, HostDependencyStatus};
 pub(crate) use data_scrub::DataScrubber;
 #[cfg(test)]
 pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
-pub(crate) use gallery_capture_time::effective_gallery_captured_at_unix;
 pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
+pub(crate) use gallery_capture_time::{
+    effective_gallery_captured_at_unix, filename_captured_at_unix,
+};
 pub(super) use gallery_labels::{
     GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryLabelFilter,
     decode_gallery_labels, encode_gallery_labels, gallery_label_filter_matches,
@@ -2355,6 +2363,14 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["run_id", "record_json"],
     },
     MetadataDbLogicalTableSpec {
+        table: "operation_runs",
+        tracked_columns: &["run_id", "operation_id", "record_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "operation_result_chunks",
+        tracked_columns: &["run_id", "chunk_id", "result_type", "payload_json"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "data_scrub_run_history",
         tracked_columns: &["run_id", "record_json"],
     },
@@ -2636,6 +2652,24 @@ trait MetadataStore: Send + Sync {
         &self,
         finished_before_unix: u64,
     ) -> Result<()>;
+    async fn list_operation_runs(
+        &self,
+        operation_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationRun>>;
+    async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>>;
+    async fn persist_operation_run(&self, run: &OperationRun) -> Result<()>;
+    async fn interrupt_unfinished_operation_runs(
+        &self,
+        finished_at_unix: u64,
+        termination_reason: &str,
+    ) -> Result<usize>;
+    async fn list_operation_result_chunks(
+        &self,
+        run_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationResultChunk>>;
+    async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()>;
     async fn list_data_scrub_run_history(
         &self,
         limit: Option<usize>,
@@ -4142,7 +4176,7 @@ impl PersistentStore {
             {
                 continue;
             }
-            self.apply_sidecar_labels(&media_key, sidecar_manifest_hash)
+            self.apply_sidecar_metadata(&media_key, sidecar_manifest_hash)
                 .await?;
         }
 
@@ -4491,6 +4525,53 @@ impl PersistentStore {
     ) -> Result<()> {
         self.metadata_store
             .prune_manual_repair_action_run_history_before(finished_before_unix)
+            .await
+    }
+
+    pub(crate) async fn list_operation_runs(
+        &self,
+        operation_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationRun>> {
+        self.metadata_store
+            .list_operation_runs(operation_id, limit)
+            .await
+    }
+
+    pub(crate) async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>> {
+        self.metadata_store.load_operation_run(run_id).await
+    }
+
+    pub(crate) async fn persist_operation_run(&self, run: &OperationRun) -> Result<()> {
+        self.metadata_store.persist_operation_run(run).await
+    }
+
+    pub(crate) async fn interrupt_unfinished_operation_runs(
+        &self,
+        finished_at_unix: u64,
+        termination_reason: &str,
+    ) -> Result<usize> {
+        self.metadata_store
+            .interrupt_unfinished_operation_runs(finished_at_unix, termination_reason)
+            .await
+    }
+
+    pub(crate) async fn list_operation_result_chunks(
+        &self,
+        run_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationResultChunk>> {
+        self.metadata_store
+            .list_operation_result_chunks(run_id, limit)
+            .await
+    }
+
+    pub(crate) async fn persist_operation_result_chunk(
+        &self,
+        chunk: &OperationResultChunk,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_operation_result_chunk(chunk)
             .await
     }
 
@@ -9112,7 +9193,7 @@ impl PersistentStore {
             .lock()
             .unwrap()
             .insert(key.to_string(), entry);
-        self.sync_sidecar_labels_after_upsert(key, &manifest_hash)
+        self.sync_sidecar_metadata_after_upsert(key, &manifest_hash)
             .await
     }
 
@@ -9122,7 +9203,7 @@ impl PersistentStore {
             .lock()
             .unwrap()
             .remove(&key.to_string());
-        self.sync_sidecar_labels_after_removal(key).await
+        self.sync_sidecar_metadata_after_removal(key).await
     }
 
     /// Makes the XMP sidecar of `media_key` carry exactly `labels`.
@@ -9152,6 +9233,51 @@ impl PersistentStore {
 
         let mut sidecar = stored.unwrap_or_else(XmpSidecar::new_empty);
         sidecar.set_keywords(labels);
+        self.write_media_sidecar(media_key, sidecar).await
+    }
+
+    /// Applies GPS and BerryKeep provenance through the same lossless XMP
+    /// read/modify/write path as label edits. Original media bytes are never
+    /// touched.
+    pub async fn set_media_geolocation(
+        &mut self,
+        media_key: &str,
+        inference: XmpGeoInference,
+    ) -> Result<Option<PutResult>> {
+        if is_sidecar_key(media_key) {
+            bail!("GPS belongs to a media object, not to the sidecar {media_key}");
+        }
+        let sidecar_key = sidecar_key_for_media(media_key);
+        let mut sidecar = self
+            .load_stored_sidecar(&sidecar_key)
+            .await?
+            .unwrap_or_else(XmpSidecar::new_empty);
+        if sidecar.geo_location().is_some() {
+            bail!("refusing to overwrite existing XMP GPS metadata for {media_key}");
+        }
+        sidecar.set_geo_inference(inference)?;
+        self.write_media_sidecar(media_key, sidecar).await
+    }
+
+    /// Reads the current XMP GPS overlay for one media object without changing
+    /// the object. Operations use this for apply-time revalidation.
+    pub(crate) async fn media_sidecar_geo_location(
+        &self,
+        media_key: &str,
+    ) -> Result<Option<XmpGeoLocation>> {
+        let sidecar_key = sidecar_key_for_media(media_key);
+        Ok(self
+            .load_stored_sidecar(&sidecar_key)
+            .await?
+            .and_then(|sidecar| sidecar.geo_location()))
+    }
+
+    async fn write_media_sidecar(
+        &mut self,
+        media_key: &str,
+        sidecar: XmpSidecar,
+    ) -> Result<Option<PutResult>> {
+        let sidecar_key = sidecar_key_for_media(media_key);
         let bytes = sidecar
             .to_bytes()
             .with_context(|| format!("failed to serialize the XMP sidecar {sidecar_key}"))?;
@@ -9161,7 +9287,6 @@ impl PersistentStore {
             }
             .into());
         }
-
         self.put_object_versioned(&sidecar_key, Bytes::from(bytes), PutOptions::default())
             .await
             .map(Some)
@@ -9212,10 +9337,14 @@ impl PersistentStore {
     /// the labels up from the sidecar that is already stored. Without the second
     /// direction a sidecar uploaded ahead of its image would be dropped
     /// silently, because the projection row it targets does not exist yet.
-    async fn sync_sidecar_labels_after_upsert(&self, key: &str, manifest_hash: &str) -> Result<()> {
+    async fn sync_sidecar_metadata_after_upsert(
+        &self,
+        key: &str,
+        manifest_hash: &str,
+    ) -> Result<()> {
         match media_key_for_sidecar(key) {
-            Some(media_key) => self.apply_sidecar_labels(&media_key, manifest_hash).await,
-            None => self.apply_stored_sidecar_labels(key).await,
+            Some(media_key) => self.apply_sidecar_metadata(&media_key, manifest_hash).await,
+            None => self.apply_stored_sidecar_metadata(key).await,
         }
     }
 
@@ -9223,7 +9352,7 @@ impl PersistentStore {
     ///
     /// Removing a media object needs no counterpart: its projection row, and
     /// with it the label column, is deleted along with the object.
-    async fn sync_sidecar_labels_after_removal(&self, key: &str) -> Result<()> {
+    async fn sync_sidecar_metadata_after_removal(&self, key: &str) -> Result<()> {
         let Some(media_key) = media_key_for_sidecar(key) else {
             return Ok(());
         };
@@ -9239,7 +9368,7 @@ impl PersistentStore {
     /// object cache does not retain misses. Gating on the media type therefore
     /// keeps the common ingest of non-media files from paying a sidecar lookup
     /// that can never resolve to a visible label.
-    async fn apply_stored_sidecar_labels(&self, media_key: &str) -> Result<()> {
+    async fn apply_stored_sidecar_metadata(&self, media_key: &str) -> Result<()> {
         if gallery_media_type_for_path(media_key).is_none() {
             return Ok(());
         }
@@ -9247,20 +9376,25 @@ impl PersistentStore {
         let Some(sidecar) = self.current_object_entry(&sidecar_key).await? else {
             return Ok(());
         };
-        self.apply_sidecar_labels(media_key, &sidecar.manifest_hash)
+        self.apply_sidecar_metadata(media_key, &sidecar.manifest_hash)
             .await
     }
 
     /// Stores the keywords of the given sidecar object on the projection row of
     /// `media_key`.
-    async fn apply_sidecar_labels(&self, media_key: &str, manifest_hash: &str) -> Result<()> {
+    async fn apply_sidecar_metadata(&self, media_key: &str, manifest_hash: &str) -> Result<()> {
         if gallery_media_type_for_path(media_key).is_none() {
             return Ok(());
         }
-        let Some(keywords) = self.read_sidecar_keywords(media_key, manifest_hash).await else {
+        let Some(sidecar) = self.read_sidecar(media_key, manifest_hash).await else {
             return Ok(());
         };
-        self.set_gallery_object_labels(media_key, &keywords).await
+        self.set_gallery_object_labels(media_key, sidecar.keywords())
+            .await?;
+        if let Some(location) = sidecar.geo_location() {
+            self.apply_sidecar_gps(media_key, location).await?;
+        }
+        Ok(())
     }
 
     /// Reads the keywords of a sidecar object, or `None` when the sidecar cannot
@@ -9270,11 +9404,7 @@ impl PersistentStore {
     /// expected input rather than a storage fault: it is reported and the
     /// projection is left untouched. Aborting here would fail the upload of a
     /// file whose own bytes are perfectly fine.
-    async fn read_sidecar_keywords(
-        &self,
-        media_key: &str,
-        manifest_hash: &str,
-    ) -> Option<Vec<String>> {
+    async fn read_sidecar(&self, media_key: &str, manifest_hash: &str) -> Option<XmpSidecar> {
         let bytes = match self.read_sidecar_bytes(manifest_hash).await {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -9289,7 +9419,7 @@ impl PersistentStore {
         };
 
         match XmpSidecar::parse(&bytes) {
-            Ok(sidecar) => Some(sidecar.keywords().to_vec()),
+            Ok(sidecar) => Some(sidecar),
             Err(err) => {
                 warn!(
                     media_key,
@@ -9300,6 +9430,42 @@ impl PersistentStore {
                 None
             }
         }
+    }
+
+    /// Merges an XMP GPS overlay into the existing media cache record. The
+    /// cache write refreshes the gallery/map projection for this fingerprint;
+    /// no library-wide media rescan is involved.
+    async fn apply_sidecar_gps(&self, media_key: &str, location: XmpGeoLocation) -> Result<()> {
+        let Some(media_entry) = self.current_object_entry(media_key).await? else {
+            return Ok(());
+        };
+        let inspector = self.store_index_inspector().await?;
+        let Some(lookup) = inspector
+            .lookup_media_cache(&media_entry.manifest_hash)
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some(mut metadata) = lookup.metadata else {
+            return Ok(());
+        };
+        if metadata.source_manifest_hash != media_entry.manifest_hash {
+            return Ok(());
+        }
+        let next = MediaGpsCoordinates {
+            latitude: location.latitude,
+            longitude: location.longitude,
+        };
+        if metadata.gps.as_ref().is_some_and(|current| {
+            (current.latitude - next.latitude).abs() < f64::EPSILON
+                && (current.longitude - next.longitude).abs() < f64::EPSILON
+        }) {
+            return Ok(());
+        }
+        metadata.gps = Some(next);
+        self.metadata_store
+            .persist_media_cache_record(&metadata)
+            .await
     }
 
     /// Reads a whole sidecar object, refusing packets that are too large to be

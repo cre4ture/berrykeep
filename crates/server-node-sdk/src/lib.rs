@@ -149,6 +149,7 @@ mod listing;
 mod map_config;
 mod map_dataset_import;
 mod natural_earth_import;
+mod operations;
 mod reliability_telemetry;
 mod rendezvous_contact_config;
 mod replication;
@@ -415,6 +416,7 @@ struct ServerMaintenanceRuntime {
     repair_state: Arc<Mutex<RepairExecutorState>>,
     repair_activity: Arc<Mutex<RepairActivityRuntime>>,
     manual_repair_activity: Arc<Mutex<ManualRepairActionActivityRuntime>>,
+    operations_activity: Arc<Mutex<operations::OperationActivityRuntime>>,
     autonomous_post_write_repair: Arc<Mutex<AutonomousPostWriteRepairRuntime>>,
     data_scrub_enabled: bool,
     data_scrub_interval_secs: u64,
@@ -7473,6 +7475,9 @@ async fn run_inner(
             manual_repair_activity: Arc::new(Mutex::new(
                 ManualRepairActionActivityRuntime::default(),
             )),
+            operations_activity: Arc::new(Mutex::new(
+                operations::OperationActivityRuntime::default(),
+            )),
             autonomous_post_write_repair: Arc::new(Mutex::new(
                 AutonomousPostWriteRepairRuntime::default(),
             )),
@@ -7499,6 +7504,7 @@ async fn run_inner(
         )),
     };
     seed_process_temperature_stats_for_tests(&state);
+    operations::interrupt_runs_after_server_restart(&state).await;
 
     start_background_runtimes(&state, &config, startup_phase_anchor).await;
 
@@ -7740,6 +7746,23 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/admin/change-password", post(change_admin_password))
         .route("/auth/repair/activity", get(repair_activity_status))
         .route("/auth/repair/history", get(repair_history))
+        .route("/auth/operations", get(operations::list_operations))
+        .route(
+            "/auth/operations/{operation_id}/runs",
+            post(operations::start_operation_run),
+        )
+        .route(
+            "/auth/operation-runs/{run_id}",
+            get(operations::get_operation_run),
+        )
+        .route(
+            "/auth/operation-runs/{run_id}/results",
+            get(operations::get_operation_run_results),
+        )
+        .route(
+            "/auth/operation-runs/history",
+            get(operations::get_operation_run_history),
+        )
         .route("/auth/repair/actions", get(list_manual_repair_actions))
         .route(
             "/auth/repair/actions/activity",
@@ -28278,6 +28301,17 @@ async fn persist_manual_repair_action_run_record_with_retention(
         );
         return;
     }
+    if let Err(err) = store
+        .persist_operation_run(&operation_run_from_manual_repair_record(record))
+        .await
+    {
+        warn!(
+            error = %err,
+            run_id = %record.run_id,
+            action_id = %record.action_id,
+            "failed to persist generic operation adapter for manual repair action"
+        );
+    }
 
     let retention_cutoff = record
         .finished_at_unix
@@ -28292,6 +28326,68 @@ async fn persist_manual_repair_action_run_record_with_retention(
             run_id = %record.run_id,
             action_id = %record.action_id,
             "failed to prune manual repair action history"
+        );
+    }
+}
+
+fn operation_run_from_manual_repair_record(
+    record: &ManualRepairActionRunRecord,
+) -> operations::OperationRun {
+    operations::OperationRun {
+        run_id: record.run_id.clone(),
+        operation_id: format!("repair.{}", record.action_id),
+        status: match record.status {
+            ManualRepairActionRunStatus::Completed => operations::OperationRunStatus::Completed,
+            ManualRepairActionRunStatus::Failed => operations::OperationRunStatus::Failed,
+        },
+        priority: operations::OperationPriority::Repair,
+        created_at_unix: record.started_at_unix,
+        started_at_unix: Some(record.started_at_unix),
+        finished_at_unix: Some(record.finished_at_unix),
+        progress: operations::OperationProgress {
+            phase: Some("completed".to_string()),
+            message: Some(record.summary.clone()),
+            ..operations::OperationProgress::default()
+        },
+        input: json!({ "dry_run": record.dry_run }),
+        summary: Some(json!({
+            "changed": record.changed,
+            "report": record.report,
+        })),
+        error: record.last_error.clone(),
+        termination_reason: None,
+    }
+}
+
+async fn persist_manual_repair_action_operation_started(
+    state: &ServerState,
+    active_run: &ManualRepairActionActiveRun,
+) {
+    let run = operations::OperationRun {
+        run_id: active_run.run_id.clone(),
+        operation_id: format!("repair.{}", active_run.action_id),
+        status: operations::OperationRunStatus::Running,
+        priority: operations::OperationPriority::Repair,
+        created_at_unix: active_run.started_at_unix,
+        started_at_unix: Some(active_run.started_at_unix),
+        finished_at_unix: None,
+        progress: operations::OperationProgress {
+            phase: Some("running".to_string()),
+            message: Some("Manual repair action is running.".to_string()),
+            ..operations::OperationProgress::default()
+        },
+        input: json!({ "dry_run": active_run.dry_run }),
+        summary: None,
+        error: None,
+        termination_reason: None,
+    };
+    let store = lock_store(state, "manual_repair.persist_started_operation").await;
+    if let Err(error) = store.persist_operation_run(&run).await {
+        warn!(
+            error = %error,
+            run_id = %run.run_id,
+            action_id = %run.operation_id,
+            "failed to persist started generic operation adapter for manual repair action"
         );
     }
 }
@@ -28544,6 +28640,7 @@ async fn start_local_manual_repair_action(
     };
 
     let (active_run, tracker) = active_or_new;
+    persist_manual_repair_action_operation_started(state, &active_run).await;
     let state_clone = state.clone();
     tokio::spawn(async move {
         execute_manual_repair_action_run(state_clone, tracker).await;

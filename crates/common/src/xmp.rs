@@ -33,8 +33,12 @@ pub const XMP_SIDECAR_SUFFIX: &str = ".xmp";
 
 const RDF_NAMESPACE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const DC_NAMESPACE: &str = "http://purl.org/dc/elements/1.1/";
+const EXIF_NAMESPACE: &str = "http://ns.adobe.com/exif/1.0/";
+const BERRYKEEP_NAMESPACE: &str = "https://berrykeep.app/ns/1.0/";
 const RDF_PREFIX_FALLBACK: &str = "rdf";
 const DC_PREFIX_FALLBACK: &str = "dc";
+const EXIF_PREFIX_FALLBACK: &str = "exif";
+const BERRYKEEP_PREFIX_FALLBACK: &str = "berrykeep";
 const INDENT_STEP_FALLBACK: &str = " ";
 
 /// Minimal, valid and empty XMP packet used by [`XmpSidecar::new_empty`].
@@ -66,6 +70,30 @@ pub struct XmpSidecar {
     indent: Option<Indentation>,
     /// Prefixes and declarations used for generated markup.
     namespaces: GeneratedNamespaces,
+    /// A newly requested geolocation write. Existing GPS properties remain in
+    /// the lossless event stream; callers only set this after checking that GPS
+    /// is absent, so a write never creates competing locations.
+    geo_inference: Option<XmpGeoInference>,
+}
+
+/// BerryKeep's auditable result of a confirmed geolocation inference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XmpGeoInference {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub method: String,
+    pub run_id: String,
+    pub confidence: String,
+    pub reference_distance_seconds: Option<u64>,
+    pub previous_anchor_distance_seconds: Option<u64>,
+    pub next_anchor_distance_seconds: Option<u64>,
+    pub estimated_speed_kmh: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XmpGeoLocation {
+    pub latitude: f64,
+    pub longitude: f64,
 }
 
 impl XmpSidecar {
@@ -97,6 +125,7 @@ impl XmpSidecar {
             placement: layout.placement,
             indent: layout.indent,
             namespaces,
+            geo_inference: None,
         })
     }
 
@@ -119,6 +148,26 @@ impl XmpSidecar {
         self.keywords = keywords;
     }
 
+    /// Returns a valid location already present in the XMP packet. Both common
+    /// XMP attribute and element property forms are accepted.
+    pub fn geo_location(&self) -> Option<XmpGeoLocation> {
+        read_geo_location(&self.events)
+    }
+
+    /// Adds canonical EXIF GPS fields and BerryKeep provenance on a fresh
+    /// `rdf:Description`. Unknown XMP content is retained verbatim.
+    pub fn set_geo_inference(&mut self, inference: XmpGeoInference) -> Result<()> {
+        if !inference.latitude.is_finite()
+            || !(-90.0..=90.0).contains(&inference.latitude)
+            || !inference.longitude.is_finite()
+            || !(-180.0..=180.0).contains(&inference.longitude)
+        {
+            bail!("invalid XMP geolocation coordinates");
+        }
+        self.geo_inference = Some(inference);
+        Ok(())
+    }
+
     /// Serializes the packet back to bytes.
     ///
     /// Fails when keywords are set but the packet offers no place to store them,
@@ -136,25 +185,42 @@ impl XmpSidecar {
     /// Builds the full output event stream by splicing the regenerated
     /// `dc:subject` property into the retained events.
     fn output_events(&self) -> Result<Vec<Event<'_>>> {
-        if self.keywords.is_empty() {
-            return Ok(self.retained_events(..).collect());
-        }
+        let mut output: Vec<Event<'_>> = if self.keywords.is_empty() {
+            self.retained_events(..).collect()
+        } else {
+            let placement = self.placement.context(
+                "XMP packet offers no place for dc:subject: the rdf:RDF element is self-closing",
+            )?;
+            let declarations = self.namespaces.declarations.as_slice();
+            let (index, replaces_event, block) = match placement {
+                SubjectPlacement::Before(index) => {
+                    (index, false, self.render_property(declarations))
+                }
+                SubjectPlacement::InsideSelfClosing(index) => {
+                    (index, true, self.expand_description(index)?)
+                }
+                SubjectPlacement::WrappedBefore(index) => {
+                    (index, false, self.wrap_in_description())
+                }
+            };
 
-        let placement = self.placement.context(
-            "XMP packet offers no place for dc:subject: the rdf:RDF element is self-closing",
-        )?;
-        let declarations = self.namespaces.declarations.as_slice();
-        let (index, replaces_event, block) = match placement {
-            SubjectPlacement::Before(index) => (index, false, self.render_property(declarations)),
-            SubjectPlacement::InsideSelfClosing(index) => {
-                (index, true, self.expand_description(index)?)
-            }
-            SubjectPlacement::WrappedBefore(index) => (index, false, self.wrap_in_description()),
+            let mut output: Vec<Event<'_>> = self.retained_events(..index).collect();
+            output.extend(block);
+            output.extend(self.retained_events(index + usize::from(replaces_event)..));
+            output
         };
-
-        let mut output: Vec<Event<'_>> = self.retained_events(..index).collect();
-        output.extend(block);
-        output.extend(self.retained_events(index + usize::from(replaces_event)..));
+        if let Some(inference) = &self.geo_inference {
+            let insertion_index = output
+                .iter()
+                .rposition(|event| {
+                    matches!(event, Event::End(end) if end.local_name().into_inner() == b"RDF")
+                })
+                .context("XMP packet offers no rdf:RDF closing element for GPS metadata")?;
+            output.splice(
+                insertion_index..insertion_index,
+                self.render_geo_inference(inference),
+            );
+        }
         Ok(output)
     }
 
@@ -239,6 +305,81 @@ impl XmpSidecar {
             rdf_prefix,
             "Description",
         ))));
+        events
+    }
+
+    fn render_geo_inference(&self, inference: &XmpGeoInference) -> Vec<Event<'static>> {
+        let rdf_prefix = &self.namespaces.rdf_prefix;
+        let mut description = BytesStart::new(qualified_name(rdf_prefix, "Description"));
+        description.push_attribute((qualified_name(rdf_prefix, "about").as_str(), ""));
+        description.push_attribute(("xmlns:exif", EXIF_NAMESPACE));
+        description.push_attribute(("xmlns:berrykeep", BERRYKEEP_NAMESPACE));
+        let latitude = format_xmp_coordinate(inference.latitude);
+        let longitude = format_xmp_coordinate(inference.longitude);
+        description.push_attribute((
+            qualified_name(EXIF_PREFIX_FALLBACK, "GPSLatitude").as_str(),
+            latitude.as_str(),
+        ));
+        description.push_attribute((
+            qualified_name(EXIF_PREFIX_FALLBACK, "GPSLongitude").as_str(),
+            longitude.as_str(),
+        ));
+        description.push_attribute((
+            qualified_name(EXIF_PREFIX_FALLBACK, "GPSMapDatum").as_str(),
+            "WGS-84",
+        ));
+        description.push_attribute((
+            qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceMethod").as_str(),
+            inference.method.as_str(),
+        ));
+        description.push_attribute((
+            qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceRunId").as_str(),
+            inference.run_id.as_str(),
+        ));
+        description.push_attribute((
+            qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceConfidence").as_str(),
+            inference.confidence.as_str(),
+        ));
+        if let Some(value) = inference.reference_distance_seconds {
+            description.push_attribute((
+                qualified_name(
+                    BERRYKEEP_PREFIX_FALLBACK,
+                    "GeoInferenceReferenceDistanceSeconds",
+                )
+                .as_str(),
+                value.to_string().as_str(),
+            ));
+        }
+        if let Some(value) = inference.previous_anchor_distance_seconds {
+            description.push_attribute((
+                qualified_name(
+                    BERRYKEEP_PREFIX_FALLBACK,
+                    "GeoInferencePreviousAnchorDistanceSeconds",
+                )
+                .as_str(),
+                value.to_string().as_str(),
+            ));
+        }
+        if let Some(value) = inference.next_anchor_distance_seconds {
+            description.push_attribute((
+                qualified_name(
+                    BERRYKEEP_PREFIX_FALLBACK,
+                    "GeoInferenceNextAnchorDistanceSeconds",
+                )
+                .as_str(),
+                value.to_string().as_str(),
+            ));
+        }
+        if let Some(value) = inference.estimated_speed_kmh {
+            let value = format!("{value:.3}");
+            description.push_attribute((
+                qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceEstimatedSpeedKmh").as_str(),
+                value.as_str(),
+            ));
+        }
+        let mut events = Vec::new();
+        self.push_line_break(&mut events, 0);
+        events.push(Event::Empty(description));
         events
     }
 
@@ -692,6 +833,107 @@ fn qualified_name(prefix: &str, local_name: &str) -> String {
     format!("{prefix}:{local_name}")
 }
 
+fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
+    let mut latitude = None;
+    let mut longitude = None;
+    let mut element_property = None;
+    for event in events {
+        match &event.event {
+            Event::Start(element) | Event::Empty(element) => {
+                let mut attributes = element.attributes();
+                attributes.with_checks(false);
+                for attribute in attributes.flatten() {
+                    let local_name = attribute.key.local_name();
+                    let value = std::str::from_utf8(attribute.value.as_ref()).ok()?;
+                    match local_name.as_ref() {
+                        b"GPSLatitude" => latitude = parse_xmp_coordinate(value, true),
+                        b"GPSLongitude" => longitude = parse_xmp_coordinate(value, false),
+                        _ => {}
+                    }
+                }
+                if matches!(&event.event, Event::Start(_)) {
+                    element_property = if is_element(event, EXIF_NAMESPACE, b"GPSLatitude") {
+                        Some(true)
+                    } else if is_element(event, EXIF_NAMESPACE, b"GPSLongitude") {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                }
+            }
+            Event::Text(text) => {
+                let Some(is_latitude) = element_property else {
+                    continue;
+                };
+                let value = text.xml10_content().ok()?;
+                if is_latitude {
+                    latitude = parse_xmp_coordinate(&value, true);
+                } else {
+                    longitude = parse_xmp_coordinate(&value, false);
+                }
+            }
+            Event::CData(text) => {
+                let Some(is_latitude) = element_property else {
+                    continue;
+                };
+                let value = std::str::from_utf8(text.as_ref()).ok()?;
+                if is_latitude {
+                    latitude = parse_xmp_coordinate(value, true);
+                } else {
+                    longitude = parse_xmp_coordinate(value, false);
+                }
+            }
+            Event::End(_) => {
+                if element_property.is_some()
+                    && (is_element(event, EXIF_NAMESPACE, b"GPSLatitude")
+                        || is_element(event, EXIF_NAMESPACE, b"GPSLongitude"))
+                {
+                    element_property = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    match (latitude, longitude) {
+        (Some(latitude), Some(longitude))
+            if (-90.0..=90.0).contains(&latitude) && (-180.0..=180.0).contains(&longitude) =>
+        {
+            Some(XmpGeoLocation {
+                latitude,
+                longitude,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_xmp_coordinate(value: &str, latitude: bool) -> Option<f64> {
+    let value = value.trim();
+    let hemisphere = value.chars().last().and_then(|suffix| match suffix {
+        'N' | 'n' | 'E' | 'e' => Some(1.0),
+        'S' | 's' | 'W' | 'w' => Some(-1.0),
+        _ => None,
+    });
+    let numeric = hemisphere
+        .map(|_| &value[..value.len().saturating_sub(1)])
+        .unwrap_or(value)
+        .trim();
+    let value = if let Some((degrees, minutes)) = numeric.split_once(',') {
+        let degrees = degrees.trim().parse::<f64>().ok()?;
+        let minutes = minutes.trim().parse::<f64>().ok()?;
+        degrees.abs() + minutes.abs() / 60.0
+    } else {
+        numeric.parse::<f64>().ok()?
+    };
+    let value = hemisphere.map(|sign| value.abs() * sign).unwrap_or(value);
+    let limit = if latitude { 90.0 } else { 180.0 };
+    (value.is_finite() && (-limit..=limit).contains(&value)).then_some(value)
+}
+
+fn format_xmp_coordinate(value: f64) -> String {
+    format!("{value:.8}")
+}
+
 /// Derives the sidecar key of a media object: `album/photo.jpg` ->
 /// `album/photo.jpg.xmp`.
 pub fn sidecar_key_for_media(key: &str) -> String {
@@ -720,7 +962,8 @@ pub fn is_sidecar_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DC_NAMESPACE, XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media,
+        DC_NAMESPACE, XmpGeoInference, XmpSidecar, is_sidecar_key, media_key_for_sidecar,
+        sidecar_key_for_media,
     };
     use anyhow::Result;
 
@@ -893,6 +1136,55 @@ mod tests {
         let reparsed = XmpSidecar::parse(serialized.as_bytes())?;
         assert_eq!(reparsed.keywords(), ["private", "nsfw"]);
         assert_eq!(serialize(&reparsed)?, serialized, "writing must be stable");
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_write_preserves_unknown_xmp_and_records_provenance() -> Result<()> {
+        let mut sidecar = XmpSidecar::parse(THIRD_PARTY_SIDECAR.as_bytes())?;
+        sidecar.set_geo_inference(XmpGeoInference {
+            latitude: 37.808_333_33,
+            longitude: -122.404_166_67,
+            method: "interpolation".to_string(),
+            run_id: "run-123".to_string(),
+            confidence: "previous=120s; next=180s; estimated_speed=5.0km/h".to_string(),
+            reference_distance_seconds: None,
+            previous_anchor_distance_seconds: Some(120),
+            next_anchor_distance_seconds: Some(180),
+            estimated_speed_kmh: Some(5.0),
+        })?;
+        let serialized = serialize(&sidecar)?;
+        for retained in [
+            "xmp:Rating=\"3\"",
+            "crs:Exposure2012=\"+0.35\"",
+            "<crs:ToneCurvePV2012>",
+            "<!-- kept verbatim -->",
+        ] {
+            assert!(serialized.contains(retained), "missing {retained:?}");
+        }
+        assert!(serialized.contains("exif:GPSMapDatum=\"WGS-84\""));
+        assert!(serialized.contains("berrykeep:GeoInferenceRunId=\"run-123\""));
+        let reparsed = XmpSidecar::parse(serialized.as_bytes())?;
+        let location = reparsed.geo_location().expect("GPS must round-trip");
+        assert!((location.latitude - 37.808_333_33).abs() < 0.000_001);
+        assert!((location.longitude + 122.404_166_67).abs() < 0.000_001);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_existing_element_form_gps() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\">",
+            "<exif:GPSLatitude>47.3769N</exif:GPSLatitude>",
+            "<exif:GPSLongitude>8.5417E</exif:GPSLongitude>",
+            "</rdf:Description></rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        let location = sidecar.geo_location().expect("element GPS must be read");
+        assert!((location.latitude - 47.3769).abs() < 0.000_001);
+        assert!((location.longitude - 8.5417).abs() < 0.000_001);
         Ok(())
     }
 

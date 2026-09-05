@@ -44,7 +44,10 @@ pub(crate) fn version_created_at_unix_from_payload(
     Ok(version_created_at_unix(&index, manifest_hash))
 }
 
-fn filename_captured_at_unix(key: &str) -> Option<u64> {
+/// Parses common camera filename timestamps. The filename carries no timezone,
+/// so consumers that need temporal inference must treat this as floating local
+/// time rather than as UTC despite this stable numeric representation.
+pub(crate) fn filename_captured_at_unix(key: &str) -> Option<u64> {
     let filename = key.rsplit('/').next().unwrap_or(key);
     let stem = filename
         .rsplit_once('.')

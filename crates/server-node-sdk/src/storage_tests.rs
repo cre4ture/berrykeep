@@ -9831,6 +9831,29 @@ async fn gallery_labels_for_key(store: &PersistentStore, key: &str) -> Vec<Strin
         .labels
 }
 
+async fn gallery_gps_for_key(store: &PersistentStore, key: &str) -> Option<MediaGpsCoordinates> {
+    let page = store
+        .query_gallery_index(&GalleryIndexQuery {
+            prefix: String::new(),
+            depth: 8,
+            media_filter: GalleryIndexMediaFilter::All,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            offset: 0,
+            limit: 64,
+            viewport: None,
+            label_filter: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page");
+
+    page.entries
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .and_then(|entry| entry.media_metadata)
+        .and_then(|metadata| metadata.gps)
+}
+
 /// Lists the gallery keys that survive `label_filter`, sorted for comparison.
 async fn gallery_keys_matching_labels(
     store: &PersistentStore,
@@ -10129,6 +10152,68 @@ run_on_all_metadata_backends!(
     gallery_labels_follow_a_sidecar_upload_impl,
     gallery_labels_follow_a_sidecar_upload,
     gallery_labels_follow_a_sidecar_upload_turso
+);
+
+async fn gallery_gps_follows_a_geolocation_sidecar_write_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-sidecar-write")
+        .await;
+    let media_key = "album/photo.jpg";
+    let put = store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("the source media needs a cached metadata record");
+    assert!(gallery_gps_for_key(&store, media_key).await.is_none());
+
+    store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the XMP sidecar should be written");
+
+    let sidecar_location = store
+        .media_sidecar_geo_location(media_key)
+        .await
+        .unwrap()
+        .expect("the written sidecar should expose GPS");
+    assert!((sidecar_location.latitude - 47.3769).abs() < 0.000_001);
+    assert!((sidecar_location.longitude - 8.5417).abs() < 0.000_001);
+    let gallery_location = gallery_gps_for_key(&store, media_key)
+        .await
+        .expect("sidecar GPS must refresh the gallery projection");
+    assert!((gallery_location.latitude - 47.3769).abs() < 0.000_001);
+    assert!((gallery_location.longitude - 8.5417).abs() < 0.000_001);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_gps_follows_a_geolocation_sidecar_write_impl,
+    gallery_gps_follows_a_geolocation_sidecar_write,
+    gallery_gps_follows_a_geolocation_sidecar_write_turso
 );
 
 /// Existing XMP sidecars must populate the new projection column on upgrade;
