@@ -1,22 +1,11 @@
 # General
 
-Official project language: English
+Official project language: English.
 
-Prefer working on own worktree for each PR.
+Prefer one worktree per PR.
 
-Pull remote changes regularily. Expect heavy parallel development on multiple seperate hosts.
+Assume concurrent development across hosts. Refresh remote state before integrating or pushing.
 
-Prefer clean and generic solutions over specialized fast-fixes. Even if this is significantly more effort.
+Prefer root-cause, reusable solutions over one-off patches, even when they require substantially more effort.
 
-Work pacing and delivery rules live in [PACE.md](PACE.md).
-
-# Skills
-
-Project-specific skills live in [skills/](skills/). Each subdirectory is a skill with its own `SKILL.md`. Read the relevant `SKILL.md` before performing the corresponding task.
-
-Available skills:
-- [skills/release-publish/](skills/release-publish/) - publishing a signed GitHub release
-- [skills/production-deploy/](skills/production-deploy/) - deploying a released artifact
-- [skills/pr-followup/](skills/pr-followup/) — following up on a pull request
-- [skills/release-commit/](skills/release-commit/) — creating a release commit
-- [skills/windows-ci-access/](skills/windows-ci-access/) — accessing the Windows CI environment
+Follow [PACE.md](PACE.md) for non-trivial work.
