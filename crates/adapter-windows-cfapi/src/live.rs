@@ -4,7 +4,7 @@ use crate::runtime::{
     HydrationProgress, HydrationRequest, HydrationResult, Hydrator, UploadReceipt, Uploader,
 };
 use anyhow::{Context, Result, anyhow};
-use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
+use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest, ObjectLookup};
 use client_sdk::{
     ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, normalize_server_base_url,
@@ -339,14 +339,20 @@ impl RemoteObjectResolver for ServerNodeHydrator {
     fn resolve_object(&self, object_id: &str) -> Result<Option<ResolvedRemoteObject>> {
         self.sdk
             .lookup_object_by_id_blocking(object_id)
-            .map(|resolved| {
-                resolved.map(|resolved| ResolvedRemoteObject {
-                    object_id: resolved.object_id,
-                    path: resolved.path,
-                    revision: resolved.revision,
-                })
-            })
+            .map(|resolved| resolved.and_then(active_resolved_remote_object))
     }
+}
+
+fn active_resolved_remote_object(resolved: ObjectLookup) -> Option<ResolvedRemoteObject> {
+    // The identity endpoint deliberately retains tombstones so a client can
+    // inspect their final revision.  CFAPI reconciliation needs the active
+    // namespace, though: a tombstone confirms that this object no longer has
+    // a remotely live path.
+    (resolved.entry_type != "tombstone").then_some(ResolvedRemoteObject {
+        object_id: resolved.object_id,
+        path: resolved.path,
+        revision: resolved.revision,
+    })
 }
 
 pub fn normalize_base_url(input: &str) -> Result<Url> {
@@ -458,6 +464,18 @@ mod tests {
             windows_download_stage_base_root(base.clone()),
             base.join("Ironmesh").join("cfapi-downloads")
         );
+    }
+
+    #[test]
+    fn object_resolver_interprets_an_identity_tombstone_as_absent() {
+        let tombstone = ObjectLookup {
+            object_id: "object-deleted".to_string(),
+            path: "docs/deleted.txt".to_string(),
+            revision: Some("revision-tombstone".to_string()),
+            entry_type: "tombstone".to_string(),
+        };
+
+        assert!(active_resolved_remote_object(tombstone).is_none());
     }
 
     #[test]

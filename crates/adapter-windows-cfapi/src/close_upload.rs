@@ -790,6 +790,9 @@ fn finalize_placeholder_after_upload(
     upload_usn: &mut i64,
 ) -> Result<()> {
     record_placeholder_upload_receipt(file, relative_path, receipt, provider_instance_id, true)?;
+    // Updating the identity advances the file's USN. Capture a fresh value after
+    // that write so CFAPI accepts the following in-sync transition.
+    *upload_usn = cf_set_not_in_sync(file)?;
     cf_set_in_sync_with_usn(file, upload_usn)
 }
 

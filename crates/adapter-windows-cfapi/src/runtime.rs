@@ -7,13 +7,14 @@ use crate::cfapi::{
 };
 use crate::cfapi_safe_wrap::{
     CancelFetchDataCallbackParams, CloseCompletionCallbackParams, ExecuteTransferDataFailureInfo,
-    FetchDataCallbackParams, NotifyDehydrateCallbackParams,
+    FetchDataCallbackParams, FetchWorkerPool, NotifyDehydrateCallbackParams,
     NotifyDehydrateCompletionCallbackParams, callback_file_identity, callback_process_log_info,
     callback_target_session_id, connect_sync_root as cf_connect_sync_root,
     create_placeholders as cf_create_placeholders, disconnect_sync_root as cf_disconnect_sync_root,
     empty_fs_metadata, execute_ack_dehydrate as cf_execute_ack_dehydrate,
     execute_transfer_data_chunk as cf_execute_transfer_data_chunk,
-    execute_transfer_data_failure as cf_execute_transfer_data_failure, string_from_pcwstr,
+    execute_transfer_data_failure as cf_execute_transfer_data_failure,
+    fetch_worker_max_concurrency_from_env, string_from_pcwstr,
     unregister_sync_root as cf_unregister_sync_root,
 };
 use crate::close_upload::{
@@ -30,7 +31,8 @@ use crate::hydration_control::{
     mark_active_hydration,
 };
 use crate::placeholder_metadata::{
-    RemotePlaceholderState, local_placeholder_paths_by_object_id, refresh_remote_conflict_identity,
+    RemotePlaceholderState, initialize_new_remote_placeholder_state,
+    local_placeholder_paths_by_object_id, refresh_remote_conflict_identity,
     refresh_remote_placeholder_state,
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
@@ -560,6 +562,7 @@ pub(crate) struct CallbackContext {
     fetch_cancellations: Mutex<HashMap<FetchCallbackIdentity, Arc<AtomicBool>>>,
     active_hydration_counts: Mutex<HashMap<String, usize>>,
     fetch_execution_gate: Arc<FetchExecutionGate>,
+    pub(crate) fetch_worker_pool: Arc<FetchWorkerPool>,
     upload_worker: Arc<UploadWorkerContext>,
     upload_debounce: Arc<UploadDebounceState>,
 }
@@ -1054,6 +1057,11 @@ pub fn apply_action_plan(
                 object_id: Some(object_id),
                 path,
                 ..
+            }
+            | CfapiAction::EnsureDirectory {
+                object_id: Some(object_id),
+                path,
+                ..
             } => (object_id.trim(), normalize_path(path)),
             _ => continue,
         };
@@ -1064,38 +1072,6 @@ pub fn apply_action_plan(
                 .insert(path);
         }
     }
-
-    // Pre-compute directories that are ancestors of planned file placeholders.
-    // When allow_empty_directories is false (remote refresh), EnsureDirectory
-    // actions for directories with no planned content are skipped to avoid
-    // resurrecting locally-renamed directories when a stale snapshot still
-    // contains directory markers that haven't been removed from the remote yet.
-    let dirs_with_planned_content: BTreeSet<String> = if allow_empty_directories {
-        BTreeSet::new()
-    } else {
-        let mut set = BTreeSet::new();
-        for action in &plan.actions {
-            let file_path = match action {
-                CfapiAction::EnsurePlaceholder {
-                    object_id: Some(object_id),
-                    path,
-                    ..
-                }
-                | CfapiAction::HydrateOnDemand {
-                    object_id: Some(object_id),
-                    path,
-                    ..
-                } if !object_id.trim().is_empty() => path,
-                _ => continue,
-            };
-            let normalized = normalize_path(file_path);
-            let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-            for i in 1..parts.len() {
-                set.insert(parts[..i].join("/"));
-            }
-        }
-        set
-    };
 
     struct PendingPlaceholder {
         object_id: Option<String>,
@@ -1111,11 +1087,92 @@ pub fn apply_action_plan(
     let mut created_placeholder_paths = BTreeSet::new();
     for action in &plan.actions {
         match action {
-            CfapiAction::EnsureDirectory { path } => {
-                if allow_empty_directories
-                    || dirs_with_planned_content.contains(&normalize_path(path))
+            CfapiAction::EnsureDirectory {
+                object_id,
+                path,
+                remote_version,
+            } => {
+                let normalized_path = normalize_path(path);
+                let stable_object_id = object_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let stable_revision = remote_version
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if let Some(stable_object_id) = stable_object_id
+                    && existing_placeholder_paths
+                        .get(stable_object_id)
+                        .is_some_and(|paths| !paths.contains(&normalized_path))
                 {
-                    std::fs::create_dir_all(root_path.join(path.replace('/', "\\")))?;
+                    tracing::warn!(
+                        "apply_action_plan: object_id={} already exists at {:?}; refusing a second directory placeholder at {}",
+                        stable_object_id,
+                        existing_placeholder_paths.get(stable_object_id),
+                        normalized_path
+                    );
+                    continue;
+                }
+                // On a remote refresh, a directory without object_id is only
+                // a synthesized parent inferred from another path.  It must
+                // not independently recreate an old namespace branch from a
+                // partial snapshot; planned file placeholders create their
+                // own parents as needed.  Startup still materializes those
+                // parents for the initial view.
+                if allow_empty_directories || stable_object_id.is_some() {
+                    let directory_path = root_path.join(normalized_path.replace('/', "\\"));
+                    let directory_existed = directory_path.exists();
+                    std::fs::create_dir_all(&directory_path)?;
+                    if stable_object_id.is_some() != stable_revision.is_some() {
+                        tracing::warn!(
+                            "apply_action_plan: refusing incomplete directory identity at {}",
+                            normalized_path
+                        );
+                    } else if let (Some(stable_object_id), Some(stable_revision)) =
+                        (stable_object_id, stable_revision)
+                    {
+                        // CFAPI does not create a placeholder when a directory is made with
+                        // CreateDirectory.  We may initialize one only when this remote action
+                        // created the directory itself: an already existing, non-placeholder
+                        // directory can contain unsynchronized local state and must not be
+                        // bound to a remote object merely because its path matches.
+                        if !directory_existed {
+                            let directory = open_sync_path(&directory_path, true)?;
+                            cf_ensure_placeholder_identity(&directory, &normalized_path)?;
+                        }
+                        let remote_state = RemotePlaceholderState {
+                            object_id: Some(stable_object_id),
+                            remote_version: Some(stable_revision),
+                            remote_content_hash: None,
+                            remote_size_bytes: None,
+                            remote_content_fingerprint: None,
+                            remote_modified_at_unix: None,
+                            remote_media: None,
+                        };
+                        let refresh_result = if directory_existed {
+                            refresh_remote_placeholder_state(
+                                root_path,
+                                &normalized_path,
+                                provider_instance_id,
+                                remote_state,
+                            )
+                        } else {
+                            initialize_new_remote_placeholder_state(
+                                root_path,
+                                &normalized_path,
+                                provider_instance_id,
+                                remote_state,
+                            )
+                        };
+                        if let Err(err) = refresh_result {
+                            tracing::info!(
+                                "apply_action_plan: failed to refresh directory identity for {}: {:#}",
+                                normalized_path,
+                                err
+                            );
+                        }
+                    }
                 }
             }
             CfapiAction::EnsurePlaceholder {
@@ -1432,7 +1489,7 @@ fn collect_directory_candidates(plan: &CfapiActionPlan) -> BTreeSet<String> {
 
     for action in &plan.actions {
         match action {
-            CfapiAction::EnsureDirectory { path } => {
+            CfapiAction::EnsureDirectory { path, .. } => {
                 record_ancestor_directories(&mut directories, path, true);
             }
             CfapiAction::EnsurePlaceholder { path, .. }
@@ -1919,9 +1976,14 @@ pub fn connect_sync_root(
 ) -> Result<SyncRootConnection> {
     let root_path = utf16_path(&registration.root_path);
     let close_upload_max_concurrency = close_upload_max_concurrency_from_env()?;
+    let fetch_worker_max_concurrency = fetch_worker_max_concurrency_from_env()?;
     tracing::info!(
         "close-completion: max concurrent uploads set to {}",
         close_upload_max_concurrency
+    );
+    tracing::info!(
+        "fetch-data: max concurrent workers set to {}",
+        fetch_worker_max_concurrency
     );
     let upload_worker = Arc::new(UploadWorkerContext {
         sync_root: registration.root_path.clone(),
@@ -1940,6 +2002,7 @@ pub fn connect_sync_root(
         fetch_cancellations: Mutex::new(HashMap::new()),
         active_hydration_counts: Mutex::new(HashMap::new()),
         fetch_execution_gate: Arc::new(FetchExecutionGate::default()),
+        fetch_worker_pool: Arc::new(FetchWorkerPool::new(fetch_worker_max_concurrency)?),
         upload_worker,
         upload_debounce,
     });
@@ -2878,7 +2941,9 @@ mod tests {
         let plan = CfapiActionPlan {
             actions: vec![
                 CfapiAction::EnsureDirectory {
+                    object_id: None,
                     path: "docs".to_string(),
+                    remote_version: None,
                 },
                 CfapiAction::EnsurePlaceholder {
                     object_id: None,
@@ -3126,6 +3191,9 @@ mod tests {
             fetch_cancellations: Mutex::new(HashMap::new()),
             active_hydration_counts: Mutex::new(HashMap::new()),
             fetch_execution_gate: Arc::new(FetchExecutionGate::default()),
+            fetch_worker_pool: Arc::new(
+                FetchWorkerPool::new(1).expect("fetch worker should start"),
+            ),
             upload_worker: Arc::new(UploadWorkerContext {
                 sync_root: sync_root.clone(),
                 provider_instance_id: uuid::Uuid::new_v4(),

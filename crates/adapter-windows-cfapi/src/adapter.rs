@@ -7,6 +7,7 @@ use sync_core::{
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RemoteFileMetadata {
     pub object_id: Option<String>,
+    pub remote_version: Option<String>,
     pub size_bytes: Option<u64>,
     pub content_fingerprint: Option<String>,
     pub modified_at_unix: Option<u64>,
@@ -30,12 +31,12 @@ impl WindowsCfapiAdapter {
         let remote_metadata_by_path = snapshot
             .remote
             .iter()
-            .filter(|entry| entry.kind == sync_core::EntryKind::File)
             .map(|entry| {
                 (
                     entry.path.clone(),
                     RemoteFileMetadata {
                         object_id: entry.object_id.clone(),
+                        remote_version: entry.version.clone(),
                         size_bytes: entry.size_bytes,
                         content_fingerprint: entry.content_fingerprint.clone(),
                         modified_at_unix: entry.modified_at_unix,
@@ -56,7 +57,9 @@ pub struct CfapiActionPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CfapiAction {
     EnsureDirectory {
+        object_id: Option<String>,
         path: String,
+        remote_version: Option<String>,
     },
     EnsurePlaceholder {
         object_id: Option<String>,
@@ -104,7 +107,12 @@ pub fn map_sync_plan_to_cfapi_actions(
     for operation in &sync_plan.operations {
         let mapped = match operation {
             SyncOperation::CreateDirectory { path } => {
-                CfapiAction::EnsureDirectory { path: path.clone() }
+                let metadata = remote_metadata_by_path.get(path);
+                CfapiAction::EnsureDirectory {
+                    object_id: metadata.and_then(|metadata| metadata.object_id.clone()),
+                    path: path.clone(),
+                    remote_version: metadata.and_then(|metadata| metadata.remote_version.clone()),
+                }
             }
             SyncOperation::EnsurePlaceholder {
                 path,
@@ -326,9 +334,12 @@ mod tests {
     #[test]
     fn adapter_maps_remote_directory_to_ensure_directory() {
         let adapter = WindowsCfapiAdapter::new("Ironmesh");
+        let mut directory = NamespaceEntry::directory("nested/dir");
+        directory.object_id = Some("obj-directory".to_string());
+        directory.version = Some("revision-directory".to_string());
         let snapshot = SyncSnapshot {
             local: vec![],
-            remote: vec![NamespaceEntry::directory("nested/dir")],
+            remote: vec![directory],
         };
 
         let plan = adapter.plan_actions(&snapshot, &SyncPolicy::default());
@@ -336,7 +347,9 @@ mod tests {
         assert_eq!(
             plan.actions,
             vec![CfapiAction::EnsureDirectory {
+                object_id: Some("obj-directory".to_string()),
                 path: "nested/dir".to_string(),
+                remote_version: Some("revision-directory".to_string()),
             }],
         );
     }

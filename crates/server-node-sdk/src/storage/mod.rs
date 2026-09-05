@@ -3262,6 +3262,63 @@ impl StoreIndexInspector {
         Ok(modified)
     }
 
+    /// Returns the current (or snapshot-bounded) preferred revision for each
+    /// indexed path. Consumers use this as an optimistic-concurrency token;
+    /// it must not be inferred from content hashes or paths.
+    pub(crate) async fn object_revisions_by_key(
+        &self,
+        object_hashes: &HashMap<String, String>,
+        object_ids: &HashMap<String, String>,
+        max_created_at_unix: Option<u64>,
+    ) -> Result<HashMap<String, String>> {
+        let mut revisions = HashMap::with_capacity(object_hashes.len());
+        for (key, manifest_hash) in object_hashes {
+            let Some(object_id) = object_ids.get(key) else {
+                continue;
+            };
+            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+                continue;
+            };
+            let revision = if max_created_at_unix.is_none() {
+                index
+                    .preferred_head_version_id
+                    .as_deref()
+                    .and_then(|version_id| index.versions.get(version_id))
+                    .filter(|record| record.manifest_hash == *manifest_hash)
+            } else {
+                index
+                    .versions
+                    .values()
+                    .filter(|record| record.manifest_hash == *manifest_hash)
+                    .filter(|record| {
+                        max_created_at_unix
+                            .map(|limit| record.created_at_unix <= limit)
+                            .unwrap_or(true)
+                    })
+                    .max_by(|left, right| {
+                        left.created_at_unix
+                            .cmp(&right.created_at_unix)
+                            .then_with(|| left.version_id.cmp(&right.version_id))
+                    })
+                    .or_else(|| {
+                        index
+                            .versions
+                            .values()
+                            .filter(|record| record.manifest_hash == *manifest_hash)
+                            .max_by(|left, right| {
+                                left.created_at_unix
+                                    .cmp(&right.created_at_unix)
+                                    .then_with(|| left.version_id.cmp(&right.version_id))
+                            })
+                    })
+            };
+            if let Some(revision) = revision {
+                revisions.insert(key.clone(), revision.version_id.clone());
+            }
+        }
+        Ok(revisions)
+    }
+
     pub(crate) async fn lookup_media_cache(
         &self,
         manifest_hash: &str,
