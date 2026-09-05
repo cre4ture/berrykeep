@@ -158,6 +158,15 @@ impl XmpSidecar {
         read_geo_location(&self.events)
     }
 
+    /// Returns whether the packet carries either EXIF coordinate property,
+    /// even if its value is incomplete or cannot be parsed safely. Callers
+    /// that mutate GPS must use this guard rather than [`Self::geo_location`]:
+    /// an unparseable third-party coordinate is still user-owned metadata and
+    /// must never be shadowed by an additional inferred location.
+    pub fn has_geo_location_properties(&self) -> bool {
+        has_geo_location_properties(&self.events)
+    }
+
     /// Adds canonical EXIF GPS fields and BerryKeep provenance on a fresh
     /// `rdf:Description`. Unknown XMP content is retained verbatim.
     pub fn set_geo_inference(&mut self, inference: XmpGeoInference) -> Result<()> {
@@ -1004,6 +1013,20 @@ fn set_first_geo_location(
     }
 }
 
+fn has_geo_location_properties(events: &[ResolvedEvent]) -> bool {
+    events.iter().any(|event| {
+        is_element(event, EXIF_NAMESPACE, b"GPSLatitude")
+            || is_element(event, EXIF_NAMESPACE, b"GPSLongitude")
+            || event.attributes.iter().any(|attribute| {
+                attribute.namespace.as_deref() == Some(EXIF_NAMESPACE)
+                    && matches!(
+                        attribute.local_name.as_slice(),
+                        b"GPSLatitude" | b"GPSLongitude"
+                    )
+            })
+    })
+}
+
 /// Detects the provenance written by [`XmpSidecar::set_geo_inference`].
 /// Attribute prefixes are resolved from declarations in the packet so a
 /// third-party writer may use a prefix other than `berrykeep`.
@@ -1341,6 +1364,10 @@ mod tests {
         );
         let sidecar = XmpSidecar::parse(packet.as_bytes())?;
         assert!(sidecar.geo_location().is_none());
+        assert!(
+            sidecar.has_geo_location_properties(),
+            "unparseable user GPS must still block an inferred overwrite"
+        );
         Ok(())
     }
 

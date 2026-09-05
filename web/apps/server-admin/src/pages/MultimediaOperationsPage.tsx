@@ -76,9 +76,34 @@ export function MultimediaOperationsPage() {
   const proposalOperationAvailable =
     operationsQuery.data?.operations.some((operation) => operation.id === PROPOSE_OPERATION_ID) ??
     false;
-  const historyQuery = useQuery({
-    queryKey: ["multimedia-operations", "history", normalizedAdminTokenOverride],
-    queryFn: () => getOperationRunHistory({ limit: 100 }, normalizedAdminTokenOverride || undefined),
+  const proposalHistoryQuery = useQuery({
+    queryKey: [
+      "multimedia-operations",
+      "history",
+      PROPOSE_OPERATION_ID,
+      normalizedAdminTokenOverride
+    ],
+    queryFn: () =>
+      getOperationRunHistory(
+        { operationId: PROPOSE_OPERATION_ID, limit: 100 },
+        normalizedAdminTokenOverride || undefined
+      ),
+    enabled: canInspect,
+    refetchInterval: (query) =>
+      query.state.data?.runs.some(isUnfinishedRun) ? 3_000 : false
+  });
+  const applyHistoryQuery = useQuery({
+    queryKey: [
+      "multimedia-operations",
+      "history",
+      APPLY_OPERATION_ID,
+      normalizedAdminTokenOverride
+    ],
+    queryFn: () =>
+      getOperationRunHistory(
+        { operationId: APPLY_OPERATION_ID, limit: 100 },
+        normalizedAdminTokenOverride || undefined
+      ),
     enabled: canInspect,
     refetchInterval: (query) =>
       query.state.data?.runs.some(isUnfinishedRun) ? 3_000 : false
@@ -96,9 +121,11 @@ export function MultimediaOperationsPage() {
     enabled: canInspect
   });
 
-  const runs = historyQuery.data?.runs ?? [];
-  const proposalRuns = runs.filter((run) => run.operation_id === PROPOSE_OPERATION_ID);
-  const applyRuns = runs.filter((run) => run.operation_id === APPLY_OPERATION_ID);
+  const proposalRuns = proposalHistoryQuery.data?.runs ?? [];
+  const applyRuns = applyHistoryQuery.data?.runs ?? [];
+  const runs = [...proposalRuns, ...applyRuns].sort(
+    (left, right) => right.created_at_unix - left.created_at_unix
+  );
   const activeRunIds = new Set(runs.filter(isUnfinishedRun).map((run) => run.run_id));
   const selectedAnalysisRun =
     proposalRuns.find((run) => run.run_id === selectedAnalysisRunId) ?? null;
@@ -184,8 +211,7 @@ export function MultimediaOperationsPage() {
   const refresh = async () => {
     await Promise.all([
       queryClient.invalidateQueries({
-        queryKey: ["multimedia-operations", "history", normalizedAdminTokenOverride],
-        exact: true
+        queryKey: ["multimedia-operations", "history"]
       }),
       queryClient.invalidateQueries({ queryKey: ["multimedia-operations", "results"] })
     ]);
@@ -331,18 +357,19 @@ export function MultimediaOperationsPage() {
             <Button
               variant="default"
               leftSection={<IconRefresh size={16} />}
-              loading={historyQuery.isFetching}
+              loading={proposalHistoryQuery.isFetching || applyHistoryQuery.isFetching}
               onClick={() => void refresh()}
             >
               Refresh
             </Button>
           </Group>
-          {historyQuery.isLoading ? (
+          {proposalHistoryQuery.isLoading || applyHistoryQuery.isLoading ? (
             <Group justify="center"><Loader size="sm" /></Group>
           ) : (
             <RunHistoryTable runs={runs} />
           )}
-          <MutationError error={historyQuery.error} />
+          <MutationError error={proposalHistoryQuery.error} />
+          <MutationError error={applyHistoryQuery.error} />
         </Stack>
       </Card>
 

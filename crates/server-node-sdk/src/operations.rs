@@ -156,6 +156,11 @@ pub(crate) struct GeoAnalysisMedia {
     pub(crate) capture_time: Option<GeoCaptureTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gps: Option<GeoCoordinate>,
+    /// Any existing GPS metadata, including an incomplete or unparseable XMP
+    /// coordinate. Such media is never a proposal target; only a valid,
+    /// non-inferred coordinate may be an inference anchor.
+    #[serde(default)]
+    pub(crate) gps_is_present: bool,
     /// A location written by a prior BerryKeep inference still means the media
     /// is geotagged, but must not become an anchor for later inferences.
     #[serde(default)]
@@ -314,7 +319,7 @@ fn infer_segment(
 
     for (target_index, target) in segment.iter().enumerate() {
         let target_time = target.capture_time?;
-        if target.gps.is_some_and(GeoCoordinate::valid) {
+        if target.gps_is_present {
             continue;
         }
 
@@ -1071,32 +1076,41 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
         candidates.sort_by(|left, right| left.0.cmp(&right.0));
         let total = candidates.len();
         let mut media = Vec::with_capacity(total);
+        let mut metadata_error_count = 0usize;
         for (batch_index, batch) in candidates
             .chunks(MULTIMEDIA_OPERATION_BATCH_SIZE)
             .enumerate()
         {
             wait_for_higher_priority_work(&state).await;
             for (path, manifest_hash) in batch {
-                let metadata = worker
-                    .ensure_media_metadata(manifest_hash)
-                    .await
-                    .with_context(|| format!("failed to read media metadata for {path}"))?;
+                let metadata = match worker.ensure_media_metadata(manifest_hash).await {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        metadata_error_count += 1;
+                        warn!(
+                            error = %error,
+                            media_path = %path,
+                            "skipping media with unreadable metadata during geolocation proposal scan"
+                        );
+                        continue;
+                    }
+                };
+                let Some(metadata) = metadata else {
+                    continue;
+                };
                 let sidecar_gps = {
                     let store = read_store(&state, "operations.geo_proposal.sidecar_gps").await;
-                    match store.media_sidecar_geo_location(path).await {
-                        Ok(location) => location,
+                    match store.media_sidecar_gps_overlay(path).await {
+                        Ok(overlay) => overlay,
                         Err(error) => {
                             warn!(
                                 error = %error,
                                 media_path = %path,
                                 "ignoring unreadable XMP sidecar during geolocation proposal scan"
                             );
-                            None
+                            storage::MediaSidecarGpsOverlay::default()
                         }
                     }
-                };
-                let Some(metadata) = metadata else {
-                    continue;
                 };
                 let capture_time = capture_time_for_geolocation(path, &metadata);
                 let embedded_gps = metadata.gps.as_ref().map(|value| GeoCoordinate {
@@ -1107,7 +1121,8 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                 // inferred sidecar. Otherwise preserve the sidecar location
                 // and its trust flag: it suppresses a duplicate proposal but
                 // cannot act as a future inference anchor.
-                let (gps, gps_is_inferred) = match (sidecar_gps, embedded_gps) {
+                let gps_is_present = embedded_gps.is_some() || sidecar_gps.has_geo_location_properties;
+                let (gps, gps_is_inferred) = match (sidecar_gps.location, embedded_gps) {
                     (Some(sidecar), Some(embedded)) if sidecar.inferred_by_berrykeep => {
                         (Some(embedded), false)
                     }
@@ -1128,6 +1143,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                     content_fingerprint: metadata.content_fingerprint.clone(),
                     capture_time,
                     gps,
+                    gps_is_present,
                     gps_is_inferred,
                 });
             }
@@ -1171,12 +1187,12 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
             persist_operation_run(&state, &run).await?;
             tokio::task::yield_now().await;
         }
-        Ok::<_, anyhow::Error>((chunks.len(), proposal_count, total))
+        Ok::<_, anyhow::Error>((chunks.len(), proposal_count, total, metadata_error_count))
     }
     .await;
 
     match result {
-        Ok((chunk_count, proposal_count, media_count)) => {
+        Ok((chunk_count, proposal_count, media_count, metadata_error_count)) => {
             run.status = OperationRunStatus::Completed;
             run.finished_at_unix = Some(super::unix_ts());
             run.progress = OperationProgress {
@@ -1189,6 +1205,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                 "media_scanned": media_count,
                 "proposal_chunk_count": chunk_count,
                 "proposal_count": proposal_count,
+                "metadata_error_count": metadata_error_count,
             }));
             if let Err(error) = persist_terminal_operation_run_with_retention(
                 &state,
@@ -1455,12 +1472,12 @@ async fn apply_one_geo_proposal(
     }
     let existing_sidecar_gps = {
         let store = read_store(state, "operations.geo_apply.revalidate_sidecar").await;
-        match store.media_sidecar_geo_location(&proposal.media_path).await {
+        match store.media_sidecar_gps_overlay(&proposal.media_path).await {
             Ok(value) => value,
             Err(error) => return failure(format!("failed reading XMP sidecar: {error:#}")),
         }
     };
-    if existing_sidecar_gps.is_some() {
+    if existing_sidecar_gps.has_geo_location_properties {
         return GeoApplyItemResult {
             proposal_id: proposal.id.clone(),
             media_path: proposal.media_path.clone(),
@@ -1799,6 +1816,7 @@ mod tests {
     }
 
     fn media(path: &str, time: Option<u64>, gps: Option<(f64, f64)>) -> GeoAnalysisMedia {
+        let gps_is_present = gps.is_some();
         GeoAnalysisMedia {
             path: path.to_string(),
             object_id: format!("object-{path}"),
@@ -1813,6 +1831,7 @@ mod tests {
                 latitude,
                 longitude,
             }),
+            gps_is_present,
             gps_is_inferred: false,
         }
     }

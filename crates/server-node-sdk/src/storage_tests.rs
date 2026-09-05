@@ -10761,9 +10761,10 @@ async fn gallery_gps_follows_a_geolocation_sidecar_write_impl(backend: StorageTe
     assert!(matches!(write, MediaGeolocationWrite::Applied(_)));
 
     let sidecar_location = store
-        .media_sidecar_geo_location(media_key)
+        .media_sidecar_gps_overlay(media_key)
         .await
         .unwrap()
+        .location
         .expect("the written sidecar should expose GPS");
     assert!((sidecar_location.latitude - 47.3769).abs() < 0.000_001);
     assert!((sidecar_location.longitude - 8.5417).abs() < 0.000_001);
@@ -10800,6 +10801,69 @@ run_on_all_metadata_backends!(
     gallery_gps_follows_a_geolocation_sidecar_write_impl,
     gallery_gps_follows_a_geolocation_sidecar_write,
     gallery_gps_follows_a_geolocation_sidecar_write_turso
+);
+
+async fn unparseable_sidecar_gps_blocks_inferred_overwrite_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-unparseable-sidecar")
+        .await;
+    let media_key = "album/photo.jpg";
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let original = concat!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+        "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+        "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+        "exif:GPSLatitude=\"47.3769\" exif:GPSLongitude=\"8.5417\"/>",
+        "</rdf:RDF></x:xmpmeta>"
+    );
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            Bytes::from(original),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let write = store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.4,
+                longitude: 8.6,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=60s".to_string(),
+                reference_distance_seconds: Some(60),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+            },
+        )
+        .await
+        .expect("existing malformed GPS must be a non-error skip");
+    assert!(matches!(write, MediaGeolocationWrite::AlreadyHasGps));
+    assert_eq!(
+        stored_sidecar_text(&store, media_key).await,
+        original,
+        "an inferred sidecar must never be appended next to unparseable user GPS"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    unparseable_sidecar_gps_blocks_inferred_overwrite_impl,
+    unparseable_sidecar_gps_blocks_inferred_overwrite,
+    unparseable_sidecar_gps_blocks_inferred_overwrite_turso
 );
 
 async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
@@ -10851,9 +10915,10 @@ async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
 
     assert!(
         store
-            .media_sidecar_geo_location(primary_key)
+            .media_sidecar_gps_overlay(primary_key)
             .await
             .unwrap()
+            .location
             .is_some(),
         "the primary media must receive the inferred XMP location"
     );
@@ -10864,9 +10929,10 @@ async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
     );
     assert!(
         store
-            .media_sidecar_geo_location(duplicate_key)
+            .media_sidecar_gps_overlay(duplicate_key)
             .await
             .unwrap()
+            .location
             .is_none(),
         "only the reviewed media key receives an XMP sidecar"
     );

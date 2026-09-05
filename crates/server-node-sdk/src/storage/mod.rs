@@ -2402,6 +2402,15 @@ pub enum MediaGeolocationWrite {
     AlreadyHasGps,
 }
 
+/// Current GPS state stored in a media sidecar. `has_geo_location_properties`
+/// deliberately remains true for malformed or incomplete coordinates so
+/// inference never appends a competing location to user-authored XMP.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MediaSidecarGpsOverlay {
+    pub(crate) location: Option<XmpGeoLocation>,
+    pub(crate) has_geo_location_properties: bool,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -9947,7 +9956,7 @@ impl PersistentStore {
             .load_stored_sidecar(&sidecar_key)
             .await?
             .unwrap_or_else(XmpSidecar::new_empty);
-        if sidecar.geo_location().is_some() {
+        if sidecar.has_geo_location_properties() {
             return Ok(MediaGeolocationWrite::AlreadyHasGps);
         }
         sidecar.set_geo_inference(inference)?;
@@ -9956,17 +9965,22 @@ impl PersistentStore {
             .map(MediaGeolocationWrite::Applied)
     }
 
-    /// Reads the current XMP GPS overlay for one media object without changing
-    /// the object. Operations use this for apply-time revalidation.
-    pub(crate) async fn media_sidecar_geo_location(
+    /// Reads the GPS overlay and the more conservative write guard in one
+    /// sidecar load. A valid location is suitable for gallery projection;
+    /// merely present coordinate properties also block an inference write.
+    pub(crate) async fn media_sidecar_gps_overlay(
         &self,
         media_key: &str,
-    ) -> Result<Option<XmpGeoLocation>> {
+    ) -> Result<MediaSidecarGpsOverlay> {
         let sidecar_key = sidecar_key_for_media(media_key);
         Ok(self
             .load_stored_sidecar(&sidecar_key)
             .await?
-            .and_then(|sidecar| sidecar.geo_location()))
+            .map(|sidecar| MediaSidecarGpsOverlay {
+                location: sidecar.geo_location(),
+                has_geo_location_properties: sidecar.has_geo_location_properties(),
+            })
+            .unwrap_or_default())
     }
 
     async fn write_media_sidecar(
