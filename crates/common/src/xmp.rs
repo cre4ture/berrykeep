@@ -405,6 +405,20 @@ impl XmpSidecar {
 struct ResolvedEvent {
     event: Event<'static>,
     namespace: Option<String>,
+    attributes: Vec<ResolvedAttribute>,
+}
+
+/// An attribute name resolved in the namespace scope of its owning event.
+///
+/// `quick_xml` resolves element names for us, but XMP uses many properties as
+/// attributes. Retaining their expanded names avoids treating an unrelated
+/// `foo:GPSLatitude` as EXIF merely because some other part of the document
+/// happens to bind an `exif` prefix.
+#[derive(Debug, Clone)]
+struct ResolvedAttribute {
+    raw_name: Vec<u8>,
+    namespace: Option<String>,
+    local_name: Vec<u8>,
 }
 
 /// Span of an element inside the event stream.
@@ -517,18 +531,42 @@ fn read_resolved_events(bytes: &[u8]) -> Result<Vec<ResolvedEvent>> {
         if matches!(event, Event::Eof) {
             break;
         }
-        let namespace = match resolved {
-            ResolveResult::Bound(namespace) => {
-                Some(String::from_utf8_lossy(namespace.into_inner()).into_owned())
+        let namespace = resolved_namespace(resolved);
+        let attributes = match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                let mut attributes = element.attributes();
+                attributes.with_checks(false);
+                attributes
+                    .flatten()
+                    .map(|attribute| {
+                        let (namespace, local_name) =
+                            reader.resolver().resolve_attribute(attribute.key);
+                        ResolvedAttribute {
+                            raw_name: attribute.key.as_ref().to_vec(),
+                            namespace: resolved_namespace(namespace),
+                            local_name: local_name.as_ref().to_vec(),
+                        }
+                    })
+                    .collect()
             }
-            ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
+            _ => Vec::new(),
         };
         events.push(ResolvedEvent {
             namespace,
+            attributes,
             event: event.into_owned(),
         });
     }
     Ok(events)
+}
+
+fn resolved_namespace(resolved: ResolveResult<'_>) -> Option<String> {
+    match resolved {
+        ResolveResult::Bound(namespace) => {
+            Some(String::from_utf8_lossy(namespace.into_inner()).into_owned())
+        }
+        ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
+    }
 }
 
 /// Locates the elements that matter for storing `dc:subject`.
@@ -839,24 +877,22 @@ fn qualified_name(prefix: &str, local_name: &str) -> String {
 
 fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
     let inferred_by_berrykeep = has_berrykeep_inference_marker(events);
-    let mut latitude = None;
-    let mut longitude = None;
+    let mut location = None;
+    let mut description_coordinates: Option<(Option<f64>, Option<f64>)> = None;
     let mut element_property = None;
     for event in events {
         match &event.event {
             Event::Start(element) | Event::Empty(element) => {
-                let mut attributes = element.attributes();
-                attributes.with_checks(false);
-                for attribute in attributes.flatten() {
-                    let local_name = attribute.key.local_name();
-                    let value = std::str::from_utf8(attribute.value.as_ref()).ok()?;
-                    match local_name.as_ref() {
-                        b"GPSLatitude" => latitude = parse_xmp_coordinate(value, true),
-                        b"GPSLongitude" => longitude = parse_xmp_coordinate(value, false),
-                        _ => {}
+                if is_element(event, RDF_NAMESPACE, b"Description") {
+                    let coordinates = geo_attributes(event, element);
+                    if matches!(&event.event, Event::Empty(_)) {
+                        set_first_geo_location(&mut location, coordinates);
+                    } else {
+                        description_coordinates = Some(coordinates);
                     }
-                }
-                if matches!(&event.event, Event::Start(_)) {
+                } else if matches!(&event.event, Event::Start(_))
+                    && description_coordinates.is_some()
+                {
                     element_property = if is_element(event, EXIF_NAMESPACE, b"GPSLatitude") {
                         Some(true)
                     } else if is_element(event, EXIF_NAMESPACE, b"GPSLongitude") {
@@ -870,22 +906,30 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
                 let Some(is_latitude) = element_property else {
                     continue;
                 };
-                let value = text.xml10_content().ok()?;
-                if is_latitude {
-                    latitude = parse_xmp_coordinate(&value, true);
-                } else {
-                    longitude = parse_xmp_coordinate(&value, false);
+                let Ok(value) = text.xml10_content() else {
+                    continue;
+                };
+                if let Some((latitude, longitude)) = description_coordinates.as_mut() {
+                    if is_latitude {
+                        *latitude = parse_xmp_coordinate(&value, true);
+                    } else {
+                        *longitude = parse_xmp_coordinate(&value, false);
+                    }
                 }
             }
             Event::CData(text) => {
                 let Some(is_latitude) = element_property else {
                     continue;
                 };
-                let value = std::str::from_utf8(text.as_ref()).ok()?;
-                if is_latitude {
-                    latitude = parse_xmp_coordinate(value, true);
-                } else {
-                    longitude = parse_xmp_coordinate(value, false);
+                let Ok(value) = std::str::from_utf8(text.as_ref()) else {
+                    continue;
+                };
+                if let Some((latitude, longitude)) = description_coordinates.as_mut() {
+                    if is_latitude {
+                        *latitude = parse_xmp_coordinate(value, true);
+                    } else {
+                        *longitude = parse_xmp_coordinate(value, false);
+                    }
                 }
             }
             Event::End(_) => {
@@ -895,21 +939,68 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
                 {
                     element_property = None;
                 }
+                if is_element(event, RDF_NAMESPACE, b"Description") {
+                    set_first_geo_location(
+                        &mut location,
+                        description_coordinates.take().unwrap_or_default(),
+                    );
+                }
             }
             _ => {}
         }
     }
-    match (latitude, longitude) {
+    location.map(|(latitude, longitude)| XmpGeoLocation {
+        latitude,
+        longitude,
+        inferred_by_berrykeep,
+    })
+}
+
+fn geo_attributes(
+    resolved: &ResolvedEvent,
+    element: &BytesStart<'_>,
+) -> (Option<f64>, Option<f64>) {
+    let mut latitude = None;
+    let mut longitude = None;
+    let mut attributes = element.attributes();
+    attributes.with_checks(false);
+    for attribute in attributes.flatten() {
+        let Some(name) = resolved
+            .attributes
+            .iter()
+            .find(|name| name.raw_name == attribute.key.as_ref())
+        else {
+            continue;
+        };
+        if name.namespace.as_deref() != Some(EXIF_NAMESPACE) {
+            continue;
+        }
+        let Ok(value) = std::str::from_utf8(attribute.value.as_ref()) else {
+            continue;
+        };
+        match name.local_name.as_slice() {
+            b"GPSLatitude" => latitude = parse_xmp_coordinate(value, true),
+            b"GPSLongitude" => longitude = parse_xmp_coordinate(value, false),
+            _ => {}
+        }
+    }
+    (latitude, longitude)
+}
+
+fn set_first_geo_location(
+    location: &mut Option<(f64, f64)>,
+    coordinates: (Option<f64>, Option<f64>),
+) {
+    if location.is_some() {
+        return;
+    }
+    match coordinates {
         (Some(latitude), Some(longitude))
             if (-90.0..=90.0).contains(&latitude) && (-180.0..=180.0).contains(&longitude) =>
         {
-            Some(XmpGeoLocation {
-                latitude,
-                longitude,
-                inferred_by_berrykeep,
-            })
+            *location = Some((latitude, longitude));
         }
-        _ => None,
+        _ => {}
     }
 }
 
@@ -917,45 +1008,14 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
 /// Attribute prefixes are resolved from declarations in the packet so a
 /// third-party writer may use a prefix other than `berrykeep`.
 fn has_berrykeep_inference_marker(events: &[ResolvedEvent]) -> bool {
-    let berrykeep_prefixes = events
-        .iter()
-        .flat_map(|resolved| match &resolved.event {
-            Event::Start(element) | Event::Empty(element) => {
-                let mut attributes = element.attributes();
-                attributes.with_checks(false);
-                attributes
-                    .flatten()
-                    .filter_map(|attribute| {
-                        let prefix = attribute.key.as_ref().strip_prefix(b"xmlns:")?;
-                        (attribute.value.as_ref() == BERRYKEEP_NAMESPACE.as_bytes())
-                            .then(|| prefix.to_vec())
-                    })
-                    .collect::<Vec<_>>()
-            }
-            _ => Vec::new(),
-        })
-        .collect::<Vec<_>>();
-
     events.iter().any(|resolved| {
         if is_element(resolved, BERRYKEEP_NAMESPACE, b"GeoInferenceMethod") {
             return true;
         }
-        match &resolved.event {
-            Event::Start(element) | Event::Empty(element) => {
-                let mut attributes = element.attributes();
-                attributes.with_checks(false);
-                attributes.flatten().any(|attribute| {
-                    let key = attribute.key.as_ref();
-                    let Some(prefix) = key.strip_suffix(b":GeoInferenceMethod") else {
-                        return false;
-                    };
-                    berrykeep_prefixes
-                        .iter()
-                        .any(|declared_prefix| declared_prefix.as_slice() == prefix)
-                })
-            }
-            _ => false,
-        }
+        resolved.attributes.iter().any(|attribute| {
+            attribute.namespace.as_deref() == Some(BERRYKEEP_NAMESPACE)
+                && attribute.local_name == b"GeoInferenceMethod"
+        })
     })
 }
 
@@ -1281,6 +1341,28 @@ mod tests {
         );
         let sidecar = XmpSidecar::parse(packet.as_bytes())?;
         assert!(sidecar.geo_location().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_attributes_are_exif_scoped_and_never_combined_across_descriptions() -> Result<()>
+    {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"https://example.invalid/\" ",
+            "exif:GPSLatitude=\"47,22N\" exif:GPSLongitude=\"8,32E\"/>",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLatitude=\"47,22N\"/>",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLongitude=\"8,32E\"/>",
+            "</rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        assert!(
+            sidecar.geo_location().is_none(),
+            "a location must be a complete EXIF pair on one rdf:Description"
+        );
         Ok(())
     }
 

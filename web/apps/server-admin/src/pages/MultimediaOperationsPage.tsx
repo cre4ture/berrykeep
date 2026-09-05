@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getOperationRunHistory,
   getOperationRunResults,
+  getAdminMediaThumbnail,
   getOperations,
   listAdminStoreEntries,
   startOperationRun,
@@ -35,7 +36,7 @@ import { useAdminAccess } from "../lib/admin-access";
 
 const PROPOSE_OPERATION_ID = "multimedia.geolocation.propose";
 const APPLY_OPERATION_ID = "multimedia.geolocation.apply";
-const RESULTS_LIMIT = 1_000;
+const RESULTS_LIMIT = 200;
 
 type InferenceSettings = {
   maxAnchorTimeDeltaSeconds: number;
@@ -57,6 +58,8 @@ export function MultimediaOperationsPage() {
   const [settings, setSettings] = useState(defaultSettings);
   const [selectedAnalysisRunId, setSelectedAnalysisRunId] = useState<string | null>(null);
   const [selectedApplyRunId, setSelectedApplyRunId] = useState<string | null>(null);
+  const [proposalResultsOffset, setProposalResultsOffset] = useState(0);
+  const [applyResultsOffset, setApplyResultsOffset] = useState(0);
   const [selectedChunkIds, setSelectedChunkIds] = useState<Set<string>>(new Set());
   const [selectedProposalIds, setSelectedProposalIds] = useState<Set<string>>(new Set());
 
@@ -105,12 +108,13 @@ export function MultimediaOperationsPage() {
       "multimedia-operations",
       "results",
       selectedAnalysisRun?.run_id ?? null,
+      proposalResultsOffset,
       normalizedAdminTokenOverride
     ],
     queryFn: () =>
       getOperationRunResults(
         selectedAnalysisRun!.run_id,
-        { limit: RESULTS_LIMIT },
+        { limit: RESULTS_LIMIT, offset: proposalResultsOffset },
         normalizedAdminTokenOverride || undefined
       ),
     enabled: canInspect && selectedAnalysisRun !== null,
@@ -131,12 +135,13 @@ export function MultimediaOperationsPage() {
       "multimedia-operations",
       "results",
       selectedApplyRun?.run_id ?? null,
+      applyResultsOffset,
       normalizedAdminTokenOverride
     ],
     queryFn: () =>
       getOperationRunResults(
         selectedApplyRun!.run_id,
-        { limit: RESULTS_LIMIT },
+        { limit: RESULTS_LIMIT, offset: applyResultsOffset },
         normalizedAdminTokenOverride || undefined
       ),
     enabled: canInspect && selectedApplyRun !== null,
@@ -169,7 +174,12 @@ export function MultimediaOperationsPage() {
   useEffect(() => {
     setSelectedChunkIds(new Set());
     setSelectedProposalIds(new Set());
+    setProposalResultsOffset(0);
   }, [selectedAnalysisRunId]);
+
+  useEffect(() => {
+    setApplyResultsOffset(0);
+  }, [selectedApplyRunId]);
 
   const refresh = async () => {
     await Promise.all([
@@ -359,6 +369,7 @@ export function MultimediaOperationsPage() {
               chunks={proposalChunks}
               selectedChunkIds={selectedChunkIds}
               selectedProposalIds={selectedProposalIds}
+              adminTokenOverride={normalizedAdminTokenOverride || undefined}
               onToggleChunk={(chunkId) => setSelectedChunkIds(toggleSetMember(selectedChunkIds, chunkId))}
               onToggleProposal={(proposalId) =>
                 setSelectedProposalIds(toggleSetMember(selectedProposalIds, proposalId))
@@ -367,6 +378,15 @@ export function MultimediaOperationsPage() {
           ) : (
             <Alert color="gray">Start or select an analysis run to review persisted proposals.</Alert>
           )}
+          {selectedAnalysisRun ? (
+            <OperationResultsPagination
+              offset={proposalResultsOffset}
+              count={proposalResultsQuery.data?.chunks.length ?? 0}
+              nextOffset={proposalResultsQuery.data?.next_offset ?? null}
+              onPrevious={() => setProposalResultsOffset(Math.max(0, proposalResultsOffset - RESULTS_LIMIT))}
+              onNext={(nextOffset) => setProposalResultsOffset(nextOffset)}
+            />
+          ) : null}
           <Group justify="space-between">
             <Text size="sm" c="dimmed">{selectedCount} selection{selectedCount === 1 ? "" : "s"}</Text>
             <Button
@@ -404,7 +424,16 @@ export function MultimediaOperationsPage() {
               clearable
             />
             {selectedApplyRun ? (
-              <ApplyResultReview run={selectedApplyRun} items={applyItems} />
+              <>
+                <ApplyResultReview run={selectedApplyRun} items={applyItems} />
+                <OperationResultsPagination
+                  offset={applyResultsOffset}
+                  count={applyResultsQuery.data?.chunks.length ?? 0}
+                  nextOffset={applyResultsQuery.data?.next_offset ?? null}
+                  onPrevious={() => setApplyResultsOffset(Math.max(0, applyResultsOffset - RESULTS_LIMIT))}
+                  onNext={(nextOffset) => setApplyResultsOffset(nextOffset)}
+                />
+              </>
             ) : null}
             <MutationError error={applyResultsQuery.error} />
           </Stack>
@@ -565,16 +594,55 @@ function ApplyResultReview({ run, items }: { run: OperationRun; items: GeoApplyI
   );
 }
 
+function OperationResultsPagination({
+  offset,
+  count,
+  nextOffset,
+  onPrevious,
+  onNext
+}: {
+  offset: number;
+  count: number;
+  nextOffset: number | null;
+  onPrevious: () => void;
+  onNext: (offset: number) => void;
+}) {
+  if (offset === 0 && nextOffset === null) {
+    return null;
+  }
+  return (
+    <Group justify="space-between">
+      <Text size="xs" c="dimmed">
+        Showing result chunks {count === 0 ? 0 : offset + 1}–{offset + count}.
+      </Text>
+      <Group gap="xs">
+        <Button size="xs" variant="default" disabled={offset === 0} onClick={onPrevious}>
+          Previous page
+        </Button>
+        <Button size="xs" variant="default" disabled={nextOffset === null} onClick={() => {
+          if (nextOffset !== null) {
+            onNext(nextOffset);
+          }
+        }}>
+          Next page
+        </Button>
+      </Group>
+    </Group>
+  );
+}
+
 function ProposalReview({
   chunks,
   selectedChunkIds,
   selectedProposalIds,
+  adminTokenOverride,
   onToggleChunk,
   onToggleProposal
 }: {
   chunks: GeoProposalChunk[];
   selectedChunkIds: Set<string>;
   selectedProposalIds: Set<string>;
+  adminTokenOverride?: string;
   onToggleChunk: (chunkId: string) => void;
   onToggleProposal: (proposalId: string) => void;
 }) {
@@ -614,6 +682,7 @@ function ProposalReview({
                       key={proposal.id}
                       proposal={proposal}
                       checked={selectedProposalIds.has(proposal.id)}
+                      adminTokenOverride={adminTokenOverride}
                       onToggle={() => onToggleProposal(proposal.id)}
                     />
                   ))}
@@ -630,24 +699,19 @@ function ProposalReview({
 function ProposalRow({
   proposal,
   checked,
+  adminTokenOverride,
   onToggle
 }: {
   proposal: GeoProposal;
   checked: boolean;
+  adminTokenOverride?: string;
   onToggle: () => void;
 }) {
   return (
     <Table.Tr>
       <Table.Td><Checkbox aria-label={`Select ${proposal.media_path}`} checked={checked} onChange={onToggle} /></Table.Td>
       <Table.Td>
-        <Image
-          src={`/api/v1/auth/media/thumbnail?key=${encodeURIComponent(proposal.media_path)}`}
-          alt=""
-          w={72}
-          h={54}
-          fit="cover"
-          fallbackSrc="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='72' height='54'/%3E"
-        />
+        <AuthenticatedThumbnail mediaPath={proposal.media_path} adminTokenOverride={adminTokenOverride} />
       </Table.Td>
       <Table.Td>
         <Text size="sm" fw={500}>{proposal.media_path}</Text>
@@ -675,6 +739,45 @@ function ProposalRow({
         )}
       </Table.Td>
     </Table.Tr>
+  );
+}
+
+function AuthenticatedThumbnail({
+  mediaPath,
+  adminTokenOverride
+}: {
+  mediaPath: string;
+  adminTokenOverride?: string;
+}) {
+  const [source, setSource] = useState<string | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    let objectUrl: string | null = null;
+    setSource(null);
+    void getAdminMediaThumbnail(mediaPath, adminTokenOverride, controller.signal)
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob);
+        setSource(objectUrl);
+      })
+      .catch(() => {
+        // A missing thumbnail is expected while metadata is still being built.
+      });
+    return () => {
+      controller.abort();
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [adminTokenOverride, mediaPath]);
+  return (
+    <Image
+      src={source ?? undefined}
+      alt=""
+      w={72}
+      h={54}
+      fit="cover"
+      fallbackSrc="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='72' height='54'/%3E"
+    />
   );
 }
 

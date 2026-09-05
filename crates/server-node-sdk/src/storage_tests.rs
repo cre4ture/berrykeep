@@ -10741,7 +10741,7 @@ async fn gallery_gps_follows_a_geolocation_sidecar_write_impl(backend: StorageTe
         .expect("the source media needs a cached metadata record");
     assert!(gallery_gps_for_key(&store, media_key).await.is_none());
 
-    store
+    let write = store
         .set_media_geolocation(
             media_key,
             common::xmp::XmpGeoInference {
@@ -10757,8 +10757,8 @@ async fn gallery_gps_follows_a_geolocation_sidecar_write_impl(backend: StorageTe
             },
         )
         .await
-        .unwrap()
-        .expect("the XMP sidecar should be written");
+        .expect("the XMP sidecar write should succeed");
+    assert!(matches!(write, MediaGeolocationWrite::Applied(_)));
 
     let sidecar_location = store
         .media_sidecar_geo_location(media_key)
@@ -10772,6 +10772,25 @@ async fn gallery_gps_follows_a_geolocation_sidecar_write_impl(backend: StorageTe
         .expect("sidecar GPS must refresh the gallery projection");
     assert!((gallery_location.latitude - 47.3769).abs() < 0.000_001);
     assert!((gallery_location.longitude - 8.5417).abs() < 0.000_001);
+
+    let second_write = store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.4,
+                longitude: 8.6,
+                method: "nearest-anchor".to_string(),
+                run_id: "later-analysis-run".to_string(),
+                confidence: "reference_distance=60s".to_string(),
+                reference_distance_seconds: Some(60),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+            },
+        )
+        .await
+        .expect("existing GPS check should not fail the sidecar mutation");
+    assert!(matches!(second_write, MediaGeolocationWrite::AlreadyHasGps));
 
     drop(store);
     let _ = fs::remove_dir_all(root).await;
@@ -10811,7 +10830,7 @@ async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
         .unwrap()
         .expect("the duplicate media needs cached metadata");
 
-    store
+    let write = store
         .set_media_geolocation(
             primary_key,
             common::xmp::XmpGeoInference {
@@ -10827,7 +10846,8 @@ async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
             },
         )
         .await
-        .unwrap();
+        .expect("the XMP sidecar write should succeed");
+    assert!(matches!(write, MediaGeolocationWrite::Applied(_)));
 
     assert!(
         store

@@ -2858,15 +2858,16 @@ impl MetadataStore for SqliteMetadataStore {
         &self,
         run_id: &str,
         limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<OperationResultChunk>> {
         let run_id = run_id.to_string();
         self.read(move |db| {
             let query = if limit.is_some() {
                 "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
-                 ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2"
+                 ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2 OFFSET ?3"
             } else {
                 "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
-                 ORDER BY created_at_unix ASC, chunk_id ASC"
+                 ORDER BY created_at_unix ASC, chunk_id ASC LIMIT -1 OFFSET ?2"
             };
             let mut statement = db.prepare(query)?;
             let mut chunks = Vec::new();
@@ -2878,13 +2879,16 @@ impl MetadataStore for SqliteMetadataStore {
                 Ok(())
             };
             if let Some(limit) = limit {
-                for row in statement.query_map(params![run_id, usize_to_i64(limit)?], |row| {
-                    row.get::<_, Vec<u8>>(0)
-                })? {
+                for row in statement.query_map(
+                    params![run_id, usize_to_i64(limit)?, usize_to_i64(offset)?],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )? {
                     append(row?)?;
                 }
             } else {
-                for row in statement.query_map(params![run_id], |row| row.get::<_, Vec<u8>>(0))? {
+                for row in statement.query_map(params![run_id, usize_to_i64(offset)?], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })? {
                     append(row?)?;
                 }
             }
@@ -5849,6 +5853,16 @@ mod tests {
             })
             .await
             .expect("proposal chunk should persist before completion");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: run.run_id.clone(),
+                chunk_id: "folder-segment-b".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 13,
+                payload: serde_json::json!({ "id": "folder-segment-b", "proposals": [] }),
+            })
+            .await
+            .expect("a second proposal chunk should persist before completion");
 
         assert_eq!(
             store
@@ -5870,13 +5884,19 @@ mod tests {
         assert_eq!(interrupted.finished_at_unix, Some(20));
         assert_eq!(
             store
-                .list_operation_result_chunks(&run.run_id, None)
+                .list_operation_result_chunks(&run.run_id, None, 0)
                 .await
                 .expect("results should load")
                 .len(),
-            1,
+            2,
             "a restart must never discard reviewable proposal chunks"
         );
+        let page = store
+            .list_operation_result_chunks(&run.run_id, Some(1), 1)
+            .await
+            .expect("result chunk page should load");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].chunk_id, "folder-segment-b");
 
         store
             .prune_operation_run_history_before(11)
@@ -5892,7 +5912,7 @@ mod tests {
         );
         assert!(
             store
-                .list_operation_result_chunks(&run.run_id, None)
+                .list_operation_result_chunks(&run.run_id, None, 0)
                 .await
                 .expect("pruned result lookup should succeed")
                 .is_empty(),

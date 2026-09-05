@@ -1354,6 +1354,7 @@ export type OperationRunHistoryResponse = {
 export type OperationRunResultsResponse = {
   run_id: string;
   chunks: OperationResultChunk[];
+  next_offset?: number | null;
 };
 
 export type GeoCaptureTimeBasis = "utc_normalized" | "floating_local";

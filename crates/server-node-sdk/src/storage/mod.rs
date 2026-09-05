@@ -2394,6 +2394,14 @@ pub struct PutResult {
     pub created_new_version: bool,
 }
 
+/// Explicit result of a geolocation sidecar mutation. This distinguishes a
+/// concurrent/existing GPS write from genuine storage or XMP failures.
+#[derive(Debug, Clone)]
+pub enum MediaGeolocationWrite {
+    Applied(PutResult),
+    AlreadyHasGps,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2857,6 +2865,7 @@ trait MetadataStore: Send + Sync {
         &self,
         run_id: &str,
         limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<OperationResultChunk>>;
     async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()>;
     async fn list_data_scrub_run_history(
@@ -5217,9 +5226,10 @@ impl PersistentStore {
         &self,
         run_id: &str,
         limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<OperationResultChunk>> {
         self.metadata_store
-            .list_operation_result_chunks(run_id, limit)
+            .list_operation_result_chunks(run_id, limit, offset)
             .await
     }
 
@@ -9918,7 +9928,7 @@ impl PersistentStore {
 
         let mut sidecar = stored.unwrap_or_else(XmpSidecar::new_empty);
         sidecar.set_keywords(labels);
-        self.write_media_sidecar(media_key, sidecar).await
+        self.write_media_sidecar(media_key, sidecar).await.map(Some)
     }
 
     /// Applies GPS and BerryKeep provenance through the same lossless XMP
@@ -9928,7 +9938,7 @@ impl PersistentStore {
         &mut self,
         media_key: &str,
         inference: XmpGeoInference,
-    ) -> Result<Option<PutResult>> {
+    ) -> Result<MediaGeolocationWrite> {
         if is_sidecar_key(media_key) {
             bail!("GPS belongs to a media object, not to the sidecar {media_key}");
         }
@@ -9938,10 +9948,12 @@ impl PersistentStore {
             .await?
             .unwrap_or_else(XmpSidecar::new_empty);
         if sidecar.geo_location().is_some() {
-            bail!("refusing to overwrite existing XMP GPS metadata for {media_key}");
+            return Ok(MediaGeolocationWrite::AlreadyHasGps);
         }
         sidecar.set_geo_inference(inference)?;
-        self.write_media_sidecar(media_key, sidecar).await
+        self.write_media_sidecar(media_key, sidecar)
+            .await
+            .map(MediaGeolocationWrite::Applied)
     }
 
     /// Reads the current XMP GPS overlay for one media object without changing
@@ -9961,7 +9973,7 @@ impl PersistentStore {
         &mut self,
         media_key: &str,
         sidecar: XmpSidecar,
-    ) -> Result<Option<PutResult>> {
+    ) -> Result<PutResult> {
         let sidecar_key = sidecar_key_for_media(media_key);
         let bytes = sidecar
             .to_bytes()
@@ -9974,7 +9986,6 @@ impl PersistentStore {
         }
         self.put_object_versioned(&sidecar_key, Bytes::from(bytes), PutOptions::default())
             .await
-            .map(Some)
     }
 
     /// Whether `labels` differ from what the stored sidecar already holds.

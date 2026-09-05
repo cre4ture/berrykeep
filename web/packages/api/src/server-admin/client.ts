@@ -216,18 +216,40 @@ export async function getOperationRun(
 
 export async function getOperationRunResults(
   runId: string,
-  options?: { limit?: number },
+  options?: { limit?: number; offset?: number },
   adminTokenOverride?: string
 ): Promise<OperationRunResultsResponse> {
   const query = new URLSearchParams();
   if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
     query.set("limit", String(Math.max(1, Math.min(1_000, Math.trunc(options.limit)))));
   }
+  if (typeof options?.offset === "number" && Number.isFinite(options.offset)) {
+    query.set("offset", String(Math.max(0, Math.trunc(options.offset))));
+  }
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return fetchAdminJson<OperationRunResultsResponse>(
     `${apiV1(`/auth/operation-runs/${encodeURIComponent(runId)}/results`)}${suffix}`,
     { adminTokenOverride }
   );
+}
+
+/** Fetches a protected media thumbnail for display through an object URL. */
+export async function getAdminMediaThumbnail(
+  key: string,
+  adminTokenOverride?: string,
+  signal?: AbortSignal
+): Promise<Blob> {
+  const query = new URLSearchParams({ key });
+  const response = await fetch(`${apiV1("/auth/media/thumbnail")}?${query.toString()}`, {
+    credentials: "same-origin",
+    cache: "no-store",
+    signal,
+    headers: buildAdminHeaders(adminTokenOverride)
+  });
+  if (!response.ok) {
+    throw new Error(`thumbnail request failed (${response.status})`);
+  }
+  return response.blob();
 }
 
 export async function getOperationRunHistory(

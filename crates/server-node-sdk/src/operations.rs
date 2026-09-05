@@ -627,6 +627,8 @@ pub(super) struct OperationRunHistoryQuery {
 pub(super) struct OperationResultQuery {
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -648,6 +650,8 @@ struct OperationRunHistoryResponse {
 struct OperationRunResultsResponse {
     run_id: String,
     chunks: Vec<OperationResultChunk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -847,23 +851,39 @@ pub(super) async fn get_operation_run_results(
         "auth/operation-runs/results",
         true,
         true,
-        json!({ "run_id": run_id, "limit": query.limit }),
+        json!({ "run_id": run_id, "limit": query.limit, "offset": query.offset }),
     )
     .await
     {
         return status.into_response();
     }
-    let limit = query.limit.map(|limit| limit.clamp(1, 1_000)).or(Some(100));
+    let limit = query
+        .limit
+        .map(|limit| limit.clamp(1, 1_000))
+        .unwrap_or(100);
+    let offset = query.offset.unwrap_or_default();
     let chunks = {
         let store = read_store(&state, "operations.load_results").await;
-        store.list_operation_result_chunks(&run_id, limit).await
+        store
+            .list_operation_result_chunks(&run_id, Some(limit.saturating_add(1)), offset)
+            .await
     };
     match chunks {
-        Ok(chunks) => (
-            StatusCode::OK,
-            Json(OperationRunResultsResponse { run_id, chunks }),
-        )
-            .into_response(),
+        Ok(mut chunks) => {
+            let next_offset = (chunks.len() > limit).then(|| {
+                chunks.pop();
+                offset.saturating_add(limit)
+            });
+            (
+                StatusCode::OK,
+                Json(OperationRunResultsResponse {
+                    run_id,
+                    chunks,
+                    next_offset,
+                }),
+            )
+                .into_response()
+        }
         Err(error) => {
             warn!(error = %error, "failed to load operation result chunks");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1221,7 +1241,7 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
         let chunks = {
             let store = read_store(&state, "operations.geo_apply.load_proposals").await;
             store
-                .list_operation_result_chunks(&input.analysis_run_id, None)
+                .list_operation_result_chunks(&input.analysis_run_id, None, 0)
                 .await?
         };
         let proposals = selected_proposals(&input, chunks)?;
@@ -1456,16 +1476,8 @@ async fn apply_one_geo_proposal(
             .await
     };
     let result = match write {
-        Ok(Some(result)) => result,
-        Ok(None) => {
-            return GeoApplyItemResult {
-                proposal_id: proposal.id.clone(),
-                media_path: proposal.media_path.clone(),
-                outcome: GeoApplyItemOutcome::AlreadyHasGps,
-                detail: Some("no sidecar write was required".to_string()),
-            };
-        }
-        Err(error) if error.to_string().contains("existing XMP GPS") => {
+        Ok(storage::MediaGeolocationWrite::Applied(result)) => result,
+        Ok(storage::MediaGeolocationWrite::AlreadyHasGps) => {
             return GeoApplyItemResult {
                 proposal_id: proposal.id.clone(),
                 media_path: proposal.media_path.clone(),

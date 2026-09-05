@@ -837,17 +837,20 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         run_id: &str,
         limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<OperationResultChunk>> {
         let mut rows = match limit {
             Some(limit) => {
                 self.connection
                     .query(
                         "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
-                     ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2",
+                     ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2 OFFSET ?3",
                         (
                             run_id,
                             i64::try_from(limit)
                                 .context("operation result chunk limit overflow")?,
+                            i64::try_from(offset)
+                                .context("operation result chunk offset overflow")?,
                         ),
                     )
                     .await?
@@ -856,8 +859,12 @@ impl MetadataStore for TursoMetadataStore {
                 self.connection
                     .query(
                         "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
-                     ORDER BY created_at_unix ASC, chunk_id ASC",
-                        (run_id,),
+                     ORDER BY created_at_unix ASC, chunk_id ASC LIMIT -1 OFFSET ?2",
+                        (
+                            run_id,
+                            i64::try_from(offset)
+                                .context("operation result chunk offset overflow")?,
+                        ),
                     )
                     .await?
             }
@@ -3595,6 +3602,22 @@ mod tests {
             })
             .await
             .expect("terminal operation result should persist");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: terminal.run_id.clone(),
+                chunk_id: "proposal-chunk-second".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 12,
+                payload: serde_json::json!({ "proposals": [] }),
+            })
+            .await
+            .expect("second terminal operation result should persist");
+        let result_page = store
+            .list_operation_result_chunks(&terminal.run_id, Some(1), 1)
+            .await
+            .expect("paged result lookup should succeed");
+        assert_eq!(result_page.len(), 1);
+        assert_eq!(result_page[0].chunk_id, "proposal-chunk-second");
 
         store
             .prune_operation_run_history_before(11)
@@ -3609,7 +3632,7 @@ mod tests {
         );
         assert!(
             store
-                .list_operation_result_chunks(&terminal.run_id, None)
+                .list_operation_result_chunks(&terminal.run_id, None, 0)
                 .await
                 .expect("pruned result lookup should succeed")
                 .is_empty()
