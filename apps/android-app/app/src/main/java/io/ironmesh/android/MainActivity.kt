@@ -395,6 +395,7 @@ class MainActivity : ComponentActivity() {
                                 MainSection.GALLERY_MAP -> GalleryMapScreen(
                                     state = state.toGalleryMapUiState(),
                                     onStartGalleryMap = vm::startWebUi,
+                                    accentColorHex = state.themeAccentColorHex,
                                     onFullscreenChanged = { fullscreen ->
                                         galleryMapFullscreen = fullscreen
                                     },

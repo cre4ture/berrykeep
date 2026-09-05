@@ -60,6 +60,26 @@ registerGalleryMapContractTests({
   }
 });
 
+test("embedded Android accent color overrides the browser-local preference", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("ironmesh-accent-color", "#db2777");
+  });
+  await installClientUiMocks(page);
+  await page.goto("/?embedded_client=android&accent_color=%232563eb");
+
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        document.documentElement.style.getPropertyValue("--ironmesh-accent-rgb").trim()
+      )
+    )
+    .toBe("37, 99, 235");
+
+  await page.getByRole("button", { name: /Style:/ }).click();
+  await expect(page.getByText("Synced from the Android app.")).toBeVisible();
+  await expect(page.locator('input[type="color"]')).toHaveCount(0);
+});
+
 test("private service origins keep the launch cookie and sibling sites isolated", async ({
   page
 }) => {

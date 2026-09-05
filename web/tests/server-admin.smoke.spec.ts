@@ -55,6 +55,22 @@ registerGalleryMapContractTests({
   }
 });
 
+test("embedded iOS accent color overrides the browser-local preference", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("ironmesh-accent-color", "#db2777");
+  });
+  await installServerAdminMocks(page);
+  await page.goto("/?embedded_client=ios&accent_color=%237c3aed");
+
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        document.documentElement.style.getPropertyValue("--ironmesh-accent-rgb").trim()
+      )
+    )
+    .toBe("124, 58, 237");
+});
+
 function defaultServerAdminGalleryMapConfiguration(): GalleryMapConfiguration {
   return {
     version: 1,

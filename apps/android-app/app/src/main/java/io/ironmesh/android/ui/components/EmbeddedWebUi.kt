@@ -26,12 +26,17 @@ import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.data.PrivateWebServiceBrowserSession
 import io.ironmesh.android.PrivateWebServiceActivity
 import io.ironmesh.android.share.OriginalShareCoordinator
+import io.ironmesh.android.ui.theme.DEFAULT_IRONMESH_ACCENT_COLOR_HEX
+import io.ironmesh.android.ui.theme.normalizeIronmeshAccentColorHex
 import java.net.URI
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 import org.json.JSONObject
 
 private const val EMBEDDED_WEB_UI_SESSION_HEADER = "X-IronMesh-Web-Ui-Session"
 private const val EMBEDDED_WEB_UI_CLIENT_PARAMETER = "embedded_client"
+private const val EMBEDDED_WEB_UI_ACCENT_COLOR_PARAMETER = "accent_color"
 private const val ANDROID_WEB_UI_CLIENT = "android"
 private const val ANDROID_SHARE_JAVASCRIPT_OBJECT = "IronmeshAndroidShare"
 private const val ANDROID_UI_JAVASCRIPT_OBJECT = "IronmeshAndroidUi"
@@ -44,16 +49,17 @@ private val androidShareExecutor = Executors.newSingleThreadExecutor { runnable 
 @Composable
 fun IronmeshEmbeddedWebUi(
     session: EmbeddedWebUiSession,
+    accentColorHex: String = DEFAULT_IRONMESH_ACCENT_COLOR_HEX,
     modifier: Modifier = Modifier,
     onCreated: ((WebView) -> Unit)? = null,
     onGalleryMapFullscreenChanged: ((Boolean) -> Unit)? = null,
 ) {
     val embeddedSession = session.withUrl(
-        Uri.parse(session.url)
-            .buildUpon()
-            .appendQueryParameter(EMBEDDED_WEB_UI_CLIENT_PARAMETER, ANDROID_WEB_UI_CLIENT)
-            .build()
-            .toString(),
+        embeddedWebUiUrl(
+            url = session.url,
+            client = ANDROID_WEB_UI_CLIENT,
+            accentColorHex = accentColorHex,
+        ),
     )
     AndroidView(
         modifier = modifier,
@@ -73,6 +79,43 @@ fun IronmeshEmbeddedWebUi(
         },
     )
 }
+
+/** Builds the native WebView URL without permitting stale host parameters to win. */
+internal fun embeddedWebUiUrl(
+    url: String,
+    client: String,
+    accentColorHex: String,
+): String {
+    val fragmentIndex = url.indexOf('#')
+    val fragment = if (fragmentIndex >= 0) url.substring(fragmentIndex) else ""
+    val urlWithoutFragment = if (fragmentIndex >= 0) url.substring(0, fragmentIndex) else url
+    val queryIndex = urlWithoutFragment.indexOf('?')
+    val baseUrl = if (queryIndex >= 0) urlWithoutFragment.substring(0, queryIndex) else urlWithoutFragment
+    val retainedParameters = if (queryIndex >= 0) {
+        urlWithoutFragment.substring(queryIndex + 1)
+            .split('&')
+            .filter { parameter ->
+                parameter.isNotEmpty() &&
+                    parameter.substringBefore('=') != EMBEDDED_WEB_UI_CLIENT_PARAMETER &&
+                    parameter.substringBefore('=') != EMBEDDED_WEB_UI_ACCENT_COLOR_PARAMETER
+            }
+    } else {
+        emptyList()
+    }
+    val nativeAccent = normalizeIronmeshAccentColorHex(accentColorHex)
+        ?: DEFAULT_IRONMESH_ACCENT_COLOR_HEX
+    val parameters = retainedParameters + listOf(
+        encodedEmbeddedWebUiParameter(EMBEDDED_WEB_UI_CLIENT_PARAMETER, client),
+        encodedEmbeddedWebUiParameter(EMBEDDED_WEB_UI_ACCENT_COLOR_PARAMETER, nativeAccent),
+    )
+
+    return "$baseUrl?${parameters.joinToString("&")}$fragment"
+}
+
+private fun encodedEmbeddedWebUiParameter(
+    name: String,
+    value: String,
+): String = "$name=${URLEncoder.encode(value, StandardCharsets.UTF_8.name())}"
 
 @SuppressLint("SetJavaScriptEnabled")
 private fun WebView.configureEmbeddedWebUi(
