@@ -2270,6 +2270,88 @@ async fn large_identity_upload_conflict_is_reported_as_object_mutation_conflict(
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn large_identity_upload_completion_conflict_is_reported_as_object_mutation_conflict() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("listener address should be available");
+    let server = tokio::spawn(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/store/uploads/start",
+                post(
+                    |Json(request): Json<UploadSessionStartRequest>| async move {
+                        (
+                            StatusCode::CREATED,
+                            Json(UploadSessionView {
+                                upload_id: "upload-stale-cas".to_string(),
+                                key: request.key,
+                                total_size_bytes: request.total_size_bytes,
+                                chunk_size_bytes: CHUNK_UPLOAD_SIZE_BYTES,
+                                chunk_count: 2,
+                                received_indexes: Vec::new(),
+                                completed: false,
+                                completed_result: None,
+                                expires_at_unix: unix_ts().saturating_add(60),
+                            }),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/store/uploads/{upload_id}/chunk/{index}",
+                put(
+                    |AxumPath((_, index)): AxumPath<(String, usize)>| async move {
+                        (
+                            StatusCode::OK,
+                            Json(UploadSessionChunkResponse {
+                                stored: true,
+                                received_index: index,
+                            }),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/store/uploads/{upload_id}/complete",
+                post(|| async { StatusCode::CONFLICT }),
+            );
+        axum::serve(listener, app)
+            .await
+            .expect("completion-conflict test server should run");
+    });
+
+    let client = IronMeshClient::from_direct_base_url(format!("http://{addr}"));
+    let payload = vec![0_u8; LARGE_UPLOAD_THRESHOLD_BYTES + 1];
+    let error = tokio::task::spawn_blocking(move || {
+        let mut reader = std::io::Cursor::new(payload);
+        match client.put_reader_with_identity_blocking(
+            "docs/large.bin",
+            Some("obj-large"),
+            Some("revision-stale"),
+            &mut reader,
+            (LARGE_UPLOAD_THRESHOLD_BYTES + 1) as u64,
+        ) {
+            Ok(_) => panic!("stale object mutation should not upload"),
+            Err(error) => error,
+        }
+    })
+    .await
+    .expect("blocking upload task should not panic");
+
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<ObjectMutationConflict>()),
+        "large completion conflicts must preserve the object mutation conflict: {error:#}"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
 #[derive(Clone)]
 struct RelayTestSecurity {
     cluster_id: uuid::Uuid,

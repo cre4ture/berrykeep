@@ -6864,6 +6864,14 @@ impl IronMeshClient {
             .with_context(|| format!("failed to complete upload session {upload_id}"))?;
         let response = routed.response;
 
+        if response.status == StatusCode::CONFLICT {
+            self.clear_upload_session_affinity(upload_id);
+            return Err(ObjectMutationConflict::new(
+                "upload-session-complete",
+                format!("session={upload_id}"),
+            )
+            .into());
+        }
         if !response.status.is_success() {
             bail!(
                 "upload session completion rejected for session={upload_id}: {}",
