@@ -7129,6 +7129,36 @@ async fn recoverable_history_head_projection_backfill_rebuilds_legacy_indexes_im
         PathMutationResult::Applied
     );
 
+    drop(store);
+    let metadata_db_path = backend.metadata_db_path(&root);
+    match backend {
+        StorageTestBackend::Sqlite => {
+            let database = rusqlite::Connection::open(&metadata_db_path).unwrap();
+            database
+                .execute(
+                    "INSERT INTO version_indexes(object_id, index_json) VALUES(?1, ?2)",
+                    rusqlite::params!["malformed-history-index", b"not valid json"],
+                )
+                .unwrap();
+        }
+        #[cfg(feature = "turso-metadata")]
+        StorageTestBackend::Turso => {
+            let database = turso::Builder::new_local(&metadata_db_path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            database
+                .connect()
+                .unwrap()
+                .execute(
+                    "INSERT INTO version_indexes(object_id, index_json) VALUES(?1, ?2)",
+                    ("malformed-history-index", b"not valid json".to_vec()),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let store = backend.open_store(root.clone()).await;
     store
         .metadata_store
         .clear_history_head_projections_for_test()

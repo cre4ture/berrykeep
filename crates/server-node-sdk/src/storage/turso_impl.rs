@@ -1777,6 +1777,45 @@ impl MetadataStore for TursoMetadataStore {
         Ok(indexes)
     }
 
+    async fn load_version_index_payloads_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        let mut rows = if let Some(after_object_id) = after_object_id {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     WHERE object_id > ?1
+                     ORDER BY object_id
+                     LIMIT ?2",
+                    (after_object_id, limit),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     ORDER BY object_id
+                     LIMIT ?1",
+                    (limit,),
+                )
+                .await?
+        };
+
+        let mut payloads = Vec::new();
+        while let Some(row) = rows.next().await? {
+            payloads.push((
+                row_string(&row, 0, "version_indexes.object_id")?,
+                row_blob(&row, 1, "version_indexes.index_json")?,
+            ));
+        }
+        Ok(payloads)
+    }
+
     async fn list_recoverable_history_entries_bounded(
         &self,
         prefix: &str,

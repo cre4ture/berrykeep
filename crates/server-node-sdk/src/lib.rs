@@ -126,6 +126,7 @@ const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
 const HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE: Duration = Duration::from_millis(25);
+const HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_ATTEMPTS: u32 = 5;
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -14390,11 +14391,13 @@ fn spawn_history_head_projection_backfill(state: ServerState) {
         };
         let started_at = Instant::now();
         let mut processed_index_count = 0usize;
+        let mut consecutive_failure_count = 0u32;
 
         info!("starting recoverable history head projection backfill");
         loop {
             match inspector.backfill_history_head_projection_batch().await {
                 Ok(progress) => {
+                    consecutive_failure_count = 0;
                     processed_index_count =
                         processed_index_count.saturating_add(progress.processed_index_count);
                     if progress.complete {
@@ -14408,12 +14411,27 @@ fn spawn_history_head_projection_backfill(state: ServerState) {
                     tokio::time::sleep(HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE).await;
                 }
                 Err(err) => {
+                    consecutive_failure_count = consecutive_failure_count.saturating_add(1);
+                    if consecutive_failure_count
+                        >= HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_ATTEMPTS
+                    {
+                        tracing::error!(
+                            error = %err,
+                            processed_index_count,
+                            consecutive_failure_count,
+                            "recoverable history head projection backfill stopped after repeated failures"
+                        );
+                        break;
+                    }
+                    let retry_delay_secs = 1_u64 << (consecutive_failure_count - 1);
                     warn!(
                         error = %err,
                         processed_index_count,
+                        consecutive_failure_count,
+                        retry_delay_secs,
                         "recoverable history head projection backfill failed; retrying"
                     );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
                 }
             }
         }

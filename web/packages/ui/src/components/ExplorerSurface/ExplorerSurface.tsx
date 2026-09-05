@@ -318,18 +318,17 @@ export function ExplorerSurface({
       loadHistoricalEntries != null;
     const includeHistorical = historicalEntriesEnabled;
     if (includeHistorical) {
+      if (
+        historyEntriesPayload?.prefix !== targetHistoryPrefix ||
+        historyEntriesPayload.depth !== targetHistoryDepth
+      ) {
+        // Do not display a previous prefix's results while the current history
+        // request is being refreshed for a different scope.
+        setHistoryEntriesPayload(null);
+      }
       setHistoryLoadState("loading");
       setHistoryLoadError(null);
-    } else if (!historicalEntriesEnabled) {
-      setHistoryLoadState("idle");
-      setHistoryLoadError(null);
-    } else if (
-      historyEntriesPayload?.prefix !== targetHistoryPrefix ||
-      historyEntriesPayload.depth !== targetHistoryDepth
-    ) {
-      // Do not display a previous prefix's results while the current history
-      // request is being refreshed for a different scope.
-      setHistoryEntriesPayload(null);
+    } else {
       setHistoryLoadState("idle");
       setHistoryLoadError(null);
     }

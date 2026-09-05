@@ -1586,6 +1586,22 @@ pub(super) struct VersionIndexHeadProjection {
     pub(super) moved_source_object_id: Option<String>,
 }
 
+impl VersionIndexHeadProjection {
+    fn empty(object_id: &str) -> Self {
+        Self {
+            object_id: object_id.to_string(),
+            head_version_id: None,
+            head_manifest_hash: None,
+            logical_path: None,
+            removed_at_unix: None,
+            restore_source_path: None,
+            restore_source_object_id: None,
+            restore_version_id: None,
+            moved_source_object_id: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HistoryHeadProjectionBackfillState {
     Pending { after_object_id: Option<String> },
@@ -1602,17 +1618,7 @@ pub(super) fn version_index_head_projection(
     object_id: &str,
     index: &FileVersionIndex,
 ) -> VersionIndexHeadProjection {
-    let mut projection = VersionIndexHeadProjection {
-        object_id: object_id.to_string(),
-        head_version_id: None,
-        head_manifest_hash: None,
-        logical_path: None,
-        removed_at_unix: None,
-        restore_source_path: None,
-        restore_source_object_id: None,
-        restore_version_id: None,
-        moved_source_object_id: None,
-    };
+    let mut projection = VersionIndexHeadProjection::empty(object_id);
 
     let Some(head_version_id) = index
         .preferred_head_version_id
@@ -2887,6 +2893,14 @@ trait MetadataStore: Send + Sync {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileVersionIndex>>;
+    /// Reads a raw page for the history-head migration. The migration can
+    /// advance past one corrupt legacy payload without weakening normal
+    /// version-index reads, which must continue to report malformed metadata.
+    async fn load_version_index_payloads_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>>;
     /// Reads the indexed preferred-head projection for Explorer history. The
     /// result contains at most `max_entries + 1` distinct paths so callers can
     /// enforce a response bound without materializing the complete namespace.
@@ -3478,21 +3492,31 @@ impl StoreHistoryInspector {
             });
         };
 
-        let indexes = self
+        let payloads = self
             .metadata_store
-            .load_version_indexes_after(
+            .load_version_index_payloads_after(
                 after_object_id.as_deref(),
                 STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE,
             )
             .await?;
-        let processed_index_count = indexes.len();
-        let next_after_object_id = indexes
-            .last()
-            .map(|index| index.persisted_object_id.clone());
+        let processed_index_count = payloads.len();
+        let next_after_object_id = payloads.last().map(|(object_id, _)| object_id.clone());
         let complete = processed_index_count < STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE;
-        let projections = indexes
+        let projections = payloads
             .iter()
-            .map(|index| version_index_head_projection(&index.persisted_object_id, index))
+            .map(|(object_id, payload)| {
+                match decode_version_index(object_id, payload, "history head projection backfill") {
+                    Ok(index) => version_index_head_projection(object_id, &index),
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            object_id,
+                            "skipping malformed version index during recoverable history backfill"
+                        );
+                        VersionIndexHeadProjection::empty(object_id)
+                    }
+                }
+            })
             .collect::<Vec<_>>();
         self.metadata_store
             .persist_history_head_projection_backfill_batch(
