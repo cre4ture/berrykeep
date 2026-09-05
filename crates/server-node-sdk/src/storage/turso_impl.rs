@@ -28,8 +28,8 @@ use super::{
     S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
     S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    compress_snapshot_json, decode_gallery_labels, decode_version_index, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    TOMBSTONE_MANIFEST_HASH, compress_snapshot_json, decode_gallery_labels, decode_version_index,
+    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
     normalize_snapshot_manifest_object_ids,
 };
 
@@ -1821,6 +1821,96 @@ impl MetadataStore for TursoMetadataStore {
                      ORDER BY object_id
                      LIMIT ?1",
                     (limit,),
+                )
+                .await?
+        };
+
+        let mut indexes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let object_id = row_string(&row, 0, "version_indexes.object_id")?;
+            let payload = row_blob(&row, 1, "version_indexes.index_json")?;
+            indexes.push(decode_version_index(&object_id, &payload, "Turso")?);
+        }
+        Ok(indexes)
+    }
+
+    async fn load_recoverable_history_version_indexes_after(
+        &self,
+        prefix: &str,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>> {
+        let prefix_pattern = if prefix.is_empty() {
+            "%".to_string()
+        } else {
+            super::sqlite_like_prefix_pattern(&format!("{prefix}/"))
+        };
+        let limit = i64::try_from(limit.max(1)).context("history index page limit overflow")?;
+        let mut rows = if let Some(after_object_id) = after_object_id {
+            self.connection
+                .query(
+                    "SELECT version_indexes.object_id, version_indexes.index_json
+                     FROM version_indexes
+                     WHERE version_indexes.object_id > ?1
+                       AND EXISTS (
+                         SELECT 1
+                         FROM json_each(CAST(version_indexes.index_json AS TEXT), '$.versions') AS version
+                         WHERE json_extract(version.value, '$.manifest_hash') = ?2
+                           AND (
+                             json_extract(CAST(version_indexes.index_json AS TEXT), '$.preferred_head_version_id') IS NULL
+                             OR version.key = json_extract(CAST(version_indexes.index_json AS TEXT), '$.preferred_head_version_id')
+                           )
+                           AND json_extract(version.value, '$.logical_path') IS NOT NULL
+                           AND (
+                             ?3 = ''
+                             OR json_extract(version.value, '$.logical_path') = ?3
+                             OR json_extract(version.value, '$.logical_path') LIKE ?4 ESCAPE '\\'
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1
+                             FROM current_objects
+                             WHERE current_objects.key = json_extract(version.value, '$.logical_path')
+                           )
+                       )
+                     ORDER BY version_indexes.object_id
+                     LIMIT ?5",
+                    (
+                        after_object_id,
+                        TOMBSTONE_MANIFEST_HASH,
+                        prefix,
+                        prefix_pattern.as_str(),
+                        limit,
+                    ),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT version_indexes.object_id, version_indexes.index_json
+                     FROM version_indexes
+                     WHERE EXISTS (
+                         SELECT 1
+                         FROM json_each(CAST(version_indexes.index_json AS TEXT), '$.versions') AS version
+                         WHERE json_extract(version.value, '$.manifest_hash') = ?1
+                           AND (
+                             json_extract(CAST(version_indexes.index_json AS TEXT), '$.preferred_head_version_id') IS NULL
+                             OR version.key = json_extract(CAST(version_indexes.index_json AS TEXT), '$.preferred_head_version_id')
+                           )
+                           AND json_extract(version.value, '$.logical_path') IS NOT NULL
+                           AND (
+                             ?2 = ''
+                             OR json_extract(version.value, '$.logical_path') = ?2
+                             OR json_extract(version.value, '$.logical_path') LIKE ?3 ESCAPE '\\'
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1
+                             FROM current_objects
+                             WHERE current_objects.key = json_extract(version.value, '$.logical_path')
+                           )
+                       )
+                     ORDER BY version_indexes.object_id
+                     LIMIT ?4",
+                    (TOMBSTONE_MANIFEST_HASH, prefix, prefix_pattern.as_str(), limit),
                 )
                 .await?
         };

@@ -9,7 +9,6 @@ const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
 const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
 const STORE_HISTORY_VERSION_INDEX_BATCH_SIZE: usize = 256;
 const STORE_HISTORY_RESTORE_FALLBACK_MAX_INDEX_PAGES: usize = 4;
-const STORE_HISTORY_LIST_MAX_INDEX_PAGES: usize = 64;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
@@ -2760,6 +2759,16 @@ trait MetadataStore: Send + Sync {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileVersionIndex>>;
+    /// Lists recoverable-history candidate indexes under `prefix`. The
+    /// metadata backend applies tombstone, prefix, and current-path filters
+    /// before deserializing indexes; legacy indexes without a preferred head
+    /// are confirmed by the caller.
+    async fn load_recoverable_history_version_indexes_after(
+        &self,
+        prefix: &str,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>>;
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
@@ -3123,7 +3132,6 @@ impl StorageStatsCollector {
 pub(crate) enum RecoverableHistoryEntries {
     Entries(Vec<RecoverableHistoryEntry>),
     ExceedsLimit { minimum_entry_count: usize },
-    ScanLimitExceeded { scanned_index_count: usize },
 }
 
 impl StoreHistoryInspector {
@@ -3360,12 +3368,12 @@ impl StoreHistoryInspector {
         let prefix = prefix.trim().trim_matches('/');
         let mut entries = BTreeMap::<String, (RecoverableHistoryEntry, Option<String>)>::new();
         let mut after_object_id = None;
-        let mut completed = false;
 
-        for _ in 0..STORE_HISTORY_LIST_MAX_INDEX_PAGES {
+        loop {
             let indexes = self
                 .metadata_store
-                .load_version_indexes_after(
+                .load_recoverable_history_version_indexes_after(
+                    prefix,
                     after_object_id.as_deref(),
                     STORE_HISTORY_VERSION_INDEX_BATCH_SIZE,
                 )
@@ -3374,7 +3382,6 @@ impl StoreHistoryInspector {
                 .last()
                 .map(|index| index.persisted_object_id.clone())
             else {
-                completed = true;
                 break;
             };
             let mut page_entries =
@@ -3482,13 +3489,6 @@ impl StoreHistoryInspector {
                 });
             }
             after_object_id = Some(last_object_id);
-        }
-
-        if !completed {
-            return Ok(RecoverableHistoryEntries::ScanLimitExceeded {
-                scanned_index_count: STORE_HISTORY_LIST_MAX_INDEX_PAGES
-                    .saturating_mul(STORE_HISTORY_VERSION_INDEX_BATCH_SIZE),
-            });
         }
 
         let moved_source_object_ids = entries

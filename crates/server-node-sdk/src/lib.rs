@@ -16463,18 +16463,6 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                     }) => Arc::new(StoreHistoryCacheValue::Oversized {
                         minimum_entry_count,
                     }),
-                    Ok(RecoverableHistoryEntries::ScanLimitExceeded {
-                        scanned_index_count,
-                    }) => {
-                        return (
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            Json(json!({
-                                "error": "recoverable history scan exceeds the interactive explorer limit",
-                                "scanned_index_count": scanned_index_count,
-                            })),
-                        )
-                            .into_response();
-                    }
                     Err(err) => {
                         tracing::error!(error = %err, prefix = %prefix, depth, "failed to list recoverable history entries");
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
