@@ -1273,3 +1273,134 @@ export type ControlPlanePromotionImportResponse = {
   rendezvous_cert_path: string;
   rendezvous_key_path: string;
 };
+
+// Persistent server operations deliberately use a small common envelope.  The
+// `input`, `summary`, and result payload are operation-specific, while the
+// lifecycle and progress fields stay uniform for maintenance and multimedia
+// work alike.
+export type OperationCategory = "repair" | "multimedia";
+
+export type OperationPriority = "background" | "maintenance" | "repair";
+
+export type OperationRunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted";
+
+export type OperationProgress = {
+  phase?: string | null;
+  completed?: number | null;
+  total?: number | null;
+  message?: string | null;
+};
+
+export type OperationDescriptor = {
+  id: string;
+  label: string;
+  description: string;
+  category: OperationCategory;
+  requires_prefix: boolean;
+  supports_review: boolean;
+  priority: OperationPriority;
+};
+
+export type OperationRun = {
+  run_id: string;
+  operation_id: string;
+  status: OperationRunStatus;
+  priority: OperationPriority;
+  created_at_unix: number;
+  started_at_unix?: number | null;
+  finished_at_unix?: number | null;
+  progress: OperationProgress;
+  input: Record<string, unknown>;
+  summary?: Record<string, unknown> | null;
+  error?: string | null;
+  termination_reason?: string | null;
+};
+
+export type OperationResultChunk = {
+  run_id: string;
+  chunk_id: string;
+  result_type: string;
+  created_at_unix: number;
+  payload: Record<string, unknown>;
+};
+
+export type OperationCatalogResponse = {
+  operations: OperationDescriptor[];
+};
+
+export type OperationRunStartRequest = {
+  prefix?: string;
+  max_anchor_time_delta_seconds?: number;
+  segment_gap_seconds?: number;
+  max_anchor_speed_kmh?: number;
+  analysis_run_id?: string;
+  proposal_chunk_ids?: string[];
+  proposal_ids?: string[];
+};
+
+export type OperationRunStartResponse = {
+  run: OperationRun;
+};
+
+export type OperationRunHistoryResponse = {
+  runs: OperationRun[];
+};
+
+export type OperationRunResultsResponse = {
+  run_id: string;
+  chunks: OperationResultChunk[];
+};
+
+export type GeoCaptureTimeBasis = "utc_normalized" | "floating_local";
+
+export type GeoCaptureTimeSource = "embedded_metadata" | "filename";
+
+export type GeoCaptureTime = {
+  unix: number;
+  source: GeoCaptureTimeSource;
+  basis: GeoCaptureTimeBasis;
+};
+
+export type GeoCoordinate = {
+  latitude: number;
+  longitude: number;
+};
+
+export type GeoProposalAnchor = {
+  path: string;
+  object_id: string;
+  capture_time: GeoCaptureTime;
+  coordinate: GeoCoordinate;
+  distance_seconds: number;
+};
+
+export type GeoProposal = {
+  id: string;
+  media_path: string;
+  object_id: string;
+  manifest_hash: string;
+  content_fingerprint: string;
+  capture_time: GeoCaptureTime;
+  proposed: GeoCoordinate;
+  method: "interpolation" | "nearest_anchor";
+  previous_anchor?: GeoProposalAnchor | null;
+  next_anchor?: GeoProposalAnchor | null;
+  estimated_anchor_speed_kmh?: number | null;
+  warnings: string[];
+};
+
+export type GeoProposalChunk = {
+  id: string;
+  analysis_run_id: string;
+  folder: string;
+  time_range_start: GeoCaptureTime;
+  time_range_end: GeoCaptureTime;
+  item_count: number;
+  status: "ready";
+  proposals: GeoProposal[];
+};
