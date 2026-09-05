@@ -14,6 +14,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::cluster::NodeDescriptor;
+#[cfg(test)]
+use crate::operations::{OperationPriority, OperationProgress};
+use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
@@ -2577,6 +2580,225 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn list_operation_runs(
+        &self,
+        operation_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationRun>> {
+        let operation_id = operation_id.map(str::to_string);
+        self.read(move |db| {
+            let mut query = String::from("SELECT record_json FROM operation_runs");
+            if operation_id.is_some() {
+                query.push_str(" WHERE operation_id = ?1");
+            }
+            query.push_str(" ORDER BY created_at_unix DESC, run_id DESC");
+            if limit.is_some() {
+                query.push_str(if operation_id.is_some() {
+                    " LIMIT ?2"
+                } else {
+                    " LIMIT ?1"
+                });
+            }
+            let mut statement = db.prepare(&query)?;
+            let mut records = Vec::new();
+            let mut append = |payload: Vec<u8>| -> Result<()> {
+                records.push(
+                    serde_json::from_slice::<OperationRun>(&payload)
+                        .context("invalid operation run record in sqlite")?,
+                );
+                Ok(())
+            };
+            match (operation_id, limit) {
+                (Some(operation_id), Some(limit)) => {
+                    for row in statement
+                        .query_map(params![operation_id, usize_to_i64(limit)?], |row| {
+                            row.get::<_, Vec<u8>>(0)
+                        })?
+                    {
+                        append(row?)?;
+                    }
+                }
+                (Some(operation_id), None) => {
+                    for row in statement
+                        .query_map(params![operation_id], |row| row.get::<_, Vec<u8>>(0))?
+                    {
+                        append(row?)?;
+                    }
+                }
+                (None, Some(limit)) => {
+                    for row in statement.query_map(params![usize_to_i64(limit)?], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })? {
+                        append(row?)?;
+                    }
+                }
+                (None, None) => {
+                    for row in statement.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
+                        append(row?)?;
+                    }
+                }
+            }
+            Ok(records)
+        })
+        .await
+    }
+
+    async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>> {
+        let run_id = run_id.to_string();
+        self.read(move |db| {
+            let payload = db
+                .query_row(
+                    "SELECT record_json FROM operation_runs WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            payload
+                .map(|payload| {
+                    serde_json::from_slice(&payload)
+                        .context("invalid operation run record in sqlite")
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    async fn persist_operation_run(&self, run: &OperationRun) -> Result<()> {
+        let run_id = run.run_id.clone();
+        let operation_id = run.operation_id.clone();
+        let status = serde_json::to_value(run.status)?
+            .as_str()
+            .context("operation status did not serialize as a string")?
+            .to_string();
+        let created_at_unix = run.created_at_unix;
+        let payload = serde_json::to_vec_pretty(run)?;
+        self.write(move |db| {
+            db.execute(
+                "INSERT INTO operation_runs (run_id, operation_id, status, created_at_unix, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                     operation_id = excluded.operation_id,
+                     status = excluded.status,
+                     created_at_unix = excluded.created_at_unix,
+                     record_json = excluded.record_json",
+                params![
+                    run_id,
+                    operation_id,
+                    status,
+                    u64_to_i64(created_at_unix)?,
+                    payload
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn interrupt_unfinished_operation_runs(
+        &self,
+        finished_at_unix: u64,
+        termination_reason: &str,
+    ) -> Result<usize> {
+        let termination_reason = termination_reason.to_string();
+        self.write_tx(move |db| {
+            let mut statement = db.prepare(
+                "SELECT run_id, record_json FROM operation_runs
+                 WHERE status IN ('queued', 'running')",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut interrupted = Vec::new();
+            for row in rows {
+                let (run_id, payload) = row?;
+                let mut run: OperationRun = serde_json::from_slice(&payload)
+                    .context("invalid operation run record in sqlite")?;
+                if !run.status.is_unfinished() {
+                    continue;
+                }
+                run.status = OperationRunStatus::Interrupted;
+                run.finished_at_unix = Some(finished_at_unix);
+                run.termination_reason = Some(termination_reason.clone());
+                run.progress.message = Some("Interrupted after server restart.".to_string());
+                interrupted.push((run_id, serde_json::to_vec_pretty(&run)?));
+            }
+            for (run_id, payload) in &interrupted {
+                db.execute(
+                    "UPDATE operation_runs SET status = 'interrupted', record_json = ?2 WHERE run_id = ?1",
+                    params![run_id, payload],
+                )?;
+            }
+            Ok(interrupted.len())
+        })
+        .await
+    }
+
+    async fn list_operation_result_chunks(
+        &self,
+        run_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationResultChunk>> {
+        let run_id = run_id.to_string();
+        self.read(move |db| {
+            let query = if limit.is_some() {
+                "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                 ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2"
+            } else {
+                "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                 ORDER BY created_at_unix ASC, chunk_id ASC"
+            };
+            let mut statement = db.prepare(query)?;
+            let mut chunks = Vec::new();
+            let mut append = |payload: Vec<u8>| -> Result<()> {
+                chunks.push(
+                    serde_json::from_slice::<OperationResultChunk>(&payload)
+                        .context("invalid operation result chunk in sqlite")?,
+                );
+                Ok(())
+            };
+            if let Some(limit) = limit {
+                for row in statement.query_map(params![run_id, usize_to_i64(limit)?], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })? {
+                    append(row?)?;
+                }
+            } else {
+                for row in statement.query_map(params![run_id], |row| row.get::<_, Vec<u8>>(0))? {
+                    append(row?)?;
+                }
+            }
+            Ok(chunks)
+        })
+        .await
+    }
+
+    async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()> {
+        let run_id = chunk.run_id.clone();
+        let chunk_id = chunk.chunk_id.clone();
+        let result_type = chunk.result_type.clone();
+        let created_at_unix = chunk.created_at_unix;
+        let payload = serde_json::to_vec_pretty(chunk)?;
+        self.write(move |db| {
+            db.execute(
+                "INSERT INTO operation_result_chunks (run_id, chunk_id, result_type, created_at_unix, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id, chunk_id) DO UPDATE SET
+                     result_type = excluded.result_type,
+                     created_at_unix = excluded.created_at_unix,
+                     payload_json = excluded.payload_json",
+                params![
+                    run_id,
+                    chunk_id,
+                    result_type,
+                    u64_to_i64(created_at_unix)?,
+                    payload
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn list_data_scrub_run_history(
         &self,
         limit: Option<usize>,
@@ -4856,6 +5078,23 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             record_json BLOB NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS operation_runs (
+            run_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            record_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_result_chunks (
+            run_id TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            result_type TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            payload_json BLOB NOT NULL,
+            PRIMARY KEY(run_id, chunk_id)
+        );
+
         CREATE TABLE IF NOT EXISTS data_scrub_run_history (
             run_id TEXT PRIMARY KEY,
             finished_at_unix INTEGER NOT NULL,
@@ -5001,6 +5240,15 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON repair_run_history(finished_at_unix DESC, run_id DESC);
         CREATE INDEX IF NOT EXISTS idx_manual_repair_action_run_history_finished
             ON manual_repair_action_run_history(finished_at_unix DESC, run_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_operation_runs_operation_created
+            ON operation_runs(operation_id, created_at_unix DESC, run_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_operation_runs_status
+            ON operation_runs(status, created_at_unix DESC, run_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_operation_result_chunks_run_created
+            ON operation_result_chunks(run_id, created_at_unix ASC, chunk_id ASC);
         CREATE INDEX IF NOT EXISTS idx_data_scrub_run_history_finished
             ON data_scrub_run_history(finished_at_unix DESC, run_id DESC);
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created
@@ -5437,6 +5685,78 @@ mod tests {
         assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
     }
 
+    #[tokio::test]
+    async fn interrupted_operation_runs_keep_their_persisted_result_chunks() {
+        let metadata_db_path = sqlite_test_db_path("operation-restart");
+        let store = SqliteMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("sqlite metadata store should open");
+        let run = OperationRun {
+            run_id: "analysis-run".to_string(),
+            operation_id: "multimedia.geolocation.propose".to_string(),
+            status: OperationRunStatus::Running,
+            priority: OperationPriority::Background,
+            created_at_unix: 10,
+            started_at_unix: Some(11),
+            finished_at_unix: None,
+            progress: OperationProgress {
+                phase: Some("persisting_results".to_string()),
+                completed: Some(1),
+                total: Some(2),
+                message: None,
+            },
+            input: serde_json::json!({ "prefix": "photos/" }),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        };
+        store
+            .persist_operation_run(&run)
+            .await
+            .expect("running operation should persist");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: run.run_id.clone(),
+                chunk_id: "folder-segment-a".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 12,
+                payload: serde_json::json!({ "id": "folder-segment-a", "proposals": [] }),
+            })
+            .await
+            .expect("proposal chunk should persist before completion");
+
+        assert_eq!(
+            store
+                .interrupt_unfinished_operation_runs(20, "server_restart")
+                .await
+                .expect("restart cleanup should succeed"),
+            1
+        );
+        let interrupted = store
+            .load_operation_run(&run.run_id)
+            .await
+            .expect("operation should load")
+            .expect("operation should remain recorded");
+        assert_eq!(interrupted.status, OperationRunStatus::Interrupted);
+        assert_eq!(
+            interrupted.termination_reason.as_deref(),
+            Some("server_restart")
+        );
+        assert_eq!(interrupted.finished_at_unix, Some(20));
+        assert_eq!(
+            store
+                .list_operation_result_chunks(&run.run_id, None)
+                .await
+                .expect("results should load")
+                .len(),
+            1,
+            "a restart must never discard reviewable proposal chunks"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
     #[test]
     fn init_metadata_db_accepts_missing_legacy_schema_version() {
         let db = Connection::open_in_memory().expect("in-memory sqlite should open");
@@ -5497,6 +5817,7 @@ mod tests {
             height: Some(48),
             orientation: Some(1),
             taken_at_unix: Some(1),
+            taken_at_timezone_known: Some(true),
             date_encoded_unix: None,
             duration_millis: None,
             frame_rate_millihertz: None,

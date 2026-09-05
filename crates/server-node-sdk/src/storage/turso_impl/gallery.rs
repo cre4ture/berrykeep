@@ -3431,6 +3431,7 @@ mod tests {
             height: Some(48),
             orientation: Some(1),
             taken_at_unix: Some(10),
+            taken_at_timezone_known: Some(true),
             date_encoded_unix: None,
             duration_millis: None,
             frame_rate_millihertz: None,

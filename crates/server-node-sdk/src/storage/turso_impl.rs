@@ -9,6 +9,7 @@ use tracing::warn;
 use turso::params_from_iter;
 
 use crate::cluster::NodeDescriptor;
+use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 
 mod gallery;
 
@@ -626,6 +627,222 @@ impl MetadataStore for TursoMetadataStore {
                 "DELETE FROM manual_repair_action_run_history\n                 WHERE finished_at_unix < ?1",
                 (i64::try_from(finished_before_unix)
                     .context("manual repair action history prune timestamp overflow")?,),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn list_operation_runs(
+        &self,
+        operation_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationRun>> {
+        let mut rows = match (operation_id, limit) {
+            (Some(operation_id), Some(limit)) => {
+                self.connection
+                    .query(
+                        "SELECT record_json FROM operation_runs WHERE operation_id = ?1
+                     ORDER BY created_at_unix DESC, run_id DESC LIMIT ?2",
+                        (
+                            operation_id,
+                            i64::try_from(limit).context("operation run limit overflow")?,
+                        ),
+                    )
+                    .await?
+            }
+            (Some(operation_id), None) => {
+                self.connection
+                    .query(
+                        "SELECT record_json FROM operation_runs WHERE operation_id = ?1
+                     ORDER BY created_at_unix DESC, run_id DESC",
+                        (operation_id,),
+                    )
+                    .await?
+            }
+            (None, Some(limit)) => {
+                self.connection
+                    .query(
+                        "SELECT record_json FROM operation_runs
+                     ORDER BY created_at_unix DESC, run_id DESC LIMIT ?1",
+                        (i64::try_from(limit).context("operation run limit overflow")?,),
+                    )
+                    .await?
+            }
+            (None, None) => {
+                self.connection
+                    .query(
+                        "SELECT record_json FROM operation_runs
+                     ORDER BY created_at_unix DESC, run_id DESC",
+                        (),
+                    )
+                    .await?
+            }
+        };
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let payload = row_blob(&row, 0, "operation_runs.record_json")?;
+            records.push(
+                serde_json::from_slice(&payload)
+                    .context("invalid operation run record in turso")?,
+            );
+        }
+        Ok(records)
+    }
+
+    async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT record_json FROM operation_runs WHERE run_id = ?1",
+                (run_id,),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let payload = row_blob(&row, 0, "operation_runs.record_json")?;
+        Ok(Some(
+            serde_json::from_slice(&payload).context("invalid operation run record in turso")?,
+        ))
+    }
+
+    async fn persist_operation_run(&self, run: &OperationRun) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        let payload = serde_json::to_vec_pretty(run)?;
+        let status = serde_json::to_value(run.status)?
+            .as_str()
+            .context("operation status did not serialize as a string")?
+            .to_string();
+        self.connection
+            .execute(
+                "INSERT INTO operation_runs (run_id, operation_id, status, created_at_unix, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                     operation_id = excluded.operation_id,
+                     status = excluded.status,
+                     created_at_unix = excluded.created_at_unix,
+                     record_json = excluded.record_json",
+                (
+                    run.run_id.as_str(),
+                    run.operation_id.as_str(),
+                    status,
+                    i64::try_from(run.created_at_unix)
+                        .context("operation run timestamp overflow")?,
+                    payload,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn interrupt_unfinished_operation_runs(
+        &self,
+        finished_at_unix: u64,
+        termination_reason: &str,
+    ) -> Result<usize> {
+        let _writer = self.writer_lock.lock().await;
+        let result = async {
+            self.connection.execute_batch("BEGIN IMMEDIATE").await?;
+            let mut rows = self
+                .connection
+                .query(
+                    "SELECT run_id, record_json FROM operation_runs
+                     WHERE status IN ('queued', 'running')",
+                    (),
+                )
+                .await?;
+            let mut interrupted = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let run_id = row_string(&row, 0, "operation_runs.run_id")?;
+                let payload = row_blob(&row, 1, "operation_runs.record_json")?;
+                let mut run: OperationRun = serde_json::from_slice(&payload)
+                    .context("invalid operation run record in turso")?;
+                if !run.status.is_unfinished() {
+                    continue;
+                }
+                run.status = OperationRunStatus::Interrupted;
+                run.finished_at_unix = Some(finished_at_unix);
+                run.termination_reason = Some(termination_reason.to_string());
+                run.progress.message = Some("Interrupted after server restart.".to_string());
+                interrupted.push((run_id, serde_json::to_vec_pretty(&run)?));
+            }
+            for (run_id, payload) in &interrupted {
+                self.connection
+                    .execute(
+                        "UPDATE operation_runs SET status = 'interrupted', record_json = ?2 WHERE run_id = ?1",
+                        (run_id.as_str(), payload.as_slice()),
+                    )
+                    .await?;
+            }
+            self.connection.execute_batch("COMMIT").await?;
+            Ok(interrupted.len())
+        }
+        .await;
+        if result.is_err() {
+            self.rollback().await;
+        }
+        result
+    }
+
+    async fn list_operation_result_chunks(
+        &self,
+        run_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationResultChunk>> {
+        let mut rows = match limit {
+            Some(limit) => {
+                self.connection
+                    .query(
+                        "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                     ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2",
+                        (
+                            run_id,
+                            i64::try_from(limit)
+                                .context("operation result chunk limit overflow")?,
+                        ),
+                    )
+                    .await?
+            }
+            None => {
+                self.connection
+                    .query(
+                        "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                     ORDER BY created_at_unix ASC, chunk_id ASC",
+                        (run_id,),
+                    )
+                    .await?
+            }
+        };
+        let mut chunks = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let payload = row_blob(&row, 0, "operation_result_chunks.payload_json")?;
+            chunks.push(
+                serde_json::from_slice(&payload)
+                    .context("invalid operation result chunk in turso")?,
+            );
+        }
+        Ok(chunks)
+    }
+
+    async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        let payload = serde_json::to_vec_pretty(chunk)?;
+        self.connection
+            .execute(
+                "INSERT INTO operation_result_chunks (run_id, chunk_id, result_type, created_at_unix, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id, chunk_id) DO UPDATE SET
+                     result_type = excluded.result_type,
+                     created_at_unix = excluded.created_at_unix,
+                     payload_json = excluded.payload_json",
+                (
+                    chunk.run_id.as_str(),
+                    chunk.chunk_id.as_str(),
+                    chunk.result_type.as_str(),
+                    i64::try_from(chunk.created_at_unix)
+                        .context("operation result chunk timestamp overflow")?,
+                    payload,
+                ),
             )
             .await?;
         Ok(())
@@ -2847,6 +3064,23 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 record_json BLOB NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS operation_runs (
+                run_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                record_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS operation_result_chunks (
+                run_id TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                result_type TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                payload_json BLOB NOT NULL,
+                PRIMARY KEY(run_id, chunk_id)
+            );
+
             CREATE TABLE IF NOT EXISTS data_scrub_run_history (
                 run_id TEXT PRIMARY KEY,
                 finished_at_unix INTEGER NOT NULL,
@@ -2986,6 +3220,15 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 ON repair_run_history(finished_at_unix DESC, run_id DESC);
             CREATE INDEX IF NOT EXISTS idx_manual_repair_action_run_history_finished
                 ON manual_repair_action_run_history(finished_at_unix DESC, run_id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_operation_runs_operation_created
+                ON operation_runs(operation_id, created_at_unix DESC, run_id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_operation_runs_status
+                ON operation_runs(status, created_at_unix DESC, run_id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_operation_result_chunks_run_created
+                ON operation_result_chunks(run_id, created_at_unix ASC, chunk_id ASC);
             CREATE INDEX IF NOT EXISTS idx_data_scrub_run_history_finished
                 ON data_scrub_run_history(finished_at_unix DESC, run_id DESC);
             CREATE INDEX IF NOT EXISTS idx_admin_audit_created
