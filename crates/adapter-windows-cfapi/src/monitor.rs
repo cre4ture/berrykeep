@@ -1690,6 +1690,7 @@ mod tests {
     struct MockUploader {
         uploads: Mutex<Vec<String>>,
         deletes: Mutex<Vec<String>>,
+        delete_revisions: Mutex<Vec<String>>,
     }
 
     #[derive(Default)]
@@ -1737,11 +1738,15 @@ mod tests {
             })
         }
 
-        fn delete_object(&self, object_id: &str, _expected_revision: &str) -> anyhow::Result<()> {
+        fn delete_object(&self, object_id: &str, expected_revision: &str) -> anyhow::Result<()> {
             self.deletes
                 .lock()
                 .expect("deletes lock poisoned")
                 .push(object_id.to_string());
+            self.delete_revisions
+                .lock()
+                .expect("delete_revisions lock poisoned")
+                .push(expected_revision.to_string());
             Ok(())
         }
     }
@@ -2191,6 +2196,45 @@ mod tests {
                 .as_slice(),
             ["test-object"],
             "a user file deletion is emitted exactly once after the monitor advances its seen set"
+        );
+    }
+
+    #[test]
+    fn monitor_directory_marker_delete_uses_object_identity_and_revision() {
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            std::env::temp_dir().join(format!(
+                "ironmesh-monitor-directory-delete-{}",
+                uuid::Uuid::new_v4()
+            )),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        let mut directory = seen_entry(true);
+        directory.placeholder_object_id = Some("directory-marker-object".to_string());
+        directory.placeholder_revision = Some("directory-marker-revision".to_string());
+        monitor.seen.insert("documents".to_string(), directory);
+
+        monitor.handle_deleted_entries(&HashMap::new(), &HashSet::new());
+
+        assert_eq!(
+            uploader
+                .deletes
+                .lock()
+                .expect("deletes lock poisoned")
+                .as_slice(),
+            ["directory-marker-object"],
+            "an explicit directory marker is deleted by its stable object identity"
+        );
+        assert_eq!(
+            uploader
+                .delete_revisions
+                .lock()
+                .expect("delete_revisions lock poisoned")
+                .as_slice(),
+            ["directory-marker-revision"],
+            "the deletion retains the marker's expected revision as its CAS precondition"
         );
     }
 
