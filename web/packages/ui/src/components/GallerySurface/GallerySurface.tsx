@@ -547,8 +547,8 @@ export function GallerySurface({
     }
     return subscribeToUpdates(handleGalleryDataUpdate);
   }, [
-    captureDateFrom,
-    captureDateThrough,
+    captureDateReloadBounds.capturedFromUnix,
+    captureDateReloadBounds.capturedUntilUnix,
     mediaFilter,
     showSensitiveContent,
     sortOrder,
