@@ -256,15 +256,19 @@ impl GallerySummaryCache {
         ))
     }
 
-    /// Waits only while this exact miss computation remains the leader for `scope`. Creating the
-    /// notification future before checking the map avoids losing a completion that races with a
-    /// follower arriving after the aggregate has already finished.
+    /// Waits only while this exact miss computation remains the leader for `scope`.
+    ///
+    /// The notification must be enabled before checking the map: `Notify::notified()` alone does
+    /// not register a waiter, so a leader completing between the map check and the first poll
+    /// would otherwise lose its `notify_waiters` call.
     pub(crate) async fn wait_for_summary_miss(
         &self,
         scope: &GallerySummaryScope,
         completion: &Arc<Notify>,
     ) {
         let notified = completion.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let still_running = self
             .in_flight_misses
             .lock()
