@@ -307,7 +307,7 @@ export function ExplorerSurface({
     const targetPrefix = nextPrefix ?? prefix;
     const targetPage = Math.max(1, options?.page ?? currentPage);
     const targetSnapshotId = options?.snapshotId === undefined ? snapshotId : options.snapshotId;
-    const targetDepth = Math.max(1, depth);
+    const targetDepth = Math.max(1, Math.floor(depth));
     const targetHistoryDepth = Math.min(HISTORY_MAX_DEPTH, targetDepth);
     const targetSortField = options?.sortField ?? sortField;
     const targetSortDirection = options?.sortDirection ?? sortDirection;
@@ -316,8 +316,7 @@ export function ExplorerSurface({
       (options?.includeHistorical ?? showHistoricalEntries) &&
       targetSnapshotId == null &&
       loadHistoricalEntries != null;
-    const includeHistorical =
-      historicalEntriesEnabled && options?.includeHistorical === true;
+    const includeHistorical = historicalEntriesEnabled;
     if (includeHistorical) {
       setHistoryLoadState("loading");
       setHistoryLoadError(null);
@@ -328,8 +327,8 @@ export function ExplorerSurface({
       historyEntriesPayload?.prefix !== targetHistoryPrefix ||
       historyEntriesPayload.depth !== targetHistoryDepth
     ) {
-      // History refreshes are explicit because they can require an expensive
-      // server-side index scan. Do not display a previous prefix's results.
+      // Do not display a previous prefix's results while the current history
+      // request is being refreshed for a different scope.
       setHistoryEntriesPayload(null);
       setHistoryLoadState("idle");
       setHistoryLoadError(null);

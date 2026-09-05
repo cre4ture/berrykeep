@@ -1829,7 +1829,7 @@ test("client-ui explorer fetches result pages instead of the complete index", as
   expect(requestPages.every((request) => request.limit === "100")).toBe(true);
 });
 
-test("client-ui explorer keeps loaded history while paging current entries", async ({ page }) => {
+test("client-ui explorer refreshes history while paging current entries", async ({ page }) => {
   let historyRequestCount = 0;
   page.on("request", (request) => {
     const url = new URL(request.url());
@@ -1860,8 +1860,41 @@ test("client-ui explorer keeps loaded history while paging current entries", asy
   await page.locator('[data-explorer-pagination="true"]').getByRole("button", { name: "2" }).click();
   await expect(page.locator('[data-explorer-pagination="true"]')).toContainText("Showing 101–200 of");
   await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
-  await page.waitForTimeout(300);
-  expect(historyRequestCount).toBe(1);
+  await expect.poll(() => historyRequestCount).toBe(2);
+});
+
+test("client-ui explorer refreshes history after navigation", async ({ page }) => {
+  let historyRequestCount = 0;
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/history") && request.method() === "GET") {
+      historyRequestCount += 1;
+    }
+  });
+
+  await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "docs/deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "docs/deleted.txt",
+        restore_source_object_id: "object-deleted-001",
+        restore_version_id: "version-deleted-001",
+        removed_at_unix: 1_712_345_600
+      }
+    ]
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "docs/deleted.txt", exact: true })).toBeVisible();
+  await expect.poll(() => historyRequestCount).toBe(1);
+
+  const docsRow = page.getByRole("cell", { name: "docs/", exact: true }).locator("..");
+  await docsRow.getByRole("button", { name: "Open", exact: true }).click();
+  await expect.poll(() => historyRequestCount).toBe(2);
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
+  await expect(page.getByText("Loading historical entries…")).toBeHidden();
 });
 
 test("client-ui explorer only caps depth for historical entries", async ({ page }) => {
