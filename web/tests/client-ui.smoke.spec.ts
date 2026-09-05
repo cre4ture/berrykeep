@@ -837,6 +837,7 @@ test("client-ui gallery sends capture-date bounds to grid and map queries", asyn
   await page.goto("/");
   await page.getByText("Gallery", { exact: true }).click();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  await expect.poll(() => mocks.galleryStoreListRequestCount()).toBe(2);
   const [capturedFromUnix, capturedUntilUnix] = await page.evaluate(() => [
     Math.floor(new Date(2024, 3, 5).getTime() / 1_000),
     Math.floor(new Date(2024, 3, 7).getTime() / 1_000)

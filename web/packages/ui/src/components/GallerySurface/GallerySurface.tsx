@@ -312,6 +312,26 @@ type GalleryLoadedScope = {
   snapshotId: string | null;
 };
 
+function galleryReloadSignature(
+  viewMode: GalleryViewMode,
+  sortOrder: GallerySortOrder,
+  mediaFilter: GalleryMediaFilter,
+  showSensitiveContent: boolean,
+  capturedFromUnix: number | undefined,
+  capturedUntilUnix: number | undefined,
+  pageSize: number | null
+): string {
+  return JSON.stringify([
+    viewMode,
+    sortOrder,
+    mediaFilter,
+    showSensitiveContent,
+    capturedFromUnix ?? null,
+    capturedUntilUnix ?? null,
+    pageSize
+  ]);
+}
+
 type GalleryGridSelection = {
   source: "grid";
   index: number;
@@ -504,6 +524,7 @@ export function GallerySurface({
     resolutionViewport: undefined as GalleryMapViewport | undefined
   });
   const galleryRequestVersionRef = useRef(0);
+  const lastStartedGalleryReloadSignatureRef = useRef<string | null>(null);
   const activeGalleryRequestRef = useRef({
     viewMode,
     sortOrder,
@@ -599,6 +620,15 @@ export function GallerySurface({
   );
   const captureDateBounds = galleryCaptureDateBounds(captureDateFrom, captureDateThrough);
   const captureDateFilterActive = Boolean(captureDateFrom || captureDateThrough);
+  const currentGalleryReloadSignature = galleryReloadSignature(
+    viewMode,
+    sortOrder,
+    requestedServerMediaFilter,
+    showSensitiveContent,
+    captureDateBounds.capturedFromUnix,
+    captureDateBounds.capturedUntilUnix,
+    galleryReloadPageSize
+  );
   activeGalleryRequestRef.current = {
     viewMode,
     sortOrder,
@@ -839,20 +869,16 @@ export function GallerySurface({
   }, [visiblePageSet, gridCollection, selection, viewMode]);
 
   useEffect(() => {
-    if (!loadedScopeRef.current && !requestedScopeRef.current) {
+    const scope = loadedScopeRef.current ?? requestedScopeRef.current;
+    if (
+      !scope ||
+      lastStartedGalleryReloadSignatureRef.current === currentGalleryReloadSignature
+    ) {
       return;
     }
 
-    void reloadAppliedEntries();
-  }, [
-    captureDateFrom,
-    captureDateThrough,
-    galleryReloadPageSize,
-    mediaFilter,
-    showSensitiveContent,
-    sortOrder,
-    viewMode
-  ]);
+    void loadGalleryScope(scope, false);
+  }, [currentGalleryReloadSignature]);
 
   async function refreshSnapshots(forceRevalidation = true) {
     if (forceRevalidation) {
@@ -1176,6 +1202,15 @@ export function GallerySurface({
     targetViewMode: GalleryViewMode = viewMode
   ) {
     requestedScopeRef.current = targetScope;
+    lastStartedGalleryReloadSignatureRef.current = galleryReloadSignature(
+      targetViewMode,
+      sortOrder,
+      requestedServerMediaFilter,
+      showSensitiveContent,
+      captureDateBounds.capturedFromUnix,
+      captureDateBounds.capturedUntilUnix,
+      targetViewMode === "grid" ? galleryVirtualPageSize : null
+    );
     const mapViewportRequest = lastMapViewportRequestRef.current;
     const shouldFitInitialMapOverview =
       targetViewMode === "map" &&
