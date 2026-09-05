@@ -5,11 +5,11 @@ Maintainer: Ulrich Hornung <hornunguli@gmx.de>
 Build-Depends:
  debhelper-compat (= 13),
  dh-sysuser,
- clang,
- cargo-1.91 | cargo-1.89 | cargo-1.85,
- rustc-1.91 | rustc-1.89 | rustc-1.85,
- libfuse3-dev,
- pkg-config
+ clang <!server-node-only>,
+ cargo-1.91 <!server-node-only> | cargo-1.89 <!server-node-only> | cargo-1.85 <!server-node-only>,
+ rustc-1.91 <!server-node-only> | rustc-1.89 <!server-node-only> | rustc-1.85 <!server-node-only>,
+ libfuse3-dev <!server-node-only>,
+ pkg-config <!server-node-only>
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 
@@ -27,6 +27,7 @@ Description: Ironmesh storage server node
 Package: ironmesh-server-node-map-tools
 Section: net
 Architecture: any
+Build-Profiles: <!server-node-only>
 Depends:
  ${misc:Depends},
  ironmesh-server-node (= ${binary:Version}),
@@ -39,6 +40,7 @@ Description: Optional Natural Earth import tools for Ironmesh server nodes
 Package: ironmesh-client
 Section: utils
 Architecture: any
+Build-Profiles: <!server-node-only>
 Depends:
  ${misc:Depends},
  ${shlibs:Depends},
@@ -52,6 +54,7 @@ Description: Ironmesh client CLI and desktop helper applications
 Package: ironmesh-rendezvous-service
 Section: net
 Architecture: any
+Build-Profiles: <!server-node-only>
 Depends:
  ${misc:Depends},
  ${shlibs:Depends}

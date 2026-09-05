@@ -6,16 +6,19 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARTIFACT_DIR="$(cd "${ROOT_DIR}/.." && pwd)"
 
 REPO_DIR="${APT_REPO_DIR:-${ROOT_DIR}/target/apt-repo}"
-SUITE="${APT_REPO_SUITE:-noble}"
-CODENAME="${APT_REPO_CODENAME:-${SUITE}}"
+SUITE="${APT_REPO_SUITE:-}"
+CODENAME="${APT_REPO_CODENAME:-}"
 COMPONENT="${APT_REPO_COMPONENT:-main}"
 DEFAULT_ARCH="${APT_REPO_ARCH:-$(dpkg --print-architecture)}"
 ORIGIN="${APT_REPO_ORIGIN:-Ironmesh}"
 LABEL="${APT_REPO_LABEL:-Ironmesh}"
 DESCRIPTION="${APT_REPO_DESCRIPTION:-Ironmesh Debian package repository}"
 SIGNING_KEY="${APT_REPO_SIGN_KEY:-${DEBUILD_KEYID:-${DEBSIGN_KEYID:-}}}"
+GPG_PASSPHRASE="${APT_REPO_GPG_PASSPHRASE:-}"
 IMPORT_REMOTE="${APT_REPO_IMPORT_REMOTE:-}"
 SIGN_REPO=true
+SERVER_NODE_ONLY=false
+SERVER_NODE_MATRIX=""
 DEB_PATHS=()
 REQUESTED_ARCHES=()
 
@@ -32,7 +35,9 @@ Usage:
 
 Options:
   --repo-dir DIR       Output repository directory. Defaults to target/apt-repo.
-  --suite NAME         Apt suite/distribution. Defaults to noble.
+  --suite NAME         Apt suite/distribution. Defaults to APT_REPO_SUITE or
+                       the local VERSION_CODENAME. Use trixie for packages
+                       built natively on Debian Trixie.
   --codename NAME      Release codename. Defaults to the suite name.
   --component NAME     Apt component. Defaults to main.
   --arch ARCH          Architecture to update. May be passed more than once.
@@ -42,13 +47,21 @@ Options:
                        before updating it, for example
                        creature@creax.de:/home/creature/html/apt/ironmesh.
   --sign-key KEY       GPG key ID or fingerprint used for Release signing.
+  --server-node-only   Publish only ironmesh-server-node packages. With no
+                       explicit .deb path, expects only that package.
+  --server-node-matrix FILE
+                       Sign each server-node-only matrix row. Each non-comment
+                       row is: SUITE ARCH PACKAGE_PATH. Relative package paths
+                       are resolved from FILE's directory. The existing remote
+                       repository is imported only before the first row.
   --no-sign            Build repository metadata without signing it.
   -h, --help           Show this help text.
 
 Environment defaults:
   APT_REPO_DIR, APT_REPO_SUITE, APT_REPO_CODENAME, APT_REPO_COMPONENT,
   APT_REPO_ARCH, APT_REPO_ORIGIN, APT_REPO_LABEL, APT_REPO_DESCRIPTION,
-  APT_REPO_IMPORT_REMOTE, APT_REPO_SIGN_KEY, DEBUILD_KEYID, DEBSIGN_KEYID.
+  APT_REPO_IMPORT_REMOTE, APT_REPO_SIGN_KEY, APT_REPO_GPG_PASSPHRASE,
+  DEBUILD_KEYID, DEBSIGN_KEYID.
 
 If no .deb paths are passed, the script expects the current changelog version
 artifacts in the parent directory of the checkout. Run
@@ -65,6 +78,171 @@ require_command() {
 
   printf '%s is required but was not found in PATH\n' "${command_name}" >&2
   exit 1
+}
+
+native_suite() {
+  local os_suite
+
+  if [[ ! -r /etc/os-release ]]; then
+    printf '%s\n' 'unable to identify the native build suite: /etc/os-release is not readable' >&2
+    exit 1
+  fi
+
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  os_suite="${VERSION_CODENAME:-}"
+  if [[ -z "${os_suite}" ]]; then
+    printf '%s\n' 'unable to identify the native build suite: VERSION_CODENAME is empty' >&2
+    exit 1
+  fi
+
+  printf '%s\n' "${os_suite}"
+}
+
+validate_release_name() {
+  local label="$1"
+  local value="$2"
+
+  if [[ ! "${value}" =~ ^[a-z0-9][a-z0-9.-]*$ ]]; then
+    printf 'invalid %s: %s\n' "${label}" "${value}" >&2
+    exit 1
+  fi
+}
+
+verify_signed_release() {
+  local inrelease_path="$1"
+  local release_path="$2"
+  local signature_path="$3"
+
+  if ! grep -Fxq -- '-----BEGIN PGP SIGNED MESSAGE-----' "${inrelease_path}" || \
+    ! grep -Fxq -- '-----BEGIN PGP SIGNATURE-----' "${inrelease_path}" || \
+    ! grep -Fxq -- '-----END PGP SIGNATURE-----' "${inrelease_path}"; then
+    printf 'generated InRelease is missing an inline OpenPGP signature: %s\n' \
+      "${inrelease_path}" >&2
+    exit 1
+  fi
+
+  if ! gpg --batch --verify "${inrelease_path}" >/dev/null 2>&1; then
+    printf 'failed to verify generated InRelease: %s\n' "${inrelease_path}" >&2
+    exit 1
+  fi
+
+  if ! gpg --batch --verify "${signature_path}" "${release_path}" >/dev/null 2>&1; then
+    printf 'failed to verify generated Release.gpg: %s\n' "${signature_path}" >&2
+    exit 1
+  fi
+}
+
+sign_release() {
+  local mode="$1"
+  local output_path="$2"
+  local input_path="$3"
+  local -a sign_args=(
+    --batch
+    --yes
+    --local-user "${SIGNING_KEY}"
+    --digest-algo SHA256
+  )
+
+  if [[ -n "${GPG_PASSPHRASE}" ]]; then
+    sign_args+=(--pinentry-mode loopback --passphrase-fd 0)
+  fi
+
+  case "${mode}" in
+    clearsign)
+      sign_args+=(--clearsign -o "${output_path}" "${input_path}")
+      ;;
+    detached)
+      sign_args+=(--armor --detach-sign -o "${output_path}" "${input_path}")
+      ;;
+    *)
+      printf 'unsupported apt Release signing mode: %s\n' "${mode}" >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ -n "${GPG_PASSPHRASE}" ]]; then
+    printf '%s\n' "${GPG_PASSPHRASE}" | \
+      gpg "${sign_args[@]}"
+  else
+    gpg "${sign_args[@]}"
+  fi
+}
+
+run_server_node_matrix() {
+  local matrix_path="$1"
+  local matrix_dir raw_line suite architecture package_path extra
+  local line_number=0 processed_rows=0 import_remote_for_row
+  local -a child_args
+
+  [[ -f "${matrix_path}" ]] || {
+    printf 'server-node matrix not found: %s\n' "${matrix_path}" >&2
+    exit 1
+  }
+  if [[ -n "${CODENAME}" ]]; then
+    printf '%s\n' '--codename cannot be combined with --server-node-matrix; each row uses its suite as codename' >&2
+    exit 1
+  fi
+  if ((${#DEB_PATHS[@]} != 0)); then
+    printf '%s\n' '--server-node-matrix cannot be combined with explicit .deb paths' >&2
+    exit 1
+  fi
+  if ((${#REQUESTED_ARCHES[@]} != 0)); then
+    printf '%s\n' '--server-node-matrix cannot be combined with --arch; each row declares its architecture' >&2
+    exit 1
+  fi
+
+  matrix_path="$(cd "$(dirname "${matrix_path}")" && pwd)/$(basename "${matrix_path}")"
+  matrix_dir="$(dirname "${matrix_path}")"
+  import_remote_for_row="${IMPORT_REMOTE}"
+
+  while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
+    ((line_number += 1))
+    [[ -z "${raw_line//[[:space:]]/}" || "${raw_line}" =~ ^[[:space:]]*# ]] && continue
+    ((processed_rows += 1))
+
+    suite=""
+    architecture=""
+    package_path=""
+    extra=""
+    read -r suite architecture package_path extra <<<"${raw_line}"
+    if [[ -z "${suite}" || -z "${architecture}" || -z "${package_path}" || -n "${extra}" ]]; then
+      printf 'invalid server-node matrix row %s in %s; expected: SUITE ARCH PACKAGE_PATH\n' \
+        "${line_number}" "${matrix_path}" >&2
+      exit 1
+    fi
+    if [[ "${package_path}" != /* ]]; then
+      package_path="${matrix_dir}/${package_path}"
+    fi
+
+    child_args=(
+      --repo-dir "${REPO_DIR}"
+      --suite "${suite}"
+      --arch "${architecture}"
+      --server-node-only
+    )
+    if [[ "${SIGN_REPO}" == true ]]; then
+      child_args+=(--sign-key "${SIGNING_KEY}")
+    else
+      child_args+=(--no-sign)
+    fi
+    if [[ -n "${import_remote_for_row}" ]]; then
+      child_args+=(--import-remote "${import_remote_for_row}")
+      import_remote_for_row=""
+    fi
+
+    log "processing server-node matrix row ${suite}/${architecture}"
+    # Child processes inherit environment defaults. Clear the import source so
+    # only the first row receives the captured --import-remote value above.
+    APT_REPO_IMPORT_REMOTE="" \
+      APT_REPO_GPG_PASSPHRASE="${GPG_PASSPHRASE}" \
+      "${ROOT_DIR}/scripts/build-apt-repository.sh" "${child_args[@]}" -- "${package_path}"
+  done < "${matrix_path}"
+
+  if ((processed_rows == 0)); then
+    printf 'server-node matrix is empty: %s\n' "${matrix_path}" >&2
+    exit 1
+  fi
 }
 
 while (($# > 0)); do
@@ -125,6 +303,22 @@ while (($# > 0)); do
       SIGNING_KEY="${1#*=}"
       shift
       ;;
+    --server-node-only)
+      SERVER_NODE_ONLY=true
+      shift
+      ;;
+    --server-node-matrix)
+      [[ $# -ge 2 ]] || {
+        printf '%s\n' '--server-node-matrix requires a matrix file' >&2
+        exit 1
+      }
+      SERVER_NODE_MATRIX="$2"
+      shift 2
+      ;;
+    --server-node-matrix=*)
+      SERVER_NODE_MATRIX="${1#*=}"
+      shift
+      ;;
     --no-sign)
       SIGN_REPO=false
       shift
@@ -156,6 +350,23 @@ require_command dpkg-deb
 require_command dpkg-parsechangelog
 require_command dpkg-scanpackages
 require_command gzip
+
+if [[ -n "${SERVER_NODE_MATRIX}" ]]; then
+  run_server_node_matrix "${SERVER_NODE_MATRIX}"
+  exit 0
+fi
+
+if [[ -z "${SUITE}" ]]; then
+  SUITE="$(native_suite)"
+fi
+
+if [[ -z "${CODENAME}" ]]; then
+  CODENAME="${SUITE}"
+fi
+
+validate_release_name 'apt suite' "${SUITE}"
+validate_release_name 'apt codename' "${CODENAME}"
+validate_release_name 'apt component' "${COMPONENT}"
 
 "${ROOT_DIR}/scripts/sync-debian-version.sh"
 
@@ -206,6 +417,41 @@ add_architecture() {
   fi
 }
 
+legacy_package_is_indexed_in_suite() {
+  local architecture="$1"
+  local package_path="$2"
+  local packages_path legacy_filename
+
+  packages_path="${SUITE_DIR}/${COMPONENT}/binary-${architecture}/Packages"
+  legacy_filename="${LEGACY_POOL_REL}/$(basename "${package_path}")"
+
+  if [[ -f "${packages_path}" ]]; then
+    grep -Fxq -- "Filename: ${legacy_filename}" "${packages_path}"
+    return
+  fi
+
+  if [[ -f "${packages_path}.gz" ]]; then
+    gzip -cd -- "${packages_path}.gz" | grep -Fxq -- "Filename: ${legacy_filename}"
+    return
+  fi
+
+  return 1
+}
+
+preserve_legacy_suite_packages() {
+  local architecture="$1"
+  local package_path
+  local -a legacy_packages=("${LEGACY_POOL_DIR}"/*_"${architecture}".deb)
+
+  for package_path in "${legacy_packages[@]}"; do
+    [[ -f "${package_path}" ]] || continue
+    if ! legacy_package_is_indexed_in_suite "${architecture}" "${package_path}"; then
+      continue
+    fi
+    cp -f "${package_path}" "${POOL_DIR}/"
+  done
+}
+
 if ((${#DEB_PATHS[@]} == 0)); then
   VERSION="$(cd "${ROOT_DIR}" && dpkg-parsechangelog -SVersion)"
   IMPLICIT_ARCHES=("${REQUESTED_ARCHES[@]}")
@@ -218,12 +464,16 @@ if ((${#DEB_PATHS[@]} == 0)); then
   DEB_PATHS=()
   for architecture in "${IMPLICIT_ARCHES[@]}"; do
     add_architecture "${architecture}"
-    DEB_PATHS+=(
-      "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${architecture}.deb"
-      "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
-      "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${architecture}.deb"
-      "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${architecture}.deb"
-    )
+    if [[ "${SERVER_NODE_ONLY}" == true ]]; then
+      DEB_PATHS+=("${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb")
+    else
+      DEB_PATHS+=(
+        "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${architecture}.deb"
+      )
+    fi
   done
 fi
 
@@ -236,10 +486,23 @@ for path in "${DEB_PATHS[@]}"; do
 done
 
 for path in "${DEB_PATHS[@]}"; do
+  package_name="$(dpkg-deb -f "${path}" Package)"
   package_architecture="$(dpkg-deb -f "${path}" Architecture)"
+  if [[ "${SERVER_NODE_ONLY}" == true && "${package_name}" != "ironmesh-server-node" ]]; then
+    printf 'server-node-only repository input must be ironmesh-server-node, got %s: %s\n' \
+      "${package_name:-empty}" "${path}" >&2
+    exit 1
+  fi
   if [[ -z "${package_architecture}" || "${package_architecture}" == "all" ]]; then
     printf 'package architecture must be a concrete architecture, not %s: %s\n' \
       "${package_architecture:-empty}" "${path}" >&2
+    exit 1
+  fi
+
+  if [[ "${SERVER_NODE_ONLY}" == true && ${#REQUESTED_ARCHES[@]} -ne 0 ]] && \
+    ! contains_architecture "${package_architecture}"; then
+    printf 'server-node-only package architecture %s does not match requested architecture: %s\n' \
+      "${package_architecture}" "${path}" >&2
     exit 1
   fi
 
@@ -258,13 +521,26 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
 done
 
 SUITE_DIR="${REPO_DIR}/dists/${SUITE}"
-POOL_DIR="${REPO_DIR}/pool/${COMPONENT}/i/ironmesh"
+POOL_REL="pool/${COMPONENT}/i/ironmesh/${SUITE}"
+POOL_DIR="${REPO_DIR}/${POOL_REL}"
+LEGACY_POOL_DIR="${REPO_DIR}/pool/${COMPONENT}/i/ironmesh"
+LEGACY_POOL_REL="pool/${COMPONENT}/i/ironmesh"
 
 log "refreshing ${REPO_DIR}"
 mkdir -p "${POOL_DIR}"
 
 for architecture in "${REQUESTED_ARCHES[@]}"; do
-  rm -f "${POOL_DIR}"/*_"${architecture}".deb
+  if [[ "${SERVER_NODE_ONLY}" == true ]]; then
+    # A server-only refresh must retain the desktop/rendezvous packages that
+    # were published before suite-scoped pools existed. Preserve packages
+    # already migrated into this suite pool, then migrate only legacy packages
+    # explicitly referenced by this suite's old index. Keep previous server
+    # versions so an unchanged map-tools package with an exact server-node
+    # dependency remains installable after the new server package is added.
+    preserve_legacy_suite_packages "${architecture}"
+  else
+    rm -f "${POOL_DIR}"/*_"${architecture}".deb
+  fi
   rm -rf "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
   mkdir -p "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
 done
@@ -277,7 +553,7 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
   log "writing ${packages_rel}"
   (
     cd "${REPO_DIR}"
-    dpkg-scanpackages --arch "${architecture}" pool /dev/null > "${packages_rel}"
+    dpkg-scanpackages --multiversion --arch "${architecture}" "${POOL_REL}" /dev/null > "${packages_rel}"
     gzip -9cn "${packages_rel}" > "${packages_rel}.gz"
   )
 done
@@ -296,6 +572,7 @@ fi
 RELEASE_ARCHITECTURES="${RELEASE_ARCHES[*]}"
 
 log "writing Release metadata"
+rm -f "${SUITE_DIR}/Release" "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release.gpg"
 RELEASE_TMP="$(mktemp)"
 trap 'rm -f "${RELEASE_TMP}"' EXIT
 apt-ftparchive \
@@ -312,16 +589,20 @@ mv "${RELEASE_TMP}" "${SUITE_DIR}/Release"
 if [[ "${SIGN_REPO}" == true ]]; then
   log "exporting public signing key"
   gpg --armor --export "${SIGNING_KEY}" > "${REPO_DIR}/ironmesh-archive-keyring.asc"
+  if [[ ! -s "${REPO_DIR}/ironmesh-archive-keyring.asc" ]]; then
+    printf 'failed to export public signing key: %s\n' "${SIGNING_KEY}" >&2
+    exit 1
+  fi
 
   log "signing Release metadata with ${SIGNING_KEY}"
-  rm -f "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release.gpg"
-  gpg --yes --local-user "${SIGNING_KEY}" --clearsign --digest-algo SHA256 \
-    -o "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release"
-  gpg --yes --local-user "${SIGNING_KEY}" --armor --detach-sign --digest-algo SHA256 \
-    -o "${SUITE_DIR}/Release.gpg" "${SUITE_DIR}/Release"
+  sign_release clearsign "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release"
+  sign_release detached "${SUITE_DIR}/Release.gpg" "${SUITE_DIR}/Release"
+  verify_signed_release \
+    "${SUITE_DIR}/InRelease" \
+    "${SUITE_DIR}/Release" \
+    "${SUITE_DIR}/Release.gpg"
 else
   log "leaving repository unsigned"
-  rm -f "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release.gpg"
 fi
 
 log "repository ready: ${REPO_DIR}"
