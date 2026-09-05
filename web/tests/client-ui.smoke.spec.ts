@@ -878,6 +878,27 @@ test("client-ui gallery sends capture-date bounds to grid and map queries", asyn
   await expect.poll(() => mapRequests.some(includesCaptureBounds)).toBe(true);
 });
 
+test("client-ui gallery preserves the lower capture date while editing the upper date", async ({
+  page
+}) => {
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  const capturedFrom = page.getByLabel("Captured from");
+  const capturedThrough = page.getByLabel("Captured through");
+  await capturedFrom.fill("2024-04-05");
+
+  // Chromium emits a change event for intermediate year values while a native date input is
+  // edited by keyboard. Such values must not move the lower bound before the upper date has
+  // been committed.
+  await capturedThrough.fill("0002-04-06");
+  await expect(capturedFrom).toHaveValue("2024-04-05");
+  await capturedThrough.fill("2024-04-06");
+  await expect(capturedFrom).toHaveValue("2024-04-05");
+});
+
 test("client-ui gallery debounces automatic capture-date reloads", async ({ page }) => {
   const filteredGridRequests: URL[] = [];
   page.on("request", (request) => {

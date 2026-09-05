@@ -1977,9 +1977,9 @@ export function GallerySurface({
                   type="date"
                   value={captureDateFrom}
                   max={captureDateThrough || undefined}
-                  onChange={(event) => {
+                  onChange={(event) => setCaptureDateFrom(event.currentTarget.value)}
+                  onBlur={(event) => {
                     const nextDate = event.currentTarget.value;
-                    setCaptureDateFrom(nextDate);
                     if (captureDateThrough && nextDate > captureDateThrough) {
                       setCaptureDateThrough(nextDate);
                     }
@@ -1990,9 +1990,9 @@ export function GallerySurface({
                   type="date"
                   value={captureDateThrough}
                   min={captureDateFrom || undefined}
-                  onChange={(event) => {
+                  onChange={(event) => setCaptureDateThrough(event.currentTarget.value)}
+                  onBlur={(event) => {
                     const nextDate = event.currentTarget.value;
-                    setCaptureDateThrough(nextDate);
                     if (captureDateFrom && nextDate && nextDate < captureDateFrom) {
                       setCaptureDateFrom(nextDate);
                     }
