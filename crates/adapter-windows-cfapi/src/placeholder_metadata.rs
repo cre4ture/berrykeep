@@ -910,7 +910,18 @@ fn reconcile_restart_placeholders(
             if normalize_path(&remote.path) != relative_path
                 && !report.renamed_paths.contains_key(&relative_path)
             {
+                // A restart snapshot can lag a local rename that the server
+                // already accepted. A remote move is safe to apply only when
+                // its revision proves the remote state advanced beyond the
+                // local placeholder's last confirmed version. Otherwise
+                // preserve the local location rather than moving it back to a
+                // stale path.
+                let remote_rename_is_newer =
+                    nonempty(remote.version.as_deref()).is_some_and(|remote_revision| {
+                        nonempty(identity.remote_version.as_deref()) != Some(remote_revision)
+                    });
                 if local.is_clean(provider_instance_id)
+                    && remote_rename_is_newer
                     && move_remote_placeholder(
                         sync_root_path,
                         &local,
@@ -1788,6 +1799,63 @@ mod tests {
             Some(new_path)
         );
         assert!(sync_root.root_path.join("docs\\after-restart.txt").exists());
+    }
+
+    #[test]
+    fn restart_reconciliation_does_not_undo_an_accepted_local_rename_from_a_stale_snapshot() {
+        let (sync_root, provider_instance_id) = registered_test_sync_root("stale-local-rename");
+        let old_path = "docs/before-rename.txt";
+        let new_path = "archive/after-rename.txt";
+        let object_id = "object-local-rename";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            old_path,
+            "revision-1",
+            "local-rename",
+            1_725_100_004,
+        );
+
+        let old_full_path = sync_root.root_path.join(old_path.replace('/', "\\"));
+        let new_full_path = sync_root.root_path.join(new_path.replace('/', "\\"));
+        fs::create_dir_all(
+            new_full_path
+                .parent()
+                .expect("renamed placeholder should have a parent"),
+        )
+        .expect("destination parent should be created");
+        fs::rename(&old_full_path, &new_full_path).expect("local rename should succeed");
+        promote_remote_to_in_sync_content_baseline(
+            &sync_root.root_path,
+            new_path,
+            provider_instance_id,
+        )
+        .expect("accepted local rename should persist its destination path");
+        let renamed_file = open_sync_path(&new_full_path, true)
+            .expect("renamed placeholder should remain openable");
+        cf_set_in_sync(&renamed_file).expect("renamed placeholder should remain in sync");
+
+        let report = reconcile_existing_placeholders(
+            &sync_root.root_path,
+            &SyncSnapshot {
+                local: Vec::new(),
+                // The rename has already been accepted by the server, but
+                // this startup snapshot still reflects its old state.
+                remote: vec![remote_file(
+                    old_path,
+                    object_id,
+                    "revision-1",
+                    "local-rename",
+                )],
+            },
+            provider_instance_id,
+        )
+        .expect("stale restart reconciliation should succeed conservatively");
+
+        assert!(report.conflicted_paths.contains(new_path));
+        assert!(report.preserved_paths.contains(new_path));
+        assert!(new_full_path.exists());
+        assert!(!old_full_path.exists());
     }
 
     #[test]

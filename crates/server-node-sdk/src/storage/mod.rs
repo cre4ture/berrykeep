@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
 const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
+const STORE_INDEX_VERSION_LOOKUP_CONCURRENCY: usize = 32;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
@@ -77,6 +78,7 @@ use common::content_fingerprint::content_fingerprint_from_chunk_refs;
 use common::range_chunk_cache::RangeChunkCache;
 use common::xmp::{XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media};
 use fs2::FileExt;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -3237,11 +3239,28 @@ impl StoreIndexInspector {
     ) -> Result<(HashMap<String, u64>, HashMap<String, String>)> {
         let mut modified = HashMap::with_capacity(object_hashes.len());
         let mut revisions = HashMap::with_capacity(object_hashes.len());
-        for (key, manifest_hash) in object_hashes {
-            let Some(object_id) = object_ids.get(key) else {
-                continue;
-            };
-            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+        let requested_indexes = object_hashes
+            .iter()
+            .filter_map(|(key, manifest_hash)| {
+                object_ids
+                    .get(key)
+                    .map(|object_id| (key.clone(), manifest_hash.clone(), object_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        let loaded_indexes = stream::iter(requested_indexes)
+            .map(|(key, manifest_hash, object_id)| async move {
+                Ok::<_, anyhow::Error>((
+                    key,
+                    manifest_hash,
+                    self.load_version_index_by_object_id(&object_id).await?,
+                ))
+            })
+            .buffer_unordered(STORE_INDEX_VERSION_LOOKUP_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for (key, manifest_hash, index) in loaded_indexes {
+            let Some(index) = index else {
                 continue;
             };
 
