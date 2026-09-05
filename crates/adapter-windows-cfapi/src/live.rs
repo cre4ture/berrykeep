@@ -1,5 +1,7 @@
 use crate::content_fingerprint::FingerprintingReader;
-use crate::placeholder_metadata::{RemoteObjectResolver, ResolvedRemoteObject};
+use crate::placeholder_metadata::{
+    RemoteObjectResolution, RemoteObjectResolver, ResolvedRemoteObject,
+};
 use crate::runtime::{
     HydrationProgress, HydrationRequest, HydrationResult, Hydrator, UploadReceipt, Uploader,
 };
@@ -11,9 +13,11 @@ use client_sdk::{
 };
 use common::range_chunk_cache::{RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES, RangeChunkCache};
 use reqwest::Url;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -340,6 +344,54 @@ impl RemoteObjectResolver for ServerNodeHydrator {
         self.sdk
             .lookup_object_by_id_blocking(object_id)
             .map(|resolved| resolved.and_then(active_resolved_remote_object))
+    }
+
+    fn resolve_objects(
+        &self,
+        object_ids: &BTreeSet<String>,
+    ) -> BTreeMap<String, RemoteObjectResolution> {
+        // Reconciliation can contain a large delete or rename batch. Bound
+        // the concurrent identity confirmations so CFAPI's worker thread is
+        // not held hostage by a sequence of round trips, while avoiding an
+        // unbounded request fan-out against the server.
+        const MAX_CONCURRENT_OBJECT_LOOKUPS: usize = 16;
+
+        let object_ids = object_ids.iter().cloned().collect::<Vec<_>>();
+        let next_object = AtomicUsize::new(0);
+        let results = Mutex::new(BTreeMap::new());
+        let worker_count = object_ids.len().min(MAX_CONCURRENT_OBJECT_LOOKUPS);
+
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let sdk = self.sdk.clone();
+                let object_ids = &object_ids;
+                let next_object = &next_object;
+                let results = &results;
+                scope.spawn(move || {
+                    loop {
+                        let index = next_object.fetch_add(1, Ordering::Relaxed);
+                        let Some(object_id) = object_ids.get(index) else {
+                            break;
+                        };
+                        let resolution = match sdk.lookup_object_by_id_blocking(object_id) {
+                            Ok(Some(remote)) => active_resolved_remote_object(remote)
+                                .map(RemoteObjectResolution::Present)
+                                .unwrap_or(RemoteObjectResolution::Absent),
+                            Ok(None) => RemoteObjectResolution::Absent,
+                            Err(error) => RemoteObjectResolution::Unavailable(format!("{error:#}")),
+                        };
+                        let mut results = results
+                            .lock()
+                            .expect("object-resolution results lock should not be poisoned");
+                        results.insert(object_id.clone(), resolution);
+                    }
+                });
+            }
+        });
+
+        results
+            .into_inner()
+            .expect("object-resolution results lock should not be poisoned")
     }
 }
 

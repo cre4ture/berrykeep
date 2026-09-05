@@ -46,8 +46,38 @@ pub struct ResolvedRemoteObject {
     pub revision: Option<String>,
 }
 
+/// The outcome of resolving a stable remote object identity.  An unavailable
+/// result is deliberately distinct from absence: reconciliation must retain
+/// the local placeholder when the server cannot confirm the current state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteObjectResolution {
+    Present(ResolvedRemoteObject),
+    Absent,
+    Unavailable(String),
+}
+
 pub trait RemoteObjectResolver: Send + Sync {
     fn resolve_object(&self, object_id: &str) -> Result<Option<ResolvedRemoteObject>>;
+
+    /// Resolve a reconciliation batch once.  The default preserves adapters
+    /// that only implement a single-object lookup; production resolvers can
+    /// override it with a bounded concurrent or server-side batch lookup.
+    fn resolve_objects(
+        &self,
+        object_ids: &BTreeSet<String>,
+    ) -> BTreeMap<String, RemoteObjectResolution> {
+        object_ids
+            .iter()
+            .map(|object_id| {
+                let resolution = match self.resolve_object(object_id) {
+                    Ok(Some(remote)) => RemoteObjectResolution::Present(remote),
+                    Ok(None) => RemoteObjectResolution::Absent,
+                    Err(error) => RemoteObjectResolution::Unavailable(format!("{error:#}")),
+                };
+                (object_id.clone(), resolution)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,7 +411,18 @@ pub fn reconcile_existing_placeholders_with_resolver(
         .iter()
         .filter_map(|entry| nonempty(entry.object_id.as_deref()))
         .collect::<BTreeSet<_>>();
-    let tombstones = scan_local_placeholders(sync_root_path)
+    let local_placeholders = scan_local_placeholders(sync_root_path);
+    let object_ids_to_resolve = local_placeholders
+        .unique
+        .iter()
+        .filter_map(|(object_id, local)| {
+            (!remote_object_ids.contains(object_id.as_str())
+                && nonempty(local.identity.remote_version.as_deref()).is_some())
+            .then_some(object_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let resolved_objects = resolver.resolve_objects(&object_ids_to_resolve);
+    let tombstones = local_placeholders
         .unique
         .iter()
         .filter_map(|(object_id, local)| {
@@ -390,8 +431,8 @@ pub fn reconcile_existing_placeholders_with_resolver(
             {
                 return None;
             }
-            match resolver.resolve_object(object_id) {
-                Ok(None) => {
+            match resolved_objects.get(object_id) {
+                Some(RemoteObjectResolution::Absent) => {
                     let revision = local.identity.remote_version.as_deref()?;
                     let mut previous = if local.full_path.is_dir() {
                         sync_core::NamespaceEntry::directory(&local.relative_path)
@@ -402,8 +443,7 @@ pub fn reconcile_existing_placeholders_with_resolver(
                     previous.version = Some(revision.to_string());
                     Some(RemoteObjectChange::Deleted { previous })
                 }
-                Ok(Some(_)) => None,
-                Err(error) => {
+                Some(RemoteObjectResolution::Unavailable(error)) => {
                     tracing::warn!(
                         object_id,
                         path = %local.relative_path,
@@ -411,17 +451,19 @@ pub fn reconcile_existing_placeholders_with_resolver(
                     );
                     None
                 }
+                Some(RemoteObjectResolution::Present(_)) | None => None,
             }
         })
         .collect::<Vec<_>>();
 
-    reconcile_remote_object_state(
+    Ok(reconcile_remote_object_state_best_effort_with_resolutions(
         sync_root_path,
         current_snapshot,
         &tombstones,
         provider_instance_id,
         Some(resolver),
-    )
+        Some(&resolved_objects),
+    ))
 }
 
 pub fn record_uploaded_object_state(
@@ -491,6 +533,24 @@ pub(crate) fn reconcile_remote_object_state_best_effort(
     provider_instance_id: Uuid,
     resolver: Option<&dyn RemoteObjectResolver>,
 ) -> RemoteObjectReconcileReport {
+    reconcile_remote_object_state_best_effort_with_resolutions(
+        sync_root_path,
+        current_snapshot,
+        object_changes,
+        provider_instance_id,
+        resolver,
+        None,
+    )
+}
+
+fn reconcile_remote_object_state_best_effort_with_resolutions(
+    sync_root_path: &Path,
+    current_snapshot: &SyncSnapshot,
+    object_changes: &[RemoteObjectChange],
+    provider_instance_id: Uuid,
+    resolver: Option<&dyn RemoteObjectResolver>,
+    prefetched_resolutions: Option<&BTreeMap<String, RemoteObjectResolution>>,
+) -> RemoteObjectReconcileReport {
     let mut report = RemoteObjectReconcileReport::default();
     let mut local_placeholders = scan_local_placeholders(sync_root_path);
     report
@@ -508,6 +568,20 @@ pub(crate) fn reconcile_remote_object_state_best_effort(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let object_ids_to_resolve = object_changes
+        .iter()
+        .filter_map(|change| match change {
+            RemoteObjectChange::Deleted { previous } => nonempty(previous.object_id.as_deref()),
+            RemoteObjectChange::Renamed { current, .. } => nonempty(current.object_id.as_deref()),
+            _ => None,
+        })
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let resolved_objects = resolver.map(|resolver| {
+        prefetched_resolutions
+            .cloned()
+            .unwrap_or_else(|| resolver.resolve_objects(&object_ids_to_resolve))
+    });
     // A directory rename changes the namespace of every descendant.  A
     // snapshot captured while those individual mutations are still arriving
     // is not authoritative for any path in either subtree, even when a child
@@ -539,9 +613,12 @@ pub(crate) fn reconcile_remote_object_state_best_effort(
         let Some(object_id) = nonempty(previous.object_id.as_deref()) else {
             continue;
         };
-        let confirmed_tombstone = resolver
-            .and_then(|resolver| resolver.resolve_object(object_id).ok())
-            .is_some_and(|resolved| resolved.is_none());
+        let confirmed_tombstone = matches!(
+            resolved_objects
+                .as_ref()
+                .and_then(|resolved_objects| resolved_objects.get(object_id)),
+            Some(RemoteObjectResolution::Absent)
+        );
         if !confirmed_tombstone {
             local_placeholders.record_conflict(object_id, &mut report);
             continue;
@@ -619,14 +696,17 @@ pub(crate) fn reconcile_remote_object_state_best_effort(
         let Some(object_id) = nonempty(current.object_id.as_deref()) else {
             continue;
         };
-        let confirmed_remote = resolver
-            .and_then(|resolver| resolver.resolve_object(object_id).ok())
-            .flatten()
-            .is_some_and(|resolved| {
+        let confirmed_remote = matches!(
+            resolved_objects
+                .as_ref()
+                .and_then(|resolved_objects| resolved_objects.get(object_id)),
+            Some(RemoteObjectResolution::Present(resolved))
+                if {
                 canonical_object_path(&resolved.path) == canonical_object_path(&current.path)
                     && nonempty(resolved.revision.as_deref())
                         == nonempty(current.version.as_deref())
-            });
+                }
+        );
         if resolver.is_some() && !confirmed_remote {
             local_placeholders.record_conflict(object_id, &mut report);
             continue;
@@ -1390,6 +1470,31 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BatchOnlyResolver {
+        batches: std::sync::Mutex<Vec<BTreeSet<String>>>,
+    }
+
+    impl RemoteObjectResolver for BatchOnlyResolver {
+        fn resolve_object(&self, _object_id: &str) -> Result<Option<ResolvedRemoteObject>> {
+            panic!("reconciliation should use the batch resolver")
+        }
+
+        fn resolve_objects(
+            &self,
+            object_ids: &BTreeSet<String>,
+        ) -> BTreeMap<String, RemoteObjectResolution> {
+            self.batches
+                .lock()
+                .expect("batch test lock should not be poisoned")
+                .push(object_ids.clone());
+            object_ids
+                .iter()
+                .map(|object_id| (object_id.clone(), RemoteObjectResolution::Absent))
+                .collect()
+        }
+    }
+
     fn remote_file(path: &str, object_id: &str, revision: &str, hash: &str) -> NamespaceEntry {
         NamespaceEntry::file(path, revision, hash).with_object_id(object_id)
     }
@@ -1762,6 +1867,41 @@ mod tests {
                 .root_path
                 .join("docs\\deleted-while-offline.txt")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_reuses_a_single_batched_object_resolution() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("startup-batched-object-resolution");
+        let path = "docs/deleted-batched.txt";
+        let object_id = "object-offline-delete-batched";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-8",
+            "offline-delete-batched",
+            1_725_100_013,
+        );
+        let resolver = BatchOnlyResolver::default();
+
+        let report = reconcile_existing_placeholders_with_resolver(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            provider_instance_id,
+            &resolver,
+        )
+        .expect("batch-confirmed startup deletion should reconcile");
+
+        assert!(report.deleted_paths.contains(path));
+        let batches = resolver
+            .batches
+            .lock()
+            .expect("batch test lock should not be poisoned");
+        assert_eq!(
+            batches.as_slice(),
+            &[BTreeSet::from([object_id.to_string()])]
         );
     }
 
