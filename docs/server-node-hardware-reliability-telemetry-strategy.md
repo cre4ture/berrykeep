@@ -88,10 +88,10 @@ The core of this strategy is implemented across the node and a new central colle
 - **Production TLS and deployment helper** (Section 5.2): `stats-collector-server` supports direct
   TLS from environment-provided PEM files and reloads renewed certificates periodically.
   `scripts/deploy-stats-collector-service.sh` provides checksum-verified MUSL deployment with
-  remote-only admin-token initialization and rollback. It also builds and deploys the public
-  `web/apps/fleet-telemetry` Vite bundle to the collector's `STATS_COLLECTOR_PUBLIC_DIR`, so the
-  dashboard and its public `/v1/stats/dashboard` API share an HTTPS origin without CORS or browser
-  credentials. The primary
+  remote-only admin-token initialization and rollback. Its Cargo build compiles the public
+  `web/apps/fleet-telemetry` Vite bundle and all of its static assets into the collector binary,
+  so the dashboard and its public `/v1/stats/dashboard` API share an HTTPS origin without CORS,
+  browser credentials, or a separate static-file upload. The primary
   `scripts/deploy-strato-stats-collector-service.sh` wrapper fixes the intended
   `root@217.160.159.105`, `/root/ironmesh/telemetry`, and
   `https://217.160.159.105:9444` layout; its root path is the publicly accessible Fleet
