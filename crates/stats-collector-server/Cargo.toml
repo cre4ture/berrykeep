@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [features]
 default = []
@@ -17,6 +18,7 @@ anyhow.workspace = true
 axum.workspace = true
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 iptocc = { version = "1", optional = true }
+percent-encoding = "2"
 # No dependency already in this crate provides a CSPRNG (see `registration.rs`); `rand` is a
 # minimal, well-established addition, pinned to the same "0.8" version `server-node-sdk` already
 # uses for its own salt generation.
@@ -24,7 +26,6 @@ rand = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tower-http = { version = "0.6", features = ["fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # Pure-Rust, embedded SQLite-compatible engine (no C toolchain / bundled libsqlite3 needed to
@@ -33,8 +34,10 @@ tracing-subscriber.workspace = true
 turso = "0.6.0-pre.2"
 
 [dev-dependencies]
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+fs2 = "0.4"
 
 [lints]
 workspace = true
