@@ -1,75 +1,32 @@
-# Pace Strategy for Meaningful Submissions
+# Delivery Pace
 
-This file defines how changes should be delivered in this repository.
+Apply these rules to non-trivial changes.
 
-## Working rules for Copilot
+## Workflow
 
-1. **Plan first for multi-step work**
-   - Create a short task plan before coding.
-   - Keep exactly one active step at a time.
+1. **Plan multi-step work; WIP limit = 1.**
+   Keep one active implementation step at a time.
 
-2. **Check both skill sources**
-   - Treat the repo-local `skills/` directory as a skills source in addition to any globally installed Codex skills.
-   - If a user mentions "skills" or has a file open under `skills/`, inspect this workspace directory before assuming only external/global skills apply.
+2. **Work in small batches and atomic commits.**
+   Each slice should produce one coherent outcome. Do not mix unrelated features, refactors, or formatting churn.
 
-3. **Submit in meaningful slices**
-   - Each slice must be one coherent outcome (example: "add server endpoint", "wire CLI command", "add integration docs").
-   - Avoid mixing unrelated refactors and features in the same slice.
+3. **Validate narrow to broad.**
+   Run the smallest relevant check first, then broader checks appropriate to the change and its risk.
 
-4. **Small, reviewable diffs**
-   - Prefer focused edits over large rewrites.
-   - Keep naming and style consistent with existing code.
+4. **Report deltas.**
+   After each meaningful slice, summarize what changed, what was validated, and what comes next.
 
-5. **Validate each slice**
-   - Run the narrowest relevant check first (crate-level or file-level).
-   - Then run broader checks when appropriate (`cargo check --workspace`, tests if present).
+## Engineering guardrails
 
-6. **Report deltas, not repetition**
-   - After each slice, summarize:
-     - What changed
-     - What was validated
-     - What comes next
+- Apply SRP and prefer high cohesion / low coupling.
+- Apply DRY to significant duplication in the touched scope.
+- Prefer a functional core / imperative shell where it keeps side effects and I/O isolated.
+- Use explicit, descriptive names and explicit, informative error handling.
+- Split functions, modules, or crates when size or branching materially harms readability, testability, or ownership clarity.
+- Apply the Boy Scout Rule only within the touched scope; do not expand the task into unrelated cleanup.
 
-## Suggested commit granularity
+## Before each commit
 
-Use this pattern for future commits:
-
-- `chore(workspace): scaffold crate/module structure`
-- `feat(server): add storage node endpoint(s)`
-- `feat(client-sdk): implement cache + transport`
-- `feat(cli): add command flow and web entrypoint`
-- `feat(mobile): add android/ios storage wrappers`
-- `docs: update runbook and architecture notes`
-
-## Pull request checklist
-
-- [ ] Scope is single-purpose and coherent
-- [ ] Build/tests pass for touched areas
-- [ ] No unrelated formatting or refactor noise
-- [ ] Docs updated for behavior/interface changes
-- [ ] Next step is explicitly stated
-
-# General Guidelines to Follow
-
-- SOLID Principles
-- DRY (Don’t Repeat Yourself)
-  - when you notice significant exisitng code duplication during work, clean it up or at least point it out.
-- Clean code principles
-- Keep functions small, focused, and readable.
-- If a function grows too large or takes on multiple responsibilities, split it into smaller helper functions or modules.
-- Prefer explicit, descriptive names and minimize nested/complex branching — refactor into smaller units where helpful.
-- Before each commit perform a quick clean-code review: check for long functions, duplicated logic, unclear names, and missing error handling.
-- Major clean-code violations must be addressed before committing (e.g., functions >~200 LOC, duplicated complex logic, unclear ownership or lifetimes that risk bugs).
-- Include a short note in the commit message when a non-trivial refactor/split was performed, referencing the reason (readability, testability, or performance).
-
-Example pre-commit checklist (add to PR description or commit message when applicable):
-
-- [ ] Long functions split into smaller units where appropriate
-- [ ] Duplicated logic extracted into helpers
-- [ ] Side-effects and I/O isolated from pure logic
-- [ ] Error handling is explicit and informative
-- [ ] Unit tests added/updated for refactored components
-
-- Large files should be split into modules or crates to keep focus clear and reduce review and maintenance cost.
-
-- Suggest meaningful refactorings at the end of each larger task.
+- Review the diff for unrelated churn, duplicated logic, unclear names, hidden side effects, and missing error handling.
+- Update tests and documentation when behavior or interfaces change.
+- Keep the commit single-purpose and reviewable.
