@@ -10846,7 +10846,7 @@ async fn gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_imp
 ) {
     let (root, mut store) = backend.init_store("gallery-sidecar-gps-backfill").await;
     let media_key = "album/photo.jpg";
-    store
+    let media = store
         .put_object_versioned(
             media_key,
             Bytes::from(sample_media_jpeg_bytes()),
@@ -10854,6 +10854,11 @@ async fn gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_imp
         )
         .await
         .unwrap();
+    store
+        .ensure_media_metadata(&media.manifest_hash)
+        .await
+        .unwrap()
+        .expect("the source media needs a cached metadata record");
     store
         .set_media_geolocation(
             media_key,
