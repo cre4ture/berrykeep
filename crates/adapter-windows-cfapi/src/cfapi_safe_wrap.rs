@@ -16,9 +16,10 @@ use std::os::windows::io::FromRawHandle;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_CLOUD_FILE_UNSUCCESSFUL,
@@ -648,7 +649,10 @@ struct FetchWorkCompletion {
 }
 
 pub(crate) struct FetchWorkerPool {
-    ingress: Sender<FetchWorkItem>,
+    ingress: Mutex<Option<Sender<FetchWorkItem>>>,
+    dispatcher: Mutex<Option<JoinHandle<()>>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl FetchWorkerPool {
@@ -656,7 +660,9 @@ impl FetchWorkerPool {
         if max_concurrency == 0 {
             anyhow::bail!("CFAPI fetch worker concurrency must be greater than zero");
         }
-        let mut workers = Vec::with_capacity(max_concurrency);
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let mut worker_senders = Vec::with_capacity(max_concurrency);
+        let mut worker_handles = Vec::with_capacity(max_concurrency);
         let (completion_sender, completion_receiver) = channel();
         for worker_index in 0..max_concurrency {
             // The dispatcher owns the backlog. A rendezvous channel prevents
@@ -664,12 +670,17 @@ impl FetchWorkerPool {
             // unrelated files behind FetchExecutionGate.
             let (sender, receiver) = sync_channel::<FetchWorkItem>(0);
             let completion_sender = completion_sender.clone();
-            std::thread::Builder::new()
+            let worker_shutting_down = shutting_down.clone();
+            let handle = std::thread::Builder::new()
                 .name(format!("ironmesh-cfapi-fetch-{worker_index}"))
                 .spawn(move || {
                     while let Ok(work) = receiver.recv() {
                         let file_id = work.callback_info.file_id;
-                        execute_fetch_work(work);
+                        if worker_shutting_down.load(Ordering::Acquire) {
+                            fail_fetch_work(work);
+                        } else {
+                            execute_fetch_work(work);
+                        }
                         if completion_sender
                             .send(FetchWorkCompletion {
                                 worker_index,
@@ -682,21 +693,86 @@ impl FetchWorkerPool {
                     }
                 })
                 .with_context(|| format!("failed starting CFAPI fetch worker {worker_index}"))?;
-            workers.push(sender);
+            worker_senders.push(sender);
+            worker_handles.push(handle);
         }
+        drop(completion_sender);
         let (ingress, receiver) = channel();
-        std::thread::Builder::new()
+        let dispatcher_shutting_down = shutting_down.clone();
+        let dispatcher = std::thread::Builder::new()
             .name("ironmesh-cfapi-fetch-dispatch".to_string())
-            .spawn(move || dispatch_fetch_work(receiver, workers, completion_receiver))
+            .spawn(move || {
+                dispatch_fetch_work(
+                    receiver,
+                    worker_senders,
+                    completion_receiver,
+                    dispatcher_shutting_down,
+                )
+            })
             .context("failed starting CFAPI fetch dispatcher")?;
-        Ok(Self { ingress })
+        Ok(Self {
+            ingress: Mutex::new(Some(ingress)),
+            dispatcher: Mutex::new(Some(dispatcher)),
+            workers: Mutex::new(worker_handles),
+            shutting_down,
+        })
     }
 
     /// Callback threads only enqueue work here. The dispatcher applies
     /// backpressure to the bounded worker queues without turning a temporary
     /// burst into a failed hydration request.
     fn submit(&self, work: FetchWorkItem) -> bool {
-        self.ingress.send(work).is_ok()
+        if self.shutting_down.load(Ordering::Acquire) {
+            return false;
+        }
+        let ingress = self
+            .ingress
+            .lock()
+            .expect("fetch worker ingress lock poisoned")
+            .clone();
+        !self.shutting_down.load(Ordering::Acquire)
+            && ingress.is_some_and(|ingress| ingress.send(work).is_ok())
+    }
+
+    /// Stops accepting callbacks, fails queued work while its connection keys
+    /// are still valid, and waits for active workers before CFAPI disconnects.
+    pub(crate) fn shutdown(&self) {
+        if self.shutting_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.ingress
+            .lock()
+            .expect("fetch worker ingress lock poisoned")
+            .take();
+
+        let dispatcher = self
+            .dispatcher
+            .lock()
+            .expect("fetch worker dispatcher lock poisoned")
+            .take();
+        if let Some(dispatcher) = dispatcher
+            && dispatcher.join().is_err()
+        {
+            tracing::error!("cfapi fetch dispatcher panicked while shutting down");
+        }
+
+        let workers = std::mem::take(
+            &mut *self
+                .workers
+                .lock()
+                .expect("fetch worker handles lock poisoned"),
+        );
+        for worker in workers {
+            if worker.join().is_err() {
+                tracing::error!("cfapi fetch worker panicked while shutting down");
+            }
+        }
+    }
+}
+
+impl Drop for FetchWorkerPool {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -704,6 +780,7 @@ fn dispatch_fetch_work(
     receiver: Receiver<FetchWorkItem>,
     workers: Vec<SyncSender<FetchWorkItem>>,
     completion_receiver: Receiver<FetchWorkCompletion>,
+    shutting_down: Arc<AtomicBool>,
 ) {
     let mut next_worker = 0usize;
     let mut active_file_ids = HashSet::new();
@@ -712,6 +789,17 @@ fn dispatch_fetch_work(
     let mut ingress_open = true;
 
     loop {
+        if shutting_down.load(Ordering::Acquire) {
+            for pending in pending_by_file_id.into_values() {
+                for work in pending {
+                    fail_fetch_work(work);
+                }
+            }
+            for work in receiver.try_iter() {
+                fail_fetch_work(work);
+            }
+            return;
+        }
         while let Ok(completion) = completion_receiver.try_recv() {
             active_file_ids.remove(&completion.file_id);
             if pending_by_file_id
@@ -1125,4 +1213,24 @@ unsafe extern "system" fn callback_file_close_completion(
     };
 
     handle_callback_file_close_completion(callback_info_ref, context, close_completion);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_worker_pool_shutdown_is_idempotent_and_closes_ingress() {
+        let pool = FetchWorkerPool::new(1).expect("fetch worker pool should start");
+        pool.shutdown();
+        pool.shutdown();
+
+        assert!(pool.shutting_down.load(Ordering::Acquire));
+        assert!(
+            pool.ingress
+                .lock()
+                .expect("fetch worker ingress lock poisoned")
+                .is_none()
+        );
+    }
 }

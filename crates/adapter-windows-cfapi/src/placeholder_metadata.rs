@@ -429,12 +429,16 @@ pub fn reconcile_existing_placeholders_with_resolver(
         .iter()
         .filter_map(|entry| nonempty(entry.object_id.as_deref()))
         .collect::<BTreeSet<_>>();
+    let remote_by_object_id = unique_remote_files_by_object_id(current_snapshot);
     let local_placeholders = scan_local_placeholders(sync_root_path);
     let object_ids_to_resolve = local_placeholders
         .unique
         .iter()
         .filter_map(|(object_id, local)| {
-            (!remote_object_ids.contains(object_id.as_str())
+            let remote_path_differs = remote_by_object_id.get(object_id).is_some_and(|remote| {
+                canonical_object_path(&remote.path) != canonical_object_path(&local.relative_path)
+            });
+            ((!remote_object_ids.contains(object_id.as_str()) || remote_path_differs)
                 && nonempty(local.identity.remote_version.as_deref()).is_some())
             .then_some(object_id.clone())
         })
@@ -586,7 +590,7 @@ fn reconcile_remote_object_state_best_effort_with_resolutions(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let object_ids_to_resolve = object_changes
+    let mut object_ids_to_resolve = object_changes
         .iter()
         .filter_map(|change| match change {
             RemoteObjectChange::Deleted { previous } => nonempty(previous.object_id.as_deref()),
@@ -595,6 +599,21 @@ fn reconcile_remote_object_state_best_effort_with_resolutions(
         })
         .map(ToString::to_string)
         .collect::<BTreeSet<_>>();
+    // A restart reconciliation can see an object at a different path without
+    // a rename delta. The snapshot alone may be stale, so ask the resolver
+    // for the authoritative identity before moving any existing placeholder.
+    let remote_by_object_id = unique_remote_files_by_object_id(current_snapshot);
+    object_ids_to_resolve.extend(local_placeholders.unique.iter().filter_map(
+        |(object_id, local)| {
+            remote_by_object_id
+                .get(object_id)
+                .is_some_and(|remote| {
+                    canonical_object_path(&remote.path)
+                        != canonical_object_path(&local.relative_path)
+                })
+                .then_some(object_id.clone())
+        },
+    ));
     let resolved_objects = resolver.map(|resolver| {
         prefetched_resolutions
             .cloned()
@@ -806,13 +825,17 @@ fn reconcile_remote_object_state_best_effort_with_resolutions(
         }
     }
 
+    let restart_guards = RestartReconciliationGuards {
+        renamed_object_ids: &renamed_object_ids,
+        renamed_directory_subtrees: &renamed_directory_subtrees,
+        resolved_objects: resolved_objects.as_ref(),
+    };
     reconcile_restart_placeholders(
         sync_root_path,
         current_snapshot,
         provider_instance_id,
         &local_placeholders.placeholders(),
-        &renamed_object_ids,
-        &renamed_directory_subtrees,
+        restart_guards,
         &mut report,
     );
 
@@ -1044,13 +1067,18 @@ pub(crate) fn local_placeholder_paths_by_object_id(
     scan_local_placeholders(sync_root_path).paths_by_object_id()
 }
 
+struct RestartReconciliationGuards<'a> {
+    renamed_object_ids: &'a BTreeSet<String>,
+    renamed_directory_subtrees: &'a [(String, String)],
+    resolved_objects: Option<&'a BTreeMap<String, RemoteObjectResolution>>,
+}
+
 fn reconcile_restart_placeholders(
     sync_root_path: &Path,
     current_snapshot: &SyncSnapshot,
     provider_instance_id: Uuid,
     local_placeholders: &[LocalPlaceholder],
-    renamed_object_ids: &BTreeSet<String>,
-    renamed_directory_subtrees: &[(String, String)],
+    guards: RestartReconciliationGuards<'_>,
     report: &mut RemoteObjectReconcileReport,
 ) {
     let remote_by_object_id = unique_remote_files_by_object_id(current_snapshot);
@@ -1064,7 +1092,8 @@ fn reconcile_restart_placeholders(
         let relative_path = local.relative_path.clone();
         let identity = &local.identity;
 
-        if renamed_directory_subtrees
+        if guards
+            .renamed_directory_subtrees
             .iter()
             .any(|(previous, current)| {
                 path_is_same_or_descendant(&relative_path, previous)
@@ -1076,7 +1105,7 @@ fn reconcile_restart_placeholders(
         }
 
         if let Some(object_id) = nonempty(identity.object_id.as_deref()) {
-            if renamed_object_ids.contains(object_id) {
+            if guards.renamed_object_ids.contains(object_id) {
                 report.preserved_paths.insert(relative_path);
                 continue;
             }
@@ -1089,17 +1118,21 @@ fn reconcile_restart_placeholders(
             if normalize_path(&remote.path) != relative_path
                 && !report.renamed_paths.contains_key(&relative_path)
             {
-                // A restart snapshot can lag a local rename that the server
-                // already accepted. A remote move is safe to apply only when
-                // its revision proves the remote state advanced beyond the
-                // local placeholder's last confirmed version. Otherwise
-                // preserve the local location rather than moving it back to a
-                // stale path.
-                let remote_rename_is_newer =
-                    nonempty(remote.version.as_deref()).is_some_and(|remote_revision| {
-                        nonempty(identity.remote_version.as_deref()) != Some(remote_revision)
-                    });
-                if local.is_clean(provider_instance_id) && remote_rename_is_newer {
+                // Revisions are opaque CAS tokens, not an ordering relation.
+                // A path mismatch in a restart snapshot is therefore only
+                // actionable when a fresh object-id lookup confirms that the
+                // snapshot's exact destination and revision are current.
+                let confirmed_remote_move = matches!(
+                    guards
+                        .resolved_objects
+                        .and_then(|resolved_objects| resolved_objects.get(object_id)),
+                    Some(RemoteObjectResolution::Present(resolved))
+                        if canonical_object_path(&resolved.path)
+                            == canonical_object_path(&remote.path)
+                            && nonempty(resolved.revision.as_deref())
+                                == nonempty(remote.version.as_deref())
+                );
+                if local.is_clean(provider_instance_id) && confirmed_remote_move {
                     match move_remote_placeholder(
                         sync_root_path,
                         local,
@@ -2191,7 +2224,17 @@ mod tests {
             1_725_100_004,
         );
 
-        let report = reconcile_existing_placeholders(
+        let resolver = StaticResolver {
+            objects: HashMap::from([(
+                object_id.to_string(),
+                ResolvedRemoteObject {
+                    object_id: object_id.to_string(),
+                    path: new_path.to_string(),
+                    revision: Some("revision-2".to_string()),
+                },
+            )]),
+        };
+        let report = reconcile_existing_placeholders_with_resolver(
             &sync_root.root_path,
             &SyncSnapshot {
                 local: Vec::new(),
@@ -2203,6 +2246,7 @@ mod tests {
                 )],
             },
             provider_instance_id,
+            &resolver,
         )
         .expect("restart reconciliation should succeed");
 
@@ -2237,17 +2281,30 @@ mod tests {
         )
         .expect("destination parent should be created");
         fs::rename(&old_full_path, &new_full_path).expect("local rename should succeed");
-        promote_remote_to_in_sync_content_baseline(
+        record_uploaded_object_state(
             &sync_root.root_path,
             new_path,
             provider_instance_id,
+            object_id,
+            "revision-2",
+            None,
         )
         .expect("accepted local rename should persist its destination path");
         let renamed_file = open_sync_path(&new_full_path, true)
             .expect("renamed placeholder should remain openable");
         cf_set_in_sync(&renamed_file).expect("renamed placeholder should remain in sync");
 
-        let report = reconcile_existing_placeholders(
+        let resolver = StaticResolver {
+            objects: HashMap::from([(
+                object_id.to_string(),
+                ResolvedRemoteObject {
+                    object_id: object_id.to_string(),
+                    path: new_path.to_string(),
+                    revision: Some("revision-2".to_string()),
+                },
+            )]),
+        };
+        let report = reconcile_existing_placeholders_with_resolver(
             &sync_root.root_path,
             &SyncSnapshot {
                 local: Vec::new(),
@@ -2261,6 +2318,7 @@ mod tests {
                 )],
             },
             provider_instance_id,
+            &resolver,
         )
         .expect("stale restart reconciliation should succeed conservatively");
 

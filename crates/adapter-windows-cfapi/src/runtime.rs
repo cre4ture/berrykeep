@@ -554,6 +554,9 @@ pub struct SyncRootConnection {
 
 impl Drop for SyncRootConnection {
     fn drop(&mut self) {
+        // FETCH_DATA work continues after the callback has returned. Drain it
+        // while the CFAPI connection keys remain valid, then disconnect.
+        self._callback_context.fetch_worker_pool.shutdown();
         cf_disconnect_sync_root(self.connection_key);
         tracing::info!(
             "dropped CFAPI connection with key {}, disconnected from sync root",

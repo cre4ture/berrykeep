@@ -591,7 +591,7 @@ fn process_debounced_close_upload(
         }
     };
 
-    let (mut upload_usn, object_context) = match prepare_file_for_upload(&file, relative_path) {
+    let object_context = match prepare_file_for_upload(&file, relative_path) {
         Ok(prepared) => prepared,
         Err(err) => {
             tracing::info!(
@@ -607,10 +607,9 @@ fn process_debounced_close_upload(
         }
     };
     tracing::info!(
-        "close-completion: prepared {} for upload snapshot_before={:?} upload_usn={} state={}",
+        "close-completion: prepared {} for upload snapshot_before={:?} state={}",
         relative_path,
         snapshot_before,
-        upload_usn,
         describe_path_state(&full_path)
     );
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
@@ -706,30 +705,44 @@ fn process_debounced_close_upload(
         return UploadAttemptOutcome::Retry;
     }
     tracing::info!(
-        "close-completion: upload finished for {} snapshot_after={:?} upload_usn={} state_before_in_sync={}",
+        "close-completion: upload finished for {} snapshot_after={:?} state_before_in_sync={}",
         relative_path,
         snapshot_after,
-        upload_usn,
         describe_path_state(&full_path)
     );
 
-    if let Err(err) = finalize_placeholder_after_upload(
+    match finalize_placeholder_after_upload(
         &file,
+        &full_path,
         relative_path,
         &upload_receipt,
         worker.provider_instance_id,
-        &mut upload_usn,
+        &snapshot_before,
     ) {
-        tracing::info!(
-            "close-completion: failed to mark {} in sync after upload: {:#}",
-            relative_path,
-            err
-        );
-        close_upload_trace_event(format!(
-            "mark-in-sync-error path={} error={:#}",
-            relative_path, err
-        ));
-        return UploadAttemptOutcome::Retry;
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                "close-completion: {} changed while recording the upload receipt; scheduling retry",
+                relative_path
+            );
+            close_upload_trace_event(format!(
+                "snapshot-changed-during-finalize path={}",
+                relative_path
+            ));
+            return UploadAttemptOutcome::Retry;
+        }
+        Err(err) => {
+            tracing::info!(
+                "close-completion: failed to mark {} in sync after upload: {:#}",
+                relative_path,
+                err
+            );
+            close_upload_trace_event(format!(
+                "mark-in-sync-error path={} error={:#}",
+                relative_path, err
+            ));
+            return UploadAttemptOutcome::Retry;
+        }
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
@@ -749,7 +762,7 @@ fn process_debounced_close_upload(
 fn prepare_file_for_upload(
     file: &std::fs::File,
     relative_path: &str,
-) -> Result<(i64, UploadObjectContext)> {
+) -> Result<UploadObjectContext> {
     cf_ensure_placeholder_identity(file, relative_path)?;
     let info = cf_get_placeholder_standard_info_with_identity(file)?;
     let identity = decode_placeholder_file_identity(info.file_identity()).ok_or_else(|| {
@@ -764,28 +777,32 @@ fn prepare_file_for_upload(
             "refusing ambiguous upload for {relative_path}: object_id and expected_revision must either both be present or both be absent"
         );
     }
-    let upload_usn = cf_set_not_in_sync(file)?;
-    Ok((
-        upload_usn,
-        UploadObjectContext {
-            object_id,
-            expected_revision,
-        },
-    ))
+    cf_set_not_in_sync(file)?;
+    Ok(UploadObjectContext {
+        object_id,
+        expected_revision,
+    })
 }
 
 fn finalize_placeholder_after_upload(
     file: &std::fs::File,
+    full_path: &Path,
     relative_path: &str,
     receipt: &UploadReceipt,
     provider_instance_id: uuid::Uuid,
-    upload_usn: &mut i64,
-) -> Result<()> {
+    uploaded_snapshot: &LocalFileSnapshot,
+) -> Result<bool> {
     record_placeholder_upload_receipt(file, relative_path, receipt, provider_instance_id, true)?;
-    // Updating the identity advances the file's USN. Capture a fresh value after
-    // that write so CFAPI accepts the following in-sync transition.
-    *upload_usn = cf_set_not_in_sync(file)?;
-    cf_set_in_sync_with_usn(file, upload_usn)
+    // Updating the identity advances the USN that guarded the upload. Obtain
+    // a replacement guard, then check the bytes again before using it. A write
+    // before the snapshot is detected here; a write after it invalidates this
+    // freshly captured USN and makes CfSetInSyncState reject the transition.
+    let mut in_sync_usn = cf_set_not_in_sync(file)?;
+    if !upload_snapshot_still_matches(full_path, uploaded_snapshot)? {
+        return Ok(false);
+    }
+    cf_set_in_sync_with_usn(file, &mut in_sync_usn)?;
+    Ok(true)
 }
 
 fn record_placeholder_upload_receipt(
@@ -853,6 +870,13 @@ fn capture_path_snapshot(path: &Path) -> std::io::Result<LocalFileSnapshot> {
         len: metadata.len(),
         modified: metadata.modified().ok(),
     })
+}
+
+fn upload_snapshot_still_matches(
+    path: &Path,
+    uploaded_snapshot: &LocalFileSnapshot,
+) -> std::io::Result<bool> {
+    Ok(capture_path_snapshot(path)? == *uploaded_snapshot)
 }
 
 fn upload_file_on_close(
@@ -984,6 +1008,20 @@ mod tests {
             Some(expected_fingerprint.as_str())
         );
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn post_receipt_snapshot_check_detects_a_late_local_write() {
+        let (path, file) = make_test_file(b"before");
+        let uploaded_snapshot = capture_file_snapshot(&file).expect("snapshot should be captured");
+
+        std::fs::write(&path, b"changed after upload").expect("test file should be updated");
+
+        assert!(
+            !upload_snapshot_still_matches(&path, &uploaded_snapshot)
+                .expect("snapshot should be compared")
+        );
         let _ = std::fs::remove_file(path);
     }
 }
