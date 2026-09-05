@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sync_core::{NamespaceEntry, SyncSnapshot};
+use sync_core::{EntryKind, NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
     ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
@@ -9873,39 +9873,56 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
     let mut remote = Vec::with_capacity(entries.len());
 
     for entry in entries {
-        if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
-            let directory_path = entry.path.trim_end_matches('/').to_string();
-            if !directory_path.is_empty() {
-                let mut directory = NamespaceEntry::directory(directory_path);
-                directory.object_id = entry.object_id;
-                directory.version = entry.version;
-                directory.content_hash = entry.content_hash;
-                directory.content_fingerprint = entry.content_fingerprint;
-                directory.size_bytes = entry.size_bytes;
-                directory.modified_at_unix = entry.modified_at_unix;
-                directory.media = entry.media.map(namespace_media_metadata);
-                remote.push(directory);
-            }
-            continue;
+        if let Some(entry) = namespace_entry_from_store_index_entry(entry) {
+            remote.push(entry);
         }
-
-        let version = entry.version.unwrap_or_else(|| "server-head".to_string());
-        let content_hash = entry
-            .content_hash
-            .unwrap_or_else(|| format!("server-head:{}", entry.path));
-        let mut remote_entry =
-            NamespaceEntry::file_sized(entry.path.clone(), version, content_hash, entry.size_bytes);
-        remote_entry.object_id = entry.object_id;
-        remote_entry.content_fingerprint = entry.content_fingerprint;
-        remote_entry.modified_at_unix = entry.modified_at_unix;
-        remote_entry.media = entry.media.map(namespace_media_metadata);
-        remote.push(remote_entry);
     }
 
     SyncSnapshot {
         local: Vec::new(),
         remote,
     }
+}
+
+/// Converts a store-index result without inventing a revision. A file can
+/// carry its stable object identity only together with the concrete revision
+/// required for a subsequent compare-and-swap mutation.
+pub(crate) fn namespace_entry_from_store_index_entry(
+    entry: StoreIndexEntry,
+) -> Option<NamespaceEntry> {
+    if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
+        let directory_path = entry.path.trim_end_matches('/').to_string();
+        if directory_path.is_empty() {
+            return None;
+        }
+
+        let revision = entry.version.filter(|value| !value.trim().is_empty());
+        let mut directory = NamespaceEntry::directory(directory_path);
+        directory.object_id = revision.is_some().then_some(entry.object_id).flatten();
+        directory.version = revision;
+        directory.content_hash = entry.content_hash;
+        directory.content_fingerprint = entry.content_fingerprint;
+        directory.size_bytes = entry.size_bytes;
+        directory.modified_at_unix = entry.modified_at_unix;
+        directory.media = entry.media.map(namespace_media_metadata);
+        return Some(directory);
+    }
+
+    let revision = entry.version.filter(|value| !value.trim().is_empty());
+    let has_cas_baseline = revision.is_some();
+    Some(NamespaceEntry {
+        path: entry.path,
+        kind: EntryKind::File,
+        // A response without a concrete revision cannot safely be used for a
+        // mutation. Retain neither half of the CAS tuple in the snapshot.
+        object_id: has_cas_baseline.then_some(entry.object_id).flatten(),
+        version: revision,
+        content_hash: entry.content_hash,
+        content_fingerprint: entry.content_fingerprint,
+        size_bytes: entry.size_bytes,
+        modified_at_unix: entry.modified_at_unix,
+        media: entry.media.map(namespace_media_metadata),
+    })
 }
 
 pub fn namespace_media_metadata(media: StoreIndexMedia) -> sync_core::NamespaceMediaMetadata {

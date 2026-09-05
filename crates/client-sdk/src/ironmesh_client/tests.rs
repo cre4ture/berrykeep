@@ -1154,11 +1154,9 @@ fn snapshot_conversion_maps_prefix_and_keys() {
     assert_eq!(snapshot.remote.len(), 2);
     assert_eq!(snapshot.remote[0], NamespaceEntry::directory("docs"));
     assert_eq!(snapshot.remote[1].path, "docs/readme.txt");
-    assert_eq!(snapshot.remote[1].version.as_deref(), Some("server-head"));
-    assert_eq!(
-        snapshot.remote[1].content_hash.as_deref(),
-        Some("server-head:docs/readme.txt")
-    );
+    assert_eq!(snapshot.remote[1].object_id, None);
+    assert_eq!(snapshot.remote[1].version, None);
+    assert_eq!(snapshot.remote[1].content_hash, None);
     assert_eq!(
         snapshot.remote[1].content_fingerprint.as_deref(),
         Some("cfp-readme")
@@ -1181,10 +1179,8 @@ fn snapshot_conversion_maps_prefix_and_keys() {
     );
 }
 
-/// Temporary green characterization of undesired current behavior.
-/// Remove this test when snapshots retain concrete server revision IDs.
 #[test]
-fn undesired_current_behavior_snapshot_entries_without_revisions_share_server_head_marker() {
+fn snapshot_entries_without_revisions_omit_cas_identity() {
     let entries = [
         ("docs/first.txt", "manifest-first", 1_723_456_789),
         ("docs/second.txt", "manifest-second", 1_723_456_790),
@@ -1193,7 +1189,7 @@ fn undesired_current_behavior_snapshot_entries_without_revisions_share_server_he
     .map(|(path, content_hash, modified_at_unix)| StoreIndexEntry {
         path: path.to_string(),
         entry_type: "key".to_string(),
-        object_id: None,
+        object_id: Some(format!("object-{path}")),
         labels: Vec::new(),
         labels_resolved: false,
         version: None,
@@ -1212,15 +1208,12 @@ fn undesired_current_behavior_snapshot_entries_without_revisions_share_server_he
         snapshot
             .remote
             .iter()
-            .all(|entry| entry.version.as_deref() == Some("server-head")),
-        "UNDESIRED CURRENT BEHAVIOR: distinct server objects without listed revision IDs are assigned the same non-authoritative marker"
+            .all(|entry| entry.object_id.is_none())
     );
+    assert!(snapshot.remote.iter().all(|entry| entry.version.is_none()));
 }
 
 #[test]
-#[should_panic(
-    expected = "a delete precondition requires a concrete server revision, not a shared selector"
-)]
 fn desired_behavior_snapshot_entries_never_use_server_head_as_a_revision_identity() {
     let snapshot = snapshot_from_store_index_entries(vec![StoreIndexEntry {
         path: "docs/readme.txt".to_string(),
@@ -1236,11 +1229,8 @@ fn desired_behavior_snapshot_entries_never_use_server_head_as_a_revision_identit
         media: None,
     }]);
 
-    assert_ne!(
-        snapshot.remote[0].version.as_deref(),
-        Some("server-head"),
-        "a delete precondition requires a concrete server revision, not a shared selector"
-    );
+    assert_eq!(snapshot.remote[0].version, None);
+    assert_eq!(snapshot.remote[0].object_id, None);
 }
 
 fn completed_upload_mapping_fixture() -> (UploadSessionView, UploadSessionCompleteResponse) {

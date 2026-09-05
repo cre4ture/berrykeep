@@ -16,8 +16,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_CLOUD_FILE_UNSUCCESSFUL,
 };
@@ -641,12 +641,14 @@ struct FetchWorkItem {
 }
 
 pub(crate) struct FetchWorkerPool {
-    workers: Vec<SyncSender<FetchWorkItem>>,
-    next_worker: AtomicUsize,
+    ingress: Sender<FetchWorkItem>,
 }
 
 impl FetchWorkerPool {
     pub(crate) fn new(max_concurrency: usize) -> Result<Self> {
+        if max_concurrency == 0 {
+            anyhow::bail!("CFAPI fetch worker concurrency must be greater than zero");
+        }
         let mut workers = Vec::with_capacity(max_concurrency);
         for worker_index in 0..max_concurrency {
             let (sender, receiver) = sync_channel(FETCH_WORKER_QUEUE_CAPACITY);
@@ -660,27 +662,52 @@ impl FetchWorkerPool {
                 .with_context(|| format!("failed starting CFAPI fetch worker {worker_index}"))?;
             workers.push(sender);
         }
-        Ok(Self {
-            workers,
-            next_worker: AtomicUsize::new(0),
-        })
+        let (ingress, receiver) = channel();
+        std::thread::Builder::new()
+            .name("ironmesh-cfapi-fetch-dispatch".to_string())
+            .spawn(move || dispatch_fetch_work(receiver, workers))
+            .context("failed starting CFAPI fetch dispatcher")?;
+        Ok(Self { ingress })
     }
 
-    fn try_submit(&self, mut work: FetchWorkItem) -> Result<(), FetchWorkItem> {
-        if self.workers.is_empty() {
-            return Err(work);
-        }
-        let start = self.next_worker.fetch_add(1, Ordering::Relaxed);
-        for offset in 0..self.workers.len() {
-            let worker_index = (start + offset) % self.workers.len();
-            match self.workers[worker_index].try_send(work) {
-                Ok(()) => return Ok(()),
-                Err(TrySendError::Full(returned)) | Err(TrySendError::Disconnected(returned)) => {
-                    work = returned;
+    /// Callback threads only enqueue work here. The dispatcher applies
+    /// backpressure to the bounded worker queues without turning a temporary
+    /// burst into a failed hydration request.
+    fn submit(&self, work: FetchWorkItem) -> Result<(), FetchWorkItem> {
+        self.ingress.send(work).map_err(|error| error.0)
+    }
+}
+
+fn dispatch_fetch_work(receiver: Receiver<FetchWorkItem>, workers: Vec<SyncSender<FetchWorkItem>>) {
+    let mut next_worker = 0usize;
+    while let Ok(work) = receiver.recv() {
+        let mut pending_work = Some(work);
+        'dispatch: loop {
+            let mut worker_is_available = false;
+            for offset in 0..workers.len() {
+                let worker_index = (next_worker + offset) % workers.len();
+                let work = pending_work
+                    .take()
+                    .expect("dispatcher must retain work between worker attempts");
+                match workers[worker_index].try_send(work) {
+                    Ok(()) => {
+                        next_worker = (worker_index + 1) % workers.len();
+                        break 'dispatch;
+                    }
+                    Err(TrySendError::Full(returned)) => {
+                        worker_is_available = true;
+                        pending_work = Some(returned);
+                    }
+                    Err(TrySendError::Disconnected(returned)) => pending_work = Some(returned),
                 }
             }
+
+            if !worker_is_available {
+                tracing::warn!("cfapi fetch dispatcher stopped because all workers disconnected");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        Err(work)
     }
 }
 
@@ -870,11 +897,11 @@ unsafe extern "system" fn callback_fetch_data(
         callback_info: OwnedFetchCallbackInfo::capture(callback_info_ref),
         fetch_data,
     };
-    if fetch_worker_pool.try_submit(work).is_err()
+    if fetch_worker_pool.submit(work).is_err()
         && let Err(err) =
             execute_transfer_data_failure(callback_info_ref, fetch_failure_info(fetch_data))
     {
-        tracing::info!("cfapi fetch-data: failed to report saturated-worker failure: {err}");
+        tracing::info!("cfapi fetch-data: failed to report unavailable-dispatcher failure: {err}");
     }
 }
 

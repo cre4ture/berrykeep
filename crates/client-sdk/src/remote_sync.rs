@@ -1,5 +1,5 @@
 use crate::bootstrap::ConnectionBootstrap;
-use crate::ironmesh_client::IronMeshClient;
+use crate::ironmesh_client::{IronMeshClient, namespace_entry_from_store_index_entry};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -258,41 +258,14 @@ where
     let mut directory_count = 0u64;
 
     for (index, entry) in entries.into_iter().enumerate() {
-        if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
-            let directory_path = entry.path.trim_end_matches('/').to_string();
-            if !directory_path.is_empty() {
+        let is_directory = (entry.entry_type == "prefix") || entry.path.ends_with('/');
+        if let Some(entry) = namespace_entry_from_store_index_entry(entry) {
+            if is_directory {
                 directory_count += 1;
-                let mut directory = NamespaceEntry::directory(directory_path);
-                directory.object_id = entry.object_id;
-                directory.version = entry.version;
-                directory.content_hash = entry.content_hash;
-                directory.content_fingerprint = entry.content_fingerprint;
-                directory.size_bytes = entry.size_bytes;
-                directory.modified_at_unix = entry.modified_at_unix;
-                directory.media = entry
-                    .media
-                    .map(crate::ironmesh_client::namespace_media_metadata);
-                remote.push(directory);
+            } else {
+                file_count += 1;
             }
-        } else {
-            let version = entry.version.unwrap_or_else(|| "server-head".to_string());
-            let content_hash = entry
-                .content_hash
-                .unwrap_or_else(|| format!("server-head:{}", entry.path));
-            let mut remote_entry = NamespaceEntry::file_sized(
-                entry.path.clone(),
-                version,
-                content_hash,
-                entry.size_bytes,
-            );
-            remote_entry.object_id = entry.object_id;
-            remote_entry.content_fingerprint = entry.content_fingerprint;
-            remote_entry.modified_at_unix = entry.modified_at_unix;
-            remote_entry.media = entry
-                .media
-                .map(crate::ironmesh_client::namespace_media_metadata);
-            file_count += 1;
-            remote.push(remote_entry);
+            remote.push(entry);
         }
 
         let processed_entry_count = (index + 1) as u64;
@@ -1022,6 +995,31 @@ mod tests {
         assert_eq!(directory.path, "docs");
         assert_eq!(directory.object_id.as_deref(), Some("obj-directory"));
         assert_eq!(directory.version.as_deref(), Some("revision-7"));
+    }
+
+    #[test]
+    fn snapshot_omits_object_identity_when_store_index_lacks_revision() {
+        let snapshot = snapshot_from_store_index_entries_with_progress(
+            vec![crate::ironmesh_client::StoreIndexEntry {
+                path: "docs/readme.txt".to_string(),
+                entry_type: "key".to_string(),
+                object_id: Some("obj-readme".to_string()),
+                version: None,
+                content_hash: Some("manifest-readme".to_string()),
+                size_bytes: Some(42),
+                modified_at_unix: Some(1_725_000_000),
+                content_fingerprint: None,
+                media: None,
+                labels: Vec::new(),
+                labels_resolved: false,
+            }],
+            |_| {},
+        );
+
+        let entry = snapshot.remote.first().expect("file should be present");
+        assert_eq!(entry.content_hash.as_deref(), Some("manifest-readme"));
+        assert_eq!(entry.object_id, None);
+        assert_eq!(entry.version, None);
     }
 
     #[test]
