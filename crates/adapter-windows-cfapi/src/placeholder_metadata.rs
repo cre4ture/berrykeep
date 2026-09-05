@@ -227,10 +227,15 @@ fn refresh_remote_placeholder_state_with_policy(
         if normalized_object_id.is_some()
             && existing_identity.object_id.is_none()
             && identity_has_remote_baseline(existing_identity)
-            && existing_identity.remote_version.as_deref() != remote_version
+            && !legacy_identity_matches_remote_baseline(
+                existing_identity,
+                remote_version,
+                remote_content_hash,
+                remote_content_fingerprint,
+            )
         {
             anyhow::bail!(
-                "legacy placeholder at {normalized} cannot be safely bound to an object with a different revision"
+                "legacy placeholder at {normalized} cannot be safely bound to this remote baseline"
             );
         }
         let local_state_is_dirty = file_metadata_policy
@@ -945,8 +950,13 @@ fn reconcile_restart_placeholders(
             continue;
         };
         let safe_legacy_match = local.is_clean(provider_instance_id)
-            && nonempty(identity.remote_version.as_deref()) == nonempty(remote.version.as_deref())
-            && nonempty(remote.object_id.as_deref()).is_some();
+            && nonempty(remote.object_id.as_deref()).is_some()
+            && legacy_identity_matches_remote_baseline(
+                &identity,
+                remote.version.as_deref(),
+                remote.content_hash.as_deref(),
+                remote.content_fingerprint.as_deref(),
+            );
         if !safe_legacy_match {
             report.conflicted_paths.insert(relative_path.clone());
             report.preserved_paths.insert(relative_path);
@@ -1188,6 +1198,36 @@ fn remote_placeholder_state(entry: &sync_core::NamespaceEntry) -> RemotePlacehol
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Legacy v2 placeholders predate server-provided revision IDs.  They may
+/// carry the synthetic `server-head` selector instead of a concrete revision.
+/// At the unchanged path that selector can be promoted only when the recorded
+/// content baseline also matches the current remote object; otherwise the
+/// placeholder remains unbound for a later conservative reconciliation.
+fn legacy_identity_matches_remote_baseline(
+    identity: &PlaceholderFileIdentity,
+    remote_revision: Option<&str>,
+    remote_content_hash: Option<&str>,
+    remote_content_fingerprint: Option<&str>,
+) -> bool {
+    let local_revision = nonempty(identity.remote_version.as_deref());
+    let remote_revision = nonempty(remote_revision);
+    if remote_revision.is_some() && local_revision == remote_revision {
+        return true;
+    }
+
+    let is_synthetic_legacy_revision =
+        local_revision.is_some_and(|revision| revision.starts_with("server-head"));
+    let same_content_hash = nonempty(identity.remote_content_hash.as_deref())
+        .zip(nonempty(remote_content_hash))
+        .is_some_and(|(local, remote)| local == remote);
+    let same_content_fingerprint = nonempty(identity.remote_content_fingerprint.as_deref())
+        .zip(nonempty(remote_content_fingerprint))
+        .is_some_and(|(local, remote)| local == remote);
+    is_synthetic_legacy_revision
+        && remote_revision.is_some()
+        && (same_content_hash || same_content_fingerprint)
 }
 
 fn mutate_placeholder_identity_for_path(
@@ -1897,6 +1937,54 @@ mod tests {
         let identity = decode_placeholder_file_identity(info.file_identity())
             .expect("migrated identity should decode");
         assert_eq!(identity.object_id.as_deref(), Some(object_id));
+    }
+
+    #[test]
+    fn legacy_server_head_placeholder_migrates_when_its_content_baseline_matches() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("legacy-server-head-migration");
+        let path = "docs/legacy-server-head.txt";
+        let object_id = "object-legacy-server-head";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-1",
+            "legacy-server-head-hash",
+            1_725_100_005,
+        );
+        let full_path = sync_root.root_path.join(path.replace('/', "\\"));
+        let file = open_sync_path(&full_path, true).expect("legacy placeholder should open");
+        let legacy_identity = format!(
+            "v=2\np={path}\nrv=server-head\nrh=legacy-server-head-hash\ncf=legacy-fingerprint\npi={provider_instance_id}"
+        );
+        cf_update_placeholder_file_identity(&file, legacy_identity.as_bytes())
+            .expect("test should install a synthetic legacy identity");
+        drop(file);
+
+        let report = reconcile_existing_placeholders(
+            &sync_root.root_path,
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![remote_file(
+                    path,
+                    object_id,
+                    "revision-2",
+                    "legacy-server-head-hash",
+                )],
+            },
+            provider_instance_id,
+        )
+        .expect("synthetic legacy placeholder should reconcile by content baseline");
+
+        assert!(report.migrated_paths.contains(path));
+        let file = open_sync_path(&full_path, false).expect("migrated placeholder should open");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("migrated identity should be readable");
+        let identity = decode_placeholder_file_identity(info.file_identity())
+            .expect("migrated identity should decode");
+        assert_eq!(identity.object_id.as_deref(), Some(object_id));
+        assert_eq!(identity.remote_version.as_deref(), Some("revision-2"));
     }
 
     #[test]
