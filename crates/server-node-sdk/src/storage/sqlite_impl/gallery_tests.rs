@@ -569,6 +569,39 @@ fn gallery_map_filters_capture_time_in_clusters_summary_and_entries() {
     assert!(empty_clusters.clusters.is_empty());
 }
 
+#[test]
+fn gallery_map_capture_summary_uses_the_capture_time_index() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    let (capture_lower_bound, capture_upper_bound) =
+        gallery_map_capture_time_bounds(Some(20), Some(30)).unwrap();
+    let scope_values = vec![
+        Value::Text(String::new()),
+        Value::Text("%".to_string()),
+        Value::Integer(64),
+        Value::Null,
+        capture_lower_bound,
+        capture_upper_bound,
+    ];
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM gallery_objects WHERE {GALLERY_MAP_SCOPE_SQL}"
+    );
+    let mut statement = db.prepare(&sql).expect("query plan should prepare");
+    let plan = statement
+        .query_map(params_from_iter(scope_values), |row| {
+            row.get::<_, String>(3)
+        })
+        .expect("query plan should execute")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("query plan rows should decode");
+
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("idx_gallery_objects_capture_summary")),
+        "capture-filtered summary should use capture index: {plan:?}"
+    );
+}
+
 #[tokio::test]
 async fn gallery_map_summary_cache_serves_stale_value_and_refreshes_in_background() {
     let metadata_db_path = sqlite_test_db_path("gallery-map-summary-cache");

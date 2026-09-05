@@ -80,34 +80,48 @@ pub(crate) struct GallerySummaryCache {
 }
 
 /// The gallery controls expose one scope at a time. Media and privacy-label filters have a fixed
-/// vocabulary, while capture-date ranges are user-selected. This LRU prevents those ranges from
-/// growing process memory without bound while retaining the scopes a user is most likely to
-/// revisit.
-const GALLERY_SUMMARY_CACHE_MAX_SCOPES: usize = 64;
+/// vocabulary, while capture-date ranges are user-selected. Keep the two classes in separate LRU
+/// partitions so walking many arbitrary date ranges cannot evict hot unfiltered scopes.
+const GALLERY_SUMMARY_CACHE_MAX_FIXED_SCOPES: usize = 64;
+const GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES: usize = 16;
 
 #[derive(Default)]
 struct GallerySummaryCacheValues {
     entries: HashMap<GallerySummaryScope, GallerySummaryCacheValue>,
-    least_recently_used: VecDeque<GallerySummaryScope>,
+    fixed_least_recently_used: VecDeque<GallerySummaryScope>,
+    capture_least_recently_used: VecDeque<GallerySummaryScope>,
 }
 
 impl GallerySummaryCacheValues {
     fn touch(&mut self, scope: &GallerySummaryScope) {
-        if let Some(index) = self
-            .least_recently_used
+        let least_recently_used =
+            if scope.captured_from_unix.is_some() || scope.captured_until_unix.is_some() {
+                &mut self.capture_least_recently_used
+            } else {
+                &mut self.fixed_least_recently_used
+            };
+        if let Some(index) = least_recently_used
             .iter()
             .position(|existing| existing == scope)
         {
-            self.least_recently_used.remove(index);
+            least_recently_used.remove(index);
         }
-        self.least_recently_used.push_back(scope.clone());
+        least_recently_used.push_back(scope.clone());
     }
 
     fn evict_excess_entries(&mut self) {
-        while self.entries.len() > GALLERY_SUMMARY_CACHE_MAX_SCOPES {
-            let Some(scope) = self.least_recently_used.pop_front() else {
-                break;
-            };
+        while self.fixed_least_recently_used.len() > GALLERY_SUMMARY_CACHE_MAX_FIXED_SCOPES {
+            let scope = self
+                .fixed_least_recently_used
+                .pop_front()
+                .expect("fixed gallery summary LRU exceeded its capacity");
+            self.entries.remove(&scope);
+        }
+        while self.capture_least_recently_used.len() > GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES {
+            let scope = self
+                .capture_least_recently_used
+                .pop_front()
+                .expect("capture-filtered gallery summary LRU exceeded its capacity");
             self.entries.remove(&scope);
         }
     }
@@ -198,20 +212,44 @@ mod tests {
         }
     }
 
+    fn capture_scope(index: usize) -> GallerySummaryScope {
+        let mut scope = scope(index);
+        scope.captured_from_unix = Some(index as u64);
+        scope.captured_until_unix = Some(index as u64 + 1);
+        scope
+    }
+
     #[test]
-    fn bounds_scopes_and_evicts_the_least_recently_used_value() {
+    fn bounds_fixed_scopes_and_evicts_the_least_recently_used_value() {
         let cache = GallerySummaryCache::new();
-        for index in 0..=GALLERY_SUMMARY_CACHE_MAX_SCOPES {
+        for index in 0..=GALLERY_SUMMARY_CACHE_MAX_FIXED_SCOPES {
             cache.store(scope(index), value(index));
         }
 
         assert!(cache.cached(&scope(0)).is_none());
         assert_eq!(
             cache
-                .cached(&scope(GALLERY_SUMMARY_CACHE_MAX_SCOPES))
+                .cached(&scope(GALLERY_SUMMARY_CACHE_MAX_FIXED_SCOPES))
                 .expect("newest scope should remain cached")
                 .revision,
-            GALLERY_SUMMARY_CACHE_MAX_SCOPES as u64
+            GALLERY_SUMMARY_CACHE_MAX_FIXED_SCOPES as u64
+        );
+    }
+
+    #[test]
+    fn capture_ranges_cannot_evict_unfiltered_scopes() {
+        let cache = GallerySummaryCache::new();
+        cache.store(scope(0), value(0));
+        for index in 0..=GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES {
+            cache.store(capture_scope(index), value(index));
+        }
+
+        assert!(cache.cached(&scope(0)).is_some());
+        assert!(cache.cached(&capture_scope(0)).is_none());
+        assert!(
+            cache
+                .cached(&capture_scope(GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES))
+                .is_some()
         );
     }
 

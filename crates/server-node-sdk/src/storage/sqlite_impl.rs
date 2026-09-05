@@ -716,6 +716,8 @@ fn query_gallery_map_summary_from_db(
         sqlite_like_prefix_pattern(&format!("{}/", scope.prefix))
     };
     let depth = i64::try_from(scope.depth).context("gallery map summary depth overflow")?;
+    let (capture_lower_bound, capture_upper_bound) =
+        gallery_map_capture_time_bounds(scope.captured_from_unix, scope.captured_until_unix)?;
     let scope_values = vec![
         Value::Text(scope.prefix.clone()),
         Value::Text(prefix_pattern),
@@ -725,8 +727,8 @@ fn query_gallery_map_summary_from_db(
             .media_type()
             .map(|value| Value::Text(value.to_string()))
             .unwrap_or(Value::Null),
-        optional_gallery_map_timestamp(scope.captured_from_unix, "lower")?,
-        optional_gallery_map_timestamp(scope.captured_until_unix, "upper")?,
+        capture_lower_bound,
+        capture_upper_bound,
     ];
     let (total_entry_count, media_summary) = match progress {
         Some(progress) => gallery_map_summary_chunked_from_db(
@@ -997,8 +999,8 @@ const GALLERY_MAP_SCOPE_SQL: &str = "
     END <= ?3
     AND gallery_objects.inferred_media_type IS NOT NULL
     AND (?4 IS NULL OR gallery_objects.media_type = ?4)
-    AND (?5 IS NULL OR gallery_objects.captured_at_unix >= ?5)
-    AND (?6 IS NULL OR gallery_objects.captured_at_unix < ?6)";
+    AND gallery_objects.captured_at_unix > ?5
+    AND gallery_objects.captured_at_unix <= ?6";
 
 const GALLERY_MAP_VIEWPORT_SQL: &str = "
     gallery_objects.latitude BETWEEN ?7 AND ?8
@@ -1027,6 +1029,8 @@ fn sqlite_gallery_map_scope_values(
     let (spatial_east, spatial_north) =
         gallery_web_mercator_position(viewport.north, viewport.east)
             .context("validated gallery map northeast bound should project")?;
+    let (capture_lower_bound, capture_upper_bound) =
+        gallery_map_capture_time_bounds(captured_from_unix, captured_until_unix)?;
     Ok(vec![
         Value::Text(prefix.to_string()),
         Value::Text(prefix_pattern.to_string()),
@@ -1035,8 +1039,8 @@ fn sqlite_gallery_map_scope_values(
             .media_type()
             .map(|value| Value::Text(value.to_string()))
             .unwrap_or(Value::Null),
-        optional_gallery_map_timestamp(captured_from_unix, "lower")?,
-        optional_gallery_map_timestamp(captured_until_unix, "upper")?,
+        capture_lower_bound,
+        capture_upper_bound,
         Value::Real(viewport.south),
         Value::Real(viewport.north),
         Value::Real(viewport.west),
@@ -1048,12 +1052,24 @@ fn sqlite_gallery_map_scope_values(
     ])
 }
 
-fn optional_gallery_map_timestamp(value: Option<u64>, bound: &str) -> Result<Value> {
-    value
+/// Converts the public inclusive/exclusive interval into an always-bound integer range. Gallery
+/// timestamps are non-negative, so `(from - 1, until - 1]` preserves `[from, until)` while also
+/// letting SQLite use the leading capture-time index instead of planning around nullable `OR`s.
+fn gallery_map_capture_time_bounds(
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
+) -> Result<(Value, Value)> {
+    let lower = captured_from_unix
         .map(i64::try_from)
         .transpose()
-        .with_context(|| format!("gallery map capture-time {bound} bound overflow"))
-        .map(|value| value.map_or(Value::Null, Value::Integer))
+        .context("gallery map capture-time lower bound overflow")?
+        .map_or(-1, |value| value - 1);
+    let upper = captured_until_unix
+        .map(i64::try_from)
+        .transpose()
+        .context("gallery map capture-time upper bound overflow")?
+        .map_or(i64::MAX, |value| value - 1);
+    Ok((Value::Integer(lower), Value::Integer(upper)))
 }
 
 fn gallery_map_summary_from_db(
@@ -4706,6 +4722,19 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         "gallery_objects",
         GALLERY_LABELS_COLUMN,
         GALLERY_LABELS_COLUMN_DEFINITION,
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gallery_objects_capture_summary
+         ON gallery_objects(
+             captured_at_unix,
+             inferred_media_type,
+             media_type,
+             media_status,
+             geotagged,
+             key,
+             labels_json
+         )",
+        [],
     )?;
     add_sqlite_column_if_missing(
         db,
