@@ -3827,10 +3827,6 @@ impl MetadataStore for SqliteMetadataStore {
                      SELECT 1
                      FROM json_each(CAST(version_indexes.index_json AS TEXT), '$.versions') AS version
                      WHERE json_extract(version.value, '$.manifest_hash') = ?2
-                       AND (
-                         json_extract(CAST(version_indexes.index_json AS TEXT), '$.preferred_head_version_id') IS NULL
-                         OR version.key = json_extract(CAST(version_indexes.index_json AS TEXT), '$.preferred_head_version_id')
-                       )
                        AND json_extract(version.value, '$.logical_path') IS NOT NULL
                        AND (
                          ?3 = ''
