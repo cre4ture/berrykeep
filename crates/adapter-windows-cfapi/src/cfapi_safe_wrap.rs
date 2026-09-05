@@ -673,8 +673,8 @@ impl FetchWorkerPool {
     /// Callback threads only enqueue work here. The dispatcher applies
     /// backpressure to the bounded worker queues without turning a temporary
     /// burst into a failed hydration request.
-    fn submit(&self, work: FetchWorkItem) -> Result<(), FetchWorkItem> {
-        self.ingress.send(work).map_err(|error| error.0)
+    fn submit(&self, work: FetchWorkItem) -> bool {
+        self.ingress.send(work).is_ok()
     }
 }
 
@@ -897,7 +897,7 @@ unsafe extern "system" fn callback_fetch_data(
         callback_info: OwnedFetchCallbackInfo::capture(callback_info_ref),
         fetch_data,
     };
-    if fetch_worker_pool.submit(work).is_err()
+    if !fetch_worker_pool.submit(work)
         && let Err(err) =
             execute_transfer_data_failure(callback_info_ref, fetch_failure_info(fetch_data))
     {
