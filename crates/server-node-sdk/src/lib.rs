@@ -17570,13 +17570,11 @@ async fn list_store_index_response_attempt(
     }
     if query.captured_from_unix.is_some() || query.captured_until_unix.is_some() {
         entries.retain(|entry| {
-            let captured_at = store_index_entry_captured_at(entry);
-            query
-                .captured_from_unix
-                .is_none_or(|from| captured_at >= from)
-                && query
-                    .captured_until_unix
-                    .is_none_or(|until| captured_at < until)
+            matches_store_index_capture_range(
+                entry,
+                query.captured_from_unix,
+                query.captured_until_unix,
+            )
         });
     }
     if label_filter_requested {
@@ -18241,6 +18239,19 @@ fn store_index_entry_captured_at(entry: &StoreIndexEntry) -> u64 {
         media.and_then(|media| media.taken_at_unix),
         entry.modified_at_unix,
     )
+}
+
+fn matches_store_index_capture_range(
+    entry: &StoreIndexEntry,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
+) -> bool {
+    if store_index_entry_type(entry) != "key" {
+        return true;
+    }
+    let captured_at = store_index_entry_captured_at(entry);
+    captured_from_unix.is_none_or(|from| captured_at >= from)
+        && captured_until_unix.is_none_or(|until| captured_at < until)
 }
 
 fn store_index_entry_type(entry: &StoreIndexEntry) -> &str {

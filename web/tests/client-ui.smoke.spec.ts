@@ -833,11 +833,10 @@ test("client-ui gallery sends capture-date bounds to grid and map queries", asyn
     }
   });
 
-  await installClientUiMocks(page);
+  const mocks = await installClientUiMocks(page);
   await page.goto("/");
   await page.getByText("Gallery", { exact: true }).click();
-  await page.getByLabel("Captured from").fill("2024-04-05");
-  await page.getByLabel("Captured through").fill("2024-04-06");
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
   const [capturedFromUnix, capturedUntilUnix] = await page.evaluate(() => [
     Math.floor(new Date(2024, 3, 5).getTime() / 1_000),
     Math.floor(new Date(2024, 3, 7).getTime() / 1_000)
@@ -846,7 +845,24 @@ test("client-ui gallery sends capture-date bounds to grid and map queries", asyn
     request.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
     request.searchParams.get("captured_until_unix") === String(capturedUntilUnix);
 
-  await expect.poll(() => gridRequests.some(includesCaptureBounds)).toBe(true);
+  mocks.setGalleryStoreListDelay(750);
+  const fromOnlyRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return (
+      url.pathname === apiV1("/store/list") &&
+      url.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
+      !url.searchParams.has("captured_until_unix")
+    );
+  });
+  await page.getByLabel("Captured from").fill("2024-04-05");
+  await fromOnlyRequest;
+  const completedRangeResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === apiV1("/store/list") && includesCaptureBounds(url);
+  });
+  await page.getByLabel("Captured through").fill("2024-04-06");
+  await completedRangeResponse;
+  mocks.setGalleryStoreListDelay(0);
 
   await page.getByLabel("Captured from").fill("1965-04-05");
   await page.getByLabel("Captured through").fill("1965-04-06");

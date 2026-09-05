@@ -17173,6 +17173,46 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
 }
 
 #[test]
+fn store_index_capture_range_preserves_prefix_entries() {
+    let entry = |path: &str, entry_type: &str, modified_at_unix| super::StoreIndexEntry {
+        path: path.to_string(),
+        entry_type: entry_type.to_string(),
+        object_id: None,
+        version: None,
+        content_hash: None,
+        size_bytes: None,
+        modified_at_unix,
+        content_fingerprint: None,
+        media: None,
+        labels: Vec::new(),
+        labels_resolved: false,
+    };
+    let prefix = entry("gallery/trip/", "prefix", None);
+    let key = entry("gallery/trip/photo.jpg", "key", Some(50));
+
+    assert!(super::matches_store_index_capture_range(
+        &prefix,
+        Some(100),
+        Some(200)
+    ));
+    assert!(super::matches_store_index_capture_range(
+        &key,
+        Some(50),
+        Some(51)
+    ));
+    assert!(!super::matches_store_index_capture_range(
+        &key,
+        Some(51),
+        None
+    ));
+    assert!(!super::matches_store_index_capture_range(
+        &key,
+        None,
+        Some(50)
+    ));
+}
+
+#[test]
 fn store_index_media_filter_prefilters_metadata_lookup_plan() {
     let keys = vec![
         "gallery/a.jpg".to_string(),

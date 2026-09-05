@@ -839,7 +839,7 @@ export function GallerySurface({
   }, [visiblePageSet, gridCollection, selection, viewMode]);
 
   useEffect(() => {
-    if (!loadedScopeRef.current) {
+    if (!loadedScopeRef.current && !requestedScopeRef.current) {
       return;
     }
 
