@@ -871,6 +871,12 @@ impl SyncRootMonitor {
                             err
                         );
                         self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                    } else {
+                        // The upload receipt advances the placeholder's
+                        // revision. Refresh this walk's snapshot so that
+                        // revision becomes the next monitor baseline instead
+                        // of looking like a new local change on every scan.
+                        self.seed_existing_entry(current, &rel_path, true);
                     }
                 }
                 Err(err) => {
@@ -1011,6 +1017,7 @@ impl SyncRootMonitor {
                                 return;
                             }
                         }
+                        self.seed_existing_entry(current, &rel_path, false);
                         tracing::info!("{}: uploaded file {}", self.name, rel_path);
                     }
                     Err(err) => {
@@ -2099,6 +2106,36 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn successful_directory_upload_refreshes_the_seen_revision() {
+        let (sync_root, provider_instance_id) =
+            registered_monitor_test_sync_root("directory-upload-seen-revision");
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.root_path.clone(),
+            provider_instance_id,
+            uploader.clone(),
+        );
+        monitor.seed_seen();
+        std::fs::create_dir_all(sync_root.root_path.join("docs"))
+            .expect("local directory should be created");
+
+        monitor.walk();
+        monitor.walk();
+
+        let uploads = uploader
+            .uploads
+            .lock()
+            .expect("uploads lock poisoned")
+            .clone();
+        assert_eq!(
+            uploads,
+            vec!["docs/"],
+            "the receipt revision must become the next monitor baseline instead of re-uploading the unchanged directory"
+        );
     }
 
     #[test]

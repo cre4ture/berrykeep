@@ -567,6 +567,45 @@ pub(crate) struct CallbackContext {
     upload_debounce: Arc<UploadDebounceState>,
 }
 
+impl CallbackContext {
+    /// Register cancellation before a fetch enters the worker queue. A
+    /// CANCEL_FETCH_DATA callback can arrive before a worker begins the
+    /// transfer, so registration inside the worker would lose that signal.
+    pub(crate) fn register_fetch_cancellation(
+        &self,
+        callback_info: &CF_CALLBACK_INFO,
+        fetch_data: FetchDataCallbackParams,
+    ) -> Arc<AtomicBool> {
+        let identity = fetch_callback_identity(
+            callback_info,
+            fetch_data.required_file_offset.max(0) as u64,
+            fetch_data.required_length.max(0) as u64,
+        );
+        self.fetch_cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(identity)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    pub(crate) fn unregister_fetch_cancellation(
+        &self,
+        callback_info: &CF_CALLBACK_INFO,
+        fetch_data: FetchDataCallbackParams,
+    ) {
+        let identity = fetch_callback_identity(
+            callback_info,
+            fetch_data.required_file_offset.max(0) as u64,
+            fetch_data.required_length.max(0) as u64,
+        );
+        self.fetch_cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&identity);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FetchCallbackIdentity {
     request_identity: i64,
@@ -640,6 +679,21 @@ struct ActiveHydrationMarkerGuard<'a> {
     context: &'a CallbackContext,
     relative_path: String,
     active: bool,
+}
+
+struct FetchCancellationGuard<'a> {
+    context: &'a CallbackContext,
+    identity: FetchCallbackIdentity,
+}
+
+impl Drop for FetchCancellationGuard<'_> {
+    fn drop(&mut self) {
+        self.context
+            .fetch_cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.identity);
+    }
 }
 
 impl<'a> ActiveHydrationMarkerGuard<'a> {
@@ -2202,10 +2256,20 @@ pub(crate) fn handle_callback_fetch_data(
     callback_info_ref: &CF_CALLBACK_INFO,
     context: &CallbackContext,
     fetch_data: FetchDataCallbackParams,
+    cancel_flag: Arc<AtomicBool>,
 ) -> Option<ExecuteTransferDataFailureInfo> {
     let required_range: RequestedRange = RequestedRange {
         offset: fetch_data.required_file_offset.max(0) as u64,
         length: fetch_data.required_length.max(0) as u64,
+    };
+    let fetch_identity = fetch_callback_identity(
+        callback_info_ref,
+        required_range.offset,
+        required_range.length,
+    );
+    let _fetch_cancellation_guard = FetchCancellationGuard {
+        context,
+        identity: fetch_identity,
     };
     let optional_range = RequestedRange {
         offset: fetch_data.optional_file_offset.max(0) as u64,
@@ -2251,11 +2315,6 @@ pub(crate) fn handle_callback_fetch_data(
     let request_kind = describe_fetch_data_request_kind(fetch_data.flags);
     let process_info = callback_process_log_info(callback_info_ref);
     let full_path = context.sync_root.join(relative_path.replace('/', "\\"));
-    let fetch_identity = fetch_callback_identity(
-        callback_info_ref,
-        required_range.offset,
-        required_range.length,
-    );
     let already_hydrated_once = context
         .hydrated_once_paths
         .lock()
@@ -2299,10 +2358,6 @@ pub(crate) fn handle_callback_fetch_data(
         upload_snapshot.to_log_string(),
         describe_path_state(&full_path)
     );
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    if let Ok(mut fetch_cancellations) = context.fetch_cancellations.lock() {
-        fetch_cancellations.insert(fetch_identity, cancel_flag.clone());
-    }
     let _active_hydration_guard = ActiveHydrationMarkerGuard::begin(context, &relative_path);
 
     let _fetch_execution_guard = context.fetch_execution_gate.acquire_for_file_range(
@@ -2355,10 +2410,6 @@ pub(crate) fn handle_callback_fetch_data(
             &should_cancel,
         )
     };
-
-    if let Ok(mut fetch_cancellations) = context.fetch_cancellations.lock() {
-        fetch_cancellations.remove(&fetch_identity);
-    }
 
     match result {
         Ok(result) => {
@@ -3288,6 +3339,77 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(first.request_identity, second.request_identity);
+    }
+
+    #[test]
+    fn queued_fetch_cancellation_is_registered_before_worker_execution() {
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-queued-fetch-cancellation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&sync_root).expect("sync root should be created");
+        let runtime = Arc::new(CfapiRuntime::default());
+        let context = CallbackContext {
+            sync_root: sync_root.clone(),
+            runtime: runtime.clone(),
+            hydrator: Box::new(DemoHydrator),
+            hydrated_once_paths: Mutex::new(HashSet::new()),
+            paths_by_file_id: Mutex::new(HashMap::new()),
+            fetch_cancellations: Mutex::new(HashMap::new()),
+            active_hydration_counts: Mutex::new(HashMap::new()),
+            fetch_execution_gate: Arc::new(FetchExecutionGate::default()),
+            fetch_worker_pool: Arc::new(
+                FetchWorkerPool::new(1).expect("fetch worker should start"),
+            ),
+            upload_worker: Arc::new(UploadWorkerContext {
+                sync_root: sync_root.clone(),
+                provider_instance_id: uuid::Uuid::new_v4(),
+                runtime,
+                uploader: Arc::new(DemoUploader),
+                upload_gate: Arc::new(UploadConcurrencyGate::new(1)),
+            }),
+            upload_debounce: Arc::new(UploadDebounceState::default()),
+        };
+        let callback_info = CF_CALLBACK_INFO {
+            StructSize: size_of::<CF_CALLBACK_INFO>() as u32,
+            RequestKey: 91,
+            ..Default::default()
+        };
+        let fetch_data = FetchDataCallbackParams {
+            flags: 0,
+            required_file_offset: 4_096,
+            required_length: 8_192,
+            optional_file_offset: 0,
+            optional_length: 0,
+            last_dehydration_reason: 0,
+            last_dehydration_time: 0,
+        };
+
+        let cancel_flag = context.register_fetch_cancellation(&callback_info, fetch_data);
+        handle_callback_cancel_fetch_data(
+            &callback_info,
+            &context,
+            CancelFetchDataCallbackParams {
+                file_offset: 4_096,
+                length: 8_192,
+            },
+        );
+
+        assert!(
+            cancel_flag.load(Ordering::SeqCst),
+            "a cancellation received while queued must be visible to the worker"
+        );
+        context.unregister_fetch_cancellation(&callback_info, fetch_data);
+        assert!(
+            context
+                .fetch_cancellations
+                .lock()
+                .expect("fetch cancellation lock should not be poisoned")
+                .is_empty(),
+            "completed or rejected work must release its cancellation entry"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
     }
 
     #[test]

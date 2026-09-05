@@ -17,6 +17,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
@@ -638,6 +639,7 @@ struct FetchWorkItem {
     context: Arc<CallbackContext>,
     callback_info: OwnedFetchCallbackInfo,
     fetch_data: FetchDataCallbackParams,
+    cancel_flag: Arc<AtomicBool>,
 }
 
 struct FetchWorkCompletion {
@@ -725,10 +727,16 @@ fn dispatch_fetch_work(
             if active_file_ids.contains(&file_id) {
                 continue;
             }
-            let Some(work) = pending_by_file_id
+            let work = pending_by_file_id
                 .get_mut(&file_id)
-                .and_then(VecDeque::pop_front)
-            else {
+                .and_then(VecDeque::pop_front);
+            if pending_by_file_id
+                .get(&file_id)
+                .is_some_and(VecDeque::is_empty)
+            {
+                pending_by_file_id.remove(&file_id);
+            }
+            let Some(work) = work else {
                 continue;
             };
 
@@ -898,7 +906,12 @@ fn fetch_failure_info(fetch_data: FetchDataCallbackParams) -> ExecuteTransferDat
 fn execute_fetch_work(mut work: FetchWorkItem) {
     let (callback_info, _process_info) = work.callback_info.as_callback_info();
     let failure_response = match catch_unwind(AssertUnwindSafe(|| {
-        handle_callback_fetch_data(&callback_info, work.context.as_ref(), work.fetch_data)
+        handle_callback_fetch_data(
+            &callback_info,
+            work.context.as_ref(),
+            work.fetch_data,
+            work.cancel_flag.clone(),
+        )
     })) {
         Ok(failure_response) => failure_response,
         Err(_) => {
@@ -917,6 +930,8 @@ fn execute_fetch_work(mut work: FetchWorkItem) {
 
 fn fail_fetch_work(mut work: FetchWorkItem) {
     let (callback_info, _process_info) = work.callback_info.as_callback_info();
+    work.context
+        .unregister_fetch_cancellation(&callback_info, work.fetch_data);
     if let Err(err) =
         execute_transfer_data_failure(&callback_info, fetch_failure_info(work.fetch_data))
     {
@@ -1004,16 +1019,22 @@ unsafe extern "system" fn callback_fetch_data(
     };
 
     let fetch_worker_pool = context.fetch_worker_pool.clone();
+    let cancel_flag = context.register_fetch_cancellation(callback_info_ref, fetch_data);
     let work = FetchWorkItem {
-        context,
+        context: context.clone(),
         callback_info: OwnedFetchCallbackInfo::capture(callback_info_ref),
         fetch_data,
+        cancel_flag,
     };
-    if !fetch_worker_pool.submit(work)
-        && let Err(err) =
+    if !fetch_worker_pool.submit(work) {
+        context.unregister_fetch_cancellation(callback_info_ref, fetch_data);
+        if let Err(err) =
             execute_transfer_data_failure(callback_info_ref, fetch_failure_info(fetch_data))
-    {
-        tracing::info!("cfapi fetch-data: failed to report unavailable-dispatcher failure: {err}");
+        {
+            tracing::info!(
+                "cfapi fetch-data: failed to report unavailable-dispatcher failure: {err}"
+            );
+        }
     }
 }
 
