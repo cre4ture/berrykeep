@@ -8,7 +8,6 @@ const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
 const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
 const STORE_HISTORY_VERSION_INDEX_BATCH_SIZE: usize = 256;
-const STORE_HISTORY_RESTORE_FALLBACK_MAX_INDEX_PAGES: usize = 4;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
@@ -3284,76 +3283,21 @@ impl StoreHistoryInspector {
             .await
     }
 
-    /// Resolves a bounded restore batch without holding the main store lock.
-    /// Index pages are scanned once for all unresolved sources, keeping both
-    /// the database work and peak memory bounded on large stores.
+    /// Resolves a historical restore batch without holding the main store lock.
+    /// The history listing supplies the immutable source object id, so each
+    /// restore resolves exactly one version index instead of scanning metadata.
     pub(crate) async fn resolve_version_restore_sources(
         &self,
-        restore_requests: &[(String, String, Option<String>, String)],
+        restore_requests: &[(String, String, String, String)],
     ) -> Result<Vec<Option<SnapshotRestoreSource>>> {
-        let mut unresolved = BTreeSet::new();
         let mut sources = HashMap::<(String, String), SnapshotRestoreSource>::new();
         for (source_path, version_id, source_object_id, _) in restore_requests {
-            let source = match source_object_id.as_deref() {
-                Some(source_object_id) => {
-                    self.version_restore_source_from_object_id(
-                        source_object_id,
-                        source_path,
-                        version_id,
-                    )
-                    .await?
-                }
-                None => match self.metadata_store.get_current_object(source_path).await? {
-                    Some(current) => {
-                        self.version_restore_source_from_object_id(
-                            &current.object_id,
-                            source_path,
-                            version_id,
-                        )
-                        .await?
-                    }
-                    None => None,
-                },
-            };
+            let source = self
+                .version_restore_source_from_object_id(source_object_id, source_path, version_id)
+                .await?;
             if let Some(source) = source {
                 sources.insert((source_path.clone(), version_id.clone()), source);
-            } else if source_object_id.is_none() {
-                unresolved.insert((source_path.clone(), version_id.clone()));
             }
-        }
-
-        let mut after_object_id = None;
-        for _ in 0..STORE_HISTORY_RESTORE_FALLBACK_MAX_INDEX_PAGES {
-            if unresolved.is_empty() {
-                break;
-            }
-            let indexes = self
-                .metadata_store
-                .load_version_indexes_after(
-                    after_object_id.as_deref(),
-                    STORE_HISTORY_VERSION_INDEX_BATCH_SIZE,
-                )
-                .await?;
-            let Some(last_object_id) = indexes
-                .last()
-                .map(|index| index.persisted_object_id.clone())
-            else {
-                break;
-            };
-
-            let candidates = unresolved.iter().cloned().collect::<Vec<_>>();
-            for (source_path, version_id) in candidates {
-                let Some(source) = self
-                    .version_restore_source_from_indexes(&indexes, &source_path, &version_id)
-                    .await?
-                else {
-                    continue;
-                };
-                unresolved.remove(&(source_path.clone(), version_id.clone()));
-                sources.insert((source_path, version_id), source);
-            }
-
-            after_object_id = Some(last_object_id);
         }
 
         Ok(restore_requests
@@ -10229,7 +10173,7 @@ impl PersistentStore {
     /// is deliberately checked here, immediately before each mutation.
     pub(crate) async fn restore_resolved_version_paths_batch(
         &mut self,
-        restore_requests: &[(String, String, Option<String>, String)],
+        restore_requests: &[(String, String, String, String)],
         sources: &[Option<SnapshotRestoreSource>],
     ) -> Result<Vec<Result<PathMutationResult>>> {
         if restore_requests.len() != sources.len() {

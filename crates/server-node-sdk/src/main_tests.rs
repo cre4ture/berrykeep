@@ -16492,8 +16492,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
             .lock()
             .unwrap()
             .get("")
-            .is_some(),
-        "ordinary namespace changes retain the short-lived recoverable-history cache"
+            .is_none(),
+        "ordinary namespace changes invalidate the recoverable-history cache"
     );
     assert!(
         super::cached_store_index_page_response(
@@ -19057,6 +19057,7 @@ async fn build_test_state(
             store_history_refresh_permits: Arc::new(tokio::sync::Semaphore::new(
                 super::STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
             )),
+            store_history_last_refresh: Arc::new(std::sync::Mutex::new(None)),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<

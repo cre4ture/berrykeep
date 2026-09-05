@@ -125,6 +125,7 @@ const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
+const STORE_HISTORY_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(15);
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -350,6 +351,7 @@ struct ServerStorageRuntime {
     store_history_cache_generation: Arc<AtomicU64>,
     store_history_refresh_locks: Arc<StdMutex<StoreHistoryRefreshLocks>>,
     store_history_refresh_permits: Arc<Semaphore>,
+    store_history_last_refresh: Arc<StdMutex<Option<Instant>>>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
@@ -904,6 +906,17 @@ struct InternalTlsRuntime {
 }
 
 pub(crate) fn publish_namespace_change(state: &ServerState) {
+    // Recoverable history is a derived namespace view. Any namespace mutation
+    // can add, remove, or move a recoverable path, so retaining a TTL entry
+    // here would make the Explorer stale immediately after a delete or rename.
+    state
+        .storage
+        .store_history_cache_generation
+        .fetch_add(1, Ordering::SeqCst);
+    match state.storage.store_history_cache.lock() {
+        Ok(mut cache) => cache.clear(),
+        Err(poisoned) => poisoned.into_inner().clear(),
+    }
     let sequence = state
         .storage
         .namespace_change_sequence
@@ -7410,6 +7423,7 @@ async fn run_inner(
             store_history_refresh_permits: Arc::new(Semaphore::new(
                 STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
             )),
+            store_history_last_refresh: Arc::new(StdMutex::new(None)),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
@@ -13958,6 +13972,10 @@ impl StoreHistoryRefreshLocks {
 }
 
 impl StoreHistoryCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     fn get(&self, prefix: &str) -> Option<Arc<StoreHistoryCacheValue>> {
         self.entries
             .iter()
@@ -16449,6 +16467,31 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                 Ok(permit) => permit,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
+            let refresh_started = Instant::now();
+            let refresh_allowed = match state.storage.store_history_last_refresh.lock() {
+                Ok(mut last_refresh) => {
+                    let allowed = last_refresh.is_none_or(|last| {
+                        refresh_started.duration_since(last) >= STORE_HISTORY_REFRESH_MIN_INTERVAL
+                    });
+                    if allowed {
+                        *last_refresh = Some(refresh_started);
+                    }
+                    allowed
+                }
+                Err(poisoned) => {
+                    let mut last_refresh = poisoned.into_inner();
+                    let allowed = last_refresh.is_none_or(|last| {
+                        refresh_started.duration_since(last) >= STORE_HISTORY_REFRESH_MIN_INTERVAL
+                    });
+                    if allowed {
+                        *last_refresh = Some(refresh_started);
+                    }
+                    allowed
+                }
+            };
+            if !refresh_allowed {
+                return StatusCode::TOO_MANY_REQUESTS.into_response();
+            }
             let refresh_lock = match state.storage.store_history_refresh_locks.lock() {
                 Ok(mut locks) => locks.lock_for_prefix(&prefix),
                 Err(poisoned) => poisoned.into_inner().lock_for_prefix(&prefix),
@@ -16717,7 +16760,7 @@ async fn restore_history_entries_response(
             (
                 entry.restore_source_path.clone(),
                 entry.restore_version_id.clone(),
-                Some(entry.restore_source_object_id.clone()),
+                entry.restore_source_object_id.clone(),
                 entry.path.clone(),
             )
         })

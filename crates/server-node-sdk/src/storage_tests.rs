@@ -6754,6 +6754,11 @@ async fn restore_history_batch_preserves_recreated_target_impl(backend: StorageT
         )
         .await
         .unwrap();
+    let deleted_object_id = store
+        .object_id_for_key("docs/readme.txt")
+        .await
+        .unwrap()
+        .unwrap();
     store
         .tombstone_object("docs/readme.txt", PutOptions::default())
         .await
@@ -6770,7 +6775,7 @@ async fn restore_history_batch_preserves_recreated_target_impl(backend: StorageT
     let restore_requests = [(
         "docs/readme.txt".to_string(),
         deleted.version_id,
-        None,
+        deleted_object_id,
         "docs/readme.txt".to_string(),
     )];
     let sources = store
@@ -6817,6 +6822,11 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
         )
         .await
         .unwrap();
+    let restored_object_id = store
+        .object_id_for_key("docs/restored.txt")
+        .await
+        .unwrap()
+        .unwrap();
     store
         .tombstone_object("docs/restored.txt", PutOptions::default())
         .await
@@ -6828,6 +6838,11 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
             PutOptions::default(),
         )
         .await
+        .unwrap();
+    let also_restored_object_id = store
+        .object_id_for_key("docs/also-restored.txt")
+        .await
+        .unwrap()
         .unwrap();
     store
         .tombstone_object("docs/also-restored.txt", PutOptions::default())
@@ -6841,6 +6856,11 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
         )
         .await
         .unwrap();
+    let broken_object_id = store
+        .object_id_for_key("docs/broken.txt")
+        .await
+        .unwrap()
+        .unwrap();
     store
         .tombstone_object("docs/broken.txt", PutOptions::default())
         .await
@@ -6853,19 +6873,19 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
         (
             "docs/restored.txt".to_string(),
             restored.version_id,
-            None,
+            restored_object_id,
             "docs/restored.txt".to_string(),
         ),
         (
             "docs/also-restored.txt".to_string(),
             also_restored.version_id,
-            None,
+            also_restored_object_id,
             "docs/also-restored.txt".to_string(),
         ),
         (
             "docs/broken.txt".to_string(),
             broken.version_id,
-            None,
+            broken_object_id,
             "docs/broken.txt".to_string(),
         ),
     ];

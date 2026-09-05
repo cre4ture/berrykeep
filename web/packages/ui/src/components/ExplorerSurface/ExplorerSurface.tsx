@@ -316,15 +316,21 @@ export function ExplorerSurface({
       (options?.includeHistorical ?? showHistoricalEntries) &&
       targetSnapshotId == null &&
       loadHistoricalEntries != null;
-    const historyMatchesTarget =
-      historyEntriesPayload?.prefix === targetHistoryPrefix &&
-      historyEntriesPayload.depth === targetHistoryDepth;
     const includeHistorical =
-      historicalEntriesEnabled && (options?.includeHistorical ?? !historyMatchesTarget);
+      historicalEntriesEnabled && options?.includeHistorical === true;
     if (includeHistorical) {
       setHistoryLoadState("loading");
       setHistoryLoadError(null);
     } else if (!historicalEntriesEnabled) {
+      setHistoryLoadState("idle");
+      setHistoryLoadError(null);
+    } else if (
+      historyEntriesPayload?.prefix !== targetHistoryPrefix ||
+      historyEntriesPayload.depth !== targetHistoryDepth
+    ) {
+      // History refreshes are explicit because they can require an expensive
+      // server-side index scan. Do not display a previous prefix's results.
+      setHistoryEntriesPayload(null);
       setHistoryLoadState("idle");
       setHistoryLoadError(null);
     }
