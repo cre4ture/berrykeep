@@ -648,8 +648,8 @@ export function GallerySurface({
     sortOrder,
     requestedServerMediaFilter,
     showSensitiveContent,
-    capturedFromUnix: captureDateBounds.capturedFromUnix,
-    capturedUntilUnix: captureDateBounds.capturedUntilUnix
+    capturedFromUnix: captureDateReloadBounds.capturedFromUnix,
+    capturedUntilUnix: captureDateReloadBounds.capturedUntilUnix
   };
   const availableBasemaps = basemaps ?? [];
   const basemapIdSignature = availableBasemaps.map((candidate) => candidate.id).join("\u0000");
@@ -1167,7 +1167,7 @@ export function GallerySurface({
         resolutionViewport,
         zoom,
         clusterCellSizePx,
-        ...captureDateBounds,
+        ...captureDateReloadBounds,
         excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS]
       });
       if (requestVersion !== mapClusterRequestVersionRef.current) {
@@ -1221,8 +1221,8 @@ export function GallerySurface({
       sortOrder,
       requestedServerMediaFilter,
       showSensitiveContent,
-      captureDateBounds.capturedFromUnix,
-      captureDateBounds.capturedUntilUnix,
+      captureDateReloadBounds.capturedFromUnix,
+      captureDateReloadBounds.capturedUntilUnix,
       targetViewMode === "grid" ? galleryVirtualPageSize : null
     );
     const mapViewportRequest = lastMapViewportRequestRef.current;
@@ -1268,7 +1268,7 @@ export function GallerySurface({
             resolutionViewport: mapViewportRequest.resolutionViewport,
             zoom: mapViewportRequest.zoom,
             clusterCellSizePx: mapViewportRequest.clusterCellSizePx,
-            ...captureDateBounds,
+            ...captureDateReloadBounds,
             excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS]
           })
         ]);
@@ -1294,7 +1294,7 @@ export function GallerySurface({
           view: "tree",
           sort: sortOrder,
           mediaFilter: requestedServerMediaFilter,
-          ...captureDateBounds,
+          ...captureDateReloadBounds,
           excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS],
           offset: 0,
           limit: galleryVirtualPageSize
@@ -1378,7 +1378,7 @@ export function GallerySurface({
         view: "tree",
         sort: sortOrder,
         mediaFilter: requestedServerMediaFilter,
-        ...captureDateBounds,
+        ...captureDateReloadBounds,
         excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS],
         offset: pageIndex * collection.pageSize,
         limit: collection.pageSize

@@ -753,7 +753,13 @@ impl TursoMetadataStore {
             return Ok((cached.total_entry_count, cached.media_summary, status));
         }
 
-        let connection = self.gallery_read_connection().await?;
+        let _capture_summary_permit = self
+            .gallery_map_summary_cache
+            .try_capture_miss_permit(&scope)?;
+        let connection = self
+            .gallery_summary_read_connection_factory()
+            .open()
+            .await?;
         let value = query_gallery_map_summary(&connection, &scope, None, None).await?;
         drop(connection);
         self.gallery_map_summary_cache.store(scope, value.clone());

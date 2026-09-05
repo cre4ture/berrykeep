@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::{GalleryIndexMediaFilter, GalleryIndexMediaSummary, GalleryLabelFilter};
 
@@ -18,6 +19,23 @@ pub(crate) struct GallerySummaryScope {
     /// unfiltered summary must never be reused for a restricted map view.
     pub(crate) label_filter: GalleryLabelFilter,
 }
+
+impl GallerySummaryScope {
+    fn is_capture_filtered(&self) -> bool {
+        self.captured_from_unix.is_some() || self.captured_until_unix.is_some()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct GalleryCaptureSummaryBusyError;
+
+impl std::fmt::Display for GalleryCaptureSummaryBusyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("too many capture-filtered gallery summaries are being computed")
+    }
+}
+
+impl std::error::Error for GalleryCaptureSummaryBusyError {}
 
 /// Client-visible status of a scope's background summary refresh, so a caller can show that the
 /// numbers it just received may be a little behind and an update is on its way.
@@ -56,16 +74,26 @@ impl GallerySummaryRefreshTracker {
 }
 
 /// Lets a background refresh report coarse progress without holding any cache lock.
-#[derive(Debug, Clone)]
-pub(crate) struct GallerySummaryProgress(Arc<GallerySummaryRefreshTracker>);
+#[derive(Debug)]
+pub(crate) struct GallerySummaryProgress {
+    tracker: Arc<GallerySummaryRefreshTracker>,
+    _capture_computation_permit: Option<OwnedSemaphorePermit>,
+}
 
 impl GallerySummaryProgress {
     /// `percent` is clamped below 100 because the refresh is only actually "done" once the
     /// cache is updated and the tracker is retired; a stray 100 would read as "refreshing but
     /// finished", which is not a state callers should see.
     pub(crate) fn report(&self, percent: u8) {
-        self.0.percent.store(percent.min(99), Ordering::Relaxed);
+        self.tracker
+            .percent
+            .store(percent.min(99), Ordering::Relaxed);
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct GallerySummaryComputationPermit {
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Caches the whole-scope gallery map summary (total entry count + media breakdown) that the
@@ -77,6 +105,7 @@ impl GallerySummaryProgress {
 pub(crate) struct GallerySummaryCache {
     values: Mutex<GallerySummaryCacheValues>,
     trackers: Mutex<HashMap<GallerySummaryScope, Arc<GallerySummaryRefreshTracker>>>,
+    capture_computation_permits: Arc<Semaphore>,
 }
 
 /// The gallery controls expose one scope at a time. Media and privacy-label filters have a fixed
@@ -84,6 +113,7 @@ pub(crate) struct GallerySummaryCache {
 /// partitions so walking many arbitrary date ranges cannot evict hot unfiltered scopes.
 const GALLERY_SUMMARY_CACHE_MAX_FIXED_SCOPES: usize = 64;
 const GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES: usize = 64;
+const GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS: usize = 2;
 
 #[derive(Default)]
 struct GallerySummaryCacheValues {
@@ -132,6 +162,9 @@ impl GallerySummaryCache {
         Self {
             values: Mutex::new(GallerySummaryCacheValues::default()),
             trackers: Mutex::new(HashMap::new()),
+            capture_computation_permits: Arc::new(Semaphore::new(
+                GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS,
+            )),
         }
     }
 
@@ -160,9 +193,26 @@ impl GallerySummaryCache {
             .unwrap_or_default()
     }
 
+    /// Admits a synchronous cache-miss computation. Capture bounds are arbitrary client input,
+    /// so reject excess novel scopes instead of allowing requests to queue an unbounded number of
+    /// whole-scope aggregate scans. Fixed scopes retain their existing behavior.
+    pub(crate) fn try_capture_miss_permit(
+        &self,
+        scope: &GallerySummaryScope,
+    ) -> Result<Option<GallerySummaryComputationPermit>, GalleryCaptureSummaryBusyError> {
+        if !scope.is_capture_filtered() {
+            return Ok(None);
+        }
+        self.capture_computation_permits
+            .clone()
+            .try_acquire_owned()
+            .map(|permit| Some(GallerySummaryComputationPermit { _permit: permit }))
+            .map_err(|_| GalleryCaptureSummaryBusyError)
+    }
+
     /// Claims the right to refresh `scope` in the background. Returns `None` if another task is
-    /// already refreshing this scope, so callers never run two refreshes for the same scope
-    /// concurrently.
+    /// already refreshing this scope or the capture-filtered computation limit is occupied, so
+    /// callers never run duplicate or unbounded refreshes.
     pub(crate) fn try_start_refresh(
         &self,
         scope: &GallerySummaryScope,
@@ -173,10 +223,23 @@ impl GallerySummaryCache {
         {
             return None;
         }
+        let capture_computation_permit = if scope.is_capture_filtered() {
+            Some(
+                self.capture_computation_permits
+                    .clone()
+                    .try_acquire_owned()
+                    .ok()?,
+            )
+        } else {
+            None
+        };
         let tracker = Arc::new(GallerySummaryRefreshTracker::default());
         tracker.running.store(true, Ordering::Release);
         trackers.insert(scope.clone(), tracker.clone());
-        Some(GallerySummaryProgress(tracker))
+        Some(GallerySummaryProgress {
+            tracker,
+            _capture_computation_permit: capture_computation_permit,
+        })
     }
 
     /// Marks a claimed refresh as finished, regardless of whether it succeeded. Must be called
@@ -251,6 +314,43 @@ mod tests {
                 .cached(&capture_scope(GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn bounds_capture_summary_computations_without_blocking_fixed_scopes() {
+        let cache = GallerySummaryCache::new();
+        let mut permits = (0..GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS)
+            .map(|index| {
+                cache
+                    .try_capture_miss_permit(&capture_scope(index))
+                    .expect("capture summary should be admitted below the limit")
+                    .expect("capture summary should own a permit")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            cache
+                .try_capture_miss_permit(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS))
+                .is_err()
+        );
+        assert!(
+            cache
+                .try_start_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS))
+                .is_none()
+        );
+        assert!(cache.try_capture_miss_permit(&scope(99)).unwrap().is_none());
+        let fixed_refresh = cache
+            .try_start_refresh(&scope(99))
+            .expect("fixed-scope refreshes should not use capture permits");
+        cache.finish_refresh(&scope(99));
+        drop(fixed_refresh);
+
+        permits.pop();
+        let capture_refresh = cache
+            .try_start_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS))
+            .expect("released capture permit should admit the next refresh");
+        cache.finish_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_COMPUTATIONS));
+        drop(capture_refresh);
     }
 
     #[test]

@@ -160,10 +160,23 @@ impl SqliteMetadataStore {
             return Ok((cached.total_entry_count, cached.media_summary, status));
         }
 
+        let _capture_summary_permit = self
+            .gallery_map_summary_cache
+            .try_capture_miss_permit(&scope)?;
         let compute_scope = scope.clone();
         let value = self
-            .read(move |db| query_gallery_map_summary_from_db(db, &compute_scope, None, None))
-            .await?;
+            .gallery_summary_reader
+            .call(move |db| {
+                Ok(query_gallery_map_summary_from_db(
+                    db,
+                    &compute_scope,
+                    None,
+                    None,
+                ))
+            })
+            .await
+            .map_err(map_tokio_rusqlite_error)
+            .and_then(|value| value)?;
         self.gallery_map_summary_cache.store(scope, value.clone());
         Ok((
             value.total_entry_count,

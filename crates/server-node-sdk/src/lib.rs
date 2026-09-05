@@ -16396,6 +16396,23 @@ async fn gallery_map_clusters_response(
             )
                 .into_response();
         }
+        Err(error)
+            if error
+                .downcast_ref::<storage::GalleryCaptureSummaryBusyError>()
+                .is_some() =>
+        {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "too many capture-filtered gallery summaries are being computed; retry shortly"
+                })),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
         Err(error) => {
             tracing::error!(error = %error, "failed to query gallery map clusters");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
