@@ -15,61 +15,48 @@ https://creax.de/apt/ironmesh
 The Server Node is built once per CPU ABI as a fully static musl executable.
 The current package jobs reuse `x86_64-generic` for `amd64` and
 `aarch64-generic` for `arm64`, so the Server Node itself is no longer rebuilt
-against each Ubuntu release's libc. The client and rendezvous binaries remain
-distribution-specific and still determine which native package builders are
-needed during this transition.
+against each distribution's libc. The client and rendezvous binaries remain
+distribution-specific and continue to use their normal native package path.
 
-The existing AMD64 package bundle is built on Ubuntu 24.04 (`noble`). The
-ARM64 bundle for Ubuntu 20.04 (`focal`) builds the static Server Node natively
-on the ARM64 runner, then builds only the remaining binaries in the Focal
-container. See [Portable Static Server-Node Package Strategy](portable-server-node-package-strategy.md)
-for the artifact contract and repository migration plan.
+For headless non-PC targets, use the `server-node-only` build profile. It
+creates only `ironmesh-server-node`, excluding the desktop client, rendezvous
+service, and optional map-tools package. The profile requires a verified static
+Server Node artifact and performs neither Rust compilation nor target-binary
+execution; an x86 builder can therefore create an ARM64 `.deb` wrapper inside
+the target suite's container.
 
-On the matching native builder, create the static Server Node first and pass it
-to the package helper. This AMD64 example keeps the artifact below the checkout
-even when the developer's normal Cargo configuration uses another target
-directory:
+Build the static AArch64 artifact on x86 (or download the matching artifact
+from the same CI workflow run):
 
 ```bash
-server_target=x86_64-unknown-linux-musl
-CARGO_TARGET_DIR="$PWD/target" ./scripts/build-static-server-node.sh \
-  --target "$server_target" \
-  --variant-id x86_64-generic \
-  --run-smoke always
-./scripts/build-local-debs.sh \
-  --prebuilt-server-node "$PWD/target/$server_target/release/ironmesh-server-node" \
-  -- -jauto
-```
-
-The four packages are written to the parent directory of the checkout. The
-core `ironmesh-server-node` package does not depend on GDAL or unzip; install
-`ironmesh-server-node-map-tools` only when the Natural Earth conversion
-workflows are needed.
-
-Ubuntu 20.04 does not provide the package-build Rust versions in its standard
-apt repositories. If the Focal ARM64 builder has the required Rust toolchain
-on `PATH` (for example through `rustup`), install the remaining native build
-tools and use the explicit opt-out below. `-d` is passed only for this local
-binary build; it does not change the binary package dependencies.
-
-```bash
-sudo apt update
-sudo apt install build-essential pkg-config libfuse3-dev dh-sysuser clang \
-  binutils file xz-utils
-sudo apt install -t focal-backports debhelper
 server_target=aarch64-unknown-linux-musl
 CARGO_TARGET_DIR="$PWD/target" ./scripts/build-static-server-node.sh \
   --target "$server_target" \
   --variant-id aarch64-generic \
-  --run-smoke always
-./scripts/build-local-debs.sh \
-  --prebuilt-server-node "$PWD/target/$server_target/release/ironmesh-server-node" \
-  --no-check-build-deps -- -j1
+  --run-smoke never
 ```
 
-Calling `build-local-debs.sh` without either prebuilt option remains supported
-for Launchpad-compatible source builds, but it compiles a distribution-native
-Server Node and does not reproduce the portable package path.
+The static builder writes a `.tar.gz`, its `.sha256` checksum, and commit
+metadata below `target/static-server-node/`. Pass the tarball, not an extracted
+binary, to the package helper. This verifies the archive checksum, binary
+checksum, clean source revision, package version, Rust target, ELF machine,
+and static-link contract before package assembly.
+
+```bash
+# Run in a Focal or Trixie container whose suite matches --suite.
+./scripts/build-local-debs.sh \
+  --suite trixie \
+  --arch arm64 \
+  --server-node-only \
+  --static-server-node-artifact target/static-server-node/ironmesh-server-node-*-aarch64-generic.tar.gz \
+  -- -j1
+```
+
+The package is written to the checkout's parent directory. It is safe to pass
+the CI artifact into a different suite's package container only when that
+container checks out the exact Git revision named by the artifact metadata.
+See [Portable Static Server-Node Package Strategy](portable-server-node-package-strategy.md)
+for the full artifact contract.
 
 ## Build repository metadata
 
@@ -104,35 +91,96 @@ creature@creax.de:/home/creature/html/apt/ironmesh
 ```
 
 The deploy script replaces metadata only for the suite being published and
-adds package files to the shared pool. It deliberately preserves other suites
-and package files, so adding Focal/ARM64 cannot remove the existing
-Noble/AMD64 publication.
+adds package files to a suite-specific pool. It deliberately preserves other
+suites and package files, so adding Trixie/ARM64 cannot remove the existing
+Focal/ARM64 or Noble/AMD64 publication. Legacy packages remain in the former
+shared pool until every published suite has been refreshed; this prevents a
+migration from breaking an existing suite's package index.
+When the repository builder prunes a superseded package, deployment mirrors
+that deletion only in the selected suite-specific pool; other suites and the
+legacy shared pool remain untouched. It publishes the signed metadata before
+applying those scoped deletions, so a failed metadata upload leaves extra files
+rather than an index that references a missing package.
 
-## Add the Focal ARM64 target
+## Sign and deploy a Server Node matrix
 
-Build the packages on the Ubuntu 20.04 ARM64 builder, then copy the four
-`.deb` files to the machine that holds the signing key. Import the published
-repository and add the Focal ARM64 index in one command:
+After building one server-only package per suite and architecture, create a
+matrix file. Paths may be relative to the matrix file and must not contain
+spaces:
+
+```text
+# suite  architecture  package path
+focal  arm64  packages/focal/ironmesh-server-node_1.1.0-1~repo2~focal.1_arm64.deb
+trixie arm64  packages/trixie/ironmesh-server-node_1.1.0-1~repo2~trixie.1_arm64.deb
+```
+
+The same matrix drives signing and deployment. The repository builder imports
+the remote repository once, adds each suite-specific package pool and index,
+and signs every `Release`/`InRelease` pair. Deployment uploads the package pool
+first, then every suite's signed metadata, and verifies the uploaded and public
+`InRelease` byte-for-byte against the local copy.
+
+`build-local-debs.sh --suite` gives each suite a distinct Debian revision
+suffix (for example `~repo2~focal.1` and `~repo2~trixie.1`) and writes that
+suite into the package changelog distribution. The first suite-specific
+package increments the legacy repository revision, so it supersedes an
+otherwise identical `~repo1~ubuntu…` package in APT's version comparison.
+
+When a server-only matrix refreshes an already-published suite, its existing
+client, rendezvous, and map-tools `.deb` files are retained from the legacy
+shared pool and copied into that suite's pool before the index is regenerated.
+The script migrates only files explicitly listed in that suite's existing
+`Packages` index. If it finds a legacy Map Tools package with an exact Server
+Node dependency, it publishes a higher-versioned compatibility rebuild with
+the same payload and an upstream-version minimum dependency. That lets APT
+upgrade the existing Map Tools installation and the new Server Node together,
+instead of holding back the Server Node or removing Map Tools. Future full
+package builds use the same minimum dependency directly. This preserves desktop
+packages in their original suite without allowing Focal packages to appear in
+Trixie on later publishes.
 
 ```bash
 export GPG_TTY="$(tty)"
 APT_REPO_SIGN_KEY=5D7762BDB9A2A564D500DE702A2E3C589C188616 \
   ./scripts/build-apt-repository.sh \
-    --suite focal \
-    --arch arm64 \
-    --import-remote creature@creax.de:/home/creature/html/apt/ironmesh \
-    ../ironmesh-client_*_arm64.deb \
-    ../ironmesh-server-node_*_arm64.deb \
-    ../ironmesh-server-node-map-tools_*_arm64.deb \
-    ../ironmesh-rendezvous-service_*_arm64.deb
+    --server-node-matrix server-node-debian-matrix.txt \
+    --import-remote creature@creax.de:/home/creature/html/apt/ironmesh
 
-./scripts/deploy-apt-repository.sh --suite focal
+./scripts/deploy-apt-repository.sh \
+  --server-node-matrix server-node-debian-matrix.txt
 ```
 
-The build helper derives each package architecture from the `.deb` metadata and
-regenerates the `Release` architecture list from the package indexes. Repeating
-`--arch` permits a staging repository to refresh more than one architecture in
-one invocation.
+## CI build, signing, and deployment
+
+`Server Node Debian packages` runs the `focal/arm64` and `trixie/arm64` matrix
+entirely on x86 GitHub-hosted runners. It cross-builds the static AArch64
+binary once with Zig, verifies its artifact metadata in each suite container,
+and uploads the resulting server-only packages. Pull requests receive no
+deployment credentials and must opt in with the `ci:debian-packages` label.
+
+To enable the manual `publish` workflow-dispatch input, create a protected
+GitHub environment named `apt-repository` and configure its required review
+policy. In that environment, add these secrets:
+
+- `IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64`: base64-encoded exported private
+  archive signing key.
+- `IRONMESH_APT_ARCHIVE_GPG_PASSPHRASE`: passphrase for that key.
+- `IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY`: deploy key for the static web host.
+- `IRONMESH_APT_REPOSITORY_KNOWN_HOSTS`: pinned `known_hosts` entry for the
+  deploy host.
+
+Add these environment variables:
+
+- `IRONMESH_APT_ARCHIVE_GPG_FINGERPRINT`: expected full signing-key fingerprint.
+- `IRONMESH_APT_REPOSITORY_REMOTE`: SSH target, such as `creature@creax.de`.
+- `IRONMESH_APT_REPOSITORY_REMOTE_DIR`: remote repository directory.
+- `IRONMESH_APT_REPOSITORY_URL`: public HTTPS repository URL.
+
+The publish job imports the private key into a fresh temporary keyring,
+confirms its fingerprint, and runs the same matrix signing and deployment
+scripts shown above. It is restricted to a manual run from `main` and the
+protected environment; it never exposes signing or SSH secrets to a pull
+request.
 
 ## Verify the published repository
 
@@ -158,8 +206,8 @@ curl -fsSL https://creax.de/apt/ironmesh/ironmesh-archive-keyring.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/ironmesh-archive-keyring.gpg
 ```
 
-Add exactly one apt source, matching the Ubuntu release and architecture of the
-host:
+Add exactly one apt source, matching the distribution suite and architecture of
+the host:
 
 ```bash
 # Ubuntu 20.04 ARM64
@@ -173,6 +221,12 @@ echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg
   | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 
+```bash
+# Debian Trixie ARM64 / Raspberry Pi OS based on Trixie
+echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh trixie main' \
+  | sudo tee /etc/apt/sources.list.d/ironmesh.list
+```
+
 Install or update packages through apt:
 
 ```bash
@@ -180,9 +234,10 @@ sudo apt update
 sudo apt install ironmesh-client
 ```
 
-Server packages can be installed with `ironmesh-server-node` and
-`ironmesh-rendezvous-service`. Add `ironmesh-server-node-map-tools` when the
-optional Natural Earth imports should be available.
+Headless targets install only `ironmesh-server-node`. The desktop package set
+can additionally install `ironmesh-rendezvous-service`; add
+`ironmesh-server-node-map-tools` when the optional Natural Earth imports are
+needed.
 
 ## Publishing updates
 

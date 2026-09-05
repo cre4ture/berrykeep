@@ -8,6 +8,7 @@ const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
 const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
 const STORE_HISTORY_VERSION_INDEX_BATCH_SIZE: usize = 256;
+const STORE_INDEX_VERSION_LOOKUP_CONCURRENCY: usize = 32;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
@@ -78,6 +79,7 @@ use common::content_fingerprint::content_fingerprint_from_chunk_refs;
 use common::range_chunk_cache::RangeChunkCache;
 use common::xmp::{XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media};
 use fs2::FileExt;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -3615,46 +3617,88 @@ impl StoreIndexInspector {
         Ok((sizes, content_fingerprints))
     }
 
-    pub(crate) async fn object_modified_at_by_key(
+    /// Returns both the timestamp and concrete preferred revision for each
+    /// indexed path.  They are derived from the same version index so store
+    /// index listing does not load that per-object metadata twice.
+    pub(crate) async fn object_modified_at_and_revisions_by_key(
         &self,
         object_hashes: &HashMap<String, String>,
         object_ids: &HashMap<String, String>,
         max_created_at_unix: Option<u64>,
-    ) -> Result<HashMap<String, u64>> {
+    ) -> Result<(HashMap<String, u64>, HashMap<String, String>)> {
         let mut modified = HashMap::with_capacity(object_hashes.len());
-        for (key, manifest_hash) in object_hashes {
-            let Some(object_id) = object_ids.get(key) else {
-                continue;
-            };
-            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+        let mut revisions = HashMap::with_capacity(object_hashes.len());
+        let requested_indexes = object_hashes
+            .iter()
+            .filter_map(|(key, manifest_hash)| {
+                object_ids
+                    .get(key)
+                    .map(|object_id| (key.clone(), manifest_hash.clone(), object_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        let loaded_indexes = stream::iter(requested_indexes)
+            .map(|(key, manifest_hash, object_id)| async move {
+                Ok::<_, anyhow::Error>((
+                    key,
+                    manifest_hash,
+                    self.load_version_index_by_object_id(&object_id).await?,
+                ))
+            })
+            .buffer_unordered(STORE_INDEX_VERSION_LOOKUP_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for (key, manifest_hash, index) in loaded_indexes {
+            let Some(index) = index else {
                 continue;
             };
 
-            let matching_created_at = index
+            let matching_versions = index
                 .versions
                 .values()
                 .filter(|record| record.manifest_hash == *manifest_hash)
+                .collect::<Vec<_>>();
+            let snapshot_matching_versions = matching_versions
+                .iter()
+                .copied()
                 .filter(|record| {
                     max_created_at_unix
                         .map(|limit| record.created_at_unix <= limit)
                         .unwrap_or(true)
                 })
+                .collect::<Vec<_>>();
+            let versions_for_snapshot =
+                if max_created_at_unix.is_some() && !snapshot_matching_versions.is_empty() {
+                    &snapshot_matching_versions
+                } else {
+                    &matching_versions
+                };
+
+            if let Some(created_at_unix) = versions_for_snapshot
+                .iter()
                 .map(|record| record.created_at_unix)
                 .max()
-                .or_else(|| {
-                    index
-                        .versions
-                        .values()
-                        .filter(|record| record.manifest_hash == *manifest_hash)
-                        .map(|record| record.created_at_unix)
-                        .max()
-                });
-
-            if let Some(created_at_unix) = matching_created_at {
+            {
                 modified.insert(key.clone(), created_at_unix);
             }
+            let revision = if max_created_at_unix.is_none() {
+                index
+                    .preferred_head_version_id
+                    .as_deref()
+                    .and_then(|version_id| index.versions.get(version_id))
+                    .filter(|record| record.manifest_hash == *manifest_hash)
+            } else {
+                versions_for_snapshot.iter().copied().max_by(|left, right| {
+                    left.created_at_unix
+                        .cmp(&right.created_at_unix)
+                        .then_with(|| left.version_id.cmp(&right.version_id))
+                })
+            };
+            if let Some(revision) = revision {
+                revisions.insert(key.clone(), revision.version_id.clone());
+            }
         }
-        Ok(modified)
+        Ok((modified, revisions))
     }
 
     pub(crate) async fn lookup_media_cache(
