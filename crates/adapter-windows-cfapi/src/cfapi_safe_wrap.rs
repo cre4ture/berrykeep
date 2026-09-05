@@ -12,8 +12,12 @@ use core::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_CLOUD_FILE_UNSUCCESSFUL,
 };
@@ -38,6 +42,33 @@ pub(crate) struct FetchDataCallbackParams {
     pub(crate) optional_length: i64,
     pub(crate) last_dehydration_reason: i32,
     pub(crate) last_dehydration_time: i64,
+}
+
+const FETCH_WORKER_QUEUE_CAPACITY: usize = 4;
+const FETCH_WORKER_MAX_CONCURRENCY_ENV: &str = "IRONMESH_CFAPI_FETCH_MAX_CONCURRENCY";
+
+pub(crate) fn fetch_worker_max_concurrency_from_env() -> Result<usize> {
+    match std::env::var(FETCH_WORKER_MAX_CONCURRENCY_ENV) {
+        Ok(value) => {
+            let parsed = value.parse::<usize>().with_context(|| {
+                format!("failed parsing {FETCH_WORKER_MAX_CONCURRENCY_ENV}={value} as usize")
+            })?;
+            if parsed == 0 {
+                anyhow::bail!("{FETCH_WORKER_MAX_CONCURRENCY_ENV} must be greater than zero");
+            }
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default_fetch_worker_max_concurrency()),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed reading {FETCH_WORKER_MAX_CONCURRENCY_ENV}"))
+        }
+    }
+}
+
+fn default_fetch_worker_max_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().clamp(4, 8))
+        .unwrap_or(8)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +141,7 @@ pub(crate) fn create_placeholders(
 
 pub(crate) fn connect_sync_root(
     root_path: &[u16],
-    callback_context: &mut CallbackContext,
+    callback_context: &Arc<CallbackContext>,
 ) -> Result<(CF_CONNECTION_KEY, Box<[CF_CALLBACK_REGISTRATION]>)> {
     let callback_table = vec![
         CF_CALLBACK_REGISTRATION {
@@ -149,7 +180,7 @@ pub(crate) fn connect_sync_root(
         CfConnectSyncRoot(
             root_path.as_ptr(),
             callback_table.as_ptr(),
-            (callback_context as *mut CallbackContext).cast::<c_void>(),
+            Arc::as_ptr(callback_context).cast_mut().cast::<c_void>(),
             CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
             &mut connection_key,
         )
@@ -578,6 +609,209 @@ fn callback_context(callback_info: &CF_CALLBACK_INFO) -> Option<&CallbackContext
     unsafe { (callback_info.CallbackContext as *const CallbackContext).as_ref() }
 }
 
+fn clone_callback_context(callback_info: &CF_CALLBACK_INFO) -> Option<Arc<CallbackContext>> {
+    let context = callback_info.CallbackContext as *const CallbackContext;
+    if context.is_null() {
+        return None;
+    }
+    unsafe {
+        Arc::increment_strong_count(context);
+        Some(Arc::from_raw(context))
+    }
+}
+
+struct OwnedFetchCallbackInfo {
+    connection_key: CF_CONNECTION_KEY,
+    file_id: i64,
+    file_size: i64,
+    file_identity: Vec<u8>,
+    normalized_path: Vec<u16>,
+    transfer_key: i64,
+    priority_hint: u8,
+    correlation_vector: Option<windows_sys::Win32::System::CorrelationVector::CORRELATION_VECTOR>,
+    process_id: u32,
+    session_id: u32,
+    request_key: i64,
+}
+
+struct FetchWorkItem {
+    context: Arc<CallbackContext>,
+    callback_info: OwnedFetchCallbackInfo,
+    fetch_data: FetchDataCallbackParams,
+}
+
+pub(crate) struct FetchWorkerPool {
+    ingress: Sender<FetchWorkItem>,
+}
+
+impl FetchWorkerPool {
+    pub(crate) fn new(max_concurrency: usize) -> Result<Self> {
+        if max_concurrency == 0 {
+            anyhow::bail!("CFAPI fetch worker concurrency must be greater than zero");
+        }
+        let mut workers = Vec::with_capacity(max_concurrency);
+        for worker_index in 0..max_concurrency {
+            let (sender, receiver) = sync_channel(FETCH_WORKER_QUEUE_CAPACITY);
+            std::thread::Builder::new()
+                .name(format!("ironmesh-cfapi-fetch-{worker_index}"))
+                .spawn(move || {
+                    while let Ok(work) = receiver.recv() {
+                        execute_fetch_work(work);
+                    }
+                })
+                .with_context(|| format!("failed starting CFAPI fetch worker {worker_index}"))?;
+            workers.push(sender);
+        }
+        let (ingress, receiver) = channel();
+        std::thread::Builder::new()
+            .name("ironmesh-cfapi-fetch-dispatch".to_string())
+            .spawn(move || dispatch_fetch_work(receiver, workers))
+            .context("failed starting CFAPI fetch dispatcher")?;
+        Ok(Self { ingress })
+    }
+
+    /// Callback threads only enqueue work here. The dispatcher applies
+    /// backpressure to the bounded worker queues without turning a temporary
+    /// burst into a failed hydration request.
+    fn submit(&self, work: FetchWorkItem) -> bool {
+        self.ingress.send(work).is_ok()
+    }
+}
+
+fn dispatch_fetch_work(receiver: Receiver<FetchWorkItem>, workers: Vec<SyncSender<FetchWorkItem>>) {
+    let mut next_worker = 0usize;
+    while let Ok(work) = receiver.recv() {
+        let mut pending_work = Some(work);
+        'dispatch: loop {
+            let mut worker_is_available = false;
+            for offset in 0..workers.len() {
+                let worker_index = (next_worker + offset) % workers.len();
+                let work = pending_work
+                    .take()
+                    .expect("dispatcher must retain work between worker attempts");
+                match workers[worker_index].try_send(work) {
+                    Ok(()) => {
+                        next_worker = (worker_index + 1) % workers.len();
+                        break 'dispatch;
+                    }
+                    Err(TrySendError::Full(returned)) => {
+                        worker_is_available = true;
+                        pending_work = Some(returned);
+                    }
+                    Err(TrySendError::Disconnected(returned)) => pending_work = Some(returned),
+                }
+            }
+
+            if !worker_is_available {
+                tracing::warn!("cfapi fetch dispatcher stopped because all workers disconnected");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl OwnedFetchCallbackInfo {
+    fn capture(callback_info: &CF_CALLBACK_INFO) -> Self {
+        let normalized_path = string_from_pcwstr(callback_info.NormalizedPath)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let file_identity = callback_file_identity(callback_info).to_vec();
+        let correlation_vector = if callback_info.CorrelationVector.is_null() {
+            None
+        } else {
+            Some(unsafe { *callback_info.CorrelationVector })
+        };
+        let (process_id, session_id) = if callback_info.ProcessInfo.is_null() {
+            (0, 0)
+        } else {
+            let process_info = unsafe { &*callback_info.ProcessInfo };
+            (process_info.ProcessId, process_info.SessionId)
+        };
+        Self {
+            connection_key: callback_info.ConnectionKey,
+            file_id: callback_info.FileId,
+            file_size: callback_info.FileSize,
+            file_identity,
+            normalized_path,
+            transfer_key: callback_info.TransferKey,
+            priority_hint: callback_info.PriorityHint,
+            correlation_vector,
+            process_id,
+            session_id,
+            request_key: callback_info.RequestKey,
+        }
+    }
+
+    fn as_callback_info(&mut self) -> (CF_CALLBACK_INFO, Box<CF_PROCESS_INFO>) {
+        let mut process_info = Box::new(CF_PROCESS_INFO {
+            StructSize: size_of::<CF_PROCESS_INFO>() as u32,
+            ProcessId: self.process_id,
+            SessionId: self.session_id,
+            ..Default::default()
+        });
+        let callback_info = CF_CALLBACK_INFO {
+            StructSize: size_of::<CF_CALLBACK_INFO>() as u32,
+            ConnectionKey: self.connection_key,
+            FileId: self.file_id,
+            FileSize: self.file_size,
+            FileIdentity: if self.file_identity.is_empty() {
+                null()
+            } else {
+                self.file_identity.as_ptr().cast::<c_void>()
+            },
+            FileIdentityLength: self.file_identity.len() as u32,
+            NormalizedPath: if self.normalized_path.is_empty() {
+                null()
+            } else {
+                self.normalized_path.as_ptr()
+            },
+            TransferKey: self.transfer_key,
+            PriorityHint: self.priority_hint,
+            CorrelationVector: self
+                .correlation_vector
+                .as_mut()
+                .map(|value| value as *mut _)
+                .unwrap_or(null_mut()),
+            ProcessInfo: process_info.as_mut(),
+            RequestKey: self.request_key,
+            ..Default::default()
+        };
+        (callback_info, process_info)
+    }
+}
+
+fn fetch_failure_info(fetch_data: FetchDataCallbackParams) -> ExecuteTransferDataFailureInfo {
+    ExecuteTransferDataFailureInfo {
+        range: RequestedRange {
+            offset: fetch_data.required_file_offset.max(0) as u64,
+            length: fetch_data.required_length.max(0) as u64,
+        },
+        completion_status: STATUS_CLOUD_FILE_UNSUCCESSFUL,
+    }
+}
+
+fn execute_fetch_work(mut work: FetchWorkItem) {
+    let (callback_info, _process_info) = work.callback_info.as_callback_info();
+    let failure_response = match catch_unwind(AssertUnwindSafe(|| {
+        handle_callback_fetch_data(&callback_info, work.context.as_ref(), work.fetch_data)
+    })) {
+        Ok(failure_response) => failure_response,
+        Err(_) => {
+            tracing::error!("cfapi fetch-data worker panicked while processing a request");
+            Some(fetch_failure_info(work.fetch_data))
+        }
+    };
+    if let Some(failure_response) = failure_response
+        && let Err(err) = execute_transfer_data_failure(&callback_info, failure_response)
+    {
+        tracing::info!(
+            "cfapi fetch-data: failed to report transfer failure for unresolved path: {err}"
+        );
+    }
+}
+
 fn fetch_data_callback_params(
     callback_parameters: *const CF_CALLBACK_PARAMETERS,
 ) -> Option<FetchDataCallbackParams> {
@@ -648,28 +882,26 @@ unsafe extern "system" fn callback_fetch_data(
     let Some(fetch_data) = fetch_data_callback_params(callback_parameters) else {
         return;
     };
-    let Some(context) = callback_context(callback_info_ref) else {
-        let offset = fetch_data.required_file_offset.max(0) as u64;
-        let length = fetch_data.required_length.max(0) as u64;
-        if let Err(err) = execute_transfer_data_failure(
-            callback_info_ref,
-            ExecuteTransferDataFailureInfo {
-                range: RequestedRange { offset, length },
-                completion_status: STATUS_CLOUD_FILE_UNSUCCESSFUL,
-            },
-        ) {
+    let Some(context) = clone_callback_context(callback_info_ref) else {
+        if let Err(err) =
+            execute_transfer_data_failure(callback_info_ref, fetch_failure_info(fetch_data))
+        {
             tracing::info!("cfapi fetch-data: failed to send null-context failure: {err}");
         }
         return;
     };
 
-    if let Some(failure_response) =
-        handle_callback_fetch_data(callback_info_ref, context, fetch_data)
-        && let Err(err) = execute_transfer_data_failure(callback_info_ref, failure_response)
+    let fetch_worker_pool = context.fetch_worker_pool.clone();
+    let work = FetchWorkItem {
+        context,
+        callback_info: OwnedFetchCallbackInfo::capture(callback_info_ref),
+        fetch_data,
+    };
+    if !fetch_worker_pool.submit(work)
+        && let Err(err) =
+            execute_transfer_data_failure(callback_info_ref, fetch_failure_info(fetch_data))
     {
-        tracing::info!(
-            "cfapi fetch-data: failed to report transfer failure for unresolved path: {err}"
-        );
+        tracing::info!("cfapi fetch-data: failed to report unavailable-dispatcher failure: {err}");
     }
 }
 

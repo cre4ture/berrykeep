@@ -7,13 +7,14 @@ use crate::cfapi::{
 };
 use crate::cfapi_safe_wrap::{
     CancelFetchDataCallbackParams, CloseCompletionCallbackParams, ExecuteTransferDataFailureInfo,
-    FetchDataCallbackParams, NotifyDehydrateCallbackParams,
+    FetchDataCallbackParams, FetchWorkerPool, NotifyDehydrateCallbackParams,
     NotifyDehydrateCompletionCallbackParams, callback_file_identity, callback_process_log_info,
     callback_target_session_id, connect_sync_root as cf_connect_sync_root,
     create_placeholders as cf_create_placeholders, disconnect_sync_root as cf_disconnect_sync_root,
     empty_fs_metadata, execute_ack_dehydrate as cf_execute_ack_dehydrate,
     execute_transfer_data_chunk as cf_execute_transfer_data_chunk,
-    execute_transfer_data_failure as cf_execute_transfer_data_failure, string_from_pcwstr,
+    execute_transfer_data_failure as cf_execute_transfer_data_failure,
+    fetch_worker_max_concurrency_from_env, string_from_pcwstr,
     unregister_sync_root as cf_unregister_sync_root,
 };
 use crate::close_upload::{
@@ -22,15 +23,17 @@ use crate::close_upload::{
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{
-    PlaceholderFileIdentity, decode_path_from_file_identity, normalize_path, path_to_relative,
-    unix_seconds_to_windows_file_time, utf16_path, utf16_string,
+    PlaceholderFileIdentity, decode_path_from_file_identity, decode_placeholder_file_identity,
+    normalize_path, path_to_relative, unix_seconds_to_windows_file_time, utf16_path, utf16_string,
 };
 use crate::hydration_control::{
     clear_active_hydration, clear_hydration_cancel_request, has_hydration_cancel_request,
     mark_active_hydration,
 };
 use crate::placeholder_metadata::{
-    RemotePlaceholderState, refresh_remote_conflict_identity, refresh_remote_placeholder_state,
+    RemotePlaceholderState, initialize_new_remote_placeholder_state,
+    local_placeholder_paths_by_object_id, refresh_remote_conflict_identity,
+    refresh_remote_placeholder_state,
 };
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use crate::sync_root_identity::{
@@ -171,6 +174,7 @@ pub struct HydrationResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UploadReceipt {
+    pub object_id: Option<String>,
     pub remote_version: Option<String>,
     pub in_sync_content_fingerprint: Option<String>,
 }
@@ -183,13 +187,38 @@ pub trait Uploader: Send + Sync + 'static {
         length: u64,
     ) -> Result<UploadReceipt>;
 
-    fn rename_path(&self, _from_path: &str, _to_path: &str) -> Result<bool> {
+    fn upload_reader_for_object(
+        &self,
+        path: &str,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+        reader: &mut dyn std::io::Read,
+        length: u64,
+    ) -> Result<UploadReceipt> {
+        if object_id.is_some() || expected_revision.is_some() {
+            anyhow::bail!("uploader does not support object-identity guarded uploads for {path}");
+        }
+        self.upload_reader(path, reader, length)
+    }
+
+    fn rename_object(
+        &self,
+        _object_id: &str,
+        _expected_revision: &str,
+        _to_path: &str,
+    ) -> Result<bool> {
         Ok(false)
     }
 
-    fn delete_path(&self, _path: &str) -> Result<()> {
-        Ok(())
+    fn delete_object(&self, object_id: &str, _expected_revision: &str) -> Result<()> {
+        anyhow::bail!("uploader does not support object-id deletion for {object_id}")
     }
+}
+
+pub(crate) fn is_remote_mutation_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<client_sdk::ObjectMutationConflict>())
 }
 
 #[cfg(test)]
@@ -232,18 +261,26 @@ impl Uploader for DemoUploader {
 
         tracing::info!("demo upload: path={} bytes={}", path, read_bytes);
         Ok(UploadReceipt {
+            object_id: None,
             remote_version: Some("demo-upload".to_string()),
             in_sync_content_fingerprint: None,
         })
     }
 
-    fn delete_path(&self, path: &str) -> Result<()> {
-        tracing::info!("demo delete: path={path}");
+    fn delete_object(&self, object_id: &str, expected_revision: &str) -> Result<()> {
+        tracing::info!("demo delete: object_id={object_id} expected_revision={expected_revision}");
         Ok(())
     }
 
-    fn rename_path(&self, from_path: &str, to_path: &str) -> Result<bool> {
-        tracing::info!("demo rename: from_path={from_path} to_path={to_path}");
+    fn rename_object(
+        &self,
+        object_id: &str,
+        expected_revision: &str,
+        to_path: &str,
+    ) -> Result<bool> {
+        tracing::info!(
+            "demo rename: object_id={object_id} expected_revision={expected_revision} to_path={to_path}"
+        );
         Ok(true)
     }
 }
@@ -503,7 +540,7 @@ pub fn create_placeholder(
 pub struct SyncRootConnection {
     connection_key: CF_CONNECTION_KEY,
     _callback_table: Box<[CF_CALLBACK_REGISTRATION]>,
-    _callback_context: Box<CallbackContext>,
+    _callback_context: Arc<CallbackContext>,
 }
 
 impl Drop for SyncRootConnection {
@@ -525,6 +562,7 @@ pub(crate) struct CallbackContext {
     fetch_cancellations: Mutex<HashMap<FetchCallbackIdentity, Arc<AtomicBool>>>,
     active_hydration_counts: Mutex<HashMap<String, usize>>,
     fetch_execution_gate: Arc<FetchExecutionGate>,
+    pub(crate) fetch_worker_pool: Arc<FetchWorkerPool>,
     upload_worker: Arc<UploadWorkerContext>,
     upload_debounce: Arc<UploadDebounceState>,
 }
@@ -1006,32 +1044,37 @@ pub fn apply_action_plan(
     allow_empty_directories: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(root_path)?;
-
-    // Pre-compute directories that are ancestors of planned file placeholders.
-    // When allow_empty_directories is false (remote refresh), EnsureDirectory
-    // actions for directories with no planned content are skipped to avoid
-    // resurrecting locally-renamed directories when a stale snapshot still
-    // contains directory markers that haven't been removed from the remote yet.
-    let dirs_with_planned_content: BTreeSet<String> = if allow_empty_directories {
-        BTreeSet::new()
-    } else {
-        let mut set = BTreeSet::new();
-        for action in &plan.actions {
-            let file_path = match action {
-                CfapiAction::EnsurePlaceholder { path, .. }
-                | CfapiAction::HydrateOnDemand { path, .. } => path,
-                _ => continue,
-            };
-            let normalized = normalize_path(file_path);
-            let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-            for i in 1..parts.len() {
-                set.insert(parts[..i].join("/"));
+    let existing_placeholder_paths = local_placeholder_paths_by_object_id(root_path);
+    let mut planned_paths_by_object_id = BTreeMap::<String, BTreeSet<String>>::new();
+    for action in &plan.actions {
+        let (object_id, path) = match action {
+            CfapiAction::EnsurePlaceholder {
+                object_id: Some(object_id),
+                path,
+                ..
             }
+            | CfapiAction::HydrateOnDemand {
+                object_id: Some(object_id),
+                path,
+                ..
+            }
+            | CfapiAction::EnsureDirectory {
+                object_id: Some(object_id),
+                path,
+                ..
+            } => (object_id.trim(), normalize_path(path)),
+            _ => continue,
+        };
+        if !object_id.is_empty() {
+            planned_paths_by_object_id
+                .entry(object_id.to_string())
+                .or_default()
+                .insert(path);
         }
-        set
-    };
+    }
 
     struct PendingPlaceholder {
+        object_id: Option<String>,
         remote_version: String,
         remote_content_hash: String,
         remote_size: Option<u64>,
@@ -1044,14 +1087,96 @@ pub fn apply_action_plan(
     let mut created_placeholder_paths = BTreeSet::new();
     for action in &plan.actions {
         match action {
-            CfapiAction::EnsureDirectory { path } => {
-                if allow_empty_directories
-                    || dirs_with_planned_content.contains(&normalize_path(path))
+            CfapiAction::EnsureDirectory {
+                object_id,
+                path,
+                remote_version,
+            } => {
+                let normalized_path = normalize_path(path);
+                let stable_object_id = object_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let stable_revision = remote_version
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if let Some(stable_object_id) = stable_object_id
+                    && existing_placeholder_paths
+                        .get(stable_object_id)
+                        .is_some_and(|paths| !paths.contains(&normalized_path))
                 {
-                    std::fs::create_dir_all(root_path.join(path.replace('/', "\\")))?;
+                    tracing::warn!(
+                        "apply_action_plan: object_id={} already exists at {:?}; refusing a second directory placeholder at {}",
+                        stable_object_id,
+                        existing_placeholder_paths.get(stable_object_id),
+                        normalized_path
+                    );
+                    continue;
+                }
+                // On a remote refresh, a directory without object_id is only
+                // a synthesized parent inferred from another path.  It must
+                // not independently recreate an old namespace branch from a
+                // partial snapshot; planned file placeholders create their
+                // own parents as needed.  Startup still materializes those
+                // parents for the initial view.
+                if allow_empty_directories || stable_object_id.is_some() {
+                    let directory_path = root_path.join(normalized_path.replace('/', "\\"));
+                    let directory_existed = directory_path.exists();
+                    std::fs::create_dir_all(&directory_path)?;
+                    if stable_object_id.is_some() != stable_revision.is_some() {
+                        tracing::warn!(
+                            "apply_action_plan: refusing incomplete directory identity at {}",
+                            normalized_path
+                        );
+                    } else if let (Some(stable_object_id), Some(stable_revision)) =
+                        (stable_object_id, stable_revision)
+                    {
+                        // CFAPI does not create a placeholder when a directory is made with
+                        // CreateDirectory.  We may initialize one only when this remote action
+                        // created the directory itself: an already existing, non-placeholder
+                        // directory can contain unsynchronized local state and must not be
+                        // bound to a remote object merely because its path matches.
+                        if !directory_existed {
+                            let directory = open_sync_path(&directory_path, true)?;
+                            cf_ensure_placeholder_identity(&directory, &normalized_path)?;
+                        }
+                        let remote_state = RemotePlaceholderState {
+                            object_id: Some(stable_object_id),
+                            remote_version: Some(stable_revision),
+                            remote_content_hash: None,
+                            remote_size_bytes: None,
+                            remote_content_fingerprint: None,
+                            remote_modified_at_unix: None,
+                            remote_media: None,
+                        };
+                        let refresh_result = if directory_existed {
+                            refresh_remote_placeholder_state(
+                                root_path,
+                                &normalized_path,
+                                provider_instance_id,
+                                remote_state,
+                            )
+                        } else {
+                            initialize_new_remote_placeholder_state(
+                                root_path,
+                                &normalized_path,
+                                provider_instance_id,
+                                remote_state,
+                            )
+                        };
+                        if let Err(err) = refresh_result {
+                            tracing::info!(
+                                "apply_action_plan: failed to refresh directory identity for {}: {:#}",
+                                normalized_path,
+                                err
+                            );
+                        }
+                    }
                 }
             }
             CfapiAction::EnsurePlaceholder {
+                object_id,
                 path,
                 remote_version,
                 remote_content_hash,
@@ -1061,6 +1186,7 @@ pub fn apply_action_plan(
                 remote_media,
             }
             | CfapiAction::HydrateOnDemand {
+                object_id,
                 path,
                 remote_version,
                 remote_content_hash,
@@ -1070,8 +1196,38 @@ pub fn apply_action_plan(
                 remote_media,
             } => {
                 let normalized = normalize_path(path);
+                let Some(stable_object_id) = object_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    tracing::warn!(
+                        "apply_action_plan: refusing to create object without object_id at {}",
+                        normalized
+                    );
+                    continue;
+                };
                 let full_path = root_path.join(normalized.replace('/', "\\"));
                 if full_path.exists() {
+                    continue;
+                }
+                if planned_paths_by_object_id
+                    .get(stable_object_id)
+                    .is_some_and(|paths| paths.len() != 1)
+                {
+                    tracing::warn!(
+                        "apply_action_plan: object_id={} has multiple planned paths; refusing ambiguous placeholder creation",
+                        stable_object_id
+                    );
+                    continue;
+                }
+                if let Some(existing_paths) = existing_placeholder_paths.get(stable_object_id) {
+                    tracing::warn!(
+                        "apply_action_plan: object_id={} already exists at {:?}; refusing a second placeholder at {}",
+                        stable_object_id,
+                        existing_paths,
+                        normalized
+                    );
                     continue;
                 }
                 if let Some(parent) = Path::new(&normalized).parent()
@@ -1082,6 +1238,7 @@ pub fn apply_action_plan(
                 placeholders.insert(
                     normalized.clone(),
                     PendingPlaceholder {
+                        object_id: Some(stable_object_id.to_string()),
                         remote_version: remote_version.clone(),
                         remote_content_hash: remote_content_hash.clone(),
                         remote_size: *remote_size,
@@ -1108,6 +1265,7 @@ pub fn apply_action_plan(
         let mut inputs = Vec::with_capacity(placeholders.len());
         for (relative_path, placeholder) in placeholders {
             let PendingPlaceholder {
+                object_id,
                 remote_version,
                 remote_content_hash,
                 remote_size,
@@ -1143,6 +1301,7 @@ pub fn apply_action_plan(
                 FileSize: file_size,
             };
             let mut identity = PlaceholderFileIdentity::new(&relative_path);
+            identity.object_id = object_id;
             identity.provider_instance_id = Some(provider_instance_id);
             identity.remote_version = Some(remote_version.clone());
             identity.remote_content_hash = Some(remote_content_hash.clone());
@@ -1214,6 +1373,7 @@ pub fn apply_action_plan(
     for action in &plan.actions {
         match action {
             CfapiAction::EnsurePlaceholder {
+                object_id,
                 path,
                 remote_version,
                 remote_content_hash,
@@ -1223,6 +1383,7 @@ pub fn apply_action_plan(
                 remote_media,
             }
             | CfapiAction::HydrateOnDemand {
+                object_id,
                 path,
                 remote_version,
                 remote_content_hash,
@@ -1234,11 +1395,32 @@ pub fn apply_action_plan(
                 if created_placeholder_paths.contains(&normalize_path(path)) {
                     continue;
                 }
+                let Some(stable_object_id) = object_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    tracing::warn!(
+                        "apply_action_plan: refusing to refresh remote state without object_id at {}",
+                        normalize_path(path)
+                    );
+                    continue;
+                };
+                if existing_placeholder_paths
+                    .get(stable_object_id)
+                    .is_some_and(|paths| paths.len() != 1 || !paths.contains(&normalize_path(path)))
+                    || planned_paths_by_object_id
+                        .get(stable_object_id)
+                        .is_some_and(|paths| paths.len() != 1)
+                {
+                    continue;
+                }
                 if let Err(err) = refresh_remote_placeholder_state(
                     root_path,
                     path,
                     provider_instance_id,
                     RemotePlaceholderState {
+                        object_id: Some(stable_object_id),
                         remote_version: Some(remote_version),
                         remote_content_hash: Some(remote_content_hash),
                         remote_size_bytes: *remote_size,
@@ -1255,6 +1437,7 @@ pub fn apply_action_plan(
                 }
             }
             CfapiAction::MarkConflict {
+                object_id,
                 path,
                 remote_version,
                 remote_content_hash,
@@ -1278,6 +1461,7 @@ pub fn apply_action_plan(
                     path,
                     provider_instance_id,
                     RemotePlaceholderState {
+                        object_id: object_id.as_deref(),
                         remote_version: remote_version.as_deref(),
                         remote_content_hash: remote_content_hash.as_deref(),
                         remote_size_bytes: *remote_size,
@@ -1305,7 +1489,7 @@ fn collect_directory_candidates(plan: &CfapiActionPlan) -> BTreeSet<String> {
 
     for action in &plan.actions {
         match action {
-            CfapiAction::EnsureDirectory { path } => {
+            CfapiAction::EnsureDirectory { path, .. } => {
                 record_ancestor_directories(&mut directories, path, true);
             }
             CfapiAction::EnsurePlaceholder { path, .. }
@@ -1525,16 +1709,37 @@ pub(crate) fn reconcile_ancestor_directory_sync_states(root_path: &Path, relativ
 }
 
 pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncStateReconcileStats {
-    let mut desired_states = BTreeMap::<String, DesiredSyncState>::new();
+    let mut desired_states =
+        BTreeMap::<String, (DesiredSyncState, Option<String>, Option<String>)>::new();
     for action in &plan.actions {
         match action {
-            CfapiAction::EnsurePlaceholder { path, .. }
-            | CfapiAction::HydrateOnDemand { path, .. } => {
-                desired_states.insert(normalize_path(path), DesiredSyncState::InSync);
+            CfapiAction::EnsurePlaceholder {
+                object_id,
+                path,
+                remote_version,
+                ..
+            }
+            | CfapiAction::HydrateOnDemand {
+                object_id,
+                path,
+                remote_version,
+                ..
+            } => {
+                desired_states.insert(
+                    normalize_path(path),
+                    (
+                        DesiredSyncState::InSync,
+                        object_id.clone(),
+                        Some(remote_version.clone()),
+                    ),
+                );
             }
             CfapiAction::QueueUploadOnClose { path, .. }
             | CfapiAction::MarkConflict { path, .. } => {
-                desired_states.insert(normalize_path(path), DesiredSyncState::NotInSync);
+                desired_states.insert(
+                    normalize_path(path),
+                    (DesiredSyncState::NotInSync, None, None),
+                );
             }
             CfapiAction::EnsureDirectory { .. } => {}
         }
@@ -1548,7 +1753,7 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
         root_path.display()
     );
     let mut stats = SyncStateReconcileStats::default();
-    for (relative_path, desired_state) in desired_states {
+    for (relative_path, (desired_state, expected_object_id, expected_revision)) in desired_states {
         let full_path = root_path.join(relative_path.replace('/', "\\"));
         if !full_path.exists() {
             stats.skipped_missing += 1;
@@ -1586,6 +1791,25 @@ pub fn reconcile_sync_states(root_path: &Path, plan: &CfapiActionPlan) -> SyncSt
                 state_before
             );
             continue;
+        }
+
+        if matches!(desired_state, DesiredSyncState::InSync) {
+            let identity_matches = open_sync_path(&full_path, false)
+                .ok()
+                .and_then(|file| cf_get_placeholder_standard_info_with_identity(&file).ok())
+                .and_then(|info| decode_placeholder_file_identity(info.file_identity()))
+                .is_some_and(|identity| {
+                    identity.object_id.as_deref() == expected_object_id.as_deref()
+                        && identity.remote_version.as_deref() == expected_revision.as_deref()
+                        && expected_object_id.is_some()
+                });
+            if !identity_matches {
+                tracing::warn!(
+                    "sync-state: preserving {} because remote object identity/revision was not confirmed",
+                    relative_path
+                );
+                continue;
+            }
         }
 
         let placeholder_state =
@@ -1752,9 +1976,14 @@ pub fn connect_sync_root(
 ) -> Result<SyncRootConnection> {
     let root_path = utf16_path(&registration.root_path);
     let close_upload_max_concurrency = close_upload_max_concurrency_from_env()?;
+    let fetch_worker_max_concurrency = fetch_worker_max_concurrency_from_env()?;
     tracing::info!(
         "close-completion: max concurrent uploads set to {}",
         close_upload_max_concurrency
+    );
+    tracing::info!(
+        "fetch-data: max concurrent workers set to {}",
+        fetch_worker_max_concurrency
     );
     let upload_worker = Arc::new(UploadWorkerContext {
         sync_root: registration.root_path.clone(),
@@ -1764,7 +1993,7 @@ pub fn connect_sync_root(
         upload_gate: Arc::new(UploadConcurrencyGate::new(close_upload_max_concurrency)),
     });
     let upload_debounce = Arc::new(UploadDebounceState::default());
-    let mut callback_context = Box::new(CallbackContext {
+    let callback_context = Arc::new(CallbackContext {
         sync_root: registration.root_path.clone(),
         runtime,
         hydrator,
@@ -1773,10 +2002,11 @@ pub fn connect_sync_root(
         fetch_cancellations: Mutex::new(HashMap::new()),
         active_hydration_counts: Mutex::new(HashMap::new()),
         fetch_execution_gate: Arc::new(FetchExecutionGate::default()),
+        fetch_worker_pool: Arc::new(FetchWorkerPool::new(fetch_worker_max_concurrency)?),
         upload_worker,
         upload_debounce,
     });
-    let (connection_key, callback_table) = cf_connect_sync_root(&root_path, &mut callback_context)?;
+    let (connection_key, callback_table) = cf_connect_sync_root(&root_path, &callback_context)?;
 
     tracing::info!(
         "connected to CFAPI callbacks with connection key {}",
@@ -2563,6 +2793,7 @@ mod tests {
     fn runtime_fetches_hydration_for_known_file() {
         let plan = CfapiActionPlan {
             actions: vec![CfapiAction::HydrateOnDemand {
+                object_id: None,
                 path: "docs/readme.md".to_string(),
                 remote_version: "v7".to_string(),
                 remote_content_hash: "h7".to_string(),
@@ -2597,6 +2828,7 @@ mod tests {
     fn runtime_normalizes_backslash_paths() {
         let plan = CfapiActionPlan {
             actions: vec![CfapiAction::HydrateOnDemand {
+                object_id: None,
                 path: "docs\\notes.txt".to_string(),
                 remote_version: "v3".to_string(),
                 remote_content_hash: "h3".to_string(),
@@ -2709,9 +2941,12 @@ mod tests {
         let plan = CfapiActionPlan {
             actions: vec![
                 CfapiAction::EnsureDirectory {
+                    object_id: None,
                     path: "docs".to_string(),
+                    remote_version: None,
                 },
                 CfapiAction::EnsurePlaceholder {
+                    object_id: None,
                     path: "docs/readme.md".to_string(),
                     remote_version: "v1".to_string(),
                     remote_content_hash: "h1".to_string(),
@@ -2721,6 +2956,7 @@ mod tests {
                     remote_media: None,
                 },
                 CfapiAction::HydrateOnDemand {
+                    object_id: None,
                     path: "docs/photo.jpg".to_string(),
                     remote_version: "v2".to_string(),
                     remote_content_hash: "h2".to_string(),
@@ -2734,6 +2970,7 @@ mod tests {
                     local_version: Some("local".to_string()),
                 },
                 CfapiAction::MarkConflict {
+                    object_id: None,
                     path: "conflict.txt".to_string(),
                     local_version: Some("local".to_string()),
                     remote_version: Some("remote".to_string()),
@@ -2780,6 +3017,7 @@ mod tests {
 
         let plan = CfapiActionPlan {
             actions: vec![CfapiAction::EnsurePlaceholder {
+                object_id: Some("obj-movie".to_string()),
                 path: "videos/movie.mkv".to_string(),
                 remote_version: "v1".to_string(),
                 remote_content_hash: "h1".to_string(),
@@ -2840,6 +3078,97 @@ mod tests {
     }
 
     #[test]
+    fn apply_action_plan_refuses_ambiguous_paths_for_one_object_id() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-apply-action-plan-ambiguous-object-{unique}"
+        ));
+        let _guard = TestSyncRootGuard::new(sync_root.clone());
+        let registration = SyncRootRegistration::new(
+            format!("test-sync-root-{unique}"),
+            "Ironmesh Test",
+            &sync_root,
+            uuid::Uuid::new_v4(),
+            None,
+        );
+        let registered_identity =
+            register_sync_root(&registration).expect("sync root registration should succeed");
+        let action = |path: &str| CfapiAction::EnsurePlaceholder {
+            object_id: Some("obj-ambiguous".to_string()),
+            path: path.to_string(),
+            remote_version: "v1".to_string(),
+            remote_content_hash: "h1".to_string(),
+            remote_size: Some(1),
+            remote_content_fingerprint: None,
+            remote_modified_at_unix: None,
+            remote_media: None,
+        };
+
+        apply_action_plan(
+            &sync_root,
+            &CfapiActionPlan {
+                actions: vec![action("first.txt"), action("second.txt")],
+            },
+            registered_identity.provider_instance_id,
+            true,
+        )
+        .expect("ambiguous plan should be conservatively ignored");
+
+        assert!(!sync_root.join("first.txt").exists());
+        assert!(!sync_root.join("second.txt").exists());
+    }
+
+    #[test]
+    fn apply_action_plan_does_not_duplicate_existing_object_at_new_path() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-apply-action-plan-existing-object-{unique}"
+        ));
+        let _guard = TestSyncRootGuard::new(sync_root.clone());
+        let registration = SyncRootRegistration::new(
+            format!("test-sync-root-{unique}"),
+            "Ironmesh Test",
+            &sync_root,
+            uuid::Uuid::new_v4(),
+            None,
+        );
+        let registered_identity =
+            register_sync_root(&registration).expect("sync root registration should succeed");
+        let action = |path: &str| CfapiAction::EnsurePlaceholder {
+            object_id: Some("obj-stable".to_string()),
+            path: path.to_string(),
+            remote_version: "v1".to_string(),
+            remote_content_hash: "h1".to_string(),
+            remote_size: Some(1),
+            remote_content_fingerprint: None,
+            remote_modified_at_unix: None,
+            remote_media: None,
+        };
+
+        apply_action_plan(
+            &sync_root,
+            &CfapiActionPlan {
+                actions: vec![action("old/place.txt")],
+            },
+            registered_identity.provider_instance_id,
+            true,
+        )
+        .expect("initial placeholder should be created");
+        apply_action_plan(
+            &sync_root,
+            &CfapiActionPlan {
+                actions: vec![action("new/place.txt")],
+            },
+            registered_identity.provider_instance_id,
+            true,
+        )
+        .expect("duplicate object plan should be conservatively ignored");
+
+        assert!(sync_root.join("old/place.txt").exists());
+        assert!(!sync_root.join("new/place.txt").exists());
+    }
+
+    #[test]
     fn close_completion_ignores_provider_originated_callbacks() {
         let sync_root = std::env::temp_dir().join(format!(
             "ironmesh-close-completion-{}",
@@ -2862,6 +3191,9 @@ mod tests {
             fetch_cancellations: Mutex::new(HashMap::new()),
             active_hydration_counts: Mutex::new(HashMap::new()),
             fetch_execution_gate: Arc::new(FetchExecutionGate::default()),
+            fetch_worker_pool: Arc::new(
+                FetchWorkerPool::new(1).expect("fetch worker should start"),
+            ),
             upload_worker: Arc::new(UploadWorkerContext {
                 sync_root: sync_root.clone(),
                 provider_instance_id: uuid::Uuid::new_v4(),

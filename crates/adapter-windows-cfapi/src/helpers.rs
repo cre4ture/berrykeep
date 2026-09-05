@@ -72,6 +72,9 @@ pub fn unix_seconds_to_windows_file_time(unix_seconds: u64) -> Option<i64> {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PlaceholderFileIdentity {
+    /// Stable identity of the remote object. This must not change when content
+    /// or the namespace path changes.
+    pub object_id: Option<String>,
     pub path: String,
     pub remote_version: Option<String>,
     pub remote_content_hash: Option<String>,
@@ -89,7 +92,8 @@ pub struct PlaceholderFileIdentity {
 }
 
 impl PlaceholderFileIdentity {
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 3;
+    const LEGACY_SCHEMA_VERSION: u32 = 2;
 
     pub fn new(relative_path: &str) -> Self {
         Self {
@@ -124,6 +128,14 @@ impl PlaceholderFileIdentity {
     pub fn encoded(&self) -> Vec<u8> {
         let mut lines = Vec::with_capacity(12);
         lines.push(format!("v={}", Self::SCHEMA_VERSION));
+        if let Some(object_id) = self
+            .object_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(format!("oi={object_id}"));
+        }
         lines.push(format!("p={}", normalize_path(&self.path)));
         if let Some(remote_version) = self
             .remote_version
@@ -210,6 +222,9 @@ pub fn decode_placeholder_file_identity(file_identity: &[u8]) -> Option<Placehol
             "p" | "path" => {
                 identity.path = normalize_path(value);
             }
+            "oi" | "object_id" => {
+                identity.object_id = Some(value.to_string());
+            }
             "rv" | "version" => {
                 identity.remote_version = Some(value.to_string());
             }
@@ -242,7 +257,10 @@ pub fn decode_placeholder_file_identity(file_identity: &[u8]) -> Option<Placehol
     }
 
     let schema_version = schema_version?;
-    if schema_version != PlaceholderFileIdentity::SCHEMA_VERSION {
+    if !matches!(
+        schema_version,
+        PlaceholderFileIdentity::LEGACY_SCHEMA_VERSION | PlaceholderFileIdentity::SCHEMA_VERSION
+    ) {
         return None;
     }
     if identity.path.is_empty() {
@@ -441,6 +459,7 @@ mod tests {
     #[test]
     fn placeholder_identity_round_trips_extended_metadata() {
         let mut identity = PlaceholderFileIdentity::new("docs/readme.txt");
+        identity.object_id = Some("obj-readme".to_string());
         identity.remote_version = Some("v2".to_string());
         identity.remote_content_hash =
             Some("b47898c3f17e6f35f2f5f7e2a28c8d7fe6cb0a58b89ea4b1d172bc5342f0cb83".to_string());
@@ -474,6 +493,23 @@ mod tests {
             decode_placeholder_file_identity(&encoded).expect("extended metadata should decode");
 
         assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn placeholder_identity_keeps_object_id_stable_when_revision_changes() {
+        let mut identity = PlaceholderFileIdentity::new("docs/readme.txt");
+        identity.object_id = Some("obj-readme".to_string());
+        identity.remote_version = Some("revision-1".to_string());
+
+        let first = decode_placeholder_file_identity(&identity.encoded())
+            .expect("first identity should decode");
+        identity.remote_version = Some("revision-2".to_string());
+        let second = decode_placeholder_file_identity(&identity.encoded())
+            .expect("updated identity should decode");
+
+        assert_eq!(first.object_id, second.object_id);
+        assert_eq!(second.object_id.as_deref(), Some("obj-readme"));
+        assert_eq!(second.remote_version.as_deref(), Some("revision-2"));
     }
 
     #[test]
@@ -565,6 +601,17 @@ mod tests {
             decoded_current.in_sync_content_fingerprint.as_deref(),
             Some("cfp-current")
         );
+    }
+
+    #[test]
+    fn legacy_v2_placeholder_decodes_without_inventing_object_id() {
+        let legacy = b"v=2\np=docs/readme.txt\nrv=revision-1\nrh=hash-1\n";
+        let decoded = decode_placeholder_file_identity(legacy)
+            .expect("legacy placeholder identity should remain readable");
+
+        assert!(decoded.object_id.is_none());
+        assert_eq!(decoded.path, "docs/readme.txt");
+        assert_eq!(decoded.remote_version.as_deref(), Some("revision-1"));
     }
 
     #[test]

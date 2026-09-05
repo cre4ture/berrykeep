@@ -862,10 +862,10 @@ async fn list_objects_v2_response(
         }
     };
     let modified = match inspector
-        .object_modified_at_by_key(&selected_hashes, &selected_object_ids, None)
+        .object_modified_at_and_revisions_by_key(&selected_hashes, &selected_object_ids, None)
         .await
     {
-        Ok(values) => values,
+        Ok((modified, _)) => modified,
         Err(err) => {
             return s3_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1903,6 +1903,8 @@ async fn create_multipart_upload_response(
         state: VersionConsistencyState::Confirmed,
         parent_version_ids: Vec::new(),
         explicit_version_id: None,
+        object_id: None,
+        expected_revision: None,
         assembly_mode: UploadAssemblyMode::Multipart,
         received_chunks: Vec::new(),
         multipart_parts: BTreeMap::new(),
