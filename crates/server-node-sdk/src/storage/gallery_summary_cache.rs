@@ -83,7 +83,7 @@ pub(crate) struct GallerySummaryCache {
 /// vocabulary, while capture-date ranges are user-selected. Keep the two classes in separate LRU
 /// partitions so walking many arbitrary date ranges cannot evict hot unfiltered scopes.
 const GALLERY_SUMMARY_CACHE_MAX_FIXED_SCOPES: usize = 64;
-const GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES: usize = 16;
+const GALLERY_SUMMARY_CACHE_MAX_CAPTURE_SCOPES: usize = 64;
 
 #[derive(Default)]
 struct GallerySummaryCacheValues {

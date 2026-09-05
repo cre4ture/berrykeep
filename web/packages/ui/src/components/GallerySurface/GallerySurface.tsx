@@ -39,7 +39,10 @@ import {
   type GalleryBasemapConfig,
   type GalleryMapProjection
 } from "./GalleryBasemapMap";
-import { galleryCaptureDateBounds } from "./gallery-capture-date";
+import {
+  galleryCaptureDateBounds,
+  type GalleryCaptureDateBounds
+} from "./gallery-capture-date";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
@@ -103,6 +106,7 @@ const GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS = 1;
 const GALLERY_VIRTUAL_PAGE_KEEP_RADIUS = 2;
 const GALLERY_VIRTUAL_PAGE_ROOT_MARGIN = "900px 0px";
 const GALLERY_GRID_PAGE_CACHE_MAX_ENTRY_COUNT = 2_048;
+const GALLERY_CAPTURE_DATE_RELOAD_DEBOUNCE_MS = 300;
 const GALLERY_SENSITIVE_LABELS = ["private", "nsfw"] as const;
 
 function isInitialGalleryMapViewport(viewport: GalleryMapViewport): boolean {
@@ -475,6 +479,8 @@ export function GallerySurface({
   const [showSensitiveContent, setShowSensitiveContent] = useState(false);
   const [captureDateFrom, setCaptureDateFrom] = useState("");
   const [captureDateThrough, setCaptureDateThrough] = useState("");
+  const [captureDateReloadBounds, setCaptureDateReloadBounds] =
+    useState<GalleryCaptureDateBounds>({});
   const { ref: galleryGridRef, width: galleryGridWidth } = useElementSize();
   const [viewMode, setViewMode] = useState(() => loadInitialViewMode(initialViewMode));
   const [activeBasemapId, setActiveBasemapId] = useState(loadStoredBasemapId);
@@ -622,13 +628,19 @@ export function GallerySurface({
   const captureDateFilterActive =
     captureDateBounds.capturedFromUnix !== undefined ||
     captureDateBounds.capturedUntilUnix !== undefined;
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      setCaptureDateReloadBounds(captureDateBounds);
+    }, GALLERY_CAPTURE_DATE_RELOAD_DEBOUNCE_MS);
+    return () => window.clearTimeout(timeout);
+  }, [captureDateBounds.capturedFromUnix, captureDateBounds.capturedUntilUnix]);
   const currentGalleryReloadSignature = galleryReloadSignature(
     viewMode,
     sortOrder,
     requestedServerMediaFilter,
     showSensitiveContent,
-    captureDateBounds.capturedFromUnix,
-    captureDateBounds.capturedUntilUnix,
+    captureDateReloadBounds.capturedFromUnix,
+    captureDateReloadBounds.capturedUntilUnix,
     galleryReloadPageSize
   );
   activeGalleryRequestRef.current = {
