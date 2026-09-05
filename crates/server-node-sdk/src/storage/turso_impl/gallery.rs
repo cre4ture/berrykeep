@@ -1338,9 +1338,33 @@ const GALLERY_MAP_SCOPE_SQL: &str = "
              - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
     END <= ?3
     AND gallery_objects.inferred_media_type IS NOT NULL
-    AND (?4 IS NULL OR gallery_objects.media_type = ?4)
-    AND gallery_objects.captured_at_unix > ?5
-    AND gallery_objects.captured_at_unix <= ?6";
+    AND (?4 IS NULL OR gallery_objects.media_type = ?4)";
+
+const GALLERY_MAP_OPTIONAL_CAPTURE_SQL: &str = "
+    AND (?5 IS NULL OR gallery_objects.captured_at_unix >= ?5)
+    AND (?6 IS NULL OR gallery_objects.captured_at_unix < ?6)";
+
+const GALLERY_MAP_CAPTURE_NONE_SQL: &str = "
+    AND ?5 IS NULL
+    AND ?6 IS NULL";
+const GALLERY_MAP_CAPTURE_FROM_SQL: &str = "
+    AND gallery_objects.captured_at_unix >= ?5
+    AND ?6 IS NULL";
+const GALLERY_MAP_CAPTURE_UNTIL_SQL: &str = "
+    AND ?5 IS NULL
+    AND gallery_objects.captured_at_unix < ?6";
+const GALLERY_MAP_CAPTURE_RANGE_SQL: &str = "
+    AND gallery_objects.captured_at_unix >= ?5
+    AND gallery_objects.captured_at_unix < ?6";
+
+fn gallery_map_summary_capture_sql(has_from: bool, has_until: bool) -> &'static str {
+    match (has_from, has_until) {
+        (false, false) => GALLERY_MAP_CAPTURE_NONE_SQL,
+        (true, false) => GALLERY_MAP_CAPTURE_FROM_SQL,
+        (false, true) => GALLERY_MAP_CAPTURE_UNTIL_SQL,
+        (true, true) => GALLERY_MAP_CAPTURE_RANGE_SQL,
+    }
+}
 
 const GALLERY_MAP_VIEWPORT_SQL: &str = "
     gallery_objects.latitude BETWEEN ?7 AND ?8
@@ -1369,15 +1393,13 @@ fn turso_gallery_map_scope_values(
     let (spatial_east, spatial_north) =
         gallery_web_mercator_position(viewport.north, viewport.east)
             .context("validated gallery map northeast bound should project")?;
-    let (capture_lower_bound, capture_upper_bound) =
-        gallery_map_capture_time_bounds(captured_from_unix, captured_until_unix)?;
     Ok(vec![
         Value::from(prefix),
         Value::from(prefix_pattern),
         Value::from(i64::try_from(depth).context("gallery map depth overflow")?),
         optional_text_value(media_filter.media_type()),
-        capture_lower_bound,
-        capture_upper_bound,
+        optional_integer_value(captured_from_unix, "gallery map capture-time lower bound")?,
+        optional_integer_value(captured_until_unix, "gallery map capture-time upper bound")?,
         Value::from(viewport.south),
         Value::from(viewport.north),
         Value::from(viewport.west),
@@ -1392,6 +1414,7 @@ fn turso_gallery_map_scope_values(
 async fn gallery_map_summary_query(
     connection: &turso::Connection,
     scope_values: &[Value],
+    capture_sql: &str,
     label_filter: &super::super::GalleryLabelFilter,
 ) -> Result<(usize, GalleryIndexMediaSummary)> {
     let (label_sql, label_values) = gallery_label_predicates(label_filter, scope_values.len() + 1)?;
@@ -1405,7 +1428,7 @@ async fn gallery_map_summary_query(
              COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(geotagged), 0)
          FROM gallery_objects
-         WHERE {GALLERY_MAP_SCOPE_SQL}{label_sql}"
+         WHERE {GALLERY_MAP_SCOPE_SQL}{capture_sql}{label_sql}"
     );
     let mut values = scope_values.to_vec();
     values.extend(label_values.into_iter().map(Value::Text));
@@ -1443,6 +1466,7 @@ const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
 async fn gallery_map_summary_chunked_query(
     connection: &turso::Connection,
     scope_values: &[Value],
+    capture_sql: &str,
     label_filter: &super::super::GalleryLabelFilter,
     total_estimate: Option<usize>,
     progress: &GallerySummaryProgress,
@@ -1454,7 +1478,7 @@ async fn gallery_map_summary_chunked_query(
         "SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
                 gallery_objects.geotagged
            FROM gallery_objects
-          WHERE {GALLERY_MAP_SCOPE_SQL}{label_sql}
+          WHERE {GALLERY_MAP_SCOPE_SQL}{capture_sql}{label_sql}
             AND (?{cursor_parameter} IS NULL OR gallery_objects.key > ?{cursor_parameter})
           ORDER BY gallery_objects.key
           LIMIT ?{limit_parameter}"
@@ -1545,7 +1569,8 @@ async fn gallery_map_cluster_cells_query(
                ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
-             WHERE {GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}{label_sql}
+             WHERE {GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_OPTIONAL_CAPTURE_SQL}
+               AND {GALLERY_MAP_VIEWPORT_SQL}{label_sql}
              GROUP BY 1, 2
              ORDER BY 2 ASC, 1 ASC
              LIMIT ?{limit_parameter}"
@@ -1633,8 +1658,16 @@ async fn query_gallery_map_clusters(
         query.captured_until_unix,
         query.viewport,
     )?;
-    let (total_entry_count, media_summary) =
-        gallery_map_summary_query(connection, &base_values[..6], &query.label_filter).await?;
+    let (total_entry_count, media_summary) = gallery_map_summary_query(
+        connection,
+        &base_values[..6],
+        gallery_map_summary_capture_sql(
+            query.captured_from_unix.is_some(),
+            query.captured_until_unix.is_some(),
+        ),
+        &query.label_filter,
+    )
+    .await?;
     let (resolution, clusters) = gallery_map_cluster_cells_query(
         connection,
         &base_values,
@@ -1719,21 +1752,30 @@ pub(super) async fn query_gallery_map_summary(
             sqlite_like_prefix_pattern(&format!("{}/", scope.prefix))
         };
         let depth = i64::try_from(scope.depth).context("gallery map summary depth overflow")?;
-        let (capture_lower_bound, capture_upper_bound) =
-            gallery_map_capture_time_bounds(scope.captured_from_unix, scope.captured_until_unix)?;
+        let capture_sql = gallery_map_summary_capture_sql(
+            scope.captured_from_unix.is_some(),
+            scope.captured_until_unix.is_some(),
+        );
         let scope_values = vec![
             Value::from(scope.prefix.as_str()),
             Value::from(prefix_pattern.as_str()),
             Value::from(depth),
             optional_text_value(scope.media_filter.media_type()),
-            capture_lower_bound,
-            capture_upper_bound,
+            optional_integer_value(
+                scope.captured_from_unix,
+                "gallery map capture-time lower bound",
+            )?,
+            optional_integer_value(
+                scope.captured_until_unix,
+                "gallery map capture-time upper bound",
+            )?,
         ];
         let (total_entry_count, media_summary) = match progress {
             Some(progress) => {
                 gallery_map_summary_chunked_query(
                     &transaction,
                     &scope_values,
+                    capture_sql,
                     &scope.label_filter,
                     total_estimate,
                     progress,
@@ -1741,7 +1783,13 @@ pub(super) async fn query_gallery_map_summary(
                 .await?
             }
             None => {
-                gallery_map_summary_query(&transaction, &scope_values, &scope.label_filter).await?
+                gallery_map_summary_query(
+                    &transaction,
+                    &scope_values,
+                    capture_sql,
+                    &scope.label_filter,
+                )
+                .await?
             }
         };
         Ok(GallerySummaryCacheValue {
@@ -1788,7 +1836,8 @@ async fn query_gallery_map_cluster_entries(
     let limit_parameter = values.len() + 1;
     let offset_parameter = limit_parameter + 1;
     let cell_scope = format!(
-        "{GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
+        "{GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_OPTIONAL_CAPTURE_SQL}
+         AND {GALLERY_MAP_VIEWPORT_SQL}
          AND CAST(gallery_objects.spatial_x * ?{resolution_parameter} AS INTEGER) = ?{cell_x_parameter}
          AND CAST(gallery_objects.spatial_y * ?{resolution_parameter} AS INTEGER) = ?{cell_y_parameter}{label_sql}"
     );
@@ -2275,26 +2324,6 @@ fn optional_integer_value(value: Option<u64>, label: &str) -> Result<Value> {
         )),
         None => Ok(Value::Null),
     }
-}
-
-/// Converts the public inclusive/exclusive interval into an always-bound integer range. Gallery
-/// timestamps are non-negative, so `(from - 1, until - 1]` preserves `[from, until)` while also
-/// letting SQLite use the leading capture-time index instead of planning around nullable `OR`s.
-fn gallery_map_capture_time_bounds(
-    captured_from_unix: Option<u64>,
-    captured_until_unix: Option<u64>,
-) -> Result<(Value, Value)> {
-    let lower = captured_from_unix
-        .map(i64::try_from)
-        .transpose()
-        .context("gallery map capture-time lower bound overflow")?
-        .map_or(-1, |value| value - 1);
-    let upper = captured_until_unix
-        .map(i64::try_from)
-        .transpose()
-        .context("gallery map capture-time upper bound overflow")?
-        .map_or(i64::MAX, |value| value - 1);
-    Ok((Value::from(lower), Value::from(upper)))
 }
 
 fn row_opt_string(row: &turso::Row, idx: usize, label: &str) -> Result<Option<String>> {

@@ -573,18 +573,17 @@ fn gallery_map_filters_capture_time_in_clusters_summary_and_entries() {
 fn gallery_map_capture_summary_uses_the_capture_time_index() {
     let db = Connection::open_in_memory().expect("in-memory sqlite should open");
     init_metadata_db(&db).expect("metadata schema should initialize");
-    let (capture_lower_bound, capture_upper_bound) =
-        gallery_map_capture_time_bounds(Some(20), Some(30)).unwrap();
     let scope_values = vec![
         Value::Text(String::new()),
         Value::Text("%".to_string()),
         Value::Integer(64),
         Value::Null,
-        capture_lower_bound,
-        capture_upper_bound,
+        Value::Integer(20),
+        Value::Integer(30),
     ];
     let sql = format!(
-        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM gallery_objects WHERE {GALLERY_MAP_SCOPE_SQL}"
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM gallery_objects
+         WHERE {GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_CAPTURE_RANGE_SQL}"
     );
     let mut statement = db.prepare(&sql).expect("query plan should prepare");
     let plan = statement
@@ -599,6 +598,54 @@ fn gallery_map_capture_summary_uses_the_capture_time_index() {
         plan.iter()
             .any(|step| step.contains("idx_gallery_objects_capture_summary")),
         "capture-filtered summary should use capture index: {plan:?}"
+    );
+}
+
+#[test]
+fn unfiltered_gallery_map_viewport_does_not_use_the_capture_summary_index() {
+    let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+    init_metadata_db(&db).expect("metadata schema should initialize");
+    let viewport = GalleryViewportBounds {
+        south: 40.0,
+        west: 0.0,
+        north: 60.0,
+        east: 20.0,
+    };
+    let scope_values = sqlite_gallery_map_scope_values(
+        "",
+        "%",
+        64,
+        GalleryIndexMediaFilter::All,
+        None,
+        None,
+        viewport,
+    )
+    .expect("unfiltered gallery map values should build");
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM gallery_objects
+         WHERE {GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_OPTIONAL_CAPTURE_SQL}
+           AND {GALLERY_MAP_VIEWPORT_SQL}"
+    );
+    let mut statement = db.prepare(&sql).expect("query plan should prepare");
+    let plan = statement
+        .query_map(params_from_iter(scope_values), |row| {
+            row.get::<_, String>(3)
+        })
+        .expect("query plan should execute")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("query plan rows should decode");
+
+    assert!(
+        plan.iter()
+            .all(|step| !step.contains("idx_gallery_objects_capture_summary")),
+        "unfiltered viewport must not use the capture-summary index: {plan:?}"
+    );
+    assert!(
+        plan.iter().any(|step| {
+            step.contains("idx_gallery_objects_spatial")
+                || step.contains("idx_gallery_objects_viewport")
+        }),
+        "unfiltered viewport should retain a viewport-bounded plan: {plan:?}"
     );
 }
 
