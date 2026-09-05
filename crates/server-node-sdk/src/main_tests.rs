@@ -500,6 +500,188 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+async fn run_selected_geo_apply_for_test(
+    state: &ServerState,
+    run_id: &str,
+    analysis_run_id: &str,
+    proposal_id: &str,
+) -> String {
+    let now = super::unix_ts();
+    super::operations::run_geo_apply_for_test(
+        state.clone(),
+        super::operations::OperationRun {
+            run_id: run_id.to_string(),
+            operation_id: super::operations::GEOLOCATION_APPLY_OPERATION_ID.to_string(),
+            status: super::operations::OperationRunStatus::Queued,
+            priority: super::operations::OperationPriority::Background,
+            created_at_unix: now,
+            started_at_unix: None,
+            finished_at_unix: None,
+            progress: super::operations::OperationProgress::default(),
+            input: serde_json::json!({}),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        },
+        analysis_run_id,
+        proposal_id,
+    )
+    .await;
+
+    let store = read_store(state, "test.geo_apply.outcome").await;
+    let chunks = store
+        .list_operation_result_chunks(run_id, None, 0)
+        .await
+        .expect("apply result chunks should load");
+    let run = store
+        .load_operation_run(run_id)
+        .await
+        .expect("apply run should load");
+    assert_eq!(chunks.len(), 1, "apply run={run:#?}");
+    chunks[0].payload["status"]
+        .as_str()
+        .expect("apply result status should be serialized")
+        .to_string()
+}
+
+async fn geolocation_apply_revalidates_stale_and_already_geotagged_media_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let media_path = "album/IMG_20240102_030405.png";
+    let (manifest_hash, object_id, metadata) = {
+        let mut store = lock_store(&state, "test.geo_apply.seed_media").await;
+        let put = store
+            .put_object_versioned(
+                media_path,
+                Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("test media should persist");
+        let metadata = store
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .expect("test media metadata should load")
+            .expect("PNG should be recognized as media");
+        let object_id = store
+            .store_index_inspector()
+            .await
+            .expect("store index should load")
+            .current_object_ids()
+            .get(media_path)
+            .cloned()
+            .expect("test media should have an object id");
+        (put.manifest_hash, object_id, metadata)
+    };
+    let capture_time =
+        super::operations::capture_time_for_geolocation_for_test(media_path, &metadata)
+            .expect("the filename should supply a floating capture time");
+    let analysis_run_id = "analysis-run";
+    let proposal_id = "proposal-1";
+    let now = super::unix_ts();
+    let proposal = super::operations::GeoProposal {
+        id: proposal_id.to_string(),
+        media_path: media_path.to_string(),
+        object_id,
+        manifest_hash,
+        content_fingerprint: metadata.content_fingerprint.clone(),
+        capture_time,
+        proposed: super::operations::GeoCoordinate {
+            latitude: 47.3769,
+            longitude: 8.5417,
+        },
+        method: super::operations::GeoInferenceMethod::NearestAnchor,
+        previous_anchor: None,
+        next_anchor: None,
+        estimated_anchor_speed_kmh: None,
+        warnings: Vec::new(),
+    };
+    {
+        let store = read_store(&state, "test.geo_apply.persist_analysis").await;
+        store
+            .persist_operation_run(&super::operations::OperationRun {
+                run_id: analysis_run_id.to_string(),
+                operation_id: super::operations::GEOLOCATION_PROPOSE_OPERATION_ID.to_string(),
+                status: super::operations::OperationRunStatus::Completed,
+                priority: super::operations::OperationPriority::Background,
+                created_at_unix: now,
+                started_at_unix: Some(now),
+                finished_at_unix: Some(now),
+                progress: super::operations::OperationProgress::default(),
+                input: serde_json::json!({}),
+                summary: None,
+                error: None,
+                termination_reason: None,
+            })
+            .await
+            .expect("analysis run should persist");
+        store
+            .persist_operation_result_chunk(&super::operations::OperationResultChunk {
+                run_id: analysis_run_id.to_string(),
+                chunk_id: "proposal-chunk".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: now,
+                payload: serde_json::to_value(super::operations::GeoProposalChunk {
+                    id: "proposal-chunk".to_string(),
+                    analysis_run_id: analysis_run_id.to_string(),
+                    folder: "album".to_string(),
+                    time_range_start: capture_time,
+                    time_range_end: capture_time,
+                    item_count: 1,
+                    status: super::operations::GeoProposalChunkStatus::Ready,
+                    proposals: vec![proposal],
+                })
+                .expect("proposal chunk should serialize"),
+            })
+            .await
+            .expect("proposal chunk should persist");
+    }
+
+    assert_eq!(
+        run_selected_geo_apply_for_test(&state, "apply-first", analysis_run_id, proposal_id).await,
+        "applied"
+    );
+    assert_eq!(
+        run_selected_geo_apply_for_test(&state, "apply-already-gps", analysis_run_id, proposal_id)
+            .await,
+        "already-has-gps"
+    );
+
+    let mut changed_pixels = image::RgbaImage::new(5, 3);
+    changed_pixels.put_pixel(0, 0, image::Rgba([12, 34, 56, 255]));
+    let mut changed_bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(changed_pixels)
+        .write_to(
+            &mut std::io::Cursor::new(&mut changed_bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("changed test PNG should encode");
+    {
+        let mut store = lock_store(&state, "test.geo_apply.change_media").await;
+        store
+            .put_object_versioned(
+                media_path,
+                Bytes::from(changed_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("changed media should persist");
+    }
+    assert_eq!(
+        run_selected_geo_apply_for_test(&state, "apply-stale", analysis_run_id, proposal_id).await,
+        "skipped-stale"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    geolocation_apply_revalidates_stale_and_already_geotagged_media_impl,
+    geolocation_apply_revalidates_stale_and_already_geotagged_media,
+    geolocation_apply_revalidates_stale_and_already_geotagged_media_turso
+);
+
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()

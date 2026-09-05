@@ -1348,6 +1348,33 @@ fn capture_time_for_geolocation(
     })
 }
 
+#[cfg(test)]
+pub(crate) async fn run_geo_apply_for_test(
+    state: ServerState,
+    run: OperationRun,
+    analysis_run_id: &str,
+    proposal_id: &str,
+) {
+    run_geo_apply(
+        state,
+        run,
+        GeoApplyRunInput {
+            analysis_run_id: analysis_run_id.to_string(),
+            proposal_chunk_ids: Vec::new(),
+            proposal_ids: vec![proposal_id.to_string()],
+        },
+    )
+    .await;
+}
+
+#[cfg(test)]
+pub(crate) fn capture_time_for_geolocation_for_test(
+    path: &str,
+    metadata: &storage::CachedMediaMetadata,
+) -> Option<GeoCaptureTime> {
+    capture_time_for_geolocation(path, metadata)
+}
+
 fn selected_proposals(
     input: &GeoApplyRunInput,
     result_chunks: Vec<OperationResultChunk>,
