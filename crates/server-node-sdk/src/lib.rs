@@ -16923,6 +16923,8 @@ fn store_index_response_from_gallery_index_page(
 ) -> StoreIndexResponse {
     // The delta change log does not retain an entry's previous capture time. Avoid issuing a
     // token whose later removals could not faithfully preserve a date-filtered result set.
+    let capture_filtered_consistency_token =
+        format!("gallery:{}:{}", page.history_id, page.revision);
     let sync_token = (query.captured_from_unix.is_none() && query.captured_until_unix.is_none())
         .then(|| {
             encode_gallery_sync_token(&GallerySyncTokenPayload {
@@ -16931,9 +16933,12 @@ fn store_index_response_from_gallery_index_page(
                 scope: gallery_sync_scope_from_query(gallery_query),
             })
         });
-    let consistency_token = sync_token
-        .as_ref()
-        .map(|sync_token| format!("gallery:{sync_token}"));
+    let consistency_token = Some(
+        sync_token
+            .as_ref()
+            .map(|sync_token| format!("gallery:{sync_token}"))
+            .unwrap_or(capture_filtered_consistency_token),
+    );
     let total_entry_count = page.total_entry_count;
     let offset = query.offset.unwrap_or(0).min(total_entry_count);
     let limit = query.limit.map(|value| value.max(1));
