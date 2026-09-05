@@ -5299,6 +5299,18 @@ impl IronMeshClient {
         overwrite: bool,
         expected_revision: Option<&str>,
     ) -> Result<()> {
+        self.rename_object_by_id_with_result(object_id, to_path, overwrite, expected_revision)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn rename_object_by_id_with_result(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<ObjectMutationResult> {
         let object_id = object_id.as_ref();
         let to_path = to_path.into();
         let payload = serde_json::to_vec(&ObjectRenameRequest {
@@ -5317,7 +5329,34 @@ impl IronMeshClient {
             .await
             .with_context(|| format!("failed to rename object_id={object_id} to {to_path}"))?;
         match response.status {
-            StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::OK => {
+                let mutation = serde_json::from_slice::<ObjectMutationResult>(&response.body)
+                    .context("failed to parse object-id rename response")?;
+                if mutation.object_id != object_id || mutation.revision.trim().is_empty() {
+                    bail!("server returned an inconsistent object-id rename response");
+                }
+                Ok(mutation)
+            }
+            // Older servers returned 204. Resolve the identity immediately so
+            // callers never mark a locally renamed object in sync with the
+            // predecessor revision that was just consumed by the rename CAS.
+            StatusCode::NO_CONTENT => {
+                let resolved = self
+                    .lookup_object_by_id(object_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("renamed object identity not found: {object_id}"))?;
+                let revision = resolved
+                    .revision
+                    .filter(|revision| !revision.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("renamed object has no concrete revision: {object_id}")
+                    })?;
+                Ok(ObjectMutationResult {
+                    object_id: resolved.object_id,
+                    path: resolved.path,
+                    revision,
+                })
+            }
             StatusCode::NOT_FOUND => bail!("object identity not found: {object_id}"),
             StatusCode::CONFLICT => Err(ObjectMutationConflict::new(
                 "rename",
@@ -7909,10 +7948,31 @@ impl IronMeshClient {
         overwrite: bool,
         expected_revision: Option<&str>,
     ) -> Result<()> {
+        self.rename_object_by_id_with_result_blocking(
+            object_id,
+            to_path,
+            overwrite,
+            expected_revision,
+        )
+        .map(|_| ())
+    }
+
+    pub fn rename_object_by_id_with_result_blocking(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<ObjectMutationResult> {
         let object_id = object_id.as_ref().to_string();
         let to_path = to_path.into();
         let runtime = blocking_runtime()?;
-        runtime.block_on(self.rename_object_by_id(object_id, to_path, overwrite, expected_revision))
+        runtime.block_on(self.rename_object_by_id_with_result(
+            object_id,
+            to_path,
+            overwrite,
+            expected_revision,
+        ))
     }
 
     pub fn delete_object_by_id_blocking(

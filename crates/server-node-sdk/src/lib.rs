@@ -14630,6 +14630,43 @@ async fn rename_object_path_response(
         .await
     {
         Ok(PathMutationResult::Applied) => {
+            let object_mutation = if let Some(object_id) = request.object_id.as_deref() {
+                match store.list_versions_by_object_id(object_id).await {
+                    Ok(Some(summary)) => {
+                        let Some(revision) = summary.preferred_head_version_id else {
+                            tracing::error!(object_id, "renamed object has no preferred revision");
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        };
+                        if summary.key != request.to_path {
+                            tracing::error!(
+                                object_id,
+                                expected_path = %request.to_path,
+                                actual_path = %summary.key,
+                                "renamed object resolved to an unexpected path"
+                            );
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                        Some(ObjectMutationResponse {
+                            object_id: summary.object_id,
+                            path: summary.key,
+                            revision,
+                        })
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            object_id,
+                            "renamed object identity disappeared after mutation"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, object_id, "failed resolving renamed object revision");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            } else {
+                None
+            };
             info!(
                 from_path = %request.from_path,
                 to_path = %request.to_path,
@@ -14666,7 +14703,10 @@ async fn rename_object_path_response(
                 total_elapsed_ms = started.elapsed().as_millis(),
                 "store path rename response ready after queueing background availability refresh"
             );
-            StatusCode::NO_CONTENT.into_response()
+            match object_mutation {
+                Some(mutation) => (StatusCode::OK, Json(mutation)).into_response(),
+                None => StatusCode::NO_CONTENT.into_response(),
+            }
         }
         Ok(PathMutationResult::SourceMissing) => {
             info!(
@@ -15796,9 +15836,17 @@ async fn complete_upload_session_response(
         match store.current_path_for_object_id(object_id).await {
             Ok(Some(current_path)) => key = current_path,
             Ok(None) => {
+                let object_history = store.list_versions_by_object_id(object_id).await;
                 drop(store);
                 reset_upload_session_finalizing(state, upload_id).await;
-                return StatusCode::NOT_FOUND.into_response();
+                return match object_history {
+                    Ok(Some(_)) => StatusCode::CONFLICT.into_response(),
+                    Ok(None) => StatusCode::NOT_FOUND.into_response(),
+                    Err(err) => {
+                        tracing::error!(error = %err, object_id, "failed checking absent object identity before finalizing upload session");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                };
             }
             Err(err) => {
                 tracing::error!(error = %err, object_id, "failed resolving object identity before finalizing upload session");

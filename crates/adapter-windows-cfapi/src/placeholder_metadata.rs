@@ -621,13 +621,27 @@ fn reconcile_remote_object_state_best_effort_with_resolutions(
             _ => None,
         })
         .collect::<Vec<_>>();
-    for change in object_changes
+    let mut delete_changes = object_changes
         .iter()
-        .filter(|change| matches!(change, RemoteObjectChange::Deleted { .. }))
-    {
-        let RemoteObjectChange::Deleted { previous } = change else {
-            continue;
-        };
+        .filter_map(|change| match change {
+            RemoteObjectChange::Deleted { previous } => Some(previous),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // A directory can only be removed after every deleted descendant. Object
+    // change order is by stable ID, not namespace depth, so preserve the
+    // filesystem ordering explicitly instead of relying on delta order.
+    delete_changes.sort_by(|left, right| {
+        path_depth(&right.path)
+            .cmp(&path_depth(&left.path))
+            .then_with(|| {
+                let left_is_directory = left.kind == sync_core::EntryKind::Directory;
+                let right_is_directory = right.kind == sync_core::EntryKind::Directory;
+                left_is_directory.cmp(&right_is_directory)
+            })
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    for previous in delete_changes {
         let Some(object_id) = nonempty(previous.object_id.as_deref()) else {
             continue;
         };
@@ -641,14 +655,43 @@ fn reconcile_remote_object_state_best_effort_with_resolutions(
             local_placeholders.record_conflict(object_id, &mut report);
             continue;
         }
-        let Some(local) = local_placeholders.get_unique(object_id).cloned() else {
+        let Some(indexed_local) = local_placeholders.get_unique(object_id).cloned() else {
             local_placeholders.record_conflict(object_id, &mut report);
             continue;
+        };
+        // Removing a child can clear the parent's CFAPI modified-data state.
+        // The index was captured before this tombstone batch, so refresh a
+        // directory after its descendants have been processed rather than
+        // treating that stale state as an unsynchronized local mutation.
+        let local = if indexed_local.full_path.is_dir() {
+            inspect_local_placeholder(
+                &indexed_local.full_path,
+                indexed_local.relative_path.clone(),
+            )
+            .unwrap_or_else(|| indexed_local.clone())
+        } else {
+            indexed_local.clone()
         };
         let revision_matches = nonempty(local.identity.remote_version.as_deref())
             .zip(nonempty(previous.version.as_deref()))
             .is_some_and(|(local_revision, previous_revision)| local_revision == previous_revision);
-        if !local.is_clean_for_confirmed_deletion(provider_instance_id) || !revision_matches {
+        // CFAPI can leave a directory not-in-sync while its own metadata is
+        // clean after the adapter removed confirmed remote children. For an
+        // empty directory, its stable identity, zero modified data, and the
+        // absence of descendants make the tombstone safe. Do not apply this
+        // exception to non-empty directories: those can contain a locally
+        // created descendant that still needs conflict handling.
+        let directory_has_no_unsynced_local_content = local.full_path.is_dir()
+            && local.identity.provider_instance_id == Some(provider_instance_id)
+            && local.identity.object_id.as_deref() == Some(object_id)
+            && normalize_path(&local.identity.path) == local.relative_path
+            && local.modified_data_size == 0
+            && identity_has_remote_baseline(&local.identity)
+            && directory_is_empty(&local.full_path);
+        let clean_for_confirmed_deletion = local
+            .is_clean_for_confirmed_deletion(provider_instance_id)
+            || directory_has_no_unsynced_local_content;
+        if !clean_for_confirmed_deletion || !revision_matches {
             report.conflicted_paths.insert(local.relative_path.clone());
             report.preserved_paths.insert(local.relative_path.clone());
             let remote_path_is_vacant = !current_snapshot.remote.iter().any(|entry| {
@@ -782,6 +825,12 @@ fn path_depth(path: &str) -> usize {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .count()
+}
+
+fn directory_is_empty(path: &Path) -> bool {
+    fs::read_dir(path)
+        .ok()
+        .is_some_and(|mut entries| entries.next().is_none())
 }
 
 fn canonical_object_path(path: &str) -> String {
@@ -965,26 +1014,28 @@ fn scan_local_placeholders(sync_root_path: &Path) -> LocalPlaceholderIndex {
         if relative_path.is_empty() || is_internal_sync_root_relative_path(&relative_path) {
             continue;
         }
-        let Ok(file) = open_sync_path(entry.path(), false) else {
-            continue;
-        };
-        let Ok(info) = cf_get_placeholder_standard_info_with_identity(&file) else {
-            continue;
-        };
-        let Some(identity) = decode_placeholder_file_identity(info.file_identity()) else {
+        let full_path = entry.into_path();
+        let Some(placeholder) = inspect_local_placeholder(&full_path, relative_path.clone()) else {
             placeholders.undecodable_paths.insert(relative_path);
             continue;
         };
-        placeholders.insert(LocalPlaceholder {
-            relative_path,
-            full_path: entry.into_path(),
-            identity,
-            on_disk_data_size: info.info().OnDiskDataSize,
-            modified_data_size: info.info().ModifiedDataSize,
-            in_sync_state: info.info().InSyncState,
-        });
+        placeholders.insert(placeholder);
     }
     placeholders
+}
+
+fn inspect_local_placeholder(full_path: &Path, relative_path: String) -> Option<LocalPlaceholder> {
+    let file = open_sync_path(full_path, false).ok()?;
+    let info = cf_get_placeholder_standard_info_with_identity(&file).ok()?;
+    let identity = decode_placeholder_file_identity(info.file_identity())?;
+    Some(LocalPlaceholder {
+        relative_path,
+        full_path: full_path.to_path_buf(),
+        identity,
+        on_disk_data_size: info.info().OnDiskDataSize,
+        modified_data_size: info.info().ModifiedDataSize,
+        in_sync_state: info.info().InSyncState,
+    })
 }
 
 pub(crate) fn local_placeholder_paths_by_object_id(
@@ -1900,6 +1951,67 @@ mod tests {
 
         assert!(report.deleted_paths.contains(path));
         assert!(!sync_root.root_path.join("docs\\deleted.txt").exists());
+    }
+
+    #[test]
+    fn confirmed_tombstones_remove_descendants_before_their_directory() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("nested-remote-tombstones");
+        let directory_object_id = "object-deleted-directory";
+        let file_object_id = "object-deleted-child";
+        apply_action_plan(
+            &sync_root.root_path,
+            &CfapiActionPlan {
+                actions: vec![
+                    CfapiAction::EnsureDirectory {
+                        object_id: Some(directory_object_id.to_string()),
+                        path: "docs".to_string(),
+                        remote_version: Some("directory-revision".to_string()),
+                    },
+                    CfapiAction::EnsurePlaceholder {
+                        object_id: Some(file_object_id.to_string()),
+                        path: "docs/child.txt".to_string(),
+                        remote_version: "child-revision".to_string(),
+                        remote_content_hash: "child-hash".to_string(),
+                        remote_size: Some(1_024),
+                        remote_content_fingerprint: Some("child-fingerprint".to_string()),
+                        remote_modified_at_unix: Some(1_725_100_003),
+                        remote_media: None,
+                    },
+                ],
+            },
+            provider_instance_id,
+            true,
+        )
+        .expect("nested provider placeholders should be created");
+        let mut directory = NamespaceEntry::directory("docs").with_object_id(directory_object_id);
+        directory.version = Some("directory-revision".to_string());
+        let child = remote_file(
+            "docs/child.txt",
+            file_object_id,
+            "child-revision",
+            "child-hash",
+        );
+
+        // The remote delta deliberately puts the parent first. Reconciliation
+        // must order confirmed tombstones by depth, not their incoming order.
+        let report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[
+                RemoteObjectChange::Deleted {
+                    previous: directory,
+                },
+                RemoteObjectChange::Deleted { previous: child },
+            ],
+            provider_instance_id,
+            Some(&StaticResolver::default()),
+        )
+        .expect("nested tombstones should reconcile");
+
+        assert!(report.deleted_paths.contains("docs/child.txt"));
+        assert!(report.deleted_paths.contains("docs"));
+        assert!(!sync_root.root_path.join("docs").exists());
     }
 
     #[test]

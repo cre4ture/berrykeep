@@ -12871,6 +12871,99 @@ run_on_main_metadata_backends!(
     start_upload_session_prefills_existing_chunk_refs_turso
 );
 
+async fn complete_upload_session_with_tombstoned_object_id_conflicts_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.upload-session-tombstone-create").await;
+        store
+            .put_object_versioned(
+                "uploads/tombstoned-large-object.bin",
+                Bytes::from_static(b"old contents"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("object should be created")
+    };
+    let deleted = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(created.version_id.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::CREATED);
+
+    let payload = b"replacement contents".to_vec();
+    let payload_hash = blake3::hash(&payload).to_hex().to_string();
+    state
+        .storage
+        .upload_chunk_ingestor
+        .ingest_chunk(&payload_hash, &payload)
+        .await
+        .expect("replacement chunk should be staged");
+    let started = super::start_upload_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::UploadSessionStartRequest {
+            key: "uploads/tombstoned-large-object.bin".to_string(),
+            total_size_bytes: payload.len() as u64,
+            state: None,
+            parent: Vec::new(),
+            version_id: None,
+            object_id: Some(created.object_id.clone()),
+            expected_revision: Some(created.version_id),
+            chunk_refs: vec![super::UploadChunkRef {
+                hash: payload_hash,
+                size_bytes: payload.len(),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(started.status(), StatusCode::CREATED);
+    let started_body = to_bytes(started.into_body(), usize::MAX)
+        .await
+        .expect("upload session start response should be readable");
+    let session: super::UploadSessionView =
+        serde_json::from_slice(&started_body).expect("upload session start response should parse");
+
+    let completed =
+        super::complete_upload_session_response(&state, &HeaderMap::new(), &session.upload_id)
+            .await;
+    assert_eq!(
+        completed.status(),
+        StatusCode::CONFLICT,
+        "a tombstoned object ID must remain a mutation conflict, not become a path-based recreate"
+    );
+
+    let sessions =
+        super::read_upload_sessions(&state, "tests.upload-session-tombstone-assert").await;
+    let pending = sessions
+        .sessions
+        .get(&session.upload_id)
+        .expect("conflicted upload session should remain retryable");
+    assert!(!pending.finalizing);
+    assert!(!pending.completed);
+    drop(sessions);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    complete_upload_session_with_tombstoned_object_id_conflicts_impl,
+    complete_upload_session_with_tombstoned_object_id_conflicts,
+    complete_upload_session_with_tombstoned_object_id_conflicts_turso
+);
+
 #[tokio::test]
 async fn client_mutation_operation_waiter_observes_completion_without_missing_signal() {
     let store = Arc::new(std::sync::Mutex::new(
@@ -14227,7 +14320,15 @@ async fn object_id_rename_replays_same_operation_id_after_delete_impl(backend: M
         Json(request.clone()),
     )
     .await;
-    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let first_mutation: super::ObjectMutationResponse =
+        serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(first_mutation.object_id, created.object_id);
+    assert_eq!(
+        first_mutation.path,
+        "object-id-rename-idempotency-target.txt"
+    );
 
     let delete = super::delete_object_by_id(
         State(state.clone()),
@@ -14253,7 +14354,11 @@ async fn object_id_rename_replays_same_operation_id_after_delete_impl(backend: M
         Json(request),
     )
     .await;
-    assert_eq!(replay.status(), StatusCode::NO_CONTENT);
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
 
     let current_path = {
         let store = lock_store(&state, "tests.object-id-rename-idempotency-verify").await;
@@ -14394,7 +14499,7 @@ async fn object_id_put_replays_same_operation_id_after_rename_impl(backend: Main
         }),
     )
     .await;
-    assert_eq!(rename_response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(rename_response.status(), StatusCode::OK);
 
     let replay = super::put_object_by_id(
         State(state.clone()),
@@ -14560,7 +14665,16 @@ async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTest
         }),
     )
     .await;
-    assert_eq!(rename_response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(rename_response.status(), StatusCode::OK);
+    let renamed: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(rename_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(renamed.object_id, created.object_id);
+    assert_eq!(renamed.path, moved_path);
+    assert_ne!(renamed.revision, modified.revision);
 
     let moved_lookup_response = super::get_object_by_id_response(&state, &created.object_id).await;
     assert_eq!(moved_lookup_response.status(), StatusCode::OK);
@@ -14801,7 +14915,11 @@ async fn object_id_routes_reach_multiplex_transport_impl(backend: MainTestBacken
         ),
     )
     .await;
-    assert_eq!(renamed.status, StatusCode::NO_CONTENT.as_u16());
+    assert_eq!(renamed.status, StatusCode::OK.as_u16());
+    let rename_result: super::ObjectMutationResponse =
+        serde_json::from_slice(&renamed.body).expect("object-id rename response should parse");
+    assert_eq!(rename_result.object_id, created.object_id);
+    assert_eq!(rename_result.path, "object-id-transport-moved.txt");
 
     let deleted = execute_public_object_id_transport_request(
         &state,

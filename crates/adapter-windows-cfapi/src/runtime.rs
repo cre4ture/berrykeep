@@ -179,6 +179,12 @@ pub struct UploadReceipt {
     pub in_sync_content_fingerprint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRenameReceipt {
+    pub object_id: String,
+    pub remote_version: String,
+}
+
 pub trait Uploader: Send + Sync + 'static {
     fn upload_reader(
         &self,
@@ -206,8 +212,8 @@ pub trait Uploader: Send + Sync + 'static {
         _object_id: &str,
         _expected_revision: &str,
         _to_path: &str,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<ObjectRenameReceipt> {
+        anyhow::bail!("uploader does not support object-id rename")
     }
 
     fn delete_object(&self, object_id: &str, _expected_revision: &str) -> Result<()> {
@@ -277,11 +283,14 @@ impl Uploader for DemoUploader {
         object_id: &str,
         expected_revision: &str,
         to_path: &str,
-    ) -> Result<bool> {
+    ) -> Result<ObjectRenameReceipt> {
         tracing::info!(
             "demo rename: object_id={object_id} expected_revision={expected_revision} to_path={to_path}"
         );
-        Ok(true)
+        Ok(ObjectRenameReceipt {
+            object_id: object_id.to_string(),
+            remote_version: format!("demo-rename-{expected_revision}"),
+        })
     }
 }
 

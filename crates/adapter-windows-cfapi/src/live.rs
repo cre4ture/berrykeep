@@ -3,7 +3,8 @@ use crate::placeholder_metadata::{
     RemoteObjectResolution, RemoteObjectResolver, ResolvedRemoteObject,
 };
 use crate::runtime::{
-    HydrationProgress, HydrationRequest, HydrationResult, Hydrator, UploadReceipt, Uploader,
+    HydrationProgress, HydrationRequest, HydrationResult, Hydrator, ObjectRenameReceipt,
+    UploadReceipt, Uploader,
 };
 use anyhow::{Context, Result, anyhow};
 use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest, ObjectLookup};
@@ -327,15 +328,27 @@ impl Uploader for ServerNodeHydrator {
         object_id: &str,
         expected_revision: &str,
         to_path: &str,
-    ) -> Result<bool> {
-        self.sdk
-            .rename_object_by_id_blocking(object_id, to_path, false, Some(expected_revision))
+    ) -> Result<ObjectRenameReceipt> {
+        let mutation = self
+            .sdk
+            .rename_object_by_id_with_result_blocking(
+                object_id,
+                to_path,
+                false,
+                Some(expected_revision),
+            )
             .with_context(|| {
                 format!(
                     "failed to rename remote object object_id={object_id} expected_revision={expected_revision} to {to_path}"
                 )
             })?;
-        Ok(true)
+        if mutation.object_id != object_id || mutation.revision.trim().is_empty() {
+            anyhow::bail!("server returned an inconsistent object-id rename result");
+        }
+        Ok(ObjectRenameReceipt {
+            object_id: mutation.object_id,
+            remote_version: mutation.revision,
+        })
     }
 }
 
@@ -556,18 +569,25 @@ mod tests {
 
     #[test]
     fn windows_rename_request_uses_object_id_and_revision_precondition() {
-        let (base_url, server, request_rx) = capture_single_http_request_with_response(
-            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-        );
+        let body =
+            br#"{"object_id":"obj-report","path":"archive/report.txt","revision":"revision-12"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).expect("response body is utf8")
+        )
+        .into_bytes();
+        let (base_url, server, request_rx) = capture_single_http_request_with_response(response);
         let hydrator = ServerNodeHydrator::with_client(
             IronMeshClient::from_direct_base_url(base_url),
             std::env::temp_dir().join(format!("ironmesh-rename-request-{}", uuid::Uuid::new_v4())),
         );
 
-        assert!(
-            Uploader::rename_object(&hydrator, "obj-report", "revision-11", "archive/report.txt",)
-                .expect("conditional rename should be accepted by the test server")
-        );
+        let receipt =
+            Uploader::rename_object(&hydrator, "obj-report", "revision-11", "archive/report.txt")
+                .expect("conditional rename should be accepted by the test server");
+        assert_eq!(receipt.object_id, "obj-report");
+        assert_eq!(receipt.remote_version, "revision-12");
 
         let request = request_rx
             .recv_timeout(Duration::from_secs(5))

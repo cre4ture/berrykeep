@@ -25,7 +25,7 @@ use crate::placeholder_metadata::{
 };
 #[cfg(test)]
 use crate::runtime::UploadReceipt;
-use crate::runtime::{Uploader, is_remote_mutation_conflict};
+use crate::runtime::{ObjectRenameReceipt, Uploader, is_remote_mutation_conflict};
 use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Storage::CloudFilters::{
@@ -531,21 +531,35 @@ impl SyncRootMonitor {
             let entry = current
                 .get(&rename.to_path)
                 .expect("object-id rename candidates must exist in the current snapshot");
-            let remote_destination = remote_rename_destination(&rename.to_path, entry.is_dir);
-            match self.uploader.rename_object(
-                entry
-                    .placeholder_object_id
-                    .as_deref()
-                    .expect("object-id rename candidates must carry object_id"),
-                entry
-                    .placeholder_revision
-                    .as_deref()
-                    .expect("object-id rename candidates must carry a revision"),
-                &remote_destination,
-            ) {
-                Ok(true) => {
+            let object_id = entry
+                .placeholder_object_id
+                .as_deref()
+                .expect("object-id rename candidates must carry object_id")
+                .to_string();
+            let expected_revision = entry
+                .placeholder_revision
+                .as_deref()
+                .expect("object-id rename candidates must carry a revision")
+                .to_string();
+            let is_dir = entry.is_dir;
+            let remote_destination = remote_rename_destination(&rename.to_path, is_dir);
+            match self
+                .uploader
+                .rename_object(&object_id, &expected_revision, &remote_destination)
+            {
+                Ok(receipt) => {
                     handled_paths.insert(rename.from_path.clone());
                     handled_paths.insert(rename.to_path.clone());
+                    if receipt.object_id != object_id || receipt.remote_version.trim().is_empty() {
+                        tracing::error!(
+                            "{}: remote rename returned an invalid post-mutation identity for {} -> {}; preserving local move as a conflict",
+                            self.name,
+                            rename.from_path,
+                            rename.to_path
+                        );
+                        mark_local_rename_conflict(&full_path);
+                        continue;
+                    }
                     tracing::info!(
                         "{}: remote rename applied {} -> {} raw_state={}",
                         self.name,
@@ -553,15 +567,14 @@ impl SyncRootMonitor {
                         rename.to_path,
                         describe_path_state(&full_path)
                     );
-                    if let Some(entry) = current.get(&rename.to_path)
-                        && let Err(err) = repair_locally_renamed_object(
-                            &self.sync_root,
-                            &full_path,
-                            &rename.to_path,
-                            self.provider_instance_id,
-                            entry,
-                        )
-                    {
+                    if let Err(err) = repair_locally_renamed_object(
+                        &self.sync_root,
+                        &full_path,
+                        &rename.to_path,
+                        self.provider_instance_id,
+                        is_dir,
+                        &receipt,
+                    ) {
                         tracing::info!(
                             "{}: failed to repair local renamed file {} after remote rename: {:#} state={}",
                             self.name,
@@ -570,18 +583,9 @@ impl SyncRootMonitor {
                             describe_path_state(&full_path)
                         );
                         mark_local_rename_conflict(&full_path);
+                    } else {
+                        self.seed_existing_entry(current, &rename.to_path, is_dir);
                     }
-                }
-                Ok(false) => {
-                    handled_paths.insert(rename.from_path.clone());
-                    handled_paths.insert(rename.to_path.clone());
-                    tracing::info!(
-                        "{}: uploader declined object-id rename {} -> {}; preserving the local move as a conflict",
-                        self.name,
-                        rename.from_path,
-                        rename.to_path
-                    );
-                    mark_local_rename_conflict(&full_path);
                 }
                 Err(err) if is_remote_mutation_conflict(&err) => {
                     handled_paths.insert(rename.from_path.clone());
@@ -1488,7 +1492,8 @@ fn repair_locally_renamed_object(
     path: &std::path::Path,
     rel_path: &str,
     provider_instance_id: uuid::Uuid,
-    entry: &SeenEntry,
+    is_dir: bool,
+    receipt: &ObjectRenameReceipt,
 ) -> anyhow::Result<()> {
     let is_placeholder = path_is_placeholder(path);
     tracing::info!(
@@ -1499,11 +1504,22 @@ fn repair_locally_renamed_object(
         } else {
             "materialized-convert-and-fingerprint"
         },
-        entry.to_log_string(),
+        format!(
+            "object_id={} revision={}",
+            receipt.object_id, receipt.remote_version
+        ),
         describe_path_state(path)
     );
 
-    if entry.is_dir {
+    if is_dir {
+        record_uploaded_object_state(
+            sync_root,
+            rel_path,
+            provider_instance_id,
+            &receipt.object_id,
+            &receipt.remote_version,
+            None,
+        )?;
         promote_remote_to_in_sync_content_baseline(sync_root, rel_path, provider_instance_id)?;
         let file = open_sync_path(path, true)?;
         cf_set_in_sync(&file)?;
@@ -1515,6 +1531,14 @@ fn repair_locally_renamed_object(
         // fingerprinting path will implicitly hydrate them. Repoint the stored
         // FileIdentity metadata to the new relative path and restore the in-sync
         // content baseline as a metadata-only operation.
+        record_uploaded_object_state(
+            sync_root,
+            rel_path,
+            provider_instance_id,
+            &receipt.object_id,
+            &receipt.remote_version,
+            None,
+        )?;
         promote_remote_to_in_sync_content_baseline(sync_root, rel_path, provider_instance_id)?;
         let file = open_sync_path(path, true)?;
         cf_set_in_sync(&file)?;
@@ -1529,6 +1553,14 @@ fn repair_locally_renamed_object(
     let metadata = std::fs::metadata(path)?;
     try_convert_materialized_file(path, rel_path, &metadata);
 
+    record_uploaded_object_state(
+        sync_root,
+        rel_path,
+        provider_instance_id,
+        &receipt.object_id,
+        &receipt.remote_version,
+        None,
+    )?;
     let file = open_sync_path(path, true)?;
     cf_set_in_sync(&file)?;
     record_in_sync_local_file_state(sync_root, rel_path, provider_instance_id)?;
@@ -1832,7 +1864,7 @@ mod tests {
             _object_id: &str,
             _expected_revision: &str,
             _to_path: &str,
-        ) -> anyhow::Result<bool> {
+        ) -> anyhow::Result<ObjectRenameReceipt> {
             *self
                 .rename_attempts
                 .lock()
@@ -2136,6 +2168,52 @@ mod tests {
             vec!["docs/"],
             "the receipt revision must become the next monitor baseline instead of re-uploading the unchanged directory"
         );
+    }
+
+    #[test]
+    fn successful_local_placeholder_rename_records_the_post_rename_revision() {
+        let (sync_root, provider_instance_id) =
+            registered_monitor_test_sync_root("rename-post-mutation-revision");
+        let old_path = "docs/before.txt";
+        let new_path = "archive/after.txt";
+        create_clean_provider_placeholder(&sync_root.root_path, provider_instance_id, old_path);
+
+        let old_full_path = sync_root.root_path.join("docs\\before.txt");
+        let new_full_path = sync_root.root_path.join("archive\\after.txt");
+        std::fs::create_dir_all(
+            new_full_path
+                .parent()
+                .expect("renamed placeholder should have a parent"),
+        )
+        .expect("rename target parent should be created");
+        std::fs::rename(&old_full_path, &new_full_path)
+            .expect("placeholder should be renamed locally");
+
+        repair_locally_renamed_object(
+            &sync_root.root_path,
+            &new_full_path,
+            new_path,
+            provider_instance_id,
+            false,
+            &ObjectRenameReceipt {
+                object_id: "test-object".to_string(),
+                remote_version: "revision-after-rename".to_string(),
+            },
+        )
+        .expect("successful rename should update placeholder metadata");
+
+        let file = open_sync_path(&new_full_path, false)
+            .expect("renamed placeholder should remain accessible");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("renamed placeholder identity should be readable");
+        let identity = decode_placeholder_file_identity(info.file_identity())
+            .expect("renamed placeholder identity should decode");
+        assert_eq!(identity.object_id.as_deref(), Some("test-object"));
+        assert_eq!(
+            identity.remote_version.as_deref(),
+            Some("revision-after-rename")
+        );
+        assert_eq!(identity.path, new_path);
     }
 
     #[test]
