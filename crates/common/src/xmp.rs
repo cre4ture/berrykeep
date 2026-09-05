@@ -887,7 +887,10 @@ fn qualified_name(prefix: &str, local_name: &str) -> String {
 fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
     let inferred_by_berrykeep = has_berrykeep_inference_marker(events);
     let mut location = None;
-    let mut description_coordinates: Option<(Option<f64>, Option<f64>)> = None;
+    // XMP permits nested `rdf:Description` values (for example Camera Raw's
+    // `crs:Look`). Keep each Description's coordinates independent so an
+    // inner structured value cannot consume the enclosing media description.
+    let mut description_coordinates = Vec::<(Option<f64>, Option<f64>)>::new();
     let mut element_property = None;
     for event in events {
         match &event.event {
@@ -897,10 +900,10 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
                     if matches!(&event.event, Event::Empty(_)) {
                         set_first_geo_location(&mut location, coordinates);
                     } else {
-                        description_coordinates = Some(coordinates);
+                        description_coordinates.push(coordinates);
                     }
                 } else if matches!(&event.event, Event::Start(_))
-                    && description_coordinates.is_some()
+                    && !description_coordinates.is_empty()
                 {
                     element_property = if is_element(event, EXIF_NAMESPACE, b"GPSLatitude") {
                         Some(true)
@@ -918,7 +921,7 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
                 let Ok(value) = text.xml10_content() else {
                     continue;
                 };
-                if let Some((latitude, longitude)) = description_coordinates.as_mut() {
+                if let Some((latitude, longitude)) = description_coordinates.last_mut() {
                     if is_latitude {
                         *latitude = parse_xmp_coordinate(&value, true);
                     } else {
@@ -933,7 +936,7 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
                 let Ok(value) = std::str::from_utf8(text.as_ref()) else {
                     continue;
                 };
-                if let Some((latitude, longitude)) = description_coordinates.as_mut() {
+                if let Some((latitude, longitude)) = description_coordinates.last_mut() {
                     if is_latitude {
                         *latitude = parse_xmp_coordinate(value, true);
                     } else {
@@ -951,7 +954,7 @@ fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
                 if is_element(event, RDF_NAMESPACE, b"Description") {
                     set_first_geo_location(
                         &mut location,
-                        description_coordinates.take().unwrap_or_default(),
+                        description_coordinates.pop().unwrap_or_default(),
                     );
                 }
             }
@@ -1350,6 +1353,28 @@ mod tests {
         assert!((location.latitude - 47.376_666_666_7).abs() < 0.000_001);
         assert!((location.longitude - 8.541_666_666_7).abs() < 0.000_001);
         assert!(!location.inferred_by_berrykeep);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_outer_description_gps_after_nested_camera_raw_description() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\">",
+            "<crs:Look><rdf:Description crs:Name=\"Adobe Color\">",
+            "<crs:Parameters/></rdf:Description></crs:Look>",
+            "<exif:GPSLatitude>47,22,36N</exif:GPSLatitude>",
+            "<exif:GPSLongitude>8,32,30E</exif:GPSLongitude>",
+            "</rdf:Description></rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        let location = sidecar
+            .geo_location()
+            .expect("outer Description GPS must survive nested descriptions");
+        assert!((location.latitude - 47.376_666_666_7).abs() < 0.000_001);
+        assert!((location.longitude - 8.541_666_666_7).abs() < 0.000_001);
         Ok(())
     }
 

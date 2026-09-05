@@ -1077,6 +1077,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
         let total = candidates.len();
         let mut media = Vec::with_capacity(total);
         let mut metadata_error_count = 0usize;
+        let mut sidecar_error_count = 0usize;
         for (batch_index, batch) in candidates
             .chunks(MULTIMEDIA_OPERATION_BATCH_SIZE)
             .enumerate()
@@ -1103,12 +1104,20 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                     match store.media_sidecar_gps_overlay(path).await {
                         Ok(overlay) => overlay,
                         Err(error) => {
+                            sidecar_error_count += 1;
                             warn!(
                                 error = %error,
                                 media_path = %path,
-                                "ignoring unreadable XMP sidecar during geolocation proposal scan"
+                                "skipping media with unreadable XMP sidecar during geolocation proposal scan"
                             );
-                            storage::MediaSidecarGpsOverlay::default()
+                            // An unreadable sidecar may contain user-owned
+                            // coordinates. Treat it as GPS-present so this
+                            // scan cannot propose an update it cannot safely
+                            // revalidate or apply.
+                            storage::MediaSidecarGpsOverlay {
+                                location: None,
+                                has_geo_location_properties: true,
+                            }
                         }
                     }
                 };
@@ -1187,12 +1196,26 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
             persist_operation_run(&state, &run).await?;
             tokio::task::yield_now().await;
         }
-        Ok::<_, anyhow::Error>((chunks.len(), proposal_count, total, metadata_error_count))
+        Ok::<_, anyhow::Error>(
+            (
+                chunks.len(),
+                proposal_count,
+                total,
+                metadata_error_count,
+                sidecar_error_count,
+            ),
+        )
     }
     .await;
 
     match result {
-        Ok((chunk_count, proposal_count, media_count, metadata_error_count)) => {
+        Ok((
+            chunk_count,
+            proposal_count,
+            media_count,
+            metadata_error_count,
+            sidecar_error_count,
+        )) => {
             run.status = OperationRunStatus::Completed;
             run.finished_at_unix = Some(super::unix_ts());
             run.progress = OperationProgress {
@@ -1206,6 +1229,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                 "proposal_chunk_count": chunk_count,
                 "proposal_count": proposal_count,
                 "metadata_error_count": metadata_error_count,
+                "sidecar_error_count": sidecar_error_count,
             }));
             if let Err(error) = persist_terminal_operation_run_with_retention(
                 &state,
@@ -2046,6 +2070,21 @@ mod tests {
                 .map(|anchor| anchor.path.as_str()),
             Some("trip/measured.jpg")
         );
+    }
+
+    #[test]
+    fn unparseable_existing_gps_is_not_an_inference_target() {
+        let mut existing_but_unparseable = media("trip/target.jpg", Some(120), None);
+        existing_but_unparseable.gps_is_present = true;
+        let result = proposals(
+            vec![
+                media("trip/before.jpg", Some(0), Some((47.0, 8.0))),
+                existing_but_unparseable,
+                media("trip/after.jpg", Some(240), Some((47.0005, 8.0005))),
+            ],
+            GeoInferenceConfig::default(),
+        );
+        assert!(result.is_empty());
     }
 
     #[test]
