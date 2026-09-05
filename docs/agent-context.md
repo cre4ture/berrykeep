@@ -77,6 +77,7 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
   - sync-root registration and placeholder creation runtime
   - fetch-data hydration callbacks backed by `server-node`
   - remote namespace refresh driven by server notifications with polling fallback
+  - object-ID-based placeholder identity and reconciliation; revisions are CAS state and paths are mutable namespace properties
   - registration helper implementation in `crates/adapter-windows-cfapi/src/register.rs`
 
 ## Key files now authoritative
