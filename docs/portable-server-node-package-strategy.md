@@ -102,22 +102,23 @@ The normal CI workflow builds and verifies `x86_64-generic` on an x86_64
 GitHub runner. The static build is part of the `Required CI` aggregate and
 uploads `static-server-node-linux-amd64`.
 
-The ARM64 packaging workflow builds and verifies `aarch64-generic` on an
-AArch64 GitHub runner and uploads `static-server-node-linux-arm64`. The
-executable runs natively for its version smoke test before it is passed into
-the Focal packaging container.
+The Server Node Debian package workflow cross-builds and verifies
+`aarch64-generic` on an x86_64 GitHub runner with Zig, then uploads
+`static-server-node-linux-arm64`. The static artifact checks its ELF contract;
+the workflow runs its version smoke test under `qemu-aarch64-static` before
+the artifact enters a package container.
 
-Both current Debian package paths consume the verified static executable:
+The workflow passes that archive into Focal and Trixie containers. Each
+container checks the archive checksum and metadata against the checked-out Git
+revision, then cross-assembles an `arm64` `ironmesh-server-node` package with
+the `server-node-only` build profile. The profile skips source compilation and
+does not execute the target binary, so the package-wrapper matrix no longer
+needs an ARM runner.
 
-- the AMD64 package job combines the static server with the separately built
-  client and rendezvous binaries before invoking the existing prebuilt-bundle
-  package path;
-- the Focal ARM64 package job passes the static server through
-  `build-local-debs.sh --prebuilt-server-node`, while compiling only the other
-  package binaries in the Focal userspace.
-
-This removes distribution-specific compilation of the Server Node without
-changing the current client or rendezvous compatibility matrix.
+The final protected, manual CI job imports the archive key into a temporary
+keyring, signs all suite metadata, deploys the matrix, and re-verifies the
+remote and public `InRelease` copies. Client and rendezvous packages remain on
+their distribution-specific native package path.
 
 ## Portable package contract
 

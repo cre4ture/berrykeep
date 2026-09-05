@@ -1,4 +1,4 @@
-name: Focal A64
+name: Server Node Debian packages
 
 on:
   push:
@@ -11,24 +11,36 @@ on:
       - reopened
       - labeled
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Sign and deploy the verified server-node package matrix.
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+
 jobs:
-  build-focal-arm64-packages:
-    name: Focal A64
-    # The full Focal package build is expensive. It runs on trusted main and
-    # manual invocations, while PRs opt in with the existing package label.
+  build-static-arm64-server-node:
+    name: Static Server Node (arm64)
+    # Package builds are intentionally opt-in on pull requests. Pushes to main
+    # and manual runs always build the complete portable package matrix.
     if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:debian-packages') }}
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # server-node-sdk's frontend build invokes pnpm from nested package
+      # scripts, so Corepack alone is insufficient: pnpm itself must be on
+      # PATH for those scripts.
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -42,7 +54,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
-      - name: Install Rust toolchain for packaging inputs
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly-2026-02-17
@@ -50,7 +62,8 @@ jobs:
       - name: Install ELF verification tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends binutils file xz-utils
+          sudo apt-get install -y --no-install-recommends \
+            binutils file qemu-user-static xz-utils
 
       - name: Restore Zig toolchain cache
         id: restore-zig
@@ -65,12 +78,25 @@ jobs:
           shared-key: static-server-node-aarch64
           save-if: ${{ github.event_name != 'pull_request' }}
 
-      - name: Build and verify static AArch64 Server Node
+      - name: Build and verify static AArch64 Server Node on x86_64
         run: |
           ./scripts/build-static-server-node.sh \
             --target aarch64-unknown-linux-musl \
             --variant-id aarch64-generic \
-            --run-smoke always
+            --run-smoke never
+
+      - name: Run the AArch64 Server Node version smoke test under QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$(mktemp -d)"
+          trap 'rm -rf "$artifact_dir"' EXIT
+          artifact="$(find target/static-server-node -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          test -n "$artifact"
+          tar -xzf "$artifact" -C "$artifact_dir"
+          binary="$(find "$artifact_dir" -type f -name ironmesh-server-node -print -quit)"
+          test -n "$binary"
+          qemu-aarch64-static "$binary" --version
 
       - name: Save Zig toolchain cache
         if: ${{ github.event_name != 'pull_request' && steps.restore-zig.outputs.cache-hit != 'true' }}
@@ -78,91 +104,6 @@ jobs:
         with:
           path: ~/.cache/ironmesh-build-tools
           key: ${{ steps.restore-zig.outputs.cache-primary-key }}
-
-      - name: Prepare vendored crates and web assets
-        run: ./scripts/prepare-ppa-source.sh
-
-      - name: Restore sccache (ARM64 Focal build)
-        id: restore-sccache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ runner.temp }}/sccache-arm64
-          key: sccache-arm64-focal-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-arm64-focal-
-
-      - name: Build Focal ARM64 Debian packages
-        shell: bash
-        env:
-          # sccache caches the rustc invocations of the in-container release
-          # build across runs. The GHA cache backend can't be reached from
-          # inside `docker run`, so we mount an on-disk cache dir that
-          # actions/cache round-trips between runs.
-          SCCACHE_VERSION: v0.16.0
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          sccache_dir="${RUNNER_TEMP}/sccache-arm64"
-          mkdir -p "$sccache_dir"
-          workspace_parent="$(dirname "$GITHUB_WORKSPACE")"
-          workspace_dir="$(basename "$GITHUB_WORKSPACE")"
-          docker run --rm \
-            --volume "${workspace_parent}:/build" \
-            --volume "${sccache_dir}:/sccache" \
-            --workdir "/build/${workspace_dir}" \
-            --env RUSTC_WRAPPER=sccache \
-            --env SCCACHE_DIR=/sccache \
-            --env SCCACHE_CACHE_SIZE=2G \
-            --env CARGO_INCREMENTAL=0 \
-            --env SCCACHE_VERSION="${SCCACHE_VERSION}" \
-            ubuntu:20.04 \
-            bash -lc '
-              set -euo pipefail
-              export DEBIAN_FRONTEND=noninteractive
-              echo "deb http://ports.ubuntu.com/ubuntu-ports focal-backports main universe" \
-                > /etc/apt/sources.list.d/focal-backports.list
-              apt-get update
-              apt-get install -y --no-install-recommends \
-                build-essential ca-certificates clang curl dh-sysuser git \
-                libfuse3-dev pkg-config
-              apt-get install -y --no-install-recommends -t focal-backports debhelper
-              git config --global --add safe.directory "$PWD"
-              curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal --default-toolchain nightly-2026-02-17
-              export PATH=/root/.cargo/bin:$PATH
-              sccache_pkg="sccache-${SCCACHE_VERSION}-aarch64-unknown-linux-musl"
-              curl --proto "=https" --tlsv1.2 -fsSL \
-                "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${sccache_pkg}.tar.gz" \
-                | tar -xz -C /tmp
-              install -m 0755 "/tmp/${sccache_pkg}/sccache" /usr/local/bin/sccache
-              CARGO_BUILD_JOBS=2 ./scripts/build-local-debs.sh \
-                --prebuilt-server-node \
-                  "$PWD/target/aarch64-unknown-linux-musl/release/ironmesh-server-node" \
-                --no-prepare --no-check-build-deps -- -j2
-              sccache --show-stats || true
-              find /build -maxdepth 1 -type f \
-                \( -name "ironmesh-*_*_arm64.deb" \
-                  -o -name "ironmesh_*_arm64.changes" \
-                  -o -name "ironmesh_*_arm64.buildinfo" \) \
-                -exec cp -v {} artifacts/ \;
-            '
-          # The explicit save step runs as the runner user, but the container
-          # wrote the cache as root; hand ownership back before that step.
-          sudo chown -R "$(id -u):$(id -g)" "$sccache_dir" || true
-
-      - name: Save sccache (ARM64 Focal build)
-        if: ${{ github.event_name != 'pull_request' && steps.restore-sccache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/sccache-arm64
-          key: ${{ steps.restore-sccache.outputs.cache-primary-key }}
-
-      - name: Upload Focal ARM64 Debian packages
-        uses: actions/upload-artifact@v4
-        with:
-          name: focal-arm64-debian-packages
-          if-no-files-found: error
-          path: artifacts/
 
       - name: Upload portable AArch64 Server Node
         uses: actions/upload-artifact@v4
@@ -172,3 +113,193 @@ jobs:
             target/static-server-node/*.tar.gz
             target/static-server-node/*.tar.gz.sha256
           if-no-files-found: error
+
+  build-server-node-debian-package:
+    name: ${{ matrix.check_name }}
+    needs: build-static-arm64-server-node
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: focal
+            architecture: arm64
+            image: ubuntu:20.04
+            check_name: Focal A64
+          - suite: trixie
+            architecture: arm64
+            image: debian:trixie
+            check_name: Trixie A64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download verified static Server Node
+        uses: actions/download-artifact@v4
+        with:
+          name: static-server-node-linux-arm64
+          path: ${{ runner.temp }}/static-server-node
+
+      - name: Build ${{ matrix.suite }} ${{ matrix.architecture }} package wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace_parent="$(dirname "$GITHUB_WORKSPACE")"
+          workspace_dir="$(basename "$GITHUB_WORKSPACE")"
+          docker run --rm \
+            --volume "${workspace_parent}:/build" \
+            --volume "${RUNNER_TEMP}:/runner-temp" \
+            --workdir "/build/${workspace_dir}" \
+            "${{ matrix.image }}" \
+            bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              package_dir="/runner-temp/debian/${{ matrix.suite }}-${{ matrix.architecture }}"
+              mkdir -p "$package_dir"
+              case "${{ matrix.suite }}" in
+                focal)
+                  echo "deb http://archive.ubuntu.com/ubuntu focal-backports main universe" \
+                    > /etc/apt/sources.list.d/focal-backports.list
+                  apt-get update
+                  apt-get install -y --no-install-recommends \
+                    build-essential ca-certificates dh-sysuser git \
+                    binutils python3 tar gzip
+                  apt-get install -y --no-install-recommends -t focal-backports debhelper
+                  ;;
+                trixie)
+                  apt-get update
+                  apt-get install -y --no-install-recommends \
+                    build-essential ca-certificates debhelper dh-sysuser git \
+                    binutils python3 tar gzip
+                  ;;
+              esac
+              git config --global --add safe.directory "$PWD"
+              static_artifact="$(find /runner-temp/static-server-node -maxdepth 1 -name "*.tar.gz" -print -quit)"
+              test -n "$static_artifact"
+              ./scripts/build-local-debs.sh \
+                --suite "${{ matrix.suite }}" \
+                --arch "${{ matrix.architecture }}" \
+                --server-node-only \
+                --static-server-node-artifact "$static_artifact" \
+                --no-check-build-deps \
+                -- -j1
+              find /build -maxdepth 1 -type f \
+                \( -name "ironmesh-server-node_*_${{ matrix.architecture }}.deb" \
+                  -o -name "ironmesh_*_${{ matrix.architecture }}.changes" \
+                  -o -name "ironmesh_*_${{ matrix.architecture }}.buildinfo" \) \
+                -exec cp -v {} "${package_dir}/" \;
+            '
+
+      - name: Upload ${{ matrix.suite }} ${{ matrix.architecture }} Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-node-debian-${{ matrix.suite }}-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/debian/${{ matrix.suite }}-${{ matrix.architecture }}/
+          if-no-files-found: error
+
+  publish-server-node-debian-packages:
+    name: Sign and deploy Server Node Debian packages
+    needs: build-server-node-debian-package
+    # Publishing requires the protected apt-repository environment. This is
+    # manual-only, runs from main, and never grants deployment secrets to PRs.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    environment: apt-repository
+    timeout-minutes: 30
+    env:
+      APT_REPO_SIGN_KEY: ${{ vars.IRONMESH_APT_ARCHIVE_GPG_FINGERPRINT }}
+      APT_REPO_GPG_PASSPHRASE: ${{ secrets.IRONMESH_APT_ARCHIVE_GPG_PASSPHRASE }}
+      APT_REPO_REMOTE: ${{ vars.IRONMESH_APT_REPOSITORY_REMOTE }}
+      APT_REPO_REMOTE_DIR: ${{ vars.IRONMESH_APT_REPOSITORY_REMOTE_DIR }}
+      APT_REPO_URL: ${{ vars.IRONMESH_APT_REPOSITORY_URL }}
+      IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64: ${{ secrets.IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64 }}
+      IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY: ${{ secrets.IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY }}
+      IRONMESH_APT_REPOSITORY_KNOWN_HOSTS: ${{ secrets.IRONMESH_APT_REPOSITORY_KNOWN_HOSTS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download server-node Debian packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: server-node-debian-*
+          path: ${{ runner.temp }}/server-node-packages
+
+      - name: Install repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            apt-utils curl gnupg openssh-client rsync
+
+      - name: Configure signing and deployment credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${APT_REPO_SIGN_KEY:?configure IRONMESH_APT_ARCHIVE_GPG_FINGERPRINT}"
+          : "${APT_REPO_GPG_PASSPHRASE:?configure IRONMESH_APT_ARCHIVE_GPG_PASSPHRASE}"
+          : "${APT_REPO_REMOTE:?configure IRONMESH_APT_REPOSITORY_REMOTE}"
+          : "${APT_REPO_REMOTE_DIR:?configure IRONMESH_APT_REPOSITORY_REMOTE_DIR}"
+          : "${APT_REPO_URL:?configure IRONMESH_APT_REPOSITORY_URL}"
+          : "${IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64:?configure IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64}"
+          : "${IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY:?configure IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY}"
+          : "${IRONMESH_APT_REPOSITORY_KNOWN_HOSTS:?configure IRONMESH_APT_REPOSITORY_KNOWN_HOSTS}"
+
+          export GNUPGHOME="$RUNNER_TEMP/apt-archive-gnupg"
+          printf 'GNUPGHOME=%s\n' "$GNUPGHOME" >> "$GITHUB_ENV"
+          install -d -m 700 "$GNUPGHOME" "$HOME/.ssh"
+          printf '%s' "$IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64" | base64 --decode \
+            | gpg --batch --import
+          actual_fingerprint="$(gpg --batch --with-colons --fingerprint "$APT_REPO_SIGN_KEY" \
+            | awk -F: '$1 == "fpr" { print $10; exit }')"
+          expected_fingerprint="${APT_REPO_SIGN_KEY//[[:space:]]/}"
+          actual_fingerprint="${actual_fingerprint//[[:space:]]/}"
+          test "$actual_fingerprint" = "$expected_fingerprint"
+
+          umask 077
+          printf '%s\n' "$IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$IRONMESH_APT_REPOSITORY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+
+      - name: Build signed repository matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          matrix_file="$RUNNER_TEMP/server-node-debian-matrix.txt"
+          : > "$matrix_file"
+          package_dirs=("$RUNNER_TEMP"/server-node-packages/server-node-debian-*)
+          test "${#package_dirs[@]}" -gt 0
+          for package_dir in "${package_dirs[@]}"; do
+            target="${package_dir##*/server-node-debian-}"
+            case "$target" in
+              *-amd64) architecture=amd64 ;;
+              *-arm64) architecture=arm64 ;;
+              *-armhf) architecture=armhf ;;
+              *)
+                echo "unrecognized package artifact target: $target" >&2
+                exit 1
+                ;;
+            esac
+            suite="${target%-${architecture}}"
+            test -n "$suite"
+            matches=("$package_dir"/ironmesh-server-node_*_"$architecture".deb)
+            test "${#matches[@]}" -eq 1
+            printf '%s %s %s\n' "$suite" "$architecture" "${matches[0]}" >> "$matrix_file"
+          done
+          ./scripts/build-apt-repository.sh \
+            --repo-dir "$RUNNER_TEMP/apt-repo" \
+            --server-node-matrix "$matrix_file" \
+            --import-remote "${APT_REPO_REMOTE}:${APT_REPO_REMOTE_DIR}"
+
+      - name: Deploy signed repository matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/deploy-apt-repository.sh \
+            --repo-dir "$RUNNER_TEMP/apt-repo" \
+            --server-node-matrix "$RUNNER_TEMP/server-node-debian-matrix.txt" \
+            --remote "$APT_REPO_REMOTE" \
+            --remote-dir "$APT_REPO_REMOTE_DIR" \
+            --url "$APT_REPO_URL"
