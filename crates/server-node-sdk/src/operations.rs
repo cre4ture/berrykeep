@@ -156,6 +156,10 @@ pub(crate) struct GeoAnalysisMedia {
     pub(crate) capture_time: Option<GeoCaptureTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gps: Option<GeoCoordinate>,
+    /// A location written by a prior BerryKeep inference still means the media
+    /// is geotagged, but must not become an anchor for later inferences.
+    #[serde(default)]
+    pub(crate) gps_is_inferred: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -316,13 +320,17 @@ fn infer_segment(
 
         let previous = (0..target_index).rev().find_map(|index| {
             let candidate = &segment[index];
-            let coordinate = candidate.gps.filter(|value| value.valid())?;
+            let coordinate = candidate
+                .gps
+                .filter(|value| value.valid() && !candidate.gps_is_inferred)?;
             let capture_time = candidate.capture_time?;
             Some((candidate, capture_time, coordinate))
         });
         let next = ((target_index + 1)..segment.len()).find_map(|index| {
             let candidate = &segment[index];
-            let coordinate = candidate.gps.filter(|value| value.valid())?;
+            let coordinate = candidate
+                .gps
+                .filter(|value| value.valid() && !candidate.gps_is_inferred)?;
             let capture_time = candidate.capture_time?;
             Some((candidate, capture_time, coordinate))
         });
@@ -897,10 +905,11 @@ pub(super) async fn get_operation_run_history(
 }
 
 pub(super) async fn interrupt_runs_after_server_restart(state: &ServerState) {
+    let interrupted_at_unix = super::unix_ts();
     let result = {
         let store = lock_store(state, "operations.restart_interrupt").await;
         store
-            .interrupt_unfinished_operation_runs(super::unix_ts(), "server_restart")
+            .interrupt_unfinished_operation_runs(interrupted_at_unix, "server_restart")
             .await
     };
     match result {
@@ -913,6 +922,7 @@ pub(super) async fn interrupt_runs_after_server_restart(state: &ServerState) {
             warn!(error = %error, "failed to interrupt unfinished operation runs after restart")
         }
     }
+    prune_operation_run_history_with_retention(state, interrupted_at_unix).await;
 }
 
 fn multimedia_operation_descriptors() -> Vec<OperationDescriptor> {
@@ -1053,24 +1063,44 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                     .with_context(|| format!("failed to read media metadata for {path}"))?;
                 let sidecar_gps = {
                     let store = read_store(&state, "operations.geo_proposal.sidecar_gps").await;
-                    store.media_sidecar_geo_location(path).await?
+                    match store.media_sidecar_geo_location(path).await {
+                        Ok(location) => location,
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                media_path = %path,
+                                "ignoring unreadable XMP sidecar during geolocation proposal scan"
+                            );
+                            None
+                        }
+                    }
                 };
                 let Some(metadata) = metadata else {
                     continue;
                 };
                 let capture_time = capture_time_for_geolocation(path, &metadata);
-                let gps = sidecar_gps
-                    .filter(|location| !location.inferred_by_berrykeep)
-                    .map(|value| GeoCoordinate {
-                        latitude: value.latitude,
-                        longitude: value.longitude,
-                    })
-                    .or_else(|| {
-                        metadata.gps.as_ref().map(|value| GeoCoordinate {
-                            latitude: value.latitude,
-                            longitude: value.longitude,
-                        })
-                    });
+                let embedded_gps = metadata.gps.as_ref().map(|value| GeoCoordinate {
+                    latitude: value.latitude,
+                    longitude: value.longitude,
+                });
+                // A measured embedded location takes precedence over an
+                // inferred sidecar. Otherwise preserve the sidecar location
+                // and its trust flag: it suppresses a duplicate proposal but
+                // cannot act as a future inference anchor.
+                let (gps, gps_is_inferred) = match (sidecar_gps, embedded_gps) {
+                    (Some(sidecar), Some(embedded)) if sidecar.inferred_by_berrykeep => {
+                        (Some(embedded), false)
+                    }
+                    (Some(sidecar), _) => (
+                        Some(GeoCoordinate {
+                            latitude: sidecar.latitude,
+                            longitude: sidecar.longitude,
+                        }),
+                        sidecar.inferred_by_berrykeep,
+                    ),
+                    (None, Some(embedded)) => (Some(embedded), false),
+                    (None, None) => (None, false),
+                };
                 media.push(GeoAnalysisMedia {
                     path: path.clone(),
                     object_id: object_ids.get(path).cloned().unwrap_or_default(),
@@ -1078,6 +1108,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                     content_fingerprint: metadata.content_fingerprint.clone(),
                     capture_time,
                     gps,
+                    gps_is_inferred,
                 });
             }
             run.progress = OperationProgress {
@@ -1139,9 +1170,12 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                 "proposal_chunk_count": chunk_count,
                 "proposal_count": proposal_count,
             }));
-            if let Err(error) =
-                persist_operation_run_with_retry(&state, &run, "complete geolocation proposal")
-                    .await
+            if let Err(error) = persist_terminal_operation_run_with_retention(
+                &state,
+                &run,
+                "complete geolocation proposal",
+            )
+            .await
             {
                 finish_interrupted_operation(&state, &mut run, "persistence_failure", error).await;
             }
@@ -1240,8 +1274,12 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
                 "skipped_stale": counters.skipped_stale,
                 "failed": counters.failed,
             }));
-            if let Err(error) =
-                persist_operation_run_with_retry(&state, &run, "complete geolocation apply").await
+            if let Err(error) = persist_terminal_operation_run_with_retention(
+                &state,
+                &run,
+                "complete geolocation apply",
+            )
+            .await
             {
                 finish_interrupted_operation(&state, &mut run, "persistence_failure", error).await;
             }
@@ -1560,6 +1598,38 @@ async fn persist_operation_run_with_retry(
     unreachable!("operation-run persistence attempts are non-empty")
 }
 
+async fn persist_terminal_operation_run_with_retention(
+    state: &ServerState,
+    run: &OperationRun,
+    action: &str,
+) -> Result<()> {
+    persist_operation_run_with_retry(state, run, action).await?;
+    prune_operation_run_history_with_retention(
+        state,
+        run.finished_at_unix.unwrap_or_else(super::unix_ts),
+    )
+    .await;
+    Ok(())
+}
+
+async fn prune_operation_run_history_with_retention(state: &ServerState, reference_unix: u64) {
+    let retention_cutoff =
+        reference_unix.saturating_sub(state.maintenance.repair_run_history_retention_secs);
+    let result = {
+        let store = lock_store(state, "operations.prune_history").await;
+        store
+            .prune_operation_run_history_before(retention_cutoff)
+            .await
+    };
+    if let Err(error) = result {
+        warn!(
+            error = %error,
+            retention_cutoff,
+            "failed to prune generic operation run history"
+        );
+    }
+}
+
 async fn persist_operation_result_chunk(
     state: &ServerState,
     chunk: &OperationResultChunk,
@@ -1579,7 +1649,7 @@ async fn finish_failed_operation(
     run.progress.phase = Some("failed".to_string());
     run.progress.message = Some("Operation failed; see error for details.".to_string());
     if let Err(persist_error) =
-        persist_operation_run_with_retry(state, run, "persist failed operation").await
+        persist_terminal_operation_run_with_retention(state, run, "persist failed operation").await
     {
         warn!(error = %persist_error, run_id = %run.run_id, "failed to persist failed operation");
     }
@@ -1600,7 +1670,8 @@ async fn finish_interrupted_operation(
     run.progress.message =
         Some("Operation interrupted; persisted results remain reviewable.".to_string());
     if let Err(persist_error) =
-        persist_operation_run_with_retry(state, run, "persist interrupted operation").await
+        persist_terminal_operation_run_with_retention(state, run, "persist interrupted operation")
+            .await
     {
         warn!(error = %persist_error, run_id = %run.run_id, "failed to persist interrupted operation");
     }
@@ -1730,6 +1801,7 @@ mod tests {
                 latitude,
                 longitude,
             }),
+            gps_is_inferred: false,
         }
     }
 
@@ -1886,6 +1958,36 @@ mod tests {
             GeoInferenceConfig::default(),
         );
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn inferred_locations_are_not_anchors_but_remain_geotagged() {
+        let mut inferred = media("trip/inferred.jpg", Some(0), Some((0.0, 0.0)));
+        inferred.gps_is_inferred = true;
+        let result = proposals(
+            vec![
+                inferred,
+                media("trip/target.jpg", Some(60), None),
+                media("trip/measured.jpg", Some(120), Some((0.0, 0.01))),
+            ],
+            GeoInferenceConfig::default(),
+        );
+
+        assert_eq!(
+            result.len(),
+            1,
+            "the already geotagged item is not proposed again"
+        );
+        assert_eq!(result[0].media_path, "trip/target.jpg");
+        assert_eq!(result[0].method, GeoInferenceMethod::NearestAnchor);
+        assert!(result[0].previous_anchor.is_none());
+        assert_eq!(
+            result[0]
+                .next_anchor
+                .as_ref()
+                .map(|anchor| anchor.path.as_str()),
+            Some("trip/measured.jpg")
+        );
     }
 
     #[test]

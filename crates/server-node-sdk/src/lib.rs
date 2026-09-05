@@ -29134,6 +29134,18 @@ async fn persist_manual_repair_action_run_record_with_retention(
         .finished_at_unix
         .saturating_sub(state.maintenance.repair_run_history_retention_secs);
     if let Err(err) = store
+        .prune_operation_run_history_before(retention_cutoff)
+        .await
+    {
+        warn!(
+            error = %err,
+            retention_cutoff,
+            run_id = %record.run_id,
+            action_id = %record.action_id,
+            "failed to prune generic operation history for manual repair actions"
+        );
+    }
+    if let Err(err) = store
         .prune_manual_repair_action_run_history_before(retention_cutoff)
         .await
     {

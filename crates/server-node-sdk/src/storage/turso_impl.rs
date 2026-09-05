@@ -9,6 +9,8 @@ use tracing::warn;
 use turso::params_from_iter;
 
 use crate::cluster::NodeDescriptor;
+#[cfg(test)]
+use crate::operations::{OperationPriority, OperationProgress};
 use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 
 mod gallery;
@@ -742,6 +744,44 @@ impl MetadataStore for TursoMetadataStore {
             )
             .await?;
         Ok(())
+    }
+
+    async fn prune_operation_run_history_before(&self, created_before_unix: u64) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        let created_before_unix = i64::try_from(created_before_unix)
+            .context("operation run history prune timestamp overflow")?;
+        let result = async {
+            self.connection.execute_batch("BEGIN IMMEDIATE").await?;
+            // Result chunks deliberately have no foreign key: older database
+            // versions already contain this table, and the explicit delete
+            // keeps the retention path compatible with them.
+            self.connection
+                .execute(
+                    "DELETE FROM operation_result_chunks
+                     WHERE run_id IN (
+                         SELECT run_id FROM operation_runs
+                         WHERE created_at_unix < ?1
+                           AND status NOT IN ('queued', 'running')
+                     )",
+                    (created_before_unix,),
+                )
+                .await?;
+            self.connection
+                .execute(
+                    "DELETE FROM operation_runs
+                     WHERE created_at_unix < ?1
+                       AND status NOT IN ('queued', 'running')",
+                    (created_before_unix,),
+                )
+                .await?;
+            self.connection.execute_batch("COMMIT").await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.rollback().await;
+        }
+        result
     }
 
     async fn interrupt_unfinished_operation_runs(
@@ -3508,6 +3548,82 @@ mod tests {
 
         drop(connection);
         drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn terminal_operation_retention_removes_result_chunks_but_keeps_active_runs() {
+        let metadata_db_path = turso_test_db_path("turso-operation-retention");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("Turso metadata store should open");
+        let terminal = OperationRun {
+            run_id: "terminal-run".to_string(),
+            operation_id: "multimedia.geolocation.propose".to_string(),
+            status: OperationRunStatus::Completed,
+            priority: OperationPriority::Background,
+            created_at_unix: 10,
+            started_at_unix: Some(10),
+            finished_at_unix: Some(11),
+            progress: OperationProgress::default(),
+            input: serde_json::json!({}),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        };
+        let active = OperationRun {
+            run_id: "active-run".to_string(),
+            status: OperationRunStatus::Running,
+            finished_at_unix: None,
+            ..terminal.clone()
+        };
+        store
+            .persist_operation_run(&terminal)
+            .await
+            .expect("terminal operation should persist");
+        store
+            .persist_operation_run(&active)
+            .await
+            .expect("active operation should persist");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: terminal.run_id.clone(),
+                chunk_id: "proposal-chunk".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 11,
+                payload: serde_json::json!({ "proposals": [] }),
+            })
+            .await
+            .expect("terminal operation result should persist");
+
+        store
+            .prune_operation_run_history_before(11)
+            .await
+            .expect("operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&terminal.run_id)
+                .await
+                .expect("pruned run lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            store
+                .list_operation_result_chunks(&terminal.run_id, None)
+                .await
+                .expect("pruned result lookup should succeed")
+                .is_empty()
+        );
+        assert!(
+            store
+                .load_operation_run(&active.run_id)
+                .await
+                .expect("active run lookup should succeed")
+                .is_some(),
+            "unfinished operations are never removed by retention"
+        );
+
+        drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 }

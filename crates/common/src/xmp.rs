@@ -318,8 +318,8 @@ impl XmpSidecar {
         description.push_attribute((qualified_name(rdf_prefix, "about").as_str(), ""));
         description.push_attribute(("xmlns:exif", EXIF_NAMESPACE));
         description.push_attribute(("xmlns:berrykeep", BERRYKEEP_NAMESPACE));
-        let latitude = format_xmp_coordinate(inference.latitude);
-        let longitude = format_xmp_coordinate(inference.longitude);
+        let latitude = format_xmp_coordinate(inference.latitude, true);
+        let longitude = format_xmp_coordinate(inference.longitude, false);
         description.push_attribute((
             qualified_name(EXIF_PREFIX_FALLBACK, "GPSLatitude").as_str(),
             latitude.as_str(),
@@ -961,29 +961,55 @@ fn has_berrykeep_inference_marker(events: &[ResolvedEvent]) -> bool {
 
 fn parse_xmp_coordinate(value: &str, latitude: bool) -> Option<f64> {
     let value = value.trim();
-    let hemisphere = value.chars().last().and_then(|suffix| match suffix {
-        'N' | 'n' | 'E' | 'e' => Some(1.0),
-        'S' | 's' | 'W' | 'w' => Some(-1.0),
-        _ => None,
-    });
-    let numeric = hemisphere
-        .map(|_| &value[..value.len().saturating_sub(1)])
-        .unwrap_or(value)
-        .trim();
-    let value = if let Some((degrees, minutes)) = numeric.split_once(',') {
-        let degrees = degrees.trim().parse::<f64>().ok()?;
-        let minutes = minutes.trim().parse::<f64>().ok()?;
-        degrees.abs() + minutes.abs() / 60.0
-    } else {
-        numeric.parse::<f64>().ok()?
+    let hemisphere = value.chars().last()?;
+    let numeric = value.strip_suffix(hemisphere)?.trim();
+    let sign = match hemisphere {
+        'N' | 'n' if latitude => 1.0,
+        'S' | 's' if latitude => -1.0,
+        'E' | 'e' if !latitude => 1.0,
+        'W' | 'w' if !latitude => -1.0,
+        _ => return None,
     };
-    let value = hemisphere.map(|sign| value.abs() * sign).unwrap_or(value);
+    let mut components = numeric.trim().split(',').map(str::trim);
+    let degrees = components.next()?.parse::<f64>().ok()?;
+    let minutes = components.next()?.parse::<f64>().ok()?;
+    let seconds = components
+        .next()
+        .map(str::parse::<f64>)
+        .transpose()
+        .ok()?
+        .unwrap_or_default();
+    if components.next().is_some()
+        || !degrees.is_finite()
+        || !minutes.is_finite()
+        || !seconds.is_finite()
+        || degrees < 0.0
+        || !(0.0..60.0).contains(&minutes)
+        || !(0.0..60.0).contains(&seconds)
+    {
+        return None;
+    }
+    let value = degrees + minutes / 60.0 + seconds / 3_600.0;
     let limit = if latitude { 90.0 } else { 180.0 };
-    (value.is_finite() && (-limit..=limit).contains(&value)).then_some(value)
+    (value.is_finite() && value <= limit).then_some(value * sign)
 }
 
-fn format_xmp_coordinate(value: f64) -> String {
-    format!("{value:.8}")
+fn format_xmp_coordinate(value: f64, latitude: bool) -> String {
+    let hemisphere = match (latitude, value.is_sign_negative()) {
+        (true, false) => 'N',
+        (true, true) => 'S',
+        (false, false) => 'E',
+        (false, true) => 'W',
+    };
+    let absolute = value.abs();
+    let mut degrees = absolute.floor();
+    let mut minutes = (absolute - degrees) * 60.0;
+    // Do not emit an invalid `60.000000` minute component due to rounding.
+    if minutes >= 59.999_999_5 {
+        degrees += 1.0;
+        minutes = 0.0;
+    }
+    format!("{degrees:.0},{minutes:.6}{hemisphere}")
 }
 
 /// Derives the sidecar key of a media object: `album/photo.jpg` ->
@@ -1214,6 +1240,8 @@ mod tests {
         ] {
             assert!(serialized.contains(retained), "missing {retained:?}");
         }
+        assert!(serialized.contains("exif:GPSLatitude=\"37,48.500000N\""));
+        assert!(serialized.contains("exif:GPSLongitude=\"122,24.250000W\""));
         assert!(serialized.contains("exif:GPSMapDatum=\"WGS-84\""));
         assert!(serialized.contains("berrykeep:GeoInferenceRunId=\"run-123\""));
         let reparsed = XmpSidecar::parse(serialized.as_bytes())?;
@@ -1230,15 +1258,29 @@ mod tests {
             "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
             "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
             "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\">",
-            "<exif:GPSLatitude>47.3769N</exif:GPSLatitude>",
-            "<exif:GPSLongitude>8.5417E</exif:GPSLongitude>",
+            "<exif:GPSLatitude>47,22,36N</exif:GPSLatitude>",
+            "<exif:GPSLongitude>8,32,30E</exif:GPSLongitude>",
             "</rdf:Description></rdf:RDF></x:xmpmeta>"
         );
         let sidecar = XmpSidecar::parse(packet.as_bytes())?;
         let location = sidecar.geo_location().expect("element GPS must be read");
-        assert!((location.latitude - 47.3769).abs() < 0.000_001);
-        assert!((location.longitude - 8.5417).abs() < 0.000_001);
+        assert!((location.latitude - 47.376_666_666_7).abs() < 0.000_001);
+        assert!((location.longitude - 8.541_666_666_7).abs() < 0.000_001);
         assert!(!location.inferred_by_berrykeep);
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_requires_a_hemisphere_and_xmp_coordinate_components() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLatitude=\"47.3769\" exif:GPSLongitude=\"8,32.5E\"/>",
+            "</rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        assert!(sidecar.geo_location().is_none());
         Ok(())
     }
 

@@ -2789,6 +2789,32 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn prune_operation_run_history_before(&self, created_before_unix: u64) -> Result<()> {
+        self.write_tx(move |db| {
+            let created_before_unix = u64_to_i64(created_before_unix)?;
+            // Result chunks deliberately have no foreign key: older database
+            // versions already contain this table, and the explicit delete
+            // keeps the retention path compatible with them.
+            db.execute(
+                "DELETE FROM operation_result_chunks
+                 WHERE run_id IN (
+                     SELECT run_id FROM operation_runs
+                     WHERE created_at_unix < ?1
+                       AND status NOT IN ('queued', 'running')
+                 )",
+                params![created_before_unix],
+            )?;
+            db.execute(
+                "DELETE FROM operation_runs
+                 WHERE created_at_unix < ?1
+                   AND status NOT IN ('queued', 'running')",
+                params![created_before_unix],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn interrupt_unfinished_operation_runs(
         &self,
         finished_at_unix: u64,
@@ -5850,6 +5876,27 @@ mod tests {
                 .len(),
             1,
             "a restart must never discard reviewable proposal chunks"
+        );
+
+        store
+            .prune_operation_run_history_before(11)
+            .await
+            .expect("terminal operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&run.run_id)
+                .await
+                .expect("pruned operation lookup should succeed")
+                .is_none(),
+            "expired terminal operations must be removed"
+        );
+        assert!(
+            store
+                .list_operation_result_chunks(&run.run_id, None)
+                .await
+                .expect("pruned result lookup should succeed")
+                .is_empty(),
+            "result chunks must be removed with their expired run"
         );
 
         drop(store);
