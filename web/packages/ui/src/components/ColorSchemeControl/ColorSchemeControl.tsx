@@ -42,7 +42,8 @@ const accentColorSwatches = [
 
 export function ColorSchemeControl() {
   const { colorScheme, setColorScheme } = useMantineColorScheme();
-  const { accentColor, setAccentColor, resetAccentColor } = useIronmeshAccentColor();
+  const { accentColor, setAccentColor, resetAccentColor, accentColorHost } =
+    useIronmeshAccentColor();
   const computedColorScheme = useComputedColorScheme("light", {
     getInitialValueInEffect: false
   });
@@ -88,54 +89,74 @@ export function ColorSchemeControl() {
         </Text>
         <Menu.Divider />
         <Menu.Label>Accent</Menu.Label>
-        <Box px="sm" py="xs">
-          <Group align="center" gap="xs" wrap="nowrap">
-            <Box
-              component="input"
-              type="color"
-              value={accentColor}
-              aria-label="Accent color"
-              onChange={(event) => setAccentColor(event.currentTarget.value)}
-              style={{
-                width: "2.25rem",
-                height: "2.25rem",
-                padding: 0,
-                border: "none",
-                background: "transparent",
-                cursor: "pointer"
-              }}
-            />
-            <Code>{accentColor.toUpperCase()}</Code>
-            <Button
-              variant="subtle"
-              size="compact-xs"
-              onClick={resetAccentColor}
-              disabled={accentColor === defaultIronmeshAccentColor}
-            >
-              Reset
-            </Button>
-          </Group>
-          <Group gap={6} mt="xs">
-            {accentColorSwatches.map((swatch) => (
-              <UnstyledButton
-                key={swatch}
-                aria-label={`Use accent color ${swatch}`}
-                onClick={() => setAccentColor(swatch)}
+        {accentColorHost ? (
+          <Box px="sm" py="xs">
+            <Group align="center" gap="xs">
+              <Box
+                aria-label="Accent color synchronized from native app"
                 style={{
                   width: "1.25rem",
                   height: "1.25rem",
                   borderRadius: "999px",
-                  backgroundColor: swatch,
-                  outline: swatch === accentColor ? "2px solid var(--mantine-color-text)" : "none",
-                  outlineOffset: 2
+                  backgroundColor: accentColor
                 }}
               />
-            ))}
-          </Group>
-          <Text c="dimmed" size="xs" mt={6}>
-            Stored locally in this browser.
-          </Text>
-        </Box>
+              <Code>{accentColor.toUpperCase()}</Code>
+            </Group>
+            <Text c="dimmed" size="xs" mt={6}>
+              Synced from the {accentColorHost === "ios" ? "iOS" : "Android"} app.
+            </Text>
+          </Box>
+        ) : (
+          <Box px="sm" py="xs">
+            <Group align="center" gap="xs" wrap="nowrap">
+              <Box
+                component="input"
+                type="color"
+                value={accentColor}
+                aria-label="Accent color"
+                onChange={(event) => setAccentColor(event.currentTarget.value)}
+                style={{
+                  width: "2.25rem",
+                  height: "2.25rem",
+                  padding: 0,
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer"
+                }}
+              />
+              <Code>{accentColor.toUpperCase()}</Code>
+              <Button
+                variant="subtle"
+                size="compact-xs"
+                onClick={resetAccentColor}
+                disabled={accentColor === defaultIronmeshAccentColor}
+              >
+                Reset
+              </Button>
+            </Group>
+            <Group gap={6} mt="xs">
+              {accentColorSwatches.map((swatch) => (
+                <UnstyledButton
+                  key={swatch}
+                  aria-label={`Use accent color ${swatch}`}
+                  onClick={() => setAccentColor(swatch)}
+                  style={{
+                    width: "1.25rem",
+                    height: "1.25rem",
+                    borderRadius: "999px",
+                    backgroundColor: swatch,
+                    outline: swatch === accentColor ? "2px solid var(--mantine-color-text)" : "none",
+                    outlineOffset: 2
+                  }}
+                />
+              ))}
+            </Group>
+            <Text c="dimmed" size="xs" mt={6}>
+              Stored locally in this browser.
+            </Text>
+          </Box>
+        )}
       </Menu.Dropdown>
     </Menu>
   );

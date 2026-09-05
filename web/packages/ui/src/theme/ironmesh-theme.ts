@@ -3,6 +3,10 @@ import { createTheme, type MantineColorsTuple } from "@mantine/core";
 export const ironmeshPrimaryColor = "brand";
 export const defaultIronmeshAccentColor = "#14b8a6";
 export const ironmeshAccentColorStorageKey = "ironmesh-accent-color";
+export const ironmeshAccentColorQueryParameter = "accent_color";
+export const ironmeshEmbeddedClientQueryParameter = "embedded_client";
+
+export type IronmeshEmbeddedClient = "android" | "ios";
 
 type RgbColor = {
   r: number;
@@ -40,6 +44,27 @@ export function normalizeIronmeshAccentColor(value: string | null | undefined): 
   }
 
   return null;
+}
+
+/**
+ * Returns the native host's accent color for embedded Android and iOS Web UIs.
+ *
+ * The query parameter is intentionally ignored outside an app-owned WebView, so a
+ * normal browser retains its locally selected accent color.
+ */
+export function readIronmeshHostAccentColor(
+  search = typeof window === "undefined" ? "" : window.location.search
+): { client: IronmeshEmbeddedClient; color: string } | null {
+  const parameters = new URLSearchParams(search);
+  const client = parameters.get(ironmeshEmbeddedClientQueryParameter);
+  if (client !== "android" && client !== "ios") {
+    return null;
+  }
+
+  const color = normalizeIronmeshAccentColor(
+    parameters.get(ironmeshAccentColorQueryParameter)
+  );
+  return color ? { client, color } : null;
 }
 
 export function createIronmeshTheme(accentColor = defaultIronmeshAccentColor) {

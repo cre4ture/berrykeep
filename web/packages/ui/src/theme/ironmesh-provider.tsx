@@ -13,7 +13,9 @@ import {
   defaultIronmeshAccentColor,
   defaultIronmeshAccentCssVariables,
   ironmeshAccentColorStorageKey,
-  normalizeIronmeshAccentColor
+  normalizeIronmeshAccentColor,
+  readIronmeshHostAccentColor,
+  type IronmeshEmbeddedClient
 } from "./ironmesh-theme";
 
 export const ironmeshColorSchemeStorageKey = "ironmesh-color-scheme";
@@ -30,16 +32,26 @@ type IronmeshAccentColorContextValue = {
   accentColor: string;
   setAccentColor: (value: string) => void;
   resetAccentColor: () => void;
+  accentColorHost: IronmeshEmbeddedClient | null;
 };
 
 const IronmeshAccentColorContext = createContext<IronmeshAccentColorContextValue | null>(null);
 
 export function IronmeshMantineProvider({ children }: IronmeshMantineProviderProps) {
-  const [accentColor, setAccentColorState] = useState(readStoredAccentColor);
+  const hostAccent = useMemo(() => readIronmeshHostAccentColor(), []);
+  const accentColorHost = hostAccent?.client ?? null;
+  const [accentColor, setAccentColorState] = useState(
+    () => hostAccent?.color ?? readStoredAccentColor()
+  );
   const theme = useMemo(() => createIronmeshTheme(accentColor), [accentColor]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
+      return;
+    }
+
+    if (hostAccent) {
+      setAccentColorState(hostAccent.color);
       return;
     }
 
@@ -52,7 +64,7 @@ export function IronmeshMantineProvider({ children }: IronmeshMantineProviderPro
     } catch {
       // Ignore local persistence failures and keep the active in-memory theme.
     }
-  }, [accentColor]);
+  }, [accentColor, hostAccent]);
 
   useEffect(() => {
     if (typeof document === "undefined") {
@@ -67,6 +79,10 @@ export function IronmeshMantineProvider({ children }: IronmeshMantineProviderPro
       return;
     }
 
+    if (hostAccent) {
+      return;
+    }
+
     function handleStorage(event: StorageEvent) {
       if (event.storageArea !== window.localStorage || event.key !== ironmeshAccentColorStorageKey) {
         return;
@@ -77,22 +93,31 @@ export function IronmeshMantineProvider({ children }: IronmeshMantineProviderPro
 
     window.addEventListener("storage", handleStorage);
     return () => window.removeEventListener("storage", handleStorage);
-  }, []);
+  }, [hostAccent]);
 
   const accentColorContextValue = useMemo<IronmeshAccentColorContextValue>(
     () => ({
       accentColor,
       setAccentColor(value: string) {
+        if (accentColorHost) {
+          return;
+        }
+
         const normalized = normalizeIronmeshAccentColor(value);
         if (normalized) {
           setAccentColorState(normalized);
         }
       },
       resetAccentColor() {
+        if (accentColorHost) {
+          return;
+        }
+
         setAccentColorState(defaultIronmeshAccentColor);
-      }
+      },
+      accentColorHost
     }),
-    [accentColor]
+    [accentColor, accentColorHost]
   );
 
   return (

@@ -143,6 +143,16 @@ final class IronmeshBrowserModel: ObservableObject {
         }
     }
 
+    @Published var themeAccentColorHex: String {
+        didSet {
+            if themeAccentColorHex == AppleAccentColor.defaultHex {
+                userDefaults.removeObject(forKey: themeAccentColorStorageKey)
+            } else {
+                userDefaults.set(themeAccentColorHex, forKey: themeAccentColorStorageKey)
+            }
+        }
+    }
+
     @Published var items: [AppleBridgeItem] = []
     @Published var currentPath = ""
     @Published var currentItems: [AppleBridgeItem] = []
@@ -184,6 +194,7 @@ final class IronmeshBrowserModel: ObservableObject {
     private let userDefaults: UserDefaults
     private let draftStorageKey = AppleConnectionSettingsStore.defaultLegacyDraftStateKey
     private let onboardingStorageKey = "IronmeshIosApp.hasCompletedOnboarding"
+    private let themeAccentColorStorageKey = "IronmeshIosApp.themeAccentColor"
     private let titleLatencyMonitorSettingsStorageKey = "IronmeshIosApp.titleLatencyMonitorSettings"
     private let recentActionLimit = 6
     private let diagnosticActionLimit = 10_000
@@ -209,6 +220,9 @@ final class IronmeshBrowserModel: ObservableObject {
         remoteSession: IronmeshRemoteSession = IronmeshRemoteSession()
     ) {
         self.userDefaults = userDefaults
+        themeAccentColorHex = AppleAccentColor.normalizedHex(
+            userDefaults.string(forKey: "IronmeshIosApp.themeAccentColor")
+        ) ?? AppleAccentColor.defaultHex
         self.enroller = enroller
         self.remoteSession = remoteSession
         self.fileProviderDomains = fileProviderDomains
@@ -272,6 +286,13 @@ final class IronmeshBrowserModel: ObservableObject {
 
     var shouldShowOnboarding: Bool {
         !hasCompletedOnboarding
+    }
+
+    func updateThemeAccentColor(_ value: String) {
+        guard let normalized = AppleAccentColor.normalizedHex(value) else {
+            return
+        }
+        themeAccentColorHex = normalized
     }
 
     var healthHeadline: String {
