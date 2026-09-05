@@ -34,7 +34,7 @@ use super::{
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
-pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 9;
+pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 10;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
 const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
 const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
@@ -1265,7 +1265,7 @@ async fn derive_video_media_cache(
             .arg("v:0")
             .arg("-show_entries")
             .arg(
-                "stream=width,height,codec_name,codec_tag_string,avg_frame_rate,bit_rate:stream_tags=creation_time:format=format_name,duration,bit_rate:format_tags=creation_time",
+                "stream=width,height,codec_name,codec_tag_string,avg_frame_rate,bit_rate:stream_tags=creation_time,location,location-eng,com.apple.quicktime.location.ISO6709:format=format_name,duration,bit_rate:format_tags=creation_time,location,location-eng,com.apple.quicktime.location.ISO6709",
             )
             .arg("-of")
             .arg("json")
@@ -1308,6 +1308,11 @@ async fn derive_video_media_cache(
             .and_then(|format| format.bit_rate.as_deref())
             .or(stream.bit_rate.as_deref())
             .and_then(parse_positive_u64);
+        let gps = probe
+            .format
+            .as_ref()
+            .and_then(|format| ffprobe_gps(&format.tags))
+            .or_else(|| ffprobe_gps(&stream.tags));
         let metadata = CachedMediaMetadata {
             status: MediaCacheStatus::Ready,
             media_type: Some("video".to_string()),
@@ -1323,6 +1328,7 @@ async fn derive_video_media_cache(
             total_bitrate_bps,
             codec_name: trimmed_metadata_string(stream.codec_name.as_deref()),
             codec_fourcc: trimmed_metadata_string(stream.codec_tag_string.as_deref()),
+            gps,
             ..base_media_metadata(
                 manifest_hash,
                 content_fingerprint,
@@ -1454,6 +1460,46 @@ pub(super) fn parse_ffprobe_timestamp(value: &str) -> Option<u64> {
         .ok()?
         .unix_timestamp();
     u64::try_from(timestamp).ok()
+}
+
+fn ffprobe_gps(tags: &super::media_tools::FfprobeTags) -> Option<MediaGpsCoordinates> {
+    [
+        tags.quicktime_location_iso6709.as_deref(),
+        tags.location.as_deref(),
+        tags.location_eng.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(parse_iso6709_location)
+}
+
+/// Parses the latitude/longitude portion of ISO 6709 values commonly exposed
+/// by ffprobe for QuickTime location atoms, e.g. `+47.3769+008.5417/`.
+pub(super) fn parse_iso6709_location(value: &str) -> Option<MediaGpsCoordinates> {
+    let value = value.trim().strip_suffix('/').unwrap_or(value.trim());
+    let first = value.as_bytes().first().copied()?;
+    if !matches!(first, b'+' | b'-') {
+        return None;
+    }
+    let longitude_start = value
+        .char_indices()
+        .skip(1)
+        .find_map(|(index, character)| matches!(character, '+' | '-').then_some(index))?;
+    let latitude = value[..longitude_start].parse::<f64>().ok()?;
+    let longitude_end = value
+        .char_indices()
+        .skip(longitude_start + 1)
+        .find_map(|(index, character)| matches!(character, '+' | '-').then_some(index))
+        .unwrap_or(value.len());
+    let longitude = value[longitude_start..longitude_end].parse::<f64>().ok()?;
+    (latitude.is_finite()
+        && longitude.is_finite()
+        && (-90.0..=90.0).contains(&latitude)
+        && (-180.0..=180.0).contains(&longitude))
+    .then_some(MediaGpsCoordinates {
+        latitude,
+        longitude,
+    })
 }
 
 fn trimmed_metadata_string(value: Option<&str>) -> Option<String> {
@@ -2451,6 +2497,16 @@ mod tests {
                 .context("thumbnail generation failed");
 
         assert!(is_thumbnail_limit_error(&error));
+    }
+
+    #[test]
+    fn parses_quicktime_iso6709_video_locations() {
+        let location = parse_iso6709_location("+47.3769+008.5417+00450.0/")
+            .expect("ISO 6709 location should parse");
+        assert!((location.latitude - 47.3769).abs() < 0.000_001);
+        assert!((location.longitude - 8.5417).abs() < 0.000_001);
+        assert!(parse_iso6709_location("not-a-location").is_none());
+        assert!(parse_iso6709_location("+91.0+008.5/").is_none());
     }
 
     #[test]

@@ -720,6 +720,7 @@ use super::{
 };
 
 const MULTIMEDIA_OPERATION_BATCH_SIZE: usize = 64;
+const OPERATION_RESULT_SELECTION_BATCH_SIZE: usize = 64;
 const MULTIMEDIA_OPERATION_YIELD_MILLIS: u64 = 100;
 const OPERATION_RUN_PERSIST_ATTEMPTS: usize = 3;
 const OPERATION_RUN_PERSIST_RETRY_MILLIS: u64 = 100;
@@ -1429,42 +1430,85 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
         ) {
             bail!("referenced analysis run has not produced reviewable results yet");
         }
-        let chunks = {
-            let store = read_store(&state, "operations.geo_apply.load_proposals").await;
-            store
-                .list_operation_result_chunks(&input.analysis_run_id, None, 0)
-                .await?
-        };
-        let proposals = selected_proposals(&input, chunks)?;
-        let total = proposals.len();
         let worker = {
             let store = read_store(&state, "operations.geo_apply.worker").await;
             store.media_cache_worker()
         };
+        let selected_chunk_ids = input
+            .proposal_chunk_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let selected_proposal_ids = input
+            .proposal_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
         let mut counters = GeoApplyCounters::default();
-        for (index, proposal) in proposals.iter().enumerate() {
-            wait_for_higher_priority_work(&state).await;
-            let item_result =
-                apply_one_geo_proposal(&state, &worker, &input.analysis_run_id, proposal).await;
-            counters.record(item_result.outcome);
-            let chunk = OperationResultChunk {
-                run_id: run.run_id.clone(),
-                chunk_id: format!("apply-{}", item_result.proposal_id),
-                result_type: OPERATION_RESULT_TYPE_GEO_APPLY_ITEM.to_string(),
-                created_at_unix: super::unix_ts(),
-                payload: serde_json::to_value(&item_result)?,
+        let mut selected_count = 0usize;
+        let mut result_offset = 0usize;
+        loop {
+            let result_chunks = {
+                let store = read_store(&state, "operations.geo_apply.load_proposal_page").await;
+                store
+                    .list_operation_result_chunks(
+                        &input.analysis_run_id,
+                        Some(OPERATION_RESULT_SELECTION_BATCH_SIZE),
+                        result_offset,
+                    )
+                    .await?
             };
-            persist_operation_result_chunk(&state, &chunk).await?;
-            run.progress = OperationProgress {
-                phase: Some("applying".to_string()),
-                completed: Some(index + 1),
-                total: Some(total),
-                message: Some("Revalidating and applying selected sidecar updates.".to_string()),
-            };
-            persist_operation_run(&state, &run).await?;
-            tokio::task::yield_now().await;
+            if result_chunks.is_empty() {
+                break;
+            }
+            let page_len = result_chunks.len();
+            result_offset += page_len;
+            for result_chunk in result_chunks {
+                if result_chunk.result_type != OPERATION_RESULT_TYPE_GEO_PROPOSAL_CHUNK {
+                    continue;
+                }
+                let proposal_chunk: GeoProposalChunk = serde_json::from_value(result_chunk.payload)
+                    .context("invalid persisted geolocation proposal chunk")?;
+                if proposal_chunk.analysis_run_id != input.analysis_run_id {
+                    bail!("proposal chunk does not belong to the referenced analysis run");
+                }
+                let whole_chunk_selected = selected_chunk_ids.contains(&proposal_chunk.id);
+                for proposal in proposal_chunk.proposals {
+                    if !whole_chunk_selected && !selected_proposal_ids.contains(&proposal.id) {
+                        continue;
+                    }
+                    wait_for_higher_priority_work(&state).await;
+                    let item_result =
+                        apply_one_geo_proposal(&state, &worker, &input.analysis_run_id, &proposal)
+                            .await;
+                    counters.record(item_result.outcome);
+                    let chunk = OperationResultChunk {
+                        run_id: run.run_id.clone(),
+                        chunk_id: format!("apply-{}", item_result.proposal_id),
+                        result_type: OPERATION_RESULT_TYPE_GEO_APPLY_ITEM.to_string(),
+                        created_at_unix: super::unix_ts(),
+                        payload: serde_json::to_value(&item_result)?,
+                    };
+                    persist_operation_result_chunk(&state, &chunk).await?;
+                    selected_count += 1;
+                    run.progress = OperationProgress {
+                        phase: Some("applying".to_string()),
+                        completed: Some(selected_count),
+                        total: None,
+                        message: Some(
+                            "Revalidating and applying selected sidecar updates.".to_string(),
+                        ),
+                    };
+                    persist_operation_run(&state, &run).await?;
+                    tokio::task::yield_now().await;
+                }
+            }
+            if page_len < OPERATION_RESULT_SELECTION_BATCH_SIZE {
+                break;
+            }
         }
-        Ok::<_, anyhow::Error>((total, counters))
+        if selected_count == 0 {
+            bail!("the selected proposal IDs do not exist in the referenced analysis run");
+        }
+        Ok::<_, anyhow::Error>((selected_count, counters))
     }
     .await;
 
@@ -1547,43 +1591,6 @@ pub(crate) fn capture_time_for_geolocation_for_test(
     metadata: &storage::CachedMediaMetadata,
 ) -> Option<GeoCaptureTime> {
     capture_time_for_geolocation(path, metadata)
-}
-
-fn selected_proposals(
-    input: &GeoApplyRunInput,
-    result_chunks: Vec<OperationResultChunk>,
-) -> Result<Vec<GeoProposal>> {
-    let selected_chunk_ids = input
-        .proposal_chunk_ids
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let selected_proposal_ids = input
-        .proposal_ids
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut proposals = Vec::new();
-    for result_chunk in result_chunks {
-        if result_chunk.result_type != OPERATION_RESULT_TYPE_GEO_PROPOSAL_CHUNK {
-            continue;
-        }
-        let chunk: GeoProposalChunk = serde_json::from_value(result_chunk.payload)
-            .context("invalid persisted geolocation proposal chunk")?;
-        if chunk.analysis_run_id != input.analysis_run_id {
-            bail!("proposal chunk does not belong to the referenced analysis run");
-        }
-        let whole_chunk_selected = selected_chunk_ids.contains(&chunk.id);
-        for proposal in chunk.proposals {
-            if whole_chunk_selected || selected_proposal_ids.contains(&proposal.id) {
-                proposals.push(proposal);
-            }
-        }
-    }
-    proposals.sort_by(|left, right| left.id.cmp(&right.id));
-    proposals.dedup_by(|left, right| left.id == right.id);
-    if proposals.is_empty() {
-        bail!("the selected proposal IDs do not exist in the referenced analysis run");
-    }
-    Ok(proposals)
 }
 
 #[derive(Default)]
