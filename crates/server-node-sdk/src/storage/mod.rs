@@ -98,7 +98,7 @@ mod turso_impl;
 
 use self::gallery_summary_cache::GallerySummaryCache;
 pub(crate) use self::gallery_summary_cache::{
-    GalleryCaptureSummaryBusyError, GallerySummaryCacheValue, GallerySummaryComputationPermit,
+    GalleryCaptureSummaryBusyError, GallerySummaryCacheValue, GallerySummaryMiss,
     GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
 };
 use self::sqlite_impl::SqliteMetadataStore;

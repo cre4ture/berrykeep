@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::{GalleryIndexMediaFilter, GalleryIndexMediaSummary, GalleryLabelFilter};
 
@@ -93,7 +93,32 @@ impl GallerySummaryProgress {
 
 #[derive(Debug)]
 pub(crate) struct GallerySummaryComputationPermit {
-    _permit: OwnedSemaphorePermit,
+    _capture_miss_permit: Option<OwnedSemaphorePermit>,
+    scope: GallerySummaryScope,
+    in_flight_misses: Arc<Mutex<HashMap<GallerySummaryScope, Arc<Notify>>>>,
+    completion: Arc<Notify>,
+}
+
+impl Drop for GallerySummaryComputationPermit {
+    fn drop(&mut self) {
+        let mut in_flight_misses = self.in_flight_misses.lock().unwrap();
+        if in_flight_misses
+            .get(&self.scope)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.completion))
+        {
+            in_flight_misses.remove(&self.scope);
+        }
+        drop(in_flight_misses);
+        self.completion.notify_waiters();
+    }
+}
+
+/// Claims a cache-miss computation for one summary scope. Followers wait for the leader rather
+/// than consuming another global capture-range permit or running a duplicate aggregate query.
+#[derive(Debug)]
+pub(crate) enum GallerySummaryMiss {
+    Leader(GallerySummaryComputationPermit),
+    Follower(Arc<Notify>),
 }
 
 /// Caches the whole-scope gallery map summary (total entry count + media breakdown) that the
@@ -105,6 +130,7 @@ pub(crate) struct GallerySummaryComputationPermit {
 pub(crate) struct GallerySummaryCache {
     values: Mutex<GallerySummaryCacheValues>,
     trackers: Mutex<HashMap<GallerySummaryScope, Arc<GallerySummaryRefreshTracker>>>,
+    in_flight_misses: Arc<Mutex<HashMap<GallerySummaryScope, Arc<Notify>>>>,
     capture_miss_permits: Arc<Semaphore>,
     capture_refresh_permits: Arc<Semaphore>,
 }
@@ -164,6 +190,7 @@ impl GallerySummaryCache {
         Self {
             values: Mutex::new(GallerySummaryCacheValues::default()),
             trackers: Mutex::new(HashMap::new()),
+            in_flight_misses: Arc::new(Mutex::new(HashMap::new())),
             capture_miss_permits: Arc::new(Semaphore::new(GALLERY_SUMMARY_MAX_CAPTURE_MISSES)),
             capture_refresh_permits: Arc::new(Semaphore::new(
                 GALLERY_SUMMARY_MAX_CAPTURE_REFRESHES,
@@ -196,21 +223,57 @@ impl GallerySummaryCache {
             .unwrap_or_default()
     }
 
-    /// Admits a synchronous cache-miss computation. Capture bounds are arbitrary client input,
-    /// so reject excess novel scopes instead of allowing requests to queue an unbounded number of
-    /// whole-scope aggregate scans. Fixed scopes retain their existing behavior.
-    pub(crate) fn try_capture_miss_permit(
+    /// Claims a synchronous cache-miss computation, coalescing concurrent requests for the same
+    /// scope. Capture bounds are arbitrary client input, so distinct excess novel scopes are
+    /// rejected instead of allowing requests to queue an unbounded number of whole-scope scans.
+    pub(crate) fn try_start_summary_miss(
         &self,
         scope: &GallerySummaryScope,
-    ) -> Result<Option<GallerySummaryComputationPermit>, GalleryCaptureSummaryBusyError> {
-        if !scope.is_capture_filtered() {
-            return Ok(None);
+    ) -> Result<GallerySummaryMiss, GalleryCaptureSummaryBusyError> {
+        let mut in_flight_misses = self.in_flight_misses.lock().unwrap();
+        if let Some(completion) = in_flight_misses.get(scope) {
+            return Ok(GallerySummaryMiss::Follower(completion.clone()));
         }
-        self.capture_miss_permits
-            .clone()
-            .try_acquire_owned()
-            .map(|permit| Some(GallerySummaryComputationPermit { _permit: permit }))
-            .map_err(|_| GalleryCaptureSummaryBusyError)
+        let capture_miss_permit = if scope.is_capture_filtered() {
+            Some(
+                self.capture_miss_permits
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| GalleryCaptureSummaryBusyError)?,
+            )
+        } else {
+            None
+        };
+        let completion = Arc::new(Notify::new());
+        in_flight_misses.insert(scope.clone(), completion.clone());
+        Ok(GallerySummaryMiss::Leader(
+            GallerySummaryComputationPermit {
+                _capture_miss_permit: capture_miss_permit,
+                scope: scope.clone(),
+                in_flight_misses: self.in_flight_misses.clone(),
+                completion,
+            },
+        ))
+    }
+
+    /// Waits only while this exact miss computation remains the leader for `scope`. Creating the
+    /// notification future before checking the map avoids losing a completion that races with a
+    /// follower arriving after the aggregate has already finished.
+    pub(crate) async fn wait_for_summary_miss(
+        &self,
+        scope: &GallerySummaryScope,
+        completion: &Arc<Notify>,
+    ) {
+        let notified = completion.notified();
+        let still_running = self
+            .in_flight_misses
+            .lock()
+            .unwrap()
+            .get(scope)
+            .is_some_and(|current| Arc::ptr_eq(current, completion));
+        if still_running {
+            notified.await;
+        }
     }
 
     /// Claims the right to refresh `scope` in the background. Returns `None` if another task is
@@ -285,6 +348,13 @@ mod tests {
         scope
     }
 
+    fn expect_miss_leader(miss: GallerySummaryMiss) -> GallerySummaryComputationPermit {
+        match miss {
+            GallerySummaryMiss::Leader(permit) => permit,
+            GallerySummaryMiss::Follower(_) => panic!("new scope should elect a miss leader"),
+        }
+    }
+
     #[test]
     fn bounds_fixed_scopes_and_evicts_the_least_recently_used_value() {
         let cache = GallerySummaryCache::new();
@@ -324,16 +394,17 @@ mod tests {
         let cache = GallerySummaryCache::new();
         let miss_permits = (0..GALLERY_SUMMARY_MAX_CAPTURE_MISSES)
             .map(|index| {
-                cache
-                    .try_capture_miss_permit(&capture_scope(index))
-                    .expect("capture summary should be admitted below the limit")
-                    .expect("capture summary should own a permit")
+                expect_miss_leader(
+                    cache
+                        .try_start_summary_miss(&capture_scope(index))
+                        .expect("capture summary should be admitted below the limit"),
+                )
             })
             .collect::<Vec<_>>();
 
         assert!(
             cache
-                .try_capture_miss_permit(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_MISSES))
+                .try_start_summary_miss(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_MISSES))
                 .is_err()
         );
         let capture_refresh = cache
@@ -353,13 +424,53 @@ mod tests {
         cache.finish_refresh(&capture_scope(GALLERY_SUMMARY_MAX_CAPTURE_MISSES + 1));
         drop(next_refresh);
 
-        assert!(cache.try_capture_miss_permit(&scope(99)).unwrap().is_none());
+        let fixed_miss = expect_miss_leader(
+            cache
+                .try_start_summary_miss(&scope(99))
+                .expect("fixed scope misses should not use capture permits"),
+        );
         let fixed_refresh = cache
             .try_start_refresh(&scope(99))
             .expect("fixed-scope refreshes should not use capture permits");
         cache.finish_refresh(&scope(99));
         drop(fixed_refresh);
+        drop(fixed_miss);
         drop(miss_permits);
+    }
+
+    #[tokio::test]
+    async fn coalesces_concurrent_capture_misses_by_scope() {
+        let cache = GallerySummaryCache::new();
+        let scope = capture_scope(0);
+        let leader = expect_miss_leader(cache.try_start_summary_miss(&scope).unwrap());
+        let completion = match cache.try_start_summary_miss(&scope).unwrap() {
+            GallerySummaryMiss::Follower(completion) => completion,
+            GallerySummaryMiss::Leader(_) => panic!("existing miss should have one leader"),
+        };
+        let second_scope_leader = expect_miss_leader(
+            cache
+                .try_start_summary_miss(&capture_scope(1))
+                .expect("same-scope follower must not consume a capture permit"),
+        );
+        assert!(cache.try_start_summary_miss(&capture_scope(2)).is_err());
+
+        let wait = cache.wait_for_summary_miss(&scope, &completion);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut wait)
+                .await
+                .is_err(),
+            "the follower should wait while its scope's leader is still computing"
+        );
+        drop(leader);
+        wait.await;
+        let replacement_leader = expect_miss_leader(
+            cache
+                .try_start_summary_miss(&scope)
+                .expect("a completed scope should accept a later cache miss"),
+        );
+        drop(replacement_leader);
+        drop(second_scope_leader);
     }
 
     #[test]

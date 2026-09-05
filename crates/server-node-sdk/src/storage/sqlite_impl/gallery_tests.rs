@@ -1,7 +1,7 @@
 use super::*;
 use crate::storage::{
-    GalleryCaptureSummaryBusyError, GalleryIndexMediaFilter, GalleryViewportBounds,
-    MediaCacheStatus,
+    GalleryCaptureSummaryBusyError, GalleryIndexMediaFilter, GallerySummaryMiss,
+    GalleryViewportBounds, MediaCacheStatus,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -739,16 +739,22 @@ async fn gallery_map_rejects_excess_capture_summary_misses_before_reading_the_vi
         captured_until_unix: None,
         label_filter: Default::default(),
     };
-    let _first_permit = store
+    let _first_permit = match store
         .gallery_map_summary_cache
-        .try_capture_miss_permit(&capture_scope(1))
+        .try_start_summary_miss(&capture_scope(1))
         .unwrap()
-        .expect("first capture miss should be admitted");
-    let _second_permit = store
+    {
+        GallerySummaryMiss::Leader(permit) => permit,
+        GallerySummaryMiss::Follower(_) => panic!("first capture miss should be admitted"),
+    };
+    let _second_permit = match store
         .gallery_map_summary_cache
-        .try_capture_miss_permit(&capture_scope(2))
+        .try_start_summary_miss(&capture_scope(2))
         .unwrap()
-        .expect("second capture miss should be admitted");
+    {
+        GallerySummaryMiss::Leader(permit) => permit,
+        GallerySummaryMiss::Follower(_) => panic!("second capture miss should be admitted"),
+    };
 
     let viewport = GalleryViewportBounds {
         south: -90.0,

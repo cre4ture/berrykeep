@@ -13,7 +13,7 @@ use super::super::{
     GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaFilter,
     GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster,
     GalleryMapClusterEntriesQuery, GalleryMapClusterPage, GalleryMapClusterQuery,
-    GallerySummaryCacheValue, GallerySummaryComputationPermit, GallerySummaryProgress,
+    GallerySummaryCacheValue, GallerySummaryMiss, GallerySummaryProgress,
     GallerySummaryRefreshStatus, GallerySummaryScope, GalleryViewportBounds, ManifestSummary,
     current_media_cache_metadata, decode_gallery_labels, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
@@ -118,6 +118,8 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
         GALLERY_LABELS_COLUMN_DEFINITION,
     )
     .await?;
+    // Chunked summary refreshes need `key` for stable pagination. Keep large label JSON out of
+    // this otherwise covering index: label-filtered summaries can fetch it from the table.
     connection
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_gallery_objects_capture_summary
@@ -127,8 +129,7 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                  media_type,
                  media_status,
                  geotagged,
-                 key,
-                 labels_json
+                 key
              )",
             (),
         )
@@ -659,9 +660,11 @@ impl TursoMetadataStore {
             label_filter: query.label_filter.clone(),
         };
         let cached_summary = self.gallery_map_summary_cache.cached(&scope);
-        let capture_miss_permit = if cached_summary.is_none() {
-            self.gallery_map_summary_cache
-                .try_capture_miss_permit(&scope)?
+        let summary_miss = if cached_summary.is_none() {
+            Some(
+                self.gallery_map_summary_cache
+                    .try_start_summary_miss(&scope)?,
+            )
         } else {
             None
         };
@@ -699,7 +702,7 @@ impl TursoMetadataStore {
                 &history_id,
                 cache_revision,
                 cached_summary,
-                capture_miss_permit,
+                summary_miss,
             )
             .await?;
 
@@ -717,69 +720,91 @@ impl TursoMetadataStore {
 
     /// Returns the whole-scope gallery map summary for `scope`, serving a cached (possibly
     /// stale) value immediately rather than blocking the caller on the underlying aggregate
-    /// query. See `SqliteMetadataStore::gallery_map_summary` for the same policy on the SQLite
-    /// backend.
+    /// query. A cold cache is computed by one leader while callers for the same scope wait for
+    /// its result. See `SqliteMetadataStore::gallery_map_summary` for the SQLite policy.
     async fn gallery_map_summary(
         &self,
         scope: GallerySummaryScope,
         history_id: &str,
         revision: u64,
         cached: Option<GallerySummaryCacheValue>,
-        _capture_miss_permit: Option<GallerySummaryComputationPermit>,
+        summary_miss: Option<GallerySummaryMiss>,
     ) -> Result<(usize, GalleryIndexMediaSummary, GallerySummaryRefreshStatus)> {
-        // Prefer a value populated while the viewport query was running, but retain the
-        // preflight snapshot in case that scope was evicted in the meantime.
-        let cached = self.gallery_map_summary_cache.cached(&scope).or(cached);
-        if let Some(cached) = cached {
-            if cached.history_id == history_id && cached.revision == revision {
-                return Ok((
-                    cached.total_entry_count,
-                    cached.media_summary,
-                    GallerySummaryRefreshStatus::default(),
-                ));
-            }
-            if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
-                let connections = self.gallery_summary_read_connection_factory();
-                let cache = self.gallery_map_summary_cache.clone();
-                let refresh_scope = scope.clone();
-                let estimate = Some(cached.total_entry_count);
-                tokio::spawn(async move {
-                    let result = match connections.open().await {
-                        Ok(connection) => {
-                            let result = query_gallery_map_summary(
-                                &connection,
-                                &refresh_scope,
-                                estimate,
-                                Some(&progress),
-                            )
-                            .await;
-                            drop(connection);
-                            result
+        let mut cached_snapshot = cached;
+        let mut summary_miss = summary_miss;
+        loop {
+            // Prefer a value populated while the viewport query was running, but retain the
+            // preflight snapshot in case that scope was evicted in the meantime.
+            let cached = self
+                .gallery_map_summary_cache
+                .cached(&scope)
+                .or(cached_snapshot.take());
+            if let Some(cached) = cached {
+                if cached.history_id == history_id && cached.revision == revision {
+                    return Ok((
+                        cached.total_entry_count,
+                        cached.media_summary,
+                        GallerySummaryRefreshStatus::default(),
+                    ));
+                }
+                if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
+                    let connections = self.gallery_summary_read_connection_factory();
+                    let cache = self.gallery_map_summary_cache.clone();
+                    let refresh_scope = scope.clone();
+                    let estimate = Some(cached.total_entry_count);
+                    tokio::spawn(async move {
+                        let result = match connections.open().await {
+                            Ok(connection) => {
+                                let result = query_gallery_map_summary(
+                                    &connection,
+                                    &refresh_scope,
+                                    estimate,
+                                    Some(&progress),
+                                )
+                                .await;
+                                drop(connection);
+                                result
+                            }
+                            Err(error) => Err(error),
+                        };
+                        match result {
+                            Ok(value) => cache.store(refresh_scope.clone(), value),
+                            Err(error) => {
+                                warn!(error = %error, "failed to refresh gallery map summary in background")
+                            }
                         }
-                        Err(error) => Err(error),
-                    };
-                    match result {
-                        Ok(value) => cache.store(refresh_scope.clone(), value),
-                        Err(error) => {
-                            warn!(error = %error, "failed to refresh gallery map summary in background")
-                        }
-                    }
-                    cache.finish_refresh(&refresh_scope);
-                });
+                        cache.finish_refresh(&refresh_scope);
+                    });
+                }
+                let status = self.gallery_map_summary_cache.status(&scope);
+                return Ok((cached.total_entry_count, cached.media_summary, status));
             }
-            let status = self.gallery_map_summary_cache.status(&scope);
-            return Ok((cached.total_entry_count, cached.media_summary, status));
-        }
 
-        let connection = self.gallery_read_connection().await?;
-        let value = query_gallery_map_summary(&connection, &scope, None, None).await?;
-        drop(connection);
-        self.gallery_map_summary_cache.store(scope, value.clone());
-        Ok((
-            value.total_entry_count,
-            value.media_summary,
-            GallerySummaryRefreshStatus::default(),
-        ))
+            match summary_miss.take() {
+                Some(GallerySummaryMiss::Follower(completion)) => {
+                    self.gallery_map_summary_cache
+                        .wait_for_summary_miss(&scope, &completion)
+                        .await;
+                }
+                Some(GallerySummaryMiss::Leader(_computation)) => {
+                    let connection = self.gallery_read_connection().await?;
+                    let value = query_gallery_map_summary(&connection, &scope, None, None).await?;
+                    drop(connection);
+                    self.gallery_map_summary_cache.store(scope, value.clone());
+                    return Ok((
+                        value.total_entry_count,
+                        value.media_summary,
+                        GallerySummaryRefreshStatus::default(),
+                    ));
+                }
+                None => {
+                    summary_miss = Some(
+                        self.gallery_map_summary_cache
+                            .try_start_summary_miss(&scope)?,
+                    );
+                }
+            }
+        }
     }
 
     pub(super) async fn query_turso_gallery_map_cluster_entries(
