@@ -41,6 +41,7 @@ import {
 } from "./GalleryBasemapMap";
 import {
   galleryCaptureDateBounds,
+  galleryCaptureDateRangeIsValid,
   type GalleryCaptureDateBounds
 } from "./gallery-capture-date";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -625,15 +626,26 @@ export function GallerySurface({
     mediaFilter
   );
   const captureDateBounds = galleryCaptureDateBounds(captureDateFrom, captureDateThrough);
+  const hasValidCaptureDateRange = galleryCaptureDateRangeIsValid(
+    captureDateFrom,
+    captureDateThrough
+  );
   const captureDateFilterActive =
     captureDateBounds.capturedFromUnix !== undefined ||
     captureDateBounds.capturedUntilUnix !== undefined;
   useEffect(() => {
+    if (!hasValidCaptureDateRange) {
+      return;
+    }
     const timeout = window.setTimeout(() => {
       setCaptureDateReloadBounds(captureDateBounds);
     }, GALLERY_CAPTURE_DATE_RELOAD_DEBOUNCE_MS);
     return () => window.clearTimeout(timeout);
-  }, [captureDateBounds.capturedFromUnix, captureDateBounds.capturedUntilUnix]);
+  }, [
+    captureDateBounds.capturedFromUnix,
+    captureDateBounds.capturedUntilUnix,
+    hasValidCaptureDateRange
+  ]);
   const currentGalleryReloadSignature = galleryReloadSignature(
     viewMode,
     sortOrder,

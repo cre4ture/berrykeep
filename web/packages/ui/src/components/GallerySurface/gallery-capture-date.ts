@@ -26,6 +26,20 @@ export function galleryCaptureDateBounds(
   };
 }
 
+/**
+ * A complete, reversed range is invalid at the API boundary. In-progress native date input
+ * values can also be temporarily unparsable, so callers should retain their last applied range
+ * until the two controls form a valid range again.
+ */
+export function galleryCaptureDateRangeIsValid(fromDate: string, throughDate: string): boolean {
+  const from = localDateStart(fromDate);
+  const through = localDateStart(throughDate);
+  if ((fromDate !== "" && from === null) || (throughDate !== "" && through === null)) {
+    return false;
+  }
+  return from === null || through === null || from <= through;
+}
+
 function localDateStart(value: string): Date | null {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
   if (!match) {

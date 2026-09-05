@@ -899,6 +899,58 @@ test("client-ui gallery preserves the lower capture date while editing the upper
   await expect(capturedFrom).toHaveValue("2024-04-05");
 });
 
+test("client-ui gallery retains its applied range while a date range is reversed", async ({
+  page
+}) => {
+  const gridRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list")) {
+      gridRequests.push(url);
+    }
+  });
+
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  const capturedFrom = page.getByLabel("Captured from");
+  const capturedThrough = page.getByLabel("Captured through");
+  await capturedFrom.fill("2024-04-05");
+  await capturedThrough.fill("2024-04-06");
+  await expect
+    .poll(() =>
+      gridRequests.some(
+        (request) =>
+          request.searchParams.has("captured_from_unix") &&
+          request.searchParams.has("captured_until_unix")
+      )
+    )
+    .toBe(true);
+  gridRequests.length = 0;
+
+  await capturedFrom.fill("2030-01-01");
+  await page.waitForTimeout(500);
+  expect(gridRequests).toHaveLength(0);
+
+  await capturedThrough.focus();
+  await expect(capturedThrough).toHaveValue("2030-01-01");
+  const [capturedFromUnix, capturedUntilUnix] = await page.evaluate(() => [
+    Math.floor(new Date(2030, 0, 1).getTime() / 1_000),
+    Math.floor(new Date(2030, 0, 2).getTime() / 1_000)
+  ]);
+  await expect
+    .poll(() =>
+      gridRequests.some(
+        (request) =>
+          request.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
+          request.searchParams.get("captured_until_unix") === String(capturedUntilUnix)
+      )
+    )
+    .toBe(true);
+});
+
 test("client-ui gallery debounces automatic capture-date reloads", async ({ page }) => {
   const filteredGridRequests: URL[] = [];
   page.on("request", (request) => {
