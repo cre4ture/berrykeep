@@ -16493,31 +16493,32 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
         (older, newer)
     };
 
-    let captured_page_query = |offset| super::StoreIndexQuery {
-        prefix: Some("gallery".to_string()),
-        depth: Some(64),
-        snapshot: None,
-        view: Some(super::StoreIndexView::Tree),
-        cursor: None,
-        page_size: None,
-        offset: Some(offset),
-        limit: Some(1),
-        sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-        media_filter: Some(super::StoreIndexMediaFilter::Image),
-        captured_from_unix: Some(50),
-        captured_until_unix: Some(250),
-        south: None,
-        west: None,
-        north: None,
-        east: None,
-        require_labels: None,
-        exclude_labels: None,
-    };
+    let gallery_page_query =
+        |offset, captured_from_unix, captured_until_unix| super::StoreIndexQuery {
+            prefix: Some("gallery".to_string()),
+            depth: Some(64),
+            snapshot: None,
+            view: Some(super::StoreIndexView::Tree),
+            cursor: None,
+            page_size: None,
+            offset: Some(offset),
+            limit: Some(1),
+            sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+            media_filter: Some(super::StoreIndexMediaFilter::Image),
+            captured_from_unix,
+            captured_until_unix,
+            south: None,
+            west: None,
+            north: None,
+            east: None,
+            require_labels: None,
+            exclude_labels: None,
+        };
 
     let first_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
-            axum::extract::Query(captured_page_query(0)),
+            axum::extract::Query(gallery_page_query(0, None, None)),
         )
         .await,
     );
@@ -16552,13 +16553,13 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     );
     assert_eq!(first_payload["total_entry_count"], 2);
     assert_eq!(first_payload["media_summary"]["ready_count"], 2);
-    assert!(first_payload["sync_token"].is_null());
+    assert!(first_payload["sync_token"].as_str().is_some());
     assert!(first_payload["consistency_token"].as_str().is_some());
 
     let second_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
-            axum::extract::Query(captured_page_query(1)),
+            axum::extract::Query(gallery_page_query(1, None, None)),
         )
         .await,
     );
@@ -16584,6 +16585,59 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
         "media summaries cover the whole filtered scope on every page"
     );
 
+    let captured_first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(gallery_page_query(0, Some(50), Some(250))),
+        )
+        .await,
+    );
+    assert_eq!(captured_first_response.status(), StatusCode::OK);
+    let captured_first_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(captured_first_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        captured_first_payload["entries"][0]["path"],
+        "gallery/newer.png"
+    );
+    assert!(captured_first_payload["sync_token"].is_null());
+    assert!(
+        captured_first_payload["consistency_token"]
+            .as_str()
+            .is_some()
+    );
+
+    let captured_second_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(gallery_page_query(1, Some(50), Some(250))),
+        )
+        .await,
+    );
+    assert_eq!(captured_second_response.status(), StatusCode::OK);
+    let captured_second_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(captured_second_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        captured_second_payload["entries"][0]["path"],
+        "gallery/older.png"
+    );
+    assert!(captured_second_payload["sync_token"].is_null());
+    assert_eq!(
+        captured_first_payload["consistency_token"], captured_second_payload["consistency_token"],
+        "captured-sort pages must identify the same gallery revision"
+    );
+    assert_eq!(
+        captured_first_payload["media_summary"], captured_second_payload["media_summary"],
+        "media summaries cover the whole capture-filtered scope on every page"
+    );
+
     {
         let mut locked = lock_store(&state, "tests.state.store").await;
         let added = locked
@@ -16605,7 +16659,7 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     let invalidated_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
-            axum::extract::Query(captured_page_query(0)),
+            axum::extract::Query(gallery_page_query(0, Some(50), Some(250))),
         )
         .await,
     );
@@ -16617,7 +16671,7 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     )
     .unwrap();
     assert_ne!(
-        first_payload["consistency_token"], invalidated_payload["consistency_token"],
+        captured_first_payload["consistency_token"], invalidated_payload["consistency_token"],
         "a gallery revision must invalidate capture-filtered offset pages"
     );
 
