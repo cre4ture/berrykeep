@@ -6709,6 +6709,19 @@ impl IronMeshClient {
             .await
             .with_context(|| format!("failed to start upload session for key={key}"))?;
         let response = routed.response;
+        if response.status == StatusCode::CONFLICT {
+            return Err(ObjectMutationConflict::new(
+                "upload-session-start",
+                match (object_id, expected_revision) {
+                    (Some(object_id), Some(expected_revision)) => {
+                        format!("object_id={object_id} expected_revision={expected_revision}")
+                    }
+                    (Some(object_id), None) => format!("object_id={object_id}"),
+                    _ => format!("path={key}"),
+                },
+            )
+            .into());
+        }
         if !response.status.is_success() {
             bail!(
                 "server rejected upload session start for key={key}: {}",

@@ -2224,6 +2224,52 @@ async fn spawn_upload_session_http_server_with_start_gate(
     (format!("http://{addr}"), state, server)
 }
 
+#[tokio::test]
+async fn large_identity_upload_conflict_is_reported_as_object_mutation_conflict() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("listener address should be available");
+    let server = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/api/v1/store/uploads/start",
+            post(|| async { StatusCode::CONFLICT }),
+        );
+        axum::serve(listener, app)
+            .await
+            .expect("conflict test server should run");
+    });
+
+    let client = IronMeshClient::from_direct_base_url(format!("http://{addr}"));
+    let payload = vec![0_u8; LARGE_UPLOAD_THRESHOLD_BYTES + 1];
+    let error = tokio::task::spawn_blocking(move || {
+        let mut reader = std::io::Cursor::new(payload);
+        match client.put_reader_with_identity_blocking(
+            "docs/large.bin",
+            Some("obj-large"),
+            Some("revision-stale"),
+            &mut reader,
+            (LARGE_UPLOAD_THRESHOLD_BYTES + 1) as u64,
+        ) {
+            Ok(_) => panic!("stale object mutation should not upload"),
+            Err(error) => error,
+        }
+    })
+    .await
+    .expect("blocking upload task should not panic");
+
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<ObjectMutationConflict>()),
+        "large upload conflicts must use the same conflict type as direct mutations: {error:#}"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
 #[derive(Clone)]
 struct RelayTestSecurity {
     cluster_id: uuid::Uuid,
