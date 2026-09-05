@@ -895,6 +895,7 @@ mod tests {
             remote: vec![sync_core::NamespaceEntry {
                 path: "docs/readme.txt".to_string(),
                 kind: EntryKind::File,
+                object_id: Some("obj-readme".to_string()),
                 version: Some("v1".to_string()),
                 content_hash: Some("manifest-hash".to_string()),
                 content_fingerprint: Some("shared-fingerprint".to_string()),

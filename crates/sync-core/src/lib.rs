@@ -61,6 +61,10 @@ pub struct NamespaceMediaMetadata {
 pub struct NamespaceEntry {
     pub path: String,
     pub kind: EntryKind,
+    /// Stable remote object identity. Revisions describe versions of this
+    /// object; paths describe its current namespace location.
+    #[serde(default)]
+    pub object_id: Option<String>,
     pub version: Option<String>,
     pub content_hash: Option<String>,
     #[serde(default)]
@@ -91,6 +95,7 @@ impl NamespaceEntry {
         Self {
             path: normalize_path(path),
             kind: EntryKind::File,
+            object_id: None,
             version: Some(version.into()),
             content_hash: Some(hash.into()),
             content_fingerprint: None,
@@ -104,6 +109,7 @@ impl NamespaceEntry {
         Self {
             path: normalize_path(path),
             kind: EntryKind::Directory,
+            object_id: None,
             version: None,
             content_hash: None,
             content_fingerprint: None,
@@ -111,6 +117,12 @@ impl NamespaceEntry {
             modified_at_unix: None,
             media: None,
         }
+    }
+
+    pub fn with_object_id(mut self, object_id: impl Into<String>) -> Self {
+        let object_id = object_id.into();
+        self.object_id = (!object_id.trim().is_empty()).then_some(object_id);
+        self
     }
 }
 

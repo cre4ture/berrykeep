@@ -1,10 +1,12 @@
 use crate::cfapi::{
-    cf_ensure_placeholder_identity, cf_get_placeholder_standard_info, cf_set_in_sync_with_usn,
-    cf_set_not_in_sync, describe_path_state,
+    cf_ensure_placeholder_identity, cf_get_placeholder_standard_info,
+    cf_get_placeholder_standard_info_with_identity, cf_set_in_sync_with_usn, cf_set_not_in_sync,
+    cf_update_placeholder_file_identity, describe_path_state,
 };
-use crate::placeholder_metadata::record_in_sync_content_baseline;
+use crate::helpers::{PlaceholderFileIdentity, decode_placeholder_file_identity};
 use crate::runtime::{
-    CfapiRuntime, UploadReceipt, Uploader, reconcile_ancestor_directory_sync_states,
+    CfapiRuntime, UploadReceipt, Uploader, is_remote_mutation_conflict,
+    reconcile_ancestor_directory_sync_states,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -210,6 +212,13 @@ struct LocalFileSnapshot {
 enum UploadAttemptOutcome {
     Settled,
     Retry,
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UploadObjectContext {
+    object_id: Option<String>,
+    expected_revision: Option<String>,
 }
 
 pub(crate) fn schedule_debounced_close_upload(
@@ -379,7 +388,9 @@ fn spawn_debounced_close_upload(
             if latest != generation {
                 let follow_up_delay = match outcome {
                     UploadAttemptOutcome::Retry => CLOSE_UPLOAD_RETRY_DELAY,
-                    UploadAttemptOutcome::Settled => CLOSE_UPLOAD_QUIET_PERIOD,
+                    UploadAttemptOutcome::Settled | UploadAttemptOutcome::Conflict => {
+                        CLOSE_UPLOAD_QUIET_PERIOD
+                    }
                 };
                 tracing::info!(
                     "close-completion: newer generation {} is pending for {}; scheduling follow-up after {:?} ({})",
@@ -430,10 +441,10 @@ fn spawn_debounced_close_upload(
                         CLOSE_UPLOAD_RETRY_DELAY,
                     );
                 }
-                UploadAttemptOutcome::Settled => {
+                UploadAttemptOutcome::Settled | UploadAttemptOutcome::Conflict => {
                     close_upload_trace_event(format!(
-                        "worker-settled path={} generation={}",
-                        relative_path, latest
+                        "worker-finished path={} generation={} outcome={outcome:?}",
+                        relative_path, latest,
                     ));
                     debounce
                         .pending_generations
@@ -580,8 +591,8 @@ fn process_debounced_close_upload(
         }
     };
 
-    let mut upload_usn = match prepare_file_for_upload(&file, relative_path) {
-        Ok(usn) => usn,
+    let (mut upload_usn, object_context) = match prepare_file_for_upload(&file, relative_path) {
+        Ok(prepared) => prepared,
         Err(err) => {
             tracing::info!(
                 "close-completion: failed to prepare {} for upload: {:#}",
@@ -604,23 +615,35 @@ fn process_debounced_close_upload(
     );
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
 
-    let upload_receipt =
-        match upload_file_on_close(worker, relative_path, snapshot_before.len, file) {
-            Ok(receipt) => receipt,
-            Err(err) => {
-                tracing::info!(
-                    "cfapi upload error: path={} bytes={} error={:#}",
-                    relative_path,
-                    snapshot_before.len,
-                    err
+    let upload_receipt = match upload_file_on_close(
+        worker,
+        relative_path,
+        &object_context,
+        snapshot_before.len,
+        file,
+    ) {
+        Ok(receipt) => receipt,
+        Err(err) => {
+            tracing::info!(
+                "cfapi upload error: path={} bytes={} error={:#}",
+                relative_path,
+                snapshot_before.len,
+                err
+            );
+            close_upload_trace_event(format!(
+                "upload-error path={} bytes={} error={:#}",
+                relative_path, snapshot_before.len, err
+            ));
+            if is_remote_mutation_conflict(&err) {
+                tracing::warn!(
+                    "close-completion: preserving unsynchronized local change after remote mutation conflict for {}",
+                    relative_path
                 );
-                close_upload_trace_event(format!(
-                    "upload-error path={} bytes={} error={:#}",
-                    relative_path, snapshot_before.len, err
-                ));
-                return UploadAttemptOutcome::Retry;
+                return UploadAttemptOutcome::Conflict;
             }
-        };
+            return UploadAttemptOutcome::Retry;
+        }
+    };
 
     let snapshot_after = match capture_path_snapshot(&full_path) {
         Ok(snapshot) => snapshot,
@@ -646,6 +669,17 @@ fn process_debounced_close_upload(
     };
 
     if snapshot_after != snapshot_before {
+        if let Err(err) = record_upload_receipt_after_concurrent_change(
+            &full_path,
+            relative_path,
+            &upload_receipt,
+            worker.provider_instance_id,
+        ) {
+            tracing::warn!(
+                "close-completion: failed recording the accepted server revision for concurrently changed {}: {err:#}",
+                relative_path
+            );
+        }
         tracing::info!(
             "close-completion: {} changed during upload, scheduling retry snapshot_before={:?} snapshot_after={:?} state={}",
             relative_path,
@@ -673,9 +707,13 @@ fn process_debounced_close_upload(
         .open(&full_path)
     {
         Ok(file_for_sync) => {
-            if let Err(err) =
-                ensure_placeholder_then_set_in_sync(&file_for_sync, relative_path, &mut upload_usn)
-            {
+            if let Err(err) = finalize_placeholder_after_upload(
+                &file_for_sync,
+                relative_path,
+                &upload_receipt,
+                worker.provider_instance_id,
+                &mut upload_usn,
+            ) {
                 tracing::info!(
                     "close-completion: failed to mark {} in sync after upload: {:#}",
                     relative_path,
@@ -703,20 +741,6 @@ fn process_debounced_close_upload(
     }
 
     reconcile_ancestor_directory_sync_states(&worker.sync_root, relative_path);
-    if let Some(in_sync_content_fingerprint) = upload_receipt.in_sync_content_fingerprint.as_deref()
-        && let Err(err) = record_in_sync_content_baseline(
-            &worker.sync_root,
-            relative_path,
-            worker.provider_instance_id,
-            in_sync_content_fingerprint,
-        )
-    {
-        tracing::info!(
-            "close-completion: failed to record in-sync content baseline for {}: {:#}",
-            relative_path,
-            err
-        );
-    }
     tracing::info!(
         "cfapi uploaded local file: path={} bytes={} final_state={}",
         relative_path,
@@ -730,18 +754,98 @@ fn process_debounced_close_upload(
     UploadAttemptOutcome::Settled
 }
 
-fn prepare_file_for_upload(file: &std::fs::File, relative_path: &str) -> Result<i64> {
-    cf_ensure_placeholder_identity(file, relative_path)?;
-    cf_set_not_in_sync(file)
-}
-
-fn ensure_placeholder_then_set_in_sync(
+fn prepare_file_for_upload(
     file: &std::fs::File,
     relative_path: &str,
+) -> Result<(i64, UploadObjectContext)> {
+    cf_ensure_placeholder_identity(file, relative_path)?;
+    let info = cf_get_placeholder_standard_info_with_identity(file)?;
+    let identity = decode_placeholder_file_identity(info.file_identity()).ok_or_else(|| {
+        anyhow::anyhow!("placeholder identity is not decodable for {relative_path}")
+    })?;
+    let object_id = identity.object_id.filter(|value| !value.trim().is_empty());
+    let expected_revision = identity
+        .remote_version
+        .filter(|value| !value.trim().is_empty());
+    if object_id.is_some() != expected_revision.is_some() {
+        bail!(
+            "refusing ambiguous upload for {relative_path}: object_id and expected_revision must either both be present or both be absent"
+        );
+    }
+    let upload_usn = cf_set_not_in_sync(file)?;
+    Ok((
+        upload_usn,
+        UploadObjectContext {
+            object_id,
+            expected_revision,
+        },
+    ))
+}
+
+fn finalize_placeholder_after_upload(
+    file: &std::fs::File,
+    relative_path: &str,
+    receipt: &UploadReceipt,
+    provider_instance_id: uuid::Uuid,
     upload_usn: &mut i64,
 ) -> Result<()> {
-    cf_ensure_placeholder_identity(file, relative_path)?;
+    record_placeholder_upload_receipt(file, relative_path, receipt, provider_instance_id, true)?;
     cf_set_in_sync_with_usn(file, upload_usn)
+}
+
+fn record_placeholder_upload_receipt(
+    file: &std::fs::File,
+    relative_path: &str,
+    receipt: &UploadReceipt,
+    provider_instance_id: uuid::Uuid,
+    update_content_baseline: bool,
+) -> Result<()> {
+    cf_ensure_placeholder_identity(file, relative_path)?;
+    let info = cf_get_placeholder_standard_info_with_identity(file)?;
+    let mut identity = decode_placeholder_file_identity(info.file_identity())
+        .unwrap_or_else(|| PlaceholderFileIdentity::new(relative_path));
+    let receipt_object_id = receipt
+        .object_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("upload returned no object_id for {relative_path}"))?;
+    if identity
+        .object_id
+        .as_deref()
+        .is_some_and(|object_id| object_id != receipt_object_id)
+    {
+        bail!("upload changed object identity unexpectedly for {relative_path}");
+    }
+    let remote_version = receipt
+        .remote_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("upload returned no revision for {relative_path}"))?;
+    identity.object_id = Some(receipt_object_id.to_string());
+    identity.path = relative_path.replace('\\', "/");
+    identity.remote_version = Some(remote_version.to_string());
+    identity.provider_instance_id = Some(provider_instance_id);
+    if update_content_baseline
+        && let Some(fingerprint) = receipt.in_sync_content_fingerprint.as_deref()
+    {
+        identity.set_in_sync_content_baseline(fingerprint);
+    }
+    cf_update_placeholder_file_identity(file, &identity.encoded())
+}
+
+fn record_upload_receipt_after_concurrent_change(
+    full_path: &Path,
+    relative_path: &str,
+    receipt: &UploadReceipt,
+    provider_instance_id: uuid::Uuid,
+) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(full_path)?;
+    record_placeholder_upload_receipt(&file, relative_path, receipt, provider_instance_id, false)
 }
 
 fn capture_file_snapshot(file: &std::fs::File) -> Result<LocalFileSnapshot> {
@@ -763,6 +867,7 @@ fn capture_path_snapshot(path: &Path) -> std::io::Result<LocalFileSnapshot> {
 fn upload_file_on_close(
     worker: &UploadWorkerContext,
     relative_path: &str,
+    object_context: &UploadObjectContext,
     metadata_len: u64,
     file: std::fs::File,
 ) -> Result<UploadReceipt> {
@@ -773,9 +878,13 @@ fn upload_file_on_close(
     );
 
     let mut reader = file;
-    let upload_receipt = worker
-        .uploader
-        .upload_reader(relative_path, &mut reader, metadata_len)?;
+    let upload_receipt = worker.uploader.upload_reader_for_object(
+        relative_path,
+        object_context.object_id.as_deref(),
+        object_context.expected_revision.as_deref(),
+        &mut reader,
+        metadata_len,
+    )?;
     if let Some(version) = upload_receipt.remote_version.clone() {
         worker.runtime.set_remote_version(relative_path, version);
     }
@@ -813,6 +922,7 @@ mod tests {
                 .expect("upload record lock poisoned")
                 .push((path.to_string(), payload, length));
             Ok(UploadReceipt {
+                object_id: Some("obj-upload".to_string()),
                 remote_version: Some(format!("version:size={length}")),
                 in_sync_content_fingerprint: Some(format!("cfp-upload-{length}")),
             })
@@ -850,8 +960,17 @@ mod tests {
         let payload = b"cfapi-upload-payload";
         let (path, file) = make_test_file(payload);
 
-        let receipt = upload_file_on_close(&worker, "docs/photo.jpg", payload.len() as u64, file)
-            .expect("upload should succeed");
+        let receipt = upload_file_on_close(
+            &worker,
+            "docs/photo.jpg",
+            &UploadObjectContext {
+                object_id: None,
+                expected_revision: None,
+            },
+            payload.len() as u64,
+            file,
+        )
+        .expect("upload should succeed");
 
         let uploads = uploader
             .uploads
