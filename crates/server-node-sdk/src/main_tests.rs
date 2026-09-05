@@ -158,6 +158,33 @@ fn store_history_cache_retains_an_oversized_history_marker() {
 }
 
 #[test]
+fn store_history_refresh_locks_preserve_an_active_prefix_during_eviction() {
+    let mut locks = super::StoreHistoryRefreshLocks::default();
+    let active = locks.lock_for_prefix("active");
+    for prefix in ["idle-one", "idle-two", "idle-three"] {
+        drop(locks.lock_for_prefix(prefix));
+    }
+
+    let replacement = locks.lock_for_prefix("replacement");
+
+    assert!(Arc::ptr_eq(
+        &active,
+        locks
+            .by_prefix
+            .get("active")
+            .expect("the active prefix lock should not be evicted")
+    ));
+    assert!(Arc::ptr_eq(
+        &replacement,
+        locks
+            .by_prefix
+            .get("replacement")
+            .expect("the replacement prefix lock should be retained")
+    ));
+    assert_eq!(locks.by_prefix.len(), 2);
+}
+
+#[test]
 fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
     let tickets = HashMap::from([
         (
@@ -18843,8 +18870,8 @@ async fn build_test_state(
             store_history_refresh_locks: Arc::new(std::sync::Mutex::new(
                 super::StoreHistoryRefreshLocks::default(),
             )),
-            store_history_restore_fallback_permits: Arc::new(tokio::sync::Semaphore::new(
-                super::STORE_HISTORY_RESTORE_FALLBACK_MAX_CONCURRENCY,
+            store_history_refresh_permits: Arc::new(tokio::sync::Semaphore::new(
+                super::STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
             )),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),

@@ -312,7 +312,7 @@ export type StoreHistoryResponse = {
 export type StoreHistoryRestoreEntry = {
   path: string;
   restore_source_path: string;
-  restore_source_object_id?: string;
+  restore_source_object_id: string;
   restore_version_id: string;
 };
 

@@ -1242,11 +1242,13 @@ mod tests {
                         {
                             "path": deleted["path"],
                             "restore_source_path": deleted["restore_source_path"],
+                            "restore_source_object_id": deleted["restore_source_object_id"],
                             "restore_version_id": deleted["restore_version_id"],
                         },
                         {
                             "path": moved["path"],
                             "restore_source_path": moved["restore_source_path"],
+                            "restore_source_object_id": moved["restore_source_object_id"],
                             "restore_version_id": moved["restore_version_id"],
                         },
                     ],

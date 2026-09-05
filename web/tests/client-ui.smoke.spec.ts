@@ -1681,6 +1681,7 @@ test("client-ui explorer keeps loaded history while paging current entries", asy
         path: "deleted.txt",
         entry_type: "historical",
         restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted-001",
         restore_version_id: "version-deleted-001",
         removed_at_unix: 1_712_345_600
       }
@@ -1718,6 +1719,7 @@ test("client-ui explorer only caps depth for historical entries", async ({ page 
         path: "deleted.txt",
         entry_type: "historical",
         restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted",
         restore_version_id: "version-deleted",
         removed_at_unix: 1_712_345_600
       }
@@ -1742,6 +1744,7 @@ test("client-ui explorer restores selected deleted and moved entries in one batc
         path: "deleted.txt",
         entry_type: "historical",
         restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted-001",
         restore_version_id: "version-deleted-001",
         removed_at_unix: 1_712_345_600,
         moved_to_path: null
@@ -1750,6 +1753,7 @@ test("client-ui explorer restores selected deleted and moved entries in one batc
         path: "old-name.txt",
         entry_type: "historical",
         restore_source_path: "old-name.txt",
+        restore_source_object_id: "object-moved-001",
         restore_version_id: "version-moved-001",
         removed_at_unix: 1_712_345_601,
         moved_to_path: "new-name.txt"
@@ -1795,6 +1799,7 @@ test("client-ui explorer splits historical restores into supported batch sizes",
         path,
         entry_type: "historical",
         restore_source_path: path,
+        restore_source_object_id: `object-deleted-${String(index + 1).padStart(3, "0")}`,
         restore_version_id: `version-deleted-${String(index + 1).padStart(3, "0")}`,
         removed_at_unix: 1_712_345_600 + index
       };
@@ -1826,6 +1831,7 @@ test("client-ui explorer retains completed historical restore batches after a la
         path,
         entry_type: "historical",
         restore_source_path: path,
+        restore_source_object_id: `object-deleted-${String(index + 1).padStart(3, "0")}`,
         restore_version_id: `version-deleted-${String(index + 1).padStart(3, "0")}`,
         removed_at_unix: 1_712_345_600 + index
       };
@@ -1944,6 +1950,7 @@ type MockHistoryEntry = {
   path: string;
   entry_type: "historical";
   restore_source_path: string;
+  restore_source_object_id: string;
   restore_version_id: string;
   removed_at_unix: number;
   moved_to_path?: string | null;
@@ -2426,6 +2433,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         entries: Array<{
           path: string;
           restore_source_path: string;
+          restore_source_object_id: string;
           restore_version_id: string;
         }>;
       };

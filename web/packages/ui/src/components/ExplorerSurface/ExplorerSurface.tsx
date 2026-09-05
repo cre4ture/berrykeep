@@ -98,7 +98,7 @@ export type ExplorerListResponse = {
 export type ExplorerHistoryRestoreEntry = {
   path: string;
   restore_source_path: string;
-  restore_source_object_id?: string;
+  restore_source_object_id: string;
   restore_version_id: string;
 };
 
@@ -500,13 +500,13 @@ export function ExplorerSurface({
     const restoreSourceObjectId = entry.restore_source_object_id?.trim();
     const restoreVersionId = entry.restore_version_id?.trim();
     const path = entry.path.trim();
-    if (!path || !restoreSourcePath || !restoreVersionId) {
+    if (!path || !restoreSourcePath || !restoreSourceObjectId || !restoreVersionId) {
       return null;
     }
     return {
       path,
       restore_source_path: restoreSourcePath,
-      ...(restoreSourceObjectId ? { restore_source_object_id: restoreSourceObjectId } : {}),
+      restore_source_object_id: restoreSourceObjectId,
       restore_version_id: restoreVersionId
     };
   }

@@ -124,7 +124,7 @@ const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
 const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
-const STORE_HISTORY_RESTORE_FALLBACK_MAX_CONCURRENCY: usize = 2;
+const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -349,7 +349,7 @@ struct ServerStorageRuntime {
     store_history_cache: Arc<StdMutex<StoreHistoryCache>>,
     store_history_cache_generation: Arc<AtomicU64>,
     store_history_refresh_locks: Arc<StdMutex<StoreHistoryRefreshLocks>>,
-    store_history_restore_fallback_permits: Arc<Semaphore>,
+    store_history_refresh_permits: Arc<Semaphore>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
@@ -7407,8 +7407,8 @@ async fn run_inner(
             store_history_refresh_locks: Arc::new(StdMutex::new(
                 StoreHistoryRefreshLocks::default(),
             )),
-            store_history_restore_fallback_permits: Arc::new(Semaphore::new(
-                STORE_HISTORY_RESTORE_FALLBACK_MAX_CONCURRENCY,
+            store_history_refresh_permits: Arc::new(Semaphore::new(
+                STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
             )),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
@@ -13361,8 +13361,7 @@ struct StoreHistoryResponse {
 struct HistoryRestoreEntryRequest {
     path: String,
     restore_source_path: String,
-    #[serde(default)]
-    restore_source_object_id: Option<String>,
+    restore_source_object_id: String,
     restore_version_id: String,
 }
 
@@ -13938,7 +13937,11 @@ impl StoreHistoryRefreshLocks {
             return Arc::clone(lock);
         }
         if self.by_prefix.len() >= STORE_HISTORY_CACHE_MAX_SCOPES {
-            self.by_prefix.clear();
+            // Never evict a lock that is still referenced by an in-flight
+            // refresh. Requests acquire the refresh permit before reaching
+            // this map, so the small fixed map always has an inactive entry
+            // to evict once it reaches capacity.
+            self.by_prefix.retain(|_, lock| Arc::strong_count(lock) > 1);
         }
         let lock = Arc::new(Mutex::new(()));
         self.by_prefix.insert(prefix.to_string(), Arc::clone(&lock));
@@ -16422,9 +16425,20 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
     let history = match cached {
         Some(cached) => cached,
         None => {
-            // Coalesce cache misses without holding the store read guard. A
+            // Coalesce cache misses without holding the store read guard, and
+            // admit only a small number of distinct prefix scans at once. A
             // short TTL intentionally tolerates concurrent namespace writes
             // while retaining each recently visited prefix for navigation.
+            let _refresh_permit = match state
+                .storage
+                .store_history_refresh_permits
+                .clone()
+                .acquire_owned()
+                .await
+            {
+                Ok(permit) => permit,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
             let refresh_lock = match state.storage.store_history_refresh_locks.lock() {
                 Ok(mut locks) => locks.lock_for_prefix(&prefix),
                 Err(poisoned) => poisoned.into_inner().lock_for_prefix(&prefix),
@@ -16671,6 +16685,7 @@ async fn restore_history_entries_response(
     if request.entries.iter().any(|entry| {
         entry.path.trim().is_empty()
             || entry.restore_source_path.trim().is_empty()
+            || entry.restore_source_object_id.trim().is_empty()
             || entry.restore_version_id.trim().is_empty()
     }) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -16682,12 +16697,7 @@ async fn restore_history_entries_response(
         .map(|entry| HistoryRestoreEntryRequest {
             path: entry.path.trim().to_string(),
             restore_source_path: entry.restore_source_path.trim().to_string(),
-            restore_source_object_id: entry
-                .restore_source_object_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|object_id| !object_id.is_empty())
-                .map(ToOwned::to_owned),
+            restore_source_object_id: entry.restore_source_object_id.trim().to_string(),
             restore_version_id: entry.restore_version_id.trim().to_string(),
         })
         .collect::<Vec<_>>();
@@ -16697,29 +16707,12 @@ async fn restore_history_entries_response(
             (
                 entry.restore_source_path.clone(),
                 entry.restore_version_id.clone(),
-                entry.restore_source_object_id.clone(),
+                Some(entry.restore_source_object_id.clone()),
                 entry.path.clone(),
             )
         })
         .collect::<Vec<_>>();
-    let requires_fallback_resolution = restore_entries
-        .iter()
-        .any(|entry| entry.restore_source_object_id.is_none());
     let source_results = {
-        let _fallback_resolution_permit = if requires_fallback_resolution {
-            match state
-                .storage
-                .store_history_restore_fallback_permits
-                .clone()
-                .acquire_owned()
-                .await
-            {
-                Ok(permit) => Some(permit),
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            }
-        } else {
-            None
-        };
         let history_inspector = {
             let store = read_store(state, "store_history.clone_restore_inspector").await;
             store.store_history_inspector()
