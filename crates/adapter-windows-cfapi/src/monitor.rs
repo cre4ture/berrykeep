@@ -286,6 +286,7 @@ struct SnapshotEntries {
 pub struct RemoteAppliedTracker {
     directories: Arc<Mutex<HashSet<String>>>,
     removed_files: Arc<Mutex<HashSet<String>>>,
+    created_files: Arc<Mutex<HashSet<String>>>,
 }
 
 impl RemoteAppliedTracker {
@@ -318,6 +319,12 @@ impl RemoteAppliedTracker {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         removed_files.extend(report.deleted_paths.iter().cloned());
         removed_files.extend(report.renamed_paths.keys().cloned());
+
+        let mut created_files = self
+            .created_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        created_files.extend(report.renamed_paths.values().cloned());
     }
 
     fn take_directory_suppression(&self, path: &str) -> bool {
@@ -334,6 +341,13 @@ impl RemoteAppliedTracker {
 
     fn take_file_removal_suppression(&self, path: &str) -> bool {
         self.removed_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&normalize_monitor_relative_path(path))
+    }
+
+    fn take_file_creation_suppression(&self, path: &str) -> bool {
+        self.created_files
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&normalize_monitor_relative_path(path))
@@ -783,6 +797,18 @@ impl SyncRootMonitor {
         self.maybe_schedule_placeholder_dehydrate(path, &rel_path, previous_entry, entry);
 
         if entry_unchanged {
+            return;
+        }
+
+        if self
+            .remote_applied_tracker
+            .take_file_creation_suppression(&rel_path)
+        {
+            tracing::info!(
+                "{}: suppressing local upload for remote-renamed path {}",
+                self.name,
+                rel_path
+            );
             return;
         }
 
@@ -2380,6 +2406,25 @@ mod tests {
                 .expect("deletes lock poisoned")
                 .is_empty(),
             "a confirmed remote-applied removal must not be echoed back to the server"
+        );
+    }
+
+    #[test]
+    fn reconcile_rename_suppresses_both_source_removal_and_destination_upload() {
+        let tracker = RemoteAppliedTracker::default();
+        let mut report = RemoteObjectReconcileReport::default();
+        report.renamed_paths.insert(
+            "docs/source.txt".to_string(),
+            "archive/destination.txt".to_string(),
+        );
+
+        tracker.record_reconcile_report(&report);
+
+        assert!(tracker.take_file_removal_suppression("docs/source.txt"));
+        assert!(tracker.take_file_creation_suppression("archive/destination.txt"));
+        assert!(
+            !tracker.take_file_creation_suppression("archive/destination.txt"),
+            "the destination suppression must be consumed after the monitor observes it"
         );
     }
 

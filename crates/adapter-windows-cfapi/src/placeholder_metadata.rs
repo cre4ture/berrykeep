@@ -247,6 +247,9 @@ fn refresh_remote_placeholder_state_with_policy(
                 .map(|identity| (identity, modified_data_size, in_sync_state))
         });
     let normalized_object_id = object_id.map(str::trim).filter(|value| !value.is_empty());
+    let normalized_remote_version = remote_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     if let Some((existing_identity, modified_data_size, in_sync_state)) =
         existing_placeholder.as_ref()
     {
@@ -271,6 +274,24 @@ fn refresh_remote_placeholder_state_with_policy(
             anyhow::bail!(
                 "legacy placeholder at {normalized} cannot be safely bound to this remote baseline"
             );
+        }
+        // A conflict action can be based on a snapshot that does not carry a
+        // concrete revision. It must never erase an existing CAS binding: the
+        // monitor would otherwise interpret the resulting unbound identity as
+        // a new object and issue an unsafe path-based upload.
+        if file_metadata_policy == RemoteFileMetadataPolicy::PreserveLocalConflict
+            && existing_identity.object_id.is_some()
+            && (normalized_object_id.is_none() || normalized_remote_version.is_none())
+        {
+            tracing::warn!(
+                path = %normalized,
+                existing_object_id = ?existing_identity.object_id,
+                existing_revision = ?existing_identity.remote_version,
+                incoming_object_id = ?normalized_object_id,
+                incoming_revision = ?normalized_remote_version,
+                "refusing to replace a conflict placeholder's stable identity with an incomplete remote baseline"
+            );
+            return Ok(());
         }
         let local_state_is_dirty = file_metadata_policy
             != RemoteFileMetadataPolicy::ApplyAfterConfirmedMove
@@ -326,10 +347,7 @@ fn refresh_remote_placeholder_state_with_policy(
             identity.object_id = normalized_object_id.map(ToString::to_string);
             identity.path = normalized.clone();
             identity.provider_instance_id = Some(provider_instance_id);
-            identity.remote_version = remote_version
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string);
+            identity.remote_version = normalized_remote_version.map(ToString::to_string);
             identity.remote_content_hash = remote_content_hash
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -1644,6 +1662,51 @@ mod tests {
             .expect("updated conflict identity should decode");
         assert_eq!(identity.object_id.as_deref(), Some(object_id));
         assert_eq!(identity.remote_version.as_deref(), Some("revision-2"));
+        assert_ne!(info.info().InSyncState, CF_IN_SYNC_STATE_IN_SYNC);
+    }
+
+    #[test]
+    fn incomplete_conflict_refresh_preserves_existing_object_id_and_revision() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("incomplete-conflict-identity");
+        let path = "docs/incomplete-conflict.txt";
+        let object_id = "object-incomplete-conflict-hash";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-1",
+            "incomplete-conflict-hash",
+            1_725_100_002,
+        );
+        let full_path = sync_root.root_path.join("docs\\incomplete-conflict.txt");
+        let file = open_sync_path(&full_path, true).expect("placeholder should open");
+        crate::cfapi::cf_set_not_in_sync(&file).expect("placeholder should become dirty");
+        drop(file);
+
+        refresh_remote_conflict_identity(
+            &sync_root.root_path,
+            path,
+            provider_instance_id,
+            RemotePlaceholderState {
+                object_id: None,
+                remote_version: None,
+                remote_content_hash: Some("incomplete-remote-hash"),
+                remote_size_bytes: None,
+                remote_content_fingerprint: None,
+                remote_modified_at_unix: None,
+                remote_media: None,
+            },
+        )
+        .expect("incomplete conflict metadata must not clear the CAS binding");
+
+        let file = open_sync_path(&full_path, false).expect("placeholder should remain");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("preserved identity should be readable");
+        let identity = decode_placeholder_file_identity(info.file_identity())
+            .expect("preserved identity should decode");
+        assert_eq!(identity.object_id.as_deref(), Some(object_id));
+        assert_eq!(identity.remote_version.as_deref(), Some("revision-1"));
         assert_ne!(info.info().InSyncState, CF_IN_SYNC_STATE_IN_SYNC);
     }
 
