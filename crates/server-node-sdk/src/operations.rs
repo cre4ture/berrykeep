@@ -238,14 +238,37 @@ pub(crate) enum GeoProposalChunkStatus {
     Ready,
 }
 
+#[derive(Debug)]
+struct GeoInferenceSegment {
+    folder: String,
+    media: Vec<GeoAnalysisMedia>,
+}
+
 /// Produces semantic chunks for a single analysis run.  Folder and time-basis
 /// boundaries are never crossed; the latter keeps floating local wall-clock
 /// time away from explicitly offset timestamps.
+#[cfg(test)]
 pub(crate) fn infer_geolocation_proposals(
     analysis_run_id: &str,
     media: impl IntoIterator<Item = GeoAnalysisMedia>,
     config: GeoInferenceConfig,
 ) -> Vec<GeoProposalChunk> {
+    semantic_geo_inference_segments(media, config)
+        .into_iter()
+        .filter_map(|segment| {
+            infer_segment(analysis_run_id, &segment.folder, &segment.media, config)
+        })
+        .collect()
+}
+
+/// Groups media into the logical review units used by both the synchronous
+/// inference helper and the background worker.  A worker can persist each
+/// returned segment independently without changing the semantics seen by the
+/// reviewer.
+fn semantic_geo_inference_segments(
+    media: impl IntoIterator<Item = GeoAnalysisMedia>,
+    config: GeoInferenceConfig,
+) -> Vec<GeoInferenceSegment> {
     let mut by_folder_and_basis =
         BTreeMap::<(String, GeoCaptureTimeBasis), Vec<GeoAnalysisMedia>>::new();
     for item in media {
@@ -263,7 +286,7 @@ pub(crate) fn infer_geolocation_proposals(
             .push(item);
     }
 
-    let mut chunks = Vec::new();
+    let mut segments = Vec::new();
     for ((folder, _basis), mut folder_media) in by_folder_and_basis {
         folder_media.sort_by(|left, right| {
             left.capture_time
@@ -297,132 +320,209 @@ pub(crate) fn infer_geolocation_proposals(
                 continue;
             }
 
-            let segment = &folder_media[segment_start..index];
-            if let Some(chunk) = infer_segment(analysis_run_id, &folder, segment, config) {
-                chunks.push(chunk);
-            }
+            segments.push(GeoInferenceSegment {
+                folder: folder.clone(),
+                media: folder_media[segment_start..index].to_vec(),
+            });
             segment_start = index;
         }
     }
-    chunks
+    segments
 }
 
+#[cfg(test)]
 fn infer_segment(
     analysis_run_id: &str,
     folder: &str,
     segment: &[GeoAnalysisMedia],
     config: GeoInferenceConfig,
 ) -> Option<GeoProposalChunk> {
-    let first = segment.first()?.capture_time?;
-    let last = segment.last()?.capture_time?;
+    let (previous_anchor_indexes, next_anchor_indexes) = nearest_anchor_indexes(segment);
     let mut proposals = Vec::new();
 
-    for (target_index, target) in segment.iter().enumerate() {
-        let target_time = target.capture_time?;
-        if target.gps_is_present {
-            continue;
-        }
-
-        let previous = (0..target_index).rev().find_map(|index| {
-            let candidate = &segment[index];
-            let coordinate = candidate
-                .gps
-                .filter(|value| value.valid() && !candidate.gps_is_inferred)?;
-            let capture_time = candidate.capture_time?;
-            Some((candidate, capture_time, coordinate))
-        });
-        let next = ((target_index + 1)..segment.len()).find_map(|index| {
-            let candidate = &segment[index];
-            let coordinate = candidate
-                .gps
-                .filter(|value| value.valid() && !candidate.gps_is_inferred)?;
-            let capture_time = candidate.capture_time?;
-            Some((candidate, capture_time, coordinate))
-        });
-
-        let previous = previous.and_then(|(item, capture_time, coordinate)| {
-            let distance_seconds = target_time.unix.saturating_sub(capture_time.unix);
-            (distance_seconds > 0 && distance_seconds <= config.max_anchor_time_delta_seconds)
-                .then_some((
-                    anchor_from(item, capture_time, coordinate, distance_seconds),
-                    coordinate,
-                ))
-        });
-        let next = next.and_then(|(item, capture_time, coordinate)| {
-            let distance_seconds = capture_time.unix.saturating_sub(target_time.unix);
-            (distance_seconds > 0 && distance_seconds <= config.max_anchor_time_delta_seconds)
-                .then_some((
-                    anchor_from(item, capture_time, coordinate, distance_seconds),
-                    coordinate,
-                ))
-        });
-
-        let proposal = match (previous, next) {
-            (
-                Some((previous_anchor, previous_coordinate)),
-                Some((next_anchor, next_coordinate)),
-            ) => {
-                let anchor_interval_seconds = next_anchor
-                    .capture_time
-                    .unix
-                    .saturating_sub(previous_anchor.capture_time.unix);
-                if anchor_interval_seconds == 0 {
-                    None
-                } else {
-                    let speed_kmh = geo_distance_km(previous_coordinate, next_coordinate)
-                        / (anchor_interval_seconds as f64 / 3_600.0);
-                    if !speed_kmh.is_finite() || speed_kmh > config.max_anchor_speed_kmh {
-                        None
-                    } else {
-                        let fraction = target_time
-                            .unix
-                            .saturating_sub(previous_anchor.capture_time.unix)
-                            as f64
-                            / anchor_interval_seconds as f64;
-                        Some(GeoProposal {
-                            id: proposal_id(analysis_run_id, &target.path),
-                            media_path: target.path.clone(),
-                            object_id: target.object_id.clone(),
-                            manifest_hash: target.manifest_hash.clone(),
-                            content_fingerprint: target.content_fingerprint.clone(),
-                            capture_time: target_time,
-                            proposed: spherical_interpolate(
-                                previous_coordinate,
-                                next_coordinate,
-                                fraction,
-                            ),
-                            method: GeoInferenceMethod::Interpolation,
-                            previous_anchor: Some(previous_anchor),
-                            next_anchor: Some(next_anchor),
-                            estimated_anchor_speed_kmh: Some(speed_kmh),
-                            warnings: Vec::new(),
-                        })
-                    }
-                }
-            }
-            (Some((anchor, coordinate)), None) => Some(nearest_anchor_proposal(
-                analysis_run_id,
-                target,
-                target_time,
-                Some(anchor),
-                None,
-                coordinate,
-            )),
-            (None, Some((anchor, coordinate))) => Some(nearest_anchor_proposal(
-                analysis_run_id,
-                target,
-                target_time,
-                None,
-                Some(anchor),
-                coordinate,
-            )),
-            (None, None) => None,
-        };
-        if let Some(proposal) = proposal {
+    for target_index in 0..segment.len() {
+        if let Some(proposal) = infer_target_proposal(
+            analysis_run_id,
+            segment,
+            target_index,
+            previous_anchor_indexes[target_index],
+            next_anchor_indexes[target_index],
+            config,
+        ) {
             proposals.push(proposal);
         }
     }
 
+    proposal_chunk(analysis_run_id, folder, segment, proposals)
+}
+
+/// The worker variant keeps a very large logical segment intact for review,
+/// while yielding between fixed-size inference batches.  Repair and scrubbing
+/// work can therefore take precedence without inventing arbitrary proposal
+/// chunk boundaries.
+async fn infer_segment_with_yields(
+    state: &ServerState,
+    analysis_run_id: &str,
+    folder: &str,
+    segment: &[GeoAnalysisMedia],
+    config: GeoInferenceConfig,
+) -> Option<GeoProposalChunk> {
+    let (previous_anchor_indexes, next_anchor_indexes) = nearest_anchor_indexes(segment);
+    let mut proposals = Vec::new();
+
+    for target_index in 0..segment.len() {
+        if target_index > 0 && target_index % MULTIMEDIA_OPERATION_BATCH_SIZE == 0 {
+            wait_for_higher_priority_work(state).await;
+            tokio::task::yield_now().await;
+        }
+        if let Some(proposal) = infer_target_proposal(
+            analysis_run_id,
+            segment,
+            target_index,
+            previous_anchor_indexes[target_index],
+            next_anchor_indexes[target_index],
+            config,
+        ) {
+            proposals.push(proposal);
+        }
+    }
+
+    proposal_chunk(analysis_run_id, folder, segment, proposals)
+}
+
+fn nearest_anchor_indexes(
+    segment: &[GeoAnalysisMedia],
+) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let mut previous_anchor_indexes = vec![None; segment.len()];
+    let mut last_anchor = None;
+    for (index, item) in segment.iter().enumerate() {
+        previous_anchor_indexes[index] = last_anchor;
+        if valid_anchor(item).is_some() {
+            last_anchor = Some(index);
+        }
+    }
+
+    let mut next_anchor_indexes = vec![None; segment.len()];
+    let mut next_anchor = None;
+    for (index, item) in segment.iter().enumerate().rev() {
+        next_anchor_indexes[index] = next_anchor;
+        if valid_anchor(item).is_some() {
+            next_anchor = Some(index);
+        }
+    }
+    (previous_anchor_indexes, next_anchor_indexes)
+}
+
+fn valid_anchor(item: &GeoAnalysisMedia) -> Option<(GeoCaptureTime, GeoCoordinate)> {
+    let coordinate = item
+        .gps
+        .filter(|value| value.valid() && !item.gps_is_inferred)?;
+    Some((item.capture_time?, coordinate))
+}
+
+fn infer_target_proposal(
+    analysis_run_id: &str,
+    segment: &[GeoAnalysisMedia],
+    target_index: usize,
+    previous_anchor_index: Option<usize>,
+    next_anchor_index: Option<usize>,
+    config: GeoInferenceConfig,
+) -> Option<GeoProposal> {
+    let target = segment.get(target_index)?;
+    let target_time = target.capture_time?;
+    if target.gps_is_present {
+        return None;
+    }
+
+    let previous = previous_anchor_index.and_then(|index| {
+        let item = &segment[index];
+        let (capture_time, coordinate) = valid_anchor(item)?;
+        let distance_seconds = target_time.unix.saturating_sub(capture_time.unix);
+        (distance_seconds > 0 && distance_seconds <= config.max_anchor_time_delta_seconds)
+            .then_some((
+                anchor_from(item, capture_time, coordinate, distance_seconds),
+                coordinate,
+            ))
+    });
+    let next = next_anchor_index.and_then(|index| {
+        let item = &segment[index];
+        let (capture_time, coordinate) = valid_anchor(item)?;
+        let distance_seconds = capture_time.unix.saturating_sub(target_time.unix);
+        (distance_seconds > 0 && distance_seconds <= config.max_anchor_time_delta_seconds)
+            .then_some((
+                anchor_from(item, capture_time, coordinate, distance_seconds),
+                coordinate,
+            ))
+    });
+
+    match (previous, next) {
+        (Some((previous_anchor, previous_coordinate)), Some((next_anchor, next_coordinate))) => {
+            let anchor_interval_seconds = next_anchor
+                .capture_time
+                .unix
+                .saturating_sub(previous_anchor.capture_time.unix);
+            if anchor_interval_seconds == 0 {
+                None
+            } else {
+                let speed_kmh = geo_distance_km(previous_coordinate, next_coordinate)
+                    / (anchor_interval_seconds as f64 / 3_600.0);
+                if !speed_kmh.is_finite() || speed_kmh > config.max_anchor_speed_kmh {
+                    None
+                } else {
+                    let fraction = target_time
+                        .unix
+                        .saturating_sub(previous_anchor.capture_time.unix)
+                        as f64
+                        / anchor_interval_seconds as f64;
+                    Some(GeoProposal {
+                        id: proposal_id(analysis_run_id, &target.path),
+                        media_path: target.path.clone(),
+                        object_id: target.object_id.clone(),
+                        manifest_hash: target.manifest_hash.clone(),
+                        content_fingerprint: target.content_fingerprint.clone(),
+                        capture_time: target_time,
+                        proposed: spherical_interpolate(
+                            previous_coordinate,
+                            next_coordinate,
+                            fraction,
+                        ),
+                        method: GeoInferenceMethod::Interpolation,
+                        previous_anchor: Some(previous_anchor),
+                        next_anchor: Some(next_anchor),
+                        estimated_anchor_speed_kmh: Some(speed_kmh),
+                        warnings: Vec::new(),
+                    })
+                }
+            }
+        }
+        (Some((anchor, coordinate)), None) => Some(nearest_anchor_proposal(
+            analysis_run_id,
+            target,
+            target_time,
+            Some(anchor),
+            None,
+            coordinate,
+        )),
+        (None, Some((anchor, coordinate))) => Some(nearest_anchor_proposal(
+            analysis_run_id,
+            target,
+            target_time,
+            None,
+            Some(anchor),
+            coordinate,
+        )),
+        (None, None) => None,
+    }
+}
+
+fn proposal_chunk(
+    analysis_run_id: &str,
+    folder: &str,
+    segment: &[GeoAnalysisMedia],
+    proposals: Vec<GeoProposal>,
+) -> Option<GeoProposalChunk> {
+    let first = segment.first()?.capture_time?;
+    let last = segment.last()?.capture_time?;
     (!proposals.is_empty()).then(|| GeoProposalChunk {
         id: chunk_id(analysis_run_id, folder, first, last),
         analysis_run_id: analysis_run_id.to_string(),
@@ -789,8 +889,22 @@ pub(super) async fn start_operation_run(
         error: None,
         termination_reason: None,
     };
+    // Reserve the per-kind slot before persisting/spawning the task.  This is
+    // admission control rather than a retry queue: a second click must not
+    // create an unbounded number of durable queued runs while one scan/apply
+    // is waiting for higher-priority maintenance work.
+    if !try_reserve_multimedia_slot(&state, &run.run_id, !start_is_apply).await {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "A multimedia operation of this kind is already queued or running."
+            })),
+        )
+            .into_response();
+    }
     if let Err(error) = persist_operation_run_with_retry(&state, &run, "queue operation").await {
         warn!(error = %error, operation_id = %run.operation_id, "failed to persist queued operation");
+        release_multimedia_slot(&state, &run.run_id, !start_is_apply).await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -1040,10 +1154,7 @@ enum OperationTask {
 }
 
 async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoProposalRunInput) {
-    if let Err(error) = acquire_multimedia_slot(&state, &run.run_id, true).await {
-        finish_failed_operation(&state, &mut run, error).await;
-        return;
-    }
+    wait_for_higher_priority_work(&state).await;
     run.status = OperationRunStatus::Running;
     run.started_at_unix = Some(super::unix_ts());
     run.progress = OperationProgress {
@@ -1055,7 +1166,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
         persist_operation_run_with_retry(&state, &run, "start geolocation proposal").await
     {
         finish_failed_operation(&state, &mut run, error).await;
-        release_multimedia_slot(&state, true).await;
+        release_multimedia_slot(&state, &run.run_id, true).await;
         return;
     }
 
@@ -1168,37 +1279,49 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
 
         run.progress = OperationProgress {
             phase: Some("proposing".to_string()),
-            completed: Some(total),
-            total: Some(total),
+            completed: Some(0),
+            total: None,
             message: Some("Building semantic folder/time-segment proposals.".to_string()),
         };
         persist_operation_run(&state, &run).await?;
-        let chunks = infer_geolocation_proposals(&run.run_id, media, input.config);
-        let proposal_count = chunks
-            .iter()
-            .map(|chunk| chunk.proposals.len())
-            .sum::<usize>();
-        for (index, chunk) in chunks.iter().enumerate() {
-            let result = OperationResultChunk {
-                run_id: run.run_id.clone(),
-                chunk_id: chunk.id.clone(),
-                result_type: OPERATION_RESULT_TYPE_GEO_PROPOSAL_CHUNK.to_string(),
-                created_at_unix: super::unix_ts(),
-                payload: serde_json::to_value(chunk)?,
-            };
-            persist_operation_result_chunk(&state, &result).await?;
+        let segments = semantic_geo_inference_segments(media, input.config);
+        let segment_count = segments.len();
+        let mut chunk_count = 0usize;
+        let mut proposal_count = 0usize;
+        for (index, segment) in segments.iter().enumerate() {
+            wait_for_higher_priority_work(&state).await;
+            if let Some(chunk) = infer_segment_with_yields(
+                &state,
+                &run.run_id,
+                &segment.folder,
+                &segment.media,
+                input.config,
+            )
+            .await
+            {
+                proposal_count += chunk.proposals.len();
+                let result = OperationResultChunk {
+                    run_id: run.run_id.clone(),
+                    chunk_id: chunk.id.clone(),
+                    result_type: OPERATION_RESULT_TYPE_GEO_PROPOSAL_CHUNK.to_string(),
+                    created_at_unix: super::unix_ts(),
+                    payload: serde_json::to_value(&chunk)?,
+                };
+                persist_operation_result_chunk(&state, &result).await?;
+                chunk_count += 1;
+            }
             run.progress = OperationProgress {
-                phase: Some("persisting_results".to_string()),
+                phase: Some("proposing".to_string()),
                 completed: Some(index + 1),
-                total: Some(chunks.len()),
-                message: Some("Persisting proposal chunks for review.".to_string()),
+                total: Some(segment_count),
+                message: Some("Building and publishing proposal chunks for review.".to_string()),
             };
             persist_operation_run(&state, &run).await?;
             tokio::task::yield_now().await;
         }
         Ok::<_, anyhow::Error>(
             (
-                chunks.len(),
+                chunk_count,
                 proposal_count,
                 total,
                 metadata_error_count,
@@ -1243,14 +1366,11 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
         }
         Err(error) => finish_failed_operation(&state, &mut run, error).await,
     }
-    release_multimedia_slot(&state, true).await;
+    release_multimedia_slot(&state, &run.run_id, true).await;
 }
 
 async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoApplyRunInput) {
-    if let Err(error) = acquire_multimedia_slot(&state, &run.run_id, false).await {
-        finish_failed_operation(&state, &mut run, error).await;
-        return;
-    }
+    wait_for_higher_priority_work(&state).await;
     run.status = OperationRunStatus::Running;
     run.started_at_unix = Some(super::unix_ts());
     run.progress = OperationProgress {
@@ -1262,7 +1382,7 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
         persist_operation_run_with_retry(&state, &run, "start geolocation apply").await
     {
         finish_failed_operation(&state, &mut run, error).await;
-        release_multimedia_slot(&state, false).await;
+        release_multimedia_slot(&state, &run.run_id, false).await;
         return;
     }
 
@@ -1347,7 +1467,7 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
         }
         Err(error) => finish_failed_operation(&state, &mut run, error).await,
     }
-    release_multimedia_slot(&state, false).await;
+    release_multimedia_slot(&state, &run.run_id, false).await;
 }
 
 fn capture_time_for_geolocation(
@@ -1757,39 +1877,33 @@ async fn finish_interrupted_operation(
     }
 }
 
-async fn acquire_multimedia_slot(state: &ServerState, run_id: &str, is_scan: bool) -> Result<()> {
-    loop {
-        if higher_priority_work_active(state).await {
-            sleep(Duration::from_millis(MULTIMEDIA_OPERATION_YIELD_MILLIS)).await;
-            continue;
-        }
-        let acquired = {
-            let mut activity = state.maintenance.operations_activity.lock().await;
-            let active = if is_scan {
-                &mut activity.multimedia_scan_run_id
-            } else {
-                &mut activity.multimedia_apply_run_id
-            };
-            if active.is_none() {
-                *active = Some(run_id.to_string());
-                true
-            } else {
-                false
-            }
-        };
-        if acquired {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(MULTIMEDIA_OPERATION_YIELD_MILLIS)).await;
+pub(crate) async fn try_reserve_multimedia_slot(
+    state: &ServerState,
+    run_id: &str,
+    is_scan: bool,
+) -> bool {
+    let mut activity = state.maintenance.operations_activity.lock().await;
+    let active = if is_scan {
+        &mut activity.multimedia_scan_run_id
+    } else {
+        &mut activity.multimedia_apply_run_id
+    };
+    if active.is_some() {
+        return false;
     }
+    *active = Some(run_id.to_string());
+    true
 }
 
-async fn release_multimedia_slot(state: &ServerState, is_scan: bool) {
+pub(crate) async fn release_multimedia_slot(state: &ServerState, run_id: &str, is_scan: bool) {
     let mut activity = state.maintenance.operations_activity.lock().await;
-    if is_scan {
-        activity.multimedia_scan_run_id = None;
+    let active = if is_scan {
+        &mut activity.multimedia_scan_run_id
     } else {
-        activity.multimedia_apply_run_id = None;
+        &mut activity.multimedia_apply_run_id
+    };
+    if active.as_deref() == Some(run_id) {
+        *active = None;
     }
 }
 

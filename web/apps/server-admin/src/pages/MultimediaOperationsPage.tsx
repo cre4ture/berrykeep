@@ -123,6 +123,8 @@ export function MultimediaOperationsPage() {
 
   const proposalRuns = proposalHistoryQuery.data?.runs ?? [];
   const applyRuns = applyHistoryQuery.data?.runs ?? [];
+  const proposalSlotOccupied = proposalRuns.some(isUnfinishedRun);
+  const applySlotOccupied = applyRuns.some(isUnfinishedRun);
   const runs = [...proposalRuns, ...applyRuns].sort(
     (left, right) => right.created_at_unix - left.created_at_unix
   );
@@ -332,7 +334,7 @@ export function MultimediaOperationsPage() {
             </Text>
             <Button
               leftSection={<IconPlayerPlay size={16} />}
-              disabled={!selectedPrefix || !proposalOperationAvailable}
+              disabled={!selectedPrefix || !proposalOperationAvailable || proposalSlotOccupied}
               loading={proposeMutation.isPending}
               onClick={() => proposeMutation.mutate()}
             >
@@ -418,7 +420,7 @@ export function MultimediaOperationsPage() {
             <Text size="sm" c="dimmed">{selectedCount} selection{selectedCount === 1 ? "" : "s"}</Text>
             <Button
               color="teal"
-              disabled={!selectedAnalysisRun || selectedCount === 0}
+              disabled={!selectedAnalysisRun || selectedCount === 0 || applySlotOccupied}
               loading={applyMutation.isPending}
               onClick={() => applyMutation.mutate()}
             >

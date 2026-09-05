@@ -325,6 +325,14 @@ impl XmpSidecar {
         let rdf_prefix = &self.namespaces.rdf_prefix;
         let mut description = BytesStart::new(qualified_name(rdf_prefix, "Description"));
         description.push_attribute((qualified_name(rdf_prefix, "about").as_str(), ""));
+        // This description can be inserted into a packet that has no existing
+        // rdf:Description.  Keep the namespace declarations needed by the
+        // generated rdf prefix local to the element, just like
+        // `wrap_in_description` does.  In particular, an XMP packet may bind
+        // the RDF namespace as a default namespace instead of `xmlns:rdf`.
+        for declaration in &self.namespaces.declarations {
+            description.push_attribute((declaration.attribute.as_str(), declaration.namespace));
+        }
         description.push_attribute(("xmlns:exif", EXIF_NAMESPACE));
         description.push_attribute(("xmlns:berrykeep", BERRYKEEP_NAMESPACE));
         let latitude = format_xmp_coordinate(inference.latitude, true);
@@ -1335,6 +1343,40 @@ mod tests {
         assert!((location.latitude - 37.808_333_33).abs() < 0.000_001);
         assert!((location.longitude + 122.404_166_67).abs() < 0.000_001);
         assert!(location.inferred_by_berrykeep);
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_write_binds_rdf_when_packet_uses_the_default_rdf_namespace() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<RDF xmlns=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"></RDF>",
+            "</x:xmpmeta>"
+        );
+        let mut sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        sidecar.set_geo_inference(XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest-anchor".to_string(),
+            run_id: "run-default-rdf".to_string(),
+            confidence: "reference_distance=120s".to_string(),
+            reference_distance_seconds: Some(120),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+        })?;
+        let serialized = serialize(&sidecar)?;
+
+        assert!(
+            serialized.contains("<rdf:Description rdf:about=\"\"")
+                && serialized.contains("xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\""),
+            "generated description must bind its rdf prefix: {serialized}"
+        );
+        let location = XmpSidecar::parse(serialized.as_bytes())?
+            .geo_location()
+            .expect("generated GPS must be parseable");
+        assert!((location.latitude - 47.3769).abs() < 0.000_001);
+        assert!((location.longitude - 8.5417).abs() < 0.000_001);
         Ok(())
     }
 

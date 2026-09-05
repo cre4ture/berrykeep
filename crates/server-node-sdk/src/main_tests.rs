@@ -682,6 +682,37 @@ run_on_main_metadata_backends!(
     geolocation_apply_revalidates_stale_and_already_geotagged_media_turso
 );
 
+#[tokio::test]
+async fn multimedia_operation_admission_reserves_one_slot_per_kind() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+
+    assert!(
+        super::operations::try_reserve_multimedia_slot(&state, "scan-first", true).await,
+        "the first scan is admitted"
+    );
+    assert!(
+        !super::operations::try_reserve_multimedia_slot(&state, "scan-second", true).await,
+        "a second scan is rejected instead of accumulating a durable queue"
+    );
+    assert!(
+        super::operations::try_reserve_multimedia_slot(&state, "apply-first", false).await,
+        "apply work uses its own serialized slot"
+    );
+
+    super::operations::release_multimedia_slot(&state, "scan-first", true).await;
+    assert!(
+        super::operations::try_reserve_multimedia_slot(&state, "scan-second", true).await,
+        "releasing the owning run admits the next scan"
+    );
+    // A stale completion must not release a newer owner's slot.
+    super::operations::release_multimedia_slot(&state, "scan-first", true).await;
+    assert!(!super::operations::try_reserve_multimedia_slot(&state, "scan-third", true).await);
+
+    super::operations::release_multimedia_slot(&state, "scan-second", true).await;
+    super::operations::release_multimedia_slot(&state, "apply-first", false).await;
+    cleanup_test_state(&state).await;
+}
+
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()
