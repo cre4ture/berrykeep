@@ -220,7 +220,7 @@ run_server_node_matrix() {
       package_path="${matrix_dir}/${package_path}"
     fi
     package_version="$(dpkg-deb -f "${package_path}" Version)"
-    transition_package_path="$(dirname "${package_path}")/ironmesh-server-node_${package_version}_all.deb"
+    transition_package_path="$(dirname "${package_path}")/ironmesh-server-node_${package_version}_${architecture}.deb"
     [[ -f "${transition_package_path}" ]] || {
       printf 'server-node transition package not found beside %s: %s\n' \
         "${package_path}" "${transition_package_path}" >&2
@@ -230,7 +230,7 @@ run_server_node_matrix() {
     transition_package_architecture="$(dpkg-deb -f "${transition_package_path}" Architecture)"
     transition_package_version="$(dpkg-deb -f "${transition_package_path}" Version)"
     if [[ "${transition_package_name}" != "ironmesh-server-node" || \
-      "${transition_package_architecture}" != "all" || \
+      "${transition_package_architecture}" != "${architecture}" || \
       "${transition_package_version}" != "${package_version}" ]]; then
       printf 'invalid server-node transition package: %s\n' "${transition_package_path}" >&2
       exit 1
@@ -541,6 +541,18 @@ preserve_legacy_suite_packages() {
   done
 }
 
+is_server_node_transition_package() {
+  local package_path="$1"
+  local package_name package_architecture depends
+
+  package_name="$(dpkg-deb -f "${package_path}" Package)"
+  package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
+  [[ "${package_name}" == "ironmesh-server-node" && "${package_architecture}" != "all" ]] || return 1
+
+  depends="$(dpkg-deb -f "${package_path}" Depends)"
+  grep -Eq '(^|, )berrykeep-server-node[[:space:]]*\(>=' <<<"${depends}"
+}
+
 prune_server_node_versions() {
   local architecture="$1"
   local package_path package_name package_architecture package_version depends required_version retained
@@ -559,7 +571,9 @@ prune_server_node_versions() {
     package_version="$(dpkg-deb -f "${package_path}" Version)"
     if [[ "${package_name}" == "berrykeep-server-node" && "${package_architecture}" == "${architecture}" ]]; then
       retained_berrykeep_versions+=("${package_version}")
-    elif [[ "${package_name}" == "ironmesh-server-node" && "${package_architecture}" == "all" ]]; then
+    elif [[ "${package_name}" == "ironmesh-server-node" && \
+      "${package_architecture}" == "${architecture}" ]] && \
+      is_server_node_transition_package "${package_path}"; then
       retained_transition_versions+=("${package_version}")
     fi
   done
@@ -581,7 +595,11 @@ prune_server_node_versions() {
         retained_versions=("${retained_berrykeep_versions[@]}")
         ;;
       ironmesh-server-node)
-        retained_versions=("${retained_ironmesh_versions[@]}")
+        if is_server_node_transition_package "${package_path}"; then
+          retained_versions=("${retained_transition_versions[@]}")
+        else
+          retained_versions=("${retained_ironmesh_versions[@]}")
+        fi
         ;;
       *)
         continue
@@ -601,24 +619,6 @@ prune_server_node_versions() {
     fi
   done
 
-  for package_path in "${POOL_DIR}"/ironmesh-server-node_*_all.deb; do
-    [[ -f "${package_path}" ]] || continue
-    package_name="$(dpkg-deb -f "${package_path}" Package)"
-    package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
-    [[ "${package_name}" == "ironmesh-server-node" && "${package_architecture}" == "all" ]] || continue
-    package_version="$(dpkg-deb -f "${package_path}" Version)"
-    retained=false
-    for retained_version in "${retained_transition_versions[@]}"; do
-      if [[ "${package_version}" == "${retained_version}" ]]; then
-        retained=true
-        break
-      fi
-    done
-    if [[ "${retained}" == false ]]; then
-      log "removing unreferenced ${package_name} ${package_version} for all"
-      rm -f "${package_path}"
-    fi
-  done
 }
 
 repack_exact_map_tools_dependencies() {
@@ -706,26 +706,23 @@ if ((${#DEB_PATHS[@]} == 0)); then
   for architecture in "${IMPLICIT_ARCHES[@]}"; do
     add_architecture "${architecture}"
     if [[ "${SERVER_NODE_ONLY}" == true ]]; then
-      DEB_PATHS+=("${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${architecture}.deb")
+      DEB_PATHS+=(
+        "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
+      )
     else
       DEB_PATHS+=(
         "${ARTIFACT_DIR}/berrykeep-client_${VERSION}_${architecture}.deb"
         "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${architecture}.deb"
         "${ARTIFACT_DIR}/berrykeep-server-node-map-tools_${VERSION}_${architecture}.deb"
         "${ARTIFACT_DIR}/berrykeep-rendezvous-service_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${architecture}.deb"
       )
     fi
   done
-  if [[ "${SERVER_NODE_ONLY}" == true ]]; then
-    DEB_PATHS+=("${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_all.deb")
-  else
-    DEB_PATHS+=(
-      "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_all.deb"
-      "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_all.deb"
-      "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_all.deb"
-      "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_all.deb"
-    )
-  fi
 fi
 
 for path in "${DEB_PATHS[@]}"; do
@@ -838,9 +835,9 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
   fi
 done
 
-# Arch-independent transition packages share the suite pool. Refresh every
-# index captured before replacing an architecture so each hash describes the
-# same package file, even when matrix rows produce different all packages.
+# Refresh every index captured before replacing an architecture. The suite pool
+# is shared, so each index must describe the package files retained for its
+# architecture after a partial matrix publish.
 for architecture in "${INDEX_ARCHES[@]}"; do
   packages_rel="dists/${SUITE}/${COMPONENT}/binary-${architecture}/Packages"
   log "writing ${packages_rel}"

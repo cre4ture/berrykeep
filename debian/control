@@ -73,7 +73,7 @@ Replaces: ironmesh-rendezvous-service (<< ${binary:Version})
 Package: ironmesh-server-node
 Section: oldlibs
 Priority: optional
-Architecture: all
+Architecture: any
 Depends:
  ${misc:Depends},
  berrykeep-server-node (>= ${source:Upstream-Version})
@@ -85,7 +85,7 @@ Description: Transitional package for BerryKeep server node
 Package: ironmesh-server-node-map-tools
 Section: oldlibs
 Priority: optional
-Architecture: all
+Architecture: any
 Build-Profiles: <!server-node-only>
 Depends:
  ${misc:Depends},
@@ -97,7 +97,7 @@ Description: Transitional package for BerryKeep server-node map tools
 Package: ironmesh-client
 Section: oldlibs
 Priority: optional
-Architecture: all
+Architecture: any
 Build-Profiles: <!server-node-only>
 Depends:
  ${misc:Depends},
@@ -109,7 +109,7 @@ Description: Transitional package for BerryKeep client applications
 Package: ironmesh-rendezvous-service
 Section: oldlibs
 Priority: optional
-Architecture: all
+Architecture: any
 Build-Profiles: <!server-node-only>
 Depends:
  ${misc:Depends},

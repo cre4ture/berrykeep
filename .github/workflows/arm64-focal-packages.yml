@@ -218,7 +218,7 @@ jobs:
                 -- -j1
               find /build -maxdepth 1 -type f \
                 \( -name "berrykeep-server-node_*_${{ matrix.architecture }}.deb" \
-                  -o -name "ironmesh-server-node_*_all.deb" \
+                  -o -name "ironmesh-server-node_*_${{ matrix.architecture }}.deb" \
                   -o -name "berrykeep_*_${{ matrix.architecture }}.changes" \
                   -o -name "berrykeep_*_${{ matrix.architecture }}.buildinfo" \) \
                 -exec cp -v {} "${package_dir}/" \;

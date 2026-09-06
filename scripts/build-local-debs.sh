@@ -608,7 +608,7 @@ BUILDINFO_PATH="${ARTIFACT_DIR}/${SOURCE_NAME}_${VERSION}_${ARCH}.buildinfo"
 if [[ "${SERVER_NODE_ONLY}" == true ]]; then
   PACKAGE_PATHS=(
     "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_all.deb"
+    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb"
   )
 else
   PACKAGE_PATHS=(
@@ -616,10 +616,10 @@ else
     "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/berrykeep-server-node-map-tools_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/berrykeep-rendezvous-service_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_all.deb"
-    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_all.deb"
-    "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_all.deb"
-    "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_all.deb"
+    "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${ARCH}.deb"
   )
 fi
 
