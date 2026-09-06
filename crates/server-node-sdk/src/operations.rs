@@ -859,6 +859,10 @@ const MAX_GEO_TIME_WINDOW_SECONDS: u64 = 60 * 60;
 /// large media library. The server fails clearly before producing partial
 /// proposals so an administrator can choose a narrower prefix.
 const MAX_GEOLOCATION_SCAN_MEDIA: usize = 50_000;
+/// Apply selections are persisted in the durable run input and rewritten with
+/// progress updates, so bound both their count and individual identifier size.
+const MAX_GEO_APPLY_SELECTION_IDS: usize = 2_000;
+const MAX_GEO_APPLY_SELECTION_ID_BYTES: usize = 256;
 const MULTIMEDIA_OPERATION_YIELD_MILLIS: u64 = 100;
 /// Multimedia work gives repair/scrub activity a bounded priority window at
 /// every batch boundary. It must not reserve the only slot of its kind forever.
@@ -1348,6 +1352,25 @@ fn validated_geo_apply_input(request: &OperationRunStartRequest) -> Result<GeoAp
         .filter(|value| !value.is_empty())
         .context("analysis_run_id is required")?
         .to_string();
+    let selection_id_count = request
+        .proposal_chunk_ids
+        .len()
+        .saturating_add(request.proposal_ids.len());
+    if selection_id_count > MAX_GEO_APPLY_SELECTION_IDS {
+        bail!(
+            "select at most {MAX_GEO_APPLY_SELECTION_IDS} proposal chunks or proposals per apply run"
+        );
+    }
+    if request
+        .proposal_chunk_ids
+        .iter()
+        .chain(&request.proposal_ids)
+        .any(|id| id.len() > MAX_GEO_APPLY_SELECTION_ID_BYTES)
+    {
+        bail!(
+            "proposal chunk and proposal IDs must not exceed {MAX_GEO_APPLY_SELECTION_ID_BYTES} bytes"
+        );
+    }
     let proposal_chunk_ids = normalized_ids(&request.proposal_chunk_ids);
     let proposal_ids = normalized_ids(&request.proposal_ids);
     if proposal_chunk_ids.is_empty() && proposal_ids.is_empty() {
@@ -1358,6 +1381,15 @@ fn validated_geo_apply_input(request: &OperationRunStartRequest) -> Result<GeoAp
         proposal_chunk_ids,
         proposal_ids,
     })
+}
+
+fn analysis_run_has_reviewable_results(status: OperationRunStatus) -> bool {
+    matches!(
+        status,
+        OperationRunStatus::Completed
+            | OperationRunStatus::Interrupted
+            | OperationRunStatus::Failed
+    )
 }
 
 fn normalized_ids(values: &[String]) -> Vec<String> {
@@ -1625,10 +1657,7 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
         }
         .filter(|analysis| analysis.operation_id == GEOLOCATION_PROPOSE_OPERATION_ID)
         .context("referenced analysis run does not exist or is not a geolocation proposal run")?;
-        if !matches!(
-            analysis.status,
-            OperationRunStatus::Completed | OperationRunStatus::Interrupted
-        ) {
+        if !analysis_run_has_reviewable_results(analysis.status) {
             bail!("referenced analysis run has not produced reviewable results yet");
         }
         let worker = {
@@ -2631,6 +2660,47 @@ mod tests {
                 .to_string()
                 .contains("geolocation timing limits must not exceed")
         );
+    }
+
+    #[test]
+    fn apply_selection_inputs_are_bounded_before_they_become_durable_run_input() {
+        let mut request = OperationRunStartRequest {
+            approve: Some(true),
+            prefix: None,
+            max_anchor_time_delta_seconds: None,
+            segment_gap_seconds: None,
+            max_anchor_speed_kmh: None,
+            analysis_run_id: Some("analysis-run".to_string()),
+            proposal_chunk_ids: Vec::new(),
+            proposal_ids: vec!["proposal".to_string(); MAX_GEO_APPLY_SELECTION_IDS + 1],
+        };
+        let error = validated_geo_apply_input(&request)
+            .expect_err("oversized proposal selection must be rejected");
+        assert!(error.to_string().contains("select at most"));
+
+        request.proposal_ids = vec!["x".repeat(MAX_GEO_APPLY_SELECTION_ID_BYTES + 1)];
+        let error = validated_geo_apply_input(&request)
+            .expect_err("oversized proposal identifier must be rejected");
+        assert!(error.to_string().contains("must not exceed"));
+    }
+
+    #[test]
+    fn terminal_analysis_runs_with_persisted_results_remain_reviewable() {
+        assert!(analysis_run_has_reviewable_results(
+            OperationRunStatus::Completed
+        ));
+        assert!(analysis_run_has_reviewable_results(
+            OperationRunStatus::Interrupted
+        ));
+        assert!(analysis_run_has_reviewable_results(
+            OperationRunStatus::Failed
+        ));
+        assert!(!analysis_run_has_reviewable_results(
+            OperationRunStatus::Queued
+        ));
+        assert!(!analysis_run_has_reviewable_results(
+            OperationRunStatus::Running
+        ));
     }
 
     #[test]
