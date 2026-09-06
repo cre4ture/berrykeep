@@ -144,5 +144,6 @@ Likely touch points:
 - The legacy handwritten `server-node` admin/setup assets and the old QR helper route have now been removed from the runtime path.
 - One Playwright smoke test runs against the built `server-admin` app through `vite preview` with mocked runtime APIs.
 - A matching Playwright smoke now covers the built `client-ui` app through `vite preview`, including text store operations, explorer loading, and cluster views.
+- The shared Explorer can optionally show recoverable deleted and moved paths, read their retained version, and restore one or many selected paths back into current data.
 - The Rust-served browser smokes now cover both a real runtime node and a real first-run setup node, including setup-to-runtime transition after `Start a new cluster`.
 - `web-ui-backend` now uses the same strict `build.rs` bundle handoff pattern as `server-node-sdk`, and `serve-web` system tests verify the React client bundle is what Rust serves.

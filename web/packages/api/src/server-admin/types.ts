@@ -1,4 +1,9 @@
-import type { VersionGraphResponse } from "../client-ui/types";
+import type {
+  StoreHistoryRestoreEntry,
+  StoreHistoryRestoreResponse,
+  StoreHistoryResponse,
+  VersionGraphResponse
+} from "../client-ui/types";
 import type { LogsResponse, ServerLogEntry } from "../shared/logs";
 import type {
   GalleryMapConfiguration,
@@ -44,6 +49,12 @@ export type AdminSnapshotSummary = {
 export type AdminStoreEntry = StoreIndexEntry;
 
 export type AdminStoreListResponse = StoreIndexResponse;
+
+export type AdminStoreHistoryResponse = StoreHistoryResponse;
+
+export type AdminStoreHistoryRestoreEntry = StoreHistoryRestoreEntry;
+
+export type AdminStoreHistoryRestoreResponse = StoreHistoryRestoreResponse;
 
 export type AdminStoreGetResponse = {
   key: string;

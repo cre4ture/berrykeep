@@ -27,6 +27,9 @@ import type {
   LogsResponse,
   SnapshotSummary,
   StoreGetResponse,
+  StoreHistoryRestoreEntry,
+  StoreHistoryRestoreResponse,
+  StoreHistoryResponse,
   StoreListRequestOptions,
   StoreListResponse,
   StoreListView,
@@ -334,6 +337,29 @@ export async function listStoreEntries(
   return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
 }
 
+export async function listStoreHistoryEntries(
+  prefix?: string,
+  depth = 1
+): Promise<StoreHistoryResponse> {
+  const query = new URLSearchParams({
+    depth: String(Math.max(1, Math.floor(depth)))
+  });
+  if (prefix?.trim()) {
+    query.set("prefix", prefix.trim());
+  }
+  return fetchJson<StoreHistoryResponse>(`${apiV1("/store/history")}?${query.toString()}`);
+}
+
+export async function restoreStoreHistoryEntries(
+  entries: StoreHistoryRestoreEntry[]
+): Promise<StoreHistoryRestoreResponse> {
+  return fetchJson<StoreHistoryRestoreResponse>(apiV1("/store/history/restore"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ entries })
+  });
+}
+
 export async function setStoreMediaLabels(path: string, labels: string[]): Promise<void> {
   await fetchJson<unknown>(apiV1("/store/labels"), {
     method: "POST",
@@ -459,7 +485,8 @@ export async function getStoreValue(
   key: string,
   snapshot?: string | null,
   version?: string | null,
-  previewBytes?: number | null
+  previewBytes?: number | null,
+  sourceObjectId?: string | null
 ): Promise<StoreGetResponse> {
   const query = new URLSearchParams({ key });
   if (snapshot?.trim()) {
@@ -467,6 +494,9 @@ export async function getStoreValue(
   }
   if (version?.trim()) {
     query.set("version", version.trim());
+  }
+  if (sourceObjectId?.trim()) {
+    query.set("object_id", sourceObjectId.trim());
   }
   if (previewBytes && previewBytes > 0) {
     query.set("preview_bytes", String(Math.floor(previewBytes)));

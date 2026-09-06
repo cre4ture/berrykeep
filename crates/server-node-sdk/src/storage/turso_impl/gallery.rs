@@ -19,11 +19,11 @@ use super::super::{
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, sqlite_like_prefix_pattern,
-    version_created_at_unix_from_payload,
+    version_created_at_unix_from_payload, version_index_head_projection,
 };
 #[cfg(test)]
 use super::turso_test_db_path;
-use super::{TursoMetadataStore, row_string, row_u64};
+use super::{TursoMetadataStore, row_string, row_u64, upsert_version_index_head_projection};
 
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
 const GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS: i64 = 1_000;
@@ -603,6 +603,7 @@ impl TursoMetadataStore {
         index: &FileVersionIndex,
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
+        let head_projection = version_index_head_projection(object_id, index);
         let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
@@ -617,6 +618,7 @@ impl TursoMetadataStore {
                     (object_id, payload),
                 )
                 .await?;
+            upsert_version_index_head_projection(connection, &head_projection).await?;
             if changed > 0 {
                 let unchanged_projection_keys =
                     refresh_gallery_objects_for_object_id_and_collect_unchanged_keys(

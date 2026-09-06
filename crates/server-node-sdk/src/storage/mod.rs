@@ -7,12 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
 const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
 const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
+const STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE: usize = 256;
 const STORE_INDEX_VERSION_LOOKUP_CONCURRENCY: usize = 32;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
-const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID;
+const METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID + 1;
+const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
+pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY: &str =
+    "history_head_projection_backfill_cursor_v1";
+pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY: &str =
+    "history_head_projection_backfill_complete_v1";
 
 fn object_id_migration_lock_path(metadata_db_path: &Path) -> PathBuf {
     let mut file_name = metadata_db_path
@@ -1522,6 +1528,15 @@ pub enum PathMutationResult {
     TargetExists,
 }
 
+/// The outcome of a historical restore batch. A finalization failure can occur
+/// after one or more paths have already been restored, so it is retained
+/// separately from the per-path mutation results.
+#[derive(Debug)]
+pub(crate) struct RestoreResolvedVersionPathsBatchResult {
+    pub(crate) results: Vec<Result<PathMutationResult>>,
+    pub(crate) finalization_error: Option<anyhow::Error>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRestoreReport {
     pub snapshot_id: String,
@@ -1543,6 +1558,137 @@ pub struct TombstonePathResult {
     pub path: String,
     pub object_id: String,
     pub version_id: String,
+}
+
+/// A removed path whose most recent recoverable version can still be restored.
+///
+/// Entries are derived from live tombstone indexes. They intentionally exclude
+/// paths that currently exist, so callers can safely present them as optional
+/// historical items instead of mixing them into the current object tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoverableHistoryEntry {
+    pub path: String,
+    pub restore_source_path: String,
+    pub restore_source_object_id: String,
+    pub restore_version_id: String,
+    pub removed_at_unix: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_to_path: Option<String>,
+}
+
+/// The queryable preferred-head projection of one version index.
+///
+/// Version indexes intentionally retain their complete lineage as JSON. Explorer's
+/// recoverable-history view only needs the preferred head plus the resolved
+/// restore source, so keeping that small, relational projection avoids parsing
+/// every historical JSON payload for each directory request.
+#[derive(Debug, Clone)]
+pub(super) struct VersionIndexHeadProjection {
+    pub(super) object_id: String,
+    pub(super) head_version_id: Option<String>,
+    pub(super) head_manifest_hash: Option<String>,
+    pub(super) logical_path: Option<String>,
+    pub(super) removed_at_unix: Option<u64>,
+    pub(super) restore_source_path: Option<String>,
+    pub(super) restore_source_object_id: Option<String>,
+    pub(super) restore_version_id: Option<String>,
+    pub(super) moved_source_object_id: Option<String>,
+}
+
+impl VersionIndexHeadProjection {
+    fn empty(object_id: &str) -> Self {
+        Self {
+            object_id: object_id.to_string(),
+            head_version_id: None,
+            head_manifest_hash: None,
+            logical_path: None,
+            removed_at_unix: None,
+            restore_source_path: None,
+            restore_source_object_id: None,
+            restore_version_id: None,
+            moved_source_object_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoryHeadProjectionBackfillState {
+    Pending { after_object_id: Option<String> },
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryHeadProjectionBackfillProgress {
+    pub processed_index_count: usize,
+    pub complete: bool,
+}
+
+pub(super) fn version_index_head_projection(
+    object_id: &str,
+    index: &FileVersionIndex,
+) -> VersionIndexHeadProjection {
+    let mut projection = VersionIndexHeadProjection::empty(object_id);
+
+    let Some(head_version_id) = index
+        .preferred_head_version_id
+        .clone()
+        .or_else(|| choose_preferred_head(index))
+    else {
+        return projection;
+    };
+    let Some(head) = index.versions.get(&head_version_id) else {
+        return projection;
+    };
+
+    projection.head_version_id = Some(head_version_id);
+    projection.head_manifest_hash = Some(head.manifest_hash.clone());
+    projection.logical_path = head
+        .logical_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned);
+
+    if head.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+        return projection;
+    }
+    let Some(path) = projection.logical_path.clone() else {
+        return projection;
+    };
+
+    projection.removed_at_unix = Some(head.created_at_unix);
+    let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
+        head.copied_from_object_id.as_deref(),
+        head.copied_from_version_id.as_deref(),
+    ) {
+        Some((
+            head.copied_from_path
+                .clone()
+                .unwrap_or_else(|| path.clone()),
+            source_object_id.to_string(),
+            source_version_id.to_string(),
+            Some(source_object_id.to_string()),
+        ))
+    } else {
+        recoverable_tombstone_ancestor(index, head).map(|record| {
+            (
+                record.logical_path.unwrap_or_else(|| path.clone()),
+                object_id.to_string(),
+                record.version_id,
+                None,
+            )
+        })
+    };
+
+    if let Some((source_path, source_object_id, source_version_id, moved_source_object_id)) =
+        restore_source
+    {
+        projection.restore_source_path = Some(source_path);
+        projection.restore_source_object_id = Some(source_object_id);
+        projection.restore_version_id = Some(source_version_id);
+        projection.moved_source_object_id = moved_source_object_id;
+    }
+    projection
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1576,7 +1722,7 @@ pub struct SnapshotObjectState {
 }
 
 #[derive(Debug, Clone)]
-struct SnapshotRestoreSource {
+pub(crate) struct SnapshotRestoreSource {
     manifest_hash: String,
     object_id: Option<String>,
     version_id: Option<String>,
@@ -2327,6 +2473,20 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["object_id", "index_json"],
     },
     MetadataDbLogicalTableSpec {
+        table: "version_index_heads",
+        tracked_columns: &[
+            "object_id",
+            "head_version_id",
+            "head_manifest_hash",
+            "logical_path",
+            "removed_at_unix",
+            "restore_source_path",
+            "restore_source_object_id",
+            "restore_version_id",
+            "moved_source_object_id",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
         table: "snapshots",
         tracked_columns: &["snapshot_id", "snapshot_json"],
     },
@@ -2533,6 +2693,16 @@ pub(crate) struct StoreIndexInspector {
     metadata_store: Arc<dyn MetadataStore>,
 }
 
+/// Detached access to the version-index metadata needed by Explorer's
+/// recoverable-history listing and restore-source resolution. It intentionally
+/// owns only clonable handles, so callers can release the main store lock
+/// before a potentially long metadata scan.
+#[derive(Clone)]
+pub(crate) struct StoreHistoryInspector {
+    storage_pool: StoragePool,
+    metadata_store: Arc<dyn MetadataStore>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ClusterReplicasPersister {
     metadata_store: Arc<dyn MetadataStore>,
@@ -2732,6 +2902,34 @@ trait MetadataStore: Send + Sync {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileVersionIndex>>;
+    /// Reads a raw page for the history-head migration. The migration can
+    /// advance past one corrupt legacy payload without weakening normal
+    /// version-index reads, which must continue to report malformed metadata.
+    async fn load_version_index_payloads_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>>;
+    /// Reads the indexed, depth-projected Explorer history. The result contains
+    /// at most `max_entries + 1` visible paths, rather than materializing every
+    /// historical descendant below the requested prefix.
+    async fn list_recoverable_history_listing(
+        &self,
+        prefix: &str,
+        depth: usize,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryListing>;
+    async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState>;
+    async fn persist_history_head_projection_backfill_batch(
+        &self,
+        projections: &[VersionIndexHeadProjection],
+        next_after_object_id: Option<&str>,
+        complete: bool,
+    ) -> Result<()>;
+    #[cfg(test)]
+    async fn clear_history_head_projections_for_test(&self) -> Result<()>;
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
@@ -3088,6 +3286,378 @@ impl StorageStatsCollector {
         self.metadata_store
             .prune_storage_stats_history_before(collected_before_unix)
             .await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoverableHistoryListingEntry {
+    Prefix { path: String },
+    Historical(RecoverableHistoryEntry),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoverableHistoryListing {
+    pub(crate) entries: Vec<RecoverableHistoryListingEntry>,
+    pub(crate) truncated: bool,
+}
+
+/// Builds the depth-projected history query without recursive CTEs, which
+/// Turso does not support. Segment lengths determine the substring boundary,
+/// while the visible path itself remains a substring of the original path.
+/// This avoids unordered string aggregation when rolling up a folder.
+pub(super) fn recoverable_history_listing_query(restrict_to_prefix: bool) -> String {
+    let prefix_filter = if restrict_to_prefix {
+        "AND history.logical_path >= ?3\n                           AND history.logical_path < ?4"
+    } else {
+        ""
+    };
+    format!(
+        r#"WITH latest AS (
+             SELECT
+                 history.logical_path,
+                 history.restore_source_path,
+                 history.restore_source_object_id,
+                 history.restore_version_id,
+                 history.removed_at_unix,
+                 history.moved_source_object_id,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY history.logical_path
+                     ORDER BY history.removed_at_unix DESC,
+                              history.restore_version_id DESC,
+                              history.object_id DESC
+                 ) AS path_rank
+             FROM version_index_heads AS history
+             WHERE history.head_manifest_hash = ?1
+               AND history.restore_source_path IS NOT NULL
+               AND history.restore_source_object_id IS NOT NULL
+               AND history.restore_version_id IS NOT NULL
+               {prefix_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM current_objects
+                   WHERE current_objects.key = history.logical_path
+               )
+         ),
+         scoped AS (
+             SELECT
+                 latest.logical_path,
+                 latest.restore_source_path,
+                 latest.restore_source_object_id,
+                 latest.restore_version_id,
+                 latest.removed_at_unix,
+                 latest.moved_source_object_id,
+                 CASE
+                     WHEN ?2 = '' THEN latest.logical_path
+                     ELSE substr(latest.logical_path, length(?2) + 2)
+                 END AS relative_path
+             FROM latest
+             WHERE latest.path_rank = 1
+         ),
+         visible AS (
+             SELECT
+                 scoped.*,
+                 length(relative_path) - length(replace(relative_path, '/', '')) + 1 AS segment_count,
+                 (
+                     SELECT sum(length(value)) + ?5 - 1
+                     FROM json_each(
+                         '[' || replace(json_quote(scoped.relative_path), '/', char(34) || ',' || char(34)) || ']'
+                     )
+                     WHERE key < ?5
+                 ) AS visible_path_length
+             FROM scoped
+         ),
+         projected AS (
+             SELECT
+                 CASE
+                     WHEN segment_count <= ?5 THEN logical_path
+                     WHEN ?2 = '' THEN substr(relative_path, 1, visible_path_length) || '/'
+                     ELSE ?2 || '/' || substr(relative_path, 1, visible_path_length) || '/'
+                 END AS display_path,
+                 CASE WHEN segment_count <= ?5 THEN 1 ELSE 0 END AS is_historical,
+                 restore_source_path,
+                 restore_source_object_id,
+                 restore_version_id,
+                 removed_at_unix,
+                 moved_source_object_id
+             FROM visible
+         )
+         SELECT
+             display_path,
+             is_historical,
+             CASE WHEN is_historical = 1 THEN restore_source_path END,
+             CASE WHEN is_historical = 1 THEN restore_source_object_id END,
+             CASE WHEN is_historical = 1 THEN restore_version_id END,
+             CASE WHEN is_historical = 1 THEN removed_at_unix END,
+             CASE WHEN is_historical = 1 THEN (
+                 SELECT MIN(current_objects.key)
+                 FROM current_objects
+                 WHERE current_objects.object_id = projected.moved_source_object_id
+                   AND current_objects.key != projected.display_path
+             ) END AS moved_to_path
+         FROM projected
+         GROUP BY display_path, is_historical
+         ORDER BY display_path, is_historical
+         LIMIT ?6"#
+    )
+}
+
+impl StoreHistoryInspector {
+    fn new(storage_pool: StoragePool, metadata_store: Arc<dyn MetadataStore>) -> Self {
+        Self {
+            storage_pool,
+            metadata_store,
+        }
+    }
+
+    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    async fn resolve_key_for_version_index(
+        &self,
+        index: &FileVersionIndex,
+    ) -> Result<Option<String>> {
+        if let Some(preferred_head) = index
+            .preferred_head_version_id
+            .as_ref()
+            .and_then(|version_id| index.versions.get(version_id))
+            .and_then(|record| record.logical_path.clone())
+        {
+            return Ok(Some(preferred_head));
+        }
+
+        if let Some(any_logical_path) = index
+            .versions
+            .values()
+            .find_map(|record| record.logical_path.clone())
+        {
+            return Ok(Some(any_logical_path));
+        }
+
+        for record in index.versions.values() {
+            if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving historical restore source key; skipping record"
+                    );
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_key_for_version_record(
+        &self,
+        index: &FileVersionIndex,
+        record: &FileVersionRecord,
+    ) -> Result<Option<String>> {
+        if let Some(logical_path) = record.logical_path.clone() {
+            return Ok(Some(logical_path));
+        }
+
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving historical restore source key; falling back to index lookup"
+                    );
+                }
+            }
+        }
+
+        self.resolve_key_for_version_index(index).await
+    }
+
+    async fn version_restore_source_from_indexes(
+        &self,
+        indexes: &[FileVersionIndex],
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        for index in indexes {
+            let Some(record) = index.versions.get(version_id) else {
+                continue;
+            };
+            let Some(resolved_path) = self.resolve_key_for_version_record(index, record).await?
+            else {
+                continue;
+            };
+            if resolved_path != source_path || record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            return Ok(Some(SnapshotRestoreSource {
+                manifest_hash: record.manifest_hash.clone(),
+                object_id: Some(index.object_id.clone()),
+                version_id: Some(record.version_id.clone()),
+                state: record.state.clone(),
+            }));
+        }
+
+        Ok(None)
+    }
+
+    async fn version_restore_source_from_object_id(
+        &self,
+        source_object_id: &str,
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        let Some(index) = self
+            .metadata_store
+            .load_version_index_by_object_id(source_object_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.version_restore_source_from_indexes(&[index], source_path, version_id)
+            .await
+    }
+
+    pub(crate) async fn history_source_manifest_hash(
+        &self,
+        source_object_id: &str,
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .version_restore_source_from_object_id(source_object_id, source_path, version_id)
+            .await?
+            .map(|source| source.manifest_hash))
+    }
+
+    /// Resolves a historical restore batch without holding the main store lock.
+    /// The history listing supplies the immutable source object id, so each
+    /// restore resolves exactly one version index instead of scanning metadata.
+    pub(crate) async fn resolve_version_restore_sources(
+        &self,
+        restore_requests: &[(String, String, String, String)],
+    ) -> Result<Vec<Option<SnapshotRestoreSource>>> {
+        let mut sources = HashMap::<(String, String), SnapshotRestoreSource>::new();
+        for (source_path, version_id, source_object_id, _) in restore_requests {
+            let source = self
+                .version_restore_source_from_object_id(source_object_id, source_path, version_id)
+                .await?;
+            if let Some(source) = source {
+                sources.insert((source_path.clone(), version_id.clone()), source);
+            }
+        }
+
+        Ok(restore_requests
+            .iter()
+            .map(|(source_path, version_id, _, _)| {
+                sources
+                    .get(&(source_path.clone(), version_id.clone()))
+                    .cloned()
+            })
+            .collect())
+    }
+
+    pub(crate) async fn list_recoverable_history_listing(
+        &self,
+        prefix: &str,
+        depth: usize,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryListing> {
+        self.metadata_store
+            .list_recoverable_history_listing(prefix, depth, max_entries)
+            .await
+    }
+
+    pub(crate) async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState> {
+        self.metadata_store
+            .history_head_projection_backfill_state()
+            .await
+    }
+
+    /// Advances the one-time projection migration without running it on an
+    /// Explorer request. Replaying a completed page is safe: the backend only
+    /// inserts missing projection rows, while normal version-index writes
+    /// always win with their current projection.
+    pub(crate) async fn backfill_history_head_projection_batch(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillProgress> {
+        let HistoryHeadProjectionBackfillState::Pending { after_object_id } = self
+            .metadata_store
+            .history_head_projection_backfill_state()
+            .await?
+        else {
+            return Ok(HistoryHeadProjectionBackfillProgress {
+                processed_index_count: 0,
+                complete: true,
+            });
+        };
+
+        let payloads = self
+            .metadata_store
+            .load_version_index_payloads_after(
+                after_object_id.as_deref(),
+                STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE,
+            )
+            .await?;
+        let processed_index_count = payloads.len();
+        let next_after_object_id = payloads.last().map(|(object_id, _)| object_id.clone());
+        let complete = processed_index_count < STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE;
+        let projections = payloads
+            .iter()
+            .map(|(object_id, payload)| {
+                match decode_version_index(object_id, payload, "history head projection backfill") {
+                    Ok(index) => version_index_head_projection(object_id, &index),
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            object_id,
+                            "skipping malformed version index during recoverable history backfill"
+                        );
+                        VersionIndexHeadProjection::empty(object_id)
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        self.metadata_store
+            .persist_history_head_projection_backfill_batch(
+                &projections,
+                next_after_object_id.as_deref(),
+                complete,
+            )
+            .await?;
+
+        Ok(HistoryHeadProjectionBackfillProgress {
+            processed_index_count,
+            complete,
+        })
     }
 }
 
@@ -4371,6 +4941,10 @@ impl PersistentStore {
             self.storage_pool.clone(),
             self.metadata_store.clone(),
         ))
+    }
+
+    pub(crate) fn store_history_inspector(&self) -> StoreHistoryInspector {
+        StoreHistoryInspector::new(self.storage_pool.clone(), self.metadata_store.clone())
     }
 
     pub(crate) async fn query_gallery_index(
@@ -7436,6 +8010,34 @@ impl PersistentStore {
         })
     }
 
+    pub async fn describe_history_object(
+        &self,
+        source_object_id: &str,
+        source_path: &str,
+        version_id: &str,
+    ) -> std::result::Result<ObjectReadDescriptor, StoreReadError> {
+        let manifest_hash = self
+            .store_history_inspector()
+            .history_source_manifest_hash(source_object_id, source_path, version_id)
+            .await
+            .map_err(StoreReadError::Internal)?
+            .ok_or(StoreReadError::NotFound)?;
+        let Some(manifest) = self
+            .load_manifest_by_hash(&manifest_hash)
+            .await
+            .map_err(StoreReadError::Internal)?
+        else {
+            return Err(StoreReadError::Corrupt(format!(
+                "manifest missing for hash={manifest_hash}"
+            )));
+        };
+
+        Ok(ObjectReadDescriptor {
+            manifest_hash,
+            total_size_bytes: manifest.total_size_bytes,
+        })
+    }
+
     #[allow(dead_code)]
     pub async fn read_object_range_by_manifest_hash(
         &self,
@@ -9820,6 +10422,78 @@ impl PersistentStore {
             .await
     }
 
+    /// Applies an already-resolved historical restore batch. Target existence
+    /// is deliberately checked here, immediately before each mutation.
+    pub(crate) async fn restore_resolved_version_paths_batch(
+        &mut self,
+        restore_requests: &[(String, String, String, String)],
+        sources: &[Option<SnapshotRestoreSource>],
+    ) -> Result<RestoreResolvedVersionPathsBatchResult> {
+        if restore_requests.len() != sources.len() {
+            bail!(
+                "historical restore request/source count mismatch: {} requests, {} sources",
+                restore_requests.len(),
+                sources.len()
+            );
+        }
+        let touched_paths = restore_requests
+            .iter()
+            .map(|(_, _, _, target_path)| target_path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut before_bindings = HashMap::with_capacity(touched_paths.len());
+        for path in &touched_paths {
+            before_bindings.insert(path.clone(), self.current_state_binding(path).await?);
+        }
+        if !touched_paths.is_empty() {
+            self.maybe_rotate_snapshot_batch(&touched_paths).await?;
+        }
+        let mut results = Vec::with_capacity(restore_requests.len());
+
+        for ((source_path, _version_id, _source_object_id, target_path), source) in
+            restore_requests.iter().zip(sources)
+        {
+            let target_exists = match self.current_object_entry(target_path).await {
+                Ok(entry) => entry.is_some(),
+                Err(err) => {
+                    results.push(Err(err));
+                    continue;
+                }
+            };
+            if target_exists {
+                results.push(Ok(PathMutationResult::TargetExists));
+                continue;
+            }
+            let result = match source {
+                Some(source) => {
+                    self.restore_object_path_from_source(
+                        source.clone(),
+                        source_path,
+                        target_path,
+                        false,
+                        false,
+                    )
+                    .await
+                }
+                None => Ok(PathMutationResult::SourceMissing),
+            };
+            results.push(result);
+        }
+
+        let finalization_error = match self.changed_paths_after_bindings(&before_bindings).await {
+            Ok(changed_paths) if !changed_paths.is_empty() => self
+                .record_snapshot_batch(changed_paths, unix_ts())
+                .await
+                .err(),
+            Ok(_) => None,
+            Err(err) => Some(err),
+        };
+
+        Ok(RestoreResolvedVersionPathsBatchResult {
+            results,
+            finalization_error,
+        })
+    }
+
     async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {
         if let Some(object_id) = self.object_id_for_key(key).await? {
             return Ok(Some(object_id));
@@ -10859,6 +11533,29 @@ fn recompute_head_version_ids(index: &FileVersionIndex) -> Vec<String> {
     let mut heads: Vec<String> = all_ids.into_iter().collect();
     heads.sort();
     heads
+}
+
+fn recoverable_tombstone_ancestor(
+    index: &FileVersionIndex,
+    tombstone: &FileVersionRecord,
+) -> Option<FileVersionRecord> {
+    let mut pending = tombstone.parent_version_ids.clone();
+    let mut visited = HashSet::new();
+
+    while let Some(version_id) = pending.pop() {
+        if !visited.insert(version_id.clone()) {
+            continue;
+        }
+        let Some(record) = index.versions.get(&version_id) else {
+            continue;
+        };
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            return Some(record.clone());
+        }
+        pending.extend(record.parent_version_ids.iter().cloned());
+    }
+
+    None
 }
 
 fn choose_preferred_head(index: &FileVersionIndex) -> Option<String> {

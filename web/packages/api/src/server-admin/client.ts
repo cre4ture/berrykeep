@@ -17,6 +17,9 @@ import type {
   AdminMediaCacheClearResponse,
   AdminStoreGetResponse,
   AdminSnapshotSummary,
+  AdminStoreHistoryRestoreEntry,
+  AdminStoreHistoryRestoreResponse,
+  AdminStoreHistoryResponse,
   AdminStoreListResponse,
   AdminVersionGraphResponse,
   AdminSessionStatus,
@@ -297,6 +300,37 @@ export async function listAdminStoreEntries(
   });
 }
 
+export async function listAdminStoreHistoryEntries(
+  prefix?: string,
+  depth = 1,
+  adminTokenOverride?: string
+): Promise<AdminStoreHistoryResponse> {
+  const query = new URLSearchParams({
+    depth: String(Math.max(1, Math.floor(depth)))
+  });
+  if (prefix?.trim()) {
+    query.set("prefix", prefix.trim());
+  }
+  return fetchAdminJson<AdminStoreHistoryResponse>(
+    `${apiV1("/auth/store/history")}?${query.toString()}`,
+    { adminTokenOverride }
+  );
+}
+
+export async function restoreAdminStoreHistoryEntries(
+  entries: AdminStoreHistoryRestoreEntry[],
+  adminTokenOverride?: string
+): Promise<AdminStoreHistoryRestoreResponse> {
+  return fetchAdminJson<AdminStoreHistoryRestoreResponse>(
+    apiV1("/auth/store/history/restore"),
+    {
+      method: "POST",
+      body: { entries },
+      adminTokenOverride
+    }
+  );
+}
+
 export async function setAdminStoreMediaLabels(
   path: string,
   labels: string[],
@@ -423,7 +457,8 @@ export async function getAdminStoreValue(
   snapshot?: string | null,
   version?: string | null,
   previewBytes?: number | null,
-  adminTokenOverride?: string
+  adminTokenOverride?: string,
+  sourceObjectId?: string | null
 ): Promise<AdminStoreGetResponse> {
   const headers = new Headers(buildAdminHeaders(adminTokenOverride));
   const previewLimit =
@@ -434,7 +469,11 @@ export async function getAdminStoreValue(
     headers.set("range", `bytes=0-${previewLimit - 1}`);
   }
 
-  const response = await fetch(getAdminStoreDownloadUrl(key, snapshot, version), {
+  const downloadUrl = getAdminStoreDownloadUrl(key, snapshot, version);
+  const sourceObjectQuery = sourceObjectId?.trim()
+    ? `${downloadUrl.includes("?") ? "&" : "?"}object_id=${encodeURIComponent(sourceObjectId.trim())}`
+    : "";
+  const response = await fetch(`${downloadUrl}${sourceObjectQuery}`, {
     credentials: "same-origin",
     cache: "no-store",
     headers

@@ -54,6 +54,52 @@ fn reconciliation_object_paths_encode_store_keys_before_transport() {
 }
 
 #[test]
+fn store_history_cache_retains_entries() {
+    let mut cache = super::StoreHistoryCache::default();
+    cache.insert(
+        "docs",
+        1,
+        Arc::new(super::StoreHistoryCacheValue::Entries(
+            super::storage::RecoverableHistoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            },
+        )),
+    );
+
+    assert!(cache.get("docs", 1).is_some());
+    assert!(cache.get("docs", 2).is_none());
+    assert!(cache.get("", 1).is_none());
+}
+
+#[test]
+fn store_history_refresh_locks_preserve_an_active_prefix_during_eviction() {
+    let mut locks = super::StoreHistoryRefreshLocks::default();
+    let active = locks.lock_for_scope("active", 1);
+    for prefix in ["idle-one", "idle-two", "idle-three"] {
+        drop(locks.lock_for_scope(prefix, 1));
+    }
+
+    let replacement = locks.lock_for_scope("replacement", 1);
+
+    assert!(Arc::ptr_eq(
+        &active,
+        locks
+            .by_scope
+            .get(&("active".to_string(), 1))
+            .expect("the active prefix lock should not be evicted")
+    ));
+    assert!(Arc::ptr_eq(
+        &replacement,
+        locks
+            .by_scope
+            .get(&("replacement".to_string(), 1))
+            .expect("the replacement prefix lock should be retained")
+    ));
+    assert_eq!(locks.by_scope.len(), 2);
+}
+
+#[test]
 fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
     let tickets = HashMap::from([
         (
@@ -16481,7 +16527,27 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .unwrap()
         .get(&cached_key, cached_sequence)
         .expect("prepared page should be cached");
+    state.storage.store_history_cache.lock().unwrap().insert(
+        "",
+        1,
+        Arc::new(super::StoreHistoryCacheValue::Entries(
+            super::storage::RecoverableHistoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            },
+        )),
+    );
     super::publish_namespace_change(&state);
+    assert!(
+        state
+            .storage
+            .store_history_cache
+            .lock()
+            .unwrap()
+            .get("", 1)
+            .is_none(),
+        "ordinary namespace changes invalidate the recoverable-history cache"
+    );
     assert!(
         super::cached_store_index_page_response(
             &state,
@@ -17794,6 +17860,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
         super::ObjectGetQuery {
             snapshot: None,
             version: None,
+            object_id: None,
             read_mode: None,
         },
         &HeaderMap::new(),
@@ -17962,6 +18029,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -17991,6 +18059,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -18799,6 +18868,7 @@ async fn get_object_admin_returns_bytes_with_admin_token_impl(backend: MainTestB
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -18841,6 +18911,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -18872,6 +18943,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -18908,6 +18980,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -19033,6 +19106,16 @@ async fn build_test_state(
             namespace_change_tx,
             store_index_page_cache: Arc::new(std::sync::Mutex::new(
                 super::StoreIndexPageCache::default(),
+            )),
+            store_history_cache: Arc::new(std::sync::Mutex::new(
+                super::StoreHistoryCache::default(),
+            )),
+            store_history_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            store_history_refresh_locks: Arc::new(std::sync::Mutex::new(
+                super::StoreHistoryRefreshLocks::default(),
+            )),
+            store_history_refresh_permits: Arc::new(tokio::sync::Semaphore::new(
+                super::STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
             )),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
@@ -23057,6 +23140,30 @@ fn rendezvous_relay_accept_retry_delay_backs_off_and_caps() {
     assert_eq!(
         super::rendezvous_relay_accept_retry_delay(999),
         Duration::from_secs(super::RENDEZVOUS_RELAY_ACCEPT_MAX_RETRY_SECS)
+    );
+}
+
+#[test]
+fn history_head_projection_backfill_retry_delay_backs_off_and_caps() {
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(1),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(2),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(9),
+        Duration::from_secs(256)
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(10),
+        super::HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(u32::MAX),
+        super::HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY
     );
 }
 

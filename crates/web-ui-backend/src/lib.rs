@@ -453,6 +453,8 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/cluster/nodes", get(web_cluster_nodes))
         .route("/cluster/replication/plan", get(web_replication_plan))
         .route("/store/list", get(web_store_list))
+        .route("/store/history", get(web_store_history))
+        .route("/store/history/restore", post(web_store_history_restore))
         .route("/store/index/delta", get(web_store_index_delta))
         .route("/gallery/map/clusters", get(web_gallery_map_clusters))
         .route(
@@ -541,6 +543,11 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/cluster/nodes", get(web_cluster_nodes))
         .route("/api/cluster/replication/plan", get(web_replication_plan))
         .route("/api/store/list", get(web_store_list))
+        .route("/api/store/history", get(web_store_history))
+        .route(
+            "/api/store/history/restore",
+            post(web_store_history_restore),
+        )
         .route("/api/store/index/delta", get(web_store_index_delta))
         .route("/api/gallery/map/clusters", get(web_gallery_map_clusters))
         .route(
@@ -767,6 +774,12 @@ struct WebStoreListQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct WebStoreHistoryQuery {
+    prefix: Option<String>,
+    depth: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct WebStoreIndexDeltaQuery {
     token: String,
     limit: Option<usize>,
@@ -804,6 +817,7 @@ struct WebStoreGetQuery {
     key: String,
     snapshot: Option<String>,
     version: Option<String>,
+    object_id: Option<String>,
     preview_bytes: Option<usize>,
 }
 
@@ -839,6 +853,19 @@ struct WebStoreRestoreRequest {
     target_path: String,
     #[serde(default)]
     recursive: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WebStoreHistoryRestoreEntry {
+    path: String,
+    restore_source_path: String,
+    restore_source_object_id: String,
+    restore_version_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WebStoreHistoryRestoreRequest {
+    entries: Vec<WebStoreHistoryRestoreEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1979,6 +2006,20 @@ fn build_versions_request_path(key: &str) -> Result<String> {
     build_relative_path(&["versions", key], &[])
 }
 
+fn build_store_history_request_path(query: &WebStoreHistoryQuery) -> Result<String> {
+    let depth = query.depth.unwrap_or(1).clamp(1, 64).to_string();
+    let mut query_pairs = vec![("depth", depth.as_str())];
+    if let Some(prefix) = query
+        .prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    {
+        query_pairs.push(("prefix", prefix));
+    }
+    build_relative_path(&["store", "history"], &query_pairs)
+}
+
 fn media_selector_query_pairs(query: &WebMediaThumbnailQuery) -> Vec<(&str, &str)> {
     let mut query_pairs = vec![("key", query.key.as_str())];
     if let Some(snapshot) = query.snapshot.as_deref() {
@@ -3063,6 +3104,70 @@ async fn web_store_list(
     }
 }
 
+async fn web_store_history(
+    State(state): State<WebState>,
+    Query(query): Query<WebStoreHistoryQuery>,
+) -> impl IntoResponse {
+    let request_path = match build_store_history_request_path(&query) {
+        Ok(path) => path,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    match current_sdk(&state)
+        .await
+        .request_relative_path(Method::GET, &request_path, Vec::new(), None)
+        .await
+    {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+                headers.insert(CONTENT_TYPE, value);
+            }
+            (response.status, headers, response.body).into_response()
+        }
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store history request failed",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn web_store_history_restore(
+    State(state): State<WebState>,
+    Json(request): Json<WebStoreHistoryRestoreRequest>,
+) -> impl IntoResponse {
+    let payload = match serde_json::to_vec(&request) {
+        Ok(payload) => payload,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    match current_sdk(&state)
+        .await
+        .request_relative_path(
+            Method::POST,
+            "/store/history/restore",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            Some(payload),
+        )
+        .await
+    {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+                headers.insert(CONTENT_TYPE, value);
+            }
+            (response.status, headers, response.body).into_response()
+        }
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store history restore request failed",
+            err.to_string(),
+        ),
+    }
+}
+
 async fn web_gallery_map_clusters(
     State(state): State<WebState>,
     Query(query): Query<WebGalleryMapClustersQuery>,
@@ -3248,8 +3353,27 @@ async fn web_store_get(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
+    let source_object_id = query.object_id.as_deref().map(str::trim);
+    if source_object_id.is_some_and(str::is_empty)
+        || (source_object_id.is_some() && query.snapshot.is_some())
+        || (source_object_id.is_some() && query.version.is_none())
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "object_id requires a version and cannot be combined with a snapshot",
+        );
+    }
+
     let client = current_client(&state).await;
-    let payload_result = if query.snapshot.is_none() && query.version.is_none() {
+    let payload_result = if let Some(object_id) = source_object_id {
+        client
+            .get_history_source_version(
+                &query.key,
+                object_id,
+                query.version.as_deref().expect("checked above"),
+            )
+            .await
+    } else if query.snapshot.is_none() && query.version.is_none() {
         client.get_cached_or_fetch(&query.key).await
     } else {
         client

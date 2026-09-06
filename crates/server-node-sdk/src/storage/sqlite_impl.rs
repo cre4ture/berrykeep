@@ -25,20 +25,24 @@ use super::{
     GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
     GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue,
     GallerySummaryMiss, GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
-    GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
-    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
-    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
-    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
-    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
+    METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
+    MetadataStore, OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker,
+    RecoverableHistoryEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
+    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
+    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
+    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
+    StorageStatsSample, StorageStatsState, TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection,
     compress_snapshot_json, current_media_cache_metadata, decode_gallery_labels,
     decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
-    sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
+    recoverable_history_listing_query, sqlite_like_prefix_pattern,
+    version_created_at_unix_from_payload, version_index_head_projection,
 };
 
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1965,6 +1969,85 @@ fn map_tokio_rusqlite_error(error: tokio_rusqlite::Error) -> anyhow::Error {
     }
 }
 
+fn upsert_version_index_head_projection(
+    db: &Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    db.execute(
+        "INSERT INTO version_index_heads (
+             object_id,
+             head_version_id,
+             head_manifest_hash,
+             logical_path,
+             removed_at_unix,
+             restore_source_path,
+             restore_source_object_id,
+             restore_version_id,
+             moved_source_object_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(object_id) DO UPDATE SET
+             head_version_id = excluded.head_version_id,
+             head_manifest_hash = excluded.head_manifest_hash,
+             logical_path = excluded.logical_path,
+             removed_at_unix = excluded.removed_at_unix,
+             restore_source_path = excluded.restore_source_path,
+             restore_source_object_id = excluded.restore_source_object_id,
+             restore_version_id = excluded.restore_version_id,
+             moved_source_object_id = excluded.moved_source_object_id",
+        params![
+            projection.object_id.as_str(),
+            projection.head_version_id.as_deref(),
+            projection.head_manifest_hash.as_deref(),
+            projection.logical_path.as_deref(),
+            projection.removed_at_unix.map(u64_to_i64).transpose()?,
+            projection.restore_source_path.as_deref(),
+            projection.restore_source_object_id.as_deref(),
+            projection.restore_version_id.as_deref(),
+            projection.moved_source_object_id.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_version_index_head_projection_if_missing(
+    db: &Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    // The backfill may race a normal version-index write or a deletion. Only
+    // insert while the source index still exists and never replace a row a
+    // normal write has already brought up to date.
+    db.execute(
+        "INSERT INTO version_index_heads (
+             object_id,
+             head_version_id,
+             head_manifest_hash,
+             logical_path,
+             removed_at_unix,
+             restore_source_path,
+             restore_source_object_id,
+             restore_version_id,
+             moved_source_object_id
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+         WHERE EXISTS (
+             SELECT 1 FROM version_indexes WHERE object_id = ?1
+         )
+         ON CONFLICT(object_id) DO NOTHING",
+        params![
+            projection.object_id.as_str(),
+            projection.head_version_id.as_deref(),
+            projection.head_manifest_hash.as_deref(),
+            projection.logical_path.as_deref(),
+            projection.removed_at_unix.map(u64_to_i64).transpose()?,
+            projection.restore_source_path.as_deref(),
+            projection.restore_source_object_id.as_deref(),
+            projection.restore_version_id.as_deref(),
+            projection.moved_source_object_id.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
     async fn object_id_backfill_needed(&self) -> Result<bool> {
@@ -3793,6 +3876,7 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
         let object_id = object_id.to_string();
+        let head_projection = version_index_head_projection(&object_id, index);
         self.write_tx(move |db| {
             let changed = db.execute(
                 "INSERT INTO version_indexes (object_id, index_json)
@@ -3801,6 +3885,7 @@ impl MetadataStore for SqliteMetadataStore {
                  WHERE version_indexes.index_json != excluded.index_json",
                 params![object_id, payload],
             )?;
+            upsert_version_index_head_projection(db, &head_projection)?;
             if changed > 0 {
                 let unchanged_projection_keys =
                     refresh_gallery_objects_for_object_id_and_collect_unchanged_keys(
@@ -3857,6 +3942,162 @@ impl MetadataStore for SqliteMetadataStore {
                 indexes.push(decode_version_index(&object_id, &payload, "sqlite")?);
             }
             Ok(indexes)
+        })
+        .await
+    }
+
+    async fn load_version_index_payloads_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let after_object_id = after_object_id.map(str::to_owned);
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        self.read(move |db| {
+            let mut statement = db.prepare(
+                "SELECT object_id, index_json
+                 FROM version_indexes
+                 WHERE ?1 IS NULL OR object_id > ?1
+                 ORDER BY object_id
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![after_object_id, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    async fn list_recoverable_history_listing(
+        &self,
+        prefix: &str,
+        depth: usize,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryListing> {
+        let prefix = prefix.trim().trim_matches('/').to_string();
+        let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+        let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
+        let depth = depth.clamp(1, 64);
+        let depth = i64::try_from(depth).context("history listing depth overflow")?;
+        let max_entries = max_entries.max(1);
+        let limit = max_entries
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(i64::MAX);
+        let query = recoverable_history_listing_query(!prefix.is_empty());
+        self.read(move |db| {
+            let mut statement = db.prepare(&query)?;
+            let mut rows = statement.query(params![
+                TOMBSTONE_MANIFEST_HASH,
+                prefix,
+                path_lower_bound.unwrap_or_default(),
+                path_upper_bound.unwrap_or_default(),
+                depth,
+                limit,
+            ])?;
+            let mut entries = Vec::new();
+            while let Some(row) = rows.next()? {
+                let path = row.get::<_, String>(0)?;
+                if row.get::<_, i64>(1)? != 0 {
+                    entries.push(RecoverableHistoryListingEntry::Historical(
+                        RecoverableHistoryEntry {
+                            path,
+                            restore_source_path: row.get(2)?,
+                            restore_source_object_id: row.get(3)?,
+                            restore_version_id: row.get(4)?,
+                            removed_at_unix: row.get(5)?,
+                            moved_to_path: row.get(6)?,
+                        },
+                    ));
+                } else {
+                    entries.push(RecoverableHistoryListingEntry::Prefix { path });
+                }
+            }
+            let truncated = entries.len() > max_entries;
+            entries.truncate(max_entries);
+            Ok(RecoverableHistoryListing { entries, truncated })
+        })
+        .await
+    }
+
+    async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState> {
+        self.read(|db| {
+            let complete = db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if complete {
+                return Ok(HistoryHeadProjectionBackfillState::Complete);
+            }
+            let after_object_id = db
+                .query_row(
+                    "SELECT value FROM metadata_meta WHERE key = ?1",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(HistoryHeadProjectionBackfillState::Pending { after_object_id })
+        })
+        .await
+    }
+
+    async fn persist_history_head_projection_backfill_batch(
+        &self,
+        projections: &[VersionIndexHeadProjection],
+        next_after_object_id: Option<&str>,
+        complete: bool,
+    ) -> Result<()> {
+        let projections = projections.to_vec();
+        let next_after_object_id = next_after_object_id.map(str::to_owned);
+        self.write_tx(move |db| {
+            for projection in &projections {
+                insert_version_index_head_projection_if_missing(db, projection)?;
+            }
+            if complete {
+                db.execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY],
+                )?;
+                db.execute(
+                    "DELETE FROM metadata_meta WHERE key = ?1",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY],
+                )?;
+            } else {
+                let after_object_id = next_after_object_id.as_deref().ok_or_else(|| {
+                    anyhow!("history head projection backfill has no next cursor")
+                })?;
+                db.execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, after_object_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn clear_history_head_projections_for_test(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute("DELETE FROM version_index_heads", [])?;
+            db.execute(
+                "DELETE FROM metadata_meta WHERE key IN (?1, ?2)",
+                params![
+                    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
+                    HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+                ],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -4394,9 +4635,13 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
         let object_id = object_id.to_string();
-        self.write(move |db| {
+        self.write_tx(move |db| {
             db.execute(
                 "DELETE FROM version_indexes WHERE object_id = ?1",
+                params![object_id],
+            )?;
+            db.execute(
+                "DELETE FROM version_index_heads WHERE object_id = ?1",
                 params![object_id],
             )?;
             Ok(())
@@ -4543,6 +4788,18 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS version_indexes (
             object_id TEXT PRIMARY KEY,
             index_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS version_index_heads (
+            object_id TEXT PRIMARY KEY,
+            head_version_id TEXT,
+            head_manifest_hash TEXT,
+            logical_path TEXT,
+            removed_at_unix INTEGER,
+            restore_source_path TEXT,
+            restore_source_object_id TEXT,
+            restore_version_id TEXT,
+            moved_source_object_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS snapshots (
@@ -4728,6 +4985,14 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON gallery_objects(manifest_hash);
         CREATE INDEX IF NOT EXISTS idx_manifest_summaries_content_fingerprint
             ON manifest_summaries(content_fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_version_index_heads_history_path
+            ON version_index_heads(
+                head_manifest_hash,
+                logical_path,
+                removed_at_unix DESC,
+                restore_version_id DESC,
+                object_id DESC
+            );
         CREATE INDEX IF NOT EXISTS idx_snapshots_created
             ON snapshots(created_at_unix DESC, snapshot_id DESC);
         CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected

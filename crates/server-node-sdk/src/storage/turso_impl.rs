@@ -21,16 +21,19 @@ use super::{
     DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
     GalleryDeltaCursorError, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage,
     GalleryIndexQuery, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
-    GalleryMapClusterQuery, GallerySummaryCache, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
-    ObjectVersionMetadataRecord, ReconcileMarker, RepairAttemptRecord, RepairRunRecord,
-    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
-    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
-    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    GalleryMapClusterQuery, GallerySummaryCache, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
+    METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
+    MetadataStore, OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker,
+    RecoverableHistoryEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
+    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
+    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
+    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
+    StorageStatsSample, StorageStatsState, TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection,
     compress_snapshot_json, decode_gallery_labels, decode_version_index, decompress_snapshot_json,
     metadata_db_logical_summary_query, metadata_db_logical_table_specs,
-    normalize_snapshot_manifest_object_ids,
+    normalize_snapshot_manifest_object_ids, recoverable_history_listing_query,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -1774,6 +1777,207 @@ impl MetadataStore for TursoMetadataStore {
         Ok(indexes)
     }
 
+    async fn load_version_index_payloads_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        let mut rows = if let Some(after_object_id) = after_object_id {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     WHERE object_id > ?1
+                     ORDER BY object_id
+                     LIMIT ?2",
+                    (after_object_id, limit),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     ORDER BY object_id
+                     LIMIT ?1",
+                    (limit,),
+                )
+                .await?
+        };
+
+        let mut payloads = Vec::new();
+        while let Some(row) = rows.next().await? {
+            payloads.push((
+                row_string(&row, 0, "version_indexes.object_id")?,
+                row_blob(&row, 1, "version_indexes.index_json")?,
+            ));
+        }
+        Ok(payloads)
+    }
+
+    async fn list_recoverable_history_listing(
+        &self,
+        prefix: &str,
+        depth: usize,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryListing> {
+        let prefix = prefix.trim().trim_matches('/').to_string();
+        let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+        let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
+        let depth = depth.clamp(1, 64);
+        let depth = i64::try_from(depth).context("history listing depth overflow")?;
+        let max_entries = max_entries.max(1);
+        let limit = max_entries
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(i64::MAX);
+        let query = recoverable_history_listing_query(!prefix.is_empty());
+        let mut rows = self
+            .connection
+            .query(
+                &query,
+                (
+                    TOMBSTONE_MANIFEST_HASH,
+                    prefix,
+                    path_lower_bound.unwrap_or_default(),
+                    path_upper_bound.unwrap_or_default(),
+                    depth,
+                    limit,
+                ),
+            )
+            .await?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let path = row_string(&row, 0, "recoverable_history_listing.path")?;
+            if row_u64(&row, 1, "recoverable_history_listing.is_historical")? != 0 {
+                entries.push(RecoverableHistoryListingEntry::Historical(
+                    RecoverableHistoryEntry {
+                        path,
+                        restore_source_path: row_string(
+                            &row,
+                            2,
+                            "recoverable_history_listing.restore_source_path",
+                        )?,
+                        restore_source_object_id: row_string(
+                            &row,
+                            3,
+                            "recoverable_history_listing.restore_source_object_id",
+                        )?,
+                        restore_version_id: row_string(
+                            &row,
+                            4,
+                            "recoverable_history_listing.restore_version_id",
+                        )?,
+                        removed_at_unix: row_u64(
+                            &row,
+                            5,
+                            "recoverable_history_listing.removed_at_unix",
+                        )?,
+                        moved_to_path: row_opt_string(
+                            &row,
+                            6,
+                            "recoverable_history_listing.moved_to_path",
+                        )?,
+                    },
+                ));
+            } else {
+                entries.push(RecoverableHistoryListingEntry::Prefix { path });
+            }
+        }
+        let truncated = entries.len() > max_entries;
+        entries.truncate(max_entries);
+        Ok(RecoverableHistoryListing { entries, truncated })
+    }
+
+    async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,),
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(HistoryHeadProjectionBackfillState::Complete);
+        }
+        drop(rows);
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT value FROM metadata_meta WHERE key = ?1",
+                (HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,),
+            )
+            .await?;
+        let after_object_id = match rows.next().await? {
+            Some(row) => Some(row_string(
+                &row,
+                0,
+                "metadata_meta.history_head_projection_backfill_cursor",
+            )?),
+            None => None,
+        };
+        Ok(HistoryHeadProjectionBackfillState::Pending { after_object_id })
+    }
+
+    async fn persist_history_head_projection_backfill_batch(
+        &self,
+        projections: &[VersionIndexHeadProjection],
+        next_after_object_id: Option<&str>,
+        complete: bool,
+    ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        for projection in projections {
+            insert_version_index_head_projection_if_missing(&self.connection, projection).await?;
+        }
+        if complete {
+            self.connection
+                .execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,),
+                )
+                .await?;
+            self.connection
+                .execute(
+                    "DELETE FROM metadata_meta WHERE key = ?1",
+                    (HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,),
+                )
+                .await?;
+        } else {
+            let after_object_id = next_after_object_id
+                .context("history head projection backfill has no next cursor")?;
+            self.connection
+                .execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, after_object_id),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn clear_history_head_projections_for_test(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute("DELETE FROM version_index_heads", ())
+            .await?;
+        self.connection
+            .execute(
+                "DELETE FROM metadata_meta WHERE key IN (?1, ?2)",
+                (
+                    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
+                    HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
         let mut rows = self
             .connection
@@ -2371,6 +2575,12 @@ impl MetadataStore for TursoMetadataStore {
                 (object_id,),
             )
             .await?;
+        self.connection
+            .execute(
+                "DELETE FROM version_index_heads WHERE object_id = ?1",
+                (object_id,),
+            )
+            .await?;
         Ok(())
     }
 
@@ -2460,6 +2670,97 @@ pub(super) async fn add_column_if_missing(
     Ok(())
 }
 
+pub(super) async fn upsert_version_index_head_projection(
+    connection: &turso::Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    connection
+        .execute(
+            "INSERT INTO version_index_heads (
+                 object_id,
+                 head_version_id,
+                 head_manifest_hash,
+                 logical_path,
+                 removed_at_unix,
+                 restore_source_path,
+                 restore_source_object_id,
+                 restore_version_id,
+                 moved_source_object_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(object_id) DO UPDATE SET
+                 head_version_id = excluded.head_version_id,
+                 head_manifest_hash = excluded.head_manifest_hash,
+                 logical_path = excluded.logical_path,
+                 removed_at_unix = excluded.removed_at_unix,
+                 restore_source_path = excluded.restore_source_path,
+                 restore_source_object_id = excluded.restore_source_object_id,
+                 restore_version_id = excluded.restore_version_id,
+                 moved_source_object_id = excluded.moved_source_object_id",
+            (
+                projection.object_id.as_str(),
+                projection.head_version_id.as_deref(),
+                projection.head_manifest_hash.as_deref(),
+                projection.logical_path.as_deref(),
+                projection
+                    .removed_at_unix
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("history head removal timestamp overflow")?,
+                projection.restore_source_path.as_deref(),
+                projection.restore_source_object_id.as_deref(),
+                projection.restore_version_id.as_deref(),
+                projection.moved_source_object_id.as_deref(),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn insert_version_index_head_projection_if_missing(
+    connection: &turso::Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    // A normal write is authoritative. This migration-only insert deliberately
+    // cannot resurrect an index that was deleted while a backfill page was
+    // being decoded, nor can it overwrite a concurrent write.
+    connection
+        .execute(
+            "INSERT INTO version_index_heads (
+                 object_id,
+                 head_version_id,
+                 head_manifest_hash,
+                 logical_path,
+                 removed_at_unix,
+                 restore_source_path,
+                 restore_source_object_id,
+                 restore_version_id,
+                 moved_source_object_id
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+             WHERE EXISTS (
+                 SELECT 1 FROM version_indexes WHERE object_id = ?1
+             )
+             ON CONFLICT(object_id) DO NOTHING",
+            (
+                projection.object_id.as_str(),
+                projection.head_version_id.as_deref(),
+                projection.head_manifest_hash.as_deref(),
+                projection.logical_path.as_deref(),
+                projection
+                    .removed_at_unix
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("history head removal timestamp overflow")?,
+                projection.restore_source_path.as_deref(),
+                projection.restore_source_object_id.as_deref(),
+                projection.restore_version_id.as_deref(),
+                projection.moved_source_object_id.as_deref(),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
     connection
         .execute_batch(
@@ -2478,6 +2779,18 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS version_indexes (
                 object_id TEXT PRIMARY KEY,
                 index_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS version_index_heads (
+                object_id TEXT PRIMARY KEY,
+                head_version_id TEXT,
+                head_manifest_hash TEXT,
+                logical_path TEXT,
+                removed_at_unix INTEGER,
+                restore_source_path TEXT,
+                restore_source_object_id TEXT,
+                restore_version_id TEXT,
+                moved_source_object_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -2661,6 +2974,14 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 ON snapshots(created_at_unix DESC, snapshot_id DESC);
             CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected
                 ON storage_stats_history(collected_at_unix DESC);
+            CREATE INDEX IF NOT EXISTS idx_version_index_heads_history_path
+                ON version_index_heads(
+                    head_manifest_hash,
+                    logical_path,
+                    removed_at_unix DESC,
+                    restore_version_id DESC,
+                    object_id DESC
+                );
             CREATE INDEX IF NOT EXISTS idx_repair_run_history_finished
                 ON repair_run_history(finished_at_unix DESC, run_id DESC);
             CREATE INDEX IF NOT EXISTS idx_manual_repair_action_run_history_finished
