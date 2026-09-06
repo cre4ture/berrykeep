@@ -29115,15 +29115,9 @@ async fn persist_manual_repair_action_run_record_with_retention(
     record: &ManualRepairActionRunRecord,
 ) {
     let store = lock_store(state, "manual_repair.persist").await;
-    if let Err(err) = store.persist_manual_repair_action_run_record(record).await {
-        warn!(
-            error = %err,
-            run_id = %record.run_id,
-            action_id = %record.action_id,
-            "failed to persist manual repair action history record"
-        );
-        return;
-    }
+    // Finalize the generic adapter first. If the legacy record write fails,
+    // this replaces the running adapter persisted at start rather than leaving
+    // an unprunable, permanently in-flight operation run behind.
     if let Err(err) = store
         .persist_operation_run(&operation_run_from_manual_repair_record(record))
         .await
@@ -29135,6 +29129,19 @@ async fn persist_manual_repair_action_run_record_with_retention(
             "failed to persist generic operation adapter for manual repair action"
         );
     }
+    let legacy_record_persisted = match store.persist_manual_repair_action_run_record(record).await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(
+                error = %err,
+                run_id = %record.run_id,
+                action_id = %record.action_id,
+                "failed to persist manual repair action history record"
+            );
+            false
+        }
+    };
 
     let retention_cutoff = record
         .finished_at_unix
@@ -29150,6 +29157,9 @@ async fn persist_manual_repair_action_run_record_with_retention(
             action_id = %record.action_id,
             "failed to prune generic operation history for manual repair actions"
         );
+    }
+    if !legacy_record_persisted {
+        return;
     }
     if let Err(err) = store
         .prune_manual_repair_action_run_history_before(retention_cutoff)

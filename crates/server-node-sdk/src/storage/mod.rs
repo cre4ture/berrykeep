@@ -3769,6 +3769,24 @@ impl StoreIndexInspector {
         self.current_state.object_ids.clone()
     }
 
+    /// Iterates the current object bindings without cloning the complete
+    /// current-state maps. Consumers that scan a bounded scope can copy only
+    /// the entries they actually need.
+    pub(crate) fn current_object_entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, Option<&str>)> {
+        self.current_state
+            .objects
+            .iter()
+            .map(|(path, manifest_hash)| {
+                (
+                    path.as_str(),
+                    manifest_hash.as_str(),
+                    self.current_state.object_ids.get(path).map(String::as_str),
+                )
+            })
+    }
+
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
         if manifest_hash == TOMBSTONE_MANIFEST_HASH {
             return Ok(None);

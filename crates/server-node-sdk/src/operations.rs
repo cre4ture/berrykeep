@@ -258,6 +258,41 @@ struct GeoInferenceSegment {
     media: Vec<GeoAnalysisMedia>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeoScanCandidate {
+    path: String,
+    manifest_hash: String,
+    object_id: Option<String>,
+}
+
+/// Collects a scope-limited, deterministic media candidate list without
+/// cloning the entire store index. A run fails rather than silently truncating
+/// its review data when the chosen prefix is too broad.
+fn geo_scan_candidates<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+    prefix: &str,
+    maximum: usize,
+) -> Result<Vec<GeoScanCandidate>> {
+    let mut candidates = Vec::new();
+    for (path, manifest_hash, object_id) in entries {
+        if !path.starts_with(prefix) || storage::gallery_media_type_for_path(path).is_none() {
+            continue;
+        }
+        if candidates.len() == maximum {
+            bail!(
+                "geolocation scan scope contains more than {maximum} media files; choose a narrower prefix"
+            );
+        }
+        candidates.push(GeoScanCandidate {
+            path: path.to_string(),
+            manifest_hash: manifest_hash.to_string(),
+            object_id: object_id.map(str::to_string),
+        });
+    }
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(candidates)
+}
+
 /// Produces semantic chunks for a single analysis run.  Folder and time-basis
 /// boundaries are never crossed; the latter keeps floating local wall-clock
 /// time away from explicitly offset timestamps.
@@ -313,30 +348,35 @@ fn semantic_geo_inference_segments(
                 .then_with(|| left.path.cmp(&right.path))
         });
 
-        let mut segment_start = 0usize;
-        for index in 1..=folder_media.len() {
-            let is_end = index == folder_media.len();
-            let gap_exceeded = !is_end
-                && folder_media[index]
-                    .capture_time
-                    .expect("capture time was grouped above")
-                    .unix
-                    .saturating_sub(
-                        folder_media[index - 1]
-                            .capture_time
-                            .expect("capture time was grouped above")
-                            .unix,
-                    )
-                    > config.segment_gap_seconds;
-            if !is_end && !gap_exceeded {
-                continue;
+        let mut current_segment = Vec::new();
+        for item in folder_media {
+            let gap_exceeded = current_segment
+                .last()
+                .is_some_and(|previous: &GeoAnalysisMedia| {
+                    item.capture_time
+                        .expect("capture time was grouped above")
+                        .unix
+                        .saturating_sub(
+                            previous
+                                .capture_time
+                                .expect("capture time was grouped above")
+                                .unix,
+                        )
+                        > config.segment_gap_seconds
+                });
+            if gap_exceeded {
+                segments.push(GeoInferenceSegment {
+                    folder: folder.clone(),
+                    media: std::mem::take(&mut current_segment),
+                });
             }
-
+            current_segment.push(item);
+        }
+        if !current_segment.is_empty() {
             segments.push(GeoInferenceSegment {
-                folder: folder.clone(),
-                media: folder_media[segment_start..index].to_vec(),
+                folder,
+                media: current_segment,
             });
-            segment_start = index;
         }
     }
     segments
@@ -785,7 +825,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use common::xmp::XmpGeoInference;
 use serde_json::json;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -813,7 +853,15 @@ const MAX_OPERATION_RESULT_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Geolocation inference assumes a short, local time window. Larger values
 /// would turn one folder into an impractically broad temporal segment.
 const MAX_GEO_TIME_WINDOW_SECONDS: u64 = 60 * 60;
+/// A scan must stay bounded even when a broad folder contains an unexpectedly
+/// large media library. The server fails clearly before producing partial
+/// proposals so an administrator can choose a narrower prefix.
+const MAX_GEOLOCATION_SCAN_MEDIA: usize = 50_000;
 const MULTIMEDIA_OPERATION_YIELD_MILLIS: u64 = 100;
+/// A queued multimedia job may wait briefly for repair/scrub work before it
+/// starts its work. It must not reserve the only slot of its kind forever.
+const MULTIMEDIA_OPERATION_START_WAIT_SECONDS: u64 = 5 * 60;
+const HIGHER_PRIORITY_WORK_TIMEOUT_REASON: &str = "higher_priority_work_timeout";
 const OPERATION_RUN_PERSIST_ATTEMPTS: usize = 3;
 const OPERATION_RUN_PERSIST_RETRY_MILLIS: u64 = 100;
 const OPERATION_RESULT_TYPE_GEO_PROPOSAL_CHUNK: &str = "multimedia.geolocation.proposal_chunk";
@@ -1004,7 +1052,10 @@ pub(super) async fn start_operation_run(
         finished_at_unix: None,
         progress: OperationProgress {
             phase: Some("queued".to_string()),
-            message: Some("Waiting for the multimedia operation slot.".to_string()),
+            message: Some(
+                "Waiting for the multimedia operation slot and higher-priority maintenance work."
+                    .to_string(),
+            ),
             ..OperationProgress::default()
         },
         input,
@@ -1320,7 +1371,10 @@ enum OperationTask {
 }
 
 async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoProposalRunInput) {
-    wait_for_higher_priority_work(&state).await;
+    if !wait_for_multimedia_start_turn(&state).await {
+        fail_multimedia_start_wait(&state, &mut run, true).await;
+        return;
+    }
     run.status = OperationRunStatus::Running;
     run.started_at_unix = Some(super::unix_ts());
     run.progress = OperationProgress {
@@ -1337,22 +1391,19 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
     }
 
     let result = async {
-        let (worker, object_hashes, object_ids) = {
+        let (worker, candidates) = {
             let store = read_store(&state, "operations.geo_proposal.snapshot").await;
             let inspector = store.store_index_inspector().await?;
             let worker = store.media_cache_worker();
-            let hashes = inspector.current_object_hashes();
-            let ids = inspector.current_object_ids();
-            (worker, hashes, ids)
+            let candidates = geo_scan_candidates(
+                inspector.current_object_entries(),
+                &input.prefix,
+                MAX_GEOLOCATION_SCAN_MEDIA,
+            )?;
+            (worker, candidates)
         };
-        let mut candidates = object_hashes
-            .into_iter()
-            .filter(|(path, _)| path.starts_with(&input.prefix))
-            .filter(|(path, _)| storage::gallery_media_type_for_path(path).is_some())
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| left.0.cmp(&right.0));
         let total = candidates.len();
-        let mut media = Vec::with_capacity(total);
+        let mut media = Vec::new();
         let mut metadata_error_count = 0usize;
         let mut sidecar_error_count = 0usize;
         for (batch_index, batch) in candidates
@@ -1360,14 +1411,14 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
             .enumerate()
         {
             wait_for_higher_priority_work(&state).await;
-            for (path, manifest_hash) in batch {
-                let metadata = match worker.ensure_media_metadata(manifest_hash).await {
+            for candidate in batch {
+                let metadata = match worker.ensure_media_metadata(&candidate.manifest_hash).await {
                     Ok(metadata) => metadata,
                     Err(error) => {
                         metadata_error_count += 1;
                         warn!(
                             error = %error,
-                            media_path = %path,
+                            media_path = %candidate.path,
                             "skipping media with unreadable metadata during geolocation proposal scan"
                         );
                         continue;
@@ -1386,13 +1437,13 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                 }
                 let sidecar_gps = {
                     let store = read_store(&state, "operations.geo_proposal.sidecar_gps").await;
-                    match store.media_sidecar_gps_overlay(path).await {
+                    match store.media_sidecar_gps_overlay(&candidate.path).await {
                         Ok(overlay) => overlay,
                         Err(error) => {
                             sidecar_error_count += 1;
                             warn!(
                                 error = %error,
-                                media_path = %path,
+                                media_path = %candidate.path,
                                 "skipping media with unreadable XMP sidecar during geolocation proposal scan"
                             );
                             // An unreadable sidecar may contain user-owned
@@ -1406,7 +1457,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                         }
                     }
                 };
-                let capture_time = capture_time_for_geolocation(path, &metadata);
+                let capture_time = capture_time_for_geolocation(&candidate.path, &metadata);
                 let embedded_gps = metadata.gps.as_ref().map(|value| GeoCoordinate {
                     latitude: value.latitude,
                     longitude: value.longitude,
@@ -1431,9 +1482,9 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                     (None, None) => (None, false),
                 };
                 media.push(GeoAnalysisMedia {
-                    path: path.clone(),
-                    object_id: object_ids.get(path).cloned().unwrap_or_default(),
-                    manifest_hash: manifest_hash.clone(),
+                    path: candidate.path.clone(),
+                    object_id: candidate.object_id.clone().unwrap_or_default(),
+                    manifest_hash: candidate.manifest_hash.clone(),
                     content_fingerprint: metadata.content_fingerprint.clone(),
                     capture_time,
                     gps,
@@ -1537,7 +1588,10 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
 }
 
 async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoApplyRunInput) {
-    wait_for_higher_priority_work(&state).await;
+    if !wait_for_multimedia_start_turn(&state).await {
+        fail_multimedia_start_wait(&state, &mut run, false).await;
+        return;
+    }
     run.status = OperationRunStatus::Running;
     run.started_at_unix = Some(super::unix_ts());
     run.progress = OperationProgress {
@@ -2147,6 +2201,31 @@ async fn release_multimedia_slot_activity(
     }
 }
 
+/// Gives active repair and scrub work a brief head start before a newly queued
+/// multimedia run starts. The caller has already reserved its serialized slot,
+/// so this admission delay must be bounded and terminal on timeout.
+async fn wait_for_multimedia_start_turn(state: &ServerState) -> bool {
+    timeout(
+        Duration::from_secs(MULTIMEDIA_OPERATION_START_WAIT_SECONDS),
+        wait_for_higher_priority_work(state),
+    )
+    .await
+    .is_ok()
+}
+
+async fn fail_multimedia_start_wait(state: &ServerState, run: &mut OperationRun, is_scan: bool) {
+    run.termination_reason = Some(HIGHER_PRIORITY_WORK_TIMEOUT_REASON.to_string());
+    finish_failed_operation(
+        state,
+        run,
+        anyhow::anyhow!(
+            "higher-priority repair or scrub work did not become idle within {MULTIMEDIA_OPERATION_START_WAIT_SECONDS} seconds"
+        ),
+    )
+    .await;
+    release_multimedia_slot(state, &run.run_id, is_scan).await;
+}
+
 async fn wait_for_higher_priority_work(state: &ServerState) {
     while higher_priority_work_active(state).await {
         sleep(Duration::from_millis(MULTIMEDIA_OPERATION_YIELD_MILLIS)).await;
@@ -2329,6 +2408,47 @@ mod tests {
         }
 
         panic!("the dropped operation worker did not release its multimedia slot");
+    }
+
+    #[test]
+    fn geo_scan_candidates_are_bounded_and_sorted_without_partial_results() {
+        let candidates = geo_scan_candidates(
+            [
+                ("album/b.jpg", "hash-b", Some("object-b")),
+                ("album/a.jpg", "hash-a", Some("object-a")),
+                ("album/readme.txt", "hash-text", Some("object-text")),
+                ("other/c.jpg", "hash-c", Some("object-c")),
+            ],
+            "album/",
+            2,
+        )
+        .expect("two media candidates fit the scope limit");
+        assert_eq!(
+            candidates,
+            vec![
+                GeoScanCandidate {
+                    path: "album/a.jpg".to_string(),
+                    manifest_hash: "hash-a".to_string(),
+                    object_id: Some("object-a".to_string()),
+                },
+                GeoScanCandidate {
+                    path: "album/b.jpg".to_string(),
+                    manifest_hash: "hash-b".to_string(),
+                    object_id: Some("object-b".to_string()),
+                },
+            ]
+        );
+
+        let error = geo_scan_candidates(
+            [
+                ("album/a.jpg", "hash-a", None),
+                ("album/b.jpg", "hash-b", None),
+            ],
+            "album/",
+            1,
+        )
+        .expect_err("an oversized scope must fail rather than truncate proposals");
+        assert!(error.to_string().contains("choose a narrower prefix"));
     }
 
     #[test]
