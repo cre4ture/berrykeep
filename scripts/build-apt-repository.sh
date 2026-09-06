@@ -477,6 +477,26 @@ has_server_node_package_for_architecture() {
   return 1
 }
 
+has_server_node_transition_package_for_architecture() {
+  local architecture="$1"
+  local expected_version="$2"
+  local package_path package_name package_architecture package_version
+
+  for package_path in "${DEB_PATHS[@]}"; do
+    package_name="$(dpkg-deb -f "${package_path}" Package)"
+    package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
+    package_version="$(dpkg-deb -f "${package_path}" Version)"
+    if [[ "${package_name}" == "ironmesh-server-node" && \
+      "${package_architecture}" == "${architecture}" && \
+      "${package_version}" == "${expected_version}" ]] && \
+      is_server_node_transition_package "${package_path}"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 server_node_version_for_architecture() {
   local architecture="$1"
   local package_path package_name package_architecture package_version
@@ -770,6 +790,12 @@ if [[ "${SERVER_NODE_ONLY}" == true ]]; then
     if ! has_server_node_package_for_architecture "${architecture}"; then
       printf 'server-node-only requested architecture has no input package: %s\n' \
         "${architecture}" >&2
+      exit 1
+    fi
+    server_node_version="$(server_node_version_for_architecture "${architecture}")"
+    if ! has_server_node_transition_package_for_architecture "${architecture}" "${server_node_version}"; then
+      printf 'server-node-only requested architecture has no matching transition package: %s (%s)\n' \
+        "${architecture}" "${server_node_version}" >&2
       exit 1
     fi
   done
