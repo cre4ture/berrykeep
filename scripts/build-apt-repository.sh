@@ -474,21 +474,22 @@ server_node_version_for_architecture() {
   printf '%s\n' "${selected_version}"
 }
 
-legacy_package_is_indexed_in_suite() {
+pool_package_is_indexed_in_suite() {
   local architecture="$1"
-  local package_path="$2"
-  local packages_path legacy_filename
+  local pool_rel="$2"
+  local package_path="$3"
+  local packages_path package_filename
 
   packages_path="${SUITE_DIR}/${COMPONENT}/binary-${architecture}/Packages"
-  legacy_filename="${LEGACY_POOL_REL}/$(basename "${package_path}")"
+  package_filename="${pool_rel}/$(basename "${package_path}")"
 
   if [[ -f "${packages_path}" ]]; then
-    grep -Fxq -- "Filename: ${legacy_filename}" "${packages_path}"
+    grep -Fxq -- "Filename: ${package_filename}" "${packages_path}"
     return
   fi
 
   if [[ -f "${packages_path}.gz" ]]; then
-    grep -Fxq -- "Filename: ${legacy_filename}" < <(gzip -cd -- "${packages_path}.gz")
+    grep -Fxq -- "Filename: ${package_filename}" < <(gzip -cd -- "${packages_path}.gz")
     return
   fi
 
@@ -497,15 +498,24 @@ legacy_package_is_indexed_in_suite() {
 
 preserve_legacy_suite_packages() {
   local architecture="$1"
-  local package_path
-  local -a legacy_packages=("${LEGACY_POOL_DIR}"/*_"${architecture}".deb)
+  local pool pool_dir pool_rel package_path
+  local -a package_pools=(
+    "${LEGACY_POOL_DIR}:${LEGACY_POOL_REL}"
+    "${PREVIOUS_SUITE_POOL_DIR}:${PREVIOUS_SUITE_POOL_REL}"
+  )
+  local -a legacy_packages=()
 
-  for package_path in "${legacy_packages[@]}"; do
-    [[ -f "${package_path}" ]] || continue
-    if ! legacy_package_is_indexed_in_suite "${architecture}" "${package_path}"; then
-      continue
-    fi
-    cp -f "${package_path}" "${POOL_DIR}/"
+  for pool in "${package_pools[@]}"; do
+    pool_dir="${pool%%:*}"
+    pool_rel="${pool#*:}"
+    legacy_packages=("${pool_dir}"/*_"${architecture}".deb)
+    for package_path in "${legacy_packages[@]}"; do
+      [[ -f "${package_path}" ]] || continue
+      if ! pool_package_is_indexed_in_suite "${architecture}" "${pool_rel}" "${package_path}"; then
+        continue
+      fi
+      cp -f "${package_path}" "${POOL_DIR}/"
+    done
   done
 }
 
@@ -722,6 +732,8 @@ POOL_REL="pool/${COMPONENT}/b/berrykeep/${SUITE}"
 POOL_DIR="${REPO_DIR}/${POOL_REL}"
 LEGACY_POOL_DIR="${REPO_DIR}/pool/${COMPONENT}/i/ironmesh"
 LEGACY_POOL_REL="pool/${COMPONENT}/i/ironmesh"
+PREVIOUS_SUITE_POOL_DIR="${LEGACY_POOL_DIR}/${SUITE}"
+PREVIOUS_SUITE_POOL_REL="${LEGACY_POOL_REL}/${SUITE}"
 
 log "refreshing ${REPO_DIR}"
 mkdir -p "${POOL_DIR}"
@@ -731,7 +743,9 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
     # A server-only refresh must retain the desktop/rendezvous packages that
     # were published before suite-scoped pools existed. Preserve packages
     # already migrated into this suite pool, then migrate only legacy packages
-    # explicitly referenced by this suite's old index. Any retained legacy
+    # explicitly referenced by this suite's old index. This includes the
+    # preceding Ironmesh suite pool, which is the active pool before the
+    # BerryKeep namespace transition. Any retained legacy
     # map-tools package with an exact Ironmesh server dependency is rebuilt to
     # depend on the new BerryKeep server package before the index is published.
     preserve_legacy_suite_packages "${architecture}"
