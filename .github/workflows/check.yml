@@ -953,6 +953,9 @@ jobs:
           ./scripts/build-local-debs.sh \
             --prebuilt-binaries "${RUNNER_TEMP}/linux-debian-binaries"
 
+      - name: Test Debian package transition
+        run: ./scripts/test-debian-package-transition.sh --package-dir ..
+
       - name: Collect Debian package artifacts
         run: |
           set -euo pipefail

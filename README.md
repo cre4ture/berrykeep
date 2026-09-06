@@ -209,6 +209,12 @@ sudo apt install berrykeep-server-node-map-tools
 The `berrykeep-server-node` package installs a systemd service, but it does not
 start it automatically. Configure the service first:
 
+These instructions are for a new installation. An upgraded
+`ironmesh-server-node` continues using its legacy service, configuration, and
+state path. Before enabling the BerryKeep unit on that host, deliberately
+migrate its configuration and state; starting `berrykeep-server-node.service`
+stops the legacy unit. See [the Debian package-name transition guide](docs/debian-package-name-transition.md).
+
 ```bash
 sudoedit /etc/berrykeep/server-node.env
 ```
