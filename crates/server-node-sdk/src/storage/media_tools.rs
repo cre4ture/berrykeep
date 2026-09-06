@@ -434,6 +434,8 @@ pub(super) struct FfprobeFormat {
 #[serde(default)]
 pub(super) struct FfprobeTags {
     pub(super) creation_time: Option<String>,
+    #[serde(rename = "com.apple.quicktime.creationdate")]
+    pub(super) quicktime_creation_date: Option<String>,
     pub(super) location: Option<String>,
     #[serde(rename = "location-eng")]
     pub(super) location_eng: Option<String>,
@@ -459,6 +461,7 @@ mod ffprobe_deserialization_tests {
         assert!(format.format_name.is_none());
         assert!(format.duration.is_none());
         assert!(format.bit_rate.is_none());
+        assert!(format.tags.quicktime_creation_date.is_none());
         assert!(format.tags.location.is_none());
         assert!(format.tags.quicktime_location_iso6709.is_none());
     }

@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use super::manifest_reader::ManifestReader;
 use super::media_tools::{
-    FFMPEG_TIMEOUT_SECS, FFPROBE_TIMEOUT_SECS, FfprobeOutput, MediaToolPaths,
+    FFMPEG_TIMEOUT_SECS, FFPROBE_TIMEOUT_SECS, FfprobeOutput, FfprobeTags, MediaToolPaths,
     VIDEO_THUMBNAIL_SEEK_FRACTION, VIDEO_THUMBNAIL_SEEK_MAX_SECS, VIDEO_THUMBNAIL_SEEK_MIN_SECS,
     VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS,
 };
@@ -1269,7 +1269,7 @@ async fn derive_video_media_cache(
             .arg("v:0")
             .arg("-show_entries")
             .arg(
-                "stream=width,height,codec_name,codec_tag_string,avg_frame_rate,bit_rate:stream_tags=creation_time,location,location-eng,com.apple.quicktime.location.ISO6709:format=format_name,duration,bit_rate:format_tags=creation_time,location,location-eng,com.apple.quicktime.location.ISO6709",
+                "stream=width,height,codec_name,codec_tag_string,avg_frame_rate,bit_rate:stream_tags=creation_time,com.apple.quicktime.creationdate,location,location-eng,com.apple.quicktime.location.ISO6709:format=format_name,duration,bit_rate:format_tags=creation_time,com.apple.quicktime.creationdate,location,location-eng,com.apple.quicktime.location.ISO6709",
             )
             .arg("-of")
             .arg("json")
@@ -1300,16 +1300,15 @@ async fn derive_video_media_cache(
             .as_ref()
             .and_then(|format| format.duration.as_deref())
             .and_then(parse_positive_f64);
-        // QuickTime's creation_time is emitted by ffprobe as RFC 3339. Keep
-        // the legacy encoded-date projection, but also expose this embedded,
-        // offset-bearing media timestamp as taken_at so strict inference code
-        // never has to use date_encoded_unix as a capture-time fallback.
-        let embedded_capture_time_unix = probe
-            .format
-            .as_ref()
-            .and_then(|format| format.tags.creation_time.as_deref())
-            .or(stream.tags.creation_time.as_deref())
-            .and_then(parse_ffprobe_timestamp);
+        // ffprobe turns QuickTime's integer `mvhd` creation time into an RFC
+        // 3339 `creation_time`, including a synthetic trailing `Z`. Cameras
+        // often store local wall-clock time there, so it is not UTC-safe on
+        // its own. Prefer Apple's offset-bearing creation-date tag when it is
+        // available; otherwise retain creation_time as a floating local time.
+        let (embedded_capture_time_unix, taken_at_timezone_known) = ffprobe_capture_time(
+            probe.format.as_ref().map(|format| &format.tags),
+            &stream.tags,
+        );
         let total_bitrate_bps = probe
             .format
             .as_ref()
@@ -1328,7 +1327,7 @@ async fn derive_video_media_cache(
             width: stream.width,
             height: stream.height,
             taken_at_unix: embedded_capture_time_unix,
-            taken_at_timezone_known: embedded_capture_time_unix.map(|_| true),
+            taken_at_timezone_known,
             date_encoded_unix: embedded_capture_time_unix,
             duration_millis: duration_secs.and_then(seconds_to_millis),
             frame_rate_millihertz: stream
@@ -1466,10 +1465,59 @@ pub(super) fn parse_frame_rate_millihertz(value: &str) -> Option<u32> {
 }
 
 pub(super) fn parse_ffprobe_timestamp(value: &str) -> Option<u64> {
-    let timestamp = OffsetDateTime::parse(value.trim(), &Rfc3339)
+    let value = value.trim();
+    let timestamp = OffsetDateTime::parse(value, &Rfc3339)
+        .or_else(|_| parse_ffprobe_basic_offset_timestamp(value))
         .ok()?
         .unix_timestamp();
     u64::try_from(timestamp).ok()
+}
+
+/// ffprobe normally emits RFC 3339 offsets with a colon, but Apple QuickTime
+/// creation-date tags also commonly use ISO 8601's compact `+HHMM` form.
+fn parse_ffprobe_basic_offset_timestamp(value: &str) -> Result<OffsetDateTime, time::error::Parse> {
+    let offset_start = value.len().saturating_sub(5);
+    let Some(offset) = value.get(offset_start..) else {
+        return OffsetDateTime::parse(value, &Rfc3339);
+    };
+    if offset.len() != 5
+        || !matches!(offset.as_bytes().first(), Some(b'+' | b'-'))
+        || !offset.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+    {
+        return OffsetDateTime::parse(value, &Rfc3339);
+    }
+    let normalized = format!(
+        "{}{}:{}",
+        &value[..offset_start],
+        &offset[..3],
+        &offset[3..]
+    );
+    OffsetDateTime::parse(&normalized, &Rfc3339)
+}
+
+fn ffprobe_capture_time(
+    format_tags: Option<&FfprobeTags>,
+    stream_tags: &FfprobeTags,
+) -> (Option<u64>, Option<bool>) {
+    let offset_bearing = [
+        format_tags.and_then(|tags| tags.quicktime_creation_date.as_deref()),
+        stream_tags.quicktime_creation_date.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(parse_ffprobe_timestamp);
+    if let Some(timestamp) = offset_bearing {
+        return (Some(timestamp), Some(true));
+    }
+
+    let floating_local = [
+        format_tags.and_then(|tags| tags.creation_time.as_deref()),
+        stream_tags.creation_time.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(parse_ffprobe_timestamp);
+    (floating_local, floating_local.map(|_| false))
 }
 
 fn ffprobe_gps(tags: &super::media_tools::FfprobeTags) -> Option<MediaGpsCoordinates> {
@@ -2517,6 +2565,28 @@ mod tests {
         assert!((location.longitude - 8.5417).abs() < 0.000_001);
         assert!(parse_iso6709_location("not-a-location").is_none());
         assert!(parse_iso6709_location("+91.0+008.5/").is_none());
+    }
+
+    #[test]
+    fn ffprobe_capture_time_requires_an_explicit_quicktime_offset_for_utc_basis() {
+        let floating_stream_tags = FfprobeTags {
+            creation_time: Some("2024-03-04T05:06:07Z".to_string()),
+            ..FfprobeTags::default()
+        };
+        assert_eq!(
+            ffprobe_capture_time(None, &floating_stream_tags),
+            (Some(1_709_528_767), Some(false))
+        );
+
+        let offset_format_tags = FfprobeTags {
+            creation_time: Some("2024-03-04T05:06:07Z".to_string()),
+            quicktime_creation_date: Some("2024-03-04T06:06:07+0100".to_string()),
+            ..FfprobeTags::default()
+        };
+        assert_eq!(
+            ffprobe_capture_time(Some(&offset_format_tags), &floating_stream_tags),
+            (Some(1_709_528_767), Some(true))
+        );
     }
 
     #[test]
