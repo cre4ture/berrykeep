@@ -163,6 +163,11 @@ pub(crate) struct GeoAnalysisMedia {
     /// non-inferred coordinate may be an inference anchor.
     #[serde(default)]
     pub(crate) gps_is_present: bool,
+    /// A pre-existing standard XMP capture time would conflict with the
+    /// reviewed timestamp an apply run writes. Keep such media out of the
+    /// proposal list rather than presenting an item that can only be skipped.
+    #[serde(default)]
+    pub(crate) has_sidecar_capture_time_properties: bool,
     /// A location written by a prior BerryKeep inference still means the media
     /// is geotagged, but must not become an anchor for later inferences.
     #[serde(default)]
@@ -550,7 +555,7 @@ fn infer_target_proposal(
 ) -> Option<GeoProposal> {
     let target = segment.get(target_index)?;
     let target_time = target.capture_time?;
-    if target.gps_is_present {
+    if target.gps_is_present || target.has_sidecar_capture_time_properties {
         return None;
     }
 
@@ -1577,6 +1582,8 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                         capture_time: ready.capture_time,
                         gps,
                         gps_is_present,
+                        has_sidecar_capture_time_properties: sidecar_gps
+                            .has_capture_time_properties,
                         gps_is_inferred,
                     });
                 }
@@ -2512,6 +2519,7 @@ mod tests {
                 longitude,
             }),
             gps_is_present,
+            has_sidecar_capture_time_properties: false,
             gps_is_inferred: false,
         }
     }
@@ -3021,6 +3029,21 @@ mod tests {
             vec![
                 media("trip/before.jpg", Some(0), Some((47.0, 8.0))),
                 existing_but_unparseable,
+                media("trip/after.jpg", Some(240), Some((47.0005, 8.0005))),
+            ],
+            GeoInferenceConfig::default(),
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn existing_sidecar_capture_time_is_not_a_proposal_target() {
+        let mut existing_capture_time = media("trip/target.jpg", Some(120), None);
+        existing_capture_time.has_sidecar_capture_time_properties = true;
+        let result = proposals(
+            vec![
+                media("trip/before.jpg", Some(0), Some((47.0, 8.0))),
+                existing_capture_time,
                 media("trip/after.jpg", Some(240), Some((47.0005, 8.0005))),
             ],
             GeoInferenceConfig::default(),
