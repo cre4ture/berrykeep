@@ -704,6 +704,18 @@ async fn geolocation_apply_revalidates_stale_and_already_geotagged_media_impl(
         run_selected_geo_apply_for_test(&state, "apply-first", analysis_run_id, proposal_id).await,
         "applied"
     );
+    let store = read_store(&state, "test.geo_apply.data_change_actor").await;
+    let event = store
+        .list_data_change_events(&super::storage::DataChangeEventQuery::default())
+        .await
+        .expect("data-change events should load")
+        .into_iter()
+        .find(|event| event.path == format!("{media_path}.xmp"))
+        .expect("the applied sidecar must have a data-change event");
+    assert_eq!(event.actor_kind, super::storage::DataChangeActorKind::Admin);
+    assert_eq!(event.actor_id.as_deref(), Some("test-admin"));
+    assert_eq!(event.actor_source_node.as_deref(), Some("test-node"));
+    drop(store);
     assert_eq!(
         run_selected_geo_apply_for_test(&state, "apply-already-gps", analysis_run_id, proposal_id)
             .await,

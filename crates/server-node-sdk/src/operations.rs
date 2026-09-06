@@ -853,10 +853,11 @@ use uuid::Uuid;
 use crate::storage;
 
 use super::{
-    DataChangeAction, DataChangeUploadMode, PendingDataChangeEvent, ServerState,
-    authorize_admin_request, enqueue_autonomous_post_write_replication, lock_store,
-    publish_namespace_change, read_store, record_data_change_event,
-    request_local_availability_refresh, should_trigger_autonomous_post_write_replication,
+    DataChangeAction, DataChangeActorContext, DataChangeUploadMode, PendingDataChangeEvent,
+    ServerState, authorize_admin_request, data_change_actor_from_admin_request,
+    enqueue_autonomous_post_write_replication, lock_store, publish_namespace_change, read_store,
+    record_data_change_event, request_local_availability_refresh,
+    should_trigger_autonomous_post_write_replication,
 };
 
 const MULTIMEDIA_OPERATION_BATCH_SIZE: usize = 64;
@@ -1028,7 +1029,7 @@ pub(super) async fn start_operation_run(
     // confirmation; the explicit start request is its approval, whereas apply
     // requires its request-body confirmation.
     let approval_granted = !start_is_apply || request.approve.unwrap_or(false);
-    let authorization = authorize_admin_request(
+    let authorization = match authorize_admin_request(
         &state,
         &headers,
         "auth/operations/run",
@@ -1040,10 +1041,11 @@ pub(super) async fn start_operation_run(
             "approve": approval_granted,
         }),
     )
-    .await;
-    if let Err(status) = authorization {
-        return status.into_response();
-    }
+    .await
+    {
+        Ok(authorization) => authorization,
+        Err(status) => return status.into_response(),
+    };
 
     let (input, priority, task) = match operation_id.as_str() {
         GEOLOCATION_PROPOSE_OPERATION_ID => match validated_geo_proposal_input(&request) {
@@ -1064,7 +1066,10 @@ pub(super) async fn start_operation_run(
             Ok(input) => (
                 serde_json::to_value(&input).expect("serializable geo apply input"),
                 OperationPriority::Background,
-                OperationTask::GeoApply(input),
+                OperationTask::GeoApply(
+                    input,
+                    data_change_actor_from_admin_request(&authorization),
+                ),
             ),
             Err(error) => {
                 return (
@@ -1130,8 +1135,8 @@ pub(super) async fn start_operation_run(
             OperationTask::GeoProposal(input) => {
                 run_geo_proposal(state_for_task, run_for_task, input).await
             }
-            OperationTask::GeoApply(input) => {
-                run_geo_apply(state_for_task, run_for_task, input).await
+            OperationTask::GeoApply(input, actor) => {
+                run_geo_apply(state_for_task, run_for_task, input, actor).await
             }
         }
     });
@@ -1433,7 +1438,7 @@ fn normalized_ids(values: &[String]) -> Vec<String> {
 
 enum OperationTask {
     GeoProposal(GeoProposalRunInput),
-    GeoApply(GeoApplyRunInput),
+    GeoApply(GeoApplyRunInput, DataChangeActorContext),
 }
 
 async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoProposalRunInput) {
@@ -1668,7 +1673,12 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
     release_multimedia_slot(&state, &run.run_id, true).await;
 }
 
-async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoApplyRunInput) {
+async fn run_geo_apply(
+    state: ServerState,
+    mut run: OperationRun,
+    input: GeoApplyRunInput,
+    actor: DataChangeActorContext,
+) {
     if let Err(error) = wait_for_multimedia_turn(&state, &mut run).await {
         finish_failed_operation(&state, &mut run, error).await;
         release_multimedia_slot(&state, &run.run_id, false).await;
@@ -1745,9 +1755,14 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
                         continue;
                     }
                     wait_for_multimedia_turn(&state, &mut run).await?;
-                    let item_result =
-                        apply_one_geo_proposal(&state, &worker, &input.analysis_run_id, &proposal)
-                            .await;
+                    let item_result = apply_one_geo_proposal(
+                        &state,
+                        &worker,
+                        &input.analysis_run_id,
+                        &proposal,
+                        &actor,
+                    )
+                    .await;
                     counters.record(item_result.outcome);
                     let chunk = OperationResultChunk {
                         run_id: run.run_id.clone(),
@@ -1862,6 +1877,13 @@ pub(crate) async fn run_geo_apply_for_test(
             proposal_chunk_ids: Vec::new(),
             proposal_ids: vec![proposal_id.to_string()],
         },
+        DataChangeActorContext {
+            actor_kind: storage::DataChangeActorKind::Admin,
+            actor_id: Some("test-admin".to_string()),
+            actor_label: Some("test-admin".to_string()),
+            actor_credential_fingerprint: None,
+            actor_source_node: Some("test-node".to_string()),
+        },
     )
     .await;
 }
@@ -1898,6 +1920,7 @@ async fn apply_one_geo_proposal(
     worker: &storage::MediaCacheWorker,
     analysis_run_id: &str,
     proposal: &GeoProposal,
+    actor: &DataChangeActorContext,
 ) -> GeoApplyItemResult {
     let stale = |detail: String| GeoApplyItemResult {
         proposal_id: proposal.id.clone(),
@@ -2014,7 +2037,7 @@ async fn apply_one_geo_proposal(
         state,
         PendingDataChangeEvent {
             action: DataChangeAction::Upload,
-            actor: None,
+            actor: Some(actor.clone()),
             path: sidecar_key,
             from_path: None,
             to_path: None,
