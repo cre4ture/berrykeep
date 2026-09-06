@@ -2419,16 +2419,18 @@ pub struct PutResult {
 pub enum MediaGeolocationWrite {
     Applied(PutResult),
     AlreadyHasGps,
+    AlreadyHasCaptureTime,
     MediaChanged,
 }
 
-/// Current GPS state stored in a media sidecar. `has_geo_location_properties`
-/// deliberately remains true for malformed or incomplete coordinates so
-/// inference never appends a competing location to user-authored XMP.
+/// Relevant XMP state stored in a media sidecar. GPS and capture-time presence
+/// are conservative write guards, so malformed user metadata is never
+/// shadowed by inferred properties.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct MediaSidecarGpsOverlay {
+pub(crate) struct MediaSidecarMetadataOverlay {
     pub(crate) location: Option<XmpGeoLocation>,
     pub(crate) has_geo_location_properties: bool,
+    pub(crate) has_capture_time_properties: bool,
 }
 
 #[allow(dead_code)]
@@ -10047,6 +10049,9 @@ impl PersistentStore {
         if sidecar.has_geo_location_properties() {
             return Ok(MediaGeolocationWrite::AlreadyHasGps);
         }
+        if inference.approved_capture_time.is_some() && sidecar.has_capture_time_properties() {
+            return Ok(MediaGeolocationWrite::AlreadyHasCaptureTime);
+        }
         sidecar.set_geo_inference(inference)?;
         self.write_media_sidecar(media_key, sidecar)
             .await
@@ -10076,20 +10081,21 @@ impl PersistentStore {
         self.set_media_geolocation(media_key, inference).await
     }
 
-    /// Reads the GPS overlay and the more conservative write guard in one
+    /// Reads the gallery GPS overlay and conservative mutation guards in one
     /// sidecar load. A valid location is suitable for gallery projection;
-    /// merely present coordinate properties also block an inference write.
-    pub(crate) async fn media_sidecar_gps_overlay(
+    /// present coordinate or capture-time properties block conflicting writes.
+    pub(crate) async fn media_sidecar_metadata_overlay(
         &self,
         media_key: &str,
-    ) -> Result<MediaSidecarGpsOverlay> {
+    ) -> Result<MediaSidecarMetadataOverlay> {
         let sidecar_key = sidecar_key_for_media(media_key);
         Ok(self
             .load_stored_sidecar(&sidecar_key)
             .await?
-            .map(|sidecar| MediaSidecarGpsOverlay {
+            .map(|sidecar| MediaSidecarMetadataOverlay {
                 location: sidecar.geo_location(),
                 has_geo_location_properties: sidecar.has_geo_location_properties(),
+                has_capture_time_properties: sidecar.has_capture_time_properties(),
             })
             .unwrap_or_default())
     }

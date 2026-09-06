@@ -151,8 +151,8 @@ fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
 }
 
 use super::storage::{
-    DataScrubRunTestHook, PersistentStore, PutOptions, S3ObjectVersionRecord, StoragePathConfig,
-    StoragePathState, StoragePoolConfig, VersionConsistencyState,
+    DataScrubRunTestHook, ObjectReadMode, PersistentStore, PutOptions, S3ObjectVersionRecord,
+    StoragePathConfig, StoragePathState, StoragePoolConfig, VersionConsistencyState,
 };
 use axum::Router;
 use axum::body::Body;
@@ -705,6 +705,27 @@ async fn geolocation_apply_revalidates_stale_and_already_geotagged_media_impl(
         "applied"
     );
     let store = read_store(&state, "test.geo_apply.data_change_actor").await;
+    let sidecar = store
+        .get_object(
+            &format!("{media_path}.xmp"),
+            None,
+            None,
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .expect("the applied sidecar should be readable");
+    let sidecar = std::str::from_utf8(&sidecar).expect("XMP sidecar should be UTF-8");
+    for field in [
+        "exif:DateTimeOriginal=\"2024-01-02T03:04:05\"",
+        "xmp:CreateDate=\"2024-01-02T03:04:05\"",
+        "photoshop:DateCreated=\"2024-01-02T03:04:05\"",
+        "berrykeep:GeoInferenceCaptureTimeSource=\"filename\"",
+    ] {
+        assert!(
+            sidecar.contains(field),
+            "applied sidecar is missing {field:?}"
+        );
+    }
     let event = store
         .list_data_change_events(&super::storage::DataChangeEventQuery::default())
         .await
@@ -827,7 +848,7 @@ async fn geolocation_apply_does_not_shadow_unparseable_embedded_gps_impl(backend
     let store = read_store(&state, "test.geo_apply.verify_unparseable_gps_sidecar").await;
     assert!(
         !store
-            .media_sidecar_gps_overlay(media_path)
+            .media_sidecar_metadata_overlay(media_path)
             .await
             .expect("sidecar state should load")
             .has_geo_location_properties,
@@ -16103,6 +16124,7 @@ async fn generic_store_index_applies_current_xmp_gps_overlay_impl(backend: MainT
                     previous_anchor_distance_seconds: None,
                     next_anchor_distance_seconds: None,
                     estimated_speed_kmh: None,
+                    approved_capture_time: None,
                 },
             )
             .await

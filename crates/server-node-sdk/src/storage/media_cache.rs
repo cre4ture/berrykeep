@@ -34,7 +34,7 @@ use super::{
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
-pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 12;
+pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 13;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
 const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
 const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
@@ -161,6 +161,10 @@ pub struct CachedMediaMetadata {
     pub taken_at_timezone_known: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_encoded_unix: Option<u64>,
+    /// Whether `date_encoded_unix` came with an explicit UTC offset. A missing
+    /// offset is a floating local wall-clock value, not a trustworthy UTC time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_encoded_timezone_known: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_millis: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -787,6 +791,7 @@ fn base_media_metadata(
         taken_at_unix: None,
         taken_at_timezone_known: None,
         date_encoded_unix: None,
+        date_encoded_timezone_known: None,
         duration_millis: None,
         frame_rate_millihertz: None,
         total_bitrate_bps: None,
@@ -1311,7 +1316,7 @@ async fn derive_video_media_cache(
         // often store local wall-clock time there, so it is not UTC-safe on
         // its own. Prefer Apple's offset-bearing creation-date tag when it is
         // available; otherwise retain creation_time as a floating local time.
-        let (embedded_capture_time_unix, taken_at_timezone_known) = ffprobe_capture_time(
+        let (date_encoded_unix, date_encoded_timezone_known) = ffprobe_capture_time(
             probe.format.as_ref().map(|format| &format.tags),
             &stream.tags,
         );
@@ -1337,9 +1342,13 @@ async fn derive_video_media_cache(
             mime_type,
             width: stream.width,
             height: stream.height,
-            taken_at_unix: embedded_capture_time_unix,
-            taken_at_timezone_known,
-            date_encoded_unix: embedded_capture_time_unix,
+            // Container creation time is less reliable than an actual media
+            // capture timestamp. Keep gallery ordering unchanged and expose it
+            // only as the final geo-inference fallback below a precise filename.
+            taken_at_unix: None,
+            taken_at_timezone_known: None,
+            date_encoded_unix,
+            date_encoded_timezone_known,
             duration_millis: duration_secs.and_then(seconds_to_millis),
             frame_rate_millihertz: stream
                 .avg_frame_rate

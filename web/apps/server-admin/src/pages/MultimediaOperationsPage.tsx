@@ -530,7 +530,7 @@ export function MultimediaOperationsPage() {
             <div>
               <Title order={3}>Apply results</Title>
               <Text size="sm" c="dimmed">
-                Each selected proposal is recorded separately, including stale and already-geotagged skips.
+                Each selected proposal is recorded separately, including stale, already-geotagged, and capture-time-conflict skips.
               </Text>
             </div>
             <Select
@@ -670,7 +670,7 @@ function RunHistoryTable({ runs }: { runs: OperationRun[] }) {
 }
 
 function ApplyResultReview({ run, items }: { run: OperationRun; items: GeoApplyItemResult[] }) {
-  const summary = ["applied", "already_has_gps", "skipped_stale", "failed"]
+  const summary = ["applied", "already_has_gps", "already_has_capture_time", "skipped_stale", "failed"]
     .map((key) => {
       const value = run.summary?.[key];
       return typeof value === "number" ? `${key.replaceAll("_", " ")}: ${value}` : null;
@@ -1055,7 +1055,7 @@ function ApplyOutcomeBadge({ outcome }: { outcome: GeoApplyItemResult["status"] 
       ? "teal"
       : outcome === "failed"
         ? "red"
-        : outcome === "already-has-gps"
+        : outcome === "already-has-gps" || outcome === "already-has-capture-time"
           ? "yellow"
           : "gray";
   return <Badge color={color}>{outcome}</Badge>;
@@ -1074,6 +1074,7 @@ function asGeoApplyItemResult(chunk: OperationResultChunk): GeoApplyItemResult |
     typeof payload.media_path === "string" &&
     (payload.status === "applied" ||
       payload.status === "already-has-gps" ||
+      payload.status === "already-has-capture-time" ||
       payload.status === "skipped-stale" ||
       payload.status === "failed")
     ? (payload as GeoApplyItemResult)

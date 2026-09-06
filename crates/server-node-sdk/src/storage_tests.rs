@@ -8213,9 +8213,10 @@ async fn ensure_media_cache_generates_thumbnail_for_mp4_impl(backend: StorageTes
     assert_eq!(metadata.mime_type.as_deref(), Some("video/mp4"));
     assert_eq!(metadata.width, Some(1920));
     assert_eq!(metadata.height, Some(1080));
-    assert_eq!(metadata.taken_at_unix, Some(1_709_528_767));
-    assert_eq!(metadata.taken_at_timezone_known, Some(true));
+    assert_eq!(metadata.taken_at_unix, None);
+    assert_eq!(metadata.taken_at_timezone_known, None);
     assert_eq!(metadata.date_encoded_unix, Some(1_709_528_767));
+    assert_eq!(metadata.date_encoded_timezone_known, Some(true));
     assert_eq!(metadata.duration_millis, Some(42_125));
     assert_eq!(metadata.frame_rate_millihertz, Some(29_970));
     assert_eq!(metadata.total_bitrate_bps, Some(4_500_000));
@@ -10883,6 +10884,7 @@ async fn gallery_gps_follows_a_geolocation_sidecar_write_impl(backend: StorageTe
                 previous_anchor_distance_seconds: None,
                 next_anchor_distance_seconds: None,
                 estimated_speed_kmh: None,
+                approved_capture_time: None,
             },
         )
         .await
@@ -10890,7 +10892,7 @@ async fn gallery_gps_follows_a_geolocation_sidecar_write_impl(backend: StorageTe
     assert!(matches!(write, MediaGeolocationWrite::Applied(_)));
 
     let sidecar_location = store
-        .media_sidecar_gps_overlay(media_key)
+        .media_sidecar_metadata_overlay(media_key)
         .await
         .unwrap()
         .location
@@ -10916,6 +10918,7 @@ async fn gallery_gps_follows_a_geolocation_sidecar_write_impl(backend: StorageTe
                 previous_anchor_distance_seconds: None,
                 next_anchor_distance_seconds: None,
                 estimated_speed_kmh: None,
+                approved_capture_time: None,
             },
         )
         .await
@@ -10969,6 +10972,7 @@ async fn conditional_geolocation_write_skips_replaced_media_impl(backend: Storag
                 previous_anchor_distance_seconds: None,
                 next_anchor_distance_seconds: None,
                 estimated_speed_kmh: None,
+                approved_capture_time: None,
             },
         )
         .await
@@ -10976,7 +10980,7 @@ async fn conditional_geolocation_write_skips_replaced_media_impl(backend: Storag
     assert!(matches!(write, MediaGeolocationWrite::MediaChanged));
     assert!(
         !store
-            .media_sidecar_gps_overlay(media_key)
+            .media_sidecar_metadata_overlay(media_key)
             .await
             .expect("sidecar state should load")
             .has_geo_location_properties,
@@ -11020,6 +11024,7 @@ async fn gallery_gps_is_visible_before_media_cache_derivation_impl(backend: Stor
                 previous_anchor_distance_seconds: None,
                 next_anchor_distance_seconds: None,
                 estimated_speed_kmh: None,
+                approved_capture_time: None,
             },
         )
         .await
@@ -11072,6 +11077,7 @@ async fn gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_imp
                 previous_anchor_distance_seconds: None,
                 next_anchor_distance_seconds: None,
                 estimated_speed_kmh: None,
+                approved_capture_time: None,
             },
         )
         .await
@@ -11140,6 +11146,7 @@ async fn unparseable_sidecar_gps_blocks_inferred_overwrite_impl(backend: Storage
                 previous_anchor_distance_seconds: None,
                 next_anchor_distance_seconds: None,
                 estimated_speed_kmh: None,
+                approved_capture_time: None,
             },
         )
         .await
@@ -11159,6 +11166,80 @@ run_on_all_metadata_backends!(
     unparseable_sidecar_gps_blocks_inferred_overwrite_impl,
     unparseable_sidecar_gps_blocks_inferred_overwrite,
     unparseable_sidecar_gps_blocks_inferred_overwrite_turso
+);
+
+async fn existing_sidecar_capture_time_is_not_overwritten_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-existing-capture-time")
+        .await;
+    let media_key = "album/photo.jpg";
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let original = concat!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+        "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+        "<rdf:Description xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" ",
+        "xmp:CreateDate=\"2024-01-02T03:04:05\"/>",
+        "</rdf:RDF></x:xmpmeta>"
+    );
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            Bytes::from(original),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let write = store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+                approved_capture_time: Some(common::xmp::XmpApprovedCaptureTime {
+                    value: "2024-01-02T03:04:05".to_string(),
+                    source: "filename".to_string(),
+                    basis: "floating_local".to_string(),
+                }),
+            },
+        )
+        .await
+        .expect("existing capture time should be a documented skip, not an error");
+    assert!(matches!(
+        write,
+        MediaGeolocationWrite::AlreadyHasCaptureTime
+    ));
+    assert_eq!(stored_sidecar_text(&store, media_key).await, original);
+    assert!(
+        store
+            .media_sidecar_metadata_overlay(media_key)
+            .await
+            .expect("sidecar state should load")
+            .has_capture_time_properties
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    existing_sidecar_capture_time_is_not_overwritten_impl,
+    existing_sidecar_capture_time_is_not_overwritten,
+    existing_sidecar_capture_time_is_not_overwritten_turso
 );
 
 async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
@@ -11202,6 +11283,7 @@ async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
                 previous_anchor_distance_seconds: None,
                 next_anchor_distance_seconds: None,
                 estimated_speed_kmh: None,
+                approved_capture_time: None,
             },
         )
         .await
@@ -11210,7 +11292,7 @@ async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
 
     assert!(
         store
-            .media_sidecar_gps_overlay(primary_key)
+            .media_sidecar_metadata_overlay(primary_key)
             .await
             .unwrap()
             .location
@@ -11224,7 +11306,7 @@ async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
     );
     assert!(
         store
-            .media_sidecar_gps_overlay(duplicate_key)
+            .media_sidecar_metadata_overlay(duplicate_key)
             .await
             .unwrap()
             .location

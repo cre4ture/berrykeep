@@ -1360,7 +1360,7 @@ export type OperationRunResultsResponse = {
 
 export type GeoCaptureTimeBasis = "utc_normalized" | "floating_local";
 
-export type GeoCaptureTimeSource = "embedded_metadata" | "filename";
+export type GeoCaptureTimeSource = "embedded_metadata" | "filename" | "date_encoded";
 
 export type GeoCaptureTime = {
   unix: number;
@@ -1415,6 +1415,7 @@ export type GeoProposalChunk = {
 export type GeoApplyItemOutcome =
   | "applied"
   | "already-has-gps"
+  | "already-has-capture-time"
   | "skipped-stale"
   | "failed";
 

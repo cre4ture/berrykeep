@@ -123,6 +123,7 @@ pub(crate) enum GeoCaptureTimeBasis {
 pub(crate) enum GeoCaptureTimeSource {
     EmbeddedMetadata,
     Filename,
+    DateEncoded,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -844,8 +845,10 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use common::xmp::XmpGeoInference;
+use common::xmp::{XmpApprovedCaptureTime, XmpGeoInference};
 use serde_json::json;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -985,6 +988,7 @@ struct GeoApplyItemResult {
 enum GeoApplyItemOutcome {
     Applied,
     AlreadyHasGps,
+    AlreadyHasCaptureTime,
     SkippedStale,
     Failed,
 }
@@ -1524,7 +1528,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
             {
                 let store = read_store(&state, "operations.geo_proposal.sidecar_gps_batch").await;
                 for ready in ready_media {
-                    let sidecar_gps = match store.media_sidecar_gps_overlay(&ready.path).await {
+                    let sidecar_gps = match store.media_sidecar_metadata_overlay(&ready.path).await {
                         Ok(overlay) => overlay,
                         Err(error) => {
                             sidecar_error_count += 1;
@@ -1537,9 +1541,10 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                             // coordinates. Treat it as GPS-present so this
                             // scan cannot propose an update it cannot safely
                             // revalidate or apply.
-                            storage::MediaSidecarGpsOverlay {
+                            storage::MediaSidecarMetadataOverlay {
                                 location: None,
                                 has_geo_location_properties: true,
+                                has_capture_time_properties: true,
                             }
                         }
                     };
@@ -1816,6 +1821,7 @@ async fn run_geo_apply(
                 "selected": total,
                 "applied": counters.applied,
                 "already_has_gps": counters.already_has_gps,
+                "already_has_capture_time": counters.already_has_capture_time,
                 "skipped_stale": counters.skipped_stale,
                 "failed": counters.failed,
             }));
@@ -1860,6 +1866,17 @@ fn capture_time_for_geolocation(
             source: GeoCaptureTimeSource::Filename,
             basis: GeoCaptureTimeBasis::FloatingLocal,
         })
+        .or_else(|| {
+            metadata.date_encoded_unix.map(|unix| GeoCaptureTime {
+                unix,
+                source: GeoCaptureTimeSource::DateEncoded,
+                basis: if metadata.date_encoded_timezone_known == Some(true) {
+                    GeoCaptureTimeBasis::UtcNormalized
+                } else {
+                    GeoCaptureTimeBasis::FloatingLocal
+                },
+            })
+        })
 }
 
 #[cfg(test)]
@@ -1900,6 +1917,7 @@ pub(crate) fn capture_time_for_geolocation_for_test(
 struct GeoApplyCounters {
     applied: usize,
     already_has_gps: usize,
+    already_has_capture_time: usize,
     skipped_stale: usize,
     failed: usize,
 }
@@ -1909,6 +1927,7 @@ impl GeoApplyCounters {
         match outcome {
             GeoApplyItemOutcome::Applied => self.applied += 1,
             GeoApplyItemOutcome::AlreadyHasGps => self.already_has_gps += 1,
+            GeoApplyItemOutcome::AlreadyHasCaptureTime => self.already_has_capture_time += 1,
             GeoApplyItemOutcome::SkippedStale => self.skipped_stale += 1,
             GeoApplyItemOutcome::Failed => self.failed += 1,
         }
@@ -1975,14 +1994,17 @@ async fn apply_one_geo_proposal(
             detail: Some("media metadata already has GPS properties".to_string()),
         };
     }
-    let existing_sidecar_gps = {
+    let existing_sidecar_metadata = {
         let store = read_store(state, "operations.geo_apply.revalidate_sidecar").await;
-        match store.media_sidecar_gps_overlay(&proposal.media_path).await {
+        match store
+            .media_sidecar_metadata_overlay(&proposal.media_path)
+            .await
+        {
             Ok(value) => value,
             Err(error) => return failure(format!("failed reading XMP sidecar: {error:#}")),
         }
     };
-    if existing_sidecar_gps.has_geo_location_properties {
+    if existing_sidecar_metadata.has_geo_location_properties {
         return GeoApplyItemResult {
             proposal_id: proposal.id.clone(),
             media_path: proposal.media_path.clone(),
@@ -1990,7 +2012,20 @@ async fn apply_one_geo_proposal(
             detail: Some("XMP sidecar already has GPS".to_string()),
         };
     }
-    let inference = xmp_geo_inference(analysis_run_id, proposal);
+    if existing_sidecar_metadata.has_capture_time_properties {
+        return GeoApplyItemResult {
+            proposal_id: proposal.id.clone(),
+            media_path: proposal.media_path.clone(),
+            outcome: GeoApplyItemOutcome::AlreadyHasCaptureTime,
+            detail: Some(
+                "XMP sidecar already has capture-time metadata; leaving it for review".to_string(),
+            ),
+        };
+    }
+    let inference = match xmp_geo_inference(analysis_run_id, proposal) {
+        Ok(inference) => inference,
+        Err(error) => return failure(format!("failed preparing XMP inference: {error:#}")),
+    };
     let write = {
         let mut store = lock_store(state, "operations.geo_apply.write_sidecar").await;
         store
@@ -2015,6 +2050,17 @@ async fn apply_one_geo_proposal(
                 media_path: proposal.media_path.clone(),
                 outcome: GeoApplyItemOutcome::AlreadyHasGps,
                 detail: Some("XMP sidecar already has GPS".to_string()),
+            };
+        }
+        Ok(storage::MediaGeolocationWrite::AlreadyHasCaptureTime) => {
+            return GeoApplyItemResult {
+                proposal_id: proposal.id.clone(),
+                media_path: proposal.media_path.clone(),
+                outcome: GeoApplyItemOutcome::AlreadyHasCaptureTime,
+                detail: Some(
+                    "XMP sidecar received capture-time metadata during apply; leaving it for review"
+                        .to_string(),
+                ),
             };
         }
         Err(error) => return failure(format!("failed writing XMP sidecar: {error:#}")),
@@ -2058,7 +2104,7 @@ async fn apply_one_geo_proposal(
     }
 }
 
-fn xmp_geo_inference(analysis_run_id: &str, proposal: &GeoProposal) -> XmpGeoInference {
+fn xmp_geo_inference(analysis_run_id: &str, proposal: &GeoProposal) -> Result<XmpGeoInference> {
     let (
         reference_distance_seconds,
         previous_anchor_distance_seconds,
@@ -2097,7 +2143,7 @@ fn xmp_geo_inference(analysis_run_id: &str, proposal: &GeoProposal) -> XmpGeoInf
             proposal.estimated_anchor_speed_kmh.unwrap_or_default(),
         ),
     };
-    XmpGeoInference {
+    Ok(XmpGeoInference {
         latitude: proposal.proposed.latitude,
         longitude: proposal.proposed.longitude,
         method: match proposal.method {
@@ -2110,7 +2156,42 @@ fn xmp_geo_inference(analysis_run_id: &str, proposal: &GeoProposal) -> XmpGeoInf
         previous_anchor_distance_seconds,
         next_anchor_distance_seconds,
         estimated_speed_kmh: proposal.estimated_anchor_speed_kmh,
-    }
+        approved_capture_time: Some(xmp_approved_capture_time(proposal.capture_time)?),
+    })
+}
+
+fn xmp_approved_capture_time(capture_time: GeoCaptureTime) -> Result<XmpApprovedCaptureTime> {
+    let unix = i64::try_from(capture_time.unix).context("capture time exceeds XMP range")?;
+    let timestamp = OffsetDateTime::from_unix_timestamp(unix)
+        .context("capture time cannot be represented as an XMP date")?;
+    let value = match capture_time.basis {
+        GeoCaptureTimeBasis::UtcNormalized => timestamp
+            .format(&Rfc3339)
+            .context("failed formatting UTC-normalized XMP capture time")?,
+        GeoCaptureTimeBasis::FloatingLocal => format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            timestamp.year(),
+            u8::from(timestamp.month()),
+            timestamp.day(),
+            timestamp.hour(),
+            timestamp.minute(),
+            timestamp.second(),
+        ),
+    };
+    Ok(XmpApprovedCaptureTime {
+        value,
+        source: match capture_time.source {
+            GeoCaptureTimeSource::EmbeddedMetadata => "taken_at_unix",
+            GeoCaptureTimeSource::Filename => "filename",
+            GeoCaptureTimeSource::DateEncoded => "date_encoded_unix",
+        }
+        .to_string(),
+        basis: match capture_time.basis {
+            GeoCaptureTimeBasis::UtcNormalized => "utc_normalized",
+            GeoCaptureTimeBasis::FloatingLocal => "floating_local",
+        }
+        .to_string(),
+    })
 }
 
 async fn persist_operation_run(state: &ServerState, run: &OperationRun) -> Result<()> {
@@ -2397,6 +2478,7 @@ mod tests {
             taken_at_unix,
             taken_at_timezone_known,
             date_encoded_unix,
+            date_encoded_timezone_known: None,
             duration_millis: None,
             frame_rate_millihertz: None,
             total_bitrate_bps: None,
@@ -2960,7 +3042,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_time_falls_back_to_filename_but_not_date_encoded_or_version_time() {
+    fn capture_time_uses_filename_before_date_encoded_and_never_version_time() {
         let metadata = cached_metadata(None, None, Some(1_700_000_000));
         let fallback = capture_time_for_geolocation("trip/IMG_20240102_030405.jpg", &metadata)
             .expect("the filename timestamp is an allowed fallback");
@@ -2969,17 +3051,45 @@ mod tests {
 
         assert_eq!(
             capture_time_for_geolocation("trip/IMG-20240102-WA0001.jpg", &metadata),
-            None,
-            "a date-only filename has no safe time-of-day for geo inference"
+            Some(GeoCaptureTime {
+                unix: 1_700_000_000,
+                source: GeoCaptureTimeSource::DateEncoded,
+                basis: GeoCaptureTimeBasis::FloatingLocal,
+            }),
+            "a date-only filename has no safe time-of-day, so date-encoded time is next"
         );
 
-        // `date_encoded_unix` is deliberately populated, yet a name without a
-        // timestamp still cannot become time-usable for geo inference. Version
-        // creation time is not part of CachedMediaMetadata or this function at
-        // all, so it cannot silently enter the decision path.
+        // Version creation time is not part of CachedMediaMetadata or this
+        // function at all, so it cannot silently enter the decision path.
         assert_eq!(
             capture_time_for_geolocation("trip/no-time.jpg", &metadata),
-            None
+            Some(GeoCaptureTime {
+                unix: 1_700_000_000,
+                source: GeoCaptureTimeSource::DateEncoded,
+                basis: GeoCaptureTimeBasis::FloatingLocal,
+            })
         );
+    }
+
+    #[test]
+    fn approved_xmp_capture_time_keeps_floating_times_floating() {
+        let floating = xmp_approved_capture_time(GeoCaptureTime {
+            unix: 1_704_164_645,
+            source: GeoCaptureTimeSource::Filename,
+            basis: GeoCaptureTimeBasis::FloatingLocal,
+        })
+        .expect("filename timestamp should format for XMP");
+        assert_eq!(floating.value, "2024-01-02T03:04:05");
+        assert_eq!(floating.source, "filename");
+        assert_eq!(floating.basis, "floating_local");
+
+        let date_encoded = xmp_approved_capture_time(GeoCaptureTime {
+            unix: 1_704_164_645,
+            source: GeoCaptureTimeSource::DateEncoded,
+            basis: GeoCaptureTimeBasis::UtcNormalized,
+        })
+        .expect("offset-bearing container timestamp should format for XMP");
+        assert_eq!(date_encoded.value, "2024-01-02T03:04:05Z");
+        assert_eq!(date_encoded.source, "date_encoded_unix");
     }
 }

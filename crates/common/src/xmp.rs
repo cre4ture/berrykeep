@@ -9,8 +9,8 @@
 //! Sidecars are regularly authored by third-party tools (Lightroom, digiKam,
 //! darktable). Those tools store a large number of namespaces Ironmesh does not
 //! model, so parsing has to be lossless: the raw XML event stream of the packet
-//! is retained verbatim and only the `dc:subject` property is regenerated when
-//! the packet is written back.
+//! is retained verbatim. BerryKeep-generated label, GPS, and approved
+//! capture-time properties are inserted without rewriting user content.
 //!
 //! The module is split into three layers:
 //! * reading raw events from bytes (`read_resolved_events`),
@@ -34,10 +34,14 @@ pub const XMP_SIDECAR_SUFFIX: &str = ".xmp";
 const RDF_NAMESPACE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const DC_NAMESPACE: &str = "http://purl.org/dc/elements/1.1/";
 const EXIF_NAMESPACE: &str = "http://ns.adobe.com/exif/1.0/";
+const XMP_NAMESPACE: &str = "http://ns.adobe.com/xap/1.0/";
+const PHOTOSHOP_NAMESPACE: &str = "http://ns.adobe.com/photoshop/1.0/";
 const BERRYKEEP_NAMESPACE: &str = "https://berrykeep.app/ns/1.0/";
 const RDF_PREFIX_FALLBACK: &str = "rdf";
 const DC_PREFIX_FALLBACK: &str = "dc";
 const EXIF_PREFIX_FALLBACK: &str = "exif";
+const XMP_PREFIX_FALLBACK: &str = "xmp";
+const PHOTOSHOP_PREFIX_FALLBACK: &str = "photoshop";
 const BERRYKEEP_PREFIX_FALLBACK: &str = "berrykeep";
 const INDENT_STEP_FALLBACK: &str = " ";
 
@@ -88,6 +92,19 @@ pub struct XmpGeoInference {
     pub previous_anchor_distance_seconds: Option<u64>,
     pub next_anchor_distance_seconds: Option<u64>,
     pub estimated_speed_kmh: Option<f64>,
+    /// The reviewed capture time to write through interoperable XMP fields.
+    /// `None` keeps generic GPS-only callers backward compatible.
+    pub approved_capture_time: Option<XmpApprovedCaptureTime>,
+}
+
+/// Capture time approved as part of a geolocation review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmpApprovedCaptureTime {
+    /// ISO 8601 local date/time, with an offset only when the source supplied
+    /// one. A floating time deliberately has no fabricated UTC designator.
+    pub value: String,
+    pub source: String,
+    pub basis: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -174,6 +191,13 @@ impl XmpSidecar {
         self.geo_inference.is_some() || has_geo_location_properties(&self.events)
     }
 
+    /// Returns whether a third-party XMP packet already provides a capture
+    /// time. An inference with an approved capture time must not overwrite it:
+    /// the item is left for review instead of creating contradictory metadata.
+    pub fn has_capture_time_properties(&self) -> bool {
+        has_capture_time_properties(&self.events)
+    }
+
     /// Stages canonical EXIF GPS fields and BerryKeep provenance on a fresh
     /// `rdf:Description`. Unknown XMP content is retained verbatim.
     ///
@@ -190,6 +214,9 @@ impl XmpSidecar {
         }
         if self.has_geo_location_properties() {
             bail!("XMP sidecar already contains geolocation properties");
+        }
+        if inference.approved_capture_time.is_some() && self.has_capture_time_properties() {
+            bail!("XMP sidecar already contains capture-time properties");
         }
         self.geo_inference = Some(inference);
         Ok(())
@@ -381,6 +408,8 @@ impl XmpSidecar {
             description.push_attribute((declaration.attribute.as_str(), declaration.namespace));
         }
         description.push_attribute(("xmlns:exif", EXIF_NAMESPACE));
+        description.push_attribute(("xmlns:xmp", XMP_NAMESPACE));
+        description.push_attribute(("xmlns:photoshop", PHOTOSHOP_NAMESPACE));
         description.push_attribute(("xmlns:berrykeep", BERRYKEEP_NAMESPACE));
         let latitude = format_xmp_coordinate(inference.latitude, true);
         let longitude = format_xmp_coordinate(inference.longitude, false);
@@ -396,6 +425,32 @@ impl XmpSidecar {
             qualified_name(EXIF_PREFIX_FALLBACK, "GPSMapDatum").as_str(),
             "WGS-84",
         ));
+        if let Some(capture_time) = &inference.approved_capture_time {
+            description.push_attribute((
+                qualified_name(EXIF_PREFIX_FALLBACK, "DateTimeOriginal").as_str(),
+                capture_time.value.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(XMP_PREFIX_FALLBACK, "CreateDate").as_str(),
+                capture_time.value.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(PHOTOSHOP_PREFIX_FALLBACK, "DateCreated").as_str(),
+                capture_time.value.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceCaptureTime").as_str(),
+                capture_time.value.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceCaptureTimeSource").as_str(),
+                capture_time.source.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceCaptureTimeBasis").as_str(),
+                capture_time.basis.as_str(),
+            ));
+        }
         description.push_attribute((
             qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceMethod").as_str(),
             inference.method.as_str(),
@@ -1116,6 +1171,34 @@ fn has_geo_location_properties(events: &[ResolvedEvent]) -> bool {
     })
 }
 
+fn has_capture_time_properties(events: &[ResolvedEvent]) -> bool {
+    events.iter().any(|event| {
+        event.has_undecodable_attributes
+            || is_capture_time_property(
+                event.namespace.as_deref(),
+                element_local_name(&event.event),
+            )
+            || event.attributes.iter().any(|attribute| {
+                is_capture_time_property(
+                    attribute.namespace.as_deref(),
+                    Some(attribute.local_name.as_slice()),
+                )
+            })
+    })
+}
+
+fn is_capture_time_property(namespace: Option<&str>, local_name: Option<&[u8]>) -> bool {
+    match namespace {
+        Some(EXIF_NAMESPACE) => matches!(
+            local_name,
+            Some(name) if name == b"DateTimeOriginal" || name == b"DateTimeDigitized"
+        ),
+        Some(XMP_NAMESPACE) => local_name == Some(b"CreateDate"),
+        Some(PHOTOSHOP_NAMESPACE) => local_name == Some(b"DateCreated"),
+        _ => false,
+    }
+}
+
 /// Detects the provenance written by [`XmpSidecar::set_geo_inference`] on one
 /// Description or one of its child properties. Attribute prefixes are resolved
 /// from declarations in the packet so a third-party writer may use a prefix
@@ -1209,8 +1292,8 @@ pub fn is_sidecar_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DC_NAMESPACE, XmpGeoInference, XmpSidecar, is_sidecar_key, media_key_for_sidecar,
-        sidecar_key_for_media,
+        DC_NAMESPACE, XmpApprovedCaptureTime, XmpGeoInference, XmpSidecar, is_sidecar_key,
+        media_key_for_sidecar, sidecar_key_for_media,
     };
     use anyhow::Result;
 
@@ -1299,6 +1382,25 @@ mod tests {
 
     fn serialize(sidecar: &XmpSidecar) -> Result<String> {
         Ok(String::from_utf8(sidecar.to_bytes()?)?)
+    }
+
+    fn approved_geolocation_inference(value: &str) -> XmpGeoInference {
+        XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest-anchor".to_string(),
+            run_id: "run-approved-time".to_string(),
+            confidence: "reference_distance=120s".to_string(),
+            reference_distance_seconds: Some(120),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+            approved_capture_time: Some(XmpApprovedCaptureTime {
+                value: value.to_string(),
+                source: "filename".to_string(),
+                basis: "floating_local".to_string(),
+            }),
+        }
     }
 
     #[test]
@@ -1399,6 +1501,7 @@ mod tests {
             previous_anchor_distance_seconds: Some(120),
             next_anchor_distance_seconds: Some(180),
             estimated_speed_kmh: Some(5.0),
+            approved_capture_time: None,
         })?;
         let serialized = serialize(&sidecar)?;
         for retained in [
@@ -1422,6 +1525,43 @@ mod tests {
     }
 
     #[test]
+    fn approved_geolocation_writes_interoperable_capture_time_without_inventing_a_timezone()
+    -> Result<()> {
+        let mut sidecar = XmpSidecar::parse(SIDECAR_WITHOUT_KEYWORDS.as_bytes())?;
+        sidecar.set_geo_inference(approved_geolocation_inference("2024-03-04T05:06:07"))?;
+        let serialized = serialize(&sidecar)?;
+
+        assert!(serialized.contains("darktable:import_timestamp=\"1715412345\""));
+        for field in [
+            "exif:DateTimeOriginal=\"2024-03-04T05:06:07\"",
+            "xmp:CreateDate=\"2024-03-04T05:06:07\"",
+            "photoshop:DateCreated=\"2024-03-04T05:06:07\"",
+            "berrykeep:GeoInferenceCaptureTimeSource=\"filename\"",
+            "berrykeep:GeoInferenceCaptureTimeBasis=\"floating_local\"",
+        ] {
+            assert!(serialized.contains(field), "missing {field:?}");
+        }
+        assert!(
+            !serialized.contains("CreateDate=\"2024-03-04T05:06:07Z\""),
+            "a floating timestamp must not acquire a synthetic UTC suffix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn approved_geolocation_refuses_to_shadow_existing_capture_time() -> Result<()> {
+        let mut sidecar = XmpSidecar::parse(THIRD_PARTY_SIDECAR.as_bytes())?;
+        assert!(sidecar.has_capture_time_properties());
+        assert!(
+            sidecar
+                .set_geo_inference(approved_geolocation_inference("2024-03-04T05:06:07"))
+                .is_err()
+        );
+        assert_eq!(serialize(&sidecar)?, THIRD_PARTY_SIDECAR);
+        Ok(())
+    }
+
+    #[test]
     fn pending_geolocation_is_visible_and_prevents_a_second_write() -> Result<()> {
         let inference = XmpGeoInference {
             latitude: 47.3769,
@@ -1433,6 +1573,7 @@ mod tests {
             previous_anchor_distance_seconds: None,
             next_anchor_distance_seconds: None,
             estimated_speed_kmh: None,
+            approved_capture_time: None,
         };
         let mut sidecar = XmpSidecar::new_empty();
         sidecar.set_geo_inference(inference.clone())?;
@@ -1469,6 +1610,7 @@ mod tests {
             previous_anchor_distance_seconds: None,
             next_anchor_distance_seconds: None,
             estimated_speed_kmh: None,
+            approved_capture_time: None,
         })?;
         let serialized = serialize(&sidecar)?;
 
@@ -1504,6 +1646,7 @@ mod tests {
             previous_anchor_distance_seconds: None,
             next_anchor_distance_seconds: None,
             estimated_speed_kmh: None,
+            approved_capture_time: None,
         })?;
         let serialized = serialize(&sidecar)?;
 
@@ -1539,6 +1682,7 @@ mod tests {
             previous_anchor_distance_seconds: None,
             next_anchor_distance_seconds: None,
             estimated_speed_kmh: None,
+            approved_capture_time: None,
         })?;
         let serialized = serialize(&sidecar)?;
 
@@ -1569,6 +1713,7 @@ mod tests {
             previous_anchor_distance_seconds: None,
             next_anchor_distance_seconds: None,
             estimated_speed_kmh: None,
+            approved_capture_time: None,
         })?;
         let serialized = serialize(&sidecar)?;
         let provenance_position = serialized
