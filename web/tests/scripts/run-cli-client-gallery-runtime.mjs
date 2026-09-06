@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { cargoDebugBinaryPath } from "./cargo-target.mjs";
 
 const repoRoot = resolve(process.cwd(), "..");
-const binaryPath = cargoDebugBinaryPath(repoRoot, "ironmesh");
+const binaryPath = cargoDebugBinaryPath(repoRoot, "berrykeep");
 const webUiPort = 18081;
 const upstreamPort = 18082;
 const webUiBindAddress = process.env.IRONMESH_GALLERY_RUNTIME_BIND ?? "127.0.0.1";

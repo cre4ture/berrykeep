@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { cargoDebugBinaryPath } from "./cargo-target.mjs";
 
 const repoRoot = resolve(process.cwd(), "..");
-const binaryPath = cargoDebugBinaryPath(repoRoot, "ironmesh");
+const binaryPath = cargoDebugBinaryPath(repoRoot, "berrykeep");
 
 const child = spawn(binaryPath, ["serve-web", "--bind", "127.0.0.1:18081"], {
   cwd: repoRoot,
