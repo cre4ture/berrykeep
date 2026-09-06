@@ -478,15 +478,25 @@ impl TursoMetadataStore {
         let result = async {
             let mut rows = connection
                 .query(
-                    "SELECT manifest_hash FROM gallery_objects WHERE key = ?1",
+                    "SELECT manifest_hash, sidecar_latitude, sidecar_longitude
+                     FROM gallery_objects WHERE key = ?1",
                     (key,),
                 )
                 .await?;
-            let manifest_hash = match rows.next().await? {
-                Some(row) => row_string(&row, 0, "gallery_objects.manifest_hash")?,
+            let (manifest_hash, existing_latitude, existing_longitude) = match rows.next().await? {
+                Some(row) => (
+                    row_string(&row, 0, "gallery_objects.manifest_hash")?,
+                    row_opt_f64(&row, 1, "gallery_objects.sidecar_latitude")?,
+                    row_opt_f64(&row, 2, "gallery_objects.sidecar_longitude")?,
+                ),
                 None => return Ok(()),
             };
             drop(rows);
+            let latitude = location.as_ref().map(|location| location.latitude);
+            let longitude = location.as_ref().map(|location| location.longitude);
+            if existing_latitude == latitude && existing_longitude == longitude {
+                return Ok(());
+            }
             connection
                 .execute(
                     "UPDATE gallery_objects
@@ -494,8 +504,8 @@ impl TursoMetadataStore {
                      WHERE key = ?1",
                     params_from_iter(vec![
                         Value::from(key),
-                        optional_real_value(location.as_ref().map(|location| location.latitude)),
-                        optional_real_value(location.as_ref().map(|location| location.longitude)),
+                        optional_real_value(latitude),
+                        optional_real_value(longitude),
                     ]),
                 )
                 .await?;
@@ -2286,16 +2296,25 @@ fn materialize_gallery_index_entry(
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in Turso"))
         .transpose()?;
+    let gallery_gps = match (gallery_latitude, gallery_longitude) {
+        (Some(latitude), Some(longitude))
+            if latitude.is_finite()
+                && (-90.0..=90.0).contains(&latitude)
+                && longitude.is_finite()
+                && (-180.0..=180.0).contains(&longitude) =>
+        {
+            Some(MediaGpsCoordinates {
+                latitude,
+                longitude,
+            })
+        }
+        _ => None,
+    };
     let mut media_metadata = metadata_payload
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
-    if let (Some(latitude), Some(longitude), Some(metadata)) =
-        (gallery_latitude, gallery_longitude, media_metadata.as_mut())
-    {
-        metadata.gps = Some(MediaGpsCoordinates {
-            latitude,
-            longitude,
-        });
+    if let (Some(gallery_gps), Some(metadata)) = (&gallery_gps, media_metadata.as_mut()) {
+        metadata.gps = Some(gallery_gps.clone());
     }
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
@@ -2308,6 +2327,7 @@ fn materialize_gallery_index_entry(
         modified_at_unix,
         content_fingerprint,
         media_metadata,
+        gps_override: gallery_gps,
         labels,
     })
 }

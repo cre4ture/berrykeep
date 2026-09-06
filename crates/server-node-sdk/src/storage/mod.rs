@@ -1244,6 +1244,9 @@ pub(crate) struct GalleryIndexEntry {
     pub(crate) modified_at_unix: Option<u64>,
     pub(crate) content_fingerprint: Option<String>,
     pub(crate) media_metadata: Option<CachedMediaMetadata>,
+    /// Path-scoped XMP GPS, retained separately so a location stays visible
+    /// while its content-addressed media cache is missing or being rebuilt.
+    pub(crate) gps_override: Option<MediaGpsCoordinates>,
     /// User labels of the object, materialized from the projection's label
     /// column. Populated by the sidecar ingest; empty until then.
     pub(crate) labels: Vec<String>,
@@ -3984,6 +3987,7 @@ impl StoreIndexInspector {
         Ok(Some(MediaCacheLookup {
             content_fingerprint,
             metadata,
+            gps_override: None,
         }))
     }
 
@@ -4026,6 +4030,7 @@ impl StoreIndexInspector {
                 MediaCacheLookup {
                     content_fingerprint,
                     metadata,
+                    gps_override: None,
                 },
             );
         }
@@ -9905,6 +9910,19 @@ impl PersistentStore {
                 .insert(key.to_string(), entry.clone());
         }
         Ok(fetched)
+    }
+
+    /// Returns the current manifest and stable object identity for one path.
+    /// This intentionally uses the path cache/single-key metadata lookup rather
+    /// than materializing the full namespace state for a point revalidation.
+    pub(crate) async fn current_object_identity(
+        &self,
+        key: &str,
+    ) -> Result<Option<(String, String)>> {
+        Ok(self
+            .current_object_entry(key)
+            .await?
+            .map(|entry| (entry.manifest_hash, entry.object_id)))
     }
 
     async fn upsert_current_object(&self, key: &str, entry: CurrentObjectEntry) -> Result<()> {

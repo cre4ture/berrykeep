@@ -10453,8 +10453,12 @@ async fn gallery_gps_for_key(store: &PersistentStore, key: &str) -> Option<Media
     page.entries
         .into_iter()
         .find(|entry| entry.key == key)
-        .and_then(|entry| entry.media_metadata)
-        .and_then(|metadata| metadata.gps)
+        .and_then(|entry| {
+            entry
+                .media_metadata
+                .and_then(|metadata| metadata.gps)
+                .or(entry.gps_override)
+        })
 }
 
 /// Lists the gallery keys that survive `label_filter`, sorted for comparison.
@@ -10839,6 +10843,54 @@ run_on_all_metadata_backends!(
     gallery_gps_follows_a_geolocation_sidecar_write_impl,
     gallery_gps_follows_a_geolocation_sidecar_write,
     gallery_gps_follows_a_geolocation_sidecar_write_turso
+);
+
+async fn gallery_gps_is_visible_before_media_cache_derivation_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-without-media-cache")
+        .await;
+    let media_key = "album/photo.jpg";
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+            },
+        )
+        .await
+        .expect("sidecar GPS should persist before cache derivation");
+
+    let location = gallery_gps_for_key(&store, media_key)
+        .await
+        .expect("sidecar GPS must be returned while the media cache is absent");
+    assert!((location.latitude - 47.3769).abs() < 0.000_001);
+    assert!((location.longitude - 8.5417).abs() < 0.000_001);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_gps_is_visible_before_media_cache_derivation_impl,
+    gallery_gps_is_visible_before_media_cache_derivation,
+    gallery_gps_is_visible_before_media_cache_derivation_turso
 );
 
 async fn gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_impl(

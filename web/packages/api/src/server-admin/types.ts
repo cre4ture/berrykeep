@@ -1403,6 +1403,11 @@ export type GeoProposalChunk = {
   time_range_start: GeoCaptureTime;
   time_range_end: GeoCaptureTime;
   item_count: number;
+  /** Total proposals in the logical semantic chunk, across technical pages. */
+  proposal_count?: number;
+  /** Zero-based technical page within the logical semantic chunk. */
+  proposal_page?: number;
+  proposal_page_count?: number;
   status: "ready";
   proposals: GeoProposal[];
 };

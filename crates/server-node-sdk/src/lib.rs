@@ -17713,6 +17713,7 @@ fn store_index_entry_from_gallery_entry(
                 &MediaCacheLookup {
                     content_fingerprint: content_fingerprint.clone(),
                     metadata: entry.media_metadata,
+                    gps_override: entry.gps_override,
                 },
                 thumbnail_route,
             )
@@ -19199,7 +19200,11 @@ fn build_media_index_response(
             total_bitrate_bps: metadata.total_bitrate_bps,
             codec_name: metadata.codec_name.clone(),
             codec_fourcc: metadata.codec_fourcc.clone(),
-            gps: metadata.gps.as_ref().map(media_gps_response),
+            gps: lookup
+                .gps_override
+                .as_ref()
+                .or(metadata.gps.as_ref())
+                .map(media_gps_response),
             photo: metadata.photo.as_ref().map(|photo| MediaPhotoResponse {
                 camera_manufacturer: photo.camera_manufacturer.clone(),
                 camera_model: photo.camera_model.clone(),
@@ -19230,7 +19235,7 @@ fn build_media_index_response(
             total_bitrate_bps: None,
             codec_name: None,
             codec_fourcc: None,
-            gps: None,
+            gps: lookup.gps_override.as_ref().map(media_gps_response),
             photo: None,
             thumbnail: Some(placeholder_thumbnail_response(thumbnail_url)),
             error: None,
@@ -20964,6 +20969,7 @@ async fn retry_media_cache_response(
     let lookup = MediaCacheLookup {
         content_fingerprint: metadata.content_fingerprint.clone(),
         metadata: Some(metadata),
+        gps_override: None,
     };
 
     (

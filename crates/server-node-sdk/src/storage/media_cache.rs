@@ -186,6 +186,10 @@ pub struct CachedMediaMetadata {
 pub struct MediaCacheLookup {
     pub content_fingerprint: String,
     pub metadata: Option<CachedMediaMetadata>,
+    /// Path-scoped GPS supplied by an XMP sidecar projection. Unlike cached
+    /// metadata, this must not be shared by byte-identical objects at other
+    /// paths.
+    pub gps_override: Option<MediaGpsCoordinates>,
 }
 
 struct RenderedThumbnail {

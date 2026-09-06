@@ -228,8 +228,21 @@ pub(crate) struct GeoProposalChunk {
     pub(crate) time_range_start: GeoCaptureTime,
     pub(crate) time_range_end: GeoCaptureTime,
     pub(crate) item_count: usize,
+    /// Number of proposals across the complete semantic folder/time segment.
+    /// A technically paginated result repeats this value on each page.
+    #[serde(default)]
+    pub(crate) proposal_count: usize,
+    /// Zero-based page within a technically paginated semantic chunk.
+    #[serde(default)]
+    pub(crate) proposal_page: usize,
+    #[serde(default = "one_geo_proposal_page")]
+    pub(crate) proposal_page_count: usize,
     pub(crate) status: GeoProposalChunkStatus,
     pub(crate) proposals: Vec<GeoProposal>,
+}
+
+const fn one_geo_proposal_page() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -255,9 +268,7 @@ pub(crate) fn infer_geolocation_proposals(
 ) -> Vec<GeoProposalChunk> {
     semantic_geo_inference_segments(media, config)
         .into_iter()
-        .filter_map(|segment| {
-            infer_segment(analysis_run_id, &segment.folder, &segment.media, config)
-        })
+        .flat_map(|segment| infer_segment(analysis_run_id, &segment.folder, &segment.media, config))
         .collect()
 }
 
@@ -336,7 +347,7 @@ fn infer_segment(
     folder: &str,
     segment: &[GeoAnalysisMedia],
     config: GeoInferenceConfig,
-) -> Option<GeoProposalChunk> {
+) -> Vec<GeoProposalChunk> {
     let (previous_anchor_indexes, next_anchor_indexes) = nearest_anchor_indexes(segment);
     let mut proposals = Vec::new();
 
@@ -353,22 +364,48 @@ fn infer_segment(
         }
     }
 
-    proposal_chunk(analysis_run_id, folder, segment, proposals)
+    proposal_chunk_pages(analysis_run_id, folder, segment, proposals)
 }
 
 /// The worker variant keeps a very large logical segment intact for review,
 /// while yielding between fixed-size inference batches.  Repair and scrubbing
 /// work can therefore take precedence without inventing arbitrary proposal
 /// chunk boundaries.
-async fn infer_segment_with_yields(
+async fn infer_and_persist_segment(
     state: &ServerState,
+    run_id: &str,
     analysis_run_id: &str,
     folder: &str,
     segment: &[GeoAnalysisMedia],
     config: GeoInferenceConfig,
-) -> Option<GeoProposalChunk> {
+) -> Result<(usize, usize)> {
     let (previous_anchor_indexes, next_anchor_indexes) = nearest_anchor_indexes(segment);
-    let mut proposals = Vec::new();
+    let mut proposal_count = 0usize;
+    for target_index in 0..segment.len() {
+        if target_index > 0 && target_index % MULTIMEDIA_OPERATION_BATCH_SIZE == 0 {
+            wait_for_higher_priority_work(state).await;
+            tokio::task::yield_now().await;
+        }
+        if infer_target_proposal(
+            analysis_run_id,
+            segment,
+            target_index,
+            previous_anchor_indexes[target_index],
+            next_anchor_indexes[target_index],
+            config,
+        )
+        .is_some()
+        {
+            proposal_count += 1;
+        }
+    }
+    if proposal_count == 0 {
+        return Ok((0, 0));
+    }
+
+    let proposal_page_count = proposal_count.div_ceil(GEO_PROPOSAL_RESULT_PAGE_SIZE);
+    let mut proposals = Vec::with_capacity(GEO_PROPOSAL_RESULT_PAGE_SIZE);
+    let mut proposal_page = 0usize;
 
     for target_index in 0..segment.len() {
         if target_index > 0 && target_index % MULTIMEDIA_OPERATION_BATCH_SIZE == 0 {
@@ -385,9 +422,46 @@ async fn infer_segment_with_yields(
         ) {
             proposals.push(proposal);
         }
+        if proposals.len() == GEO_PROPOSAL_RESULT_PAGE_SIZE {
+            persist_geo_proposal_page(
+                state,
+                run_id,
+                proposal_chunk_page(
+                    analysis_run_id,
+                    folder,
+                    segment,
+                    std::mem::take(&mut proposals),
+                    proposal_count,
+                    proposal_page,
+                    proposal_page_count,
+                )
+                .context("geolocation segment lost its capture-time bounds")?,
+            )
+            .await?;
+            proposal_page += 1;
+            proposals = Vec::with_capacity(GEO_PROPOSAL_RESULT_PAGE_SIZE);
+        }
     }
 
-    proposal_chunk(analysis_run_id, folder, segment, proposals)
+    if !proposals.is_empty() {
+        persist_geo_proposal_page(
+            state,
+            run_id,
+            proposal_chunk_page(
+                analysis_run_id,
+                folder,
+                segment,
+                proposals,
+                proposal_count,
+                proposal_page,
+                proposal_page_count,
+            )
+            .context("geolocation segment lost its capture-time bounds")?,
+        )
+        .await?;
+        proposal_page += 1;
+    }
+    Ok((proposal_count, proposal_page))
 }
 
 fn nearest_anchor_indexes(
@@ -539,21 +613,57 @@ fn infer_target_proposal(
     }
 }
 
-fn proposal_chunk(
+#[cfg(test)]
+fn proposal_chunk_pages(
     analysis_run_id: &str,
     folder: &str,
     segment: &[GeoAnalysisMedia],
     proposals: Vec<GeoProposal>,
+) -> Vec<GeoProposalChunk> {
+    if proposals.is_empty() {
+        return Vec::new();
+    }
+    let proposal_count = proposals.len();
+    let proposal_page_count = proposal_count.div_ceil(GEO_PROPOSAL_RESULT_PAGE_SIZE);
+    proposals
+        .chunks(GEO_PROPOSAL_RESULT_PAGE_SIZE)
+        .enumerate()
+        .map(|(proposal_page, proposals)| {
+            proposal_chunk_page(
+                analysis_run_id,
+                folder,
+                segment,
+                proposals.to_vec(),
+                proposal_count,
+                proposal_page,
+                proposal_page_count,
+            )
+            .expect("semantic segments always have capture times")
+        })
+        .collect()
+}
+
+fn proposal_chunk_page(
+    analysis_run_id: &str,
+    folder: &str,
+    segment: &[GeoAnalysisMedia],
+    proposals: Vec<GeoProposal>,
+    proposal_count: usize,
+    proposal_page: usize,
+    proposal_page_count: usize,
 ) -> Option<GeoProposalChunk> {
     let first = segment.first()?.capture_time?;
     let last = segment.last()?.capture_time?;
-    (!proposals.is_empty()).then(|| GeoProposalChunk {
+    Some(GeoProposalChunk {
         id: chunk_id(analysis_run_id, folder, first, last),
         analysis_run_id: analysis_run_id.to_string(),
         folder: folder.to_string(),
         time_range_start: first,
         time_range_end: last,
         item_count: segment.len(),
+        proposal_count,
+        proposal_page,
+        proposal_page_count,
         status: GeoProposalChunkStatus::Ready,
         proposals,
     })
@@ -721,6 +831,12 @@ use super::{
 
 const MULTIMEDIA_OPERATION_BATCH_SIZE: usize = 64;
 const OPERATION_RESULT_SELECTION_BATCH_SIZE: usize = 64;
+/// A result row remains transportable and bounded even when one logical
+/// folder/time segment contains a very large number of proposals.
+const GEO_PROPOSAL_RESULT_PAGE_SIZE: usize = 256;
+/// Geolocation inference assumes a short, local time window. Larger values
+/// would turn one folder into an impractically broad temporal segment.
+const MAX_GEO_TIME_WINDOW_SECONDS: u64 = 60 * 60;
 const MULTIMEDIA_OPERATION_YIELD_MILLIS: u64 = 100;
 const OPERATION_RUN_PERSIST_ATTEMPTS: usize = 3;
 const OPERATION_RUN_PERSIST_RETRY_MILLIS: u64 = 100;
@@ -1144,6 +1260,11 @@ fn validated_geo_proposal_input(request: &OperationRunStartRequest) -> Result<Ge
     {
         bail!("geolocation timing and speed limits must be positive");
     }
+    if config.max_anchor_time_delta_seconds > MAX_GEO_TIME_WINDOW_SECONDS
+        || config.segment_gap_seconds > MAX_GEO_TIME_WINDOW_SECONDS
+    {
+        bail!("geolocation timing limits must not exceed {MAX_GEO_TIME_WINDOW_SECONDS} seconds");
+    }
     Ok(GeoProposalRunInput { prefix, config })
 }
 
@@ -1321,24 +1442,17 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
         let mut proposal_count = 0usize;
         for (index, segment) in segments.iter().enumerate() {
             wait_for_higher_priority_work(&state).await;
-            if let Some(chunk) = infer_segment_with_yields(
+            let (segment_proposal_count, persisted_page_count) = infer_and_persist_segment(
                 &state,
+                &run.run_id,
                 &run.run_id,
                 &segment.folder,
                 &segment.media,
                 input.config,
             )
-            .await
-            {
-                proposal_count += chunk.proposals.len();
-                let result = OperationResultChunk {
-                    run_id: run.run_id.clone(),
-                    chunk_id: chunk.id.clone(),
-                    result_type: OPERATION_RESULT_TYPE_GEO_PROPOSAL_CHUNK.to_string(),
-                    created_at_unix: super::unix_ts(),
-                    payload: serde_json::to_value(&chunk)?,
-                };
-                persist_operation_result_chunk(&state, &result).await?;
+            .await?;
+            proposal_count += segment_proposal_count;
+            if persisted_page_count > 0 {
                 chunk_count += 1;
             }
             run.progress = OperationProgress {
@@ -1633,24 +1747,14 @@ async fn apply_one_geo_proposal(
 
     let identity = {
         let store = read_store(state, "operations.geo_apply.revalidate_identity").await;
-        let inspector = match store.store_index_inspector().await {
-            Ok(inspector) => inspector,
+        match store.current_object_identity(&proposal.media_path).await {
+            Ok(identity) => identity,
             Err(error) => {
                 return failure(format!("failed reading current object state: {error:#}"));
             }
-        };
-        (
-            inspector
-                .current_object_hashes()
-                .get(&proposal.media_path)
-                .cloned(),
-            inspector
-                .current_object_ids()
-                .get(&proposal.media_path)
-                .cloned(),
-        )
+        }
     };
-    let (Some(manifest_hash), Some(object_id)) = identity else {
+    let Some((manifest_hash, object_id)) = identity else {
         return stale("media object no longer exists".to_string());
     };
     if manifest_hash != proposal.manifest_hash || object_id != proposal.object_id {
@@ -1873,6 +1977,23 @@ async fn persist_operation_result_chunk(
 ) -> Result<()> {
     let store = lock_store(state, "operations.persist_result_chunk").await;
     store.persist_operation_result_chunk(chunk).await
+}
+
+async fn persist_geo_proposal_page(
+    state: &ServerState,
+    run_id: &str,
+    chunk: GeoProposalChunk,
+) -> Result<()> {
+    let result = OperationResultChunk {
+        run_id: run_id.to_string(),
+        // `GeoProposalChunk::id` stays the semantic folder/time-segment ID;
+        // only persistence pages receive an implementation-specific suffix.
+        chunk_id: format!("{}-page-{}", chunk.id, chunk.proposal_page),
+        result_type: OPERATION_RESULT_TYPE_GEO_PROPOSAL_CHUNK.to_string(),
+        created_at_unix: super::unix_ts(),
+        payload: serde_json::to_value(&chunk)?,
+    };
+    persist_operation_result_chunk(state, &result).await
 }
 
 async fn finish_failed_operation(
@@ -2138,6 +2259,65 @@ mod tests {
         assert_eq!(chunks[0].folder, "trip");
         assert_eq!(chunks[0].item_count, 3);
         assert_eq!(chunks[1].item_count, 2);
+    }
+
+    #[test]
+    fn large_semantic_chunk_is_persisted_as_bounded_technical_pages() {
+        let mut source = vec![media("trip/a.jpg", Some(0), Some((0.0, 0.0)))];
+        source.extend((1..=GEO_PROPOSAL_RESULT_PAGE_SIZE + 1).map(|second| {
+            media(
+                &format!("trip/target-{second:03}.jpg"),
+                Some(second as u64),
+                None,
+            )
+        }));
+        source.push(media(
+            "trip/b.jpg",
+            Some((GEO_PROPOSAL_RESULT_PAGE_SIZE + 2) as u64),
+            Some((0.0, 0.001)),
+        ));
+
+        let chunks = infer_geolocation_proposals(
+            "run",
+            source,
+            GeoInferenceConfig {
+                max_anchor_time_delta_seconds: 1_000,
+                segment_gap_seconds: 1_000,
+                ..GeoInferenceConfig::default()
+            },
+        );
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].id, chunks[1].id);
+        assert_eq!(chunks[0].proposal_count, GEO_PROPOSAL_RESULT_PAGE_SIZE + 1);
+        assert_eq!(chunks[0].proposal_page, 0);
+        assert_eq!(chunks[1].proposal_page, 1);
+        assert_eq!(chunks[0].proposal_page_count, 2);
+        assert_eq!(chunks[1].proposal_page_count, 2);
+        assert_eq!(chunks[0].proposals.len(), GEO_PROPOSAL_RESULT_PAGE_SIZE);
+        assert_eq!(chunks[1].proposals.len(), 1);
+    }
+
+    #[test]
+    fn proposal_time_windows_are_bounded_at_the_api_boundary() {
+        let request = OperationRunStartRequest {
+            approve: None,
+            prefix: Some("trip".to_string()),
+            max_anchor_time_delta_seconds: Some(MAX_GEO_TIME_WINDOW_SECONDS + 1),
+            segment_gap_seconds: None,
+            max_anchor_speed_kmh: None,
+            analysis_run_id: None,
+            proposal_chunk_ids: Vec::new(),
+            proposal_ids: Vec::new(),
+        };
+
+        let error = validated_geo_proposal_input(&request)
+            .expect_err("unbounded geolocation timing input must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("geolocation timing limits must not exceed")
+        );
     }
 
     #[test]

@@ -23,26 +23,26 @@ use super::{
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
     GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
-    GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
-    GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
-    GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
-    GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue,
-    GallerySummaryMiss, GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
+    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange, GalleryDeltaCursorError,
+    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
+    GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery,
+    GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
+    GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue, GallerySummaryMiss,
+    GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
     GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
     HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
     METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
     MediaGpsCoordinates, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
     MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
     ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
-    RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord, RepairRunRecord,
-    S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection,
-    compress_snapshot_json, current_media_cache_metadata, decode_gallery_labels,
-    decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
-    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
+    RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
+    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
+    current_media_cache_metadata, decode_gallery_labels, decode_version_index,
+    decompress_snapshot_json, effective_gallery_captured_at_unix, encode_gallery_labels,
+    gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
@@ -1629,16 +1629,25 @@ fn materialize_gallery_index_entry(
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
         .transpose()?;
+    let gallery_gps = match (gallery_latitude, gallery_longitude) {
+        (Some(latitude), Some(longitude))
+            if latitude.is_finite()
+                && (-90.0..=90.0).contains(&latitude)
+                && longitude.is_finite()
+                && (-180.0..=180.0).contains(&longitude) =>
+        {
+            Some(MediaGpsCoordinates {
+                latitude,
+                longitude,
+            })
+        }
+        _ => None,
+    };
     let mut media_metadata = metadata_payload
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
-    if let (Some(latitude), Some(longitude), Some(metadata)) =
-        (gallery_latitude, gallery_longitude, media_metadata.as_mut())
-    {
-        metadata.gps = Some(MediaGpsCoordinates {
-            latitude,
-            longitude,
-        });
+    if let (Some(gallery_gps), Some(metadata)) = (&gallery_gps, media_metadata.as_mut()) {
+        metadata.gps = Some(gallery_gps.clone());
     }
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
@@ -1651,6 +1660,7 @@ fn materialize_gallery_index_entry(
         modified_at_unix,
         content_fingerprint,
         media_metadata,
+        gps_override: gallery_gps,
         labels,
     })
 }
@@ -2265,25 +2275,33 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<()> {
         let key = key.to_string();
         self.write_tx(move |db| {
-            let Some(manifest_hash) = db
+            let Some((manifest_hash, existing_latitude, existing_longitude)) = db
                 .query_row(
-                    "SELECT manifest_hash FROM gallery_objects WHERE key = ?1",
+                    "SELECT manifest_hash, sidecar_latitude, sidecar_longitude
+                     FROM gallery_objects WHERE key = ?1",
                     params![key],
-                    |row| row.get::<_, String>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<f64>>(1)?,
+                            row.get::<_, Option<f64>>(2)?,
+                        ))
+                    },
                 )
                 .optional()?
             else {
                 return Ok(());
             };
+            let latitude = location.as_ref().map(|location| location.latitude);
+            let longitude = location.as_ref().map(|location| location.longitude);
+            if existing_latitude == latitude && existing_longitude == longitude {
+                return Ok(());
+            }
             db.execute(
                 "UPDATE gallery_objects
                  SET sidecar_latitude = ?2, sidecar_longitude = ?3
                  WHERE key = ?1",
-                params![
-                    key,
-                    location.as_ref().map(|location| location.latitude),
-                    location.as_ref().map(|location| location.longitude),
-                ],
+                params![key, latitude, longitude],
             )?;
             refresh_gallery_objects_for_manifest(db, &manifest_hash)
         })

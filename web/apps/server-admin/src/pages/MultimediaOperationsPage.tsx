@@ -37,6 +37,7 @@ import { useAdminAccess } from "../lib/admin-access";
 const PROPOSE_OPERATION_ID = "multimedia.geolocation.propose";
 const APPLY_OPERATION_ID = "multimedia.geolocation.apply";
 const RESULTS_LIMIT = 200;
+const MAX_GEO_TIME_WINDOW_SECONDS = 60 * 60;
 
 type InferenceSettings = {
   maxAnchorTimeDeltaSeconds: number;
@@ -56,12 +57,14 @@ export function MultimediaOperationsPage() {
   const [browsePrefix, setBrowsePrefix] = useState("");
   const [selectedPrefix, setSelectedPrefix] = useState("");
   const [settings, setSettings] = useState(defaultSettings);
-  const [selectedAnalysisRunId, setSelectedAnalysisRunId] = useState<string | null>(null);
-  const [selectedApplyRunId, setSelectedApplyRunId] = useState<string | null>(null);
+  // `undefined` means no automatic choice has been made yet; `null` is the
+  // user's deliberate clear action and must remain clearable.
+  const [selectedAnalysisRunId, setSelectedAnalysisRunId] = useState<string | null | undefined>(undefined);
+  const [selectedApplyRunId, setSelectedApplyRunId] = useState<string | null | undefined>(undefined);
   const [proposalResultsOffset, setProposalResultsOffset] = useState(0);
   const [applyResultsOffset, setApplyResultsOffset] = useState(0);
-  const [selectedChunkIds, setSelectedChunkIds] = useState<Set<string>>(new Set());
-  const [selectedProposalIds, setSelectedProposalIds] = useState<Set<string>>(new Set());
+  const [selectedChunkProposalCounts, setSelectedChunkProposalCounts] = useState<Map<string, number>>(new Map());
+  const [selectedProposalChunkIds, setSelectedProposalChunkIds] = useState<Map<string, string>>(new Map());
 
   const normalizedAdminTokenOverride = adminTokenOverride.trim();
   const hasAdminAccess =
@@ -129,6 +132,14 @@ export function MultimediaOperationsPage() {
     (left, right) => right.created_at_unix - left.created_at_unix
   );
   const activeRunIds = new Set(runs.filter(isUnfinishedRun).map((run) => run.run_id));
+  const selectedChunkIds = useMemo(
+    () => new Set(selectedChunkProposalCounts.keys()),
+    [selectedChunkProposalCounts]
+  );
+  const selectedProposalIds = useMemo(
+    () => new Set(selectedProposalChunkIds.keys()),
+    [selectedProposalChunkIds]
+  );
   const selectedAnalysisRun =
     proposalRuns.find((run) => run.run_id === selectedAnalysisRunId) ?? null;
   const selectedApplyRun = applyRuns.find((run) => run.run_id === selectedApplyRunId) ?? null;
@@ -187,22 +198,22 @@ export function MultimediaOperationsPage() {
   );
 
   useEffect(() => {
-    if (selectedAnalysisRunId || proposalRuns.length === 0) {
+    if (selectedAnalysisRunId !== undefined || proposalRuns.length === 0) {
       return;
     }
     setSelectedAnalysisRunId(proposalRuns[0].run_id);
   }, [proposalRuns, selectedAnalysisRunId]);
 
   useEffect(() => {
-    if (selectedApplyRunId || applyRuns.length === 0) {
+    if (selectedApplyRunId !== undefined || applyRuns.length === 0) {
       return;
     }
     setSelectedApplyRunId(applyRuns[0].run_id);
   }, [applyRuns, selectedApplyRunId]);
 
   useEffect(() => {
-    setSelectedChunkIds(new Set());
-    setSelectedProposalIds(new Set());
+    setSelectedChunkProposalCounts(new Map());
+    setSelectedProposalChunkIds(new Map());
     setProposalResultsOffset(0);
   }, [selectedAnalysisRunId]);
 
@@ -261,7 +272,15 @@ export function MultimediaOperationsPage() {
   const childPrefixes = (prefixQuery.data?.entries ?? []).filter(
     (entry) => entry.entry_type === "prefix" || entry.path.endsWith("/")
   );
-  const selectedCount = selectedChunkIds.size + selectedProposalIds.size;
+  const selectedCount = useMemo(() => {
+    const selectedChunkIds = new Set(selectedChunkProposalCounts.keys());
+    const wholeChunkProposalCount = [...selectedChunkProposalCounts.values()]
+      .reduce((total, count) => total + count, 0);
+    const individuallySelectedCount = [...selectedProposalChunkIds.values()]
+      .filter((chunkId) => !selectedChunkIds.has(chunkId))
+      .length;
+    return wholeChunkProposalCount + individuallySelectedCount;
+  }, [selectedChunkProposalCounts, selectedProposalChunkIds]);
   const analysisOptions = proposalRuns.map((run) => ({
     value: run.run_id,
     label: `${formatUnixTs(run.created_at_unix)} — ${run.status}`
@@ -297,6 +316,7 @@ export function MultimediaOperationsPage() {
             <NumberInput
               label="Maximum anchor distance (seconds)"
               min={1}
+              max={MAX_GEO_TIME_WINDOW_SECONDS}
               value={settings.maxAnchorTimeDeltaSeconds}
               onChange={(value) =>
                 setSettings((current) => ({
@@ -308,6 +328,7 @@ export function MultimediaOperationsPage() {
             <NumberInput
               label="Segment gap (seconds)"
               min={1}
+              max={MAX_GEO_TIME_WINDOW_SECONDS}
               value={settings.segmentGapSeconds}
               onChange={(value) =>
                 setSettings((current) => ({
@@ -389,7 +410,7 @@ export function MultimediaOperationsPage() {
             label="Analysis run"
             placeholder="No analysis run yet"
             data={analysisOptions}
-            value={selectedAnalysisRunId}
+            value={selectedAnalysisRunId ?? null}
             onChange={setSelectedAnalysisRunId}
             searchable
             clearable
@@ -400,10 +421,28 @@ export function MultimediaOperationsPage() {
               selectedChunkIds={selectedChunkIds}
               selectedProposalIds={selectedProposalIds}
               adminTokenOverride={normalizedAdminTokenOverride || undefined}
-              onToggleChunk={(chunkId) => setSelectedChunkIds(toggleSetMember(selectedChunkIds, chunkId))}
-              onToggleProposal={(proposalId) =>
-                setSelectedProposalIds(toggleSetMember(selectedProposalIds, proposalId))
-              }
+              onToggleChunk={(chunkId, proposalCount) => {
+                setSelectedChunkProposalCounts((selected) => {
+                  const next = new Map(selected);
+                  if (next.has(chunkId)) {
+                    next.delete(chunkId);
+                  } else {
+                    next.set(chunkId, proposalCount);
+                  }
+                  return next;
+                });
+              }}
+              onToggleProposal={(proposalId, chunkId) => {
+                setSelectedProposalChunkIds((selected) => {
+                  const next = new Map(selected);
+                  if (next.has(proposalId)) {
+                    next.delete(proposalId);
+                  } else {
+                    next.set(proposalId, chunkId);
+                  }
+                  return next;
+                });
+              }}
             />
           ) : (
             <Alert color="gray">Start or select an analysis run to review persisted proposals.</Alert>
@@ -418,7 +457,7 @@ export function MultimediaOperationsPage() {
             />
           ) : null}
           <Group justify="space-between">
-            <Text size="sm" c="dimmed">{selectedCount} selection{selectedCount === 1 ? "" : "s"}</Text>
+            <Text size="sm" c="dimmed">{selectedCount} proposal{selectedCount === 1 ? "" : "s"} selected</Text>
             <Button
               color="teal"
               disabled={!selectedAnalysisRun || selectedCount === 0 || applySlotOccupied}
@@ -455,7 +494,7 @@ export function MultimediaOperationsPage() {
                 value: run.run_id,
                 label: `${formatUnixTs(run.created_at_unix)} — ${run.status}`
               }))}
-              value={selectedApplyRunId}
+              value={selectedApplyRunId ?? null}
               onChange={setSelectedApplyRunId}
               searchable
               clearable
@@ -680,8 +719,8 @@ function ProposalReview({
   selectedChunkIds: Set<string>;
   selectedProposalIds: Set<string>;
   adminTokenOverride?: string;
-  onToggleChunk: (chunkId: string) => void;
-  onToggleProposal: (proposalId: string) => void;
+  onToggleChunk: (chunkId: string, proposalCount: number) => void;
+  onToggleProposal: (proposalId: string, chunkId: string) => void;
 }) {
   if (chunks.length === 0) {
     return <Alert color="gray">This run has not published any reviewable proposal chunks yet.</Alert>;
@@ -689,13 +728,17 @@ function ProposalReview({
   return (
     <Stack gap="md">
       {chunks.map((chunk) => (
-        <Card key={chunk.id} withBorder radius="sm" p="sm">
+        <Card key={`${chunk.id}-page-${chunk.proposal_page ?? 0}`} withBorder radius="sm" p="sm">
           <Stack gap="xs">
             <Group justify="space-between">
               <Checkbox
-                label={`${chunk.folder || "/"} — ${chunk.item_count} media items`}
+                label={`${chunk.folder || "/"} — ${chunk.item_count} media items${
+                  (chunk.proposal_page_count ?? 1) > 1
+                    ? ` (proposal page ${(chunk.proposal_page ?? 0) + 1} of ${chunk.proposal_page_count})`
+                    : ""
+                }`}
                 checked={selectedChunkIds.has(chunk.id)}
-                onChange={() => onToggleChunk(chunk.id)}
+                onChange={() => onToggleChunk(chunk.id, chunk.proposal_count ?? chunk.proposals.length)}
               />
               <Text size="xs" c="dimmed">
                 {formatCaptureTime(chunk.time_range_start)} – {formatCaptureTime(chunk.time_range_end)}
@@ -720,7 +763,7 @@ function ProposalReview({
                       proposal={proposal}
                       checked={selectedProposalIds.has(proposal.id)}
                       adminTokenOverride={adminTokenOverride}
-                      onToggle={() => onToggleProposal(proposal.id)}
+                      onToggle={() => onToggleProposal(proposal.id, chunk.id)}
                     />
                   ))}
                 </Table.Tbody>
@@ -900,15 +943,6 @@ function parentOfPrefix(prefix: string): string {
   return separator < 0 ? "" : `${normalized.slice(0, separator + 1)}`;
 }
 
-function toggleSetMember(values: Set<string>, member: string): Set<string> {
-  const next = new Set(values);
-  if (next.has(member)) {
-    next.delete(member);
-  } else {
-    next.add(member);
-  }
-  return next;
-}
 
 function asPositiveNumber(value: string | number, fallback: number): number {
   const parsed = typeof value === "number" ? value : Number(value);

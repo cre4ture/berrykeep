@@ -198,8 +198,8 @@ impl XmpSidecar {
     /// Builds the full output event stream by splicing the regenerated
     /// `dc:subject` property into the retained events.
     fn output_events(&self) -> Result<Vec<Event<'_>>> {
-        let mut output: Vec<Event<'_>> = if self.keywords.is_empty() {
-            self.retained_events(..).collect()
+        let mut output: Vec<ResolvedEvent> = if self.keywords.is_empty() {
+            self.events.clone()
         } else {
             let placement = self.placement.context(
                 "XMP packet offers no place for dc:subject: the rdf:RDF element is self-closing",
@@ -217,32 +217,34 @@ impl XmpSidecar {
                 }
             };
 
-            let mut output: Vec<Event<'_>> = self.retained_events(..index).collect();
-            output.extend(block);
-            output.extend(self.retained_events(index + usize::from(replaces_event)..));
+            let mut output = self.events[..index].to_vec();
+            output.extend(block.into_iter().map(ResolvedEvent::generated));
+            output.extend(
+                self.events[index + usize::from(replaces_event)..]
+                    .iter()
+                    .cloned(),
+            );
             output
         };
         if let Some(inference) = &self.geo_inference {
             let insertion_index = output
                 .iter()
                 .rposition(|event| {
-                    matches!(event, Event::End(end) if end.local_name().into_inner() == b"RDF")
+                    event.namespace.as_deref() == Some(RDF_NAMESPACE)
+                        && matches!(
+                            &event.event,
+                            Event::End(end) if end.local_name().into_inner() == b"RDF"
+                        )
                 })
                 .context("XMP packet offers no rdf:RDF closing element for GPS metadata")?;
             output.splice(
                 insertion_index..insertion_index,
-                self.render_geo_inference(inference),
+                self.render_geo_inference(inference)
+                    .into_iter()
+                    .map(ResolvedEvent::generated),
             );
         }
-        Ok(output)
-    }
-
-    /// Borrows the retained events of the given range for serialization.
-    fn retained_events<R>(&self, range: R) -> impl Iterator<Item = Event<'_>>
-    where
-        R: std::slice::SliceIndex<[ResolvedEvent], Output = [ResolvedEvent]>,
-    {
-        self.events[range].iter().map(|entry| entry.event.borrow())
+        Ok(output.into_iter().map(|event| event.event).collect())
     }
 
     /// Renders the `dc:subject` property, declaring the given namespaces on the
@@ -423,6 +425,16 @@ struct ResolvedEvent {
     event: Event<'static>,
     namespace: Option<String>,
     attributes: Vec<ResolvedAttribute>,
+}
+
+impl ResolvedEvent {
+    fn generated(event: Event<'static>) -> Self {
+        Self {
+            event,
+            namespace: None,
+            attributes: Vec::new(),
+        }
+    }
 }
 
 /// An attribute name resolved in the namespace scope of its owning event.
@@ -1393,6 +1405,70 @@ mod tests {
             .expect("generated GPS must be parseable");
         assert!((location.latitude - 47.3769).abs() < 0.000_001);
         assert!((location.longitude - 8.5417).abs() < 0.000_001);
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_write_escapes_provenance_attributes() -> Result<()> {
+        let mut sidecar = XmpSidecar::new_empty();
+        sidecar.set_geo_inference(XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest\"<&".to_string(),
+            run_id: "run\"<&".to_string(),
+            confidence: "reference\"<&".to_string(),
+            reference_distance_seconds: Some(120),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+        })?;
+        let serialized = serialize(&sidecar)?;
+
+        assert!(serialized.contains("GeoInferenceMethod=\"nearest&quot;&lt;&amp;\""));
+        assert!(serialized.contains("GeoInferenceRunId=\"run&quot;&lt;&amp;\""));
+        assert!(serialized.contains("GeoInferenceConfidence=\"reference&quot;&lt;&amp;\""));
+        XmpSidecar::parse(serialized.as_bytes())?;
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_write_uses_the_actual_rdf_namespace_closing_tag() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\"/></rdf:RDF>",
+            "<foo:RDF xmlns:foo=\"https://example.invalid/not-rdf\"></foo:RDF>",
+            "</x:xmpmeta>"
+        );
+        let mut sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        sidecar.set_geo_inference(XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest-anchor".to_string(),
+            run_id: "run-rdf-namespace".to_string(),
+            confidence: "reference_distance=120s".to_string(),
+            reference_distance_seconds: Some(120),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+        })?;
+        let serialized = serialize(&sidecar)?;
+        let provenance_position = serialized
+            .find("berrykeep:GeoInferenceRunId")
+            .expect("generated provenance must be present");
+        let rdf_close_position = serialized
+            .find("</rdf:RDF>")
+            .expect("RDF root must remain present");
+        let unrelated_rdf_position = serialized
+            .find("<foo:RDF")
+            .expect("unrelated RDF-named element must remain present");
+        assert!(provenance_position < rdf_close_position);
+        assert!(rdf_close_position < unrelated_rdf_position);
+        assert!(
+            XmpSidecar::parse(serialized.as_bytes())?
+                .geo_location()
+                .is_some()
+        );
         Ok(())
     }
 

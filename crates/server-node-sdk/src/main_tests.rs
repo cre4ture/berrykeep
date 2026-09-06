@@ -629,6 +629,9 @@ async fn geolocation_apply_revalidates_stale_and_already_geotagged_media_impl(
                     time_range_start: capture_time,
                     time_range_end: capture_time,
                     item_count: 1,
+                    proposal_count: 1,
+                    proposal_page: 0,
+                    proposal_page_count: 1,
                     status: super::operations::GeoProposalChunkStatus::Ready,
                     proposals: vec![proposal],
                 })
