@@ -523,16 +523,18 @@ prune_server_node_versions() {
   local architecture="$1"
   local package_path package_name package_architecture package_version depends required_version retained
   local retained_version
+  local -a retained_berrykeep_versions=()
+  local -a retained_ironmesh_versions=()
   local -a retained_versions=()
 
-  # Keep the BerryKeep Server Node version being published. Legacy map-tools
-  # packages with an exact Ironmesh dependency are repaired before this prune,
-  # while BerryKeep map-tools packages use an upstream-version minimum.
+  # Keep the BerryKeep Server Node version being published. An exact legacy
+  # Map Tools dependency protects only the matching Ironmesh Server Node while
+  # it is still needed; the compatibility rebuild removes that dependency.
   for package_path in "${DEB_PATHS[@]}"; do
     package_name="$(dpkg-deb -f "${package_path}" Package)"
     package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
     [[ "${package_name}" == "berrykeep-server-node" && "${package_architecture}" == "${architecture}" ]] || continue
-    retained_versions+=("$(dpkg-deb -f "${package_path}" Version)")
+    retained_berrykeep_versions+=("$(dpkg-deb -f "${package_path}" Version)")
   done
 
   for package_path in "${POOL_DIR}"/*_"${architecture}".deb; do
@@ -541,13 +543,23 @@ prune_server_node_versions() {
     [[ "${package_name}" == "ironmesh-server-node-map-tools" ]] || continue
     depends="$(dpkg-deb -f "${package_path}" Depends)"
     required_version="$(sed -n 's/.*ironmesh-server-node[[:space:]]*(=[[:space:]]*\([^)]*\)).*/\1/p' <<<"${depends}" | tr -d '[:space:]')"
-    [[ -n "${required_version}" ]] && retained_versions+=("${required_version}")
+    [[ -n "${required_version}" ]] && retained_ironmesh_versions+=("${required_version}")
   done
 
   for package_path in "${POOL_DIR}"/*_"${architecture}".deb; do
     [[ -f "${package_path}" ]] || continue
     package_name="$(dpkg-deb -f "${package_path}" Package)"
-    [[ "${package_name}" == "berrykeep-server-node" ]] || continue
+    case "${package_name}" in
+      berrykeep-server-node)
+        retained_versions=("${retained_berrykeep_versions[@]}")
+        ;;
+      ironmesh-server-node)
+        retained_versions=("${retained_ironmesh_versions[@]}")
+        ;;
+      *)
+        continue
+        ;;
+    esac
     package_version="$(dpkg-deb -f "${package_path}" Version)"
     retained=false
     for retained_version in "${retained_versions[@]}"; do
@@ -557,7 +569,7 @@ prune_server_node_versions() {
       fi
     done
     if [[ "${retained}" == false ]]; then
-      log "removing unreferenced Server Node ${package_version} for ${architecture}"
+      log "removing unreferenced ${package_name} ${package_version} for ${architecture}"
       rm -f "${package_path}"
     fi
   done
