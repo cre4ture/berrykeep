@@ -219,9 +219,13 @@ private func galleryMapWebUiSession(from session: AppleWebUiSession) -> AppleWeb
         return nil
     }
     var queryItems = components.queryItems ?? []
-    queryItems.removeAll { $0.name == "embedded" || $0.name == "embedded_client" }
+    queryItems.removeAll {
+        $0.name == "embedded" || $0.name == "embedded_client" || $0.name == "page" || $0.name == "gallery_view"
+    }
     queryItems.append(URLQueryItem(name: "embedded", value: IronmeshEmbeddedSurface.galleryMap.rawValue))
     queryItems.append(URLQueryItem(name: "embedded_client", value: "ios"))
+    queryItems.append(URLQueryItem(name: "page", value: "gallery"))
+    queryItems.append(URLQueryItem(name: "gallery_view", value: "map"))
     components.queryItems = queryItems
 
     guard let url = components.url,

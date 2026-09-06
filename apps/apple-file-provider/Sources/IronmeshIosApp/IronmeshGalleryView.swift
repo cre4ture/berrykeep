@@ -212,7 +212,9 @@ private struct IronmeshGalleryThumbnailCell: View {
                         Image(uiImage: image)
                             .resizable()
                             .scaledToFill()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .aspectRatio(1, contentMode: .fill)
+                            .frame(maxWidth: .infinity)
+                            .clipped()
                     }
                     .buttonStyle(.plain)
                 } else if errorMessage != nil {
