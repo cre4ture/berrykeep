@@ -525,6 +525,7 @@ prune_server_node_versions() {
   local retained_version
   local -a retained_berrykeep_versions=()
   local -a retained_ironmesh_versions=()
+  local -a retained_transition_versions=()
   local -a retained_versions=()
 
   # Keep the BerryKeep Server Node version being published. An exact legacy
@@ -533,8 +534,12 @@ prune_server_node_versions() {
   for package_path in "${DEB_PATHS[@]}"; do
     package_name="$(dpkg-deb -f "${package_path}" Package)"
     package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
-    [[ "${package_name}" == "berrykeep-server-node" && "${package_architecture}" == "${architecture}" ]] || continue
-    retained_berrykeep_versions+=("$(dpkg-deb -f "${package_path}" Version)")
+    package_version="$(dpkg-deb -f "${package_path}" Version)"
+    if [[ "${package_name}" == "berrykeep-server-node" && "${package_architecture}" == "${architecture}" ]]; then
+      retained_berrykeep_versions+=("${package_version}")
+    elif [[ "${package_name}" == "ironmesh-server-node" && "${package_architecture}" == "all" ]]; then
+      retained_transition_versions+=("${package_version}")
+    fi
   done
 
   for package_path in "${POOL_DIR}"/*_"${architecture}".deb; do
@@ -573,6 +578,25 @@ prune_server_node_versions() {
       rm -f "${package_path}"
     fi
   done
+
+  for package_path in "${POOL_DIR}"/ironmesh-server-node_*_all.deb; do
+    [[ -f "${package_path}" ]] || continue
+    package_name="$(dpkg-deb -f "${package_path}" Package)"
+    package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
+    [[ "${package_name}" == "ironmesh-server-node" && "${package_architecture}" == "all" ]] || continue
+    package_version="$(dpkg-deb -f "${package_path}" Version)"
+    retained=false
+    for retained_version in "${retained_transition_versions[@]}"; do
+      if [[ "${package_version}" == "${retained_version}" ]]; then
+        retained=true
+        break
+      fi
+    done
+    if [[ "${retained}" == false ]]; then
+      log "removing unreferenced ${package_name} ${package_version} for all"
+      rm -f "${package_path}"
+    fi
+  done
 }
 
 repack_exact_map_tools_dependencies() {
@@ -606,7 +630,7 @@ repack_exact_map_tools_dependencies() {
     fi
   done
 
-  [[ -n "${selected_package}" ]] || return
+  [[ -n "${selected_package}" ]] || return 0
 
   if dpkg --compare-versions "${server_node_version}" lt "${selected_version}"; then
     printf 'server-node-only package version %s is older than retained map-tools version %s for %s; publish a full package set instead\n' \
@@ -762,7 +786,7 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
     # depend on the new BerryKeep server package before the index is published.
     preserve_legacy_suite_packages "${architecture}"
   else
-    rm -f "${POOL_DIR}"/*_"${architecture}".deb
+    rm -f "${POOL_DIR}"/*_"${architecture}".deb "${POOL_DIR}"/*_all.deb
   fi
   rm -rf "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
   mkdir -p "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"

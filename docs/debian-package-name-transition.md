@@ -11,8 +11,10 @@ following packages replace their previous names:
 | `berrykeep-rendezvous-service` | `ironmesh-rendezvous-service` |
 
 For an existing installation, run the usual `apt update` and `apt upgrade`.
-The transitional package pulls in its `berrykeep-*` replacement, and the
-legacy service, configuration path, and executable command continue to work.
+The transitional package pulls in a compatible `berrykeep-*` replacement, and
+the legacy service, configuration path, and executable command continue to work.
+Its dependency uses the upstream version rather than an architecture-specific
+Debian revision, so independently rebuilt suite packages remain upgradeable.
 The replacement packages also provide `ironmesh-*` executable symlinks during
 the transition window.
 

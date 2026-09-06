@@ -74,7 +74,7 @@ Package: ironmesh-server-node
 Section: oldlibs
 Priority: optional
 Architecture: all
-Depends: berrykeep-server-node (= ${binary:Version})
+Depends: berrykeep-server-node (>= ${source:Upstream-Version})
 Description: Transitional package for BerryKeep server node
  This package keeps existing Ironmesh server-node installations upgrading to
  the renamed BerryKeep package. It retains the legacy systemd service and
@@ -85,7 +85,7 @@ Section: oldlibs
 Priority: optional
 Architecture: all
 Build-Profiles: <!server-node-only>
-Depends: berrykeep-server-node-map-tools (= ${binary:Version})
+Depends: berrykeep-server-node-map-tools (>= ${source:Upstream-Version})
 Description: Transitional package for BerryKeep server-node map tools
  This package keeps existing Ironmesh map-tools installations upgrading to the
  renamed BerryKeep package during the compatibility window.
@@ -95,7 +95,7 @@ Section: oldlibs
 Priority: optional
 Architecture: all
 Build-Profiles: <!server-node-only>
-Depends: berrykeep-client (= ${binary:Version})
+Depends: berrykeep-client (>= ${source:Upstream-Version})
 Description: Transitional package for BerryKeep client applications
  This package keeps existing Ironmesh client installations upgrading to the
  renamed BerryKeep package during the compatibility window.
@@ -105,7 +105,7 @@ Section: oldlibs
 Priority: optional
 Architecture: all
 Build-Profiles: <!server-node-only>
-Depends: berrykeep-rendezvous-service (= ${binary:Version})
+Depends: berrykeep-rendezvous-service (>= ${source:Upstream-Version})
 Description: Transitional package for BerryKeep rendezvous service
  This package keeps existing Ironmesh rendezvous installations upgrading to
  the renamed BerryKeep package. It retains the legacy systemd service and
