@@ -163,11 +163,6 @@ pub(crate) struct GeoAnalysisMedia {
     /// non-inferred coordinate may be an inference anchor.
     #[serde(default)]
     pub(crate) gps_is_present: bool,
-    /// A pre-existing standard XMP capture time would conflict with the
-    /// reviewed timestamp an apply run writes. Keep such media out of the
-    /// proposal list rather than presenting an item that can only be skipped.
-    #[serde(default)]
-    pub(crate) has_sidecar_capture_time_properties: bool,
     /// A location written by a prior BerryKeep inference still means the media
     /// is geotagged, but must not become an anchor for later inferences.
     #[serde(default)]
@@ -555,7 +550,7 @@ fn infer_target_proposal(
 ) -> Option<GeoProposal> {
     let target = segment.get(target_index)?;
     let target_time = target.capture_time?;
-    if target.gps_is_present || target.has_sidecar_capture_time_properties {
+    if target.gps_is_present {
         return None;
     }
 
@@ -1582,8 +1577,6 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                         capture_time: ready.capture_time,
                         gps,
                         gps_is_present,
-                        has_sidecar_capture_time_properties: sidecar_gps
-                            .has_capture_time_properties,
                         gps_is_inferred,
                     });
                 }
@@ -2019,17 +2012,14 @@ async fn apply_one_geo_proposal(
             detail: Some("XMP sidecar already has GPS".to_string()),
         };
     }
-    if existing_sidecar_metadata.has_capture_time_properties {
-        return GeoApplyItemResult {
-            proposal_id: proposal.id.clone(),
-            media_path: proposal.media_path.clone(),
-            outcome: GeoApplyItemOutcome::AlreadyHasCaptureTime,
-            detail: Some(
-                "XMP sidecar already has capture-time metadata; leaving it for review".to_string(),
-            ),
-        };
-    }
-    let inference = match xmp_geo_inference(analysis_run_id, proposal) {
+    // A third-party XMP capture time must be preserved, but it does not make
+    // the reviewed location unsafe. In that case write the inferred GPS and
+    // provenance without attempting to replace the existing standard time.
+    let inference = match xmp_geo_inference(
+        analysis_run_id,
+        proposal,
+        !existing_sidecar_metadata.has_capture_time_properties,
+    ) {
         Ok(inference) => inference,
         Err(error) => return failure(format!("failed preparing XMP inference: {error:#}")),
     };
@@ -2111,7 +2101,11 @@ async fn apply_one_geo_proposal(
     }
 }
 
-fn xmp_geo_inference(analysis_run_id: &str, proposal: &GeoProposal) -> Result<XmpGeoInference> {
+fn xmp_geo_inference(
+    analysis_run_id: &str,
+    proposal: &GeoProposal,
+    write_approved_capture_time: bool,
+) -> Result<XmpGeoInference> {
     let (
         reference_distance_seconds,
         previous_anchor_distance_seconds,
@@ -2163,7 +2157,9 @@ fn xmp_geo_inference(analysis_run_id: &str, proposal: &GeoProposal) -> Result<Xm
         previous_anchor_distance_seconds,
         next_anchor_distance_seconds,
         estimated_speed_kmh: proposal.estimated_anchor_speed_kmh,
-        approved_capture_time: Some(xmp_approved_capture_time(proposal.capture_time)?),
+        approved_capture_time: write_approved_capture_time
+            .then(|| xmp_approved_capture_time(proposal.capture_time))
+            .transpose()?,
     })
 }
 
@@ -2519,7 +2515,6 @@ mod tests {
                 longitude,
             }),
             gps_is_present,
-            has_sidecar_capture_time_properties: false,
             gps_is_inferred: false,
         }
     }
@@ -3037,18 +3032,23 @@ mod tests {
     }
 
     #[test]
-    fn existing_sidecar_capture_time_is_not_a_proposal_target() {
-        let mut existing_capture_time = media("trip/target.jpg", Some(120), None);
-        existing_capture_time.has_sidecar_capture_time_properties = true;
-        let result = proposals(
+    fn existing_sidecar_capture_time_uses_gps_only_inference() {
+        let mut result = proposals(
             vec![
                 media("trip/before.jpg", Some(0), Some((47.0, 8.0))),
-                existing_capture_time,
+                media("trip/target.jpg", Some(120), None),
                 media("trip/after.jpg", Some(240), Some((47.0005, 8.0005))),
             ],
             GeoInferenceConfig::default(),
         );
-        assert!(result.is_empty());
+        let proposal = result.pop().expect("the target should still be proposed");
+        let inference = xmp_geo_inference("run", &proposal, false)
+            .expect("GPS-only inference should not require a capture-time write");
+
+        assert_eq!(proposal.media_path, "trip/target.jpg");
+        assert!(inference.approved_capture_time.is_none());
+        assert_eq!(inference.latitude, proposal.proposed.latitude);
+        assert_eq!(inference.longitude, proposal.proposed.longitude);
     }
 
     #[test]

@@ -1562,6 +1562,20 @@ mod tests {
     }
 
     #[test]
+    fn gps_only_geolocation_preserves_existing_capture_time() -> Result<()> {
+        let mut sidecar = XmpSidecar::parse(THIRD_PARTY_SIDECAR.as_bytes())?;
+        let mut inference = approved_geolocation_inference("2024-03-04T05:06:07");
+        inference.approved_capture_time = None;
+
+        sidecar.set_geo_inference(inference)?;
+        let serialized = serialize(&sidecar)?;
+        assert!(serialized.contains("photoshop:DateCreated=\"2024-05-11T09:03:12\""));
+        assert!(serialized.contains("exif:GPSLatitude=\"47,22.614000N\""));
+        assert!(serialized.contains("berrykeep:GeoInferenceMethod=\"nearest-anchor\""));
+        Ok(())
+    }
+
+    #[test]
     fn pending_geolocation_is_visible_and_prevents_a_second_write() -> Result<()> {
         let inference = XmpGeoInference {
             latitude: 47.3769,

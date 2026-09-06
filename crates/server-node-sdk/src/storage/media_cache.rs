@@ -1315,7 +1315,8 @@ async fn derive_video_media_cache(
         // 3339 `creation_time`, including a synthetic trailing `Z`. Cameras
         // often store local wall-clock time there, so it is not UTC-safe on
         // its own. Prefer Apple's offset-bearing creation-date tag when it is
-        // available; otherwise retain creation_time as a floating local time.
+        // available. A `creation_time` with an explicit numeric offset is
+        // also a real instant; only the synthetic `Z` form remains floating.
         let (date_encoded_unix, date_encoded_timezone_known) = ffprobe_capture_time(
             probe.format.as_ref().map(|format| &format.tags),
             &stream.tags,
@@ -1494,6 +1495,28 @@ pub(super) fn parse_ffprobe_timestamp(value: &str) -> Option<u64> {
     u64::try_from(timestamp).ok()
 }
 
+/// Returns whether `value` ends in a numeric ISO 8601 UTC offset. Unlike a
+/// trailing `Z`, ffprobe's numeric offsets are carried by the source tag and
+/// therefore distinguish an actual instant from QuickTime's synthetic `Z`.
+fn ffprobe_has_explicit_numeric_offset(value: &str) -> bool {
+    let value = value.trim().as_bytes();
+    let compact_offset = value.len().checked_sub(5).and_then(|start| {
+        let offset = &value[start..];
+        (matches!(offset.first(), Some(b'+' | b'-')) && offset[1..].iter().all(u8::is_ascii_digit))
+            .then_some(())
+    });
+    if compact_offset.is_some() {
+        return true;
+    }
+    value.len().checked_sub(6).is_some_and(|start| {
+        let offset = &value[start..];
+        matches!(offset.first(), Some(b'+' | b'-'))
+            && offset[1..3].iter().all(u8::is_ascii_digit)
+            && offset[3] == b':'
+            && offset[4..].iter().all(u8::is_ascii_digit)
+    })
+}
+
 /// ffprobe normally emits RFC 3339 offsets with a colon, but Apple QuickTime
 /// creation-date tags also commonly use ISO 8601's compact `+HHMM` form.
 fn parse_ffprobe_basic_offset_timestamp(value: &str) -> Result<OffsetDateTime, time::error::Parse> {
@@ -1531,14 +1554,20 @@ fn ffprobe_capture_time(
         return (Some(timestamp), Some(true));
     }
 
-    let floating_local = [
+    let creation_time = [
         format_tags.and_then(|tags| tags.creation_time.as_deref()),
         stream_tags.creation_time.as_deref(),
     ]
     .into_iter()
     .flatten()
-    .find_map(parse_ffprobe_timestamp);
-    (floating_local, floating_local.map(|_| false))
+    .find_map(|value| {
+        parse_ffprobe_timestamp(value)
+            .map(|timestamp| (timestamp, ffprobe_has_explicit_numeric_offset(value)))
+    });
+    match creation_time {
+        Some((timestamp, timezone_known)) => (Some(timestamp), Some(timezone_known)),
+        None => (None, None),
+    }
 }
 
 fn ffprobe_gps(tags: &super::media_tools::FfprobeTags) -> Option<MediaGpsCoordinates> {
@@ -2616,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn ffprobe_capture_time_requires_an_explicit_quicktime_offset_for_utc_basis() {
+    fn ffprobe_capture_time_distinguishes_synthetic_z_from_explicit_offsets() {
         let floating_stream_tags = FfprobeTags {
             creation_time: Some("2024-03-04T05:06:07Z".to_string()),
             ..FfprobeTags::default()
@@ -2633,6 +2662,24 @@ mod tests {
         };
         assert_eq!(
             ffprobe_capture_time(Some(&offset_format_tags), &floating_stream_tags),
+            (Some(1_709_528_767), Some(true))
+        );
+
+        let offset_creation_time = FfprobeTags {
+            creation_time: Some("2024-03-04T06:06:07+01:00".to_string()),
+            ..FfprobeTags::default()
+        };
+        assert_eq!(
+            ffprobe_capture_time(None, &offset_creation_time),
+            (Some(1_709_528_767), Some(true))
+        );
+
+        let compact_offset_creation_time = FfprobeTags {
+            creation_time: Some("2024-03-04T06:06:07+0100".to_string()),
+            ..FfprobeTags::default()
+        };
+        assert_eq!(
+            ffprobe_capture_time(None, &compact_offset_creation_time),
             (Some(1_709_528_767), Some(true))
         );
     }
