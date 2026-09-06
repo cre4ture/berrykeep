@@ -540,7 +540,7 @@ pool_package_is_indexed_in_suite() {
 
 preserve_legacy_suite_packages() {
   local architecture="$1"
-  local pool pool_dir pool_rel package_path
+  local pool pool_dir pool_rel package_path package_architecture
   local -a package_pools=(
     "${LEGACY_POOL_DIR}:${LEGACY_POOL_REL}"
     "${PREVIOUS_SUITE_POOL_DIR}:${PREVIOUS_SUITE_POOL_REL}"
@@ -558,6 +558,28 @@ preserve_legacy_suite_packages() {
       fi
       cp -f "${package_path}" "${POOL_DIR}/"
     done
+
+    legacy_packages=("${pool_dir}"/*_all.deb)
+    for package_path in "${legacy_packages[@]}"; do
+      [[ -f "${package_path}" ]] || continue
+      package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
+      [[ "${package_architecture}" == "all" ]] || continue
+      if ! pool_package_is_indexed_in_suite "${architecture}" "${pool_rel}" "${package_path}"; then
+        continue
+      fi
+      cp -f "${package_path}" "${POOL_DIR}/"
+    done
+  done
+}
+
+prune_replaced_arch_all_packages() {
+  local package_path package_name package_architecture
+
+  for package_path in "${DEB_PATHS[@]}"; do
+    package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
+    [[ "${package_architecture}" == "all" ]] || continue
+    package_name="$(dpkg-deb -f "${package_path}" Package)"
+    rm -f "${POOL_DIR}/${package_name}_"*_all.deb
   done
 }
 
@@ -819,9 +841,9 @@ PREVIOUS_SUITE_POOL_REL="${LEGACY_POOL_REL}/${SUITE}"
 log "refreshing ${REPO_DIR}"
 mkdir -p "${POOL_DIR}"
 
-# A suite pool is shared by its architecture indexes because it also holds the
-# architecture-independent transition packages. Capture every existing index
-# before replacing any one of them, and preserve all of their legacy package
+# A suite pool is shared by its architecture indexes and can hold
+# architecture-independent packages. Capture every existing index before
+# replacing any one of them, and preserve all of their legacy package
 # references before the first new shared-pool package is published.
 mapfile -t existing_index_arches < <(
   find "${SUITE_DIR}/${COMPONENT}" -mindepth 1 -maxdepth 1 -type d -name 'binary-*' -printf '%f\n' 2>/dev/null \
@@ -843,9 +865,14 @@ for architecture in "${INDEX_ARCHES[@]}"; do
   preserve_legacy_suite_packages "${architecture}"
 done
 
+# A publish replaces only architecture-independent packages supplied in this
+# invocation. Leave unrelated indexed all packages available to architecture
+# siblings that are not being rebuilt.
+prune_replaced_arch_all_packages
+
 for architecture in "${REQUESTED_ARCHES[@]}"; do
   if [[ "${SERVER_NODE_ONLY}" != true ]]; then
-    rm -f "${POOL_DIR}"/*_"${architecture}".deb "${POOL_DIR}"/*_all.deb
+    rm -f "${POOL_DIR}"/*_"${architecture}".deb
   fi
   rm -rf "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
   mkdir -p "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
