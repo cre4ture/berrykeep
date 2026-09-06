@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+    # Only final stable version tags enter the package release path. The
+    # validation job below additionally requires an annotated tag whose
+    # version matches the workspace version before deployment is allowed.
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   pull_request:
     types:
       - opened
@@ -26,8 +31,51 @@ permissions:
   contents: read
 
 jobs:
+  validate-stable-release-tag:
+    name: Validate stable release tag
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+
+    steps:
+      - name: Checkout release tag
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Validate annotated release tag and workspace version
+        id: release
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RELEASE_TAG" =~ ^v([1-9][0-9]*)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Release tags must use the stable vX.Y.Z form; received '$RELEASE_TAG'." >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -t "$RELEASE_TAG")" != "tag" ]; then
+            echo "Release tags must be annotated." >&2
+            exit 1
+          fi
+          workspace_version="$(python3 - <<'PY'
+          import tomllib
+          with open('Cargo.toml', 'rb') as cargo_toml:
+              print(tomllib.load(cargo_toml)['workspace']['package']['version'])
+          PY
+          )"
+          if [ "v$workspace_version" != "$RELEASE_TAG" ]; then
+            echo "Tag '$RELEASE_TAG' does not match workspace version '$workspace_version'." >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
   build-static-server-node:
     name: Static Server Node (${{ matrix.architecture }})
+    needs: validate-stable-release-tag
     # Package builds are intentionally opt-in on pull requests. Pushes to main
     # and manual runs always build the complete portable package matrix.
     if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:debian-packages') }}
@@ -233,10 +281,17 @@ jobs:
 
   publish-server-node-debian-packages:
     name: Sign and deploy Server Node Debian packages
-    needs: build-server-node-debian-package
-    # Publishing requires the protected apt-repository environment. This is
-    # manual-only, runs from main, and never grants deployment secrets to PRs.
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main' }}
+    needs:
+      - build-server-node-debian-package
+      - validate-stable-release-tag
+    # Publishing requires the protected apt-repository environment. It is
+    # allowed for validated final release tags and for an explicit repair run
+    # from main; it never grants deployment secrets to pull requests.
+    if: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'push' && needs.validate-stable-release-tag.outputs.tag != '')
+      }}
     runs-on: ubuntu-24.04
     environment: apt-repository
     timeout-minutes: 30
