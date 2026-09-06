@@ -415,6 +415,7 @@ fn infer_segment(
 async fn infer_and_persist_segment(
     state: &ServerState,
     run_id: &str,
+    run: &mut OperationRun,
     analysis_run_id: &str,
     folder: &str,
     segment: &[GeoAnalysisMedia],
@@ -424,7 +425,7 @@ async fn infer_and_persist_segment(
     let mut proposals = Vec::new();
     for target_index in 0..segment.len() {
         if target_index > 0 && target_index.is_multiple_of(MULTIMEDIA_OPERATION_BATCH_SIZE) {
-            wait_for_higher_priority_work(state).await;
+            wait_for_multimedia_turn(state, run).await?;
             tokio::task::yield_now().await;
         }
         if let Some(proposal) = infer_target_proposal(
@@ -449,7 +450,7 @@ async fn infer_and_persist_segment(
     let proposal_page_count = proposal_count.div_ceil(GEO_PROPOSAL_RESULT_PAGE_SIZE);
     let mut proposal_pages = proposals.into_iter();
     for proposal_page in 0..proposal_page_count {
-        wait_for_higher_priority_work(state).await;
+        wait_for_multimedia_turn(state, run).await?;
         let page_proposals = proposal_pages
             .by_ref()
             .take(GEO_PROPOSAL_RESULT_PAGE_SIZE)
@@ -843,6 +844,7 @@ const OPERATION_RESULT_SELECTION_BATCH_SIZE: usize = 64;
 /// A result row remains transportable and bounded even when one logical
 /// folder/time segment contains a very large number of proposals.
 const GEO_PROPOSAL_RESULT_PAGE_SIZE: usize = 64;
+const GEO_PROPOSAL_RESULT_PAGE_INDEX_WIDTH: usize = 6;
 /// The public results endpoint pages generic result chunks, whose payload
 /// sizes are operation-defined. Keep both the number of chunks and the
 /// serialized payload bounded so a single administrative request cannot load
@@ -858,9 +860,9 @@ const MAX_GEO_TIME_WINDOW_SECONDS: u64 = 60 * 60;
 /// proposals so an administrator can choose a narrower prefix.
 const MAX_GEOLOCATION_SCAN_MEDIA: usize = 50_000;
 const MULTIMEDIA_OPERATION_YIELD_MILLIS: u64 = 100;
-/// A queued multimedia job may wait briefly for repair/scrub work before it
-/// starts its work. It must not reserve the only slot of its kind forever.
-const MULTIMEDIA_OPERATION_START_WAIT_SECONDS: u64 = 5 * 60;
+/// Multimedia work gives repair/scrub activity a bounded priority window at
+/// every batch boundary. It must not reserve the only slot of its kind forever.
+const MULTIMEDIA_OPERATION_PRIORITY_WAIT_SECONDS: u64 = 5 * 60;
 const HIGHER_PRIORITY_WORK_TIMEOUT_REASON: &str = "higher_priority_work_timeout";
 const OPERATION_RUN_PERSIST_ATTEMPTS: usize = 3;
 const OPERATION_RUN_PERSIST_RETRY_MILLIS: u64 = 100;
@@ -1371,8 +1373,9 @@ enum OperationTask {
 }
 
 async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoProposalRunInput) {
-    if !wait_for_multimedia_start_turn(&state).await {
-        fail_multimedia_start_wait(&state, &mut run, true).await;
+    if let Err(error) = wait_for_multimedia_turn(&state, &mut run).await {
+        finish_failed_operation(&state, &mut run, error).await;
+        release_multimedia_slot(&state, &run.run_id, true).await;
         return;
     }
     run.status = OperationRunStatus::Running;
@@ -1410,7 +1413,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
             .chunks(MULTIMEDIA_OPERATION_BATCH_SIZE)
             .enumerate()
         {
-            wait_for_higher_priority_work(&state).await;
+            wait_for_multimedia_turn(&state, &mut run).await?;
             for candidate in batch {
                 let metadata = match worker.ensure_media_metadata(&candidate.manifest_hash).await {
                     Ok(metadata) => metadata,
@@ -1514,11 +1517,13 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
         let mut chunk_count = 0usize;
         let mut proposal_count = 0usize;
         for (index, segment) in segments.iter().enumerate() {
-            wait_for_higher_priority_work(&state).await;
+            wait_for_multimedia_turn(&state, &mut run).await?;
+            let run_id = run.run_id.clone();
             let (segment_proposal_count, persisted_page_count) = infer_and_persist_segment(
                 &state,
-                &run.run_id,
-                &run.run_id,
+                &run_id,
+                &mut run,
+                &run_id,
                 &segment.folder,
                 &segment.media,
                 input.config,
@@ -1588,8 +1593,9 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
 }
 
 async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoApplyRunInput) {
-    if !wait_for_multimedia_start_turn(&state).await {
-        fail_multimedia_start_wait(&state, &mut run, false).await;
+    if let Err(error) = wait_for_multimedia_turn(&state, &mut run).await {
+        finish_failed_operation(&state, &mut run, error).await;
+        release_multimedia_slot(&state, &run.run_id, false).await;
         return;
     }
     run.status = OperationRunStatus::Running;
@@ -1665,7 +1671,7 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
                     if !whole_chunk_selected && !selected_proposal_ids.contains(&proposal.id) {
                         continue;
                     }
-                    wait_for_higher_priority_work(&state).await;
+                    wait_for_multimedia_turn(&state, &mut run).await?;
                     let item_result =
                         apply_one_geo_proposal(&state, &worker, &input.analysis_run_id, &proposal)
                             .await;
@@ -2079,12 +2085,19 @@ async fn persist_geo_proposal_page(
         run_id: run_id.to_string(),
         // `GeoProposalChunk::id` stays the semantic folder/time-segment ID;
         // only persistence pages receive an implementation-specific suffix.
-        chunk_id: format!("{}-page-{}", chunk.id, chunk.proposal_page),
+        chunk_id: geo_proposal_page_result_chunk_id(&chunk.id, chunk.proposal_page),
         result_type: OPERATION_RESULT_TYPE_GEO_PROPOSAL_CHUNK.to_string(),
         created_at_unix: super::unix_ts(),
         payload: serde_json::to_value(&chunk)?,
     };
     persist_operation_result_chunk(state, &result).await
+}
+
+fn geo_proposal_page_result_chunk_id(semantic_chunk_id: &str, proposal_page: usize) -> String {
+    format!(
+        "{semantic_chunk_id}-page-{proposal_page:0width$}",
+        width = GEO_PROPOSAL_RESULT_PAGE_INDEX_WIDTH,
+    )
 }
 
 async fn finish_failed_operation(
@@ -2201,29 +2214,23 @@ async fn release_multimedia_slot_activity(
     }
 }
 
-/// Gives active repair and scrub work a brief head start before a newly queued
-/// multimedia run starts. The caller has already reserved its serialized slot,
-/// so this admission delay must be bounded and terminal on timeout.
-async fn wait_for_multimedia_start_turn(state: &ServerState) -> bool {
-    timeout(
-        Duration::from_secs(MULTIMEDIA_OPERATION_START_WAIT_SECONDS),
+/// Waits for an uninterrupted higher-priority maintenance phase at any
+/// multimedia batch boundary. Timeout is a terminal run failure because the
+/// serialized slot has no user-visible cancellation mechanism in V1.
+async fn wait_for_multimedia_turn(state: &ServerState, run: &mut OperationRun) -> Result<()> {
+    if timeout(
+        Duration::from_secs(MULTIMEDIA_OPERATION_PRIORITY_WAIT_SECONDS),
         wait_for_higher_priority_work(state),
     )
     .await
-    .is_ok()
-}
-
-async fn fail_multimedia_start_wait(state: &ServerState, run: &mut OperationRun, is_scan: bool) {
-    run.termination_reason = Some(HIGHER_PRIORITY_WORK_TIMEOUT_REASON.to_string());
-    finish_failed_operation(
-        state,
-        run,
-        anyhow::anyhow!(
-            "higher-priority repair or scrub work did not become idle within {MULTIMEDIA_OPERATION_START_WAIT_SECONDS} seconds"
-        ),
-    )
-    .await;
-    release_multimedia_slot(state, &run.run_id, is_scan).await;
+    .is_err()
+    {
+        run.termination_reason = Some(HIGHER_PRIORITY_WORK_TIMEOUT_REASON.to_string());
+        bail!(
+            "higher-priority repair or scrub work did not become idle within {MULTIMEDIA_OPERATION_PRIORITY_WAIT_SECONDS} seconds"
+        );
+    }
+    Ok(())
 }
 
 async fn wait_for_higher_priority_work(state: &ServerState) {
@@ -2449,6 +2456,22 @@ mod tests {
         )
         .expect_err("an oversized scope must fail rather than truncate proposals");
         assert!(error.to_string().contains("choose a narrower prefix"));
+    }
+
+    #[test]
+    fn geo_proposal_page_result_chunk_ids_sort_by_numeric_page_order() {
+        let mut chunk_ids = (0..12)
+            .rev()
+            .map(|page| geo_proposal_page_result_chunk_id("semantic-chunk", page))
+            .collect::<Vec<_>>();
+        chunk_ids.sort();
+
+        assert_eq!(
+            chunk_ids,
+            (0..12)
+                .map(|page| geo_proposal_page_result_chunk_id("semantic-chunk", page))
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]
