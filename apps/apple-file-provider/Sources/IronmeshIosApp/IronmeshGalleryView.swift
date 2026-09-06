@@ -203,36 +203,38 @@ private struct IronmeshGalleryThumbnailCell: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color(uiColor: .secondarySystemGroupedBackground))
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color(uiColor: .secondarySystemGroupedBackground))
 
-                if let image {
-                    Button(action: onOpen) {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFill()
-                            .aspectRatio(1, contentMode: .fill)
-                            .frame(maxWidth: .infinity)
-                            .clipped()
-                    }
-                    .buttonStyle(.plain)
-                } else if errorMessage != nil {
-                    Button {
-                        retryGeneration += 1
-                    } label: {
-                        VStack(spacing: 6) {
-                            Image(systemName: "arrow.clockwise")
-                            Text("Retry")
-                                .font(.caption)
+                        if let image {
+                            Button(action: onOpen) {
+                                Image(uiImage: image)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                    .clipped()
+                            }
+                            .buttonStyle(.plain)
+                        } else if errorMessage != nil {
+                            Button {
+                                retryGeneration += 1
+                            } label: {
+                                VStack(spacing: 6) {
+                                    Image(systemName: "arrow.clockwise")
+                                    Text("Retry")
+                                        .font(.caption)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        } else {
+                            ProgressView()
                         }
                     }
-                    .buttonStyle(.bordered)
-                } else {
-                    ProgressView()
                 }
-            }
-            .aspectRatio(1, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             Text(galleryDisplayName(entry.path))

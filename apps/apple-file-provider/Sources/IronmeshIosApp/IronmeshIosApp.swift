@@ -22,7 +22,8 @@ struct IronmeshIosApp: App {
                         session: session,
                         isStarting: false,
                         statusMessage: "",
-                        onStart: {}
+                        onStart: {},
+                        onClose: {}
                     )
                 } else {
                     IronmeshHostedWebView(session: session)
@@ -160,11 +161,9 @@ private struct IronmeshGalleryMapView: View {
             session: model.galleryMapPresentation?.session,
             isStarting: model.isBusy,
             statusMessage: model.statusText,
-            onStart: model.openGalleryMap
+            onStart: model.openGalleryMap,
+            onClose: model.closeGalleryMap
         )
-        .onDisappear {
-            model.closeGalleryMap()
-        }
     }
 }
 
@@ -173,11 +172,13 @@ private struct IronmeshGalleryMapContent: View {
     let isStarting: Bool
     let statusMessage: String
     let onStart: () -> Void
+    let onClose: () -> Void
 
     var body: some View {
         if let session, let galleryMapSession = galleryMapWebUiSession(from: session) {
             IronmeshHostedWebView(session: galleryMapSession)
                 .ignoresSafeArea()
+                .onDisappear(perform: onClose)
         } else {
             galleryMapStartCard
         }
