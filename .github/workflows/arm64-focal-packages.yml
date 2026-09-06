@@ -71,6 +71,11 @@ jobs:
             echo "Tag '$RELEASE_TAG' does not match workspace version '$workspace_version'." >&2
             exit 1
           fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$RELEASE_TAG^{commit}" refs/remotes/origin/main; then
+            echo "Tag '$RELEASE_TAG' is not reachable from main." >&2
+            exit 1
+          fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
   build-static-server-node:
