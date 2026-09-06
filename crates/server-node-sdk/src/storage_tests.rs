@@ -294,6 +294,16 @@ fn sample_media_jpeg_with_gps_bytes() -> Vec<u8> {
     )
 }
 
+fn sample_media_jpeg_with_unparseable_gps_bytes() -> Vec<u8> {
+    jpeg_with_exif_gps(
+        sample_media_jpeg_bytes(),
+        b'N',
+        [(37, 1), (48, 1), (30, 0)],
+        b'W',
+        [(122, 1), (24, 1), (15, 1)],
+    )
+}
+
 fn sample_media_jpeg_with_photo_metadata_bytes() -> Vec<u8> {
     let jpeg = sample_media_jpeg_bytes();
     assert!(jpeg.starts_with(&[0xff, 0xd8]));
@@ -8729,6 +8739,7 @@ async fn ensure_media_metadata_refreshes_gps_after_overwrite_impl(backend: Stora
     let gps = updated_metadata
         .gps
         .expect("expected GPS metadata after overwrite");
+    assert!(updated_metadata.has_embedded_gps_properties);
     assert!((gps.latitude - 37.808_333_333_333_33).abs() < 0.000_001);
     assert!((gps.longitude - (-122.404_166_666_666_67)).abs() < 0.000_001);
 
@@ -8753,6 +8764,50 @@ run_on_all_metadata_backends!(
     ensure_media_metadata_refreshes_gps_after_overwrite_impl,
     ensure_media_metadata_refreshes_gps_after_overwrite,
     ensure_media_metadata_refreshes_gps_after_overwrite_turso
+);
+
+async fn ensure_media_metadata_marks_unparseable_gps_as_present_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-cache-unparseable-gps").await;
+    let put = store
+        .put_object_versioned(
+            "photos/unparseable-gps.jpg",
+            Bytes::from(sample_media_jpeg_with_unparseable_gps_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected media metadata");
+    assert_eq!(metadata.status, MediaCacheStatus::Ready);
+    assert!(metadata.gps.is_none());
+    assert!(metadata.has_embedded_gps_properties);
+
+    let lookup = store
+        .lookup_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected media cache lookup");
+    assert!(
+        lookup
+            .metadata
+            .expect("expected cached media metadata")
+            .has_embedded_gps_properties
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_metadata_marks_unparseable_gps_as_present_impl,
+    ensure_media_metadata_marks_unparseable_gps_as_present,
+    ensure_media_metadata_marks_unparseable_gps_as_present_turso
 );
 
 async fn content_fingerprint_is_stable_across_distinct_keys_with_same_bytes_impl(

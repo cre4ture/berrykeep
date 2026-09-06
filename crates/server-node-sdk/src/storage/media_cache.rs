@@ -34,7 +34,7 @@ use super::{
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
-pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 11;
+pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 12;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
 const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
 const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
@@ -172,6 +172,11 @@ pub struct CachedMediaMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codec_fourcc: Option<String>,
     pub gps: Option<MediaGpsCoordinates>,
+    /// Whether the original media contains GPS coordinate properties, even
+    /// when their values cannot be parsed into a usable location. This keeps
+    /// inference from adding a competing sidecar location to user media.
+    #[serde(default)]
+    pub has_embedded_gps_properties: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub photo: Option<CachedPhotoMetadata>,
     pub thumbnail: Option<CachedThumbnailInfo>,
@@ -788,6 +793,7 @@ fn base_media_metadata(
         codec_name: None,
         codec_fourcc: None,
         gps: None,
+        has_embedded_gps_properties: false,
         photo: None,
         thumbnail: None,
         source_size_bytes,
@@ -1320,6 +1326,11 @@ async fn derive_video_media_cache(
             .as_ref()
             .and_then(|format| ffprobe_gps(&format.tags))
             .or_else(|| ffprobe_gps(&stream.tags));
+        let has_embedded_gps_properties = probe
+            .format
+            .as_ref()
+            .is_some_and(|format| ffprobe_has_gps_properties(&format.tags))
+            || ffprobe_has_gps_properties(&stream.tags);
         let metadata = CachedMediaMetadata {
             status: MediaCacheStatus::Ready,
             media_type: Some("video".to_string()),
@@ -1338,6 +1349,7 @@ async fn derive_video_media_cache(
             codec_name: trimmed_metadata_string(stream.codec_name.as_deref()),
             codec_fourcc: trimmed_metadata_string(stream.codec_tag_string.as_deref()),
             gps,
+            has_embedded_gps_properties,
             ..base_media_metadata(
                 manifest_hash,
                 content_fingerprint,
@@ -1531,6 +1543,12 @@ fn ffprobe_gps(tags: &super::media_tools::FfprobeTags) -> Option<MediaGpsCoordin
     .find_map(parse_iso6709_location)
 }
 
+fn ffprobe_has_gps_properties(tags: &FfprobeTags) -> bool {
+    tags.quicktime_location_iso6709.is_some()
+        || tags.location.is_some()
+        || tags.location_eng.is_some()
+}
+
 /// Parses the latitude/longitude portion of ISO 6709 values commonly exposed
 /// by ffprobe for QuickTime location atoms, e.g. `+47.3769+008.5417/`.
 pub(super) fn parse_iso6709_location(value: &str) -> Option<MediaGpsCoordinates> {
@@ -1687,8 +1705,14 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
     };
 
     let (width, height) = image_dimensions_from_reader(reader, format)?;
-    let (orientation, gps, taken_at_unix, taken_at_timezone_known, photo) =
-        extract_exif_fields_from_reader(reader);
+    let (
+        orientation,
+        gps,
+        has_embedded_gps_properties,
+        taken_at_unix,
+        taken_at_timezone_known,
+        photo,
+    ) = extract_exif_fields_from_reader(reader);
     let mut metadata = CachedMediaMetadata {
         status: MediaCacheStatus::Ready,
         media_type: Some("image".to_string()),
@@ -1699,6 +1723,7 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
         taken_at_unix,
         taken_at_timezone_known,
         gps,
+        has_embedded_gps_properties,
         photo,
         ..base_media_metadata(
             manifest_hash,
@@ -2029,7 +2054,7 @@ fn render_image_thumbnail_payload(
         return Ok(None);
     }
 
-    let (orientation, _, _, _, _) = extract_exif_fields_from_reader(&mut reader);
+    let (orientation, _, _, _, _, _) = extract_exif_fields_from_reader(&mut reader);
     let rendered =
         match render_thumbnail_from_reader(&mut reader, format, orientation, profile, image_limits)
         {
@@ -2068,6 +2093,7 @@ fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {
 type ExifExtraction = (
     Option<u16>,
     Option<MediaGpsCoordinates>,
+    bool,
     Option<u64>,
     Option<bool>,
     Option<CachedPhotoMetadata>,
@@ -2075,11 +2101,11 @@ type ExifExtraction = (
 
 fn extract_exif_fields_from_reader<R: BufRead + Seek>(reader: &mut R) -> ExifExtraction {
     if reader.seek(SeekFrom::Start(0)).is_err() {
-        return (None, None, None, None, None);
+        return (None, None, false, None, None, None);
     }
     let exif = match ExifReader::new().read_from_container(reader) {
         Ok(value) => value,
-        Err(_) => return (None, None, None, None, None),
+        Err(_) => return (None, None, false, None, None, None),
     };
 
     let orientation = exif
@@ -2113,6 +2139,7 @@ fn extract_exif_fields_from_reader<R: BufRead + Seek>(reader: &mut R) -> ExifExt
         }),
         _ => None,
     };
+    let has_embedded_gps_properties = exif_has_gps_properties(&exif);
 
     let (taken_at_unix, taken_at_timezone_known) = exif_capture_time(&exif)
         .map(|(unix, timezone_known)| (Some(unix), Some(timezone_known)))
@@ -2122,10 +2149,22 @@ fn extract_exif_fields_from_reader<R: BufRead + Seek>(reader: &mut R) -> ExifExt
     (
         orientation,
         gps,
+        has_embedded_gps_properties,
         taken_at_unix,
         taken_at_timezone_known,
         photo,
     )
+}
+
+fn exif_has_gps_properties(exif: &exif::Exif) -> bool {
+    [
+        Tag::GPSLatitude,
+        Tag::GPSLatitudeRef,
+        Tag::GPSLongitude,
+        Tag::GPSLongitudeRef,
+    ]
+    .into_iter()
+    .any(|tag| exif.get_field(tag, In::PRIMARY).is_some())
 }
 
 fn exif_photo_metadata(exif: &exif::Exif) -> Option<CachedPhotoMetadata> {

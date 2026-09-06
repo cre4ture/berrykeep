@@ -1506,7 +1506,9 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                 // inferred sidecar. Otherwise preserve the sidecar location
                 // and its trust flag: it suppresses a duplicate proposal but
                 // cannot act as a future inference anchor.
-                let gps_is_present = embedded_gps.is_some() || sidecar_gps.has_geo_location_properties;
+                let gps_is_present = embedded_gps.is_some()
+                    || metadata.has_embedded_gps_properties
+                    || sidecar_gps.has_geo_location_properties;
                 let (gps, gps_is_inferred) = match (sidecar_gps.location, embedded_gps) {
                     (Some(sidecar), Some(embedded)) if sidecar.inferred_by_berrykeep => {
                         (Some(embedded), false)
@@ -1905,12 +1907,12 @@ async fn apply_one_geo_proposal(
     {
         return stale("capture-time data changed since analysis".to_string());
     }
-    if metadata.gps.is_some() {
+    if metadata.gps.is_some() || metadata.has_embedded_gps_properties {
         return GeoApplyItemResult {
             proposal_id: proposal.id.clone(),
             media_path: proposal.media_path.clone(),
             outcome: GeoApplyItemOutcome::AlreadyHasGps,
-            detail: Some("media metadata already has GPS".to_string()),
+            detail: Some("media metadata already has GPS properties".to_string()),
         };
     }
     let existing_sidecar_gps = {
@@ -2331,6 +2333,7 @@ mod tests {
             codec_name: None,
             codec_fourcc: None,
             gps: None,
+            has_embedded_gps_properties: false,
             photo: None,
             thumbnail: None,
             source_size_bytes: 0,

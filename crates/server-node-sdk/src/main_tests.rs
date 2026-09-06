@@ -500,6 +500,58 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn sample_jpeg_with_incomplete_exif_gps() -> Vec<u8> {
+    let image = image::RgbImage::new(4, 3);
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .encode_image(&image)
+        .expect("test JPEG should encode");
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+
+    // A valid GPS IFD with a latitude but no longitude. The image is readable,
+    // but its coordinate is intentionally incomplete and must not be shadowed
+    // by a proposed sidecar location.
+    let gps_ifd_offset = 26u32;
+    let latitude_offset = 56u32;
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"MM");
+    tiff.extend_from_slice(&42u16.to_be_bytes());
+    tiff.extend_from_slice(&8u32.to_be_bytes());
+    tiff.extend_from_slice(&1u16.to_be_bytes());
+    tiff.extend_from_slice(&0x8825u16.to_be_bytes());
+    tiff.extend_from_slice(&4u16.to_be_bytes());
+    tiff.extend_from_slice(&1u32.to_be_bytes());
+    tiff.extend_from_slice(&gps_ifd_offset.to_be_bytes());
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    tiff.extend_from_slice(&2u16.to_be_bytes());
+    tiff.extend_from_slice(&1u16.to_be_bytes());
+    tiff.extend_from_slice(&2u16.to_be_bytes());
+    tiff.extend_from_slice(&2u32.to_be_bytes());
+    tiff.extend_from_slice(&[b'N', 0, 0, 0]);
+    tiff.extend_from_slice(&2u16.to_be_bytes());
+    tiff.extend_from_slice(&5u16.to_be_bytes());
+    tiff.extend_from_slice(&3u32.to_be_bytes());
+    tiff.extend_from_slice(&latitude_offset.to_be_bytes());
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    for (numerator, denominator) in [(47u32, 1u32), (22, 1), (37, 1)] {
+        tiff.extend_from_slice(&numerator.to_be_bytes());
+        tiff.extend_from_slice(&denominator.to_be_bytes());
+    }
+    assert_eq!(tiff.len(), 80);
+
+    let mut payload = b"Exif\0\0".to_vec();
+    payload.extend_from_slice(&tiff);
+    let mut app1 = vec![0xff, 0xe1];
+    app1.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    app1.extend_from_slice(&payload);
+
+    let mut encoded = Vec::with_capacity(jpeg.len() + app1.len());
+    encoded.extend_from_slice(&jpeg[..2]);
+    encoded.extend_from_slice(&app1);
+    encoded.extend_from_slice(&jpeg[2..]);
+    encoded
+}
+
 async fn run_selected_geo_apply_for_test(
     state: &ServerState,
     run_id: &str,
@@ -544,6 +596,56 @@ async fn run_selected_geo_apply_for_test(
         .to_string()
 }
 
+async fn persist_test_geo_proposal(
+    state: &ServerState,
+    analysis_run_id: &str,
+    proposal: super::operations::GeoProposal,
+) {
+    let now = super::unix_ts();
+    let chunk_id = format!("{analysis_run_id}-proposal-chunk");
+    let store = read_store(state, "test.geo_apply.persist_analysis").await;
+    store
+        .persist_operation_run(&super::operations::OperationRun {
+            run_id: analysis_run_id.to_string(),
+            operation_id: super::operations::GEOLOCATION_PROPOSE_OPERATION_ID.to_string(),
+            status: super::operations::OperationRunStatus::Completed,
+            priority: super::operations::OperationPriority::Background,
+            created_at_unix: now,
+            started_at_unix: Some(now),
+            finished_at_unix: Some(now),
+            progress: super::operations::OperationProgress::default(),
+            input: serde_json::json!({}),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        })
+        .await
+        .expect("analysis run should persist");
+    store
+        .persist_operation_result_chunk(&super::operations::OperationResultChunk {
+            run_id: analysis_run_id.to_string(),
+            chunk_id: chunk_id.clone(),
+            result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+            created_at_unix: now,
+            payload: serde_json::to_value(super::operations::GeoProposalChunk {
+                id: chunk_id,
+                analysis_run_id: analysis_run_id.to_string(),
+                folder: "album".to_string(),
+                time_range_start: proposal.capture_time,
+                time_range_end: proposal.capture_time,
+                item_count: 1,
+                proposal_count: 1,
+                proposal_page: 0,
+                proposal_page_count: 1,
+                status: super::operations::GeoProposalChunkStatus::Ready,
+                proposals: vec![proposal],
+            })
+            .expect("proposal chunk should serialize"),
+        })
+        .await
+        .expect("proposal chunk should persist");
+}
+
 async fn geolocation_apply_revalidates_stale_and_already_geotagged_media_impl(
     backend: MainTestBackend,
 ) {
@@ -579,7 +681,6 @@ async fn geolocation_apply_revalidates_stale_and_already_geotagged_media_impl(
             .expect("the filename should supply a floating capture time");
     let analysis_run_id = "analysis-run";
     let proposal_id = "proposal-1";
-    let now = super::unix_ts();
     let proposal = super::operations::GeoProposal {
         id: proposal_id.to_string(),
         media_path: media_path.to_string(),
@@ -597,49 +698,7 @@ async fn geolocation_apply_revalidates_stale_and_already_geotagged_media_impl(
         estimated_anchor_speed_kmh: None,
         warnings: Vec::new(),
     };
-    {
-        let store = read_store(&state, "test.geo_apply.persist_analysis").await;
-        store
-            .persist_operation_run(&super::operations::OperationRun {
-                run_id: analysis_run_id.to_string(),
-                operation_id: super::operations::GEOLOCATION_PROPOSE_OPERATION_ID.to_string(),
-                status: super::operations::OperationRunStatus::Completed,
-                priority: super::operations::OperationPriority::Background,
-                created_at_unix: now,
-                started_at_unix: Some(now),
-                finished_at_unix: Some(now),
-                progress: super::operations::OperationProgress::default(),
-                input: serde_json::json!({}),
-                summary: None,
-                error: None,
-                termination_reason: None,
-            })
-            .await
-            .expect("analysis run should persist");
-        store
-            .persist_operation_result_chunk(&super::operations::OperationResultChunk {
-                run_id: analysis_run_id.to_string(),
-                chunk_id: "proposal-chunk".to_string(),
-                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
-                created_at_unix: now,
-                payload: serde_json::to_value(super::operations::GeoProposalChunk {
-                    id: "proposal-chunk".to_string(),
-                    analysis_run_id: analysis_run_id.to_string(),
-                    folder: "album".to_string(),
-                    time_range_start: capture_time,
-                    time_range_end: capture_time,
-                    item_count: 1,
-                    proposal_count: 1,
-                    proposal_page: 0,
-                    proposal_page_count: 1,
-                    status: super::operations::GeoProposalChunkStatus::Ready,
-                    proposals: vec![proposal],
-                })
-                .expect("proposal chunk should serialize"),
-            })
-            .await
-            .expect("proposal chunk should persist");
-    }
+    persist_test_geo_proposal(&state, analysis_run_id, proposal).await;
 
     assert_eq!(
         run_selected_geo_apply_for_test(&state, "apply-first", analysis_run_id, proposal_id).await,
@@ -683,6 +742,94 @@ run_on_main_metadata_backends!(
     geolocation_apply_revalidates_stale_and_already_geotagged_media_impl,
     geolocation_apply_revalidates_stale_and_already_geotagged_media,
     geolocation_apply_revalidates_stale_and_already_geotagged_media_turso
+);
+
+async fn geolocation_apply_does_not_shadow_unparseable_embedded_gps_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let media_path = "album/IMG_20240102_030405.jpg";
+    let (manifest_hash, object_id, metadata) = {
+        let mut store = lock_store(&state, "test.geo_apply.seed_unparseable_gps").await;
+        let put = store
+            .put_object_versioned(
+                media_path,
+                Bytes::from(sample_jpeg_with_incomplete_exif_gps()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("test media should persist");
+        let metadata = store
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .expect("test media metadata should load")
+            .expect("JPEG should be recognized as media");
+        let object_id = store
+            .store_index_inspector()
+            .await
+            .expect("store index should load")
+            .current_object_ids()
+            .get(media_path)
+            .cloned()
+            .expect("test media should have an object id");
+        (put.manifest_hash, object_id, metadata)
+    };
+    assert!(metadata.gps.is_none());
+    assert!(metadata.has_embedded_gps_properties);
+    let capture_time =
+        super::operations::capture_time_for_geolocation_for_test(media_path, &metadata)
+            .expect("the filename should supply a floating capture time");
+    let analysis_run_id = "analysis-run-unparseable-gps";
+    let proposal_id = "proposal-unparseable-gps";
+    persist_test_geo_proposal(
+        &state,
+        analysis_run_id,
+        super::operations::GeoProposal {
+            id: proposal_id.to_string(),
+            media_path: media_path.to_string(),
+            object_id,
+            manifest_hash,
+            content_fingerprint: metadata.content_fingerprint.clone(),
+            capture_time,
+            proposed: super::operations::GeoCoordinate {
+                latitude: 47.3769,
+                longitude: 8.5417,
+            },
+            method: super::operations::GeoInferenceMethod::NearestAnchor,
+            previous_anchor: None,
+            next_anchor: None,
+            estimated_anchor_speed_kmh: None,
+            warnings: Vec::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        run_selected_geo_apply_for_test(
+            &state,
+            "apply-unparseable-gps",
+            analysis_run_id,
+            proposal_id,
+        )
+        .await,
+        "already-has-gps"
+    );
+    let store = read_store(&state, "test.geo_apply.verify_unparseable_gps_sidecar").await;
+    assert!(
+        !store
+            .media_sidecar_gps_overlay(media_path)
+            .await
+            .expect("sidecar state should load")
+            .has_geo_location_properties,
+        "apply must not create a competing XMP sidecar location"
+    );
+    drop(store);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    geolocation_apply_does_not_shadow_unparseable_embedded_gps_impl,
+    geolocation_apply_does_not_shadow_unparseable_embedded_gps,
+    geolocation_apply_does_not_shadow_unparseable_embedded_gps_turso
 );
 
 #[tokio::test]

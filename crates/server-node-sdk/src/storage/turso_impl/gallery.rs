@@ -3595,6 +3595,7 @@ mod tests {
             codec_name: None,
             codec_fourcc: None,
             gps: None,
+            has_embedded_gps_properties: false,
             photo: None,
             thumbnail: None,
             source_size_bytes: 100,
