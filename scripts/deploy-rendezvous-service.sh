@@ -11,9 +11,17 @@ TARGET_TRIPLE="${IRONMESH_RENDEZVOUS_DEPLOY_TARGET:-${IRONMESH_RENDEZVOUS_TARGET
 REMOTE_DIR="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_DIR:-${IRONMESH_RENDEZVOUS_REMOTE_DIR:-}}"
 REMOTE_BINARY="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_BINARY:-${IRONMESH_RENDEZVOUS_REMOTE_BINARY:-}}"
 LEGACY_REMOTE_BINARY="${IRONMESH_RENDEZVOUS_DEPLOY_LEGACY_REMOTE_BINARY:-}"
+LEGACY_REMOTE_BINARY_IS_EXPLICIT=0
+if [[ -n "${IRONMESH_RENDEZVOUS_DEPLOY_LEGACY_REMOTE_BINARY:-}" ]]; then
+  LEGACY_REMOTE_BINARY_IS_EXPLICIT=1
+fi
 REMOTE_WORKDIR="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_WORKDIR:-${IRONMESH_RENDEZVOUS_REMOTE_WORKDIR:-}}"
 REMOTE_PIDFILE="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_PIDFILE:-${IRONMESH_RENDEZVOUS_REMOTE_PIDFILE:-}}"
 LEGACY_REMOTE_PIDFILE="${IRONMESH_RENDEZVOUS_DEPLOY_LEGACY_REMOTE_PIDFILE:-}"
+LEGACY_REMOTE_PIDFILE_IS_EXPLICIT=0
+if [[ -n "${IRONMESH_RENDEZVOUS_DEPLOY_LEGACY_REMOTE_PIDFILE:-}" ]]; then
+  LEGACY_REMOTE_PIDFILE_IS_EXPLICIT=1
+fi
 REMOTE_LOGFILE="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_LOGFILE:-${IRONMESH_RENDEZVOUS_REMOTE_LOGFILE:-}}"
 REMOTE_START_CMD="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_START_CMD:-${IRONMESH_RENDEZVOUS_REMOTE_START_CMD:-}}"
 REMOTE_MATCH_PATTERN="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_MATCH_PATTERN:-${IRONMESH_RENDEZVOUS_REMOTE_MATCH_PATTERN:-}}"
@@ -106,8 +114,9 @@ Notes:
   Deployments also update a sibling ironmesh-rendezvous-service symlink and
   stop its former pid file, allowing existing service definitions to transition
   to the BerryKeep binary without a coordinated remote edit.
-  Supplying --remote-match-pattern disables the inferred legacy paths so the
-  custom process-selection boundary remains authoritative.
+  Supplying --remote-match-pattern disables inferred legacy paths so the
+  custom process-selection boundary remains authoritative; explicitly
+  configured legacy paths remain in scope.
   Configure IRONMESH_RENDEZVOUS_PEER_URLS in the remote environment file when
   deploying a multi-rendezvous mesh so /control/mesh and client discovery can
   surface healthy peer rendezvous URLs.
@@ -377,9 +386,14 @@ resolve_remote_layout() {
 
   if [[ "$REMOTE_MATCH_PATTERN_IS_EXPLICIT" -eq 1 ]]; then
     # An operator-provided selector must bound every process and pid file this
-    # deployment touches, even if another instance uses the legacy layout.
-    LEGACY_REMOTE_BINARY=""
-    LEGACY_REMOTE_PIDFILE=""
+    # deployment touches. Retain only legacy locations explicitly supplied by
+    # the operator, which are intentionally part of that deployment boundary.
+    if [[ "$LEGACY_REMOTE_BINARY_IS_EXPLICIT" -eq 0 ]]; then
+      LEGACY_REMOTE_BINARY=""
+    fi
+    if [[ "$LEGACY_REMOTE_PIDFILE_IS_EXPLICIT" -eq 0 ]]; then
+      LEGACY_REMOTE_PIDFILE=""
+    fi
   fi
 
 }
