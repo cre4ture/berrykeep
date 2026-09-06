@@ -4,11 +4,15 @@ BerryKeep can be published from any static HTTPS web root as a small signed apt
 repository. The web server only hosts files; apt verifies the signed `Release`
 metadata and the package checksums inside that metadata.
 
-The default BerryKeep target retains the established URL:
+The primary BerryKeep repository URL is:
 
 ```bash
-https://creax.de/apt/ironmesh
+https://creax.de/apt/berrykeep
 ```
+
+The former `https://creax.de/apt/ironmesh` location is retained as a signed
+compatibility mirror. Existing clients can keep using it, but new
+installations should use the BerryKeep URL.
 
 ## Build packages
 
@@ -69,7 +73,7 @@ directory.
 export GPG_TTY="$(tty)"
 APT_REPO_SIGN_KEY=5D7762BDB9A2A564D500DE702A2E3C589C188616 \
   ./scripts/build-apt-repository.sh \
-    --import-remote creature@creax.de:/home/creature/html/apt/ironmesh
+    --import-remote creature@creax.de:/home/creature/html/apt/berrykeep
 ```
 
 The repository is created under `target/apt-repo` by default. If GPG needs the
@@ -87,7 +91,7 @@ Upload the generated repository to the dedicated web directory:
 The default deploy target is:
 
 ```bash
-creature@creax.de:/home/creature/html/apt/ironmesh
+creature@creax.de:/home/creature/html/apt/berrykeep
 ```
 
 The deploy script replaces metadata only for the suite being published and
@@ -150,10 +154,28 @@ export GPG_TTY="$(tty)"
 APT_REPO_SIGN_KEY=5D7762BDB9A2A564D500DE702A2E3C589C188616 \
   ./scripts/build-apt-repository.sh \
     --server-node-matrix server-node-debian-matrix.txt \
+    --import-remote creature@creax.de:/home/creature/html/apt/berrykeep
+
+./scripts/deploy-apt-repository.sh \
+  --server-node-matrix server-node-debian-matrix.txt
+```
+
+For the first publication at the BerryKeep path, import the old repository
+instead so the new archive starts with all existing packages. Then deploy the
+same signed repository to both locations:
+
+```bash
+APT_REPO_SIGN_KEY=5D7762BDB9A2A564D500DE702A2E3C589C188616 \
+  ./scripts/build-apt-repository.sh \
+    --server-node-matrix server-node-debian-matrix.txt \
     --import-remote creature@creax.de:/home/creature/html/apt/ironmesh
 
 ./scripts/deploy-apt-repository.sh \
   --server-node-matrix server-node-debian-matrix.txt
+./scripts/deploy-apt-repository.sh \
+  --server-node-matrix server-node-debian-matrix.txt \
+  --remote-dir /home/creature/html/apt/ironmesh \
+  --url https://creax.de/apt/ironmesh
 ```
 
 ## CI build, signing, and deployment
@@ -170,39 +192,53 @@ To enable the manual `publish` workflow-dispatch input, create a protected
 GitHub environment named `apt-repository` and configure its required review
 policy. In that environment, add these secrets:
 
-- `IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64`: base64-encoded exported private
+- `BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64`: base64-encoded exported private
   archive signing key.
-- `IRONMESH_APT_ARCHIVE_GPG_PASSPHRASE`: passphrase for that key.
-- `IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY`: deploy key for the static web host.
-- `IRONMESH_APT_REPOSITORY_KNOWN_HOSTS`: pinned `known_hosts` entry for the
+- `BERRYKEEP_APT_ARCHIVE_GPG_PASSPHRASE`: passphrase for that key.
+- `BERRYKEEP_APT_REPOSITORY_SSH_PRIVATE_KEY`: deploy key for the static web host.
+- `BERRYKEEP_APT_REPOSITORY_KNOWN_HOSTS`: pinned `known_hosts` entry for the
   deploy host.
 
 Add these environment variables:
 
-- `IRONMESH_APT_ARCHIVE_GPG_FINGERPRINT`: expected full signing-key fingerprint.
-- `IRONMESH_APT_REPOSITORY_REMOTE`: SSH target, such as `creature@creax.de`.
-- `IRONMESH_APT_REPOSITORY_REMOTE_DIR`: remote repository directory.
-- `IRONMESH_APT_REPOSITORY_URL`: public HTTPS repository URL.
+- `BERRYKEEP_APT_ARCHIVE_GPG_FINGERPRINT`: expected full signing-key fingerprint.
+- `BERRYKEEP_APT_REPOSITORY_REMOTE`: SSH target, such as `creature@creax.de`.
+- `BERRYKEEP_APT_REPOSITORY_REMOTE_DIR`: primary remote repository directory,
+  `/home/creature/html/apt/berrykeep`.
+- `BERRYKEEP_APT_REPOSITORY_URL`: primary public URL,
+  `https://creax.de/apt/berrykeep`.
+- `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE`: SSH target of the legacy
+  mirror, normally `creature@creax.de`.
+- `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE_DIR`: legacy mirror directory,
+  `/home/creature/html/apt/ironmesh`.
+- `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_URL`: legacy mirror URL,
+  `https://creax.de/apt/ironmesh`.
 
 The publish job imports the private key into a fresh temporary keyring,
-confirms its fingerprint, and runs the same matrix signing and deployment
-scripts shown above. It is restricted to a manual run from `main` and the
-protected environment; it never exposes signing or SSH secrets to a pull
-request.
+confirms its fingerprint, imports the primary archive, and deploys identical
+signed metadata to the primary and compatibility locations. Seed the primary
+archive from the legacy repository once with the migration commands above
+before enabling CI publishing. The job is restricted to a manual run from
+`main` and the protected environment; it never exposes signing or SSH secrets
+to a pull request.
 
 ## Verify the published repository
 
 After publishing, check that the signed metadata and package index are visible:
 
 ```bash
-curl -fsSL https://creax.de/apt/ironmesh/dists/noble/InRelease | gpg --verify
-curl -fsSL https://creax.de/apt/ironmesh/dists/noble/main/binary-amd64/Packages.gz \
+curl -fsSL https://creax.de/apt/berrykeep/dists/noble/InRelease | gpg --verify
+curl -fsSL https://creax.de/apt/berrykeep/dists/noble/main/binary-amd64/Packages.gz \
   | gzip -dc \
   | grep '^Package: '
-curl -fsSL https://creax.de/apt/ironmesh/dists/focal/InRelease | gpg --verify
-curl -fsSL https://creax.de/apt/ironmesh/dists/focal/main/binary-arm64/Packages.gz \
+curl -fsSL https://creax.de/apt/berrykeep/dists/focal/InRelease | gpg --verify
+curl -fsSL https://creax.de/apt/berrykeep/dists/focal/main/binary-arm64/Packages.gz \
   | gzip -dc \
   | grep '^Package: '
+
+# Existing Ironmesh clients continue to receive the same signed metadata.
+cmp <(curl -fsSL https://creax.de/apt/berrykeep/dists/noble/InRelease) \
+  <(curl -fsSL https://creax.de/apt/ironmesh/dists/noble/InRelease)
 ```
 
 ## Client setup
@@ -210,30 +246,30 @@ curl -fsSL https://creax.de/apt/ironmesh/dists/focal/main/binary-arm64/Packages.
 Install the repository key into apt's keyring directory:
 
 ```bash
-curl -fsSL https://creax.de/apt/ironmesh/berrykeep-archive-keyring.asc \
+curl -fsSL https://creax.de/apt/berrykeep/berrykeep-archive-keyring.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/berrykeep-archive-keyring.gpg
 ```
 
 Add exactly one apt source, matching the distribution suite and architecture of
-the host. Keep the established `ironmesh.list` filename so this replaces an
-existing source entry instead of creating a duplicate:
+the host. New installations use `berrykeep.list`; existing clients can retain
+their `ironmesh.list` source because the legacy URL is a compatibility mirror:
 
 ```bash
 # Ubuntu 20.04 ARM64
-echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh focal main' \
-  | sudo tee /etc/apt/sources.list.d/ironmesh.list
+echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/berrykeep focal main' \
+  | sudo tee /etc/apt/sources.list.d/berrykeep.list
 ```
 
 ```bash
 # Ubuntu 24.04 AMD64
-echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh noble main' \
-  | sudo tee /etc/apt/sources.list.d/ironmesh.list
+echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/berrykeep noble main' \
+  | sudo tee /etc/apt/sources.list.d/berrykeep.list
 ```
 
 ```bash
 # Debian Trixie ARM64 / Raspberry Pi OS based on Trixie
-echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh trixie main' \
-  | sudo tee /etc/apt/sources.list.d/ironmesh.list
+echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/berrykeep trixie main' \
+  | sudo tee /etc/apt/sources.list.d/berrykeep.list
 ```
 
 Install or update packages through apt:
