@@ -1,12 +1,16 @@
 # Ubuntu PPA Packaging
 
 This repository contains Debian packaging metadata under `debian/` for a
-single source package that builds four installable packages:
+single source package that builds four primary BerryKeep packages:
 
 - `berrykeep-server-node`
 - `berrykeep-server-node-map-tools`
 - `berrykeep-client`
 - `berrykeep-rendezvous-service`
+
+It also builds four `ironmesh-*` transition packages with matching package
+roles. They depend on the BerryKeep packages so existing installations upgrade
+without changing their installed package names first.
 
 ## First-release install and update strategy
 
