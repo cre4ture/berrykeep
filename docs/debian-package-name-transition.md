@@ -23,3 +23,7 @@ New installations should install a `berrykeep-*` package and configure its
 systemd unit. Do not remove a transitional package from an upgraded host until
 its service has been intentionally migrated to the new configuration and state
 paths.
+
+The client package installs its executable payload under
+`/usr/lib/berrykeep-client`; the public `berrykeep` and legacy `ironmesh`
+commands remain available in `/usr/bin` during the transition.

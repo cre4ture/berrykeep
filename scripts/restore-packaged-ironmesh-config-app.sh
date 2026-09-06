@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PACKAGE_ROOT="/usr/lib/ironmesh-client"
+PACKAGE_ROOT="/usr/lib/berrykeep-client"
 PACKAGED_BINARY="${PACKAGE_ROOT}/berrykeep-config-app"
 PACKAGED_BACKUP="${PACKAGE_ROOT}/berrykeep-config-app.packaged-deb"
 

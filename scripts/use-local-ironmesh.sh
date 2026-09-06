@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACKAGE_ROOT="/usr/lib/ironmesh-client"
+PACKAGE_ROOT="/usr/lib/berrykeep-client"
 PACKAGED_BINARY="${PACKAGE_ROOT}/berrykeep"
 PACKAGED_BACKUP="${PACKAGE_ROOT}/berrykeep.packaged-deb"
 DEFAULT_PROFILE="release"
@@ -29,7 +29,7 @@ Environment:
 
 Notes:
   The packaged binary is backed up once at:
-    /usr/lib/ironmesh-client/berrykeep.packaged-deb
+    /usr/lib/berrykeep-client/berrykeep.packaged-deb
 
 Examples:
   scripts/use-local-ironmesh.sh

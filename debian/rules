@@ -54,7 +54,7 @@ CLANGXX_BIN := $(firstword $(wildcard /usr/bin/clang++))
 export CC := $(CLANG_BIN)
 export CXX := $(CLANGXX_BIN)
 
-CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/berrykeep-client/usr/lib/ironmesh-client
+CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/berrykeep-client/usr/lib/berrykeep-client
 CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
 
 %:
@@ -211,21 +211,21 @@ ifeq ($(SERVER_NODE_ONLY),)
 		$(CLIENT_EXTENSION_ROOT)/stylesheet.css
 
 	install -d $(CURDIR)/debian/berrykeep-client/usr/bin
-	ln -sf ../lib/ironmesh-client/berrykeep \
+	ln -sf ../lib/berrykeep-client/berrykeep \
 		$(CURDIR)/debian/berrykeep-client/usr/bin/berrykeep
-	ln -sf ../lib/ironmesh-client/berrykeep-config-app \
+	ln -sf ../lib/berrykeep-client/berrykeep-config-app \
 		$(CURDIR)/debian/berrykeep-client/usr/bin/berrykeep-config-app
-	ln -sf ../lib/ironmesh-client/berrykeep-folder-agent \
+	ln -sf ../lib/berrykeep-client/berrykeep-folder-agent \
 		$(CURDIR)/debian/berrykeep-client/usr/bin/berrykeep-folder-agent
-	ln -sf ../lib/ironmesh-client/berrykeep-os-integration \
+	ln -sf ../lib/berrykeep-client/berrykeep-os-integration \
 		$(CURDIR)/debian/berrykeep-client/usr/bin/berrykeep-os-integration
-	ln -sf ../lib/ironmesh-client/ironmesh \
+	ln -sf ../lib/berrykeep-client/ironmesh \
 		$(CURDIR)/debian/berrykeep-client/usr/bin/ironmesh
-	ln -sf ../lib/ironmesh-client/ironmesh-config-app \
+	ln -sf ../lib/berrykeep-client/ironmesh-config-app \
 		$(CURDIR)/debian/berrykeep-client/usr/bin/ironmesh-config-app
-	ln -sf ../lib/ironmesh-client/ironmesh-folder-agent \
+	ln -sf ../lib/berrykeep-client/ironmesh-folder-agent \
 		$(CURDIR)/debian/berrykeep-client/usr/bin/ironmesh-folder-agent
-	ln -sf ../lib/ironmesh-client/ironmesh-os-integration \
+	ln -sf ../lib/berrykeep-client/ironmesh-os-integration \
 		$(CURDIR)/debian/berrykeep-client/usr/bin/ironmesh-os-integration
 
 	install -d $(CURDIR)/debian/berrykeep-client/usr/share/applications
