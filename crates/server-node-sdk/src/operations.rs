@@ -1652,7 +1652,7 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
                     // derived run counter in batches so a large apply does
                     // not acquire the global store write lock twice for
                     // every sidecar update.
-                    if selected_count % MULTIMEDIA_OPERATION_BATCH_SIZE == 0 {
+                    if selected_count.is_multiple_of(MULTIMEDIA_OPERATION_BATCH_SIZE) {
                         persist_operation_run(&state, &run).await?;
                     }
                     tokio::task::yield_now().await;
