@@ -7055,6 +7055,18 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
     assert_eq!(deleted_entry.restore_source_path, "deleted.txt");
     assert_eq!(deleted_entry.restore_version_id, deleted.version_id);
     assert_eq!(deleted_entry.moved_to_path, None);
+    let historical_descriptor = store
+        .describe_history_object(
+            &deleted_entry.restore_source_object_id,
+            &deleted_entry.restore_source_path,
+            &deleted_entry.restore_version_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        historical_descriptor.total_size_bytes,
+        b"deleted payload".len()
+    );
     assert!(
         history.iter().all(|entry| entry.path != "recreated.txt"),
         "current paths must not be exposed as recoverable history"

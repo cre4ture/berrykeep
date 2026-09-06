@@ -3537,6 +3537,18 @@ impl StoreHistoryInspector {
             .await
     }
 
+    pub(crate) async fn history_source_manifest_hash(
+        &self,
+        source_object_id: &str,
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .version_restore_source_from_object_id(source_object_id, source_path, version_id)
+            .await?
+            .map(|source| source.manifest_hash))
+    }
+
     /// Resolves a historical restore batch without holding the main store lock.
     /// The history listing supplies the immutable source object id, so each
     /// restore resolves exactly one version index instead of scanning metadata.
@@ -7975,6 +7987,34 @@ impl PersistentStore {
         let manifest_hash = self
             .resolve_manifest_hash_for_key(key, snapshot_id, version_id, read_mode)
             .await?;
+        let Some(manifest) = self
+            .load_manifest_by_hash(&manifest_hash)
+            .await
+            .map_err(StoreReadError::Internal)?
+        else {
+            return Err(StoreReadError::Corrupt(format!(
+                "manifest missing for hash={manifest_hash}"
+            )));
+        };
+
+        Ok(ObjectReadDescriptor {
+            manifest_hash,
+            total_size_bytes: manifest.total_size_bytes,
+        })
+    }
+
+    pub async fn describe_history_object(
+        &self,
+        source_object_id: &str,
+        source_path: &str,
+        version_id: &str,
+    ) -> std::result::Result<ObjectReadDescriptor, StoreReadError> {
+        let manifest_hash = self
+            .store_history_inspector()
+            .history_source_manifest_hash(source_object_id, source_path, version_id)
+            .await
+            .map_err(StoreReadError::Internal)?
+            .ok_or(StoreReadError::NotFound)?;
         let Some(manifest) = self
             .load_manifest_by_hash(&manifest_hash)
             .await

@@ -17860,6 +17860,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
         super::ObjectGetQuery {
             snapshot: None,
             version: None,
+            object_id: None,
             read_mode: None,
         },
         &HeaderMap::new(),
@@ -18028,6 +18029,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -18057,6 +18059,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -18865,6 +18868,7 @@ async fn get_object_admin_returns_bytes_with_admin_token_impl(backend: MainTestB
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -18907,6 +18911,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -18938,6 +18943,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -18974,6 +18980,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )

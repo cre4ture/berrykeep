@@ -817,6 +817,7 @@ struct WebStoreGetQuery {
     key: String,
     snapshot: Option<String>,
     version: Option<String>,
+    object_id: Option<String>,
     preview_bytes: Option<usize>,
 }
 
@@ -3352,8 +3353,27 @@ async fn web_store_get(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
+    let source_object_id = query.object_id.as_deref().map(str::trim);
+    if source_object_id.is_some_and(str::is_empty)
+        || (source_object_id.is_some() && query.snapshot.is_some())
+        || (source_object_id.is_some() && query.version.is_none())
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "object_id requires a version and cannot be combined with a snapshot",
+        );
+    }
+
     let client = current_client(&state).await;
-    let payload_result = if query.snapshot.is_none() && query.version.is_none() {
+    let payload_result = if let Some(object_id) = source_object_id {
+        client
+            .get_history_source_version(
+                &query.key,
+                object_id,
+                query.version.as_deref().expect("checked above"),
+            )
+            .await
+    } else if query.snapshot.is_none() && query.version.is_none() {
         client.get_cached_or_fetch(&query.key).await
     } else {
         client

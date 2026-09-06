@@ -32,8 +32,21 @@ export function ExplorerPage() {
     [adminTokenOverride]
   );
   const readValue = useCallback(
-    (key: string, snapshotId: string | null, versionId: string | null, previewBytes: number) =>
-      getAdminStoreValue(key, snapshotId, versionId, previewBytes, adminTokenOverride),
+    (
+      key: string,
+      snapshotId: string | null,
+      versionId: string | null,
+      previewBytes: number,
+      sourceObjectId?: string | null
+    ) =>
+      getAdminStoreValue(
+        key,
+        snapshotId,
+        versionId,
+        previewBytes,
+        adminTokenOverride,
+        sourceObjectId
+      ),
     [adminTokenOverride]
   );
   const loadVersions = useCallback(

@@ -485,7 +485,8 @@ export async function getStoreValue(
   key: string,
   snapshot?: string | null,
   version?: string | null,
-  previewBytes?: number | null
+  previewBytes?: number | null,
+  sourceObjectId?: string | null
 ): Promise<StoreGetResponse> {
   const query = new URLSearchParams({ key });
   if (snapshot?.trim()) {
@@ -493,6 +494,9 @@ export async function getStoreValue(
   }
   if (version?.trim()) {
     query.set("version", version.trim());
+  }
+  if (sourceObjectId?.trim()) {
+    query.set("object_id", sourceObjectId.trim());
   }
   if (previewBytes && previewBytes > 0) {
     query.set("preview_bytes", String(Math.floor(previewBytes)));

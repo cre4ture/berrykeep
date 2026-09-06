@@ -13310,6 +13310,7 @@ async fn list_snapshots_response(state: &ServerState) -> Response {
 struct ObjectGetQuery {
     snapshot: Option<String>,
     version: Option<String>,
+    object_id: Option<String>,
     read_mode: Option<String>,
 }
 
@@ -20097,16 +20098,34 @@ async fn get_object_response(
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
 
+    let history_source_object_id = query.object_id.as_deref().map(str::trim);
+    if history_source_object_id.is_some_and(str::is_empty)
+        || (history_source_object_id.is_some() && query.snapshot.is_some())
+        || (history_source_object_id.is_some() && query.version.is_none())
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     let descriptor = {
         let store = read_store(state, "object_read.describe").await;
-        store
-            .describe_object(
-                key,
-                query.snapshot.as_deref(),
-                query.version.as_deref(),
-                read_mode,
-            )
-            .await
+        if let Some(object_id) = history_source_object_id {
+            store
+                .describe_history_object(
+                    object_id,
+                    key,
+                    query.version.as_deref().expect("checked above"),
+                )
+                .await
+        } else {
+            store
+                .describe_object(
+                    key,
+                    query.snapshot.as_deref(),
+                    query.version.as_deref(),
+                    read_mode,
+                )
+                .await
+        }
     };
 
     let descriptor = match descriptor {

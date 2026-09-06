@@ -186,7 +186,8 @@ export type ExplorerSurfaceProps = {
     key: string,
     snapshotId: string | null,
     versionId: string | null,
-    previewBytes: number
+    previewBytes: number,
+    sourceObjectId?: string | null
   ) => Promise<ExplorerValueResponse | Record<string, unknown>>;
   getDownloadUrl?: (
     key: string,
@@ -407,8 +408,9 @@ export function ExplorerSurface({
 
   async function readHistoricalEntry(entry: ExplorerEntry) {
     const restoreSourcePath = entry.restore_source_path?.trim();
+    const restoreSourceObjectId = entry.restore_source_object_id?.trim();
     const restoreVersionId = entry.restore_version_id?.trim();
-    if (!restoreSourcePath || !restoreVersionId) {
+    if (!restoreSourcePath || !restoreSourceObjectId || !restoreVersionId) {
       setError("This historical entry does not include a recoverable version.");
       return;
     }
@@ -416,7 +418,13 @@ export function ExplorerSurface({
     setLoading(`read-history:${entry.path}`);
     setError(null);
     try {
-      const payload = await readValue(restoreSourcePath, null, restoreVersionId, previewBytes);
+      const payload = await readValue(
+        restoreSourcePath,
+        null,
+        restoreVersionId,
+        previewBytes,
+        restoreSourceObjectId
+      );
       setSelectedPayload(payload);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Failed reading historical object");

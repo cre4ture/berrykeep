@@ -3143,6 +3143,7 @@ async fn get_or_head_object_response(
         ObjectGetQuery {
             snapshot: None,
             version: resolved_version_id.clone(),
+            object_id: None,
             read_mode: None,
         },
         &headers,

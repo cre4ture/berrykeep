@@ -457,7 +457,8 @@ export async function getAdminStoreValue(
   snapshot?: string | null,
   version?: string | null,
   previewBytes?: number | null,
-  adminTokenOverride?: string
+  adminTokenOverride?: string,
+  sourceObjectId?: string | null
 ): Promise<AdminStoreGetResponse> {
   const headers = new Headers(buildAdminHeaders(adminTokenOverride));
   const previewLimit =
@@ -468,7 +469,11 @@ export async function getAdminStoreValue(
     headers.set("range", `bytes=0-${previewLimit - 1}`);
   }
 
-  const response = await fetch(getAdminStoreDownloadUrl(key, snapshot, version), {
+  const downloadUrl = getAdminStoreDownloadUrl(key, snapshot, version);
+  const sourceObjectQuery = sourceObjectId?.trim()
+    ? `${downloadUrl.includes("?") ? "&" : "?"}object_id=${encodeURIComponent(sourceObjectId.trim())}`
+    : "";
+  const response = await fetch(`${downloadUrl}${sourceObjectQuery}`, {
     credentials: "same-origin",
     cache: "no-store",
     headers

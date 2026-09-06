@@ -1897,6 +1897,41 @@ test("client-ui explorer refreshes history after navigation", async ({ page }) =
   await expect(page.getByText("Loading historical entries…")).toBeHidden();
 });
 
+test("client-ui explorer reads historical entries by source object ID", async ({ page }) => {
+  let historicalReadQuery: URLSearchParams | null = null;
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (
+      url.pathname === apiV1("/store/get") &&
+      url.searchParams.get("object_id") === "object-deleted-001"
+    ) {
+      historicalReadQuery = url.searchParams;
+    }
+  });
+
+  await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted-001",
+        restore_version_id: "version-deleted-001",
+        removed_at_unix: 1_712_345_600
+      }
+    ]
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  const row = page.getByRole("cell", { name: "deleted.txt", exact: true }).locator("..");
+  await row.getByRole("button", { name: "Read", exact: true }).click();
+
+  await expect.poll(() => historicalReadQuery?.get("key")).toBe("deleted.txt");
+  expect(historicalReadQuery?.get("version")).toBe("version-deleted-001");
+  expect(historicalReadQuery?.get("object_id")).toBe("object-deleted-001");
+});
+
 test("client-ui explorer only caps depth for historical entries", async ({ page }) => {
   const currentDepths: string[] = [];
   const historyDepths: string[] = [];

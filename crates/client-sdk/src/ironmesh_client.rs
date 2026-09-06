@@ -5432,6 +5432,37 @@ impl IronMeshClient {
         Ok(response.body)
     }
 
+    pub async fn get_history_source_version(
+        &self,
+        key: impl AsRef<str>,
+        source_object_id: &str,
+        version: &str,
+    ) -> Result<Bytes> {
+        let key = key.as_ref();
+        let source_object_id = source_object_id.trim();
+        let version = version.trim();
+        if source_object_id.is_empty() || version.is_empty() {
+            bail!("history source object id and version must not be empty");
+        }
+        let mut url = self.store_key_url(key)?;
+        append_optional_query(&mut url, "object_id", Some(source_object_id));
+        append_optional_query(&mut url, "version", Some(version));
+
+        let routed = self
+            .execute_buffered_request_with_route(Method::GET, url, Vec::new(), None)
+            .await
+            .map_err(|error| anyhow!("failed to GET historical object key={key}: {error:#}"))?;
+        let endpoint_context = routed.endpoint_context;
+        let response = routed.response;
+        if !response.status.is_success() {
+            bail!(
+                "historical object not found or inaccessible key={key}: {} ({endpoint_context})",
+                response.status,
+            );
+        }
+        Ok(response.body)
+    }
+
     pub async fn rename_path(
         &self,
         from_path: impl Into<String>,

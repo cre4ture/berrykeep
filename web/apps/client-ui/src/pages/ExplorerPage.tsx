@@ -32,8 +32,13 @@ export function ExplorerPage({ queueFilesToPrefix, onOpenStore }: ExplorerPagePr
     []
   );
   const readValue = useCallback(
-    (key: string, snapshotId: string | null, versionId: string | null, previewBytes: number) =>
-      getStoreValue(key, snapshotId, versionId, previewBytes),
+    (
+      key: string,
+      snapshotId: string | null,
+      versionId: string | null,
+      previewBytes: number,
+      sourceObjectId?: string | null
+    ) => getStoreValue(key, snapshotId, versionId, previewBytes, sourceObjectId),
     []
   );
   const queueFiles = useCallback(
