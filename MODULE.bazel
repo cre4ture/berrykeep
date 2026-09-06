@@ -12,8 +12,19 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_rust", version = "0.71.3")
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+# Keep the C++ compiler driver so it supplies the host system-library paths,
+# but use the LLD bundled with the Rust toolchain for Linux x86_64 link steps.
+# `RUST_SYSROOT` is expanded by rules_rust when it creates each toolchain.
+rust_lld_link_args = {
+    "x86_64-unknown-linux-gnu": [
+        "--codegen=link-arg=-B$(RUST_SYSROOT)/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld",
+        "--codegen=link-arg=-fuse-ld=lld",
+    ],
+}
 rust.toolchain(
     edition = "2024",
+    extra_exec_rustc_flags_triples = rust_lld_link_args,
+    extra_rustc_flags_triples = rust_lld_link_args,
     versions = ["1.89.0"],
 )
 use_repo(rust, "rust_toolchains")
