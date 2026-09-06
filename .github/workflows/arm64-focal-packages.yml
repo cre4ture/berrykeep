@@ -26,13 +26,27 @@ permissions:
   contents: read
 
 jobs:
-  build-static-arm64-server-node:
-    name: Static Server Node (arm64)
+  build-static-server-node:
+    name: Static Server Node (${{ matrix.architecture }})
     # Package builds are intentionally opt-in on pull requests. Pushes to main
     # and manual runs always build the complete portable package matrix.
     if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:debian-packages') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            rust_target: aarch64-unknown-linux-musl
+            variant_id: aarch64-generic
+            run_smoke: never
+            rust_cache_key: static-server-node-aarch64
+          - architecture: amd64
+            rust_target: x86_64-unknown-linux-musl
+            variant_id: x86_64-generic
+            run_smoke: always
+            rust_cache_key: static-server-node-x86-64
 
     steps:
       - name: Checkout
@@ -63,7 +77,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            binutils file qemu-user-static xz-utils
+            binutils file xz-utils
+
+      - name: Install QEMU for the AArch64 smoke test
+        if: ${{ matrix.architecture == 'arm64' }}
+        run: sudo apt-get install -y --no-install-recommends qemu-user-static
 
       - name: Restore Zig toolchain cache
         id: restore-zig
@@ -75,17 +93,18 @@ jobs:
       - name: Cache static Server Node Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: static-server-node-aarch64
+          shared-key: ${{ matrix.rust_cache_key }}
           save-if: ${{ github.event_name != 'pull_request' }}
 
-      - name: Build and verify static AArch64 Server Node on x86_64
+      - name: Build and verify static ${{ matrix.architecture }} Server Node
         run: |
           ./scripts/build-static-server-node.sh \
-            --target aarch64-unknown-linux-musl \
-            --variant-id aarch64-generic \
-            --run-smoke never
+            --target ${{ matrix.rust_target }} \
+            --variant-id ${{ matrix.variant_id }} \
+            --run-smoke ${{ matrix.run_smoke }}
 
       - name: Run the AArch64 Server Node version smoke test under QEMU
+        if: ${{ matrix.architecture == 'arm64' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -99,16 +118,16 @@ jobs:
           qemu-aarch64-static "$binary" --version
 
       - name: Save Zig toolchain cache
-        if: ${{ github.event_name != 'pull_request' && steps.restore-zig.outputs.cache-hit != 'true' }}
+        if: ${{ github.event_name != 'pull_request' && matrix.architecture == 'arm64' && steps.restore-zig.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: ~/.cache/ironmesh-build-tools
           key: ${{ steps.restore-zig.outputs.cache-primary-key }}
 
-      - name: Upload portable AArch64 Server Node
+      - name: Upload portable ${{ matrix.architecture }} Server Node
         uses: actions/upload-artifact@v4
         with:
-          name: static-server-node-linux-arm64
+          name: static-server-node-linux-${{ matrix.architecture }}
           path: |
             target/static-server-node/*.tar.gz
             target/static-server-node/*.tar.gz.sha256
@@ -116,7 +135,7 @@ jobs:
 
   build-server-node-debian-package:
     name: ${{ matrix.check_name }}
-    needs: build-static-arm64-server-node
+    needs: build-static-server-node
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -131,6 +150,18 @@ jobs:
             architecture: arm64
             image: debian:trixie
             check_name: Trixie A64
+          - suite: focal
+            architecture: amd64
+            image: ubuntu:20.04
+            check_name: Focal AMD64
+          - suite: trixie
+            architecture: amd64
+            image: debian:trixie
+            check_name: Trixie AMD64
+          - suite: noble
+            architecture: amd64
+            image: ubuntu:24.04
+            check_name: Noble AMD64
 
     steps:
       - name: Checkout
@@ -139,7 +170,7 @@ jobs:
       - name: Download verified static Server Node
         uses: actions/download-artifact@v4
         with:
-          name: static-server-node-linux-arm64
+          name: static-server-node-linux-${{ matrix.architecture }}
           path: ${{ runner.temp }}/static-server-node
 
       - name: Build ${{ matrix.suite }} ${{ matrix.architecture }} package wrapper
@@ -168,7 +199,7 @@ jobs:
                     binutils python3 tar gzip
                   apt-get install -y --no-install-recommends -t focal-backports debhelper
                   ;;
-                trixie)
+                trixie|noble)
                   apt-get update
                   apt-get install -y --no-install-recommends \
                     build-essential ca-certificates debhelper dh-sysuser git \

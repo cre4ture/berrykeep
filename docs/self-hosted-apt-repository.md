@@ -112,6 +112,9 @@ spaces:
 # suite  architecture  package path
 focal  arm64  packages/focal/ironmesh-server-node_1.1.0-1~repo2~focal.1_arm64.deb
 trixie arm64  packages/trixie/ironmesh-server-node_1.1.0-1~repo2~trixie.1_arm64.deb
+focal  amd64  packages/focal/ironmesh-server-node_1.1.0-1~repo2~focal.1_amd64.deb
+trixie amd64  packages/trixie/ironmesh-server-node_1.1.0-1~repo2~trixie.1_amd64.deb
+noble  amd64  packages/noble/ironmesh-server-node_1.1.0-1~repo2~noble.1_amd64.deb
 ```
 
 The same matrix drives signing and deployment. The repository builder imports
@@ -152,11 +155,13 @@ APT_REPO_SIGN_KEY=5D7762BDB9A2A564D500DE702A2E3C589C188616 \
 
 ## CI build, signing, and deployment
 
-`Server Node Debian packages` runs the `focal/arm64` and `trixie/arm64` matrix
-entirely on x86 GitHub-hosted runners. It cross-builds the static AArch64
-binary once with Zig, verifies its artifact metadata in each suite container,
-and uploads the resulting server-only packages. Pull requests receive no
-deployment credentials and must opt in with the `ci:debian-packages` label.
+`Server Node Debian packages` runs the `focal/arm64`, `trixie/arm64`,
+`focal/amd64`, `trixie/amd64`, and `noble/amd64` matrix entirely on x86
+GitHub-hosted runners. It cross-builds the static AArch64 binary once with Zig
+and builds the static AMD64 binary once with the same verified artifact
+pipeline. Each suite container verifies its matching artifact metadata and
+uploads the resulting server-only package. Pull requests receive no deployment
+credentials and must opt in with the `ci:debian-packages` label.
 
 To enable the manual `publish` workflow-dispatch input, create a protected
 GitHub environment named `apt-repository` and configure its required review

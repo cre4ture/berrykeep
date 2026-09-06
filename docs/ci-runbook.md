@@ -281,19 +281,21 @@ interpreter or `DT_NEEDED` entry, executes the binary, and uploads
 `static-server-node-linux-amd64` with checksums and build metadata.
 
 The `Server Node Debian packages` workflow builds
-`aarch64-unknown-linux-musl` once with Zig on an x86_64 runner, validates the
-static artifact, and runs its `--version` smoke test under QEMU. Its
-`Focal A64` and `Trixie A64` package matrix entries each verify that artifact
-inside the target distribution container and use
+`aarch64-unknown-linux-musl` and `x86_64-unknown-linux-musl` once each with
+Zig on an x86_64 runner. It validates both static artifacts and runs the
+AArch64 `--version` smoke test under QEMU. Its `Focal A64`, `Trixie A64`,
+`Focal AMD64`, `Trixie AMD64`, and `Noble AMD64` package matrix entries each
+verify the matching artifact inside the target distribution container and use
 `build-local-debs.sh --server-node-only --static-server-node-artifact` to
 assemble only the portable `ironmesh-server-node` package. They do not compile
-or execute the AArch64 binary in the distribution container.
+or execute a target binary in the distribution container.
 
 On pull requests, add the `ci:debian-packages` label to run the Focal/Trixie
-ARM64 Server Node matrix and the AMD64 binary-package handoff. `Linux binaries`
-builds the AMD64 non-server bundle, and `Debian packages` combines it with the
-static Server Node to produce the complete AMD64 package set. The ARM64 matrix
-produces only `ironmesh-server-node` for each target suite.
+ARM64 and Focal/Trixie/Noble AMD64 Server Node matrices, plus the existing
+AMD64 binary-package handoff. `Linux binaries` builds the AMD64 non-server
+bundle, and `Debian packages` combines it with the static Server Node to
+produce the complete AMD64 package set. The Server Node matrix produces only
+`ironmesh-server-node` for each target suite.
 
 For a local static build, install the web workspace dependencies and ELF tools,
 then run:
