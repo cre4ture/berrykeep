@@ -3,6 +3,17 @@ use time::{Date, Month, PrimitiveDateTime, Time};
 
 use super::FileVersionIndex;
 
+/// Timestamp parsed from a media filename.
+///
+/// Gallery ordering may use a date-only name as midnight, but callers that
+/// infer and persist metadata need to distinguish that synthetic fallback from
+/// a filename that actually supplied a time of day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FilenameCaptureTime {
+    pub(crate) unix: u64,
+    pub(crate) has_time_of_day: bool,
+}
+
 pub(crate) fn effective_gallery_captured_at_unix(
     key: &str,
     metadata_status: Option<&str>,
@@ -44,10 +55,11 @@ pub(crate) fn version_created_at_unix_from_payload(
     Ok(version_created_at_unix(&index, manifest_hash))
 }
 
-/// Parses common camera filename timestamps. The filename carries no timezone,
-/// so consumers that need temporal inference must treat this as floating local
-/// time rather than as UTC despite this stable numeric representation.
-pub(crate) fn filename_captured_at_unix(key: &str) -> Option<u64> {
+/// Parses common camera filename timestamps without discarding their precision.
+/// The filename carries no timezone, so consumers that need temporal inference
+/// must treat this as floating local time rather than as UTC despite this
+/// stable numeric representation.
+pub(crate) fn filename_capture_time(key: &str) -> Option<FilenameCaptureTime> {
     let filename = key.rsplit('/').next().unwrap_or(key);
     let stem = filename
         .rsplit_once('.')
@@ -68,15 +80,28 @@ pub(crate) fn filename_captured_at_unix(key: &str) -> Option<u64> {
         parse_compact_date(bytes, start)
             .or_else(|| parse_separated_date(bytes, start))
             .and_then(|(date, end)| {
-                let time = parse_time_after_date(bytes, end).unwrap_or(Time::MIDNIGHT);
-                u64::try_from(
-                    PrimitiveDateTime::new(date, time)
+                let parsed_time = parse_time_after_date(bytes, end);
+                let unix = u64::try_from(
+                    PrimitiveDateTime::new(date, parsed_time.unwrap_or(Time::MIDNIGHT))
                         .assume_utc()
                         .unix_timestamp(),
                 )
-                .ok()
+                .ok()?;
+                Some(FilenameCaptureTime {
+                    unix,
+                    has_time_of_day: parsed_time.is_some(),
+                })
             })
     })
+}
+
+/// Parses common camera filename timestamps for gallery ordering.
+///
+/// A date-only name deliberately maps to midnight here, preserving the
+/// existing deterministic gallery sort order. Metadata-inference callers must
+/// use [`filename_capture_time`] and require `has_time_of_day` instead.
+pub(crate) fn filename_captured_at_unix(key: &str) -> Option<u64> {
+    filename_capture_time(key).map(|capture_time| capture_time.unix)
 }
 
 fn parse_compact_date(bytes: &[u8], start: usize) -> Option<(Date, usize)> {
@@ -201,6 +226,21 @@ mod tests {
                 "unexpected timestamp for {filename}"
             );
         }
+    }
+
+    #[test]
+    fn date_only_filename_capture_times_keep_their_missing_time_precision() {
+        let capture_time = filename_capture_time("IMG-20240304-WA0001.jpg")
+            .expect("the calendar date should be recognized");
+        assert_eq!(capture_time.unix, unix_timestamp((2024, 3, 4, 0, 0, 0)));
+        assert!(
+            !capture_time.has_time_of_day,
+            "gallery sorting may use midnight, but inference must not"
+        );
+
+        let precise_capture_time = filename_capture_time("IMG_20240304_050607.jpg")
+            .expect("the date and time should be recognized");
+        assert!(precise_capture_time.has_time_of_day);
     }
 
     #[test]

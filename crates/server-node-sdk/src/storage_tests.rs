@@ -8199,6 +8199,8 @@ async fn ensure_media_cache_generates_thumbnail_for_mp4_impl(backend: StorageTes
     assert_eq!(metadata.mime_type.as_deref(), Some("video/mp4"));
     assert_eq!(metadata.width, Some(1920));
     assert_eq!(metadata.height, Some(1080));
+    assert_eq!(metadata.taken_at_unix, Some(1_709_528_767));
+    assert_eq!(metadata.taken_at_timezone_known, Some(true));
     assert_eq!(metadata.date_encoded_unix, Some(1_709_528_767));
     assert_eq!(metadata.duration_millis, Some(42_125));
     assert_eq!(metadata.frame_rate_millihertz, Some(29_970));

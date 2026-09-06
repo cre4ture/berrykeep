@@ -34,7 +34,7 @@ use super::{
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
-pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 10;
+pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 11;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
 const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
 const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
@@ -1300,7 +1300,11 @@ async fn derive_video_media_cache(
             .as_ref()
             .and_then(|format| format.duration.as_deref())
             .and_then(parse_positive_f64);
-        let date_encoded_unix = probe
+        // QuickTime's creation_time is emitted by ffprobe as RFC 3339. Keep
+        // the legacy encoded-date projection, but also expose this embedded,
+        // offset-bearing media timestamp as taken_at so strict inference code
+        // never has to use date_encoded_unix as a capture-time fallback.
+        let embedded_capture_time_unix = probe
             .format
             .as_ref()
             .and_then(|format| format.tags.creation_time.as_deref())
@@ -1323,7 +1327,9 @@ async fn derive_video_media_cache(
             mime_type,
             width: stream.width,
             height: stream.height,
-            date_encoded_unix,
+            taken_at_unix: embedded_capture_time_unix,
+            taken_at_timezone_known: embedded_capture_time_unix.map(|_| true),
+            date_encoded_unix: embedded_capture_time_unix,
             duration_millis: duration_secs.and_then(seconds_to_millis),
             frame_rate_millihertz: stream
                 .avg_frame_rate

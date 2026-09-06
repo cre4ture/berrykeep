@@ -133,9 +133,7 @@ pub(crate) use data_scrub::DataScrubber;
 #[cfg(test)]
 pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
 pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
-pub(crate) use gallery_capture_time::{
-    effective_gallery_captured_at_unix, filename_captured_at_unix,
-};
+pub(crate) use gallery_capture_time::{effective_gallery_captured_at_unix, filename_capture_time};
 pub(super) use gallery_labels::{
     GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryLabelFilter,
     decode_gallery_labels, encode_gallery_labels, gallery_label_filter_matches,

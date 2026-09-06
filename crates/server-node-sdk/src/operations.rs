@@ -1705,11 +1705,13 @@ fn capture_time_for_geolocation(
             },
         });
     }
-    storage::filename_captured_at_unix(path).map(|unix| GeoCaptureTime {
-        unix,
-        source: GeoCaptureTimeSource::Filename,
-        basis: GeoCaptureTimeBasis::FloatingLocal,
-    })
+    storage::filename_capture_time(path)
+        .filter(|capture_time| capture_time.has_time_of_day)
+        .map(|capture_time| GeoCaptureTime {
+            unix: capture_time.unix,
+            source: GeoCaptureTimeSource::Filename,
+            basis: GeoCaptureTimeBasis::FloatingLocal,
+        })
 }
 
 #[cfg(test)]
@@ -2631,6 +2633,12 @@ mod tests {
             .expect("the filename timestamp is an allowed fallback");
         assert_eq!(fallback.source, GeoCaptureTimeSource::Filename);
         assert_eq!(fallback.basis, GeoCaptureTimeBasis::FloatingLocal);
+
+        assert_eq!(
+            capture_time_for_geolocation("trip/IMG-20240102-WA0001.jpg", &metadata),
+            None,
+            "a date-only filename has no safe time-of-day for geo inference"
+        );
 
         // `date_encoded_unix` is deliberately populated, yet a name without a
         // timestamp still cannot become time-usable for geo inference. Version
