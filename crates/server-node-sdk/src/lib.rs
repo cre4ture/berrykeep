@@ -14119,6 +14119,8 @@ struct ObjectLookupResponse {
     object_id: String,
     path: String,
     revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tombstone_predecessor_revision: Option<String>,
     entry_type: String,
 }
 
@@ -14597,12 +14599,21 @@ async fn get_object_by_id_response(state: &ServerState, object_id: &str) -> Resp
         } else {
             "key"
         };
+    let tombstone_predecessor_revision = (entry_type == "tombstone")
+        .then(|| {
+            preferred.and_then(|version| {
+                (version.parent_version_ids.len() == 1)
+                    .then(|| version.parent_version_ids[0].clone())
+            })
+        })
+        .flatten();
     (
         StatusCode::OK,
         Json(ObjectLookupResponse {
             object_id: summary.object_id,
             path: summary.key,
             revision: summary.preferred_head_version_id,
+            tombstone_predecessor_revision,
             entry_type: entry_type.to_string(),
         }),
     )

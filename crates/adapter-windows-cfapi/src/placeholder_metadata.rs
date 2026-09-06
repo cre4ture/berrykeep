@@ -33,6 +33,10 @@ pub struct RemoteObjectReconcileReport {
     pub conflicted_paths: BTreeSet<String>,
     pub preserved_paths: BTreeSet<String>,
     pub suppressed_startup_paths: BTreeSet<String>,
+    /// Object IDs whose identity lookup was inconclusive. Callers may use
+    /// this to request another reconciliation on their normal refresh
+    /// cadence; these IDs never authorize a local deletion.
+    pub unresolved_remote_object_ids: BTreeSet<String>,
     /// Stable object IDs observed before this reconciliation pass. Runtime
     /// action application reuses this inventory instead of opening every
     /// placeholder again solely to check for object-ID collisions.
@@ -46,18 +50,28 @@ pub struct ResolvedRemoteObject {
     pub revision: Option<String>,
 }
 
-/// The outcome of resolving a stable remote object identity.  An unavailable
-/// result is deliberately distinct from absence: reconciliation must retain
-/// the local placeholder when the server cannot confirm the current state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedRemoteTombstone {
+    /// The live revision the server tombstoned. A missing value is
+    /// non-destructive because it cannot satisfy the local revision guard.
+    pub predecessor_revision: Option<String>,
+}
+
+/// The outcome of resolving a stable remote object identity.
+///
+/// A tombstone is positive evidence that the remote object was deleted.
+/// `NotFound` and `Unavailable` are deliberately non-destructive: neither
+/// result authorizes removal of a local placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteObjectResolution {
     Present(ResolvedRemoteObject),
-    Absent,
+    Tombstone(ResolvedRemoteTombstone),
+    NotFound,
     Unavailable(String),
 }
 
 pub trait RemoteObjectResolver: Send + Sync {
-    fn resolve_object(&self, object_id: &str) -> Result<Option<ResolvedRemoteObject>>;
+    fn resolve_object(&self, object_id: &str) -> Result<RemoteObjectResolution>;
 
     /// Resolve a reconciliation batch once.  The default preserves adapters
     /// that only implement a single-object lookup; production resolvers can
@@ -70,8 +84,7 @@ pub trait RemoteObjectResolver: Send + Sync {
             .iter()
             .map(|object_id| {
                 let resolution = match self.resolve_object(object_id) {
-                    Ok(Some(remote)) => RemoteObjectResolution::Present(remote),
-                    Ok(None) => RemoteObjectResolution::Absent,
+                    Ok(resolution) => resolution,
                     Err(error) => RemoteObjectResolution::Unavailable(format!("{error:#}")),
                 };
                 (object_id.clone(), resolution)
@@ -414,77 +427,21 @@ pub fn reconcile_existing_placeholders(
 }
 
 /// Reconcile placeholders at startup using an object resolver to confirm
-/// deletions that happened while the adapter was offline.  Snapshot absence by
-/// itself remains non-authoritative: a placeholder is treated as a tombstone
-/// only when its stable object ID cannot be resolved and it has a known remote
-/// revision to compare before removal.
+/// deletions that happened while the adapter was offline. Snapshot absence by
+/// itself remains non-authoritative: only an identity lookup that returns a
+/// server tombstone may authorize removal.
 pub fn reconcile_existing_placeholders_with_resolver(
     sync_root_path: &Path,
     current_snapshot: &SyncSnapshot,
     provider_instance_id: Uuid,
     resolver: &dyn RemoteObjectResolver,
 ) -> Result<RemoteObjectReconcileReport> {
-    let remote_object_ids = current_snapshot
-        .remote
-        .iter()
-        .filter_map(|entry| nonempty(entry.object_id.as_deref()))
-        .collect::<BTreeSet<_>>();
-    let remote_by_object_id = unique_remote_files_by_object_id(current_snapshot);
-    let local_placeholders = scan_local_placeholders(sync_root_path);
-    let object_ids_to_resolve = local_placeholders
-        .unique
-        .iter()
-        .filter_map(|(object_id, local)| {
-            let remote_path_differs = remote_by_object_id.get(object_id).is_some_and(|remote| {
-                canonical_object_path(&remote.path) != canonical_object_path(&local.relative_path)
-            });
-            ((!remote_object_ids.contains(object_id.as_str()) || remote_path_differs)
-                && nonempty(local.identity.remote_version.as_deref()).is_some())
-            .then_some(object_id.clone())
-        })
-        .collect::<BTreeSet<_>>();
-    let resolved_objects = resolver.resolve_objects(&object_ids_to_resolve);
-    let tombstones = local_placeholders
-        .unique
-        .iter()
-        .filter_map(|(object_id, local)| {
-            if remote_object_ids.contains(object_id.as_str())
-                || nonempty(local.identity.remote_version.as_deref()).is_none()
-            {
-                return None;
-            }
-            match resolved_objects.get(object_id) {
-                Some(RemoteObjectResolution::Absent) => {
-                    let revision = local.identity.remote_version.as_deref()?;
-                    let mut previous = if local.full_path.is_dir() {
-                        sync_core::NamespaceEntry::directory(&local.relative_path)
-                    } else {
-                        sync_core::NamespaceEntry::file(&local.relative_path, revision, "")
-                    };
-                    previous.object_id = Some(object_id.clone());
-                    previous.version = Some(revision.to_string());
-                    Some(RemoteObjectChange::Deleted { previous })
-                }
-                Some(RemoteObjectResolution::Unavailable(error)) => {
-                    tracing::warn!(
-                        object_id,
-                        path = %local.relative_path,
-                        "startup deletion could not be confirmed by object ID: {error:#}"
-                    );
-                    None
-                }
-                Some(RemoteObjectResolution::Present(_)) | None => None,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    Ok(reconcile_remote_object_state_best_effort_with_resolutions(
+    Ok(reconcile_remote_object_state_best_effort(
         sync_root_path,
         current_snapshot,
-        &tombstones,
+        &[],
         provider_instance_id,
         Some(resolver),
-        Some(&resolved_objects),
     ))
 }
 
@@ -555,24 +512,6 @@ pub(crate) fn reconcile_remote_object_state_best_effort(
     provider_instance_id: Uuid,
     resolver: Option<&dyn RemoteObjectResolver>,
 ) -> RemoteObjectReconcileReport {
-    reconcile_remote_object_state_best_effort_with_resolutions(
-        sync_root_path,
-        current_snapshot,
-        object_changes,
-        provider_instance_id,
-        resolver,
-        None,
-    )
-}
-
-fn reconcile_remote_object_state_best_effort_with_resolutions(
-    sync_root_path: &Path,
-    current_snapshot: &SyncSnapshot,
-    object_changes: &[RemoteObjectChange],
-    provider_instance_id: Uuid,
-    resolver: Option<&dyn RemoteObjectResolver>,
-    prefetched_resolutions: Option<&BTreeMap<String, RemoteObjectResolution>>,
-) -> RemoteObjectReconcileReport {
     let mut report = RemoteObjectReconcileReport::default();
     let mut local_placeholders = scan_local_placeholders(sync_root_path);
     report
@@ -589,6 +528,11 @@ fn reconcile_remote_object_state_best_effort_with_resolutions(
             }
             _ => None,
         })
+        .collect::<BTreeSet<_>>();
+    let remote_object_ids = current_snapshot
+        .remote
+        .iter()
+        .filter_map(|entry| nonempty(entry.object_id.as_deref()))
         .collect::<BTreeSet<_>>();
     let mut object_ids_to_resolve = object_changes
         .iter()
@@ -614,11 +558,63 @@ fn reconcile_remote_object_state_best_effort_with_resolutions(
                 .then_some(object_id.clone())
         },
     ));
-    let resolved_objects = resolver.map(|resolver| {
-        prefetched_resolutions
-            .cloned()
-            .unwrap_or_else(|| resolver.resolve_objects(&object_ids_to_resolve))
-    });
+    // A deleted object can be absent from the next snapshot even when its
+    // earlier identity lookup was inconclusive. Re-resolve it during the
+    // poller's normal snapshot refresh cadence; no separate tight retry loop
+    // is introduced here.
+    let missing_snapshot_object_ids = local_placeholders
+        .unique
+        .iter()
+        .filter_map(|(object_id, local)| {
+            (!remote_object_ids.contains(object_id.as_str())
+                && nonempty(local.identity.remote_version.as_deref()).is_some())
+            .then_some(object_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    object_ids_to_resolve.extend(missing_snapshot_object_ids.iter().cloned());
+    let deleted_object_ids = object_changes
+        .iter()
+        .filter_map(|change| match change {
+            RemoteObjectChange::Deleted { previous } => nonempty(previous.object_id.as_deref()),
+            _ => None,
+        })
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let unresolved_candidate_ids = missing_snapshot_object_ids
+        .union(&deleted_object_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let resolved_objects =
+        resolver.map(|resolver| resolver.resolve_objects(&object_ids_to_resolve));
+    for object_id in unresolved_candidate_ids {
+        if !local_placeholders.unique.contains_key(&object_id)
+            && !local_placeholders.ambiguous.contains_key(&object_id)
+        {
+            continue;
+        }
+        match resolved_objects
+            .as_ref()
+            .and_then(|resolved_objects| resolved_objects.get(&object_id))
+        {
+            Some(RemoteObjectResolution::NotFound) => {
+                report
+                    .unresolved_remote_object_ids
+                    .insert(object_id.clone());
+                local_placeholders.record_preserved(&object_id, &mut report);
+            }
+            Some(RemoteObjectResolution::Unavailable(error)) => {
+                tracing::warn!(
+                    object_id,
+                    "remote object identity lookup is unavailable; preserving the local placeholder: {error:#}"
+                );
+                report
+                    .unresolved_remote_object_ids
+                    .insert(object_id.clone());
+                local_placeholders.record_preserved(&object_id, &mut report);
+            }
+            _ => {}
+        }
+    }
     // A directory rename changes the namespace of every descendant.  A
     // snapshot captured while those individual mutations are still arriving
     // is not authoritative for any path in either subtree, even when a child
@@ -643,10 +639,38 @@ fn reconcile_remote_object_state_best_effort_with_resolutions(
     let mut delete_changes = object_changes
         .iter()
         .filter_map(|change| match change {
-            RemoteObjectChange::Deleted { previous } => Some(previous),
+            RemoteObjectChange::Deleted { previous } => Some(previous.clone()),
             _ => None,
         })
         .collect::<Vec<_>>();
+    // A snapshot does not by itself prove deletion. It does, however, tell us
+    // which preserved placeholders need another object-ID lookup. Synthesize
+    // a delete only after that lookup returned a positive tombstone.
+    delete_changes.extend(
+        local_placeholders
+            .unique
+            .iter()
+            .filter_map(|(object_id, local)| {
+                if deleted_object_ids.contains(object_id.as_str())
+                    || remote_object_ids.contains(object_id.as_str())
+                {
+                    return None;
+                }
+                match resolved_objects
+                    .as_ref()
+                    .and_then(|resolved_objects| resolved_objects.get(object_id))
+                {
+                    Some(RemoteObjectResolution::Tombstone(tombstone)) => {
+                        confirmed_tombstone_previous(
+                            object_id,
+                            local,
+                            tombstone.predecessor_revision.as_deref(),
+                        )
+                    }
+                    _ => None,
+                }
+            }),
+    );
     // A directory can only be removed after every deleted descendant. Object
     // change order is by stable ID, not namespace depth, so preserve the
     // filesystem ordering explicitly instead of relying on delta order.
@@ -660,18 +684,20 @@ fn reconcile_remote_object_state_best_effort_with_resolutions(
             })
             .then_with(|| left.path.cmp(&right.path))
     });
-    for previous in delete_changes {
+    for previous in &delete_changes {
         let Some(object_id) = nonempty(previous.object_id.as_deref()) else {
             continue;
         };
-        let confirmed_tombstone = matches!(
-            resolved_objects
-                .as_ref()
-                .and_then(|resolved_objects| resolved_objects.get(object_id)),
-            Some(RemoteObjectResolution::Absent)
-        );
+        let resolution = resolved_objects
+            .as_ref()
+            .and_then(|resolved_objects| resolved_objects.get(object_id));
+        let confirmed_tombstone = matches!(resolution, Some(RemoteObjectResolution::Tombstone(_)));
         if !confirmed_tombstone {
-            local_placeholders.record_conflict(object_id, &mut report);
+            match resolution {
+                Some(RemoteObjectResolution::NotFound)
+                | Some(RemoteObjectResolution::Unavailable(_)) => {}
+                _ => local_placeholders.record_conflict(object_id, &mut report),
+            }
             continue;
         }
         let Some(indexed_local) = local_placeholders.get_unique(object_id).cloned() else {
@@ -983,6 +1009,15 @@ impl LocalPlaceholderIndex {
     }
 
     fn record_conflict(&self, object_id: &str, report: &mut RemoteObjectReconcileReport) {
+        if let Some(placeholder) = self.unique.get(object_id) {
+            report
+                .conflicted_paths
+                .insert(placeholder.relative_path.clone());
+            report
+                .preserved_paths
+                .insert(placeholder.relative_path.clone());
+            return;
+        }
         let Some(duplicates) = self.ambiguous.get(object_id) else {
             return;
         };
@@ -994,6 +1029,16 @@ impl LocalPlaceholderIndex {
                 .preserved_paths
                 .insert(placeholder.relative_path.clone());
         }
+    }
+
+    fn record_preserved(&self, object_id: &str, report: &mut RemoteObjectReconcileReport) {
+        if let Some(placeholder) = self.unique.get(object_id) {
+            report
+                .preserved_paths
+                .insert(placeholder.relative_path.clone());
+            return;
+        }
+        self.record_conflict(object_id, report);
     }
 
     fn paths_by_object_id(&self) -> BTreeMap<String, BTreeSet<String>> {
@@ -1111,7 +1156,7 @@ fn reconcile_restart_placeholders(
             }
             let Some(remote) = remote_by_object_id.get(object_id) else {
                 // Absence is not a tombstone. Keep the placeholder until a
-                // confirmed object-id deletion delta arrives.
+                // later object-ID lookup returns a confirmed tombstone.
                 report.preserved_paths.insert(relative_path);
                 continue;
             };
@@ -1439,6 +1484,22 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn confirmed_tombstone_previous(
+    object_id: &str,
+    local: &LocalPlaceholder,
+    predecessor_revision: Option<&str>,
+) -> Option<sync_core::NamespaceEntry> {
+    let revision = nonempty(predecessor_revision)?;
+    let mut previous = if local.full_path.is_dir() {
+        sync_core::NamespaceEntry::directory(&local.relative_path)
+    } else {
+        sync_core::NamespaceEntry::file(&local.relative_path, revision, "")
+    };
+    previous.object_id = Some(object_id.to_string());
+    previous.version = Some(revision.to_string());
+    Some(previous)
+}
+
 /// Legacy v2 placeholders predate server-provided revision IDs.  They may
 /// carry the synthetic `server-head` selector instead of a concrete revision.
 /// At the unchanged path that selector can be promoted only when the recorded
@@ -1564,21 +1625,60 @@ mod tests {
     #[derive(Default)]
     struct StaticResolver {
         objects: HashMap<String, ResolvedRemoteObject>,
+        tombstones: BTreeSet<String>,
     }
 
     impl RemoteObjectResolver for StaticResolver {
-        fn resolve_object(&self, object_id: &str) -> Result<Option<ResolvedRemoteObject>> {
-            Ok(self.objects.get(object_id).cloned())
+        fn resolve_object(&self, object_id: &str) -> Result<RemoteObjectResolution> {
+            Ok(if self.tombstones.contains(object_id) {
+                tombstone(None)
+            } else {
+                self.objects
+                    .get(object_id)
+                    .cloned()
+                    .map(RemoteObjectResolution::Present)
+                    .unwrap_or(RemoteObjectResolution::NotFound)
+            })
+        }
+    }
+
+    struct SequenceResolver {
+        resolutions: std::sync::Mutex<std::collections::VecDeque<Result<RemoteObjectResolution>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SequenceResolver {
+        fn new(resolutions: impl IntoIterator<Item = Result<RemoteObjectResolution>>) -> Self {
+            Self {
+                resolutions: std::sync::Mutex::new(resolutions.into_iter().collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl RemoteObjectResolver for SequenceResolver {
+        fn resolve_object(&self, _object_id: &str) -> Result<RemoteObjectResolution> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.resolutions
+                .lock()
+                .expect("sequence resolver lock should not be poisoned")
+                .pop_front()
+                .unwrap_or(Ok(RemoteObjectResolution::NotFound))
         }
     }
 
     #[derive(Default)]
     struct BatchOnlyResolver {
         batches: std::sync::Mutex<Vec<BTreeSet<String>>>,
+        predecessor_revision: Option<String>,
     }
 
     impl RemoteObjectResolver for BatchOnlyResolver {
-        fn resolve_object(&self, _object_id: &str) -> Result<Option<ResolvedRemoteObject>> {
+        fn resolve_object(&self, _object_id: &str) -> Result<RemoteObjectResolution> {
             panic!("reconciliation should use the batch resolver")
         }
 
@@ -1592,13 +1692,34 @@ mod tests {
                 .push(object_ids.clone());
             object_ids
                 .iter()
-                .map(|object_id| (object_id.clone(), RemoteObjectResolution::Absent))
+                .map(|object_id| {
+                    (
+                        object_id.clone(),
+                        tombstone(self.predecessor_revision.as_deref()),
+                    )
+                })
                 .collect()
         }
     }
 
     fn remote_file(path: &str, object_id: &str, revision: &str, hash: &str) -> NamespaceEntry {
         NamespaceEntry::file(path, revision, hash).with_object_id(object_id)
+    }
+
+    fn tombstone_resolver(object_ids: &[&str]) -> StaticResolver {
+        StaticResolver {
+            tombstones: object_ids
+                .iter()
+                .map(|object_id| (*object_id).to_string())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn tombstone(predecessor_revision: Option<&str>) -> RemoteObjectResolution {
+        RemoteObjectResolution::Tombstone(ResolvedRemoteTombstone {
+            predecessor_revision: predecessor_revision.map(ToString::to_string),
+        })
     }
 
     #[test]
@@ -1894,6 +2015,7 @@ mod tests {
                     revision: Some("revision-2".to_string()),
                 },
             )]),
+            ..Default::default()
         };
 
         let report = reconcile_remote_object_state(
@@ -1972,13 +2094,14 @@ mod tests {
             1_725_100_002,
         );
         let previous = remote_file(path, object_id, "revision-7", "delete-hash");
+        let resolver = tombstone_resolver(&[object_id]);
 
         let report = reconcile_remote_object_state(
             &sync_root.root_path,
             &SyncSnapshot::default(),
             &[RemoteObjectChange::Deleted { previous }],
             provider_instance_id,
-            Some(&StaticResolver::default()),
+            Some(&resolver),
         )
         .expect("confirmed tombstone should reconcile");
 
@@ -2025,6 +2148,7 @@ mod tests {
             "child-revision",
             "child-hash",
         );
+        let resolver = tombstone_resolver(&[directory_object_id, file_object_id]);
 
         // The remote delta deliberately puts the parent first. Reconciliation
         // must order confirmed tombstones by depth, not their incoming order.
@@ -2038,7 +2162,7 @@ mod tests {
                 RemoteObjectChange::Deleted { previous: child },
             ],
             provider_instance_id,
-            Some(&StaticResolver::default()),
+            Some(&resolver),
         )
         .expect("nested tombstones should reconcile");
 
@@ -2060,12 +2184,13 @@ mod tests {
             "offline-delete",
             1_725_100_012,
         );
+        let resolver = SequenceResolver::new([Ok(tombstone(Some("revision-7")))]);
 
         let report = reconcile_existing_placeholders_with_resolver(
             &sync_root.root_path,
             &SyncSnapshot::default(),
             provider_instance_id,
-            &StaticResolver::default(),
+            &resolver,
         )
         .expect("confirmed missing object should be reconciled at startup");
 
@@ -2076,6 +2201,67 @@ mod tests {
                 .join("docs\\deleted-while-offline.txt")
                 .exists()
         );
+    }
+
+    #[test]
+    fn startup_reconciliation_does_not_synthesize_a_delete_from_not_found() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("startup-not-found-preserves-placeholder");
+        let path = "docs/not-found-at-startup.txt";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-7",
+            "not-found-at-startup",
+            1_725_100_014,
+        );
+
+        let report = reconcile_existing_placeholders_with_resolver(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            provider_instance_id,
+            &StaticResolver::default(),
+        )
+        .expect("not-found startup reconciliation should preserve the placeholder");
+
+        assert!(report.deleted_paths.is_empty());
+        assert!(report.preserved_paths.contains(path));
+        assert!(
+            sync_root
+                .root_path
+                .join("docs\\not-found-at-startup.txt")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn not_found_without_a_local_placeholder_does_not_schedule_a_retry() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("not-found-without-local-placeholder");
+        let object_id = "object-not-found-without-local-placeholder";
+        let resolver = SequenceResolver::new([Ok(RemoteObjectResolution::NotFound)]);
+
+        let report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[RemoteObjectChange::Deleted {
+                previous: remote_file(
+                    "docs/missing-local-placeholder.txt",
+                    object_id,
+                    "revision-8",
+                    "missing-local-placeholder",
+                ),
+            }],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("not-found without a local placeholder should be ignored");
+
+        assert!(report.deleted_paths.is_empty());
+        assert!(report.preserved_paths.is_empty());
+        assert!(report.unresolved_remote_object_ids.is_empty());
+        assert_eq!(resolver.calls(), 1);
     }
 
     #[test]
@@ -2092,7 +2278,10 @@ mod tests {
             "offline-delete-batched",
             1_725_100_013,
         );
-        let resolver = BatchOnlyResolver::default();
+        let resolver = BatchOnlyResolver {
+            predecessor_revision: Some("revision-8".to_string()),
+            ..Default::default()
+        };
 
         let report = reconcile_existing_placeholders_with_resolver(
             &sync_root.root_path,
@@ -2114,6 +2303,202 @@ mod tests {
     }
 
     #[test]
+    fn not_found_is_rechecked_by_later_reconciliation_and_deleted_only_after_tombstone() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("not-found-later-tombstone");
+        let path = "docs/not-found-then-tombstone.txt";
+        let object_id = "object-not-found-then-tombstone";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-9",
+            "not-found-then-tombstone",
+            1_725_100_015,
+        );
+        let resolver = SequenceResolver::new([
+            Ok(RemoteObjectResolution::NotFound),
+            Ok(tombstone(Some("revision-9"))),
+        ]);
+
+        let first_report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[RemoteObjectChange::Deleted {
+                previous: remote_file(path, object_id, "revision-9", "not-found-then-tombstone"),
+            }],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("not-found should preserve the placeholder");
+
+        assert!(first_report.deleted_paths.is_empty());
+        assert!(first_report.preserved_paths.contains(path));
+        assert!(
+            first_report
+                .unresolved_remote_object_ids
+                .contains(object_id)
+        );
+        assert!(
+            sync_root
+                .root_path
+                .join("docs\\not-found-then-tombstone.txt")
+                .exists()
+        );
+        assert_eq!(resolver.calls(), 1);
+
+        let second_report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("later regular reconciliation should recheck the preserved placeholder");
+
+        assert!(second_report.deleted_paths.contains(path));
+        assert!(second_report.unresolved_remote_object_ids.is_empty());
+        assert!(
+            !sync_root
+                .root_path
+                .join("docs\\not-found-then-tombstone.txt")
+                .exists()
+        );
+        assert_eq!(resolver.calls(), 2);
+    }
+
+    #[test]
+    fn unavailable_lookup_preserves_placeholder_and_is_rechecked_later() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("unavailable-lookup-later-tombstone");
+        let path = "docs/unavailable-then-tombstone.txt";
+        let object_id = "object-unavailable-then-tombstone";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-10",
+            "unavailable-then-tombstone",
+            1_725_100_016,
+        );
+        let resolver = SequenceResolver::new([
+            Err(anyhow::anyhow!("identity lookup timed out")),
+            Ok(tombstone(Some("revision-10"))),
+        ]);
+
+        let first_report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[RemoteObjectChange::Deleted {
+                previous: remote_file(path, object_id, "revision-10", "unavailable-then-tombstone"),
+            }],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("unavailable lookup should preserve the placeholder");
+
+        assert!(first_report.deleted_paths.is_empty());
+        assert!(first_report.preserved_paths.contains(path));
+        assert!(
+            first_report
+                .unresolved_remote_object_ids
+                .contains(object_id)
+        );
+        assert!(
+            sync_root
+                .root_path
+                .join("docs\\unavailable-then-tombstone.txt")
+                .exists()
+        );
+        assert_eq!(resolver.calls(), 1);
+
+        let second_report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("later regular reconciliation should retry through the normal snapshot cycle");
+
+        assert!(second_report.deleted_paths.contains(path));
+        assert!(second_report.unresolved_remote_object_ids.is_empty());
+        assert_eq!(resolver.calls(), 2);
+    }
+
+    #[test]
+    fn not_found_then_present_preserves_the_existing_placeholder_binding() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("not-found-later-present");
+        let path = "docs/not-found-then-present.txt";
+        let object_id = "object-not-found-then-present";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-11",
+            "not-found-then-present",
+            1_725_100_017,
+        );
+        let resolver = SequenceResolver::new([
+            Ok(RemoteObjectResolution::NotFound),
+            Ok(RemoteObjectResolution::Present(ResolvedRemoteObject {
+                object_id: object_id.to_string(),
+                path: path.to_string(),
+                revision: Some("revision-11".to_string()),
+            })),
+        ]);
+
+        let first_report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[RemoteObjectChange::Deleted {
+                previous: remote_file(path, object_id, "revision-11", "not-found-then-present"),
+            }],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("not-found should preserve the placeholder");
+        assert!(first_report.deleted_paths.is_empty());
+        assert!(
+            first_report
+                .unresolved_remote_object_ids
+                .contains(object_id)
+        );
+
+        let second_report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("present identity lookup should retain the existing binding");
+
+        assert!(second_report.deleted_paths.is_empty());
+        assert!(second_report.preserved_paths.contains(path));
+        assert!(second_report.unresolved_remote_object_ids.is_empty());
+        assert!(
+            sync_root
+                .root_path
+                .join("docs\\not-found-then-present.txt")
+                .exists()
+        );
+        let file = open_sync_path(
+            &sync_root.root_path.join("docs\\not-found-then-present.txt"),
+            false,
+        )
+        .expect("preserved placeholder should remain readable");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("preserved placeholder identity should be readable");
+        let identity = decode_placeholder_file_identity(info.file_identity())
+            .expect("preserved placeholder identity should decode");
+        assert_eq!(identity.object_id.as_deref(), Some(object_id));
+        assert_eq!(identity.remote_version.as_deref(), Some("revision-11"));
+        assert_eq!(resolver.calls(), 2);
+    }
+
+    #[test]
     fn delete_and_recreate_same_path_installs_new_object_identity() {
         let (sync_root, provider_instance_id) = registered_test_sync_root("replace-same-path");
         let path = "docs/replaced.txt";
@@ -2129,6 +2514,7 @@ mod tests {
         );
         let previous = remote_file(path, old_object_id, "revision-old", "replace-old");
         let current = remote_file(path, new_object_id, "revision-new", "replace-new");
+        let resolver = tombstone_resolver(&[old_object_id]);
 
         let report = reconcile_remote_object_state(
             &sync_root.root_path,
@@ -2143,7 +2529,7 @@ mod tests {
                 },
             ],
             provider_instance_id,
-            Some(&StaticResolver::default()),
+            Some(&resolver),
         )
         .expect("old tombstone should remove only the old object");
         assert!(report.deleted_paths.contains(path));
@@ -2192,6 +2578,10 @@ mod tests {
             1_725_100_003,
         );
         let stale_previous = remote_file(path, object_id, "revision-1", "stale-hash");
+        let resolver = SequenceResolver::new([
+            Ok(tombstone(Some("revision-1"))),
+            Ok(tombstone(Some("revision-1"))),
+        ]);
 
         let report = reconcile_remote_object_state(
             &sync_root.root_path,
@@ -2200,13 +2590,80 @@ mod tests {
                 previous: stale_previous,
             }],
             provider_instance_id,
-            Some(&StaticResolver::default()),
+            Some(&resolver),
         )
         .expect("stale tombstone should be handled conservatively");
 
         assert!(report.deleted_paths.is_empty());
         assert!(report.conflicted_paths.contains(path));
         assert!(sync_root.root_path.join("docs\\changed.txt").exists());
+
+        let second_report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("a tombstone revision conflict must remain non-destructive");
+
+        assert!(second_report.deleted_paths.is_empty());
+        assert!(second_report.conflicted_paths.contains(path));
+        assert!(sync_root.root_path.join("docs\\changed.txt").exists());
+    }
+
+    #[test]
+    fn deferred_stale_tombstone_revision_is_a_conflict_not_a_delete() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("deferred-stale-tombstone-revision");
+        let path = "docs/changed.txt";
+        let object_id = "object-stale-hash";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-2",
+            "stale-hash",
+            1_725_100_003,
+        );
+        let stale_previous = remote_file(path, object_id, "revision-1", "stale-hash");
+        let resolver = SequenceResolver::new([
+            Ok(RemoteObjectResolution::Unavailable("timeout".to_string())),
+            Ok(tombstone(Some("revision-1"))),
+        ]);
+
+        let first_report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[RemoteObjectChange::Deleted {
+                previous: stale_previous,
+            }],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("unavailable lookup should preserve the placeholder");
+
+        assert!(first_report.deleted_paths.is_empty());
+        assert!(
+            first_report
+                .unresolved_remote_object_ids
+                .contains(object_id)
+        );
+        assert!(sync_root.root_path.join("docs\\changed.txt").exists());
+
+        let second_report = reconcile_remote_object_state(
+            &sync_root.root_path,
+            &SyncSnapshot::default(),
+            &[],
+            provider_instance_id,
+            Some(&resolver),
+        )
+        .expect("a deferred stale tombstone must remain non-destructive");
+
+        assert!(second_report.deleted_paths.is_empty());
+        assert!(second_report.conflicted_paths.contains(path));
+        assert!(sync_root.root_path.join("docs\\changed.txt").exists());
+        assert_eq!(resolver.calls(), 2);
     }
 
     #[test]
@@ -2233,6 +2690,7 @@ mod tests {
                     revision: Some("revision-2".to_string()),
                 },
             )]),
+            ..Default::default()
         };
         let report = reconcile_existing_placeholders_with_resolver(
             &sync_root.root_path,
@@ -2303,6 +2761,7 @@ mod tests {
                     revision: Some("revision-2".to_string()),
                 },
             )]),
+            ..Default::default()
         };
         let report = reconcile_existing_placeholders_with_resolver(
             &sync_root.root_path,
@@ -2493,6 +2952,7 @@ mod tests {
                     revision: Some("revision-2".to_string()),
                 },
             )]),
+            ..Default::default()
         };
 
         let report = reconcile_remote_object_state(

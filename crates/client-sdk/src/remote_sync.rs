@@ -328,12 +328,42 @@ impl RemoteSnapshotPoller {
     where
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
     {
-        self.spawn_fetcher_loop_with_fetch(
+        self.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
             running,
             initial_snapshot,
             fetcher,
             |fetcher| fetcher.fetch_snapshot_blocking(),
             on_change,
+            || false,
+        )
+    }
+
+    /// Like [`Self::spawn_fetcher_loop`], but emits an update with empty
+    /// change sets after an unchanged snapshot refresh while
+    /// `needs_unchanged_snapshot_refresh` returns `true`.
+    ///
+    /// This is deliberately driven by the poller's existing notification
+    /// wait or polling cadence. It lets consumers retry deferred
+    /// object-identity work without adding a separate short-interval loop.
+    pub fn spawn_fetcher_loop_with_unchanged_snapshot_refresh<C, R>(
+        &self,
+        running: Arc<AtomicBool>,
+        initial_snapshot: Option<SyncSnapshot>,
+        fetcher: RemoteSnapshotFetcher,
+        on_change: C,
+        needs_unchanged_snapshot_refresh: R,
+    ) -> JoinHandle<()>
+    where
+        C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+        R: FnMut() -> bool + Send + 'static,
+    {
+        self.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            running,
+            initial_snapshot,
+            fetcher,
+            |fetcher| fetcher.fetch_snapshot_blocking(),
+            on_change,
+            needs_unchanged_snapshot_refresh,
         )
     }
 
@@ -342,20 +372,46 @@ impl RemoteSnapshotPoller {
         running: Arc<AtomicBool>,
         initial_snapshot: Option<SyncSnapshot>,
         fetcher: RemoteSnapshotFetcher,
-        mut fetch_snapshot: F,
-        mut on_change: C,
+        fetch_snapshot: F,
+        on_change: C,
     ) -> JoinHandle<()>
     where
         F: FnMut(&RemoteSnapshotFetcher) -> Result<SyncSnapshot> + Send + 'static,
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
     {
+        self.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            running,
+            initial_snapshot,
+            fetcher,
+            fetch_snapshot,
+            on_change,
+            || false,
+        )
+    }
+
+    fn spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh<F, C, R>(
+        &self,
+        running: Arc<AtomicBool>,
+        initial_snapshot: Option<SyncSnapshot>,
+        fetcher: RemoteSnapshotFetcher,
+        mut fetch_snapshot: F,
+        mut on_change: C,
+        mut needs_unchanged_snapshot_refresh: R,
+    ) -> JoinHandle<()>
+    where
+        F: FnMut(&RemoteSnapshotFetcher) -> Result<SyncSnapshot> + Send + 'static,
+        C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+        R: FnMut() -> bool + Send + 'static,
+    {
         match self.scheduler.strategy.mode {
-            RemoteSyncMode::Polling { .. } => self.spawn_changed_paths_loop(
-                running,
-                initial_snapshot,
-                move || fetch_snapshot(&fetcher),
-                on_change,
-            ),
+            RemoteSyncMode::Polling { .. } => self
+                .spawn_changed_paths_loop_with_unchanged_snapshot_refresh(
+                    running,
+                    initial_snapshot,
+                    move || fetch_snapshot(&fetcher),
+                    on_change,
+                    needs_unchanged_snapshot_refresh,
+                ),
             RemoteSyncMode::ServerNotifications {
                 wait_timeout,
                 retry_interval: _,
@@ -416,6 +472,9 @@ impl RemoteSnapshotPoller {
                         if !running.load(Ordering::SeqCst) {
                             break;
                         }
+                        let refresh_unchanged_snapshot =
+                            current_snapshot.is_some() && needs_unchanged_snapshot_refresh();
+                        should_fetch |= refresh_unchanged_snapshot;
                         if !should_fetch {
                             continue;
                         }
@@ -428,7 +487,12 @@ impl RemoteSnapshotPoller {
                             }
                         };
                         last_sequence = observed_sequence;
-                        apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
+                        apply_snapshot_update_with_unchanged_refresh(
+                            &mut current_snapshot,
+                            next_snapshot,
+                            &mut on_change,
+                            refresh_unchanged_snapshot,
+                        );
                     }
                 })
             }
@@ -438,13 +502,35 @@ impl RemoteSnapshotPoller {
     pub fn spawn_changed_paths_loop<F, C>(
         &self,
         running: Arc<AtomicBool>,
-        mut current_snapshot: Option<SyncSnapshot>,
-        mut fetch_snapshot: F,
-        mut on_change: C,
+        current_snapshot: Option<SyncSnapshot>,
+        fetch_snapshot: F,
+        on_change: C,
     ) -> JoinHandle<()>
     where
         F: FnMut() -> Result<SyncSnapshot> + Send + 'static,
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+    {
+        self.spawn_changed_paths_loop_with_unchanged_snapshot_refresh(
+            running,
+            current_snapshot,
+            fetch_snapshot,
+            on_change,
+            || false,
+        )
+    }
+
+    fn spawn_changed_paths_loop_with_unchanged_snapshot_refresh<F, C, R>(
+        &self,
+        running: Arc<AtomicBool>,
+        mut current_snapshot: Option<SyncSnapshot>,
+        mut fetch_snapshot: F,
+        mut on_change: C,
+        mut needs_unchanged_snapshot_refresh: R,
+    ) -> JoinHandle<()>
+    where
+        F: FnMut() -> Result<SyncSnapshot> + Send + 'static,
+        C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+        R: FnMut() -> bool + Send + 'static,
     {
         let scheduler = self.scheduler.clone();
         thread::spawn(move || {
@@ -463,7 +549,13 @@ impl RemoteSnapshotPoller {
                         continue;
                     }
                 };
-                apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
+                let refresh_unchanged_snapshot = needs_unchanged_snapshot_refresh();
+                apply_snapshot_update_with_unchanged_refresh(
+                    &mut current_snapshot,
+                    next_snapshot,
+                    &mut on_change,
+                    refresh_unchanged_snapshot,
+                );
             }
         })
     }
@@ -481,6 +573,7 @@ fn should_fallback_to_polling_after_wait_error(error: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(test)]
 fn apply_snapshot_update<C>(
     current_snapshot: &mut Option<SyncSnapshot>,
     next_snapshot: SyncSnapshot,
@@ -488,9 +581,20 @@ fn apply_snapshot_update<C>(
 ) where
     C: FnMut(RemoteSnapshotUpdate),
 {
+    apply_snapshot_update_with_unchanged_refresh(current_snapshot, next_snapshot, on_change, false);
+}
+
+fn apply_snapshot_update_with_unchanged_refresh<C>(
+    current_snapshot: &mut Option<SyncSnapshot>,
+    next_snapshot: SyncSnapshot,
+    on_change: &mut C,
+    refresh_unchanged_snapshot: bool,
+) where
+    C: FnMut(RemoteSnapshotUpdate),
+{
     if let Some(previous) = current_snapshot.as_ref() {
         let changed_paths = changed_paths_between(previous, &next_snapshot);
-        if !changed_paths.is_empty() {
+        if !changed_paths.is_empty() || refresh_unchanged_snapshot {
             let object_changes = object_changes_between(previous, &next_snapshot);
             on_change(RemoteSnapshotUpdate {
                 snapshot: next_snapshot.clone(),
@@ -1355,6 +1459,60 @@ mod tests {
     }
 
     #[test]
+    fn server_notification_loop_refreshes_an_unchanged_snapshot_when_requested() {
+        let router = Router::new().route(
+            "/api/v1/store/index/changes/wait",
+            get(|| async { Json(serde_json::json!({ "sequence": 0, "changed": false })) }),
+        );
+        let (addr, shutdown_tx, server) = spawn_test_server(router);
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let initial_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+        };
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fetch_count_for_loop = Arc::clone(&fetch_count);
+        let running_for_callback = Arc::clone(&running);
+        let snapshot_for_fetch = initial_snapshot.clone();
+        let (tx, rx) = mpsc::channel();
+
+        let handle = poller.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            Arc::clone(&running),
+            Some(initial_snapshot.clone()),
+            fetcher,
+            move |_fetcher| {
+                fetch_count_for_loop.fetch_add(1, Ordering::SeqCst);
+                Ok(snapshot_for_fetch.clone())
+            },
+            move |update| {
+                running_for_callback.store(false, Ordering::SeqCst);
+                tx.send(update).expect("unchanged refresh should send");
+            },
+            || true,
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("requested unchanged refresh should produce an update");
+        handle
+            .join()
+            .expect("notification loop should stop cleanly");
+
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert!(update.changed_paths.is_empty());
+        assert!(update.object_changes.is_empty());
+        assert_eq!(update.snapshot, initial_snapshot);
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
     fn server_notification_loop_falls_back_to_polling_when_wait_is_unavailable() {
         let (addr, shutdown_tx, server) = spawn_test_server(Router::new());
 
@@ -1404,6 +1562,55 @@ mod tests {
             update.changed_paths,
             vec!["docs/new.txt".to_string(), "docs/readme.md".to_string()],
         );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
+    fn polling_fallback_refreshes_an_unchanged_snapshot_when_requested() {
+        let (addr, shutdown_tx, server) = spawn_test_server(Router::new());
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let initial_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+        };
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fetch_count_for_loop = Arc::clone(&fetch_count);
+        let snapshot_for_fetch = initial_snapshot.clone();
+        let running_for_callback = Arc::clone(&running);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = poller.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            Arc::clone(&running),
+            Some(initial_snapshot.clone()),
+            fetcher,
+            move |_fetcher| {
+                fetch_count_for_loop.fetch_add(1, Ordering::SeqCst);
+                Ok(snapshot_for_fetch.clone())
+            },
+            move |update| {
+                running_for_callback.store(false, Ordering::SeqCst);
+                tx.send(update)
+                    .expect("unchanged fallback refresh should send");
+            },
+            || true,
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("requested fallback refresh should produce an update");
+        handle.join().expect("fallback loop should stop cleanly");
+
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert!(update.changed_paths.is_empty());
+        assert!(update.object_changes.is_empty());
+        assert_eq!(update.snapshot, initial_snapshot);
 
         let _ = shutdown_tx.send(());
         let _ = server.join();

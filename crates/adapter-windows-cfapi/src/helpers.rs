@@ -126,7 +126,7 @@ impl PlaceholderFileIdentity {
     }
 
     pub fn encoded(&self) -> Vec<u8> {
-        let mut lines = Vec::with_capacity(12);
+        let mut lines = Vec::with_capacity(13);
         lines.push(format!("v={}", Self::SCHEMA_VERSION));
         if let Some(object_id) = self
             .object_id
