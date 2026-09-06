@@ -23,7 +23,8 @@ struct IronmeshIosApp: App {
                         accentColorHex: AppleAccentColor.defaultHex,
                         isStarting: false,
                         statusMessage: "",
-                        onStart: {}
+                        onStart: {},
+                        onClose: {}
                     )
                 } else {
                     IronmeshHostedWebView(
@@ -169,11 +170,9 @@ private struct IronmeshGalleryMapView: View {
             accentColorHex: model.themeAccentColorHex,
             isStarting: model.isBusy,
             statusMessage: model.statusText,
-            onStart: model.openGalleryMap
+            onStart: model.openGalleryMap,
+            onClose: model.closeGalleryMap
         )
-        .onDisappear {
-            model.closeGalleryMap()
-        }
     }
 }
 
@@ -183,6 +182,7 @@ private struct IronmeshGalleryMapContent: View {
     let isStarting: Bool
     let statusMessage: String
     let onStart: () -> Void
+    let onClose: () -> Void
 
     var body: some View {
         if let session, let galleryMapSession = galleryMapWebUiSession(from: session) {
@@ -191,6 +191,7 @@ private struct IronmeshGalleryMapContent: View {
                 accentColorHex: accentColorHex
             )
                 .ignoresSafeArea()
+                .onDisappear(perform: onClose)
         } else {
             galleryMapStartCard
         }
@@ -232,9 +233,13 @@ private func galleryMapWebUiSession(from session: AppleWebUiSession) -> AppleWeb
         return nil
     }
     var queryItems = components.queryItems ?? []
-    queryItems.removeAll { $0.name == "embedded" || $0.name == "embedded_client" }
+    queryItems.removeAll {
+        $0.name == "embedded" || $0.name == "embedded_client" || $0.name == "page" || $0.name == "gallery_view"
+    }
     queryItems.append(URLQueryItem(name: "embedded", value: IronmeshEmbeddedSurface.galleryMap.rawValue))
     queryItems.append(URLQueryItem(name: "embedded_client", value: "ios"))
+    queryItems.append(URLQueryItem(name: "page", value: "gallery"))
+    queryItems.append(URLQueryItem(name: "gallery_view", value: "map"))
     components.queryItems = queryItems
 
     guard let url = components.url,
