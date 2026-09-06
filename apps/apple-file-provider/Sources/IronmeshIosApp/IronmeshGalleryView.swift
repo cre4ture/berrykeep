@@ -491,7 +491,28 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
 
         context.coordinator.imageView.contentMode = .scaleAspectFit
         context.coordinator.imageView.clipsToBounds = true
+        context.coordinator.imageView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.addSubview(context.coordinator.imageView)
+        NSLayoutConstraint.activate([
+            context.coordinator.imageView.leadingAnchor.constraint(
+                equalTo: scrollView.contentLayoutGuide.leadingAnchor
+            ),
+            context.coordinator.imageView.trailingAnchor.constraint(
+                equalTo: scrollView.contentLayoutGuide.trailingAnchor
+            ),
+            context.coordinator.imageView.topAnchor.constraint(
+                equalTo: scrollView.contentLayoutGuide.topAnchor
+            ),
+            context.coordinator.imageView.bottomAnchor.constraint(
+                equalTo: scrollView.contentLayoutGuide.bottomAnchor
+            ),
+            context.coordinator.imageView.widthAnchor.constraint(
+                equalTo: scrollView.frameLayoutGuide.widthAnchor
+            ),
+            context.coordinator.imageView.heightAnchor.constraint(
+                equalTo: scrollView.frameLayoutGuide.heightAnchor
+            ),
+        ])
         return scrollView
     }
 
@@ -499,8 +520,6 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
         let isFirstImage = context.coordinator.imageView.image == nil
         context.coordinator.onZoomStarted = onZoomStarted
         context.coordinator.imageView.image = image
-        context.coordinator.imageView.frame = scrollView.bounds
-        scrollView.contentSize = scrollView.bounds.size
         if isFirstImage {
             scrollView.setZoomScale(1, animated: false)
         }
