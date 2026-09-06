@@ -213,14 +213,31 @@ impl XmpSidecar {
     /// `dc:subject` property into the retained events.
     fn output_events(&self) -> Result<Vec<Event<'_>>> {
         if self.keywords.is_empty() && self.geo_inference.is_none() {
-            return Ok(self
-                .events
-                .iter()
-                .map(|entry| entry.event.borrow())
-                .collect());
+            return Ok(self.retained_events(..).collect());
         }
-        let mut output: Vec<ResolvedEvent> = if self.keywords.is_empty() {
-            self.events.clone()
+
+        // Find the generated GPS insertion point in the retained stream, so
+        // the normal keyword-only path can keep borrowing every third-party
+        // event. Keyword rendering below may move that point forward.
+        let mut geo_insertion_index = self
+            .geo_inference
+            .as_ref()
+            .map(|_| {
+                self.events
+                    .iter()
+                    .rposition(|event| {
+                        event.namespace.as_deref() == Some(RDF_NAMESPACE)
+                            && matches!(
+                                &event.event,
+                                Event::End(end) if end.local_name().into_inner() == b"RDF"
+                            )
+                    })
+                    .context("XMP packet offers no rdf:RDF closing element for GPS metadata")
+            })
+            .transpose()?;
+
+        let mut output: Vec<Event<'_>> = if self.keywords.is_empty() {
+            self.retained_events(..).collect()
         } else {
             let placement = self.placement.context(
                 "XMP packet offers no place for dc:subject: the rdf:RDF element is self-closing",
@@ -238,34 +255,33 @@ impl XmpSidecar {
                 }
             };
 
-            let mut output = self.events[..index].to_vec();
-            output.extend(block.into_iter().map(ResolvedEvent::generated));
-            output.extend(
-                self.events[index + usize::from(replaces_event)..]
-                    .iter()
-                    .cloned(),
-            );
+            if let Some(geo_insertion_index) = geo_insertion_index.as_mut()
+                && *geo_insertion_index >= index
+            {
+                *geo_insertion_index += block.len() - usize::from(replaces_event);
+            }
+
+            let mut output: Vec<Event<'_>> = self.retained_events(..index).collect();
+            output.extend(block);
+            output.extend(self.retained_events(index + usize::from(replaces_event)..));
             output
         };
-        if let Some(inference) = &self.geo_inference {
-            let insertion_index = output
-                .iter()
-                .rposition(|event| {
-                    event.namespace.as_deref() == Some(RDF_NAMESPACE)
-                        && matches!(
-                            &event.event,
-                            Event::End(end) if end.local_name().into_inner() == b"RDF"
-                        )
-                })
-                .context("XMP packet offers no rdf:RDF closing element for GPS metadata")?;
+        if let (Some(inference), Some(insertion_index)) = (&self.geo_inference, geo_insertion_index)
+        {
             output.splice(
                 insertion_index..insertion_index,
-                self.render_geo_inference(inference)
-                    .into_iter()
-                    .map(ResolvedEvent::generated),
+                self.render_geo_inference(inference),
             );
         }
-        Ok(output.into_iter().map(|event| event.event).collect())
+        Ok(output)
+    }
+
+    /// Borrows the retained events of the given range for serialization.
+    fn retained_events<R>(&self, range: R) -> impl Iterator<Item = Event<'_>>
+    where
+        R: std::slice::SliceIndex<[ResolvedEvent], Output = [ResolvedEvent]>,
+    {
+        self.events[range].iter().map(|entry| entry.event.borrow())
     }
 
     /// Renders the `dc:subject` property, declaring the given namespaces on the
@@ -459,17 +475,6 @@ struct ResolvedEvent {
     /// was accepted, so safety checks do not mistake malformed third-party
     /// metadata for absent metadata.
     has_undecodable_attributes: bool,
-}
-
-impl ResolvedEvent {
-    fn generated(event: Event<'static>) -> Self {
-        Self {
-            event,
-            namespace: None,
-            attributes: Vec::new(),
-            has_undecodable_attributes: false,
-        }
-    }
 }
 
 /// An attribute name resolved in the namespace scope of its owning event.
