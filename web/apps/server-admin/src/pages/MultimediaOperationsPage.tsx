@@ -30,7 +30,7 @@ import {
   Text,
   Title
 } from "@mantine/core";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
@@ -39,6 +39,44 @@ const APPLY_OPERATION_ID = "multimedia.geolocation.apply";
 const RESULTS_LIMIT = 10;
 const PROPOSALS_PER_REVIEW_PAGE = 25;
 const MAX_GEO_TIME_WINDOW_SECONDS = 60 * 60;
+
+type OperationResultsPaginationState = {
+  offset: number;
+  previousOffsets: number[];
+};
+
+type OperationResultsPaginationAction =
+  | { type: "next"; nextOffset: number }
+  | { type: "previous" }
+  | { type: "reset" };
+
+function operationResultsPaginationReducer(
+  state: OperationResultsPaginationState,
+  action: OperationResultsPaginationAction
+): OperationResultsPaginationState {
+  switch (action.type) {
+    case "next":
+      if (action.nextOffset <= state.offset) {
+        return state;
+      }
+      return {
+        offset: action.nextOffset,
+        previousOffsets: [...state.previousOffsets, state.offset]
+      };
+    case "previous": {
+      const previousOffset = state.previousOffsets[state.previousOffsets.length - 1];
+      if (previousOffset === undefined) {
+        return state;
+      }
+      return {
+        offset: previousOffset,
+        previousOffsets: state.previousOffsets.slice(0, -1)
+      };
+    }
+    case "reset":
+      return { offset: 0, previousOffsets: [] };
+  }
+}
 
 type InferenceSettings = {
   maxAnchorTimeDeltaSeconds: number;
@@ -62,8 +100,14 @@ export function MultimediaOperationsPage() {
   // user's deliberate clear action and must remain clearable.
   const [selectedAnalysisRunId, setSelectedAnalysisRunId] = useState<string | null | undefined>(undefined);
   const [selectedApplyRunId, setSelectedApplyRunId] = useState<string | null | undefined>(undefined);
-  const [proposalResultsOffset, setProposalResultsOffset] = useState(0);
-  const [applyResultsOffset, setApplyResultsOffset] = useState(0);
+  const [proposalResultsPagination, dispatchProposalResultsPagination] = useReducer(
+    operationResultsPaginationReducer,
+    { offset: 0, previousOffsets: [] }
+  );
+  const [applyResultsPagination, dispatchApplyResultsPagination] = useReducer(
+    operationResultsPaginationReducer,
+    { offset: 0, previousOffsets: [] }
+  );
   const [selectedChunkProposalCounts, setSelectedChunkProposalCounts] = useState<Map<string, number>>(new Map());
   const [selectedProposalChunkIds, setSelectedProposalChunkIds] = useState<Map<string, string>>(new Map());
 
@@ -149,13 +193,13 @@ export function MultimediaOperationsPage() {
       "multimedia-operations",
       "results",
       selectedAnalysisRun?.run_id ?? null,
-      proposalResultsOffset,
+      proposalResultsPagination.offset,
       normalizedAdminTokenOverride
     ],
     queryFn: () =>
       getOperationRunResults(
         selectedAnalysisRun!.run_id,
-        { limit: RESULTS_LIMIT, offset: proposalResultsOffset },
+        { limit: RESULTS_LIMIT, offset: proposalResultsPagination.offset },
         normalizedAdminTokenOverride || undefined
       ),
     enabled: canInspect && selectedAnalysisRun !== null,
@@ -176,13 +220,13 @@ export function MultimediaOperationsPage() {
       "multimedia-operations",
       "results",
       selectedApplyRun?.run_id ?? null,
-      applyResultsOffset,
+      applyResultsPagination.offset,
       normalizedAdminTokenOverride
     ],
     queryFn: () =>
       getOperationRunResults(
         selectedApplyRun!.run_id,
-        { limit: RESULTS_LIMIT, offset: applyResultsOffset },
+        { limit: RESULTS_LIMIT, offset: applyResultsPagination.offset },
         normalizedAdminTokenOverride || undefined
       ),
     enabled: canInspect && selectedApplyRun !== null,
@@ -215,11 +259,11 @@ export function MultimediaOperationsPage() {
   useEffect(() => {
     setSelectedChunkProposalCounts(new Map());
     setSelectedProposalChunkIds(new Map());
-    setProposalResultsOffset(0);
+    dispatchProposalResultsPagination({ type: "reset" });
   }, [selectedAnalysisRunId]);
 
   useEffect(() => {
-    setApplyResultsOffset(0);
+    dispatchApplyResultsPagination({ type: "reset" });
   }, [selectedApplyRunId]);
 
   const refresh = async () => {
@@ -450,11 +494,11 @@ export function MultimediaOperationsPage() {
           )}
           {selectedAnalysisRun ? (
             <OperationResultsPagination
-              offset={proposalResultsOffset}
+              offset={proposalResultsPagination.offset}
               count={proposalResultsQuery.data?.chunks.length ?? 0}
               nextOffset={proposalResultsQuery.data?.next_offset ?? null}
-              onPrevious={() => setProposalResultsOffset(Math.max(0, proposalResultsOffset - RESULTS_LIMIT))}
-              onNext={(nextOffset) => setProposalResultsOffset(nextOffset)}
+              onPrevious={() => dispatchProposalResultsPagination({ type: "previous" })}
+              onNext={(nextOffset) => dispatchProposalResultsPagination({ type: "next", nextOffset })}
             />
           ) : null}
           <Group justify="space-between">
@@ -504,11 +548,11 @@ export function MultimediaOperationsPage() {
               <>
                 <ApplyResultReview run={selectedApplyRun} items={applyItems} />
                 <OperationResultsPagination
-                  offset={applyResultsOffset}
+                  offset={applyResultsPagination.offset}
                   count={applyResultsQuery.data?.chunks.length ?? 0}
                   nextOffset={applyResultsQuery.data?.next_offset ?? null}
-                  onPrevious={() => setApplyResultsOffset(Math.max(0, applyResultsOffset - RESULTS_LIMIT))}
-                  onNext={(nextOffset) => setApplyResultsOffset(nextOffset)}
+                  onPrevious={() => dispatchApplyResultsPagination({ type: "previous" })}
+                  onNext={(nextOffset) => dispatchApplyResultsPagination({ type: "next", nextOffset })}
                 />
               </>
             ) : null}
