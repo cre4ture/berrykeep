@@ -22,7 +22,9 @@ New installations should install a `berrykeep-*` package and configure its
 `/etc/berrykeep/*.env` file before enabling the matching `berrykeep-*`
 systemd unit. Do not remove a transitional package from an upgraded host until
 its service has been intentionally migrated to the new configuration and state
-paths.
+paths. Starting a new `berrykeep-server-node.service` or
+`berrykeep-rendezvous-service.service` stops its matching legacy service, so
+the two identities cannot run simultaneously during that migration.
 
 The client package installs its executable payload under
 `/usr/lib/berrykeep-client`; the public `berrykeep` and legacy `ironmesh`

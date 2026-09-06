@@ -2,6 +2,7 @@
 Description=BerryKeep server node
 After=network-online.target
 Wants=network-online.target
+Conflicts=ironmesh-server-node.service
 
 [Service]
 Type=simple

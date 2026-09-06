@@ -2,6 +2,7 @@
 Description=BerryKeep rendezvous service
 After=network-online.target
 Wants=network-online.target
+Conflicts=ironmesh-rendezvous-service.service
 
 [Service]
 Type=simple
