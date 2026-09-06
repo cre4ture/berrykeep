@@ -2373,6 +2373,56 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn gallery_object_gps_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, MediaGpsCoordinates>> {
+        const GPS_LOOKUP_CHUNK_SIZE: usize = 500;
+        let keys = keys.to_vec();
+        self.read(move |db| {
+            let mut gps_by_key = HashMap::new();
+            for keys in keys.chunks(GPS_LOOKUP_CHUNK_SIZE) {
+                if keys.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=keys.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT key, latitude, longitude FROM gallery_objects WHERE key IN ({placeholders})"
+                );
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement.query_map(params_from_iter(keys.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                        row.get::<_, Option<f64>>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (key, latitude, longitude) = row?;
+                    if let (Some(latitude), Some(longitude)) = (latitude, longitude)
+                        && latitude.is_finite()
+                        && (-90.0..=90.0).contains(&latitude)
+                        && longitude.is_finite()
+                        && (-180.0..=180.0).contains(&longitude)
+                    {
+                        gps_by_key.insert(
+                            key,
+                            MediaGpsCoordinates {
+                                latitude,
+                                longitude,
+                            },
+                        );
+                    }
+                }
+            }
+            Ok(gps_by_key)
+        })
+        .await
+    }
+
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,

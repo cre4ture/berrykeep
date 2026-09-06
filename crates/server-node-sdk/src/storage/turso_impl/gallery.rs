@@ -2546,7 +2546,7 @@ fn row_opt_u64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<u64>>
         .transpose()
 }
 
-fn row_opt_f64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<f64>> {
+pub(super) fn row_opt_f64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<f64>> {
     match row.get_value(idx)? {
         Value::Null => Ok(None),
         Value::Real(value) => Ok(Some(value)),

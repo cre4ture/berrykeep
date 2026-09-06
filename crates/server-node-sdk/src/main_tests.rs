@@ -15915,6 +15915,161 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_images_turso
 );
 
+async fn generic_store_index_applies_current_xmp_gps_overlay_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/geotagged.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+        let write = locked
+            .set_media_geolocation(
+                "gallery/geotagged.png",
+                common::xmp::XmpGeoInference {
+                    latitude: 47.3769,
+                    longitude: 8.5417,
+                    method: "nearest-anchor".to_string(),
+                    run_id: "analysis-run".to_string(),
+                    confidence: "reference_distance=180s".to_string(),
+                    reference_distance_seconds: Some(180),
+                    previous_anchor_distance_seconds: None,
+                    next_anchor_distance_seconds: None,
+                    estimated_speed_kmh: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            write,
+            super::storage::MediaGeolocationWrite::Applied(_)
+        ));
+    }
+
+    let generic_query = super::StoreIndexQuery {
+        prefix: Some("gallery".to_string()),
+        depth: Some(2),
+        snapshot: None,
+        view: Some(super::StoreIndexView::Tree),
+        cursor: None,
+        page_size: None,
+        offset: Some(0),
+        limit: Some(1),
+        sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+        media_filter: None,
+        captured_from_unix: None,
+        captured_until_unix: None,
+        south: None,
+        west: None,
+        north: None,
+        east: None,
+        require_labels: None,
+        exclude_labels: None,
+    };
+    let cursor_query = super::StoreIndexQuery {
+        view: None,
+        cursor: None,
+        page_size: Some(1),
+        offset: None,
+        limit: None,
+        sort: None,
+        ..generic_query.clone()
+    };
+    let first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(generic_query.clone()),
+        )
+        .await,
+    );
+    assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+    let first_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first_payload["entries"][0]["path"], "gallery/geotagged.png");
+    assert_eq!(
+        first_payload["entries"][0]["media"]["gps"]["latitude"],
+        47.3769
+    );
+    assert_eq!(
+        first_payload["entries"][0]["media"]["gps"]["longitude"],
+        8.5417
+    );
+
+    let cached_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(generic_query),
+        )
+        .await,
+    );
+    assert_eq!(cached_response.status(), axum::http::StatusCode::OK);
+    assert!(
+        cached_response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("store-index-page-cache;desc=hit")),
+        "the cached generic response must reload path-scoped XMP GPS"
+    );
+    let cached_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(cached_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cached_payload["entries"][0]["media"]["gps"]["latitude"],
+        47.3769
+    );
+    assert_eq!(
+        cached_payload["entries"][0]["media"]["gps"]["longitude"],
+        8.5417
+    );
+
+    let cursor_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(cursor_query),
+        )
+        .await,
+    );
+    assert_eq!(cursor_response.status(), axum::http::StatusCode::OK);
+    let cursor_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(cursor_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cursor_payload["entries"][0]["media"]["gps"]["latitude"],
+        47.3769
+    );
+    assert_eq!(
+        cursor_payload["entries"][0]["media"]["gps"]["longitude"],
+        8.5417
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    generic_store_index_applies_current_xmp_gps_overlay_impl,
+    generic_store_index_applies_current_xmp_gps_overlay,
+    generic_store_index_applies_current_xmp_gps_overlay_turso
+);
+
 async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_impl(
     backend: MainTestBackend,
 ) {

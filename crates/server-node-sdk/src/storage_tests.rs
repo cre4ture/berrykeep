@@ -11111,6 +11111,19 @@ async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
             .is_none(),
         "only the reviewed media key receives an XMP sidecar"
     );
+    let gps_by_key = store
+        .gallery_object_gps_by_key(&[primary_key.to_string(), duplicate_key.to_string()])
+        .await
+        .expect("the current path-scoped GPS projection should be queryable in a batch");
+    let primary_gps = gps_by_key
+        .get(primary_key)
+        .expect("the reviewed media must expose its current projected GPS");
+    assert!((primary_gps.latitude - 47.3769).abs() < 0.000_001);
+    assert!((primary_gps.longitude - 8.5417).abs() < 0.000_001);
+    assert!(
+        !gps_by_key.contains_key(duplicate_key),
+        "the batch GPS projection must preserve the sidecar's path scope"
+    );
 
     drop(store);
     let _ = fs::remove_dir_all(root).await;

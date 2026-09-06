@@ -28,9 +28,9 @@ use super::{
     GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache,
     HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY, HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
     HistoryHeadProjectionBackfillState, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
-    ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
+    ManualRepairActionRunRecord, MediaGpsCoordinates, MetadataDbLogicalProgress,
+    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
+    OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
     RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
     RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
     S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
@@ -352,6 +352,52 @@ impl MetadataStore for TursoMetadataStore {
             }
         }
         Ok(labels_by_key)
+    }
+
+    async fn gallery_object_gps_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, MediaGpsCoordinates>> {
+        const GPS_LOOKUP_CHUNK_SIZE: usize = 500;
+        let mut gps_by_key = HashMap::new();
+        for keys in keys.chunks(GPS_LOOKUP_CHUNK_SIZE) {
+            if keys.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=keys.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!(
+                        "SELECT key, latitude, longitude FROM gallery_objects WHERE key IN ({placeholders})"
+                    ),
+                    params_from_iter(keys.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let key = row_string(&row, 0, "gallery_objects.key")?;
+                let latitude = gallery::row_opt_f64(&row, 1, "gallery_objects.latitude")?;
+                let longitude = gallery::row_opt_f64(&row, 2, "gallery_objects.longitude")?;
+                if let (Some(latitude), Some(longitude)) = (latitude, longitude)
+                    && latitude.is_finite()
+                    && (-90.0..=90.0).contains(&latitude)
+                    && longitude.is_finite()
+                    && (-180.0..=180.0).contains(&longitude)
+                {
+                    gps_by_key.insert(
+                        key,
+                        MediaGpsCoordinates {
+                            latitude,
+                            longitude,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(gps_by_key)
     }
 
     async fn query_gallery_index(

@@ -2832,6 +2832,13 @@ trait MetadataStore: Send + Sync {
         &self,
         keys: &[String],
     ) -> Result<HashMap<String, Vec<String>>>;
+    /// Returns the current effective GPS projection for each requested media
+    /// key. This stays path-scoped: a sidecar must not change an otherwise
+    /// identical object at another logical path.
+    async fn gallery_object_gps_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, MediaGpsCoordinates>>;
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -5121,6 +5128,16 @@ impl PersistentStore {
         keys: &[String],
     ) -> Result<HashMap<String, Vec<String>>> {
         self.metadata_store.gallery_object_labels_by_key(keys).await
+    }
+
+    /// Loads the current effective GPS projection for generic current-store
+    /// listings. Callers must not use this for snapshots or historic versions:
+    /// an XMP sidecar is mutable path metadata, not snapshot metadata.
+    pub(crate) async fn gallery_object_gps_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, MediaGpsCoordinates>> {
+        self.metadata_store.gallery_object_gps_by_key(keys).await
     }
 
     pub(crate) async fn query_gallery_delta(
