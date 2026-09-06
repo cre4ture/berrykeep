@@ -509,7 +509,7 @@ export function MultimediaOperationsPage() {
               loading={applyMutation.isPending}
               onClick={() => {
                 const confirmed = window.confirm(
-                  `Apply the selected ${selectedCount} location proposal${selectedCount === 1 ? "" : "s"}? This writes GPS metadata to XMP sidecars and cannot be undone automatically.`
+                  `Apply the selected ${selectedCount} location proposal${selectedCount === 1 ? "" : "s"}? This writes GPS metadata to XMP sidecars. When no embedded capture time exists, it also persists the reviewed fallback capture time. This cannot be undone automatically.`
                 );
                 if (confirmed) {
                   applyMutation.mutate(true);
