@@ -10932,6 +10932,67 @@ run_on_all_metadata_backends!(
     gallery_gps_follows_a_geolocation_sidecar_write_turso
 );
 
+async fn conditional_geolocation_write_skips_replaced_media_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-conditional-write")
+        .await;
+    let media_key = "album/photo.jpg";
+    let reviewed = store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from_static(b"replacement media object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let write = store
+        .set_media_geolocation_if_current(
+            media_key,
+            &reviewed.manifest_hash,
+            &reviewed.object_id,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+            },
+        )
+        .await
+        .expect("a stale media guard must not turn into a storage error");
+    assert!(matches!(write, MediaGeolocationWrite::MediaChanged));
+    assert!(
+        !store
+            .media_sidecar_gps_overlay(media_key)
+            .await
+            .expect("sidecar state should load")
+            .has_geo_location_properties,
+        "the conditional write must not create a sidecar for replacement media"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    conditional_geolocation_write_skips_replaced_media_impl,
+    conditional_geolocation_write_skips_replaced_media,
+    conditional_geolocation_write_skips_replaced_media_turso
+);
+
 async fn gallery_gps_is_visible_before_media_cache_derivation_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend
         .init_store("gallery-geolocation-without-media-cache")

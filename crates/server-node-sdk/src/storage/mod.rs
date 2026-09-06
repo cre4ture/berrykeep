@@ -2413,11 +2413,13 @@ pub struct PutResult {
 }
 
 /// Explicit result of a geolocation sidecar mutation. This distinguishes a
-/// concurrent/existing GPS write from genuine storage or XMP failures.
+/// concurrent/existing GPS write or a changed media object from genuine
+/// storage or XMP failures.
 #[derive(Debug, Clone)]
 pub enum MediaGeolocationWrite {
     Applied(PutResult),
     AlreadyHasGps,
+    MediaChanged,
 }
 
 /// Current GPS state stored in a media sidecar. `has_geo_location_properties`
@@ -10049,6 +10051,29 @@ impl PersistentStore {
         self.write_media_sidecar(media_key, sidecar)
             .await
             .map(MediaGeolocationWrite::Applied)
+    }
+
+    /// Applies inferred GPS only while `media_key` still identifies the exact
+    /// media version reviewed by an operation. Callers hold the server store
+    /// write lock for this check and the following sidecar write, so a normal
+    /// object mutation cannot replace the media between revalidation and the
+    /// write.
+    pub async fn set_media_geolocation_if_current(
+        &mut self,
+        media_key: &str,
+        expected_manifest_hash: &str,
+        expected_object_id: &str,
+        inference: XmpGeoInference,
+    ) -> Result<MediaGeolocationWrite> {
+        let identity = self.current_object_identity(media_key).await?;
+        if !matches!(
+            identity,
+            Some((manifest_hash, object_id))
+                if manifest_hash == expected_manifest_hash && object_id == expected_object_id
+        ) {
+            return Ok(MediaGeolocationWrite::MediaChanged);
+        }
+        self.set_media_geolocation(media_key, inference).await
     }
 
     /// Reads the GPS overlay and the more conservative write guard in one

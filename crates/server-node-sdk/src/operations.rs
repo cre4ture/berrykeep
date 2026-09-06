@@ -1955,11 +1955,21 @@ async fn apply_one_geo_proposal(
     let write = {
         let mut store = lock_store(state, "operations.geo_apply.write_sidecar").await;
         store
-            .set_media_geolocation(&proposal.media_path, inference)
+            .set_media_geolocation_if_current(
+                &proposal.media_path,
+                &proposal.manifest_hash,
+                &proposal.object_id,
+                inference,
+            )
             .await
     };
     let result = match write {
         Ok(storage::MediaGeolocationWrite::Applied(result)) => result,
+        Ok(storage::MediaGeolocationWrite::MediaChanged) => {
+            return stale(
+                "media object identity or current version changed during sidecar write".to_string(),
+            );
+        }
         Ok(storage::MediaGeolocationWrite::AlreadyHasGps) => {
             return GeoApplyItemResult {
                 proposal_id: proposal.id.clone(),
