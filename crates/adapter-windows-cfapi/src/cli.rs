@@ -158,22 +158,24 @@ fn log_remote_object_reconcile_summary(label: &str, report: &RemoteObjectReconci
         && report.conflicted_paths.is_empty()
         && report.preserved_paths.is_empty()
         && report.suppressed_startup_paths.is_empty()
+        && report.unresolved_remote_object_ids.is_empty()
     {
         return;
     }
 
     tracing::info!(
-        "remote-object-reconcile: {} deleted={} renamed={} migrated={} conflicted={} preserved={} suppressed={}",
+        "remote-object-reconcile: {} deleted={} renamed={} migrated={} conflicted={} preserved={} suppressed={} unresolved={}",
         label,
         report.deleted_paths.len(),
         report.renamed_paths.len(),
         report.migrated_paths.len(),
         report.conflicted_paths.len(),
         report.preserved_paths.len(),
-        report.suppressed_startup_paths.len()
+        report.suppressed_startup_paths.len(),
+        report.unresolved_remote_object_ids.len()
     );
     tracing::info!(
-        "remote-object-reconcile: {} deleted_sample={:?} renamed_sample={:?} migrated_sample={:?} conflict_sample={:?} preserved_sample={:?} suppressed_sample={:?}",
+        "remote-object-reconcile: {} deleted_sample={:?} renamed_sample={:?} migrated_sample={:?} conflict_sample={:?} preserved_sample={:?} suppressed_sample={:?} unresolved_sample={:?}",
         label,
         report
             .deleted_paths
@@ -202,6 +204,12 @@ fn log_remote_object_reconcile_summary(label: &str, report: &RemoteObjectReconci
             .collect::<Vec<_>>(),
         report
             .suppressed_startup_paths
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>(),
+        report
+            .unresolved_remote_object_ids
             .iter()
             .take(8)
             .cloned()
@@ -514,6 +522,11 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                 RemoteObjectReconcileReport::default()
             }
         };
+        let has_unresolved_remote_objects = Arc::new(AtomicBool::new(
+            !startup_reconcile_report
+                .unresolved_remote_object_ids
+                .is_empty(),
+        ));
         let action_plan = adapter.plan_actions(&initial_snapshot, &SyncPolicy::default());
         log_action_plan_summary("startup", &action_plan);
 
@@ -616,7 +629,9 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let refresh_remote_applied_tracker = remote_applied_tracker.clone();
         let refresh_monitor_gate = refresh_gate.clone();
         let refresh_status_publisher = status_publisher.clone();
-        refresh_poller.spawn_fetcher_loop(
+        let refresh_has_unresolved_remote_objects = has_unresolved_remote_objects.clone();
+        let refresh_needs_unchanged_snapshot = has_unresolved_remote_objects.clone();
+        refresh_poller.spawn_fetcher_loop_with_unchanged_snapshot_refresh(
             refresh_running,
             Some(initial_snapshot),
             fetcher,
@@ -643,6 +658,10 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                         &update.object_changes,
                         refresh_provider_instance_id,
                         Some(uploader.as_ref()),
+                    );
+                    refresh_has_unresolved_remote_objects.store(
+                        !report.unresolved_remote_object_ids.is_empty(),
+                        Ordering::SeqCst,
                     );
                     if let Err(err) = apply_action_plan_with_observed_placeholder_paths(
                         &refresh_registration.root_path,
@@ -689,6 +708,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                     );
                 }
             },
+            move || refresh_needs_unchanged_snapshot.load(Ordering::SeqCst),
         );
 
         while running.load(Ordering::SeqCst) {

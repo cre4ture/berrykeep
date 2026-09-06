@@ -1,6 +1,6 @@
 use crate::content_fingerprint::FingerprintingReader;
 use crate::placeholder_metadata::{
-    RemoteObjectResolution, RemoteObjectResolver, ResolvedRemoteObject,
+    RemoteObjectResolution, RemoteObjectResolver, ResolvedRemoteObject, ResolvedRemoteTombstone,
 };
 use crate::runtime::{
     HydrationProgress, HydrationRequest, HydrationResult, Hydrator, ObjectRenameReceipt,
@@ -353,10 +353,10 @@ impl Uploader for ServerNodeHydrator {
 }
 
 impl RemoteObjectResolver for ServerNodeHydrator {
-    fn resolve_object(&self, object_id: &str) -> Result<Option<ResolvedRemoteObject>> {
+    fn resolve_object(&self, object_id: &str) -> Result<RemoteObjectResolution> {
         self.sdk
             .lookup_object_by_id_blocking(object_id)
-            .map(|resolved| resolved.and_then(active_resolved_remote_object))
+            .map(remote_object_resolution)
     }
 
     fn resolve_objects(
@@ -387,10 +387,7 @@ impl RemoteObjectResolver for ServerNodeHydrator {
                             break;
                         };
                         let resolution = match sdk.lookup_object_by_id_blocking(object_id) {
-                            Ok(Some(remote)) => active_resolved_remote_object(remote)
-                                .map(RemoteObjectResolution::Present)
-                                .unwrap_or(RemoteObjectResolution::Absent),
-                            Ok(None) => RemoteObjectResolution::Absent,
+                            Ok(remote) => remote_object_resolution(remote),
                             Err(error) => RemoteObjectResolution::Unavailable(format!("{error:#}")),
                         };
                         let mut results = results
@@ -408,16 +405,20 @@ impl RemoteObjectResolver for ServerNodeHydrator {
     }
 }
 
-fn active_resolved_remote_object(resolved: ObjectLookup) -> Option<ResolvedRemoteObject> {
-    // The identity endpoint deliberately retains tombstones so a client can
-    // inspect their final revision.  CFAPI reconciliation needs the active
-    // namespace, though: a tombstone confirms that this object no longer has
-    // a remotely live path.
-    (resolved.entry_type != "tombstone").then_some(ResolvedRemoteObject {
-        object_id: resolved.object_id,
-        path: resolved.path,
-        revision: resolved.revision,
-    })
+fn remote_object_resolution(resolved: Option<ObjectLookup>) -> RemoteObjectResolution {
+    match resolved {
+        Some(resolved) if resolved.entry_type == "tombstone" => {
+            RemoteObjectResolution::Tombstone(ResolvedRemoteTombstone {
+                predecessor_revision: resolved.tombstone_predecessor_revision,
+            })
+        }
+        Some(resolved) => RemoteObjectResolution::Present(ResolvedRemoteObject {
+            object_id: resolved.object_id,
+            path: resolved.path,
+            revision: resolved.revision,
+        }),
+        None => RemoteObjectResolution::NotFound,
+    }
 }
 
 pub fn normalize_base_url(input: &str) -> Result<Url> {
@@ -532,15 +533,29 @@ mod tests {
     }
 
     #[test]
-    fn object_resolver_interprets_an_identity_tombstone_as_absent() {
+    fn object_resolver_interprets_an_identity_tombstone_as_a_tombstone() {
         let tombstone = ObjectLookup {
             object_id: "object-deleted".to_string(),
             path: "docs/deleted.txt".to_string(),
             revision: Some("revision-tombstone".to_string()),
+            tombstone_predecessor_revision: Some("revision-live".to_string()),
             entry_type: "tombstone".to_string(),
         };
 
-        assert!(active_resolved_remote_object(tombstone).is_none());
+        assert_eq!(
+            remote_object_resolution(Some(tombstone)),
+            RemoteObjectResolution::Tombstone(ResolvedRemoteTombstone {
+                predecessor_revision: Some("revision-live".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn object_resolver_interprets_an_unknown_identity_as_not_found() {
+        assert_eq!(
+            remote_object_resolution(None),
+            RemoteObjectResolution::NotFound
+        );
     }
 
     #[test]

@@ -14774,6 +14774,10 @@ async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTest
         tombstone_lookup.revision.as_deref(),
         Some(deleted.revision.as_str())
     );
+    assert_eq!(
+        tombstone_lookup.tombstone_predecessor_revision.as_deref(),
+        moved_lookup.revision.as_deref()
+    );
     assert_eq!(tombstone_lookup.entry_type, "tombstone");
 
     let directory_path = "object-id-directory/".to_string();

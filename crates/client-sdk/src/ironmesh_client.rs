@@ -3955,6 +3955,8 @@ pub struct ObjectLookup {
     pub object_id: String,
     pub path: String,
     pub revision: Option<String>,
+    #[serde(default)]
+    pub tombstone_predecessor_revision: Option<String>,
     pub entry_type: String,
 }
 
