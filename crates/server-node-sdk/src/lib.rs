@@ -155,6 +155,7 @@ mod listing;
 mod map_config;
 mod map_dataset_import;
 mod natural_earth_import;
+mod operations;
 mod reliability_telemetry;
 mod rendezvous_contact_config;
 mod replication;
@@ -427,6 +428,7 @@ struct ServerMaintenanceRuntime {
     repair_state: Arc<Mutex<RepairExecutorState>>,
     repair_activity: Arc<Mutex<RepairActivityRuntime>>,
     manual_repair_activity: Arc<Mutex<ManualRepairActionActivityRuntime>>,
+    operations_activity: Arc<Mutex<operations::OperationActivityRuntime>>,
     autonomous_post_write_repair: Arc<Mutex<AutonomousPostWriteRepairRuntime>>,
     data_scrub_enabled: bool,
     data_scrub_interval_secs: u64,
@@ -7512,6 +7514,9 @@ async fn run_inner(
             manual_repair_activity: Arc::new(Mutex::new(
                 ManualRepairActionActivityRuntime::default(),
             )),
+            operations_activity: Arc::new(Mutex::new(
+                operations::OperationActivityRuntime::default(),
+            )),
             autonomous_post_write_repair: Arc::new(Mutex::new(
                 AutonomousPostWriteRepairRuntime::default(),
             )),
@@ -7538,6 +7543,7 @@ async fn run_inner(
         )),
     };
     seed_process_temperature_stats_for_tests(&state);
+    operations::interrupt_runs_after_server_restart(&state).await;
 
     start_background_runtimes(&state, &config, startup_phase_anchor).await;
 
@@ -7782,6 +7788,23 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/admin/change-password", post(change_admin_password))
         .route("/auth/repair/activity", get(repair_activity_status))
         .route("/auth/repair/history", get(repair_history))
+        .route("/auth/operations", get(operations::list_operations))
+        .route(
+            "/auth/operations/{operation_id}/runs",
+            post(operations::start_operation_run),
+        )
+        .route(
+            "/auth/operation-runs/{run_id}",
+            get(operations::get_operation_run),
+        )
+        .route(
+            "/auth/operation-runs/{run_id}/results",
+            get(operations::get_operation_run_results),
+        )
+        .route(
+            "/auth/operation-runs/history",
+            get(operations::get_operation_run_history),
+        )
         .route("/auth/repair/actions", get(list_manual_repair_actions))
         .route(
             "/auth/repair/actions/activity",
@@ -17690,6 +17713,7 @@ fn store_index_entry_from_gallery_entry(
                 &MediaCacheLookup {
                     content_fingerprint: content_fingerprint.clone(),
                     metadata: entry.media_metadata,
+                    gps_override: entry.gps_override,
                 },
                 thumbnail_route,
             )
@@ -17766,6 +17790,23 @@ async fn store_index_media_labels_by_key(
     store.gallery_object_labels_by_key(&keys).await
 }
 
+async fn store_index_media_gps_by_key(
+    state: &ServerState,
+    entries: &[StoreIndexEntry],
+    operation: &'static str,
+) -> Result<HashMap<String, MediaGpsCoordinates>> {
+    let keys = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let store = read_store(state, operation).await;
+    store.gallery_object_gps_by_key(&keys).await
+}
+
 fn populate_store_index_entry_labels(
     entries: &mut [StoreIndexEntry],
     labels_by_key: &HashMap<String, Vec<String>>,
@@ -17774,6 +17815,37 @@ fn populate_store_index_entry_labels(
         if let Some(labels) = labels_by_key.get(&entry.path) {
             entry.labels = labels.clone();
             entry.labels_resolved = true;
+        }
+    }
+}
+
+fn populate_store_index_entry_gps(
+    entries: &mut [StoreIndexEntry],
+    gps_by_key: &HashMap<String, MediaGpsCoordinates>,
+) {
+    for entry in entries {
+        if let (Some(gps), Some(media)) = (gps_by_key.get(&entry.path), entry.media.as_mut()) {
+            media.gps = Some(media_gps_response(gps));
+        }
+    }
+}
+
+async fn current_media_gps_override(
+    state: &ServerState,
+    key: &str,
+    operation: &'static str,
+) -> Option<MediaGpsCoordinates> {
+    let keys = vec![key.to_string()];
+    let store = read_store(state, operation).await;
+    match store.gallery_object_gps_by_key(&keys).await {
+        Ok(gps_by_key) => gps_by_key.get(key).cloned(),
+        Err(error) => {
+            tracing::warn!(
+                key,
+                error = %error,
+                "failed to load optional current XMP GPS projection"
+            );
+            None
         }
     }
 }
@@ -17803,6 +17875,19 @@ async fn cached_store_index_page_response(
             ),
         }
         label_lookup_started_at.elapsed().as_millis()
+    } else {
+        0
+    };
+    let gps_lookup_ms = if query.snapshot.is_none() {
+        let gps_lookup_started_at = Instant::now();
+        match store_index_media_gps_by_key(state, &entries, "store_index.cached_gps").await {
+            Ok(gps_by_key) => populate_store_index_entry_gps(&mut entries, &gps_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional GPS projection for cached generic store index"
+            ),
+        }
+        gps_lookup_started_at.elapsed().as_millis()
     } else {
         0
     };
@@ -17838,7 +17923,7 @@ async fn cached_store_index_page_response(
         request_id,
         response,
         format!(
-            "store-index-page-cache;desc=hit, label-lookup;dur={label_lookup_ms}, total;dur={total_ms}"
+            "store-index-page-cache;desc=hit, label-lookup;dur={label_lookup_ms}, gps-projection-lookup;dur={gps_lookup_ms}, total;dur={total_ms}"
         ),
         cached.matching_key_count,
         cached.visible_file_count,
@@ -18383,6 +18468,19 @@ async fn list_store_index_response_attempt(
         }
         label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
     }
+    let gps_lookup_ms = if query.snapshot.is_none() {
+        let gps_lookup_started_at = Instant::now();
+        match store_index_media_gps_by_key(state, &entries, "store_index.page_gps").await {
+            Ok(gps_by_key) => populate_store_index_entry_gps(&mut entries, &gps_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional GPS projection for generic store index page"
+            ),
+        }
+        gps_lookup_started_at.elapsed().as_millis()
+    } else {
+        0
+    };
     let returned_entry_count = entries.len();
     let total_ms = request_started_at.elapsed().as_millis();
 
@@ -18421,6 +18519,7 @@ async fn list_store_index_response_attempt(
             label_lookup_ms,
             media_lookup_lock_waited_ms = media_lookup_waited_ms,
             media_lookup_ms,
+            gps_lookup_ms,
             tree_collapse_ms,
             filter_ms,
             sort_ms,
@@ -18460,7 +18559,7 @@ async fn list_store_index_response_attempt(
         request_id,
         response,
         format!(
-            "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, label-lookup;dur={label_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
+            "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, label-lookup;dur={label_lookup_ms}, media-lookup;dur={media_lookup_ms}, gps-projection-lookup;dur={gps_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
         ),
         keys.len(),
         entry_plan.file_entries.len(),
@@ -18737,6 +18836,17 @@ async fn list_store_index_response_cursor_mode(
         }
     };
     populate_store_index_entry_labels(&mut entries, &labels_by_key);
+    let gps_lookup_started_at = Instant::now();
+    if query.snapshot.is_none() {
+        match store_index_media_gps_by_key(state, &entries, "store_index.cursor_gps").await {
+            Ok(gps_by_key) => populate_store_index_entry_gps(&mut entries, &gps_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional GPS projection for cursor store index"
+            ),
+        }
+    }
+    let gps_lookup_ms = gps_lookup_started_at.elapsed().as_millis();
 
     let media_summary = summarize_store_index_entries(&entries);
     let returned_entry_count = entries.len();
@@ -18771,6 +18881,7 @@ async fn list_store_index_response_cursor_mode(
             metadata_lookup_ms,
             media_lookup_lock_waited_ms = media_lookup_waited_ms,
             media_lookup_ms,
+            gps_lookup_ms,
             tree_collapse_ms = 0,
             filter_ms = 0,
             sort_ms = 0,
@@ -18820,7 +18931,7 @@ async fn list_store_index_response_cursor_mode(
             .insert("x-ironmesh-store-index-request-id", header_value);
     }
     let server_timing = format!(
-        "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur=0, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur=0, filter;dur=0, sort;dur=0, paginate;dur={pagination_ms}, total;dur={total_ms}"
+        "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur=0, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, gps-projection-lookup;dur={gps_lookup_ms}, tree-collapse;dur=0, filter;dur=0, sort;dur=0, paginate;dur={pagination_ms}, total;dur={total_ms}"
     );
     if let Ok(header_value) = HeaderValue::from_str(&server_timing) {
         response.headers_mut().insert("server-timing", header_value);
@@ -19176,7 +19287,11 @@ fn build_media_index_response(
             total_bitrate_bps: metadata.total_bitrate_bps,
             codec_name: metadata.codec_name.clone(),
             codec_fourcc: metadata.codec_fourcc.clone(),
-            gps: metadata.gps.as_ref().map(media_gps_response),
+            gps: lookup
+                .gps_override
+                .as_ref()
+                .or(metadata.gps.as_ref())
+                .map(media_gps_response),
             photo: metadata.photo.as_ref().map(|photo| MediaPhotoResponse {
                 camera_manufacturer: photo.camera_manufacturer.clone(),
                 camera_model: photo.camera_model.clone(),
@@ -19207,7 +19322,7 @@ fn build_media_index_response(
             total_bitrate_bps: None,
             codec_name: None,
             codec_fourcc: None,
-            gps: None,
+            gps: lookup.gps_override.as_ref().map(media_gps_response),
             photo: None,
             thumbnail: Some(placeholder_thumbnail_response(thumbnail_url)),
             error: None,
@@ -20938,9 +21053,15 @@ async fn retry_media_cache_response(
         }
     };
 
+    let gps_override = if query.snapshot.is_none() && query.version.is_none() {
+        current_media_gps_override(state, &query.key, "media_cache.retry.gps").await
+    } else {
+        None
+    };
     let lookup = MediaCacheLookup {
         content_fingerprint: metadata.content_fingerprint.clone(),
         metadata: Some(metadata),
+        gps_override,
     };
 
     (
@@ -21007,6 +21128,35 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
+            let (current_manifest_hash, current_gps_override) = match store
+                .current_object_identity(key)
+                .await
+            {
+                Ok(Some((manifest_hash, _))) => {
+                    let keys = vec![key.to_string()];
+                    let gps_override = match store.gallery_object_gps_by_key(&keys).await {
+                        Ok(gps_by_key) => gps_by_key.get(key).cloned(),
+                        Err(error) => {
+                            tracing::warn!(
+                                key,
+                                error = %error,
+                                "failed to load optional current XMP GPS projection for version history"
+                            );
+                            None
+                        }
+                    };
+                    (Some(manifest_hash), gps_override)
+                }
+                Ok(None) => (None, None),
+                Err(error) => {
+                    tracing::warn!(
+                        key,
+                        error = %error,
+                        "failed to resolve current object while loading version history"
+                    );
+                    (None, None)
+                }
+            };
             let mut versions = Vec::with_capacity(summary.versions.len());
             for version in summary.versions {
                 let is_tombstone = version.manifest_hash == TOMBSTONE_MANIFEST_HASH;
@@ -21046,9 +21196,17 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
                         .lookup_media_cache(&version.manifest_hash)
                         .await
                     {
-                        Ok(Some(lookup)) => {
+                        Ok(Some(mut lookup)) => {
                             content_fingerprint = Some(lookup.content_fingerprint.clone());
                             if looks_like_media_path(version_path) {
+                                // Sidecars are path-scoped mutable metadata. A current
+                                // location can decorate only the current manifest, never
+                                // an older version in this history.
+                                if current_manifest_hash.as_deref()
+                                    == Some(version.manifest_hash.as_str())
+                                {
+                                    lookup.gps_override = current_gps_override.clone();
+                                }
                                 media = Some(build_media_index_response(
                                     key,
                                     None,
@@ -29086,19 +29244,52 @@ async fn persist_manual_repair_action_run_record_with_retention(
     record: &ManualRepairActionRunRecord,
 ) {
     let store = lock_store(state, "manual_repair.persist").await;
-    if let Err(err) = store.persist_manual_repair_action_run_record(record).await {
+    // Finalize the generic adapter first. If the legacy record write fails,
+    // this replaces the running adapter persisted at start rather than leaving
+    // an unprunable, permanently in-flight operation run behind.
+    if let Err(err) = store
+        .persist_operation_run(&operation_run_from_manual_repair_record(record))
+        .await
+    {
         warn!(
             error = %err,
             run_id = %record.run_id,
             action_id = %record.action_id,
-            "failed to persist manual repair action history record"
+            "failed to persist generic operation adapter for manual repair action"
         );
-        return;
     }
+    let legacy_record_persisted = match store.persist_manual_repair_action_run_record(record).await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(
+                error = %err,
+                run_id = %record.run_id,
+                action_id = %record.action_id,
+                "failed to persist manual repair action history record"
+            );
+            false
+        }
+    };
 
     let retention_cutoff = record
         .finished_at_unix
         .saturating_sub(state.maintenance.repair_run_history_retention_secs);
+    if let Err(err) = store
+        .prune_operation_run_history_before(retention_cutoff)
+        .await
+    {
+        warn!(
+            error = %err,
+            retention_cutoff,
+            run_id = %record.run_id,
+            action_id = %record.action_id,
+            "failed to prune generic operation history for manual repair actions"
+        );
+    }
+    if !legacy_record_persisted {
+        return;
+    }
     if let Err(err) = store
         .prune_manual_repair_action_run_history_before(retention_cutoff)
         .await
@@ -29109,6 +29300,68 @@ async fn persist_manual_repair_action_run_record_with_retention(
             run_id = %record.run_id,
             action_id = %record.action_id,
             "failed to prune manual repair action history"
+        );
+    }
+}
+
+fn operation_run_from_manual_repair_record(
+    record: &ManualRepairActionRunRecord,
+) -> operations::OperationRun {
+    operations::OperationRun {
+        run_id: record.run_id.clone(),
+        operation_id: format!("repair.{}", record.action_id),
+        status: match record.status {
+            ManualRepairActionRunStatus::Completed => operations::OperationRunStatus::Completed,
+            ManualRepairActionRunStatus::Failed => operations::OperationRunStatus::Failed,
+        },
+        priority: operations::OperationPriority::Repair,
+        created_at_unix: record.started_at_unix,
+        started_at_unix: Some(record.started_at_unix),
+        finished_at_unix: Some(record.finished_at_unix),
+        progress: operations::OperationProgress {
+            phase: Some("completed".to_string()),
+            message: Some(record.summary.clone()),
+            ..operations::OperationProgress::default()
+        },
+        input: json!({ "dry_run": record.dry_run }),
+        summary: Some(json!({
+            "changed": record.changed,
+            "report": record.report,
+        })),
+        error: record.last_error.clone(),
+        termination_reason: None,
+    }
+}
+
+async fn persist_manual_repair_action_operation_started(
+    state: &ServerState,
+    active_run: &ManualRepairActionActiveRun,
+) {
+    let run = operations::OperationRun {
+        run_id: active_run.run_id.clone(),
+        operation_id: format!("repair.{}", active_run.action_id),
+        status: operations::OperationRunStatus::Running,
+        priority: operations::OperationPriority::Repair,
+        created_at_unix: active_run.started_at_unix,
+        started_at_unix: Some(active_run.started_at_unix),
+        finished_at_unix: None,
+        progress: operations::OperationProgress {
+            phase: Some("running".to_string()),
+            message: Some("Manual repair action is running.".to_string()),
+            ..operations::OperationProgress::default()
+        },
+        input: json!({ "dry_run": active_run.dry_run }),
+        summary: None,
+        error: None,
+        termination_reason: None,
+    };
+    let store = lock_store(state, "manual_repair.persist_started_operation").await;
+    if let Err(error) = store.persist_operation_run(&run).await {
+        warn!(
+            error = %error,
+            run_id = %run.run_id,
+            action_id = %run.operation_id,
+            "failed to persist started generic operation adapter for manual repair action"
         );
     }
 }
@@ -29361,6 +29614,7 @@ async fn start_local_manual_repair_action(
     };
 
     let (active_run, tracker) = active_or_new;
+    persist_manual_repair_action_operation_started(state, &active_run).await;
     let state_clone = state.clone();
     tokio::spawn(async move {
         execute_manual_repair_action_run(state_clone, tracker).await;

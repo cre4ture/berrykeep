@@ -9,8 +9,8 @@
 //! Sidecars are regularly authored by third-party tools (Lightroom, digiKam,
 //! darktable). Those tools store a large number of namespaces Ironmesh does not
 //! model, so parsing has to be lossless: the raw XML event stream of the packet
-//! is retained verbatim and only the `dc:subject` property is regenerated when
-//! the packet is written back.
+//! is retained verbatim. BerryKeep-generated label, GPS, and approved
+//! capture-time properties are inserted without rewriting user content.
 //!
 //! The module is split into three layers:
 //! * reading raw events from bytes (`read_resolved_events`),
@@ -33,8 +33,16 @@ pub const XMP_SIDECAR_SUFFIX: &str = ".xmp";
 
 const RDF_NAMESPACE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const DC_NAMESPACE: &str = "http://purl.org/dc/elements/1.1/";
+const EXIF_NAMESPACE: &str = "http://ns.adobe.com/exif/1.0/";
+const XMP_NAMESPACE: &str = "http://ns.adobe.com/xap/1.0/";
+const PHOTOSHOP_NAMESPACE: &str = "http://ns.adobe.com/photoshop/1.0/";
+const BERRYKEEP_NAMESPACE: &str = "https://berrykeep.app/ns/1.0/";
 const RDF_PREFIX_FALLBACK: &str = "rdf";
 const DC_PREFIX_FALLBACK: &str = "dc";
+const EXIF_PREFIX_FALLBACK: &str = "exif";
+const XMP_PREFIX_FALLBACK: &str = "xmp";
+const PHOTOSHOP_PREFIX_FALLBACK: &str = "photoshop";
+const BERRYKEEP_PREFIX_FALLBACK: &str = "berrykeep";
 const INDENT_STEP_FALLBACK: &str = " ";
 
 /// Minimal, valid and empty XMP packet used by [`XmpSidecar::new_empty`].
@@ -66,6 +74,47 @@ pub struct XmpSidecar {
     indent: Option<Indentation>,
     /// Prefixes and declarations used for generated markup.
     namespaces: GeneratedNamespaces,
+    /// A newly requested geolocation write. Existing GPS properties remain in
+    /// the lossless event stream; callers only set this after checking that GPS
+    /// is absent, so a write never creates competing locations.
+    geo_inference: Option<XmpGeoInference>,
+}
+
+/// BerryKeep's auditable result of a confirmed geolocation inference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XmpGeoInference {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub method: String,
+    pub run_id: String,
+    pub confidence: String,
+    pub reference_distance_seconds: Option<u64>,
+    pub previous_anchor_distance_seconds: Option<u64>,
+    pub next_anchor_distance_seconds: Option<u64>,
+    pub estimated_speed_kmh: Option<f64>,
+    /// The reviewed capture time to write through interoperable XMP fields.
+    /// `None` keeps generic GPS-only callers backward compatible.
+    pub approved_capture_time: Option<XmpApprovedCaptureTime>,
+}
+
+/// Capture time approved as part of a geolocation review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmpApprovedCaptureTime {
+    /// ISO 8601 local date/time, with an offset only when the source supplied
+    /// one. A floating time deliberately has no fabricated UTC designator.
+    pub value: String,
+    pub source: String,
+    pub basis: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XmpGeoLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+    /// `true` when the sidecar marks this location as a BerryKeep inference.
+    /// Inference runs exclude such locations as anchors so derived positions
+    /// can never become new ground-truth input.
+    pub inferred_by_berrykeep: bool,
 }
 
 impl XmpSidecar {
@@ -97,6 +146,7 @@ impl XmpSidecar {
             placement: layout.placement,
             indent: layout.indent,
             namespaces,
+            geo_inference: None,
         })
     }
 
@@ -119,6 +169,59 @@ impl XmpSidecar {
         self.keywords = keywords;
     }
 
+    /// Returns a valid location already present in the XMP packet or staged by
+    /// [`Self::set_geo_inference`]. Both common XMP attribute and element
+    /// property forms are accepted.
+    pub fn geo_location(&self) -> Option<XmpGeoLocation> {
+        read_geo_location(&self.events).or_else(|| {
+            self.geo_inference.as_ref().map(|inference| XmpGeoLocation {
+                latitude: inference.latitude,
+                longitude: inference.longitude,
+                inferred_by_berrykeep: true,
+            })
+        })
+    }
+
+    /// Returns whether the packet carries either EXIF coordinate property,
+    /// even if its value is incomplete or cannot be parsed safely. Callers
+    /// that mutate GPS must use this guard rather than [`Self::geo_location`]:
+    /// an unparseable third-party coordinate is still user-owned metadata and
+    /// must never be shadowed by an additional inferred location.
+    pub fn has_geo_location_properties(&self) -> bool {
+        self.geo_inference.is_some() || has_geo_location_properties(&self.events)
+    }
+
+    /// Returns whether a third-party XMP packet already provides a capture
+    /// time. An inference with an approved capture time must not overwrite it:
+    /// the item is left for review instead of creating contradictory metadata.
+    pub fn has_capture_time_properties(&self) -> bool {
+        has_capture_time_properties(&self.events)
+    }
+
+    /// Stages canonical EXIF GPS fields and BerryKeep provenance on a fresh
+    /// `rdf:Description`. Unknown XMP content is retained verbatim.
+    ///
+    /// The sidecar must not already contain GPS, including a pending inference.
+    /// This preserves the no-competing-locations invariant even when callers
+    /// reuse one [`XmpSidecar`] instance before serializing it.
+    pub fn set_geo_inference(&mut self, inference: XmpGeoInference) -> Result<()> {
+        if !inference.latitude.is_finite()
+            || !(-90.0..=90.0).contains(&inference.latitude)
+            || !inference.longitude.is_finite()
+            || !(-180.0..=180.0).contains(&inference.longitude)
+        {
+            bail!("invalid XMP geolocation coordinates");
+        }
+        if self.has_geo_location_properties() {
+            bail!("XMP sidecar already contains geolocation properties");
+        }
+        if inference.approved_capture_time.is_some() && self.has_capture_time_properties() {
+            bail!("XMP sidecar already contains capture-time properties");
+        }
+        self.geo_inference = Some(inference);
+        Ok(())
+    }
+
     /// Serializes the packet back to bytes.
     ///
     /// Fails when keywords are set but the packet offers no place to store them,
@@ -136,25 +239,67 @@ impl XmpSidecar {
     /// Builds the full output event stream by splicing the regenerated
     /// `dc:subject` property into the retained events.
     fn output_events(&self) -> Result<Vec<Event<'_>>> {
-        if self.keywords.is_empty() {
+        if self.keywords.is_empty() && self.geo_inference.is_none() {
             return Ok(self.retained_events(..).collect());
         }
 
-        let placement = self.placement.context(
-            "XMP packet offers no place for dc:subject: the rdf:RDF element is self-closing",
-        )?;
-        let declarations = self.namespaces.declarations.as_slice();
-        let (index, replaces_event, block) = match placement {
-            SubjectPlacement::Before(index) => (index, false, self.render_property(declarations)),
-            SubjectPlacement::InsideSelfClosing(index) => {
-                (index, true, self.expand_description(index)?)
-            }
-            SubjectPlacement::WrappedBefore(index) => (index, false, self.wrap_in_description()),
-        };
+        // Find the generated GPS insertion point in the retained stream, so
+        // the normal keyword-only path can keep borrowing every third-party
+        // event. Keyword rendering below may move that point forward.
+        let mut geo_insertion_index = self
+            .geo_inference
+            .as_ref()
+            .map(|_| {
+                self.events
+                    .iter()
+                    .rposition(|event| {
+                        event.namespace.as_deref() == Some(RDF_NAMESPACE)
+                            && matches!(
+                                &event.event,
+                                Event::End(end) if end.local_name().into_inner() == b"RDF"
+                            )
+                    })
+                    .context("XMP packet offers no rdf:RDF closing element for GPS metadata")
+            })
+            .transpose()?;
 
-        let mut output: Vec<Event<'_>> = self.retained_events(..index).collect();
-        output.extend(block);
-        output.extend(self.retained_events(index + usize::from(replaces_event)..));
+        let mut output: Vec<Event<'_>> = if self.keywords.is_empty() {
+            self.retained_events(..).collect()
+        } else {
+            let placement = self.placement.context(
+                "XMP packet offers no place for dc:subject: the rdf:RDF element is self-closing",
+            )?;
+            let declarations = self.namespaces.declarations.as_slice();
+            let (index, replaces_event, block) = match placement {
+                SubjectPlacement::Before(index) => {
+                    (index, false, self.render_property(declarations))
+                }
+                SubjectPlacement::InsideSelfClosing(index) => {
+                    (index, true, self.expand_description(index)?)
+                }
+                SubjectPlacement::WrappedBefore(index) => {
+                    (index, false, self.wrap_in_description())
+                }
+            };
+
+            if let Some(geo_insertion_index) = geo_insertion_index.as_mut()
+                && *geo_insertion_index >= index
+            {
+                *geo_insertion_index += block.len() - usize::from(replaces_event);
+            }
+
+            let mut output: Vec<Event<'_>> = self.retained_events(..index).collect();
+            output.extend(block);
+            output.extend(self.retained_events(index + usize::from(replaces_event)..));
+            output
+        };
+        if let (Some(inference), Some(insertion_index)) = (&self.geo_inference, geo_insertion_index)
+        {
+            output.splice(
+                insertion_index..insertion_index,
+                self.render_geo_inference(inference),
+            );
+        }
         Ok(output)
     }
 
@@ -242,6 +387,125 @@ impl XmpSidecar {
         events
     }
 
+    fn render_geo_inference(&self, inference: &XmpGeoInference) -> Vec<Event<'static>> {
+        let rdf_prefix = &self.namespaces.rdf_prefix;
+        let mut description = BytesStart::new(qualified_name(rdf_prefix, "Description"));
+        description.push_attribute((qualified_name(rdf_prefix, "about").as_str(), ""));
+        // GPS is inserted as a sibling of existing rdf:Description elements,
+        // while `namespaces` is resolved for the dc:subject insertion point.
+        // Bind the rendered RDF prefix locally so it remains valid when that
+        // prefix was declared only on another description.
+        let rdf_namespace_attribute = format!("xmlns:{rdf_prefix}");
+        if !self
+            .namespaces
+            .declarations
+            .iter()
+            .any(|declaration| declaration.attribute == rdf_namespace_attribute)
+        {
+            description.push_attribute((rdf_namespace_attribute.as_str(), RDF_NAMESPACE));
+        }
+        for declaration in &self.namespaces.declarations {
+            description.push_attribute((declaration.attribute.as_str(), declaration.namespace));
+        }
+        description.push_attribute(("xmlns:exif", EXIF_NAMESPACE));
+        description.push_attribute(("xmlns:xmp", XMP_NAMESPACE));
+        description.push_attribute(("xmlns:photoshop", PHOTOSHOP_NAMESPACE));
+        description.push_attribute(("xmlns:berrykeep", BERRYKEEP_NAMESPACE));
+        let latitude = format_xmp_coordinate(inference.latitude, true);
+        let longitude = format_xmp_coordinate(inference.longitude, false);
+        description.push_attribute((
+            qualified_name(EXIF_PREFIX_FALLBACK, "GPSLatitude").as_str(),
+            latitude.as_str(),
+        ));
+        description.push_attribute((
+            qualified_name(EXIF_PREFIX_FALLBACK, "GPSLongitude").as_str(),
+            longitude.as_str(),
+        ));
+        description.push_attribute((
+            qualified_name(EXIF_PREFIX_FALLBACK, "GPSMapDatum").as_str(),
+            "WGS-84",
+        ));
+        if let Some(capture_time) = &inference.approved_capture_time {
+            description.push_attribute((
+                qualified_name(EXIF_PREFIX_FALLBACK, "DateTimeOriginal").as_str(),
+                capture_time.value.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(XMP_PREFIX_FALLBACK, "CreateDate").as_str(),
+                capture_time.value.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(PHOTOSHOP_PREFIX_FALLBACK, "DateCreated").as_str(),
+                capture_time.value.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceCaptureTime").as_str(),
+                capture_time.value.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceCaptureTimeSource").as_str(),
+                capture_time.source.as_str(),
+            ));
+            description.push_attribute((
+                qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceCaptureTimeBasis").as_str(),
+                capture_time.basis.as_str(),
+            ));
+        }
+        description.push_attribute((
+            qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceMethod").as_str(),
+            inference.method.as_str(),
+        ));
+        description.push_attribute((
+            qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceRunId").as_str(),
+            inference.run_id.as_str(),
+        ));
+        description.push_attribute((
+            qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceConfidence").as_str(),
+            inference.confidence.as_str(),
+        ));
+        if let Some(value) = inference.reference_distance_seconds {
+            description.push_attribute((
+                qualified_name(
+                    BERRYKEEP_PREFIX_FALLBACK,
+                    "GeoInferenceReferenceDistanceSeconds",
+                )
+                .as_str(),
+                value.to_string().as_str(),
+            ));
+        }
+        if let Some(value) = inference.previous_anchor_distance_seconds {
+            description.push_attribute((
+                qualified_name(
+                    BERRYKEEP_PREFIX_FALLBACK,
+                    "GeoInferencePreviousAnchorDistanceSeconds",
+                )
+                .as_str(),
+                value.to_string().as_str(),
+            ));
+        }
+        if let Some(value) = inference.next_anchor_distance_seconds {
+            description.push_attribute((
+                qualified_name(
+                    BERRYKEEP_PREFIX_FALLBACK,
+                    "GeoInferenceNextAnchorDistanceSeconds",
+                )
+                .as_str(),
+                value.to_string().as_str(),
+            ));
+        }
+        if let Some(value) = inference.estimated_speed_kmh {
+            let value = format!("{value:.3}");
+            description.push_attribute((
+                qualified_name(BERRYKEEP_PREFIX_FALLBACK, "GeoInferenceEstimatedSpeedKmh").as_str(),
+                value.as_str(),
+            ));
+        }
+        let mut events = Vec::new();
+        self.push_line_break(&mut events, 0);
+        events.push(Event::Empty(description));
+        events
+    }
+
     /// Appends a line break plus the indentation of the given nesting level,
     /// unless the packet is not indented at all.
     fn push_line_break(&self, events: &mut Vec<Event<'static>>, depth: usize) {
@@ -260,6 +524,25 @@ impl XmpSidecar {
 struct ResolvedEvent {
     event: Event<'static>,
     namespace: Option<String>,
+    attributes: Vec<ResolvedAttribute>,
+    /// Attribute syntax is decoded lazily by `quick_xml`. Preserve the fact
+    /// that an attribute could not be decoded even though the raw event itself
+    /// was accepted, so safety checks do not mistake malformed third-party
+    /// metadata for absent metadata.
+    has_undecodable_attributes: bool,
+}
+
+/// An attribute name resolved in the namespace scope of its owning event.
+///
+/// `quick_xml` resolves element names for us, but XMP uses many properties as
+/// attributes. Retaining their expanded names avoids treating an unrelated
+/// `foo:GPSLatitude` as EXIF merely because some other part of the document
+/// happens to bind an `exif` prefix.
+#[derive(Debug, Clone)]
+struct ResolvedAttribute {
+    raw_name: Vec<u8>,
+    namespace: Option<String>,
+    local_name: Vec<u8>,
 }
 
 /// Span of an element inside the event stream.
@@ -372,18 +655,48 @@ fn read_resolved_events(bytes: &[u8]) -> Result<Vec<ResolvedEvent>> {
         if matches!(event, Event::Eof) {
             break;
         }
-        let namespace = match resolved {
-            ResolveResult::Bound(namespace) => {
-                Some(String::from_utf8_lossy(namespace.into_inner()).into_owned())
+        let namespace = resolved_namespace(resolved);
+        let (attributes, has_undecodable_attributes) = match &event {
+            Event::Start(element) | Event::Empty(element) => {
+                let mut attributes = element.attributes();
+                attributes.with_checks(false);
+                let mut resolved_attributes = Vec::new();
+                let mut has_undecodable_attributes = false;
+                for attribute in attributes {
+                    match attribute {
+                        Ok(attribute) => {
+                            let (namespace, local_name) =
+                                reader.resolver().resolve_attribute(attribute.key);
+                            resolved_attributes.push(ResolvedAttribute {
+                                raw_name: attribute.key.as_ref().to_vec(),
+                                namespace: resolved_namespace(namespace),
+                                local_name: local_name.as_ref().to_vec(),
+                            });
+                        }
+                        Err(_) => has_undecodable_attributes = true,
+                    }
+                }
+                (resolved_attributes, has_undecodable_attributes)
             }
-            ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
+            _ => (Vec::new(), false),
         };
         events.push(ResolvedEvent {
             namespace,
+            attributes,
+            has_undecodable_attributes,
             event: event.into_owned(),
         });
     }
     Ok(events)
+}
+
+fn resolved_namespace(resolved: ResolveResult<'_>) -> Option<String> {
+    match resolved {
+        ResolveResult::Bound(namespace) => {
+            Some(String::from_utf8_lossy(namespace.into_inner()).into_owned())
+        }
+        ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
+    }
 }
 
 /// Locates the elements that matter for storing `dc:subject`.
@@ -692,6 +1005,265 @@ fn qualified_name(prefix: &str, local_name: &str) -> String {
     format!("{prefix}:{local_name}")
 }
 
+#[derive(Debug, Default)]
+struct DescriptionGeoState {
+    coordinates: (Option<f64>, Option<f64>),
+    inferred_by_berrykeep: bool,
+}
+
+fn read_geo_location(events: &[ResolvedEvent]) -> Option<XmpGeoLocation> {
+    let mut location = None;
+    // XMP permits nested `rdf:Description` values (for example Camera Raw's
+    // `crs:Look`). Keep each Description's coordinates independent so an
+    // inner structured value cannot consume or supersede the enclosing media
+    // description. Only a top-level Description represents the media item.
+    let mut descriptions = Vec::<DescriptionGeoState>::new();
+    let mut element_property = None;
+    for event in events {
+        match &event.event {
+            Event::Start(element) | Event::Empty(element) => {
+                if is_element(event, RDF_NAMESPACE, b"Description") {
+                    let state = DescriptionGeoState {
+                        coordinates: geo_attributes(event, element),
+                        inferred_by_berrykeep: has_berrykeep_inference_marker(event),
+                    };
+                    if matches!(&event.event, Event::Empty(_)) {
+                        // An empty Description nested inside a structured XMP
+                        // value is not the media's Description. It must not
+                        // win over its enclosing top-level coordinates.
+                        if descriptions.is_empty() {
+                            set_first_geo_location(&mut location, state);
+                        }
+                    } else {
+                        descriptions.push(state);
+                    }
+                } else if !descriptions.is_empty() {
+                    if has_berrykeep_inference_marker(event) {
+                        descriptions
+                            .last_mut()
+                            .expect("non-empty descriptions stack")
+                            .inferred_by_berrykeep = true;
+                    }
+                    if matches!(&event.event, Event::Start(_)) {
+                        element_property = if is_element(event, EXIF_NAMESPACE, b"GPSLatitude") {
+                            Some(true)
+                        } else if is_element(event, EXIF_NAMESPACE, b"GPSLongitude") {
+                            Some(false)
+                        } else {
+                            None
+                        };
+                    }
+                }
+            }
+            Event::Text(text) => {
+                let Some(is_latitude) = element_property else {
+                    continue;
+                };
+                let Ok(value) = text.xml10_content() else {
+                    continue;
+                };
+                if let Some(description) = descriptions.last_mut() {
+                    let (latitude, longitude) = &mut description.coordinates;
+                    if is_latitude {
+                        *latitude = parse_xmp_coordinate(&value, true);
+                    } else {
+                        *longitude = parse_xmp_coordinate(&value, false);
+                    }
+                }
+            }
+            Event::CData(text) => {
+                let Some(is_latitude) = element_property else {
+                    continue;
+                };
+                let Ok(value) = std::str::from_utf8(text.as_ref()) else {
+                    continue;
+                };
+                if let Some(description) = descriptions.last_mut() {
+                    let (latitude, longitude) = &mut description.coordinates;
+                    if is_latitude {
+                        *latitude = parse_xmp_coordinate(value, true);
+                    } else {
+                        *longitude = parse_xmp_coordinate(value, false);
+                    }
+                }
+            }
+            Event::End(_) => {
+                if element_property.is_some()
+                    && (is_element(event, EXIF_NAMESPACE, b"GPSLatitude")
+                        || is_element(event, EXIF_NAMESPACE, b"GPSLongitude"))
+                {
+                    element_property = None;
+                }
+                if is_element(event, RDF_NAMESPACE, b"Description") {
+                    let state = descriptions.pop().unwrap_or_default();
+                    if descriptions.is_empty() {
+                        set_first_geo_location(&mut location, state);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    location
+}
+
+fn geo_attributes(
+    resolved: &ResolvedEvent,
+    element: &BytesStart<'_>,
+) -> (Option<f64>, Option<f64>) {
+    let mut latitude = None;
+    let mut longitude = None;
+    let mut attributes = element.attributes();
+    attributes.with_checks(false);
+    for attribute in attributes.flatten() {
+        let Some(name) = resolved
+            .attributes
+            .iter()
+            .find(|name| name.raw_name == attribute.key.as_ref())
+        else {
+            continue;
+        };
+        if name.namespace.as_deref() != Some(EXIF_NAMESPACE) {
+            continue;
+        }
+        let Ok(value) = std::str::from_utf8(attribute.value.as_ref()) else {
+            continue;
+        };
+        match name.local_name.as_slice() {
+            b"GPSLatitude" => latitude = parse_xmp_coordinate(value, true),
+            b"GPSLongitude" => longitude = parse_xmp_coordinate(value, false),
+            _ => {}
+        }
+    }
+    (latitude, longitude)
+}
+
+fn set_first_geo_location(location: &mut Option<XmpGeoLocation>, state: DescriptionGeoState) {
+    if location.is_some() {
+        return;
+    }
+    match state.coordinates {
+        (Some(latitude), Some(longitude))
+            if (-90.0..=90.0).contains(&latitude) && (-180.0..=180.0).contains(&longitude) =>
+        {
+            *location = Some(XmpGeoLocation {
+                latitude,
+                longitude,
+                inferred_by_berrykeep: state.inferred_by_berrykeep,
+            });
+        }
+        _ => {}
+    }
+}
+
+fn has_geo_location_properties(events: &[ResolvedEvent]) -> bool {
+    events.iter().any(|event| {
+        event.has_undecodable_attributes
+            || is_element(event, EXIF_NAMESPACE, b"GPSLatitude")
+            || is_element(event, EXIF_NAMESPACE, b"GPSLongitude")
+            || event.attributes.iter().any(|attribute| {
+                attribute.namespace.as_deref() == Some(EXIF_NAMESPACE)
+                    && matches!(
+                        attribute.local_name.as_slice(),
+                        b"GPSLatitude" | b"GPSLongitude"
+                    )
+            })
+    })
+}
+
+fn has_capture_time_properties(events: &[ResolvedEvent]) -> bool {
+    events.iter().any(|event| {
+        event.has_undecodable_attributes
+            || is_capture_time_property(
+                event.namespace.as_deref(),
+                element_local_name(&event.event),
+            )
+            || event.attributes.iter().any(|attribute| {
+                is_capture_time_property(
+                    attribute.namespace.as_deref(),
+                    Some(attribute.local_name.as_slice()),
+                )
+            })
+    })
+}
+
+fn is_capture_time_property(namespace: Option<&str>, local_name: Option<&[u8]>) -> bool {
+    match namespace {
+        Some(EXIF_NAMESPACE) => matches!(
+            local_name,
+            Some(name) if name == b"DateTimeOriginal" || name == b"DateTimeDigitized"
+        ),
+        Some(XMP_NAMESPACE) => local_name == Some(b"CreateDate"),
+        Some(PHOTOSHOP_NAMESPACE) => local_name == Some(b"DateCreated"),
+        _ => false,
+    }
+}
+
+/// Detects the provenance written by [`XmpSidecar::set_geo_inference`] on one
+/// Description or one of its child properties. Attribute prefixes are resolved
+/// from declarations in the packet so a third-party writer may use a prefix
+/// other than `berrykeep`.
+fn has_berrykeep_inference_marker(event: &ResolvedEvent) -> bool {
+    is_element(event, BERRYKEEP_NAMESPACE, b"GeoInferenceMethod")
+        || event.attributes.iter().any(|attribute| {
+            attribute.namespace.as_deref() == Some(BERRYKEEP_NAMESPACE)
+                && attribute.local_name == b"GeoInferenceMethod"
+        })
+}
+
+fn parse_xmp_coordinate(value: &str, latitude: bool) -> Option<f64> {
+    let value = value.trim();
+    let hemisphere = value.chars().last()?;
+    let numeric = value.strip_suffix(hemisphere)?.trim();
+    let sign = match hemisphere {
+        'N' | 'n' if latitude => 1.0,
+        'S' | 's' if latitude => -1.0,
+        'E' | 'e' if !latitude => 1.0,
+        'W' | 'w' if !latitude => -1.0,
+        _ => return None,
+    };
+    let mut components = numeric.trim().split(',').map(str::trim);
+    let degrees = components.next()?.parse::<f64>().ok()?;
+    let minutes = components.next()?.parse::<f64>().ok()?;
+    let seconds = components
+        .next()
+        .map(str::parse::<f64>)
+        .transpose()
+        .ok()?
+        .unwrap_or_default();
+    if components.next().is_some()
+        || !degrees.is_finite()
+        || !minutes.is_finite()
+        || !seconds.is_finite()
+        || degrees < 0.0
+        || !(0.0..60.0).contains(&minutes)
+        || !(0.0..60.0).contains(&seconds)
+    {
+        return None;
+    }
+    let value = degrees + minutes / 60.0 + seconds / 3_600.0;
+    let limit = if latitude { 90.0 } else { 180.0 };
+    (value.is_finite() && value <= limit).then_some(value * sign)
+}
+
+fn format_xmp_coordinate(value: f64, latitude: bool) -> String {
+    let hemisphere = match (latitude, value.is_sign_negative()) {
+        (true, false) => 'N',
+        (true, true) => 'S',
+        (false, false) => 'E',
+        (false, true) => 'W',
+    };
+    let absolute = value.abs();
+    let mut degrees = absolute.floor();
+    let mut minutes = (absolute - degrees) * 60.0;
+    // Do not emit an invalid `60.000000` minute component due to rounding.
+    if minutes >= 59.999_999_5 {
+        degrees += 1.0;
+        minutes = 0.0;
+    }
+    format!("{degrees:.0},{minutes:.6}{hemisphere}")
+}
+
 /// Derives the sidecar key of a media object: `album/photo.jpg` ->
 /// `album/photo.jpg.xmp`.
 pub fn sidecar_key_for_media(key: &str) -> String {
@@ -720,7 +1292,8 @@ pub fn is_sidecar_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DC_NAMESPACE, XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media,
+        DC_NAMESPACE, XmpApprovedCaptureTime, XmpGeoInference, XmpSidecar, is_sidecar_key,
+        media_key_for_sidecar, sidecar_key_for_media,
     };
     use anyhow::Result;
 
@@ -811,6 +1384,25 @@ mod tests {
         Ok(String::from_utf8(sidecar.to_bytes()?)?)
     }
 
+    fn approved_geolocation_inference(value: &str) -> XmpGeoInference {
+        XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest-anchor".to_string(),
+            run_id: "run-approved-time".to_string(),
+            confidence: "reference_distance=120s".to_string(),
+            reference_distance_seconds: Some(120),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+            approved_capture_time: Some(XmpApprovedCaptureTime {
+                value: value.to_string(),
+                source: "filename".to_string(),
+                basis: "floating_local".to_string(),
+            }),
+        }
+    }
+
     #[test]
     fn third_party_sidecar_round_trips_unknown_namespaces() -> Result<()> {
         let mut sidecar = XmpSidecar::parse(THIRD_PARTY_SIDECAR.as_bytes())?;
@@ -893,6 +1485,407 @@ mod tests {
         let reparsed = XmpSidecar::parse(serialized.as_bytes())?;
         assert_eq!(reparsed.keywords(), ["private", "nsfw"]);
         assert_eq!(serialize(&reparsed)?, serialized, "writing must be stable");
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_write_preserves_unknown_xmp_and_records_provenance() -> Result<()> {
+        let mut sidecar = XmpSidecar::parse(THIRD_PARTY_SIDECAR.as_bytes())?;
+        sidecar.set_geo_inference(XmpGeoInference {
+            latitude: 37.808_333_33,
+            longitude: -122.404_166_67,
+            method: "interpolation".to_string(),
+            run_id: "run-123".to_string(),
+            confidence: "previous=120s; next=180s; estimated_speed=5.0km/h".to_string(),
+            reference_distance_seconds: None,
+            previous_anchor_distance_seconds: Some(120),
+            next_anchor_distance_seconds: Some(180),
+            estimated_speed_kmh: Some(5.0),
+            approved_capture_time: None,
+        })?;
+        let serialized = serialize(&sidecar)?;
+        for retained in [
+            "xmp:Rating=\"3\"",
+            "crs:Exposure2012=\"+0.35\"",
+            "<crs:ToneCurvePV2012>",
+            "<!-- kept verbatim -->",
+        ] {
+            assert!(serialized.contains(retained), "missing {retained:?}");
+        }
+        assert!(serialized.contains("exif:GPSLatitude=\"37,48.500000N\""));
+        assert!(serialized.contains("exif:GPSLongitude=\"122,24.250000W\""));
+        assert!(serialized.contains("exif:GPSMapDatum=\"WGS-84\""));
+        assert!(serialized.contains("berrykeep:GeoInferenceRunId=\"run-123\""));
+        let reparsed = XmpSidecar::parse(serialized.as_bytes())?;
+        let location = reparsed.geo_location().expect("GPS must round-trip");
+        assert!((location.latitude - 37.808_333_33).abs() < 0.000_001);
+        assert!((location.longitude + 122.404_166_67).abs() < 0.000_001);
+        assert!(location.inferred_by_berrykeep);
+        Ok(())
+    }
+
+    #[test]
+    fn approved_geolocation_writes_interoperable_capture_time_without_inventing_a_timezone()
+    -> Result<()> {
+        let mut sidecar = XmpSidecar::parse(SIDECAR_WITHOUT_KEYWORDS.as_bytes())?;
+        sidecar.set_geo_inference(approved_geolocation_inference("2024-03-04T05:06:07"))?;
+        let serialized = serialize(&sidecar)?;
+
+        assert!(serialized.contains("darktable:import_timestamp=\"1715412345\""));
+        for field in [
+            "exif:DateTimeOriginal=\"2024-03-04T05:06:07\"",
+            "xmp:CreateDate=\"2024-03-04T05:06:07\"",
+            "photoshop:DateCreated=\"2024-03-04T05:06:07\"",
+            "berrykeep:GeoInferenceCaptureTimeSource=\"filename\"",
+            "berrykeep:GeoInferenceCaptureTimeBasis=\"floating_local\"",
+        ] {
+            assert!(serialized.contains(field), "missing {field:?}");
+        }
+        assert!(
+            !serialized.contains("CreateDate=\"2024-03-04T05:06:07Z\""),
+            "a floating timestamp must not acquire a synthetic UTC suffix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn approved_geolocation_refuses_to_shadow_existing_capture_time() -> Result<()> {
+        let mut sidecar = XmpSidecar::parse(THIRD_PARTY_SIDECAR.as_bytes())?;
+        assert!(sidecar.has_capture_time_properties());
+        assert!(
+            sidecar
+                .set_geo_inference(approved_geolocation_inference("2024-03-04T05:06:07"))
+                .is_err()
+        );
+        assert_eq!(serialize(&sidecar)?, THIRD_PARTY_SIDECAR);
+        Ok(())
+    }
+
+    #[test]
+    fn gps_only_geolocation_preserves_existing_capture_time() -> Result<()> {
+        let mut sidecar = XmpSidecar::parse(THIRD_PARTY_SIDECAR.as_bytes())?;
+        let mut inference = approved_geolocation_inference("2024-03-04T05:06:07");
+        inference.approved_capture_time = None;
+
+        sidecar.set_geo_inference(inference)?;
+        let serialized = serialize(&sidecar)?;
+        assert!(serialized.contains("photoshop:DateCreated=\"2024-05-11T09:03:12\""));
+        assert!(serialized.contains("exif:GPSLatitude=\"47,22.614000N\""));
+        assert!(serialized.contains("berrykeep:GeoInferenceMethod=\"nearest-anchor\""));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_geolocation_is_visible_and_prevents_a_second_write() -> Result<()> {
+        let inference = XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest-anchor".to_string(),
+            run_id: "run-123".to_string(),
+            confidence: "reference_distance=180s".to_string(),
+            reference_distance_seconds: Some(180),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+            approved_capture_time: None,
+        };
+        let mut sidecar = XmpSidecar::new_empty();
+        sidecar.set_geo_inference(inference.clone())?;
+
+        assert!(sidecar.has_geo_location_properties());
+        let location = sidecar
+            .geo_location()
+            .expect("a staged inference must be visible before serialization");
+        assert!((location.latitude - inference.latitude).abs() < f64::EPSILON);
+        assert!((location.longitude - inference.longitude).abs() < f64::EPSILON);
+        assert!(location.inferred_by_berrykeep);
+        assert!(
+            sidecar.set_geo_inference(inference).is_err(),
+            "a second staged inference must not replace the first"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_write_binds_rdf_when_packet_uses_the_default_rdf_namespace() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<RDF xmlns=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"></RDF>",
+            "</x:xmpmeta>"
+        );
+        let mut sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        sidecar.set_geo_inference(XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest-anchor".to_string(),
+            run_id: "run-default-rdf".to_string(),
+            confidence: "reference_distance=120s".to_string(),
+            reference_distance_seconds: Some(120),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+            approved_capture_time: None,
+        })?;
+        let serialized = serialize(&sidecar)?;
+
+        assert!(
+            serialized.contains("<rdf:Description rdf:about=\"\"")
+                && serialized.contains("xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\""),
+            "generated description must bind its rdf prefix: {serialized}"
+        );
+        let location = XmpSidecar::parse(serialized.as_bytes())?
+            .geo_location()
+            .expect("generated GPS must be parseable");
+        assert!((location.latitude - 47.3769).abs() < 0.000_001);
+        assert!((location.longitude - 8.5417).abs() < 0.000_001);
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_write_binds_rdf_when_prefix_is_scoped_to_another_description() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<RDF xmlns=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<Description xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" rdf:about=\"\"/>",
+            "</RDF></x:xmpmeta>"
+        );
+        let mut sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        sidecar.set_geo_inference(XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest-anchor".to_string(),
+            run_id: "run-sibling-rdf-prefix".to_string(),
+            confidence: "reference_distance=120s".to_string(),
+            reference_distance_seconds: Some(120),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+            approved_capture_time: None,
+        })?;
+        let serialized = serialize(&sidecar)?;
+
+        let provenance_position = serialized
+            .find("berrykeep:GeoInferenceRunId")
+            .expect("generated provenance must be present");
+        let generated_description_start = serialized[..provenance_position]
+            .rfind("<rdf:Description")
+            .expect("generated description must be present");
+        assert!(
+            serialized[generated_description_start..provenance_position]
+                .contains("xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\""),
+            "the generated sibling must bind its RDF prefix locally: {serialized}"
+        );
+        let location = XmpSidecar::parse(serialized.as_bytes())?
+            .geo_location()
+            .expect("generated GPS must be parseable");
+        assert!((location.latitude - 47.3769).abs() < 0.000_001);
+        assert!((location.longitude - 8.5417).abs() < 0.000_001);
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_write_escapes_provenance_attributes() -> Result<()> {
+        let mut sidecar = XmpSidecar::new_empty();
+        sidecar.set_geo_inference(XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest\"<&".to_string(),
+            run_id: "run\"<&".to_string(),
+            confidence: "reference\"<&".to_string(),
+            reference_distance_seconds: Some(120),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+            approved_capture_time: None,
+        })?;
+        let serialized = serialize(&sidecar)?;
+
+        assert!(serialized.contains("GeoInferenceMethod=\"nearest&quot;&lt;&amp;\""));
+        assert!(serialized.contains("GeoInferenceRunId=\"run&quot;&lt;&amp;\""));
+        assert!(serialized.contains("GeoInferenceConfidence=\"reference&quot;&lt;&amp;\""));
+        XmpSidecar::parse(serialized.as_bytes())?;
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_write_uses_the_actual_rdf_namespace_closing_tag() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\"/></rdf:RDF>",
+            "<foo:RDF xmlns:foo=\"https://example.invalid/not-rdf\"></foo:RDF>",
+            "</x:xmpmeta>"
+        );
+        let mut sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        sidecar.set_geo_inference(XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest-anchor".to_string(),
+            run_id: "run-rdf-namespace".to_string(),
+            confidence: "reference_distance=120s".to_string(),
+            reference_distance_seconds: Some(120),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+            approved_capture_time: None,
+        })?;
+        let serialized = serialize(&sidecar)?;
+        let provenance_position = serialized
+            .find("berrykeep:GeoInferenceRunId")
+            .expect("generated provenance must be present");
+        let rdf_close_position = serialized
+            .find("</rdf:RDF>")
+            .expect("RDF root must remain present");
+        let unrelated_rdf_position = serialized
+            .find("<foo:RDF")
+            .expect("unrelated RDF-named element must remain present");
+        assert!(provenance_position < rdf_close_position);
+        assert!(rdf_close_position < unrelated_rdf_position);
+        assert!(
+            XmpSidecar::parse(serialized.as_bytes())?
+                .geo_location()
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_existing_element_form_gps() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\">",
+            "<exif:GPSLatitude>47,22,36N</exif:GPSLatitude>",
+            "<exif:GPSLongitude>8,32,30E</exif:GPSLongitude>",
+            "</rdf:Description></rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        let location = sidecar.geo_location().expect("element GPS must be read");
+        assert!((location.latitude - 47.376_666_666_7).abs() < 0.000_001);
+        assert!((location.longitude - 8.541_666_666_7).abs() < 0.000_001);
+        assert!(!location.inferred_by_berrykeep);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_outer_description_gps_after_nested_camera_raw_description() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\">",
+            "<crs:Look><rdf:Description crs:Name=\"Adobe Color\">",
+            "<crs:Parameters/></rdf:Description></crs:Look>",
+            "<exif:GPSLatitude>47,22,36N</exif:GPSLatitude>",
+            "<exif:GPSLongitude>8,32,30E</exif:GPSLongitude>",
+            "</rdf:Description></rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        let location = sidecar
+            .geo_location()
+            .expect("outer Description GPS must survive nested descriptions");
+        assert!((location.latitude - 47.376_666_666_7).abs() < 0.000_001);
+        assert!((location.longitude - 8.541_666_666_7).abs() < 0.000_001);
+        Ok(())
+    }
+
+    #[test]
+    fn nested_empty_description_does_not_override_outer_media_gps() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "exif:GPSLatitude=\"47,22,36N\" exif:GPSLongitude=\"8,32,30E\">",
+            "<crs:Look><rdf:Description crs:Name=\"Adobe Color\" ",
+            "exif:GPSLatitude=\"0,0,0N\" exif:GPSLongitude=\"0,0,0E\"/>",
+            "</crs:Look></rdf:Description></rdf:RDF></x:xmpmeta>"
+        );
+        let location = XmpSidecar::parse(packet.as_bytes())?
+            .geo_location()
+            .expect("outer Description GPS must be read");
+        assert!((location.latitude - 47.376_666_666_7).abs() < 0.000_001);
+        assert!((location.longitude - 8.541_666_666_7).abs() < 0.000_001);
+        assert!(!location.inferred_by_berrykeep);
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_is_scoped_to_the_description_that_provides_gps() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLatitude=\"47,22,36N\" exif:GPSLongitude=\"8,32,30E\"/>",
+            "<rdf:Description xmlns:berrykeep=\"https://berrykeep.app/ns/1.0/\" ",
+            "berrykeep:GeoInferenceMethod=\"nearest-anchor\"/>",
+            "</rdf:RDF></x:xmpmeta>"
+        );
+        let location = XmpSidecar::parse(packet.as_bytes())?
+            .geo_location()
+            .expect("real GPS must be read");
+        assert!(!location.inferred_by_berrykeep);
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_requires_a_hemisphere_and_xmp_coordinate_components() -> Result<()> {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLatitude=\"47.3769\" exif:GPSLongitude=\"8,32.5E\"/>",
+            "</rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        assert!(sidecar.geo_location().is_none());
+        assert!(
+            sidecar.has_geo_location_properties(),
+            "unparseable user GPS must still block an inferred overwrite"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn undecodable_xmp_attributes_conservatively_block_inferred_geolocation() -> Result<()> {
+        // `quick_xml` accepts the event and only reports this malformed value
+        // when attributes are decoded. Treat it as user-owned GPS rather than
+        // appending a second, inferred location to the same sidecar.
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLatitude=47,22,36N exif:GPSLongitude=8,32,30E/>",
+            "</rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        assert!(sidecar.geo_location().is_none());
+        assert!(
+            sidecar.has_geo_location_properties(),
+            "an undecodable third-party attribute must block inferred GPS"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn geolocation_attributes_are_exif_scoped_and_never_combined_across_descriptions() -> Result<()>
+    {
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"https://example.invalid/\" ",
+            "exif:GPSLatitude=\"47,22N\" exif:GPSLongitude=\"8,32E\"/>",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLatitude=\"47,22N\"/>",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLongitude=\"8,32E\"/>",
+            "</rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        assert!(
+            sidecar.geo_location().is_none(),
+            "a location must be a complete EXIF pair on one rdf:Description"
+        );
         Ok(())
     }
 
