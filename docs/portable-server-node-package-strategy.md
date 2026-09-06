@@ -102,18 +102,19 @@ The normal CI workflow builds and verifies `x86_64-generic` on an x86_64
 GitHub runner. The static build is part of the `Required CI` aggregate and
 uploads `static-server-node-linux-amd64`.
 
-The Server Node Debian package workflow cross-builds and verifies
-`aarch64-generic` on an x86_64 GitHub runner with Zig, then uploads
-`static-server-node-linux-arm64`. The static artifact checks its ELF contract;
-the workflow runs its version smoke test under `qemu-aarch64-static` before
-the artifact enters a package container.
+The Server Node Debian package workflow builds and verifies both
+`aarch64-generic` and `x86_64-generic` on an x86_64 GitHub runner with Zig,
+then uploads `static-server-node-linux-arm64` and
+`static-server-node-linux-amd64`. The static artifact checks each ELF contract;
+the workflow runs the AArch64 version smoke test under `qemu-aarch64-static`
+before that artifact enters a package container.
 
-The workflow passes that archive into Focal and Trixie containers. Each
-container checks the archive checksum and metadata against the checked-out Git
-revision, then cross-assembles an `arm64` `ironmesh-server-node` package with
-the `server-node-only` build profile. The profile skips source compilation and
-does not execute the target binary, so the package-wrapper matrix no longer
-needs an ARM runner.
+The workflow passes the matching archive into Focal and Trixie containers for
+both architectures and into a Noble container for AMD64. Each container checks
+the archive checksum and metadata against the checked-out Git revision, then
+assembles an `ironmesh-server-node` package with the `server-node-only` build
+profile. The profile skips source compilation and does not execute the target
+binary, so the package-wrapper matrix needs no architecture-specific runner.
 
 The final protected, manual CI job imports the archive key into a temporary
 keyring, signs all suite metadata, deploys the matrix, and re-verifies the
