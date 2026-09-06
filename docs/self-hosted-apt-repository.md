@@ -215,24 +215,25 @@ curl -fsSL https://creax.de/apt/ironmesh/berrykeep-archive-keyring.asc \
 ```
 
 Add exactly one apt source, matching the distribution suite and architecture of
-the host:
+the host. Keep the established `ironmesh.list` filename so this replaces an
+existing source entry instead of creating a duplicate:
 
 ```bash
 # Ubuntu 20.04 ARM64
 echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh focal main' \
-  | sudo tee /etc/apt/sources.list.d/berrykeep.list
+  | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 
 ```bash
 # Ubuntu 24.04 AMD64
 echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh noble main' \
-  | sudo tee /etc/apt/sources.list.d/berrykeep.list
+  | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 
 ```bash
 # Debian Trixie ARM64 / Raspberry Pi OS based on Trixie
 echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh trixie main' \
-  | sudo tee /etc/apt/sources.list.d/berrykeep.list
+  | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 
 Install or update packages through apt:

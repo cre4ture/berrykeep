@@ -17,6 +17,10 @@ LEGACY_REMOTE_PIDFILE="${IRONMESH_RENDEZVOUS_DEPLOY_LEGACY_REMOTE_PIDFILE:-}"
 REMOTE_LOGFILE="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_LOGFILE:-${IRONMESH_RENDEZVOUS_REMOTE_LOGFILE:-}}"
 REMOTE_START_CMD="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_START_CMD:-${IRONMESH_RENDEZVOUS_REMOTE_START_CMD:-}}"
 REMOTE_MATCH_PATTERN="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_MATCH_PATTERN:-${IRONMESH_RENDEZVOUS_REMOTE_MATCH_PATTERN:-}}"
+REMOTE_MATCH_PATTERN_IS_EXPLICIT=0
+if [[ -n "${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_MATCH_PATTERN:-}" || -n "${IRONMESH_RENDEZVOUS_REMOTE_MATCH_PATTERN:-}" ]]; then
+  REMOTE_MATCH_PATTERN_IS_EXPLICIT=1
+fi
 STOP_TIMEOUT_SECS="${IRONMESH_RENDEZVOUS_DEPLOY_STOP_TIMEOUT_SECS:-${IRONMESH_RENDEZVOUS_STOP_TIMEOUT_SECS:-20}}"
 FORCE_KILL="${IRONMESH_RENDEZVOUS_DEPLOY_FORCE_KILL:-${IRONMESH_RENDEZVOUS_FORCE_KILL:-true}}"
 AUTO_ADD_TARGET="${IRONMESH_RENDEZVOUS_DEPLOY_AUTO_ADD_TARGET:-${IRONMESH_RENDEZVOUS_AUTO_ADD_TARGET:-true}}"
@@ -102,6 +106,8 @@ Notes:
   Deployments also update a sibling ironmesh-rendezvous-service symlink and
   stop its former pid file, allowing existing service definitions to transition
   to the BerryKeep binary without a coordinated remote edit.
+  Supplying --remote-match-pattern disables the inferred legacy paths so the
+  custom process-selection boundary remains authoritative.
   Configure IRONMESH_RENDEZVOUS_PEER_URLS in the remote environment file when
   deploying a multi-rendezvous mesh so /control/mesh and client discovery can
   surface healthy peer rendezvous URLs.
@@ -249,10 +255,12 @@ parse_args() {
       --remote-match-pattern)
         [[ $# -ge 2 ]] || fail "--remote-match-pattern requires a value"
         REMOTE_MATCH_PATTERN="$2"
+        REMOTE_MATCH_PATTERN_IS_EXPLICIT=1
         shift 2
         ;;
       --remote-match-pattern=*)
         REMOTE_MATCH_PATTERN="${1#*=}"
+        REMOTE_MATCH_PATTERN_IS_EXPLICIT=1
         shift
         ;;
       --hosts-file)
@@ -367,6 +375,13 @@ resolve_remote_layout() {
     REMOTE_MATCH_PATTERN="$REMOTE_BINARY"
   fi
 
+  if [[ "$REMOTE_MATCH_PATTERN_IS_EXPLICIT" -eq 1 ]]; then
+    # An operator-provided selector must bound every process and pid file this
+    # deployment touches, even if another instance uses the legacy layout.
+    LEGACY_REMOTE_BINARY=""
+    LEGACY_REMOTE_PIDFILE=""
+  fi
+
 }
 
 resolve_local_build_artifact() {
@@ -475,19 +490,23 @@ if [[ -f "$REMOTE_PIDFILE" ]]; then
   pid="$(tr -d '[:space:]' <"$REMOTE_PIDFILE" || true)"
   record_pid "$pid"
 fi
-if [[ -f "$LEGACY_REMOTE_PIDFILE" ]]; then
+if [[ -n "$LEGACY_REMOTE_PIDFILE" && -f "$LEGACY_REMOTE_PIDFILE" ]]; then
   pid="$(tr -d '[:space:]' <"$LEGACY_REMOTE_PIDFILE" || true)"
   record_pid "$pid"
 fi
 
 while IFS= read -r line; do
-  [[ "$line" == *"$REMOTE_MATCH_PATTERN"* || "$line" == *"$LEGACY_REMOTE_BINARY"* ]] || continue
+  if [[ "$line" != *"$REMOTE_MATCH_PATTERN"* ]] && \
+     { [[ -z "$LEGACY_REMOTE_BINARY" ]] || [[ "$line" != *"$LEGACY_REMOTE_BINARY"* ]]; }; then
+    continue
+  fi
   read -r pid _ <<<"$line"
   record_pid "$pid"
 done < <(ps -eo pid=,args=)
 
 if [[ ${#pids[@]} -eq 0 ]]; then
-  rm -f "$REMOTE_PIDFILE" "$LEGACY_REMOTE_PIDFILE"
+  rm -f "$REMOTE_PIDFILE"
+  [[ -z "$LEGACY_REMOTE_PIDFILE" ]] || rm -f "$LEGACY_REMOTE_PIDFILE"
   echo "service not running"
   exit 0
 fi
@@ -509,7 +528,8 @@ while :; do
   done
 
   if [[ "$any_running" -eq 0 ]]; then
-    rm -f "$REMOTE_PIDFILE" "$LEGACY_REMOTE_PIDFILE"
+    rm -f "$REMOTE_PIDFILE"
+    [[ -z "$LEGACY_REMOTE_PIDFILE" ]] || rm -f "$LEGACY_REMOTE_PIDFILE"
     echo "service stopped"
     exit 0
   fi
@@ -547,7 +567,8 @@ for pid in "${pids[@]}"; do
   fi
 done
 
-rm -f "$REMOTE_PIDFILE" "$LEGACY_REMOTE_PIDFILE"
+rm -f "$REMOTE_PIDFILE"
+[[ -z "$LEGACY_REMOTE_PIDFILE" ]] || rm -f "$LEGACY_REMOTE_PIDFILE"
 echo "service killed after timeout"
 REMOTE
 }
@@ -577,7 +598,7 @@ REMOTE
 set -euo pipefail
 chmod 0755 "$REMOTE_TMP"
 mv "$REMOTE_TMP" "$REMOTE_BINARY"
-if [[ "$LEGACY_REMOTE_BINARY" != "$REMOTE_BINARY" ]]; then
+if [[ -n "$LEGACY_REMOTE_BINARY" && "$LEGACY_REMOTE_BINARY" != "$REMOTE_BINARY" ]]; then
   ln -sfn "$REMOTE_BINARY" "$LEGACY_REMOTE_BINARY"
 fi
 REMOTE
