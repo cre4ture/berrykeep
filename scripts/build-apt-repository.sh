@@ -812,15 +812,13 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
   add_index_architecture "${architecture}"
 done
 
-if [[ "${SERVER_NODE_ONLY}" == true ]]; then
-  for architecture in "${INDEX_ARCHES[@]}"; do
-    # A server-only refresh must retain the desktop/rendezvous packages that
-    # were published before suite-scoped pools existed. Migrate every package
-    # still referenced by each suite index before rewriting any shared-pool
-    # index, including architecture siblings processed by later matrix rows.
-    preserve_legacy_suite_packages "${architecture}"
-  done
-fi
+# Migrate every package still referenced by each suite index before rewriting
+# any shared-pool index. This retains architecture siblings on both full and
+# server-only publishes, including later matrix rows and packages published
+# before suite-scoped pools existed.
+for architecture in "${INDEX_ARCHES[@]}"; do
+  preserve_legacy_suite_packages "${architecture}"
+done
 
 for architecture in "${REQUESTED_ARCHES[@]}"; do
   if [[ "${SERVER_NODE_ONLY}" != true ]]; then
