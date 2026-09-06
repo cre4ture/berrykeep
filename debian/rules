@@ -187,6 +187,8 @@ ifeq ($(SERVER_NODE_ONLY),)
 		$(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh/rendezvous-service.env
 
 	install -d $(CLIENT_PACKAGE_ROOT)
+	ln -sfn berrykeep-client \
+		$(CURDIR)/debian/berrykeep-client/usr/lib/ironmesh-client
 	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep $(CLIENT_PACKAGE_ROOT)/berrykeep
 	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep-config-app \
 		$(CLIENT_PACKAGE_ROOT)/berrykeep-config-app
