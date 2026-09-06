@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use common::NodeId;
+use common::xmp::XmpGeoLocation;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tokio_rusqlite::Connection as TokioConnection;
@@ -41,8 +42,8 @@ use super::{
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
     TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
     current_media_cache_metadata, decode_gallery_labels, decode_version_index,
-    decompress_snapshot_json, effective_gallery_captured_at_unix, encode_gallery_labels,
-    gallery_index_media_status, gallery_index_media_type_from_metadata,
+    decompress_snapshot_json, effective_gallery_captured_at_unix, effective_gallery_gps,
+    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
@@ -366,9 +367,10 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              longitude,
              sidecar_latitude,
              sidecar_longitude,
+             sidecar_inferred_by_berrykeep,
              spatial_x,
              spatial_y
-         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL)
+         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL, NULL)
          ON CONFLICT(key) DO UPDATE SET
              manifest_hash = excluded.manifest_hash,
              object_id = excluded.object_id,
@@ -381,6 +383,7 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              longitude = NULL,
              sidecar_latitude = NULL,
              sidecar_longitude = NULL,
+             sidecar_inferred_by_berrykeep = 0,
              spatial_x = NULL,
              spatial_y = NULL
          WHERE gallery_objects.manifest_hash != excluded.manifest_hash
@@ -427,7 +430,8 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
              gallery_objects.key,
              version_indexes.index_json,
              gallery_objects.sidecar_latitude,
-             gallery_objects.sidecar_longitude
+             gallery_objects.sidecar_longitude,
+             gallery_objects.sidecar_inferred_by_berrykeep
          FROM gallery_objects
          LEFT JOIN version_indexes
            ON version_indexes.object_id = gallery_objects.object_id
@@ -440,12 +444,20 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 row.get::<_, Option<Vec<u8>>>(1)?,
                 row.get::<_, Option<f64>>(2)?,
                 row.get::<_, Option<f64>>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
 
-    for (key, version_index_payload, sidecar_latitude, sidecar_longitude) in entries {
+    for (
+        key,
+        version_index_payload,
+        sidecar_latitude,
+        sidecar_longitude,
+        sidecar_inferred_by_berrykeep,
+    ) in entries
+    {
         let version_created_at_unix =
             version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
         let captured_at_unix = effective_gallery_captured_at_unix(
@@ -470,7 +482,11 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
             }
             _ => None,
         };
-        let effective_gps = sidecar_gps.as_ref().or(gps);
+        let effective_gps = effective_gallery_gps(
+            gps,
+            sidecar_gps.as_ref(),
+            sidecar_inferred_by_berrykeep != 0,
+        );
         let spatial_position = effective_gps
             .and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
         db.execute(
@@ -2271,13 +2287,19 @@ impl MetadataStore for SqliteMetadataStore {
     async fn set_gallery_object_sidecar_gps(
         &self,
         key: &str,
-        location: Option<MediaGpsCoordinates>,
+        location: Option<XmpGeoLocation>,
     ) -> Result<()> {
         let key = key.to_string();
         self.write_tx(move |db| {
-            let Some((manifest_hash, existing_latitude, existing_longitude)) = db
+            let Some((
+                manifest_hash,
+                existing_latitude,
+                existing_longitude,
+                existing_inferred_by_berrykeep,
+            )) = db
                 .query_row(
-                    "SELECT manifest_hash, sidecar_latitude, sidecar_longitude
+                    "SELECT manifest_hash, sidecar_latitude, sidecar_longitude,
+                            sidecar_inferred_by_berrykeep
                      FROM gallery_objects WHERE key = ?1",
                     params![key],
                     |row| {
@@ -2285,6 +2307,7 @@ impl MetadataStore for SqliteMetadataStore {
                             row.get::<_, String>(0)?,
                             row.get::<_, Option<f64>>(1)?,
                             row.get::<_, Option<f64>>(2)?,
+                            row.get::<_, i64>(3)?,
                         ))
                     },
                 )
@@ -2294,14 +2317,23 @@ impl MetadataStore for SqliteMetadataStore {
             };
             let latitude = location.as_ref().map(|location| location.latitude);
             let longitude = location.as_ref().map(|location| location.longitude);
-            if existing_latitude == latitude && existing_longitude == longitude {
+            let inferred_by_berrykeep = i64::from(
+                location
+                    .as_ref()
+                    .is_some_and(|location| location.inferred_by_berrykeep),
+            );
+            if existing_latitude == latitude
+                && existing_longitude == longitude
+                && existing_inferred_by_berrykeep == inferred_by_berrykeep
+            {
                 return Ok(());
             }
             db.execute(
                 "UPDATE gallery_objects
-                 SET sidecar_latitude = ?2, sidecar_longitude = ?3
+                 SET sidecar_latitude = ?2, sidecar_longitude = ?3,
+                     sidecar_inferred_by_berrykeep = ?4
                  WHERE key = ?1",
-                params![key, latitude, longitude],
+                params![key, latitude, longitude, inferred_by_berrykeep],
             )?;
             refresh_gallery_objects_for_manifest(db, &manifest_hash)
         })
@@ -5163,6 +5195,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             longitude REAL,
             sidecar_latitude REAL,
             sidecar_longitude REAL,
+            sidecar_inferred_by_berrykeep INTEGER NOT NULL DEFAULT 0,
             spatial_x REAL,
             spatial_y REAL,
             labels_json TEXT NOT NULL DEFAULT '[]'
@@ -5460,6 +5493,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     add_sqlite_column_if_missing(db, "gallery_objects", "longitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "sidecar_latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "sidecar_longitude", "REAL")?;
+    add_sqlite_column_if_missing(
+        db,
+        "gallery_objects",
+        "sidecar_inferred_by_berrykeep",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_sqlite_column_if_missing(db, "gallery_objects", "spatial_x", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "spatial_y", "REAL")?;
     add_sqlite_column_if_missing(

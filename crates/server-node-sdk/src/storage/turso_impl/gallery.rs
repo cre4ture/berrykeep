@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
+use common::xmp::XmpGeoLocation;
 use tracing::warn;
 use turso::transaction::{DropBehavior, Transaction, TransactionBehavior};
 use turso::{Value, params_from_iter};
@@ -16,10 +17,10 @@ use super::super::{
     GallerySummaryCacheValue, GallerySummaryMiss, GallerySummaryProgress,
     GallerySummaryRefreshStatus, GallerySummaryScope, GalleryViewportBounds, ManifestSummary,
     MediaGpsCoordinates, current_media_cache_metadata, decode_gallery_labels,
-    effective_gallery_captured_at_unix, encode_gallery_labels, gallery_index_media_status,
-    gallery_index_media_type_from_metadata, gallery_label_filter_matches_json,
-    gallery_label_predicates, gallery_map_bounded_resolution, gallery_media_type_for_path,
-    gallery_web_mercator_position, sqlite_like_prefix_pattern,
+    effective_gallery_captured_at_unix, effective_gallery_gps, encode_gallery_labels,
+    gallery_index_media_status, gallery_index_media_type_from_metadata,
+    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
+    gallery_media_type_for_path, gallery_web_mercator_position, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload, version_index_head_projection,
 };
 #[cfg(test)]
@@ -57,6 +58,7 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                 longitude REAL,
                 sidecar_latitude REAL,
                 sidecar_longitude REAL,
+                sidecar_inferred_by_berrykeep INTEGER NOT NULL DEFAULT 0,
                 spatial_x REAL,
                 spatial_y REAL,
                 labels_json TEXT NOT NULL DEFAULT '[]'
@@ -97,6 +99,12 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
     add_gallery_projection_column(connection, "spatial_y", "REAL").await?;
     add_gallery_projection_column(connection, "sidecar_latitude", "REAL").await?;
     add_gallery_projection_column(connection, "sidecar_longitude", "REAL").await?;
+    add_gallery_projection_column(
+        connection,
+        "sidecar_inferred_by_berrykeep",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     connection
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial
@@ -469,7 +477,7 @@ impl TursoMetadataStore {
     pub(super) async fn store_gallery_object_sidecar_gps(
         &self,
         key: &str,
-        location: Option<MediaGpsCoordinates>,
+        location: Option<XmpGeoLocation>,
     ) -> Result<()> {
         let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
@@ -478,34 +486,49 @@ impl TursoMetadataStore {
         let result = async {
             let mut rows = connection
                 .query(
-                    "SELECT manifest_hash, sidecar_latitude, sidecar_longitude
+                    "SELECT manifest_hash, sidecar_latitude, sidecar_longitude,
+                            sidecar_inferred_by_berrykeep
                      FROM gallery_objects WHERE key = ?1",
                     (key,),
                 )
                 .await?;
-            let (manifest_hash, existing_latitude, existing_longitude) = match rows.next().await? {
+            let (
+                manifest_hash,
+                existing_latitude,
+                existing_longitude,
+                existing_inferred_by_berrykeep,
+            ) = match rows.next().await? {
                 Some(row) => (
                     row_string(&row, 0, "gallery_objects.manifest_hash")?,
                     row_opt_f64(&row, 1, "gallery_objects.sidecar_latitude")?,
                     row_opt_f64(&row, 2, "gallery_objects.sidecar_longitude")?,
+                    row_u64(&row, 3, "gallery_objects.sidecar_inferred_by_berrykeep")?,
                 ),
                 None => return Ok(()),
             };
             drop(rows);
             let latitude = location.as_ref().map(|location| location.latitude);
             let longitude = location.as_ref().map(|location| location.longitude);
-            if existing_latitude == latitude && existing_longitude == longitude {
+            let inferred_by_berrykeep = location
+                .as_ref()
+                .is_some_and(|location| location.inferred_by_berrykeep);
+            if existing_latitude == latitude
+                && existing_longitude == longitude
+                && existing_inferred_by_berrykeep == u64::from(inferred_by_berrykeep)
+            {
                 return Ok(());
             }
             connection
                 .execute(
                     "UPDATE gallery_objects
-                     SET sidecar_latitude = ?2, sidecar_longitude = ?3
+                     SET sidecar_latitude = ?2, sidecar_longitude = ?3,
+                         sidecar_inferred_by_berrykeep = ?4
                      WHERE key = ?1",
                     params_from_iter(vec![
                         Value::from(key),
                         optional_real_value(latitude),
                         optional_real_value(longitude),
+                        Value::from(i64::from(inferred_by_berrykeep)),
                     ]),
                 )
                 .await?;
@@ -932,8 +955,9 @@ async fn upsert_gallery_object(
             "INSERT INTO gallery_objects (
                  key, manifest_hash, object_id, inferred_media_type, media_type,
                  captured_at_unix, media_status, geotagged, latitude, longitude,
-                 sidecar_latitude, sidecar_longitude, spatial_x, spatial_y
-             ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL)
+                 sidecar_latitude, sidecar_longitude, sidecar_inferred_by_berrykeep,
+                 spatial_x, spatial_y
+             ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL, NULL)
              ON CONFLICT(key) DO UPDATE SET
                  manifest_hash = excluded.manifest_hash,
                  object_id = excluded.object_id,
@@ -946,6 +970,7 @@ async fn upsert_gallery_object(
                  longitude = NULL,
                  sidecar_latitude = NULL,
                  sidecar_longitude = NULL,
+                 sidecar_inferred_by_berrykeep = 0,
                  spatial_x = NULL,
                  spatial_y = NULL
              WHERE gallery_objects.manifest_hash != excluded.manifest_hash
@@ -1000,7 +1025,8 @@ async fn refresh_gallery_objects_for_manifest(
                  gallery_objects.key,
                  version_indexes.index_json,
                  gallery_objects.sidecar_latitude,
-                 gallery_objects.sidecar_longitude
+                 gallery_objects.sidecar_longitude,
+                 gallery_objects.sidecar_inferred_by_berrykeep
              FROM gallery_objects
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
@@ -1015,11 +1041,19 @@ async fn refresh_gallery_objects_for_manifest(
             row_opt_blob(&row, 1, "version_indexes.index_json")?,
             row_opt_f64(&row, 2, "gallery_objects.sidecar_latitude")?,
             row_opt_f64(&row, 3, "gallery_objects.sidecar_longitude")?,
+            row_u64(&row, 4, "gallery_objects.sidecar_inferred_by_berrykeep")?,
         ));
     }
     drop(rows);
 
-    for (key, version_index_payload, sidecar_latitude, sidecar_longitude) in entries {
+    for (
+        key,
+        version_index_payload,
+        sidecar_latitude,
+        sidecar_longitude,
+        sidecar_inferred_by_berrykeep,
+    ) in entries
+    {
         let version_created_at_unix =
             version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
         let captured_at_unix = effective_gallery_captured_at_unix(
@@ -1044,7 +1078,11 @@ async fn refresh_gallery_objects_for_manifest(
             }
             _ => None,
         };
-        let effective_gps = sidecar_gps.as_ref().or(gps);
+        let effective_gps = effective_gallery_gps(
+            gps,
+            sidecar_gps.as_ref(),
+            sidecar_inferred_by_berrykeep != 0,
+        );
         let spatial_position = effective_gps
             .and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
         connection

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use common::NodeId;
+use common::xmp::XmpGeoLocation;
 use tracing::warn;
 use turso::params_from_iter;
 
@@ -27,8 +28,8 @@ use super::{
     GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache,
     HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY, HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
     HistoryHeadProjectionBackfillState, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MediaGpsCoordinates, MetadataDbLogicalProgress,
-    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
+    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore,
     OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
     RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
     RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
@@ -316,7 +317,7 @@ impl MetadataStore for TursoMetadataStore {
     async fn set_gallery_object_sidecar_gps(
         &self,
         key: &str,
-        location: Option<MediaGpsCoordinates>,
+        location: Option<XmpGeoLocation>,
     ) -> Result<()> {
         self.store_gallery_object_sidecar_gps(key, location).await
     }

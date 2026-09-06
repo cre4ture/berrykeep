@@ -69,6 +69,28 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+#[test]
+fn measured_embedded_gps_overrides_a_berrykeep_inferred_sidecar() {
+    let embedded = MediaGpsCoordinates {
+        latitude: 47.3769,
+        longitude: 8.5417,
+    };
+    let inferred_sidecar = MediaGpsCoordinates {
+        latitude: 47.4,
+        longitude: 8.6,
+    };
+
+    let effective = effective_gallery_gps(Some(&embedded), Some(&inferred_sidecar), true)
+        .expect("one location is available");
+    assert!((effective.latitude - embedded.latitude).abs() < f64::EPSILON);
+    assert!((effective.longitude - embedded.longitude).abs() < f64::EPSILON);
+
+    let user_sidecar = effective_gallery_gps(Some(&embedded), Some(&inferred_sidecar), false)
+        .expect("one location is available");
+    assert!((user_sidecar.latitude - inferred_sidecar.latitude).abs() < f64::EPSILON);
+    assert!((user_sidecar.longitude - inferred_sidecar.longitude).abs() < f64::EPSILON);
+}
+
 fn sample_heic_bytes() -> Vec<u8> {
     let hex: String = include_str!("../testdata/test-exif-orientation.heic.hex")
         .chars()
@@ -843,9 +865,11 @@ impl StorageTestBackend {
                 database
                     .execute_batch(
                         "UPDATE gallery_objects
-                            SET sidecar_latitude = NULL, sidecar_longitude = NULL;
+                            SET sidecar_latitude = NULL,
+                                sidecar_longitude = NULL,
+                                sidecar_inferred_by_berrykeep = 0;
                          DELETE FROM metadata_meta
-                          WHERE key = 'gallery_sidecar_gps_v1';",
+                          WHERE key = 'gallery_sidecar_gps_v2';",
                     )
                     .expect("legacy sqlite GPS projection should persist");
             }
@@ -861,9 +885,11 @@ impl StorageTestBackend {
                 connection
                     .execute_batch(
                         "UPDATE gallery_objects
-                            SET sidecar_latitude = NULL, sidecar_longitude = NULL;
+                            SET sidecar_latitude = NULL,
+                                sidecar_longitude = NULL,
+                                sidecar_inferred_by_berrykeep = 0;
                          DELETE FROM metadata_meta
-                          WHERE key = 'gallery_sidecar_gps_v1';",
+                          WHERE key = 'gallery_sidecar_gps_v2';",
                     )
                     .await
                     .expect("legacy Turso GPS projection should persist");

@@ -15,7 +15,7 @@ const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_HISTORY_HEA
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
-pub(super) const GALLERY_SIDECAR_GPS_BACKFILL_KEY: &str = "gallery_sidecar_gps_v1";
+pub(super) const GALLERY_SIDECAR_GPS_BACKFILL_KEY: &str = "gallery_sidecar_gps_v2";
 pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY: &str =
     "history_head_projection_backfill_cursor_v1";
 pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY: &str =
@@ -2151,6 +2151,22 @@ pub(crate) fn gallery_media_type_for_path(path: &str) -> Option<&'static str> {
     None
 }
 
+/// Resolves one gallery position while preserving the distinction between a
+/// user-authored XMP location and a BerryKeep inference. An inference is an
+/// overlay only while the original media lacks a measured position; a real
+/// embedded GPS fix always becomes authoritative once metadata is available.
+pub(crate) fn effective_gallery_gps<'a>(
+    embedded_gps: Option<&'a MediaGpsCoordinates>,
+    sidecar_gps: Option<&'a MediaGpsCoordinates>,
+    sidecar_inferred_by_berrykeep: bool,
+) -> Option<&'a MediaGpsCoordinates> {
+    if sidecar_inferred_by_berrykeep {
+        embedded_gps.or(sidecar_gps)
+    } else {
+        sidecar_gps.or(embedded_gps)
+    }
+}
+
 const WEB_MERCATOR_MAX_LATITUDE: f64 = 85.051_128_779_806_6;
 
 pub(super) fn gallery_web_mercator_position(latitude: f64, longitude: f64) -> Option<(f64, f64)> {
@@ -2809,7 +2825,7 @@ trait MetadataStore: Send + Sync {
     async fn set_gallery_object_sidecar_gps(
         &self,
         key: &str,
-        location: Option<MediaGpsCoordinates>,
+        location: Option<XmpGeoLocation>,
     ) -> Result<()>;
     /// Returns the current complete label list for each requested key. Generic
     /// store listings use this projection too, so gallery label edits never
@@ -5077,7 +5093,7 @@ impl PersistentStore {
     pub(crate) async fn set_gallery_object_sidecar_gps(
         &self,
         key: &str,
-        location: Option<MediaGpsCoordinates>,
+        location: Option<XmpGeoLocation>,
     ) -> Result<()> {
         self.metadata_store
             .set_gallery_object_sidecar_gps(key, location)
@@ -10186,14 +10202,8 @@ impl PersistentStore {
         media_key: &str,
         location: Option<XmpGeoLocation>,
     ) -> Result<()> {
-        self.set_gallery_object_sidecar_gps(
-            media_key,
-            location.map(|location| MediaGpsCoordinates {
-                latitude: location.latitude,
-                longitude: location.longitude,
-            }),
-        )
-        .await
+        self.set_gallery_object_sidecar_gps(media_key, location)
+            .await
     }
 
     /// Reads a whole sidecar object, refusing packets that are too large to be

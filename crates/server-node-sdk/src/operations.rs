@@ -380,35 +380,9 @@ async fn infer_and_persist_segment(
     config: GeoInferenceConfig,
 ) -> Result<(usize, usize)> {
     let (previous_anchor_indexes, next_anchor_indexes) = nearest_anchor_indexes(segment);
-    let mut proposal_count = 0usize;
+    let mut proposals = Vec::new();
     for target_index in 0..segment.len() {
-        if target_index > 0 && target_index % MULTIMEDIA_OPERATION_BATCH_SIZE == 0 {
-            wait_for_higher_priority_work(state).await;
-            tokio::task::yield_now().await;
-        }
-        if infer_target_proposal(
-            analysis_run_id,
-            segment,
-            target_index,
-            previous_anchor_indexes[target_index],
-            next_anchor_indexes[target_index],
-            config,
-        )
-        .is_some()
-        {
-            proposal_count += 1;
-        }
-    }
-    if proposal_count == 0 {
-        return Ok((0, 0));
-    }
-
-    let proposal_page_count = proposal_count.div_ceil(GEO_PROPOSAL_RESULT_PAGE_SIZE);
-    let mut proposals = Vec::with_capacity(GEO_PROPOSAL_RESULT_PAGE_SIZE);
-    let mut proposal_page = 0usize;
-
-    for target_index in 0..segment.len() {
-        if target_index > 0 && target_index % MULTIMEDIA_OPERATION_BATCH_SIZE == 0 {
+        if target_index > 0 && target_index.is_multiple_of(MULTIMEDIA_OPERATION_BATCH_SIZE) {
             wait_for_higher_priority_work(state).await;
             tokio::task::yield_now().await;
         }
@@ -422,28 +396,23 @@ async fn infer_and_persist_segment(
         ) {
             proposals.push(proposal);
         }
-        if proposals.len() == GEO_PROPOSAL_RESULT_PAGE_SIZE {
-            persist_geo_proposal_page(
-                state,
-                run_id,
-                proposal_chunk_page(
-                    analysis_run_id,
-                    folder,
-                    segment,
-                    std::mem::take(&mut proposals),
-                    proposal_count,
-                    proposal_page,
-                    proposal_page_count,
-                )
-                .context("geolocation segment lost its capture-time bounds")?,
-            )
-            .await?;
-            proposal_page += 1;
-            proposals = Vec::with_capacity(GEO_PROPOSAL_RESULT_PAGE_SIZE);
-        }
+    }
+    let proposal_count = proposals.len();
+    if proposal_count == 0 {
+        return Ok((0, 0));
     }
 
-    if !proposals.is_empty() {
+    // Page metadata contains the logical proposal total. The scan already
+    // retains this segment in memory, so materializing its small proposal
+    // records once avoids a second inference pass and its repeated clones.
+    let proposal_page_count = proposal_count.div_ceil(GEO_PROPOSAL_RESULT_PAGE_SIZE);
+    let mut proposal_pages = proposals.into_iter();
+    for proposal_page in 0..proposal_page_count {
+        wait_for_higher_priority_work(state).await;
+        let page_proposals = proposal_pages
+            .by_ref()
+            .take(GEO_PROPOSAL_RESULT_PAGE_SIZE)
+            .collect();
         persist_geo_proposal_page(
             state,
             run_id,
@@ -451,7 +420,7 @@ async fn infer_and_persist_segment(
                 analysis_run_id,
                 folder,
                 segment,
-                proposals,
+                page_proposals,
                 proposal_count,
                 proposal_page,
                 proposal_page_count,
@@ -459,9 +428,8 @@ async fn infer_and_persist_segment(
             .context("geolocation segment lost its capture-time bounds")?,
         )
         .await?;
-        proposal_page += 1;
     }
-    Ok((proposal_count, proposal_page))
+    Ok((proposal_count, proposal_page_count))
 }
 
 fn nearest_anchor_indexes(
@@ -1399,6 +1367,14 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                 let Some(metadata) = metadata else {
                     continue;
                 };
+                if !media_metadata_is_ready_for_geolocation(&metadata) {
+                    // An incomplete, unsupported, or failed cache record
+                    // does not establish that embedded GPS is absent. Do not
+                    // infer a competing sidecar until the original metadata
+                    // can be read and revalidated.
+                    metadata_error_count += 1;
+                    continue;
+                }
                 let sidecar_gps = {
                     let store = read_store(&state, "operations.geo_proposal.sidecar_gps").await;
                     match store.media_sidecar_gps_overlay(path).await {
@@ -1701,6 +1677,10 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
     release_multimedia_slot(&state, &run.run_id, false).await;
 }
 
+fn media_metadata_is_ready_for_geolocation(metadata: &storage::CachedMediaMetadata) -> bool {
+    metadata.status == storage::MediaCacheStatus::Ready
+}
+
 fn capture_time_for_geolocation(
     path: &str,
     metadata: &storage::CachedMediaMetadata,
@@ -1810,6 +1790,9 @@ async fn apply_one_geo_proposal(
         Ok(None) => return stale("media metadata is no longer available".to_string()),
         Err(error) => return failure(format!("failed reading current media metadata: {error:#}")),
     };
+    if !media_metadata_is_ready_for_geolocation(&metadata) {
+        return stale("media metadata is no longer ready for revalidation".to_string());
+    }
     if metadata.content_fingerprint != proposal.content_fingerprint {
         return stale("media content fingerprint changed since analysis".to_string());
     }
@@ -2207,6 +2190,21 @@ mod tests {
             .into_iter()
             .flat_map(|chunk| chunk.proposals)
             .collect()
+    }
+
+    #[test]
+    fn geolocation_requires_ready_media_metadata() {
+        let mut metadata = cached_metadata(Some(1_700_000_000), Some(true), None);
+        assert!(media_metadata_is_ready_for_geolocation(&metadata));
+
+        for status in [
+            storage::MediaCacheStatus::Incomplete,
+            storage::MediaCacheStatus::Unsupported,
+            storage::MediaCacheStatus::Failed,
+        ] {
+            metadata.status = status;
+            assert!(!media_metadata_is_ready_for_geolocation(&metadata));
+        }
     }
 
     #[test]
