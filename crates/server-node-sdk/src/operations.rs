@@ -593,6 +593,8 @@ fn infer_target_proposal(
                         .saturating_sub(previous_anchor.capture_time.unix)
                         as f64
                         / anchor_interval_seconds as f64;
+                    let proposed =
+                        spherical_interpolate(previous_coordinate, next_coordinate, fraction)?;
                     Some(GeoProposal {
                         id: proposal_id(analysis_run_id, &target.path),
                         media_path: target.path.clone(),
@@ -600,11 +602,7 @@ fn infer_target_proposal(
                         manifest_hash: target.manifest_hash.clone(),
                         content_fingerprint: target.content_fingerprint.clone(),
                         capture_time: target_time,
-                        proposed: spherical_interpolate(
-                            previous_coordinate,
-                            next_coordinate,
-                            fraction,
-                        ),
+                        proposed,
                         method: GeoInferenceMethod::Interpolation,
                         previous_anchor: Some(previous_anchor),
                         next_anchor: Some(next_anchor),
@@ -746,7 +744,10 @@ pub(crate) fn spherical_interpolate(
     start: GeoCoordinate,
     end: GeoCoordinate,
     fraction: f64,
-) -> GeoCoordinate {
+) -> Option<GeoCoordinate> {
+    if !start.valid() || !end.valid() || !fraction.is_finite() {
+        return None;
+    }
     let fraction = fraction.clamp(0.0, 1.0);
     let start_vector = geographic_unit_vector(start);
     let end_vector = geographic_unit_vector(end);
@@ -763,6 +764,12 @@ pub(crate) fn spherical_interpolate(
         )
     } else {
         let sin_omega = omega.sin();
+        // Antipodal points have no unique shortest great-circle path. Their
+        // spherical interpolation is numerically unstable, so leave the
+        // target without a proposal instead of persisting arbitrary GPS.
+        if sin_omega.abs() < 1e-12 {
+            return None;
+        }
         let left_weight = ((1.0 - fraction) * omega).sin() / sin_omega;
         let right_weight = (fraction * omega).sin() / sin_omega;
         (
@@ -772,13 +779,14 @@ pub(crate) fn spherical_interpolate(
         )
     };
     let magnitude = (x * x + y * y + z * z).sqrt();
-    if magnitude > 0.0 {
-        x /= magnitude;
-        y /= magnitude;
-        z /= magnitude;
+    if !magnitude.is_finite() || magnitude <= 0.0 {
+        return None;
     }
+    x /= magnitude;
+    y /= magnitude;
+    z /= magnitude;
     let longitude = y.atan2(x).to_degrees();
-    GeoCoordinate {
+    let proposed = GeoCoordinate {
         latitude: z.atan2((x * x + y * y).sqrt()).to_degrees(),
         longitude: if longitude > 180.0 {
             longitude - 360.0
@@ -787,7 +795,8 @@ pub(crate) fn spherical_interpolate(
         } else {
             longitude
         },
-    }
+    };
+    proposed.valid().then_some(proposed)
 }
 
 fn geographic_unit_vector(coordinate: GeoCoordinate) -> (f64, f64, f64) {
@@ -866,6 +875,10 @@ const MAX_OPERATION_RESULT_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Geolocation inference assumes a short, local time window. Larger values
 /// would turn one folder into an impractically broad temporal segment.
 const MAX_GEO_TIME_WINDOW_SECONDS: u64 = 60 * 60;
+/// An intentionally generous cap for a local inference feature. Together
+/// with the one-hour maximum anchor window this excludes ambiguous antipodal
+/// interpolation while still permitting explicitly configured fast travel.
+const MAX_GEO_ANCHOR_SPEED_KMH: f64 = 10_000.0;
 /// A scan must stay bounded even when a broad folder contains an unexpectedly
 /// large media library. The server fails clearly before producing partial
 /// proposals so an administrator can choose a narrower prefix.
@@ -1351,6 +1364,9 @@ fn validated_geo_proposal_input(request: &OperationRunStartRequest) -> Result<Ge
         || config.segment_gap_seconds > MAX_GEO_TIME_WINDOW_SECONDS
     {
         bail!("geolocation timing limits must not exceed {MAX_GEO_TIME_WINDOW_SECONDS} seconds");
+    }
+    if config.max_anchor_speed_kmh > MAX_GEO_ANCHOR_SPEED_KMH {
+        bail!("geolocation anchor speed must not exceed {MAX_GEO_ANCHOR_SPEED_KMH} km/h");
     }
     Ok(GeoProposalRunInput { prefix, config })
 }
@@ -2697,6 +2713,28 @@ mod tests {
     }
 
     #[test]
+    fn proposal_anchor_speed_is_bounded_at_the_api_boundary() {
+        let request = OperationRunStartRequest {
+            approve: None,
+            prefix: Some("trip".to_string()),
+            max_anchor_time_delta_seconds: None,
+            segment_gap_seconds: None,
+            max_anchor_speed_kmh: Some(MAX_GEO_ANCHOR_SPEED_KMH + 0.1),
+            analysis_run_id: None,
+            proposal_chunk_ids: Vec::new(),
+            proposal_ids: Vec::new(),
+        };
+
+        let error = validated_geo_proposal_input(&request)
+            .expect_err("unbounded geolocation anchor speed must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("geolocation anchor speed must not exceed")
+        );
+    }
+
+    #[test]
     fn apply_selection_inputs_are_bounded_before_they_become_durable_run_input() {
         let mut request = OperationRunStartRequest {
             approve: Some(true),
@@ -2805,8 +2843,28 @@ mod tests {
                 longitude: -179.0,
             },
             0.5,
-        );
+        )
+        .expect("nearby anchors should have a unique short arc");
         assert!(value.longitude.abs() > 179.5);
+    }
+
+    #[test]
+    fn interpolation_rejects_ambiguous_antipodal_anchors() {
+        assert!(
+            spherical_interpolate(
+                GeoCoordinate {
+                    latitude: 0.0,
+                    longitude: 0.0,
+                },
+                GeoCoordinate {
+                    latitude: 0.0,
+                    longitude: 180.0,
+                },
+                0.5,
+            )
+            .is_none(),
+            "an antipodal pair has no unique great-circle interpolation"
+        );
     }
 
     #[test]

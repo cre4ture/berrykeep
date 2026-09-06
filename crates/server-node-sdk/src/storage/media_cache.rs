@@ -1564,7 +1564,7 @@ pub(super) fn parse_iso6709_location(value: &str) -> Option<MediaGpsCoordinates>
     let latitude = value[..longitude_start].parse::<f64>().ok()?;
     let longitude_end = value
         .char_indices()
-        .skip(longitude_start + 1)
+        .skip_while(|(index, _)| *index <= longitude_start)
         .find_map(|(index, character)| matches!(character, '+' | '-').then_some(index))
         .unwrap_or(value.len());
     let longitude = value[longitude_start..longitude_end].parse::<f64>().ok()?;
