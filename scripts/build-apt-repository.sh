@@ -21,6 +21,7 @@ SERVER_NODE_ONLY=false
 SERVER_NODE_MATRIX=""
 DEB_PATHS=()
 REQUESTED_ARCHES=()
+INDEX_ARCHES=()
 
 log() {
   printf '[build-apt-repository] %s\n' "$*"
@@ -440,6 +441,27 @@ add_architecture() {
   fi
 }
 
+contains_index_architecture() {
+  local architecture="$1"
+  local candidate
+
+  for candidate in "${INDEX_ARCHES[@]}"; do
+    if [[ "${candidate}" == "${architecture}" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+add_index_architecture() {
+  local architecture="$1"
+
+  if ! contains_index_architecture "${architecture}"; then
+    INDEX_ARCHES+=("${architecture}")
+  fi
+}
+
 has_server_node_package_for_architecture() {
   local architecture="$1"
   local package_path package_name package_architecture
@@ -774,18 +796,34 @@ PREVIOUS_SUITE_POOL_REL="${LEGACY_POOL_REL}/${SUITE}"
 log "refreshing ${REPO_DIR}"
 mkdir -p "${POOL_DIR}"
 
+# A suite pool is shared by its architecture indexes because it also holds the
+# architecture-independent transition packages. Capture every existing index
+# before replacing any one of them, and preserve all of their legacy package
+# references before the first new shared-pool package is published.
+mapfile -t existing_index_arches < <(
+  find "${SUITE_DIR}/${COMPONENT}" -mindepth 1 -maxdepth 1 -type d -name 'binary-*' -printf '%f\n' 2>/dev/null \
+    | sed 's/^binary-//' \
+    | sort -u
+)
+for architecture in "${existing_index_arches[@]}"; do
+  add_index_architecture "${architecture}"
+done
 for architecture in "${REQUESTED_ARCHES[@]}"; do
-  if [[ "${SERVER_NODE_ONLY}" == true ]]; then
+  add_index_architecture "${architecture}"
+done
+
+if [[ "${SERVER_NODE_ONLY}" == true ]]; then
+  for architecture in "${INDEX_ARCHES[@]}"; do
     # A server-only refresh must retain the desktop/rendezvous packages that
-    # were published before suite-scoped pools existed. Preserve packages
-    # already migrated into this suite pool, then migrate only legacy packages
-    # explicitly referenced by this suite's old index. This includes the
-    # preceding Ironmesh suite pool, which is the active pool before the
-    # BerryKeep namespace transition. Any retained legacy
-    # map-tools package with an exact Ironmesh server dependency is rebuilt to
-    # depend on the new BerryKeep server package before the index is published.
+    # were published before suite-scoped pools existed. Migrate every package
+    # still referenced by each suite index before rewriting any shared-pool
+    # index, including architecture siblings processed by later matrix rows.
     preserve_legacy_suite_packages "${architecture}"
-  else
+  done
+fi
+
+for architecture in "${REQUESTED_ARCHES[@]}"; do
+  if [[ "${SERVER_NODE_ONLY}" != true ]]; then
     rm -f "${POOL_DIR}"/*_"${architecture}".deb "${POOL_DIR}"/*_all.deb
   fi
   rm -rf "${SUITE_DIR}/${COMPONENT}/binary-${architecture}"
@@ -803,18 +841,8 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
 done
 
 # Arch-independent transition packages share the suite pool. Refresh every
-# existing architecture index after changing that pool so each hash describes
-# the same package file, even when matrix rows produce different all packages.
-mapfile -t INDEX_ARCHES < <(
-  find "${SUITE_DIR}/${COMPONENT}" -mindepth 1 -maxdepth 1 -type d -name 'binary-*' -printf '%f\n' \
-    | sed 's/^binary-//' \
-    | sort -u
-)
-if ((${#INDEX_ARCHES[@]} == 0)); then
-  printf 'no package architectures found under %s\n' "${SUITE_DIR}/${COMPONENT}" >&2
-  exit 1
-fi
-
+# index captured before replacing an architecture so each hash describes the
+# same package file, even when matrix rows produce different all packages.
 for architecture in "${INDEX_ARCHES[@]}"; do
   packages_rel="dists/${SUITE}/${COMPONENT}/binary-${architecture}/Packages"
   log "writing ${packages_rel}"
