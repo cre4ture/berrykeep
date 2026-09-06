@@ -1528,6 +1528,15 @@ pub enum PathMutationResult {
     TargetExists,
 }
 
+/// The outcome of a historical restore batch. A finalization failure can occur
+/// after one or more paths have already been restored, so it is retained
+/// separately from the per-path mutation results.
+#[derive(Debug)]
+pub(crate) struct RestoreResolvedVersionPathsBatchResult {
+    pub(crate) results: Vec<Result<PathMutationResult>>,
+    pub(crate) finalization_error: Option<anyhow::Error>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRestoreReport {
     pub snapshot_id: String,
@@ -3292,11 +3301,11 @@ pub(crate) struct RecoverableHistoryListing {
     pub(crate) truncated: bool,
 }
 
-/// Uses JSON1's table-valued array iterator to form the visible path. This
-/// keeps the depth rollup inside the database query without recursive CTEs,
-/// which Turso does not support. The bound therefore applies to visible paths,
-/// not to every historical descendant below a large folder.
-pub(super) fn recoverable_history_listing_query_with_json_path(restrict_to_prefix: bool) -> String {
+/// Builds the depth-projected history query without recursive CTEs, which
+/// Turso does not support. Segment lengths determine the substring boundary,
+/// while the visible path itself remains a substring of the original path.
+/// This avoids unordered string aggregation when rolling up a folder.
+pub(super) fn recoverable_history_listing_query(restrict_to_prefix: bool) -> String {
     let prefix_filter = if restrict_to_prefix {
         "AND history.logical_path >= ?3\n                           AND history.logical_path < ?4"
     } else {
@@ -3346,24 +3355,22 @@ pub(super) fn recoverable_history_listing_query_with_json_path(restrict_to_prefi
          visible AS (
              SELECT
                  scoped.*,
-                 json_array_length(
-                     '[' || replace(json_quote(relative_path), '/', char(34) || ',' || char(34)) || ']'
-                 ) AS segment_count,
+                 length(relative_path) - length(replace(relative_path, '/', '')) + 1 AS segment_count,
                  (
-                     SELECT group_concat(value, '/')
+                     SELECT sum(length(value)) + ?5 - 1
                      FROM json_each(
                          '[' || replace(json_quote(scoped.relative_path), '/', char(34) || ',' || char(34)) || ']'
                      )
                      WHERE key < ?5
-                 ) AS visible_path
+                 ) AS visible_path_length
              FROM scoped
          ),
          projected AS (
              SELECT
                  CASE
                      WHEN segment_count <= ?5 THEN logical_path
-                     WHEN ?2 = '' THEN visible_path || '/'
-                     ELSE ?2 || '/' || visible_path || '/'
+                     WHEN ?2 = '' THEN substr(relative_path, 1, visible_path_length) || '/'
+                     ELSE ?2 || '/' || substr(relative_path, 1, visible_path_length) || '/'
                  END AS display_path,
                  CASE WHEN segment_count <= ?5 THEN 1 ELSE 0 END AS is_historical,
                  restore_source_path,
@@ -10421,7 +10428,7 @@ impl PersistentStore {
         &mut self,
         restore_requests: &[(String, String, String, String)],
         sources: &[Option<SnapshotRestoreSource>],
-    ) -> Result<Vec<Result<PathMutationResult>>> {
+    ) -> Result<RestoreResolvedVersionPathsBatchResult> {
         if restore_requests.len() != sources.len() {
             bail!(
                 "historical restore request/source count mismatch: {} requests, {} sources",
@@ -10472,12 +10479,19 @@ impl PersistentStore {
             results.push(result);
         }
 
-        let changed_paths = self.changed_paths_after_bindings(&before_bindings).await?;
-        if !changed_paths.is_empty() {
-            self.record_snapshot_batch(changed_paths, unix_ts()).await?;
-        }
+        let finalization_error = match self.changed_paths_after_bindings(&before_bindings).await {
+            Ok(changed_paths) if !changed_paths.is_empty() => self
+                .record_snapshot_batch(changed_paths, unix_ts())
+                .await
+                .err(),
+            Ok(_) => None,
+            Err(err) => Some(err),
+        };
 
-        Ok(results)
+        Ok(RestoreResolvedVersionPathsBatchResult {
+            results,
+            finalization_error,
+        })
     }
 
     async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {

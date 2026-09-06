@@ -41,7 +41,7 @@ use super::{
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
-    recoverable_history_listing_query_with_json_path, sqlite_like_prefix_pattern,
+    recoverable_history_listing_query, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload, version_index_head_projection,
 };
 
@@ -3979,13 +3979,14 @@ impl MetadataStore for SqliteMetadataStore {
         let prefix = prefix.trim().trim_matches('/').to_string();
         let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
         let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
-        let depth = i64::try_from(depth.max(1)).context("history listing depth overflow")?;
+        let depth = depth.clamp(1, 64);
+        let depth = i64::try_from(depth).context("history listing depth overflow")?;
         let max_entries = max_entries.max(1);
         let limit = max_entries
             .checked_add(1)
             .and_then(|value| i64::try_from(value).ok())
             .unwrap_or(i64::MAX);
-        let query = recoverable_history_listing_query_with_json_path(!prefix.is_empty());
+        let query = recoverable_history_listing_query(!prefix.is_empty());
         self.read(move |db| {
             let mut statement = db.prepare(&query)?;
             let mut rows = statement.query(params![

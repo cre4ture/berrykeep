@@ -6783,12 +6783,13 @@ async fn restore_history_batch_preserves_recreated_target_impl(backend: StorageT
         .resolve_version_restore_sources(&restore_requests)
         .await
         .unwrap();
-    let results = store
+    let batch = store
         .restore_resolved_version_paths_batch(&restore_requests, &sources)
         .await
         .unwrap();
+    assert!(batch.finalization_error.is_none());
     assert!(matches!(
-        results.as_slice(),
+        batch.results.as_slice(),
         [Ok(PathMutationResult::TargetExists)]
     ));
     assert_eq!(
@@ -6894,10 +6895,12 @@ async fn restore_history_batch_keeps_partial_successes_impl(backend: StorageTest
         .resolve_version_restore_sources(&restore_requests)
         .await
         .unwrap();
-    let results = store
+    let batch = store
         .restore_resolved_version_paths_batch(&restore_requests, &sources)
         .await
         .unwrap();
+    assert!(batch.finalization_error.is_none());
+    let results = batch.results;
     assert!(matches!(
         results.first(),
         Some(Ok(PathMutationResult::Applied))
@@ -7017,6 +7020,18 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
             .await
             .unwrap();
     }
+    store
+        .put_object_versioned(
+            "a/b/c.txt",
+            Bytes::from_static(b"multi-segment rollup payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .tombstone_object("a/b/c.txt", PutOptions::default())
+        .await
+        .unwrap();
 
     let rollup_listing = store
         .store_history_inspector()
@@ -7032,6 +7047,21 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         vec![RecoverableHistoryListingEntry::Prefix {
             path: "rollup/deep/".to_string(),
         }]
+    );
+
+    let multi_segment_rollup = store
+        .store_history_inspector()
+        .list_recoverable_history_listing("", 2, usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        multi_segment_rollup.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                RecoverableHistoryListingEntry::Prefix { path } if path == "a/b/"
+            )
+        }),
+        "depth rollups must preserve the path segment order"
     );
 
     let history_listing = store

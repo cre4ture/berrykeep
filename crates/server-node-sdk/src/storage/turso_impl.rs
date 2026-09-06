@@ -33,7 +33,7 @@ use super::{
     StorageStatsSample, StorageStatsState, TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection,
     compress_snapshot_json, decode_gallery_labels, decode_version_index, decompress_snapshot_json,
     metadata_db_logical_summary_query, metadata_db_logical_table_specs,
-    normalize_snapshot_manifest_object_ids, recoverable_history_listing_query_with_json_path,
+    normalize_snapshot_manifest_object_ids, recoverable_history_listing_query,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -1825,13 +1825,14 @@ impl MetadataStore for TursoMetadataStore {
         let prefix = prefix.trim().trim_matches('/').to_string();
         let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
         let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
-        let depth = i64::try_from(depth.max(1)).context("history listing depth overflow")?;
+        let depth = depth.clamp(1, 64);
+        let depth = i64::try_from(depth).context("history listing depth overflow")?;
         let max_entries = max_entries.max(1);
         let limit = max_entries
             .checked_add(1)
             .and_then(|value| i64::try_from(value).ok())
             .unwrap_or(i64::MAX);
-        let query = recoverable_history_listing_query_with_json_path(!prefix.is_empty());
+        let query = recoverable_history_listing_query(!prefix.is_empty());
         let mut rows = self
             .connection
             .query(

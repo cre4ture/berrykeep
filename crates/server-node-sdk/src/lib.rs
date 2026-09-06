@@ -16831,7 +16831,16 @@ async fn restore_history_entries_response(
         Err(err) => Err(err),
     };
     let restore_results: Vec<Result<PathMutationResult>> = match restore_results {
-        Ok(results) => results,
+        Ok(batch) => {
+            if let Some(err) = batch.finalization_error {
+                tracing::error!(
+                    error = %err,
+                    entry_count = restore_requests.len(),
+                    "historical restore batch changed paths but did not finish snapshot recording"
+                );
+            }
+            batch.results
+        }
         Err(err) => {
             tracing::warn!(error = %err, entry_count = restore_requests.len(), "failed resolving historical restore batch");
             let error = err.to_string();
