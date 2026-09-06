@@ -265,6 +265,17 @@ struct GeoScanCandidate {
     object_id: Option<String>,
 }
 
+#[derive(Debug)]
+struct GeoScanReadyMedia {
+    path: String,
+    object_id: String,
+    manifest_hash: String,
+    content_fingerprint: String,
+    capture_time: Option<GeoCaptureTime>,
+    embedded_gps: Option<GeoCoordinate>,
+    has_embedded_gps_properties: bool,
+}
+
 /// Collects a scope-limited, deterministic media candidate list without
 /// cloning the entire store index. A run fails rather than silently truncating
 /// its review data when the chosen prefix is too broad.
@@ -1451,6 +1462,7 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
             .enumerate()
         {
             wait_for_multimedia_turn(&state, &mut run).await?;
+            let mut ready_media = Vec::with_capacity(batch.len());
             for candidate in batch {
                 let metadata = match worker.ensure_media_metadata(&candidate.manifest_hash).await {
                     Ok(metadata) => metadata,
@@ -1475,15 +1487,29 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                     metadata_error_count += 1;
                     continue;
                 }
-                let sidecar_gps = {
-                    let store = read_store(&state, "operations.geo_proposal.sidecar_gps").await;
-                    match store.media_sidecar_gps_overlay(&candidate.path).await {
+                ready_media.push(GeoScanReadyMedia {
+                    path: candidate.path.clone(),
+                    object_id: candidate.object_id.clone().unwrap_or_default(),
+                    manifest_hash: candidate.manifest_hash.clone(),
+                    content_fingerprint: metadata.content_fingerprint.clone(),
+                    capture_time: capture_time_for_geolocation(&candidate.path, &metadata),
+                    embedded_gps: metadata.gps.as_ref().map(|value| GeoCoordinate {
+                        latitude: value.latitude,
+                        longitude: value.longitude,
+                    }),
+                    has_embedded_gps_properties: metadata.has_embedded_gps_properties,
+                });
+            }
+            {
+                let store = read_store(&state, "operations.geo_proposal.sidecar_gps_batch").await;
+                for ready in ready_media {
+                    let sidecar_gps = match store.media_sidecar_gps_overlay(&ready.path).await {
                         Ok(overlay) => overlay,
                         Err(error) => {
                             sidecar_error_count += 1;
                             warn!(
                                 error = %error,
-                                media_path = %candidate.path,
+                                media_path = %ready.path,
                                 "skipping media with unreadable XMP sidecar during geolocation proposal scan"
                             );
                             // An unreadable sidecar may contain user-owned
@@ -1495,44 +1521,39 @@ async fn run_geo_proposal(state: ServerState, mut run: OperationRun, input: GeoP
                                 has_geo_location_properties: true,
                             }
                         }
-                    }
-                };
-                let capture_time = capture_time_for_geolocation(&candidate.path, &metadata);
-                let embedded_gps = metadata.gps.as_ref().map(|value| GeoCoordinate {
-                    latitude: value.latitude,
-                    longitude: value.longitude,
-                });
-                // A measured embedded location takes precedence over an
-                // inferred sidecar. Otherwise preserve the sidecar location
-                // and its trust flag: it suppresses a duplicate proposal but
-                // cannot act as a future inference anchor.
-                let gps_is_present = embedded_gps.is_some()
-                    || metadata.has_embedded_gps_properties
-                    || sidecar_gps.has_geo_location_properties;
-                let (gps, gps_is_inferred) = match (sidecar_gps.location, embedded_gps) {
-                    (Some(sidecar), Some(embedded)) if sidecar.inferred_by_berrykeep => {
-                        (Some(embedded), false)
-                    }
-                    (Some(sidecar), _) => (
-                        Some(GeoCoordinate {
-                            latitude: sidecar.latitude,
-                            longitude: sidecar.longitude,
-                        }),
-                        sidecar.inferred_by_berrykeep,
-                    ),
-                    (None, Some(embedded)) => (Some(embedded), false),
-                    (None, None) => (None, false),
-                };
-                media.push(GeoAnalysisMedia {
-                    path: candidate.path.clone(),
-                    object_id: candidate.object_id.clone().unwrap_or_default(),
-                    manifest_hash: candidate.manifest_hash.clone(),
-                    content_fingerprint: metadata.content_fingerprint.clone(),
-                    capture_time,
-                    gps,
-                    gps_is_present,
-                    gps_is_inferred,
-                });
+                    };
+                    // A measured embedded location takes precedence over an
+                    // inferred sidecar. Otherwise preserve the sidecar location
+                    // and its trust flag: it suppresses a duplicate proposal but
+                    // cannot act as a future inference anchor.
+                    let gps_is_present = ready.embedded_gps.is_some()
+                        || ready.has_embedded_gps_properties
+                        || sidecar_gps.has_geo_location_properties;
+                    let (gps, gps_is_inferred) = match (sidecar_gps.location, ready.embedded_gps) {
+                        (Some(sidecar), Some(embedded)) if sidecar.inferred_by_berrykeep => {
+                            (Some(embedded), false)
+                        }
+                        (Some(sidecar), _) => (
+                            Some(GeoCoordinate {
+                                latitude: sidecar.latitude,
+                                longitude: sidecar.longitude,
+                            }),
+                            sidecar.inferred_by_berrykeep,
+                        ),
+                        (None, Some(embedded)) => (Some(embedded), false),
+                        (None, None) => (None, false),
+                    };
+                    media.push(GeoAnalysisMedia {
+                        path: ready.path,
+                        object_id: ready.object_id,
+                        manifest_hash: ready.manifest_hash,
+                        content_fingerprint: ready.content_fingerprint,
+                        capture_time: ready.capture_time,
+                        gps,
+                        gps_is_present,
+                        gps_is_inferred,
+                    });
+                }
             }
             run.progress = OperationProgress {
                 phase: Some("scanning".to_string()),
