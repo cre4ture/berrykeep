@@ -56,6 +56,8 @@ export CXX := $(CLANGXX_BIN)
 
 CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/berrykeep-client/usr/lib/berrykeep-client
 CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
+LEGACY_CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/berrykeep-client/usr/lib/ironmesh-client
+LEGACY_CLIENT_EXTENSION_ROOT := $(LEGACY_CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
 
 %:
 	dh $@ --with sysuser
@@ -187,8 +189,6 @@ ifeq ($(SERVER_NODE_ONLY),)
 		$(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh/rendezvous-service.env
 
 	install -d $(CLIENT_PACKAGE_ROOT)
-	ln -sfn berrykeep-client \
-		$(CURDIR)/debian/berrykeep-client/usr/lib/ironmesh-client
 	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep $(CLIENT_PACKAGE_ROOT)/berrykeep
 	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep-config-app \
 		$(CLIENT_PACKAGE_ROOT)/berrykeep-config-app
@@ -203,6 +203,12 @@ ifeq ($(SERVER_NODE_ONLY),)
 	ln -sf berrykeep-background-launcher $(CLIENT_PACKAGE_ROOT)/ironmesh-background-launcher
 	ln -sf berrykeep-folder-agent $(CLIENT_PACKAGE_ROOT)/ironmesh-folder-agent
 	ln -sf berrykeep-os-integration $(CLIENT_PACKAGE_ROOT)/ironmesh-os-integration
+	install -d $(LEGACY_CLIENT_PACKAGE_ROOT)
+	ln -sf ../berrykeep-client/berrykeep $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh
+	ln -sf ../berrykeep-client/berrykeep-config-app $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh-config-app
+	ln -sf ../berrykeep-client/berrykeep-background-launcher $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh-background-launcher
+	ln -sf ../berrykeep-client/berrykeep-folder-agent $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh-folder-agent
+	ln -sf ../berrykeep-client/berrykeep-os-integration $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh-os-integration
 
 	install -d $(CLIENT_EXTENSION_ROOT)
 	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/extension.js \
@@ -211,6 +217,13 @@ ifeq ($(SERVER_NODE_ONLY),)
 		$(CLIENT_EXTENSION_ROOT)/metadata.json
 	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/stylesheet.css \
 		$(CLIENT_EXTENSION_ROOT)/stylesheet.css
+	install -d $(LEGACY_CLIENT_EXTENSION_ROOT)
+	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/extension.js \
+		$(LEGACY_CLIENT_EXTENSION_ROOT)/extension.js
+	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/metadata.json \
+		$(LEGACY_CLIENT_EXTENSION_ROOT)/metadata.json
+	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/stylesheet.css \
+		$(LEGACY_CLIENT_EXTENSION_ROOT)/stylesheet.css
 
 	install -d $(CURDIR)/debian/berrykeep-client/usr/bin
 	ln -sf ../lib/berrykeep-client/berrykeep \

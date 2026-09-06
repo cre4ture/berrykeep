@@ -27,5 +27,6 @@ paths.
 The client package installs its executable payload under
 `/usr/lib/berrykeep-client`; the public `berrykeep` and legacy `ironmesh`
 commands remain available in `/usr/bin` during the transition.
-`/usr/lib/ironmesh-client` is retained as a symlink to the new payload path so
-an already-running legacy config app can complete its package-upgrade handoff.
+`/usr/lib/ironmesh-client` remains a compatibility directory containing aliases
+to the new payload and extension assets, so an already-running legacy config
+app can complete its package-upgrade handoff.
