@@ -833,7 +833,14 @@ const MULTIMEDIA_OPERATION_BATCH_SIZE: usize = 64;
 const OPERATION_RESULT_SELECTION_BATCH_SIZE: usize = 64;
 /// A result row remains transportable and bounded even when one logical
 /// folder/time segment contains a very large number of proposals.
-const GEO_PROPOSAL_RESULT_PAGE_SIZE: usize = 256;
+const GEO_PROPOSAL_RESULT_PAGE_SIZE: usize = 64;
+/// The public results endpoint pages generic result chunks, whose payload
+/// sizes are operation-defined. Keep both the number of chunks and the
+/// serialized payload bounded so a single administrative request cannot load
+/// an unbounded report into memory.
+const DEFAULT_OPERATION_RESULT_CHUNK_LIMIT: usize = 10;
+const MAX_OPERATION_RESULT_CHUNKS_PER_RESPONSE: usize = 20;
+const MAX_OPERATION_RESULT_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Geolocation inference assumes a short, local time window. Larger values
 /// would turn one folder into an impractically broad temporal segment.
 const MAX_GEO_TIME_WINDOW_SECONDS: u64 = 60 * 60;
@@ -1125,8 +1132,8 @@ pub(super) async fn get_operation_run_results(
     }
     let limit = query
         .limit
-        .map(|limit| limit.clamp(1, 1_000))
-        .unwrap_or(100);
+        .map(|limit| limit.clamp(1, MAX_OPERATION_RESULT_CHUNKS_PER_RESPONSE))
+        .unwrap_or(DEFAULT_OPERATION_RESULT_CHUNK_LIMIT);
     let offset = query.offset.unwrap_or_default();
     let chunks = {
         let store = read_store(&state, "operations.load_results").await;
@@ -1135,12 +1142,8 @@ pub(super) async fn get_operation_run_results(
             .await
     };
     match chunks {
-        Ok(mut chunks) => {
-            let next_offset = (chunks.len() > limit).then(|| {
-                chunks.pop();
-                offset.saturating_add(limit)
-            });
-            (
+        Ok(chunks) => match bounded_operation_result_page(chunks, limit, offset) {
+            Ok((chunks, next_offset)) => (
                 StatusCode::OK,
                 Json(OperationRunResultsResponse {
                     run_id,
@@ -1148,13 +1151,47 @@ pub(super) async fn get_operation_run_results(
                     next_offset,
                 }),
             )
-                .into_response()
-        }
+                .into_response(),
+            Err(error) => {
+                warn!(error = %error, "failed to bound operation result response");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
         Err(error) => {
             warn!(error = %error, "failed to load operation result chunks");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+fn bounded_operation_result_page(
+    fetched_chunks: Vec<OperationResultChunk>,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<OperationResultChunk>, Option<usize>)> {
+    debug_assert!(limit > 0);
+    let has_chunk_after_requested_limit = fetched_chunks.len() > limit;
+    let mut response_bytes = 0usize;
+    let mut chunks = Vec::with_capacity(fetched_chunks.len().min(limit));
+    let mut stopped_for_byte_budget = false;
+
+    for chunk in fetched_chunks.into_iter().take(limit) {
+        let chunk_bytes = serde_json::to_vec(&chunk)?.len();
+        // Always return the first chunk. This preserves forward progress even
+        // for a future operation with one exceptionally large result row.
+        if !chunks.is_empty()
+            && response_bytes.saturating_add(chunk_bytes) > MAX_OPERATION_RESULT_RESPONSE_BYTES
+        {
+            stopped_for_byte_budget = true;
+            break;
+        }
+        response_bytes = response_bytes.saturating_add(chunk_bytes);
+        chunks.push(chunk);
+    }
+
+    let next_offset = (stopped_for_byte_budget || has_chunk_after_requested_limit)
+        .then(|| offset.saturating_add(chunks.len()));
+    Ok((chunks, next_offset))
 }
 
 pub(super) async fn get_operation_run_history(
@@ -1611,7 +1648,13 @@ async fn run_geo_apply(state: ServerState, mut run: OperationRun, input: GeoAppl
                             "Revalidating and applying selected sidecar updates.".to_string(),
                         ),
                     };
-                    persist_operation_run(&state, &run).await?;
+                    // Each item outcome is durable on its own. Persist the
+                    // derived run counter in batches so a large apply does
+                    // not acquire the global store write lock twice for
+                    // every sidecar update.
+                    if selected_count % MULTIMEDIA_OPERATION_BATCH_SIZE == 0 {
+                        persist_operation_run(&state, &run).await?;
+                    }
                     tokio::task::yield_now().await;
                 }
             }
@@ -2164,6 +2207,46 @@ mod tests {
             .into_iter()
             .flat_map(|chunk| chunk.proposals)
             .collect()
+    }
+
+    #[test]
+    fn operation_result_responses_stop_at_the_serialized_byte_budget() {
+        let large_chunk = |index| OperationResultChunk {
+            run_id: "run".to_string(),
+            chunk_id: format!("chunk-{index}"),
+            result_type: "test".to_string(),
+            created_at_unix: 0,
+            payload: json!({ "contents": "x".repeat(MAX_OPERATION_RESULT_RESPONSE_BYTES / 2 + 1) }),
+        };
+
+        let (chunks, next_offset) = bounded_operation_result_page(
+            vec![large_chunk(1), large_chunk(2), large_chunk(3)],
+            3,
+            12,
+        )
+        .expect("result page is serializable");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_id, "chunk-1");
+        assert_eq!(next_offset, Some(13));
+    }
+
+    #[test]
+    fn operation_result_responses_keep_chunk_limit_pagination() {
+        let chunk = |index| OperationResultChunk {
+            run_id: "run".to_string(),
+            chunk_id: format!("chunk-{index}"),
+            result_type: "test".to_string(),
+            created_at_unix: 0,
+            payload: json!({ "index": index }),
+        };
+
+        let (chunks, next_offset) =
+            bounded_operation_result_page(vec![chunk(1), chunk(2), chunk(3)], 2, 4)
+                .expect("result page is serializable");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(next_offset, Some(6));
     }
 
     #[test]

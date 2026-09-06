@@ -221,7 +221,7 @@ export async function getOperationRunResults(
 ): Promise<OperationRunResultsResponse> {
   const query = new URLSearchParams();
   if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
-    query.set("limit", String(Math.max(1, Math.min(1_000, Math.trunc(options.limit)))));
+    query.set("limit", String(Math.max(1, Math.min(20, Math.trunc(options.limit)))));
   }
   if (typeof options?.offset === "number" && Number.isFinite(options.offset)) {
     query.set("offset", String(Math.max(0, Math.trunc(options.offset))));

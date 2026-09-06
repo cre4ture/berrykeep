@@ -30,13 +30,14 @@ import {
   Text,
   Title
 } from "@mantine/core";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 
 const PROPOSE_OPERATION_ID = "multimedia.geolocation.propose";
 const APPLY_OPERATION_ID = "multimedia.geolocation.apply";
-const RESULTS_LIMIT = 200;
+const RESULTS_LIMIT = 10;
+const PROPOSALS_PER_REVIEW_PAGE = 25;
 const MAX_GEO_TIME_WINDOW_SECONDS = 60 * 60;
 
 type InferenceSettings = {
@@ -728,51 +729,116 @@ function ProposalReview({
   return (
     <Stack gap="md">
       {chunks.map((chunk) => (
-        <Card key={`${chunk.id}-page-${chunk.proposal_page ?? 0}`} withBorder radius="sm" p="sm">
-          <Stack gap="xs">
-            <Group justify="space-between">
-              <Checkbox
-                label={`${chunk.folder || "/"} — ${chunk.item_count} media items${
-                  (chunk.proposal_page_count ?? 1) > 1
-                    ? ` (proposal page ${(chunk.proposal_page ?? 0) + 1} of ${chunk.proposal_page_count})`
-                    : ""
-                }`}
-                checked={selectedChunkIds.has(chunk.id)}
-                onChange={() => onToggleChunk(chunk.id, chunk.proposal_count ?? chunk.proposals.length)}
-              />
-              <Text size="xs" c="dimmed">
-                {formatCaptureTime(chunk.time_range_start)} – {formatCaptureTime(chunk.time_range_end)}
-              </Text>
-            </Group>
-            <Table.ScrollContainer minWidth={1_150}>
-              <Table striped highlightOnHover verticalSpacing="xs">
-                <Table.Thead>
-                  <Table.Tr>
-                    <Table.Th>Select</Table.Th>
-                    <Table.Th>Preview</Table.Th>
-                    <Table.Th>File / capture time</Table.Th>
-                    <Table.Th>Proposal</Table.Th>
-                    <Table.Th>Anchors</Table.Th>
-                    <Table.Th>Plausibility</Table.Th>
-                  </Table.Tr>
-                </Table.Thead>
-                <Table.Tbody>
-                  {chunk.proposals.map((proposal) => (
-                    <ProposalRow
-                      key={proposal.id}
-                      proposal={proposal}
-                      checked={selectedProposalIds.has(proposal.id)}
-                      adminTokenOverride={adminTokenOverride}
-                      onToggle={() => onToggleProposal(proposal.id, chunk.id)}
-                    />
-                  ))}
-                </Table.Tbody>
-              </Table>
-            </Table.ScrollContainer>
-          </Stack>
-        </Card>
+        <ProposalChunkReview
+          key={`${chunk.id}-page-${chunk.proposal_page ?? 0}`}
+          chunk={chunk}
+          selectedChunkIds={selectedChunkIds}
+          selectedProposalIds={selectedProposalIds}
+          adminTokenOverride={adminTokenOverride}
+          onToggleChunk={onToggleChunk}
+          onToggleProposal={onToggleProposal}
+        />
       ))}
     </Stack>
+  );
+}
+
+function ProposalChunkReview({
+  chunk,
+  selectedChunkIds,
+  selectedProposalIds,
+  adminTokenOverride,
+  onToggleChunk,
+  onToggleProposal
+}: {
+  chunk: GeoProposalChunk;
+  selectedChunkIds: Set<string>;
+  selectedProposalIds: Set<string>;
+  adminTokenOverride?: string;
+  onToggleChunk: (chunkId: string, proposalCount: number) => void;
+  onToggleProposal: (proposalId: string, chunkId: string) => void;
+}) {
+  const [proposalOffset, setProposalOffset] = useState(0);
+  const visibleProposals = chunk.proposals.slice(
+    proposalOffset,
+    proposalOffset + PROPOSALS_PER_REVIEW_PAGE
+  );
+  const nextProposalOffset = proposalOffset + visibleProposals.length < chunk.proposals.length
+    ? proposalOffset + PROPOSALS_PER_REVIEW_PAGE
+    : null;
+  return (
+    <Card withBorder radius="sm" p="sm">
+      <Stack gap="xs">
+        <Group justify="space-between">
+          <Checkbox
+            label={`${chunk.folder || "/"} — ${chunk.item_count} media items${
+              (chunk.proposal_page_count ?? 1) > 1
+                ? ` (proposal page ${(chunk.proposal_page ?? 0) + 1} of ${chunk.proposal_page_count})`
+                : ""
+            }`}
+            checked={selectedChunkIds.has(chunk.id)}
+            onChange={() => onToggleChunk(chunk.id, chunk.proposal_count ?? chunk.proposals.length)}
+          />
+          <Text size="xs" c="dimmed">
+            {formatCaptureTime(chunk.time_range_start)} – {formatCaptureTime(chunk.time_range_end)}
+          </Text>
+        </Group>
+        <Table.ScrollContainer minWidth={1_150}>
+          <Table striped highlightOnHover verticalSpacing="xs">
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>Select</Table.Th>
+                <Table.Th>Preview</Table.Th>
+                <Table.Th>File / capture time</Table.Th>
+                <Table.Th>Proposal</Table.Th>
+                <Table.Th>Anchors</Table.Th>
+                <Table.Th>Plausibility</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {visibleProposals.map((proposal) => (
+                <ProposalRow
+                  key={proposal.id}
+                  proposal={proposal}
+                  checked={selectedProposalIds.has(proposal.id)}
+                  adminTokenOverride={adminTokenOverride}
+                  onToggle={() => onToggleProposal(proposal.id, chunk.id)}
+                />
+              ))}
+            </Table.Tbody>
+          </Table>
+        </Table.ScrollContainer>
+        {chunk.proposals.length > PROPOSALS_PER_REVIEW_PAGE ? (
+          <Group justify="space-between">
+            <Text size="xs" c="dimmed">
+              Showing proposals {proposalOffset + 1}–{proposalOffset + visibleProposals.length} of {chunk.proposals.length} in this result page.
+            </Text>
+            <Group gap="xs">
+              <Button
+                size="xs"
+                variant="default"
+                disabled={proposalOffset === 0}
+                onClick={() => setProposalOffset(Math.max(0, proposalOffset - PROPOSALS_PER_REVIEW_PAGE))}
+              >
+                Previous proposals
+              </Button>
+              <Button
+                size="xs"
+                variant="default"
+                disabled={nextProposalOffset === null}
+                onClick={() => {
+                  if (nextProposalOffset !== null) {
+                    setProposalOffset(nextProposalOffset);
+                  }
+                }}
+              >
+                Next proposals
+              </Button>
+            </Group>
+          </Group>
+        ) : null}
+      </Stack>
+    </Card>
   );
 }
 
@@ -791,7 +857,7 @@ function ProposalRow({
     <Table.Tr>
       <Table.Td><Checkbox aria-label={`Select ${proposal.media_path}`} checked={checked} onChange={onToggle} /></Table.Td>
       <Table.Td>
-        <AuthenticatedThumbnail mediaPath={proposal.media_path} adminTokenOverride={adminTokenOverride} />
+        <DeferredThumbnail mediaPath={proposal.media_path} adminTokenOverride={adminTokenOverride} />
       </Table.Td>
       <Table.Td>
         <Text size="sm" fw={500}>{proposal.media_path}</Text>
@@ -822,6 +888,43 @@ function ProposalRow({
   );
 }
 
+function DeferredThumbnail({
+  mediaPath,
+  adminTokenOverride
+}: {
+  mediaPath: string;
+  adminTokenOverride?: string;
+}) {
+  const targetRef = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const target = targetRef.current;
+    if (!target || typeof IntersectionObserver === "undefined") {
+      setVisible(true);
+      return undefined;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "300px" }
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <div ref={targetRef} style={{ width: 72, height: 54 }}>
+      {visible ? (
+        <AuthenticatedThumbnail mediaPath={mediaPath} adminTokenOverride={adminTokenOverride} />
+      ) : null}
+    </div>
+  );
+}
+
 function AuthenticatedThumbnail({
   mediaPath,
   adminTokenOverride
@@ -833,9 +936,13 @@ function AuthenticatedThumbnail({
   useEffect(() => {
     const controller = new AbortController();
     let objectUrl: string | null = null;
+    let cancelled = false;
     setSource(null);
     void getAdminMediaThumbnail(mediaPath, adminTokenOverride, controller.signal)
       .then((blob) => {
+        if (cancelled) {
+          return;
+        }
         objectUrl = URL.createObjectURL(blob);
         setSource(objectUrl);
       })
@@ -843,6 +950,7 @@ function AuthenticatedThumbnail({
         // A missing thumbnail is expected while metadata is still being built.
       });
     return () => {
+      cancelled = true;
       controller.abort();
       if (objectUrl) {
         URL.revokeObjectURL(objectUrl);
