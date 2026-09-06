@@ -16121,7 +16121,10 @@ async fn generic_store_index_applies_current_xmp_gps_overlay_impl(backend: MainT
         cursor: None,
         page_size: None,
         offset: Some(0),
-        limit: Some(1),
+        // The sidecar is deliberately visible in a generic file listing. Do
+        // not let its (newer) modification timestamp decide whether this
+        // test sees the media entry.
+        limit: Some(2),
         sort: Some(super::StoreIndexSortOrder::CapturedDesc),
         media_filter: None,
         captured_from_unix: None,
@@ -16136,12 +16139,23 @@ async fn generic_store_index_applies_current_xmp_gps_overlay_impl(backend: MainT
     let cursor_query = super::StoreIndexQuery {
         view: None,
         cursor: None,
-        page_size: Some(1),
+        page_size: Some(2),
         offset: None,
         limit: None,
         sort: None,
         ..generic_query.clone()
     };
+    fn media_entry(payload: &serde_json::Value) -> &serde_json::Value {
+        payload["entries"]
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry["path"] == "gallery/geotagged.png")
+            })
+            .expect("the generic listing should include the geotagged media")
+    }
+
     let first_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
@@ -16156,15 +16170,9 @@ async fn generic_store_index_applies_current_xmp_gps_overlay_impl(backend: MainT
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(first_payload["entries"][0]["path"], "gallery/geotagged.png");
-    assert_eq!(
-        first_payload["entries"][0]["media"]["gps"]["latitude"],
-        47.3769
-    );
-    assert_eq!(
-        first_payload["entries"][0]["media"]["gps"]["longitude"],
-        8.5417
-    );
+    let first_media = media_entry(&first_payload);
+    assert_eq!(first_media["media"]["gps"]["latitude"], 47.3769);
+    assert_eq!(first_media["media"]["gps"]["longitude"], 8.5417);
 
     let cached_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
@@ -16188,14 +16196,9 @@ async fn generic_store_index_applies_current_xmp_gps_overlay_impl(backend: MainT
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        cached_payload["entries"][0]["media"]["gps"]["latitude"],
-        47.3769
-    );
-    assert_eq!(
-        cached_payload["entries"][0]["media"]["gps"]["longitude"],
-        8.5417
-    );
+    let cached_media = media_entry(&cached_payload);
+    assert_eq!(cached_media["media"]["gps"]["latitude"], 47.3769);
+    assert_eq!(cached_media["media"]["gps"]["longitude"], 8.5417);
 
     let cursor_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
@@ -16211,14 +16214,9 @@ async fn generic_store_index_applies_current_xmp_gps_overlay_impl(backend: MainT
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        cursor_payload["entries"][0]["media"]["gps"]["latitude"],
-        47.3769
-    );
-    assert_eq!(
-        cursor_payload["entries"][0]["media"]["gps"]["longitude"],
-        8.5417
-    );
+    let cursor_media = media_entry(&cursor_payload);
+    assert_eq!(cursor_media["media"]["gps"]["latitude"], 47.3769);
+    assert_eq!(cursor_media["media"]["gps"]["longitude"], 8.5417);
 
     cleanup_test_state(&state).await;
 }
