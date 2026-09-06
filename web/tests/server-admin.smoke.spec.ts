@@ -2057,7 +2057,7 @@ async function installServerAdminMocks(
       public_url: "https://node-alpha.local:9443",
       tls_enabled: true,
       gateway_command_hint:
-        "ironmesh --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000",
+        "berrykeep --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000",
       local_generation: s3LocalGeneration,
       last_applied_at_unix: 1_900_000_210,
       last_source_node_id: "node-beta",
