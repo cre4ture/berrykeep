@@ -133,8 +133,8 @@ print_result() {
   local resolved_target
   resolved_target="$(readlink -f "$PACKAGED_BINARY")"
   log "active berrykeep-config-app target: ${resolved_target}"
-	log "package symlink at /usr/bin/berrykeep-config-app remains unchanged"
-	log "restart any running berrykeep-config-app --background process to pick up the new binary"
+  log "package symlink at /usr/bin/berrykeep-config-app remains unchanged"
+  log "restart any running berrykeep-config-app --background process to pick up the new binary"
   log "revert with: scripts/restore-packaged-ironmesh-config-app.sh"
 }
 

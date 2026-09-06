@@ -129,9 +129,11 @@ suite into the package changelog distribution. The first suite-specific
 package increments the legacy repository revision, so it supersedes an
 otherwise identical `~repo1~ubuntu…` package in APT's version comparison.
 
-When a server-only matrix refreshes an already-published suite, its existing
-client, rendezvous, and map-tools `.deb` files are retained from the legacy
-shared pool and copied into that suite's pool before the index is regenerated.
+When a server-only matrix refreshes an already-published suite, the matrix
+discovers and publishes the matching `ironmesh-server-node` transition package
+beside each `berrykeep-server-node` input. Its existing client, rendezvous, and
+map-tools `.deb` files are retained from the legacy shared pool and copied into
+that suite's pool before the index is regenerated.
 The script migrates only files explicitly listed in that suite's existing
 `Packages` index. If it finds a legacy Map Tools package with an exact Server
 Node dependency, it publishes a higher-versioned compatibility rebuild with

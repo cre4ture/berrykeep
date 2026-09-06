@@ -47,12 +47,15 @@ Options:
                        before updating it, for example
                        creature@creax.de:/home/creature/html/apt/ironmesh.
   --sign-key KEY       GPG key ID or fingerprint used for Release signing.
-  --server-node-only   Publish only berrykeep-server-node packages. With no
-                       explicit .deb path, expects only that package.
+  --server-node-only   Publish berrykeep-server-node and its Ironmesh
+                       transition package. With no explicit .deb path,
+                       expects both packages.
   --server-node-matrix FILE
                        Sign each server-node-only matrix row. Each non-comment
                        row is: SUITE ARCH PACKAGE_PATH. Relative package paths
-                       are resolved from FILE's directory. The existing remote
+                       are resolved from FILE's directory. The matching
+                       ironmesh-server-node transition package is discovered
+                       beside each primary package. The existing remote
                        repository is imported only before the first row.
   --no-sign            Build repository metadata without signing it.
   -h, --help           Show this help text.
@@ -171,7 +174,8 @@ sign_release() {
 
 run_server_node_matrix() {
   local matrix_path="$1"
-  local matrix_dir raw_line suite architecture package_path extra
+  local matrix_dir raw_line suite architecture package_path transition_package_path extra
+  local package_version transition_package_name transition_package_architecture transition_package_version
   local line_number=0 processed_rows=0 import_remote_for_row
   local -a child_args
 
@@ -214,6 +218,22 @@ run_server_node_matrix() {
     if [[ "${package_path}" != /* ]]; then
       package_path="${matrix_dir}/${package_path}"
     fi
+    package_version="$(dpkg-deb -f "${package_path}" Version)"
+    transition_package_path="$(dirname "${package_path}")/ironmesh-server-node_${package_version}_all.deb"
+    [[ -f "${transition_package_path}" ]] || {
+      printf 'server-node transition package not found beside %s: %s\n' \
+        "${package_path}" "${transition_package_path}" >&2
+      exit 1
+    }
+    transition_package_name="$(dpkg-deb -f "${transition_package_path}" Package)"
+    transition_package_architecture="$(dpkg-deb -f "${transition_package_path}" Architecture)"
+    transition_package_version="$(dpkg-deb -f "${transition_package_path}" Version)"
+    if [[ "${transition_package_name}" != "ironmesh-server-node" || \
+      "${transition_package_architecture}" != "all" || \
+      "${transition_package_version}" != "${package_version}" ]]; then
+      printf 'invalid server-node transition package: %s\n' "${transition_package_path}" >&2
+      exit 1
+    fi
 
     child_args=(
       --repo-dir "${REPO_DIR}"
@@ -237,7 +257,8 @@ run_server_node_matrix() {
     # only the first row receives the captured --import-remote value above.
     APT_REPO_IMPORT_REMOTE="" \
       APT_REPO_GPG_PASSPHRASE="${GPG_PASSPHRASE}" \
-      "${ROOT_DIR}/scripts/build-apt-repository.sh" "${child_args[@]}" -- "${package_path}"
+      "${ROOT_DIR}/scripts/build-apt-repository.sh" "${child_args[@]}" -- \
+      "${package_path}" "${transition_package_path}"
   done < "${matrix_path}"
 
   if ((processed_rows == 0)); then
