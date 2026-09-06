@@ -2843,21 +2843,24 @@ impl MetadataStore for SqliteMetadataStore {
             .context("operation status did not serialize as a string")?
             .to_string();
         let created_at_unix = run.created_at_unix;
+        let finished_at_unix = run.finished_at_unix.map(u64_to_i64).transpose()?;
         let payload = serde_json::to_vec_pretty(run)?;
         self.write(move |db| {
             db.execute(
-                "INSERT INTO operation_runs (run_id, operation_id, status, created_at_unix, record_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO operation_runs (run_id, operation_id, status, created_at_unix, finished_at_unix, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(run_id) DO UPDATE SET
                      operation_id = excluded.operation_id,
                      status = excluded.status,
                      created_at_unix = excluded.created_at_unix,
+                     finished_at_unix = excluded.finished_at_unix,
                      record_json = excluded.record_json",
                 params![
                     run_id,
                     operation_id,
                     status,
                     u64_to_i64(created_at_unix)?,
+                    finished_at_unix,
                     payload
                 ],
             )?;
@@ -2866,9 +2869,9 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn prune_operation_run_history_before(&self, created_before_unix: u64) -> Result<()> {
+    async fn prune_operation_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
         self.write_tx(move |db| {
-            let created_before_unix = u64_to_i64(created_before_unix)?;
+            let finished_before_unix = u64_to_i64(finished_before_unix)?;
             // Result chunks deliberately have no foreign key: older database
             // versions already contain this table, and the explicit delete
             // keeps the retention path compatible with them.
@@ -2876,16 +2879,16 @@ impl MetadataStore for SqliteMetadataStore {
                 "DELETE FROM operation_result_chunks
                  WHERE run_id IN (
                      SELECT run_id FROM operation_runs
-                     WHERE created_at_unix < ?1
+                     WHERE finished_at_unix < ?1
                        AND status NOT IN ('queued', 'running')
                  )",
-                params![created_before_unix],
+                params![finished_before_unix],
             )?;
             db.execute(
                 "DELETE FROM operation_runs
-                 WHERE created_at_unix < ?1
+                 WHERE finished_at_unix < ?1
                    AND status NOT IN ('queued', 'running')",
-                params![created_before_unix],
+                params![finished_before_unix],
             )?;
             Ok(())
         })
@@ -2922,8 +2925,10 @@ impl MetadataStore for SqliteMetadataStore {
             }
             for (run_id, payload) in &interrupted {
                 db.execute(
-                    "UPDATE operation_runs SET status = 'interrupted', record_json = ?2 WHERE run_id = ?1",
-                    params![run_id, payload],
+                    "UPDATE operation_runs
+                     SET status = 'interrupted', finished_at_unix = ?2, record_json = ?3
+                     WHERE run_id = ?1",
+                    params![run_id, u64_to_i64(finished_at_unix)?, payload],
                 )?;
             }
             Ok(interrupted.len())
@@ -5288,6 +5293,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             operation_id TEXT NOT NULL,
             status TEXT NOT NULL,
             created_at_unix INTEGER NOT NULL,
+            finished_at_unix INTEGER,
             record_json BLOB NOT NULL
         );
 
@@ -5528,6 +5534,19 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         "TEXT",
     )?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_media_type", "TEXT")?;
+    add_sqlite_column_if_missing(db, "operation_runs", "finished_at_unix", "INTEGER")?;
+    db.execute(
+        "UPDATE operation_runs
+         SET finished_at_unix = created_at_unix
+         WHERE finished_at_unix IS NULL
+           AND status NOT IN ('queued', 'running')",
+        [],
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_operation_runs_status_finished
+         ON operation_runs(status, finished_at_unix DESC, run_id DESC)",
+        [],
+    )?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_longitude", "REAL")?;
     add_sqlite_column_if_missing(
@@ -5986,6 +6005,19 @@ mod tests {
             .prune_operation_run_history_before(11)
             .await
             .expect("terminal operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&run.run_id)
+                .await
+                .expect("retained operation lookup should succeed")
+                .is_some(),
+            "retention must be measured from interruption, not the original queue time"
+        );
+
+        store
+            .prune_operation_run_history_before(21)
+            .await
+            .expect("expired operation retention should succeed");
         assert!(
             store
                 .load_operation_run(&run.run_id)

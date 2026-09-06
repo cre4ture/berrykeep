@@ -425,6 +425,11 @@ struct ResolvedEvent {
     event: Event<'static>,
     namespace: Option<String>,
     attributes: Vec<ResolvedAttribute>,
+    /// Attribute syntax is decoded lazily by `quick_xml`. Preserve the fact
+    /// that an attribute could not be decoded even though the raw event itself
+    /// was accepted, so safety checks do not mistake malformed third-party
+    /// metadata for absent metadata.
+    has_undecodable_attributes: bool,
 }
 
 impl ResolvedEvent {
@@ -433,6 +438,7 @@ impl ResolvedEvent {
             event,
             namespace: None,
             attributes: Vec::new(),
+            has_undecodable_attributes: false,
         }
     }
 }
@@ -561,28 +567,34 @@ fn read_resolved_events(bytes: &[u8]) -> Result<Vec<ResolvedEvent>> {
             break;
         }
         let namespace = resolved_namespace(resolved);
-        let attributes = match &event {
+        let (attributes, has_undecodable_attributes) = match &event {
             Event::Start(element) | Event::Empty(element) => {
                 let mut attributes = element.attributes();
                 attributes.with_checks(false);
-                attributes
-                    .flatten()
-                    .map(|attribute| {
-                        let (namespace, local_name) =
-                            reader.resolver().resolve_attribute(attribute.key);
-                        ResolvedAttribute {
-                            raw_name: attribute.key.as_ref().to_vec(),
-                            namespace: resolved_namespace(namespace),
-                            local_name: local_name.as_ref().to_vec(),
+                let mut resolved_attributes = Vec::new();
+                let mut has_undecodable_attributes = false;
+                for attribute in attributes {
+                    match attribute {
+                        Ok(attribute) => {
+                            let (namespace, local_name) =
+                                reader.resolver().resolve_attribute(attribute.key);
+                            resolved_attributes.push(ResolvedAttribute {
+                                raw_name: attribute.key.as_ref().to_vec(),
+                                namespace: resolved_namespace(namespace),
+                                local_name: local_name.as_ref().to_vec(),
+                            });
                         }
-                    })
-                    .collect()
+                        Err(_) => has_undecodable_attributes = true,
+                    }
+                }
+                (resolved_attributes, has_undecodable_attributes)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), false),
         };
         events.push(ResolvedEvent {
             namespace,
             attributes,
+            has_undecodable_attributes,
             event: event.into_owned(),
         });
     }
@@ -1057,7 +1069,8 @@ fn set_first_geo_location(location: &mut Option<XmpGeoLocation>, state: Descript
 
 fn has_geo_location_properties(events: &[ResolvedEvent]) -> bool {
     events.iter().any(|event| {
-        is_element(event, EXIF_NAMESPACE, b"GPSLatitude")
+        event.has_undecodable_attributes
+            || is_element(event, EXIF_NAMESPACE, b"GPSLatitude")
             || is_element(event, EXIF_NAMESPACE, b"GPSLongitude")
             || event.attributes.iter().any(|attribute| {
                 attribute.namespace.as_deref() == Some(EXIF_NAMESPACE)
@@ -1565,6 +1578,27 @@ mod tests {
         assert!(
             sidecar.has_geo_location_properties(),
             "unparseable user GPS must still block an inferred overwrite"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn undecodable_xmp_attributes_conservatively_block_inferred_geolocation() -> Result<()> {
+        // `quick_xml` accepts the event and only reports this malformed value
+        // when attributes are decoded. Treat it as user-owned GPS rather than
+        // appending a second, inferred location to the same sidecar.
+        let packet = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+            "exif:GPSLatitude=47,22,36N exif:GPSLongitude=8,32,30E/>",
+            "</rdf:RDF></x:xmpmeta>"
+        );
+        let sidecar = XmpSidecar::parse(packet.as_bytes())?;
+        assert!(sidecar.geo_location().is_none());
+        assert!(
+            sidecar.has_geo_location_properties(),
+            "an undecodable third-party attribute must block inferred GPS"
         );
         Ok(())
     }

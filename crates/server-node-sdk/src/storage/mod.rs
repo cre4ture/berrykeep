@@ -2890,7 +2890,7 @@ trait MetadataStore: Send + Sync {
     async fn persist_operation_run(&self, run: &OperationRun) -> Result<()>;
     /// Removes terminal generic operation runs and their result chunks that
     /// predate the retention cutoff. Unfinished work is never pruned here.
-    async fn prune_operation_run_history_before(&self, created_before_unix: u64) -> Result<()>;
+    async fn prune_operation_run_history_before(&self, finished_before_unix: u64) -> Result<()>;
     async fn interrupt_unfinished_operation_runs(
         &self,
         finished_at_unix: u64,
@@ -5254,10 +5254,10 @@ impl PersistentStore {
 
     pub(crate) async fn prune_operation_run_history_before(
         &self,
-        created_before_unix: u64,
+        finished_before_unix: u64,
     ) -> Result<()> {
         self.metadata_store
-            .prune_operation_run_history_before(created_before_unix)
+            .prune_operation_run_history_before(finished_before_unix)
             .await
     }
 

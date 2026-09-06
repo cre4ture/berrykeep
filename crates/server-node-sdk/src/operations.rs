@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -1032,7 +1033,13 @@ pub(super) async fn start_operation_run(
 
     let run_for_task = run.clone();
     let state_for_task = state.clone();
+    let slot_guard = MultimediaOperationSlotGuard::new(
+        Arc::clone(&state_for_task.maintenance.operations_activity),
+        run_for_task.run_id.clone(),
+        !start_is_apply,
+    );
     tokio::spawn(async move {
+        let _slot_guard = slot_guard;
         match task {
             OperationTask::GeoProposal(input) => {
                 run_geo_proposal(state_for_task, run_for_task, input).await
@@ -1140,7 +1147,9 @@ fn bounded_operation_result_page(
     debug_assert!(limit > 0);
     let has_chunk_after_requested_limit = fetched_chunks.len() > limit;
     let mut response_bytes = 0usize;
-    let mut chunks = Vec::with_capacity(fetched_chunks.len().min(limit));
+    // `limit` is clamped by the HTTP handler, but retain the fixed capacity
+    // here as well so this helper cannot allocate based on an external value.
+    let mut chunks = Vec::with_capacity(MAX_OPERATION_RESULT_CHUNKS_PER_RESPONSE);
     let mut stopped_for_byte_budget = false;
 
     for chunk in fetched_chunks.into_iter().take(limit) {
@@ -2061,17 +2070,58 @@ async fn finish_interrupted_operation(
     }
 }
 
+struct MultimediaOperationSlotGuard {
+    activity: Arc<tokio::sync::Mutex<OperationActivityRuntime>>,
+    run_id: String,
+    is_scan: bool,
+}
+
+impl MultimediaOperationSlotGuard {
+    fn new(
+        activity: Arc<tokio::sync::Mutex<OperationActivityRuntime>>,
+        run_id: String,
+        is_scan: bool,
+    ) -> Self {
+        Self {
+            activity,
+            run_id,
+            is_scan,
+        }
+    }
+}
+
+impl Drop for MultimediaOperationSlotGuard {
+    fn drop(&mut self) {
+        // Operation workers are Tokio tasks. A detached cleanup task also runs
+        // when the worker is aborted or panics, which prevents stale admission
+        // control from blocking all later runs of this operation kind.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let activity = Arc::clone(&self.activity);
+        let run_id = self.run_id.clone();
+        let is_scan = self.is_scan;
+        drop(handle.spawn(async move {
+            release_multimedia_slot_activity(&activity, &run_id, is_scan).await;
+        }));
+    }
+}
+
+fn multimedia_slot(activity: &mut OperationActivityRuntime, is_scan: bool) -> &mut Option<String> {
+    if is_scan {
+        &mut activity.multimedia_scan_run_id
+    } else {
+        &mut activity.multimedia_apply_run_id
+    }
+}
+
 pub(crate) async fn try_reserve_multimedia_slot(
     state: &ServerState,
     run_id: &str,
     is_scan: bool,
 ) -> bool {
     let mut activity = state.maintenance.operations_activity.lock().await;
-    let active = if is_scan {
-        &mut activity.multimedia_scan_run_id
-    } else {
-        &mut activity.multimedia_apply_run_id
-    };
+    let active = multimedia_slot(&mut activity, is_scan);
     if active.is_some() {
         return false;
     }
@@ -2080,12 +2130,16 @@ pub(crate) async fn try_reserve_multimedia_slot(
 }
 
 pub(crate) async fn release_multimedia_slot(state: &ServerState, run_id: &str, is_scan: bool) {
-    let mut activity = state.maintenance.operations_activity.lock().await;
-    let active = if is_scan {
-        &mut activity.multimedia_scan_run_id
-    } else {
-        &mut activity.multimedia_apply_run_id
-    };
+    release_multimedia_slot_activity(&state.maintenance.operations_activity, run_id, is_scan).await;
+}
+
+async fn release_multimedia_slot_activity(
+    activity: &tokio::sync::Mutex<OperationActivityRuntime>,
+    run_id: &str,
+    is_scan: bool,
+) {
+    let mut activity = activity.lock().await;
+    let active = multimedia_slot(&mut activity, is_scan);
     if active.as_deref() == Some(run_id) {
         *active = None;
     }
@@ -2245,6 +2299,34 @@ mod tests {
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(next_offset, Some(6));
+    }
+
+    #[tokio::test]
+    async fn multimedia_slot_guard_releases_a_slot_when_its_worker_ends() {
+        let activity = std::sync::Arc::new(tokio::sync::Mutex::new(OperationActivityRuntime {
+            multimedia_scan_run_id: Some("run-1".to_string()),
+            multimedia_apply_run_id: None,
+        }));
+        {
+            let _guard = MultimediaOperationSlotGuard::new(
+                std::sync::Arc::clone(&activity),
+                "run-1".to_string(),
+                true,
+            );
+        }
+
+        for _ in 0..32 {
+            let released = {
+                let mut current = activity.lock().await;
+                multimedia_slot(&mut current, true).is_none()
+            };
+            if released {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        panic!("the dropped operation worker did not release its multimedia slot");
     }
 
     #[test]

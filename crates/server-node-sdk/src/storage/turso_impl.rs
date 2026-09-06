@@ -29,8 +29,8 @@ use super::{
     HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY, HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
     HistoryHeadProjectionBackfillState, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
     ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore,
-    OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
     RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
     RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
     S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
@@ -748,14 +748,20 @@ impl MetadataStore for TursoMetadataStore {
             .as_str()
             .context("operation status did not serialize as a string")?
             .to_string();
+        let finished_at_unix = run
+            .finished_at_unix
+            .map(i64::try_from)
+            .transpose()
+            .context("operation run timestamp overflow")?;
         self.connection
             .execute(
-                "INSERT INTO operation_runs (run_id, operation_id, status, created_at_unix, record_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO operation_runs (run_id, operation_id, status, created_at_unix, finished_at_unix, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(run_id) DO UPDATE SET
                      operation_id = excluded.operation_id,
                      status = excluded.status,
                      created_at_unix = excluded.created_at_unix,
+                     finished_at_unix = excluded.finished_at_unix,
                      record_json = excluded.record_json",
                 (
                     run.run_id.as_str(),
@@ -763,6 +769,7 @@ impl MetadataStore for TursoMetadataStore {
                     status,
                     i64::try_from(run.created_at_unix)
                         .context("operation run timestamp overflow")?,
+                    finished_at_unix,
                     payload,
                 ),
             )
@@ -770,9 +777,9 @@ impl MetadataStore for TursoMetadataStore {
         Ok(())
     }
 
-    async fn prune_operation_run_history_before(&self, created_before_unix: u64) -> Result<()> {
+    async fn prune_operation_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
         let _writer = self.writer_lock.lock().await;
-        let created_before_unix = i64::try_from(created_before_unix)
+        let finished_before_unix = i64::try_from(finished_before_unix)
             .context("operation run history prune timestamp overflow")?;
         let result = async {
             self.connection.execute_batch("BEGIN IMMEDIATE").await?;
@@ -784,18 +791,18 @@ impl MetadataStore for TursoMetadataStore {
                     "DELETE FROM operation_result_chunks
                      WHERE run_id IN (
                          SELECT run_id FROM operation_runs
-                         WHERE created_at_unix < ?1
+                         WHERE finished_at_unix < ?1
                            AND status NOT IN ('queued', 'running')
                      )",
-                    (created_before_unix,),
+                    (finished_before_unix,),
                 )
                 .await?;
             self.connection
                 .execute(
                     "DELETE FROM operation_runs
-                     WHERE created_at_unix < ?1
+                     WHERE finished_at_unix < ?1
                        AND status NOT IN ('queued', 'running')",
-                    (created_before_unix,),
+                    (finished_before_unix,),
                 )
                 .await?;
             self.connection.execute_batch("COMMIT").await?;
@@ -842,8 +849,15 @@ impl MetadataStore for TursoMetadataStore {
             for (run_id, payload) in &interrupted {
                 self.connection
                     .execute(
-                        "UPDATE operation_runs SET status = 'interrupted', record_json = ?2 WHERE run_id = ?1",
-                        (run_id.as_str(), payload.as_slice()),
+                        "UPDATE operation_runs
+                         SET status = 'interrupted', finished_at_unix = ?2, record_json = ?3
+                         WHERE run_id = ?1",
+                        (
+                            run_id.as_str(),
+                            i64::try_from(finished_at_unix)
+                                .context("operation run timestamp overflow")?,
+                            payload.as_slice(),
+                        ),
                     )
                     .await?;
             }
@@ -3149,6 +3163,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 operation_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at_unix INTEGER NOT NULL,
+                finished_at_unix INTEGER,
                 record_json BLOB NOT NULL
             );
 
@@ -3349,6 +3364,23 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    add_column_if_missing(connection, "operation_runs", "finished_at_unix", "INTEGER").await?;
+    connection
+        .execute(
+            "UPDATE operation_runs
+             SET finished_at_unix = created_at_unix
+             WHERE finished_at_unix IS NULL
+               AND status NOT IN ('queued', 'running')",
+            (),
+        )
+        .await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_operation_runs_status_finished
+             ON operation_runs(status, finished_at_unix DESC, run_id DESC)",
+            (),
+        )
+        .await?;
     gallery::init_gallery_projection(connection).await?;
 
     let mut rows = connection
@@ -3647,6 +3679,19 @@ mod tests {
             .prune_operation_run_history_before(11)
             .await
             .expect("operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&terminal.run_id)
+                .await
+                .expect("retained run lookup should succeed")
+                .is_some(),
+            "retention must be measured from completion, not queue time"
+        );
+
+        store
+            .prune_operation_run_history_before(12)
+            .await
+            .expect("expired operation retention should succeed");
         assert!(
             store
                 .load_operation_run(&terminal.run_id)
