@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 build = "build.rs"
-default-run = "ironmesh-rendezvous-service"
+default-run = "berrykeep-rendezvous-service"
 autobins = false
 
 [[bin]]
-name = "ironmesh-rendezvous-service"
+name = "berrykeep-rendezvous-service"
 path = "src/main.rs"
 
 [dependencies]

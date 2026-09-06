@@ -873,19 +873,19 @@ jobs:
             -p os-integration \
             -p rendezvous-service
           mkdir -p artifacts/linux-debian-binaries
-          install -m0755 target/release/ironmesh-rendezvous-service artifacts/linux-debian-binaries/
-          install -m0755 target/release/ironmesh artifacts/linux-debian-binaries/
-          install -m0755 target/release/ironmesh-config-app artifacts/linux-debian-binaries/
-          install -m0755 target/release/ironmesh-background-launcher artifacts/linux-debian-binaries/
-          install -m0755 target/release/ironmesh-folder-agent artifacts/linux-debian-binaries/
-          install -m0755 target/release/ironmesh-os-integration artifacts/linux-debian-binaries/
+          install -m0755 target/release/berrykeep-rendezvous-service artifacts/linux-debian-binaries/
+          install -m0755 target/release/berrykeep artifacts/linux-debian-binaries/
+          install -m0755 target/release/berrykeep-config-app artifacts/linux-debian-binaries/
+          install -m0755 target/release/berrykeep-background-launcher artifacts/linux-debian-binaries/
+          install -m0755 target/release/berrykeep-folder-agent artifacts/linux-debian-binaries/
+          install -m0755 target/release/berrykeep-os-integration artifacts/linux-debian-binaries/
           tar -C artifacts/linux-debian-binaries -czf artifacts/linux-debian-binaries.tar.gz .
 
       - name: Upload Linux FUSE mount binary
         uses: actions/upload-artifact@v4
         with:
           name: linux-fuse-mount-binary-ubuntu
-          path: target/release/ironmesh-os-integration
+          path: target/release/berrykeep-os-integration
           if-no-files-found: error
 
       - name: Upload Linux Debian binary bundle
@@ -934,14 +934,14 @@ jobs:
           tar -xzf "${RUNNER_TEMP}"/static-server-node-archive/*.tar.gz \
             -C "${RUNNER_TEMP}/static-server-node"
           static_binary="$(find "${RUNNER_TEMP}/static-server-node" -type f \
-            -name ironmesh-server-node -print -quit)"
+            -name berrykeep-server-node -print -quit)"
           test -n "$static_binary"
           (
             cd "$(dirname "$static_binary")"
             sha256sum -c SHA256SUMS
           )
           install -m0755 "$static_binary" \
-            "${RUNNER_TEMP}/linux-debian-binaries/ironmesh-server-node"
+            "${RUNNER_TEMP}/linux-debian-binaries/berrykeep-server-node"
 
       - name: Install Debian packaging tools
         run: |
@@ -953,15 +953,19 @@ jobs:
           ./scripts/build-local-debs.sh \
             --prebuilt-binaries "${RUNNER_TEMP}/linux-debian-binaries"
 
+      - name: Test Debian package transition
+        run: ./scripts/test-debian-package-transition.sh --package-dir ..
+
       - name: Collect Debian package artifacts
         run: |
           set -euo pipefail
           architecture="$(dpkg --print-architecture)"
           mkdir -p artifacts
           find .. -maxdepth 1 -type f \
-            \( -name "ironmesh-*_*_${architecture}.deb" \
-              -o -name "ironmesh_*_${architecture}.changes" \
-              -o -name "ironmesh_*_${architecture}.buildinfo" \) \
+            \( -name "berrykeep-*_*_${architecture}.deb" \
+              -o -name "ironmesh-*_*_${architecture}.deb" \
+              -o -name "berrykeep_*_${architecture}.changes" \
+              -o -name "berrykeep_*_${architecture}.buildinfo" \) \
             -exec cp -v {} artifacts/ \;
 
       - name: Upload Debian packages

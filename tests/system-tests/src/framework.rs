@@ -1611,7 +1611,7 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
         "cli-client" => "IRONMESH_CLI_BIN",
         "config-app" => "IRONMESH_CONFIG_APP_BIN",
         "os-integration" => "IRONMESH_OS_INTEGRATION_BIN",
-        "ironmesh-folder-agent" => "IRONMESH_FOLDER_AGENT_BIN",
+        "berrykeep-folder-agent" => "IRONMESH_FOLDER_AGENT_BIN",
         "rendezvous-service" => "IRONMESH_RENDEZVOUS_BIN",
         _ => "",
     };
@@ -1630,15 +1630,15 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
     }
 
     let artifact_path = match name {
-        "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_ironmesh-server-node"),
-        "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_ironmesh"),
-        "config-app" => option_env!("CARGO_BIN_FILE_IRONMESH_CONFIG_APP_ironmesh-config-app"),
-        "os-integration" => option_env!("CARGO_BIN_FILE_OS_INTEGRATION_ironmesh-os-integration"),
-        "ironmesh-folder-agent" => {
-            option_env!("CARGO_BIN_FILE_IRONMESH_FOLDER_AGENT_ironmesh-folder-agent")
+        "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_berrykeep-server-node"),
+        "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_berrykeep"),
+        "config-app" => option_env!("CARGO_BIN_FILE_IRONMESH_CONFIG_APP_berrykeep-config-app"),
+        "os-integration" => option_env!("CARGO_BIN_FILE_OS_INTEGRATION_berrykeep-os-integration"),
+        "berrykeep-folder-agent" => {
+            option_env!("CARGO_BIN_FILE_IRONMESH_FOLDER_AGENT_berrykeep-folder-agent")
         }
         "rendezvous-service" => {
-            option_env!("CARGO_BIN_FILE_RENDEZVOUS_SERVICE_ironmesh-rendezvous-service")
+            option_env!("CARGO_BIN_FILE_RENDEZVOUS_SERVICE_berrykeep-rendezvous-service")
         }
         _ => None,
     };
@@ -1649,11 +1649,11 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
 
     let workspace_root = workspace_root()?;
     let executable_name = match name {
-        "server-node" => "ironmesh-server-node",
-        "cli-client" => "ironmesh",
-        "config-app" => "ironmesh-config-app",
-        "os-integration" => "ironmesh-os-integration",
-        "rendezvous-service" => "ironmesh-rendezvous-service",
+        "server-node" => "berrykeep-server-node",
+        "cli-client" => "berrykeep",
+        "config-app" => "berrykeep-config-app",
+        "os-integration" => "berrykeep-os-integration",
+        "rendezvous-service" => "berrykeep-rendezvous-service",
         _ => name,
     };
     let path = workspace_root

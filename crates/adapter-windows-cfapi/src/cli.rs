@@ -210,7 +210,7 @@ fn log_remote_object_reconcile_summary(label: &str, report: &RemoteObjectReconci
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "ironmesh-os-integration")]
+#[command(name = "berrykeep-os-integration")]
 #[command(about = "Combined CLI for register, unregister, serve, and pin")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
@@ -1036,7 +1036,7 @@ mod tests {
 #[test]
 fn serve_accepts_server_ca_pem_file_flag() {
     let cli = Cli::try_parse_from([
-        "ironmesh-os-integration",
+        "berrykeep-os-integration",
         "serve",
         "--sync-root-id",
         "demo-root",
@@ -1062,7 +1062,7 @@ fn serve_accepts_server_ca_pem_file_flag() {
 #[test]
 fn serve_accepts_legacy_server_ca_cert_alias() {
     let cli = Cli::try_parse_from([
-        "ironmesh-os-integration",
+        "berrykeep-os-integration",
         "serve",
         "--sync-root-id",
         "demo-root",

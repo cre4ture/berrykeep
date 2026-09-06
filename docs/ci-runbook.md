@@ -287,7 +287,7 @@ AArch64 `--version` smoke test under QEMU. Its `Focal A64`, `Trixie A64`,
 `Focal AMD64`, `Trixie AMD64`, and `Noble AMD64` package matrix entries each
 verify the matching artifact inside the target distribution container and use
 `build-local-debs.sh --server-node-only --static-server-node-artifact` to
-assemble only the portable `ironmesh-server-node` package. They do not compile
+assemble only the portable `berrykeep-server-node` package. They do not compile
 or execute a target binary in the distribution container.
 
 On pull requests, add the `ci:debian-packages` label to run the Focal/Trixie
@@ -295,7 +295,7 @@ ARM64 and Focal/Trixie/Noble AMD64 Server Node matrices, plus the existing
 AMD64 binary-package handoff. `Linux binaries` builds the AMD64 non-server
 bundle, and `Debian packages` combines it with the static Server Node to
 produce the complete AMD64 package set. The Server Node matrix produces only
-`ironmesh-server-node` for each target suite.
+`berrykeep-server-node` for each target suite.
 
 For a local static build, install the web workspace dependencies and ELF tools,
 then run:

@@ -11,30 +11,30 @@ SERVER_NODE_ONLY := $(filter server-node-only,$(DEB_BUILD_PROFILES))
 
 ifeq ($(IRONMESH_USE_PREBUILT_BINARIES),1)
 PACKAGE_BIN_DIR := $(IRONMESH_PREBUILT_BIN_DIR)
-SERVER_NODE_BIN := $(PACKAGE_BIN_DIR)/ironmesh-server-node
+SERVER_NODE_BIN := $(PACKAGE_BIN_DIR)/berrykeep-server-node
 else
 PACKAGE_BIN_DIR := $(CARGO_TARGET_DIR)/release
 ifeq ($(IRONMESH_USE_PREBUILT_SERVER_NODE),1)
 SERVER_NODE_BIN := $(IRONMESH_PREBUILT_SERVER_NODE_BIN)
 SERVER_NODE_CARGO_PACKAGE :=
 else
-SERVER_NODE_BIN := $(PACKAGE_BIN_DIR)/ironmesh-server-node
+SERVER_NODE_BIN := $(PACKAGE_BIN_DIR)/berrykeep-server-node
 SERVER_NODE_CARGO_PACKAGE := -p server-node
 endif
 endif
 
 ifeq ($(SERVER_NODE_ONLY),server-node-only)
-PACKAGE_BINARIES := ironmesh-server-node
+PACKAGE_BINARIES := berrykeep-server-node
 CARGO_PACKAGE_ARGS :=
 else
 PACKAGE_BINARIES := \
-	ironmesh-server-node \
-	ironmesh-rendezvous-service \
-	ironmesh \
-	ironmesh-config-app \
-	ironmesh-background-launcher \
-	ironmesh-folder-agent \
-	ironmesh-os-integration
+	berrykeep-server-node \
+	berrykeep-rendezvous-service \
+	berrykeep \
+	berrykeep-config-app \
+	berrykeep-background-launcher \
+	berrykeep-folder-agent \
+	berrykeep-os-integration
 
 CARGO_PACKAGE_ARGS := \
 	$(SERVER_NODE_CARGO_PACKAGE) \
@@ -54,8 +54,10 @@ CLANGXX_BIN := $(firstword $(wildcard /usr/bin/clang++))
 export CC := $(CLANG_BIN)
 export CXX := $(CLANGXX_BIN)
 
-CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/ironmesh-client/usr/lib/ironmesh-client
+CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/berrykeep-client/usr/lib/berrykeep-client
 CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
+LEGACY_CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/berrykeep-client/usr/lib/ironmesh-client
+LEGACY_CLIENT_EXTENSION_ROOT := $(LEGACY_CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
 
 %:
 	dh $@ --with sysuser
@@ -135,12 +137,12 @@ ifeq ($(SERVER_NODE_ONLY),server-node-only)
 	# Avoid host-architecture ELF analysis when assembling an ARM package on an
 	# x86 package runner, while still defining the substitution variable used by
 	# the control file.
-	grep -q '^shlibs:Depends=' debian/ironmesh-server-node.substvars 2>/dev/null || \
-		printf '%s\n' 'shlibs:Depends=' >> debian/ironmesh-server-node.substvars
+	grep -q '^shlibs:Depends=' debian/berrykeep-server-node.substvars 2>/dev/null || \
+		printf '%s\n' 'shlibs:Depends=' >> debian/berrykeep-server-node.substvars
 else
 	dh_shlibdeps
-	grep -q '^shlibs:Depends=' debian/ironmesh-server-node.substvars 2>/dev/null || \
-		printf '%s\n' 'shlibs:Depends=' >> debian/ironmesh-server-node.substvars
+	grep -q '^shlibs:Depends=' debian/berrykeep-server-node.substvars 2>/dev/null || \
+		printf '%s\n' 'shlibs:Depends=' >> debian/berrykeep-server-node.substvars
 endif
 
 ifeq ($(SERVER_NODE_ONLY),server-node-only)
@@ -158,31 +160,55 @@ override_dh_makeshlibs:
 endif
 
 override_dh_auto_install:
-	install -d $(CURDIR)/debian/ironmesh-server-node/usr/bin
+	install -d $(CURDIR)/debian/berrykeep-server-node/usr/bin
 	install -m0755 $(SERVER_NODE_BIN) \
-		$(CURDIR)/debian/ironmesh-server-node/usr/bin/ironmesh-server-node
+		$(CURDIR)/debian/berrykeep-server-node/usr/bin/berrykeep-server-node
+	ln -sf berrykeep-server-node \
+		$(CURDIR)/debian/berrykeep-server-node/usr/bin/ironmesh-server-node
+	install -d $(CURDIR)/debian/berrykeep-server-node/etc/berrykeep
+	install -m0644 debian/berrykeep-server-node.env \
+		$(CURDIR)/debian/berrykeep-server-node/etc/berrykeep/server-node.env
+
+	# The transitional package retains the enabled legacy unit, user, and
+	# configuration path. Its executable is the compatibility symlink above.
 	install -d $(CURDIR)/debian/ironmesh-server-node/etc/ironmesh
 	install -m0644 debian/ironmesh-server-node.env \
 		$(CURDIR)/debian/ironmesh-server-node/etc/ironmesh/server-node.env
 
 ifeq ($(SERVER_NODE_ONLY),)
-	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin
-	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-rendezvous-service \
-		$(CURDIR)/debian/ironmesh-rendezvous-service/usr/bin/ironmesh-rendezvous-service
+	install -d $(CURDIR)/debian/berrykeep-rendezvous-service/usr/bin
+	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep-rendezvous-service \
+		$(CURDIR)/debian/berrykeep-rendezvous-service/usr/bin/berrykeep-rendezvous-service
+	ln -sf berrykeep-rendezvous-service \
+		$(CURDIR)/debian/berrykeep-rendezvous-service/usr/bin/ironmesh-rendezvous-service
+	install -d $(CURDIR)/debian/berrykeep-rendezvous-service/etc/berrykeep
+	install -m0644 debian/berrykeep-rendezvous-service.env \
+		$(CURDIR)/debian/berrykeep-rendezvous-service/etc/berrykeep/rendezvous-service.env
 	install -d $(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh
 	install -m0644 debian/ironmesh-rendezvous-service.env \
 		$(CURDIR)/debian/ironmesh-rendezvous-service/etc/ironmesh/rendezvous-service.env
 
 	install -d $(CLIENT_PACKAGE_ROOT)
-	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh $(CLIENT_PACKAGE_ROOT)/ironmesh
-	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-config-app \
-		$(CLIENT_PACKAGE_ROOT)/ironmesh-config-app
-	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-background-launcher \
-		$(CLIENT_PACKAGE_ROOT)/ironmesh-background-launcher
-	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-folder-agent \
-		$(CLIENT_PACKAGE_ROOT)/ironmesh-folder-agent
-	install -m0755 $(PACKAGE_BIN_DIR)/ironmesh-os-integration \
-		$(CLIENT_PACKAGE_ROOT)/ironmesh-os-integration
+	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep $(CLIENT_PACKAGE_ROOT)/berrykeep
+	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep-config-app \
+		$(CLIENT_PACKAGE_ROOT)/berrykeep-config-app
+	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep-background-launcher \
+		$(CLIENT_PACKAGE_ROOT)/berrykeep-background-launcher
+	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep-folder-agent \
+		$(CLIENT_PACKAGE_ROOT)/berrykeep-folder-agent
+	install -m0755 $(PACKAGE_BIN_DIR)/berrykeep-os-integration \
+		$(CLIENT_PACKAGE_ROOT)/berrykeep-os-integration
+	ln -sf berrykeep $(CLIENT_PACKAGE_ROOT)/ironmesh
+	ln -sf berrykeep-config-app $(CLIENT_PACKAGE_ROOT)/ironmesh-config-app
+	ln -sf berrykeep-background-launcher $(CLIENT_PACKAGE_ROOT)/ironmesh-background-launcher
+	ln -sf berrykeep-folder-agent $(CLIENT_PACKAGE_ROOT)/ironmesh-folder-agent
+	ln -sf berrykeep-os-integration $(CLIENT_PACKAGE_ROOT)/ironmesh-os-integration
+	install -d $(LEGACY_CLIENT_PACKAGE_ROOT)
+	ln -sf ../berrykeep-client/berrykeep $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh
+	ln -sf ../berrykeep-client/berrykeep-config-app $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh-config-app
+	ln -sf ../berrykeep-client/berrykeep-background-launcher $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh-background-launcher
+	ln -sf ../berrykeep-client/berrykeep-folder-agent $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh-folder-agent
+	ln -sf ../berrykeep-client/berrykeep-os-integration $(LEGACY_CLIENT_PACKAGE_ROOT)/ironmesh-os-integration
 
 	install -d $(CLIENT_EXTENSION_ROOT)
 	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/extension.js \
@@ -191,23 +217,38 @@ ifeq ($(SERVER_NODE_ONLY),)
 		$(CLIENT_EXTENSION_ROOT)/metadata.json
 	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/stylesheet.css \
 		$(CLIENT_EXTENSION_ROOT)/stylesheet.css
+	install -d $(LEGACY_CLIENT_EXTENSION_ROOT)
+	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/extension.js \
+		$(LEGACY_CLIENT_EXTENSION_ROOT)/extension.js
+	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/metadata.json \
+		$(LEGACY_CLIENT_EXTENSION_ROOT)/metadata.json
+	install -m0644 apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/stylesheet.css \
+		$(LEGACY_CLIENT_EXTENSION_ROOT)/stylesheet.css
 
-	install -d $(CURDIR)/debian/ironmesh-client/usr/bin
-	ln -sf ../lib/ironmesh-client/ironmesh \
-		$(CURDIR)/debian/ironmesh-client/usr/bin/ironmesh
-	ln -sf ../lib/ironmesh-client/ironmesh-config-app \
-		$(CURDIR)/debian/ironmesh-client/usr/bin/ironmesh-config-app
-	ln -sf ../lib/ironmesh-client/ironmesh-folder-agent \
-		$(CURDIR)/debian/ironmesh-client/usr/bin/ironmesh-folder-agent
-	ln -sf ../lib/ironmesh-client/ironmesh-os-integration \
-		$(CURDIR)/debian/ironmesh-client/usr/bin/ironmesh-os-integration
+	install -d $(CURDIR)/debian/berrykeep-client/usr/bin
+	ln -sf ../lib/berrykeep-client/berrykeep \
+		$(CURDIR)/debian/berrykeep-client/usr/bin/berrykeep
+	ln -sf ../lib/berrykeep-client/berrykeep-config-app \
+		$(CURDIR)/debian/berrykeep-client/usr/bin/berrykeep-config-app
+	ln -sf ../lib/berrykeep-client/berrykeep-folder-agent \
+		$(CURDIR)/debian/berrykeep-client/usr/bin/berrykeep-folder-agent
+	ln -sf ../lib/berrykeep-client/berrykeep-os-integration \
+		$(CURDIR)/debian/berrykeep-client/usr/bin/berrykeep-os-integration
+	ln -sf ../lib/berrykeep-client/ironmesh \
+		$(CURDIR)/debian/berrykeep-client/usr/bin/ironmesh
+	ln -sf ../lib/berrykeep-client/ironmesh-config-app \
+		$(CURDIR)/debian/berrykeep-client/usr/bin/ironmesh-config-app
+	ln -sf ../lib/berrykeep-client/ironmesh-folder-agent \
+		$(CURDIR)/debian/berrykeep-client/usr/bin/ironmesh-folder-agent
+	ln -sf ../lib/berrykeep-client/ironmesh-os-integration \
+		$(CURDIR)/debian/berrykeep-client/usr/bin/ironmesh-os-integration
 
-	install -d $(CURDIR)/debian/ironmesh-client/usr/share/applications
+	install -d $(CURDIR)/debian/berrykeep-client/usr/share/applications
 	install -m0644 debian/ironmesh-config-app.desktop \
-		$(CURDIR)/debian/ironmesh-client/usr/share/applications/ironmesh-config-app.desktop
-	install -d $(CURDIR)/debian/ironmesh-client/etc/xdg/autostart
+		$(CURDIR)/debian/berrykeep-client/usr/share/applications/ironmesh-config-app.desktop
+	install -d $(CURDIR)/debian/berrykeep-client/etc/xdg/autostart
 	install -m0644 debian/ironmesh-config-app-background.desktop \
-		$(CURDIR)/debian/ironmesh-client/etc/xdg/autostart/ironmesh-config-app-background.desktop
+		$(CURDIR)/debian/berrykeep-client/etc/xdg/autostart/ironmesh-config-app-background.desktop
 endif
 
 override_dh_installsystemd:

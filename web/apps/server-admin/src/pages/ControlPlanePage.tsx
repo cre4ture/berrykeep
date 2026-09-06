@@ -547,7 +547,7 @@ export function ControlPlanePage() {
               </Group>
               <Text c="dimmed">
                 {standaloneRendezvousExport
-                  ? "Use this when a dedicated standalone ironmesh-rendezvous-service should take over the public rendezvous endpoint while the signer stays on this node."
+                  ? "Use this when a dedicated standalone berrykeep-rendezvous-service should take over the public rendezvous endpoint while the signer stays on this node."
                   : "Use this when you only want to move the embedded rendezvous listener to another cluster node and keep the signer where it is."}
               </Text>
               <Radio.Group
@@ -563,7 +563,7 @@ export function ControlPlanePage() {
                   />
                   <Radio
                     value="standalone_service"
-                    label="Standalone ironmesh-rendezvous-service"
+                    label="Standalone berrykeep-rendezvous-service"
                     description="Includes the client CA certificate and a TLS identity for the standalone service. The cluster signer stays on this node; the service needs this JSON package and its passphrase."
                   />
                 </Stack>
@@ -752,11 +752,11 @@ export function ControlPlanePage() {
       <Card withBorder radius="md" padding="lg">
         <Stack gap="sm">
           <Group justify="space-between">
-            <Text fw={700}>Dedicated standalone ironmesh-rendezvous-service</Text>
+            <Text fw={700}>Dedicated standalone berrykeep-rendezvous-service</Text>
             <Badge color="blue" variant="light">advanced/manual</Badge>
           </Group>
           <Text c="dimmed">
-            A pure standalone <code>ironmesh-rendezvous-service</code> is still the advanced operator path, but the
+            A pure standalone <code>berrykeep-rendezvous-service</code> is still the advanced operator path, but the
             export card above can now emit a standalone-targeted rendezvous package with inline cluster certificate
             material.
           </Text>
@@ -764,7 +764,7 @@ export function ControlPlanePage() {
             Recommended standalone flow:
           </Text>
           <Text size="sm" c="dimmed">
-            1. Choose <code>Standalone ironmesh-rendezvous-service</code> in the export card and export the package JSON.
+            1. Choose <code>Standalone berrykeep-rendezvous-service</code> in the export card and export the package JSON.
           </Text>
           <Text size="sm" c="dimmed">
             2. Start the standalone service with that package file, the passphrase, and the same stable public

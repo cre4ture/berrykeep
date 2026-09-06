@@ -6435,7 +6435,7 @@ impl ServerNodeConfig {
         }
 
         bail!(
-            "ironmesh-server-node refuses insecure public HTTP startup without TLS; configure IRONMESH_PUBLIC_TLS_CERT plus IRONMESH_PUBLIC_TLS_KEY, or set {ALLOW_INSECURE_PUBLIC_HTTP_ENV}=true for local development/testing only"
+            "berrykeep-server-node refuses insecure public HTTP startup without TLS; configure IRONMESH_PUBLIC_TLS_CERT plus IRONMESH_PUBLIC_TLS_KEY, or set {ALLOW_INSECURE_PUBLIC_HTTP_ENV}=true for local development/testing only"
         )
     }
 
@@ -22061,7 +22061,7 @@ async fn build_s3_control_plane_status_response(
         public_url: state.s3.public_url.clone(),
         tls_enabled: state.s3.tls_enabled,
         gateway_command_hint:
-            "ironmesh --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000"
+            "berrykeep --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000"
                 .to_string(),
         local_generation: runtime.generation,
         last_applied_at_unix: runtime.last_applied_at_unix,

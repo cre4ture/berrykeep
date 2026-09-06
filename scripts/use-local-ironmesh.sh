@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACKAGE_ROOT="/usr/lib/ironmesh-client"
-PACKAGED_BINARY="${PACKAGE_ROOT}/ironmesh"
-PACKAGED_BACKUP="${PACKAGE_ROOT}/ironmesh.packaged-deb"
+PACKAGE_ROOT="/usr/lib/berrykeep-client"
+PACKAGED_BINARY="${PACKAGE_ROOT}/berrykeep"
+PACKAGED_BACKUP="${PACKAGE_ROOT}/berrykeep.packaged-deb"
 DEFAULT_PROFILE="release"
 
 PROFILE="${IRONMESH_LOCAL_PROFILE:-${DEFAULT_PROFILE}}"
@@ -15,7 +15,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/use-local-ironmesh.sh [options]
 
-Build the local `ironmesh` CLI and replace the packaged client binary with a
+Build the local `berrykeep` CLI and replace the packaged client binary with a
 symlink to the local build for testing.
 
 Options:
@@ -29,12 +29,12 @@ Environment:
 
 Notes:
   The packaged binary is backed up once at:
-    /usr/lib/ironmesh-client/ironmesh.packaged-deb
+    /usr/lib/berrykeep-client/berrykeep.packaged-deb
 
 Examples:
   scripts/use-local-ironmesh.sh
   scripts/use-local-ironmesh.sh --profile debug
-  scripts/use-local-ironmesh.sh --local-binary /home/me/rust-dev/ironmesh/target/release/ironmesh
+  scripts/use-local-ironmesh.sh --local-binary /home/me/rust-dev/ironmesh/target/release/berrykeep
 EOF
 }
 
@@ -96,9 +96,9 @@ resolve_local_binary() {
     return
   fi
 
-  LOCAL_BINARY="${ROOT_DIR}/target/${PROFILE}/ironmesh"
+  LOCAL_BINARY="${ROOT_DIR}/target/${PROFILE}/berrykeep"
   if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    log "building local ironmesh binary with cargo profile=${PROFILE}"
+    log "building local berrykeep binary with cargo profile=${PROFILE}"
     cargo build --locked -p cli-client "--profile=${PROFILE}" --manifest-path "${ROOT_DIR}/Cargo.toml"
   fi
 
@@ -132,8 +132,8 @@ install_local_symlink() {
 print_result() {
   local resolved_target
   resolved_target="$(readlink -f "$PACKAGED_BINARY")"
-  log "active ironmesh target: ${resolved_target}"
-  log "package symlink at /usr/bin/ironmesh remains unchanged"
+  log "active berrykeep target: ${resolved_target}"
+  log "package symlink at /usr/bin/berrykeep remains unchanged"
   log "revert with: scripts/restore-packaged-ironmesh.sh"
 }
 

@@ -113,7 +113,7 @@ jobs:
           artifact="$(find target/static-server-node -maxdepth 1 -name '*.tar.gz' -print -quit)"
           test -n "$artifact"
           tar -xzf "$artifact" -C "$artifact_dir"
-          binary="$(find "$artifact_dir" -type f -name ironmesh-server-node -print -quit)"
+          binary="$(find "$artifact_dir" -type f -name berrykeep-server-node -print -quit)"
           test -n "$binary"
           qemu-aarch64-static "$binary" --version
 
@@ -217,9 +217,10 @@ jobs:
                 --no-check-build-deps \
                 -- -j1
               find /build -maxdepth 1 -type f \
-                \( -name "ironmesh-server-node_*_${{ matrix.architecture }}.deb" \
-                  -o -name "ironmesh_*_${{ matrix.architecture }}.changes" \
-                  -o -name "ironmesh_*_${{ matrix.architecture }}.buildinfo" \) \
+                \( -name "berrykeep-server-node_*_${{ matrix.architecture }}.deb" \
+                  -o -name "ironmesh-server-node_*_${{ matrix.architecture }}.deb" \
+                  -o -name "berrykeep_*_${{ matrix.architecture }}.changes" \
+                  -o -name "berrykeep_*_${{ matrix.architecture }}.buildinfo" \) \
                 -exec cp -v {} "${package_dir}/" \;
             '
 
@@ -315,7 +316,7 @@ jobs:
             esac
             suite="${target%-${architecture}}"
             test -n "$suite"
-            matches=("$package_dir"/ironmesh-server-node_*_"$architecture".deb)
+            matches=("$package_dir"/berrykeep-server-node_*_"$architecture".deb)
             test "${#matches[@]}" -eq 1
             printf '%s %s %s\n' "$suite" "$architecture" "${matches[0]}" >> "$matrix_file"
           done

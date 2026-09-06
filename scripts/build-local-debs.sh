@@ -50,11 +50,11 @@ Options:
                 instead of preparing sources and compiling them. This skips
                 the build-dependency check and validates the binary bundle.
   --prebuilt-server-node FILE
-                Package this executable as ironmesh-server-node while building
+                Package this executable as berrykeep-server-node while building
                 the remaining binaries from source. This supports reusing the
                 verified static musl server artifact across distribution builds.
   --server-node-only
-                Build only the portable ironmesh-server-node package. This
+                Build only the portable berrykeep-server-node package. This
                 requires --prebuilt-server-node or --static-server-node-artifact
                 and skips client, rendezvous, map-tools, source preparation,
                 and Rust compilation.
@@ -252,7 +252,7 @@ extract_static_server_node_artifact() {
   fi
   expected_entries=(
     "${archive_root}/"
-    "${archive_root}/ironmesh-server-node"
+    "${archive_root}/berrykeep-server-node"
     "${archive_root}/SHA256SUMS"
     "${archive_root}/build-metadata.json"
   )
@@ -321,7 +321,7 @@ with open(metadata_path, encoding="utf-8") as metadata_file:
 
 expected = {
     "schema_version": 1,
-    "binary": "ironmesh-server-node",
+    "binary": "berrykeep-server-node",
     "rust_target": expected_target,
     "variant_id": expected_variant,
     "target_cpu": "generic",
@@ -338,7 +338,7 @@ if metadata.get("source_dirty") is not False:
     raise SystemExit("static server-node artifact was built from a dirty checkout")
 PY
 
-  PREBUILT_SERVER_NODE="${STATIC_ARTIFACT_TEMP_DIR}/${archive_root}/ironmesh-server-node"
+  PREBUILT_SERVER_NODE="${STATIC_ARTIFACT_TEMP_DIR}/${archive_root}/berrykeep-server-node"
   validate_server_node_binary "${PREBUILT_SERVER_NODE}"
 }
 
@@ -375,13 +375,13 @@ check_build_dependencies() {
 validate_prebuilt_binaries() {
   local binary
   local -a expected_binaries=(
-    ironmesh-server-node
-    ironmesh-rendezvous-service
-    ironmesh
-    ironmesh-config-app
-    ironmesh-background-launcher
-    ironmesh-folder-agent
-    ironmesh-os-integration
+    berrykeep-server-node
+    berrykeep-rendezvous-service
+    berrykeep
+    berrykeep-config-app
+    berrykeep-background-launcher
+    berrykeep-folder-agent
+    berrykeep-os-integration
   )
 
   for binary in "${expected_binaries[@]}"; do
@@ -606,9 +606,16 @@ ARCH="${TARGET_ARCH}"
 CHANGES_PATH="${ARTIFACT_DIR}/${SOURCE_NAME}_${VERSION}_${ARCH}.changes"
 BUILDINFO_PATH="${ARTIFACT_DIR}/${SOURCE_NAME}_${VERSION}_${ARCH}.buildinfo"
 if [[ "${SERVER_NODE_ONLY}" == true ]]; then
-  PACKAGE_PATHS=("${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb")
+  PACKAGE_PATHS=(
+    "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb"
+  )
 else
   PACKAGE_PATHS=(
+    "${ARTIFACT_DIR}/berrykeep-client_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/berrykeep-server-node-map-tools_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/berrykeep-rendezvous-service_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${ARCH}.deb"

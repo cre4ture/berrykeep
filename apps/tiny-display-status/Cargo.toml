@@ -7,7 +7,7 @@ authors.workspace = true
 autobins = false
 
 [[bin]]
-name = "ironmesh-tiny-display-status"
+name = "berrykeep-tiny-display-status"
 path = "src/main.rs"
 
 [dependencies]

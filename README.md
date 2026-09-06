@@ -161,26 +161,27 @@ sudo apt install ca-certificates curl gnupg
 sudo install -d -m 0755 /usr/share/keyrings
 ```
 
-Install the legacy `ironmesh` repository signing key (the package
-infrastructure is not renamed yet):
+Install the BerryKeep repository signing key. The repository URL stays stable
+so existing apt source entries continue to work:
 
 ```bash
-curl -fsSL https://creax.de/apt/ironmesh/ironmesh-archive-keyring.asc \
-  | sudo gpg --dearmor --yes -o /usr/share/keyrings/ironmesh-archive-keyring.gpg
+curl -fsSL https://creax.de/apt/ironmesh/berrykeep-archive-keyring.asc \
+  | sudo gpg --dearmor --yes -o /usr/share/keyrings/berrykeep-archive-keyring.gpg
 ```
 
 Add exactly one apt source, matching the Ubuntu release and architecture of the
-host:
+host. Keep the established `ironmesh.list` filename so this replaces an
+existing source entry instead of creating a duplicate:
 
 ```bash
 # Ubuntu 20.04 ARM64
-echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh focal main' \
+echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh focal main' \
   | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 
 ```bash
 # Ubuntu 24.04 AMD64
-echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh noble main' \
+echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh noble main' \
   | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 
@@ -188,7 +189,7 @@ Install the server-node package:
 
 ```bash
 sudo apt update
-sudo apt install ironmesh-server-node
+sudo apt install berrykeep-server-node
 ```
 
 The package contains the generic static Server Node for the selected CPU
@@ -200,36 +201,42 @@ Natural Earth map conversion is optional. Install its external GDAL and unzip
 tools separately through the companion package when required:
 
 ```bash
-sudo apt install ironmesh-server-node-map-tools
+sudo apt install berrykeep-server-node-map-tools
 ```
 
 ## Start A Server Node
 
-The `ironmesh-server-node` package installs a systemd service, but it does not
+The `berrykeep-server-node` package installs a systemd service, but it does not
 start it automatically. Configure the service first:
 
+These instructions are for a new installation. An upgraded
+`ironmesh-server-node` continues using its legacy service, configuration, and
+state path. Before enabling the BerryKeep unit on that host, deliberately
+migrate its configuration and state; starting `berrykeep-server-node.service`
+stops the legacy unit. See [the Debian package-name transition guide](docs/debian-package-name-transition.md).
+
 ```bash
-sudoedit /etc/ironmesh/server-node.env
+sudoedit /etc/berrykeep/server-node.env
 ```
 
 For a first node in a new cluster, this minimal configuration is enough:
 
 ```bash
-IRONMESH_DATA_DIR=/var/lib/ironmesh-server-node
+IRONMESH_DATA_DIR=/var/lib/berrykeep-server-node
 IRONMESH_SERVER_BIND=0.0.0.0:8443
 ```
 
 Then enable the service for boot and start it immediately:
 
 ```bash
-sudo systemctl enable --now ironmesh-server-node.service
+sudo systemctl enable --now berrykeep-server-node.service
 ```
 
 Check the service:
 
 ```bash
-systemctl status ironmesh-server-node.service
-journalctl -u ironmesh-server-node.service -f
+systemctl status berrykeep-server-node.service
+journalctl -u berrykeep-server-node.service -f
 ```
 
 Open the setup UI in a browser:
@@ -241,17 +248,22 @@ https://<server-hostname-or-ip>:8443/
 Accept the temporary self-signed certificate warning, choose `Start a new
 cluster` on the first node, and use the setup UI to connect additional nodes.
 
-The package creates a dedicated `ironmesh-server-node` system user. The service
-runs as that user, and systemd creates `/var/lib/ironmesh-server-node` as its
+The package creates a dedicated `berrykeep-server-node` system user. The service
+runs as that user, and systemd creates `/var/lib/berrykeep-server-node` as its
 state directory.
 
-If you upgrade from an earlier beta package that ran the service as `root`, fix
-existing data ownership once:
+If you upgrade from an earlier Ironmesh beta package that ran the service as
+`root`, fix its retained legacy service data ownership once:
 
 ```bash
 sudo chown -R ironmesh-server-node:ironmesh-server-node /var/lib/ironmesh-server-node
 sudo systemctl restart ironmesh-server-node.service
 ```
+
+Existing `ironmesh-*` installations upgrade through transitional packages that
+keep their current services, configuration files, state directories, and
+legacy command aliases. See [the Debian package transition guide](docs/debian-package-name-transition.md)
+for the operator-facing details.
 
 ## Install On macOS
 

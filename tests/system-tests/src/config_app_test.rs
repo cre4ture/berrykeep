@@ -52,34 +52,34 @@ mod tests {
     fn packaged_binary_file_name(binary_name: &str) -> Result<&'static str> {
         match binary_name {
             "config-app" => Ok(if cfg!(windows) {
-                "ironmesh-config-app.exe"
+                "berrykeep-config-app.exe"
             } else {
-                "ironmesh-config-app"
+                "berrykeep-config-app"
             }),
             "cli-client" => Ok(if cfg!(windows) {
-                "ironmesh.exe"
+                "berrykeep.exe"
             } else {
-                "ironmesh"
+                "berrykeep"
             }),
-            "ironmesh-folder-agent" => Ok(if cfg!(windows) {
-                "ironmesh-folder-agent.exe"
+            "berrykeep-folder-agent" => Ok(if cfg!(windows) {
+                "berrykeep-folder-agent.exe"
             } else {
-                "ironmesh-folder-agent"
+                "berrykeep-folder-agent"
             }),
             "os-integration" => Ok(if cfg!(windows) {
-                "ironmesh-os-integration.exe"
+                "berrykeep-os-integration.exe"
             } else {
-                "ironmesh-os-integration"
+                "berrykeep-os-integration"
             }),
             "server-node" => Ok(if cfg!(windows) {
-                "ironmesh-server-node.exe"
+                "berrykeep-server-node.exe"
             } else {
-                "ironmesh-server-node"
+                "berrykeep-server-node"
             }),
             "rendezvous-service" => Ok(if cfg!(windows) {
-                "ironmesh-rendezvous-service.exe"
+                "berrykeep-rendezvous-service.exe"
             } else {
-                "ironmesh-rendezvous-service"
+                "berrykeep-rendezvous-service"
             }),
             _ => bail!("unsupported packaged binary mapping for {binary_name}"),
         }

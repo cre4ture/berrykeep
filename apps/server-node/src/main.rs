@@ -14,7 +14,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 );
 
 #[derive(Debug, Parser)]
-#[command(name = "ironmesh-server-node")]
+#[command(name = "berrykeep-server-node")]
 #[command(about = "BerryKeep server node")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
@@ -52,7 +52,7 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
 
     let mut runtime_builder = if use_current_thread {
         eprintln!(
-            "ironmesh-server-node: using Tokio current-thread runtime because \
+            "berrykeep-server-node: using Tokio current-thread runtime because \
 IRONMESH_TOKIO_CURRENT_THREAD is set; this avoids worker-pool overhead on \
 single-core hosts"
         );

@@ -435,7 +435,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Save cluster contact list" }).click();
   await expect(page.locator("pre").filter({ hasText: "home-router.example:19080" }).first()).toBeVisible();
 
-  await page.getByLabel("Standalone ironmesh-rendezvous-service").click();
+  await page.getByLabel("Standalone berrykeep-rendezvous-service").click();
   await expect(page.getByRole("textbox", { name: "Target node ID" })).toHaveCount(1);
   await expect(page.getByText("No target node ID is needed for the standalone service package.")).toBeVisible();
   await expect(page.getByText(/Encrypts the exported JSON, including the service TLS private key/)).toBeVisible();
@@ -2057,7 +2057,7 @@ async function installServerAdminMocks(
       public_url: "https://node-alpha.local:9443",
       tls_enabled: true,
       gateway_command_hint:
-        "ironmesh --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000",
+        "berrykeep --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000",
       local_generation: s3LocalGeneration,
       last_applied_at_unix: 1_900_000_210,
       last_source_node_id: "node-beta",

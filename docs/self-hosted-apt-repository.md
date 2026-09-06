@@ -1,10 +1,10 @@
-# Self-Hosted Apt Repository
+# Self-Hosted BerryKeep Apt Repository
 
-Ironmesh can be published from any static HTTPS web root as a small signed apt
+BerryKeep can be published from any static HTTPS web root as a small signed apt
 repository. The web server only hosts files; apt verifies the signed `Release`
 metadata and the package checksums inside that metadata.
 
-The default Ironmesh target is:
+The default BerryKeep target retains the established URL:
 
 ```bash
 https://creax.de/apt/ironmesh
@@ -19,7 +19,7 @@ against each distribution's libc. The client and rendezvous binaries remain
 distribution-specific and continue to use their normal native package path.
 
 For headless non-PC targets, use the `server-node-only` build profile. It
-creates only `ironmesh-server-node`, excluding the desktop client, rendezvous
+creates only `berrykeep-server-node`, excluding the desktop client, rendezvous
 service, and optional map-tools package. The profile requires a verified static
 Server Node artifact and performs neither Rust compilation nor target-binary
 execution; an x86 builder can therefore create an ARM64 `.deb` wrapper inside
@@ -48,7 +48,7 @@ and static-link contract before package assembly.
   --suite trixie \
   --arch arm64 \
   --server-node-only \
-  --static-server-node-artifact target/static-server-node/ironmesh-server-node-*-aarch64-generic.tar.gz \
+  --static-server-node-artifact target/static-server-node/berrykeep-server-node-*-aarch64-generic.tar.gz \
   -- -j1
 ```
 
@@ -110,11 +110,11 @@ spaces:
 
 ```text
 # suite  architecture  package path
-focal  arm64  packages/focal/ironmesh-server-node_1.1.0-1~repo2~focal.1_arm64.deb
-trixie arm64  packages/trixie/ironmesh-server-node_1.1.0-1~repo2~trixie.1_arm64.deb
-focal  amd64  packages/focal/ironmesh-server-node_1.1.0-1~repo2~focal.1_amd64.deb
-trixie amd64  packages/trixie/ironmesh-server-node_1.1.0-1~repo2~trixie.1_amd64.deb
-noble  amd64  packages/noble/ironmesh-server-node_1.1.0-1~repo2~noble.1_amd64.deb
+focal  arm64  packages/focal/berrykeep-server-node_1.1.0-1~repo2~focal.1_arm64.deb
+trixie arm64  packages/trixie/berrykeep-server-node_1.1.0-1~repo2~trixie.1_arm64.deb
+focal  amd64  packages/focal/berrykeep-server-node_1.1.0-1~repo2~focal.1_amd64.deb
+trixie amd64  packages/trixie/berrykeep-server-node_1.1.0-1~repo2~trixie.1_amd64.deb
+noble  amd64  packages/noble/berrykeep-server-node_1.1.0-1~repo2~noble.1_amd64.deb
 ```
 
 The same matrix drives signing and deployment. The repository builder imports
@@ -129,9 +129,12 @@ suite into the package changelog distribution. The first suite-specific
 package increments the legacy repository revision, so it supersedes an
 otherwise identical `~repo1~ubuntu…` package in APT's version comparison.
 
-When a server-only matrix refreshes an already-published suite, its existing
-client, rendezvous, and map-tools `.deb` files are retained from the legacy
-shared pool and copied into that suite's pool before the index is regenerated.
+When a server-only matrix refreshes an already-published suite, the matrix
+discovers and publishes the matching `ironmesh-server-node` transition package
+beside each `berrykeep-server-node` input. Its existing client, rendezvous, and
+map-tools `.deb` files are retained from both the legacy shared pool and the
+previous Ironmesh suite pool, then copied into the new BerryKeep suite pool
+before the index is regenerated.
 The script migrates only files explicitly listed in that suite's existing
 `Packages` index. If it finds a legacy Map Tools package with an exact Server
 Node dependency, it publishes a higher-versioned compatibility rebuild with
@@ -207,28 +210,29 @@ curl -fsSL https://creax.de/apt/ironmesh/dists/focal/main/binary-arm64/Packages.
 Install the repository key into apt's keyring directory:
 
 ```bash
-curl -fsSL https://creax.de/apt/ironmesh/ironmesh-archive-keyring.asc \
-  | sudo gpg --dearmor -o /usr/share/keyrings/ironmesh-archive-keyring.gpg
+curl -fsSL https://creax.de/apt/ironmesh/berrykeep-archive-keyring.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/berrykeep-archive-keyring.gpg
 ```
 
 Add exactly one apt source, matching the distribution suite and architecture of
-the host:
+the host. Keep the established `ironmesh.list` filename so this replaces an
+existing source entry instead of creating a duplicate:
 
 ```bash
 # Ubuntu 20.04 ARM64
-echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh focal main' \
+echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh focal main' \
   | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 
 ```bash
 # Ubuntu 24.04 AMD64
-echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh noble main' \
+echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh noble main' \
   | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 
 ```bash
 # Debian Trixie ARM64 / Raspberry Pi OS based on Trixie
-echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/ironmesh-archive-keyring.gpg] https://creax.de/apt/ironmesh trixie main' \
+echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh trixie main' \
   | sudo tee /etc/apt/sources.list.d/ironmesh.list
 ```
 
@@ -236,12 +240,12 @@ Install or update packages through apt:
 
 ```bash
 sudo apt update
-sudo apt install ironmesh-client
+sudo apt install berrykeep-client
 ```
 
-Headless targets install only `ironmesh-server-node`. The desktop package set
-can additionally install `ironmesh-rendezvous-service`; add
-`ironmesh-server-node-map-tools` when the optional Natural Earth imports are
+Headless targets install only `berrykeep-server-node`. The desktop package set
+can additionally install `berrykeep-rendezvous-service`; add
+`berrykeep-server-node-map-tools` when the optional Natural Earth imports are
 needed.
 
 ## Publishing updates

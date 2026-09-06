@@ -1,4 +1,4 @@
-Ironmesh Debian/PPA packaging
+BerryKeep Debian/PPA packaging
 ==============================
 
 This packaging is aimed at Launchpad PPA source uploads.
@@ -29,7 +29,7 @@ This helper intentionally uses `debuild -S -sa -nc` so the prepared vendored
 dependencies and prebuilt web assets remain in the source tree for the source
 upload.
 
-The resulting `../ironmesh_<version>_source.changes` file can then be uploaded
+The resulting `../berrykeep_<version>_source.changes` file can then be uploaded
 with `dput`.
 
 Notes:
@@ -37,10 +37,12 @@ Notes:
   * The package build intentionally skips the workspace test suites because the
     repository includes long-running integration tests and a nightly-only
     `system-tests` harness that are not suitable for Launchpad builders.
-  * The systemd units for `ironmesh-server-node` and
-    `ironmesh-rendezvous-service` are installed but not enabled or started
-    automatically. Fill in the matching `/etc/ironmesh/*.env` file and enable
+  * The systemd units for `berrykeep-server-node` and
+    `berrykeep-rendezvous-service` are installed but not enabled or started
+    automatically. Fill in the matching `/etc/berrykeep/*.env` file and enable
     the service manually after installation.
-  * `ironmesh-server-node` uses the `dh-sysuser` Debhelper addon so the
-    `ironmesh-server-node` system user is created automatically at package
+  * Transitional `ironmesh-*` packages depend on their `berrykeep-*`
+    replacements and retain the old service/configuration paths for upgrades.
+  * `berrykeep-server-node` uses the `dh-sysuser` Debhelper addon so the
+    `berrykeep-server-node` system user is created automatically at package
     installation time, including on Ubuntu 20.04.

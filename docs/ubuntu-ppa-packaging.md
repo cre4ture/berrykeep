@@ -1,12 +1,16 @@
 # Ubuntu PPA Packaging
 
 This repository contains Debian packaging metadata under `debian/` for a
-single source package that builds four installable packages:
+single source package that builds four primary BerryKeep packages:
 
-- `ironmesh-server-node`
-- `ironmesh-server-node-map-tools`
-- `ironmesh-client`
-- `ironmesh-rendezvous-service`
+- `berrykeep-server-node`
+- `berrykeep-server-node-map-tools`
+- `berrykeep-client`
+- `berrykeep-rendezvous-service`
+
+It also builds four `ironmesh-*` transition packages with matching package
+roles. They depend on the BerryKeep packages so existing installations upgrade
+without changing their installed package names first.
 
 ## First-release install and update strategy
 
@@ -20,13 +24,13 @@ suite. Launchpad source uploads cannot consume a separately built CI artifact,
 so a PPA source build remains a distribution-native compatibility path until a
 dedicated portable Server Node package is published in the signed repository.
 
-If Launchpad is unavailable or too slow for a release, Ironmesh can also be
+If Launchpad is unavailable or too slow for a release, BerryKeep can also be
 published from a static signed apt repository. See
 `docs/self-hosted-apt-repository.md` for the `creax.de` flow.
 
 That means:
 
-- end users install Ironmesh through `apt`, not from ad-hoc tarballs or a
+- end users install BerryKeep through `apt`, not from ad-hoc tarballs or a
   custom binary updater,
 - updates arrive through the normal Ubuntu package-management path (`apt
   upgrade`, Software Updater, or unattended upgrades),
@@ -38,32 +42,32 @@ Example user flow once the production PPA name exists:
 ```bash
 sudo add-apt-repository ppa:<launchpad-user>/<ppa-name>
 sudo apt update
-sudo apt install ironmesh-client
+sudo apt install berrykeep-client
 ```
 
-For server deployments, install `ironmesh-server-node` and/or
-`ironmesh-rendezvous-service` instead of, or in addition to,
-`ironmesh-client`. Install `ironmesh-server-node-map-tools` only when the
+For server deployments, install `berrykeep-server-node` and/or
+`berrykeep-rendezvous-service` instead of, or in addition to,
+`berrykeep-client`. Install `berrykeep-server-node-map-tools` only when the
 optional Natural Earth imports are needed.
 
 Package-specific notes:
 
-- `ironmesh-client` installs the public `ironmesh` CLI and the packaged desktop
-  helpers `ironmesh-config-app`, `ironmesh-folder-agent`,
-  `ironmesh-os-integration`, and `ironmesh-background-launcher`.
-- `ironmesh-client` also installs an XDG autostart entry for
-  `ironmesh-config-app --background` so the config app can own merged desktop
+- `berrykeep-client` installs the public `berrykeep` CLI and the packaged desktop
+  helpers `berrykeep-config-app`, `berrykeep-folder-agent`,
+  `berrykeep-os-integration`, and `berrykeep-background-launcher`.
+- `berrykeep-client` also installs an XDG autostart entry for
+  `berrykeep-config-app --background` so the config app can own merged desktop
   status and launch enabled managed services after graphical sign-in.
 - Package upgrades replace binaries inside the package payload, while XDG user
-  state, `/etc/ironmesh/*.env`, and systemd-managed service state stay outside
+  state, `/etc/berrykeep/*.env`, and systemd-managed service state stay outside
   the package and should survive upgrades.
-- `ironmesh-server-node` and `ironmesh-rendezvous-service` install systemd
-  units plus sample `/etc/ironmesh/*.env` files, but the units remain disabled
+- `berrykeep-server-node` and `berrykeep-rendezvous-service` install systemd
+  units plus sample `/etc/berrykeep/*.env` files, but the units remain disabled
   until an operator fills in configuration and runs `systemctl enable --now`.
-- `ironmesh-server-node` creates and runs as a dedicated
-  `ironmesh-server-node` system user. Its systemd state directory is
-  `/var/lib/ironmesh-server-node`.
-- `ironmesh-server-node-map-tools` depends on the Server Node, `gdal-bin`, and
+- `berrykeep-server-node` creates and runs as a dedicated
+  `berrykeep-server-node` system user. Its systemd state directory is
+  `/var/lib/berrykeep-server-node`.
+- `berrykeep-server-node-map-tools` depends on the Server Node, `gdal-bin`, and
   `unzip`. Keeping those tools outside the core package makes the normal
   storage-server installation portable without bundling optional programs.
 - GNOME Shell integration stays optional. The client package ships the
@@ -81,7 +85,7 @@ sudo apt upgrade
 ```
 
 If unattended upgrades or the graphical Software Updater are enabled, those
-mechanisms can apply new Ironmesh package versions too. The first release
+mechanisms can apply new BerryKeep package versions too. The first release
 should not ship a separate in-app updater or another binary replacement path on
 Ubuntu.
 
@@ -135,10 +139,10 @@ Example:
 ```bash
 ./scripts/build-local-debs.sh -- -jauto
 sudo apt install \
-  ../ironmesh-client_1.0.0~beta.1-1_amd64.deb \
-  ../ironmesh-server-node_1.0.0~beta.1-1_amd64.deb \
-  ../ironmesh-server-node-map-tools_1.0.0~beta.1-1_amd64.deb \
-  ../ironmesh-rendezvous-service_1.0.0~beta.1-1_amd64.deb
+  ../berrykeep-client_1.0.0~beta.1-1_amd64.deb \
+  ../berrykeep-server-node_1.0.0~beta.1-1_amd64.deb \
+  ../berrykeep-server-node-map-tools_1.0.0~beta.1-1_amd64.deb \
+  ../berrykeep-rendezvous-service_1.0.0~beta.1-1_amd64.deb
 ```
 
 Like the PPA source-package path, the Debian package build itself skips the
@@ -188,18 +192,18 @@ current changelog entry is preserved.
   `rustc-1.89`, or `rustc-1.85`) because the workspace uses Rust edition 2024.
 - The build helper skips `lintian` by default to keep the PPA upload loop fast
   with the large vendored source package. Run `lintian
-  ../ironmesh_<version>_source.changes` yourself, or pass `--lintian` to the
+  ../berrykeep_<version>_source.changes` yourself, or pass `--lintian` to the
   helper if you want the extra check inline.
 - If you omit `DEBUILD_KEYID` (or `DEBSIGN_KEYID`), the helper still builds the
   source package but leaves the `.dsc` and `.changes` unsigned. You can sign
-  them afterwards with `debsign ../ironmesh_<version>_source.changes`.
+  them afterwards with `debsign ../berrykeep_<version>_source.changes`.
 - `tests/system-tests` is intentionally excluded from the main workspace so
   stable Cargo on Ubuntu builders does not have to parse nightly-only artifact
   dependency declarations.
 - The installed systemd units are present but intentionally not enabled or
-  started automatically. Fill in `/etc/ironmesh/server-node.env` or
-  `/etc/ironmesh/rendezvous-service.env` and then enable the service manually.
+  started automatically. Fill in `/etc/berrykeep/server-node.env` or
+  `/etc/berrykeep/rendezvous-service.env` and then enable the service manually.
 - Server-node logs use Rust tracing. Set `RUST_LOG=server_node_sdk=debug,info`
-  in `/etc/ironmesh/server-node.env`, then run `sudo systemctl restart
-  ironmesh-server-node` and inspect logs with `journalctl -u
-  ironmesh-server-node -f`.
+  in `/etc/berrykeep/server-node.env`, then run `sudo systemctl restart
+  berrykeep-server-node` and inspect logs with `journalctl -u
+  berrykeep-server-node -f`.

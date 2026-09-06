@@ -138,7 +138,7 @@ if (-not $SkipCargoBuild) {
     Push-Location $repoRoot
     try {
         $env:CARGO_TARGET_DIR = $CargoTargetDir
-        cargo build --locked --release -p server-node --bin ironmesh-server-node
+        cargo build --locked --release -p server-node --bin berrykeep-server-node
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build failed with exit code $LASTEXITCODE"
         }
@@ -148,7 +148,7 @@ if (-not $SkipCargoBuild) {
     }
 }
 
-$serverNodeExecutable = Join-Path $CargoTargetDir "release\ironmesh-server-node.exe"
+$serverNodeExecutable = Join-Path $CargoTargetDir "release\berrykeep-server-node.exe"
 if (-not (Test-Path -LiteralPath $serverNodeExecutable)) {
     throw "Server node executable was not found: $serverNodeExecutable. Run without -SkipCargoBuild or provide -CargoTargetDir."
 }
