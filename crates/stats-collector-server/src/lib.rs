@@ -29,7 +29,6 @@ pub mod registration;
 pub mod storage;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,7 +41,6 @@ use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
-use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
 use crate::aggregate::{FleetSummary, summarize};
@@ -288,26 +286,11 @@ impl StatsCollectorAppState {
     }
 }
 
-/// Builds the API-only axum [`Router`] for this service. Callers are responsible for TLS
-/// termination and for actually binding/serving it (see `main.rs`).
-///
-/// Production deployments normally use [`build_router_with_public_assets`] so the public
-/// dashboard and its API share the same HTTPS origin. Keeping the API-only constructor also makes
-/// small integration tests and API-only deployments straightforward.
+/// Builds the collector's API routes. The binary adds its compiled-in public dashboard as this
+/// router's fallback (see `main.rs`), keeping the library usable without Node.js or frontend build
+/// inputs in Bazel unit tests.
 pub fn build_router(state: StatsCollectorAppState) -> Router {
-    build_router_with_public_assets(state, None)
-}
-
-/// Builds the collector router, optionally serving a compiled public dashboard as its fallback.
-///
-/// The dashboard contains no credentials and calls only the k-anonymized public statistics API.
-/// Serving it from the collector's HTTPS origin avoids an unnecessarily broad CORS policy. The
-/// caller must provide a directory containing a Vite build, including `index.html` and `assets/`.
-pub fn build_router_with_public_assets(
-    state: StatsCollectorAppState,
-    public_assets_dir: Option<PathBuf>,
-) -> Router {
-    let router = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route(
             "/v1/ingest/hardware-reliability",
@@ -327,14 +310,7 @@ pub fn build_router_with_public_assets(
             "/v1/admin/subject/{telemetry_subject_id}",
             delete(admin_delete_subject),
         )
-        .with_state(state);
-
-    match public_assets_dir {
-        Some(dir) => {
-            router.fallback_service(ServeDir::new(dir).append_index_html_on_directories(true))
-        }
-        None => router,
-    }
+        .with_state(state)
 }
 
 #[derive(Debug, Serialize)]
@@ -895,29 +871,6 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn public_asset_fallback_serves_the_dashboard_index() {
-        let assets = tempfile::tempdir().expect("temporary dashboard asset directory should open");
-        std::fs::write(
-            assets.path().join("index.html"),
-            "<!doctype html><title>IronMesh Fleet Reliability</title>",
-        )
-        .expect("dashboard index should be written");
-        let router =
-            build_router_with_public_assets(test_state().await, Some(assets.path().to_path_buf()));
-
-        let response = router
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("dashboard response body should read");
-        assert!(String::from_utf8_lossy(&body).contains("IronMesh Fleet Reliability"));
     }
 
     #[tokio::test]

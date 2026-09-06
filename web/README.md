@@ -4,7 +4,7 @@ This workspace is the shared frontend home for:
 
 - `server-admin`
 - `client-ui`
-- `fleet-telemetry` — a credential-free public dashboard served by the telemetry collector
+- `fleet-telemetry` — a credential-free public dashboard compiled into and served by the telemetry collector
 - shared UI components
 - shared API helpers
 
