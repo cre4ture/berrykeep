@@ -115,6 +115,38 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(ffi.createHandleCallCount, 2)
     }
 
+    func testBridgeDefersHandleFreeUntilAnInFlightFFIRequestCompletes() throws {
+        let ffi = MockFFI()
+        let listStarted = DispatchSemaphore(value: 0)
+        let releaseList = DispatchSemaphore(value: 0)
+        let freeHandleCalled = DispatchSemaphore(value: 0)
+        ffi.listStarted = listStarted
+        ffi.releaseList = releaseList
+        ffi.freeHandleCalled = freeHandleCalled
+
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        let configuration = AppleConnectionConfiguration(connectionInput: #"{"version":1}"#)
+        _ = try bridge.connect(configuration)
+
+        let listFinished = expectation(description: "list finishes")
+        DispatchQueue.global().async {
+            _ = try? bridge.list(path: "", depth: 1)
+            listFinished.fulfill()
+        }
+        XCTAssertEqual(listStarted.wait(timeout: .now() + 1), .success)
+
+        let reconnectFinished = expectation(description: "reconnect finishes")
+        DispatchQueue.global().async {
+            _ = try? bridge.connect(configuration)
+            reconnectFinished.fulfill()
+        }
+
+        XCTAssertEqual(freeHandleCalled.wait(timeout: .now() + 0.2), .timedOut)
+        releaseList.signal()
+        wait(for: [listFinished, reconnectFinished], timeout: 1)
+        XCTAssertEqual(freeHandleCalled.wait(timeout: .now() + 1), .success)
+    }
+
     func testBridgeRejectsObjectIdentifierLookupsUntilRustSupportsThem() throws {
         let bridge = AppleCFacadeBridge(ffi: MockFFI())
         _ = try bridge.connect(AppleConnectionConfiguration(connectionInput: #"{"version":1}"#))
@@ -387,10 +419,13 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var createdConnectionInput: String?
     var createHandleError: Error?
     var createHandleCallCount = 0
+    var freeHandleCalled: DispatchSemaphore?
     var lastListPrefix: String?
     var lastListDepth: Int?
     var listError: Error?
     var listCallCount = 0
+    var listStarted: DispatchSemaphore?
+    var releaseList: DispatchSemaphore?
     var lastDeletePath: String?
     var lastDeleteExpectedRevision: String?
     var lastPutExpectedRevision: String?
@@ -445,6 +480,7 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
 
     func freeHandle(_ handle: AppleRustHandle) {
         _ = handle
+        freeHandleCalled?.signal()
     }
 
     func startWebUi(
@@ -466,6 +502,10 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         lastListPrefix = prefix
         lastListDepth = depth
         listCallCount += 1
+        listStarted?.signal()
+        if let releaseList {
+            _ = releaseList.wait(timeout: .distantFuture)
+        }
         if let listError {
             throw listError
         }

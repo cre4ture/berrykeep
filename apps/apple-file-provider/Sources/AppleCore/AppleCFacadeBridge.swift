@@ -221,7 +221,7 @@ public enum AppleManualCBridgeError: Error, Sendable, Equatable, LocalizedError 
 public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     private let ffi: AppleManualCBridgeFFI
     private let lock = NSLock()
-    private var handle: AppleRustHandle?
+    private var handle: AppleRustHandleLease?
 
     public init(ffi: AppleManualCBridgeFFI) {
         self.ffi = ffi
@@ -239,14 +239,13 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
             clientIdentityJSON: configuration.clientIdentityJSON
         )
 
-        lock.lock()
-        let previousHandle = handle
-        handle = newHandle
-        lock.unlock()
+        let newLease = AppleRustHandleLease(handle: newHandle, freeHandle: ffi.freeHandle)
 
-        if let previousHandle {
-            ffi.freeHandle(previousHandle)
-        }
+        lock.lock()
+        let previousLease = handle
+        handle = newLease
+        lock.unlock()
+        previousLease?.retire()
 
         return AppleBridgeSession(
             sessionID: UUID().uuidString,
@@ -477,13 +476,10 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
 
     private func disconnectIfNeeded() {
         lock.lock()
-        let existingHandle = handle
+        let existingLease = handle
         handle = nil
         lock.unlock()
-
-        if let existingHandle {
-            ffi.freeHandle(existingHandle)
-        }
+        existingLease?.retire()
     }
 
     private func validatedBootstrapJSON(
@@ -501,15 +497,22 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     }
 
     private func withHandle<T>(_ body: (AppleRustHandle) throws -> T) throws -> T {
-        lock.lock()
-        let existingHandle = handle
-        lock.unlock()
+        while true {
+            lock.lock()
+            let existingLease = handle
+            lock.unlock()
 
-        guard let existingHandle else {
-            throw AppleManualCBridgeError.notConnected
+            guard let existingLease else {
+                throw AppleManualCBridgeError.notConnected
+            }
+            guard let existingHandle = existingLease.borrow() else {
+                continue
+            }
+            defer {
+                existingLease.release()
+            }
+            return try body(existingHandle)
         }
-
-        return try body(existingHandle)
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from json: String) throws -> T {
@@ -560,6 +563,65 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
             return normalized
         }
         return "\(normalized)/"
+    }
+}
+
+private final class AppleRustHandleLease: @unchecked Sendable {
+    private let handle: AppleRustHandle
+    private let freeHandle: (AppleRustHandle) -> Void
+    private let lock = NSLock()
+    private var activeCallCount = 0
+    private var isRetired = false
+    private var isFreed = false
+
+    init(handle: AppleRustHandle, freeHandle: @escaping (AppleRustHandle) -> Void) {
+        self.handle = handle
+        self.freeHandle = freeHandle
+    }
+
+    func borrow() -> AppleRustHandle? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !isRetired else {
+            return nil
+        }
+        activeCallCount += 1
+        return handle
+    }
+
+    func release() {
+        let handleToFree = completeCallOrRetirement()
+        if let handleToFree {
+            freeHandle(handleToFree)
+        }
+    }
+
+    func retire() {
+        lock.lock()
+        isRetired = true
+        let handleToFree = handleToFreeIfReady()
+        lock.unlock()
+
+        if let handleToFree {
+            freeHandle(handleToFree)
+        }
+    }
+
+    private func completeCallOrRetirement() -> AppleRustHandle? {
+        lock.lock()
+        activeCallCount -= 1
+        let handleToFree = handleToFreeIfReady()
+        lock.unlock()
+        return handleToFree
+    }
+
+    private func handleToFreeIfReady() -> AppleRustHandle? {
+        guard isRetired, activeCallCount == 0, !isFreed else {
+            return nil
+        }
+        isFreed = true
+        return handle
     }
 }
 

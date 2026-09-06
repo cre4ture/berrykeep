@@ -118,33 +118,48 @@ private struct IronmeshIosRootView: View {
     }
 }
 
+private enum IronmeshMainShellTab: Hashable {
+    case home
+    case library
+    case galleryMap
+    case files
+    case settings
+}
+
 private struct IronmeshMainShellView: View {
+    @State private var selectedTab: IronmeshMainShellTab = .home
+
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             IronmeshHomeView()
                 .tabItem {
                     Label("Home", systemImage: "house")
                 }
+                .tag(IronmeshMainShellTab.home)
 
             IronmeshLibraryView()
                 .tabItem {
                     Label("Library", systemImage: "books.vertical")
                 }
+                .tag(IronmeshMainShellTab.library)
 
             IronmeshGalleryMapView()
                 .tabItem {
                     Label("Gallery Map", systemImage: "map")
                 }
+                .tag(IronmeshMainShellTab.galleryMap)
 
             IronmeshFilesView()
                 .tabItem {
                     Label("Files", systemImage: "folder.badge.gearshape")
                 }
+                .tag(IronmeshMainShellTab.files)
 
             IronmeshSettingsView()
                 .tabItem {
                     Label("Settings", systemImage: "gearshape")
                 }
+                .tag(IronmeshMainShellTab.settings)
         }
     }
 }
@@ -177,7 +192,6 @@ private struct IronmeshGalleryMapContent: View {
     var body: some View {
         if let session, let galleryMapSession = galleryMapWebUiSession(from: session) {
             IronmeshHostedWebView(session: galleryMapSession)
-                .ignoresSafeArea()
                 .onDisappear(perform: onClose)
         } else {
             galleryMapStartCard
