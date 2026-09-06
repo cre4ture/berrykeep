@@ -152,10 +152,17 @@ impl XmpSidecar {
         self.keywords = keywords;
     }
 
-    /// Returns a valid location already present in the XMP packet. Both common
-    /// XMP attribute and element property forms are accepted.
+    /// Returns a valid location already present in the XMP packet or staged by
+    /// [`Self::set_geo_inference`]. Both common XMP attribute and element
+    /// property forms are accepted.
     pub fn geo_location(&self) -> Option<XmpGeoLocation> {
-        read_geo_location(&self.events)
+        read_geo_location(&self.events).or_else(|| {
+            self.geo_inference.as_ref().map(|inference| XmpGeoLocation {
+                latitude: inference.latitude,
+                longitude: inference.longitude,
+                inferred_by_berrykeep: true,
+            })
+        })
     }
 
     /// Returns whether the packet carries either EXIF coordinate property,
@@ -164,11 +171,15 @@ impl XmpSidecar {
     /// an unparseable third-party coordinate is still user-owned metadata and
     /// must never be shadowed by an additional inferred location.
     pub fn has_geo_location_properties(&self) -> bool {
-        has_geo_location_properties(&self.events)
+        self.geo_inference.is_some() || has_geo_location_properties(&self.events)
     }
 
-    /// Adds canonical EXIF GPS fields and BerryKeep provenance on a fresh
+    /// Stages canonical EXIF GPS fields and BerryKeep provenance on a fresh
     /// `rdf:Description`. Unknown XMP content is retained verbatim.
+    ///
+    /// The sidecar must not already contain GPS, including a pending inference.
+    /// This preserves the no-competing-locations invariant even when callers
+    /// reuse one [`XmpSidecar`] instance before serializing it.
     pub fn set_geo_inference(&mut self, inference: XmpGeoInference) -> Result<()> {
         if !inference.latitude.is_finite()
             || !(-90.0..=90.0).contains(&inference.latitude)
@@ -176,6 +187,9 @@ impl XmpSidecar {
             || !(-180.0..=180.0).contains(&inference.longitude)
         {
             bail!("invalid XMP geolocation coordinates");
+        }
+        if self.has_geo_location_properties() {
+            bail!("XMP sidecar already contains geolocation properties");
         }
         self.geo_inference = Some(inference);
         Ok(())
@@ -198,6 +212,13 @@ impl XmpSidecar {
     /// Builds the full output event stream by splicing the regenerated
     /// `dc:subject` property into the retained events.
     fn output_events(&self) -> Result<Vec<Event<'_>>> {
+        if self.keywords.is_empty() && self.geo_inference.is_none() {
+            return Ok(self
+                .events
+                .iter()
+                .map(|entry| entry.event.borrow())
+                .collect());
+        }
         let mut output: Vec<ResolvedEvent> = if self.keywords.is_empty() {
             self.events.clone()
         } else {
@@ -1392,6 +1413,36 @@ mod tests {
         assert!((location.latitude - 37.808_333_33).abs() < 0.000_001);
         assert!((location.longitude + 122.404_166_67).abs() < 0.000_001);
         assert!(location.inferred_by_berrykeep);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_geolocation_is_visible_and_prevents_a_second_write() -> Result<()> {
+        let inference = XmpGeoInference {
+            latitude: 47.3769,
+            longitude: 8.5417,
+            method: "nearest-anchor".to_string(),
+            run_id: "run-123".to_string(),
+            confidence: "reference_distance=180s".to_string(),
+            reference_distance_seconds: Some(180),
+            previous_anchor_distance_seconds: None,
+            next_anchor_distance_seconds: None,
+            estimated_speed_kmh: None,
+        };
+        let mut sidecar = XmpSidecar::new_empty();
+        sidecar.set_geo_inference(inference.clone())?;
+
+        assert!(sidecar.has_geo_location_properties());
+        let location = sidecar
+            .geo_location()
+            .expect("a staged inference must be visible before serialization");
+        assert!((location.latitude - inference.latitude).abs() < f64::EPSILON);
+        assert!((location.longitude - inference.longitude).abs() < f64::EPSILON);
+        assert!(location.inferred_by_berrykeep);
+        assert!(
+            sidecar.set_geo_inference(inference).is_err(),
+            "a second staged inference must not replace the first"
+        );
         Ok(())
     }
 
