@@ -246,12 +246,12 @@ The package creates a dedicated `berrykeep-server-node` system user. The service
 runs as that user, and systemd creates `/var/lib/berrykeep-server-node` as its
 state directory.
 
-If you upgrade from an earlier beta package that ran the service as `root`, fix
-existing data ownership once:
+If you upgrade from an earlier Ironmesh beta package that ran the service as
+`root`, fix its retained legacy service data ownership once:
 
 ```bash
-sudo chown -R berrykeep-server-node:berrykeep-server-node /var/lib/berrykeep-server-node
-sudo systemctl restart berrykeep-server-node.service
+sudo chown -R ironmesh-server-node:ironmesh-server-node /var/lib/ironmesh-server-node
+sudo systemctl restart ironmesh-server-node.service
 ```
 
 Existing `ironmesh-*` installations upgrade through transitional packages that

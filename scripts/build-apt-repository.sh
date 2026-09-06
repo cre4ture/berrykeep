@@ -800,6 +800,22 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
     repack_exact_map_tools_dependencies "${architecture}"
     prune_server_node_versions "${architecture}"
   fi
+done
+
+# Arch-independent transition packages share the suite pool. Refresh every
+# existing architecture index after changing that pool so each hash describes
+# the same package file, even when matrix rows produce different all packages.
+mapfile -t INDEX_ARCHES < <(
+  find "${SUITE_DIR}/${COMPONENT}" -mindepth 1 -maxdepth 1 -type d -name 'binary-*' -printf '%f\n' \
+    | sed 's/^binary-//' \
+    | sort -u
+)
+if ((${#INDEX_ARCHES[@]} == 0)); then
+  printf 'no package architectures found under %s\n' "${SUITE_DIR}/${COMPONENT}" >&2
+  exit 1
+fi
+
+for architecture in "${INDEX_ARCHES[@]}"; do
   packages_rel="dists/${SUITE}/${COMPONENT}/binary-${architecture}/Packages"
   log "writing ${packages_rel}"
   (
@@ -809,16 +825,7 @@ for architecture in "${REQUESTED_ARCHES[@]}"; do
   )
 done
 
-mapfile -t RELEASE_ARCHES < <(
-  find "${SUITE_DIR}/${COMPONENT}" -mindepth 1 -maxdepth 1 -type d -name 'binary-*' -printf '%f\n' \
-    | sed 's/^binary-//' \
-    | sort -u
-)
-
-if ((${#RELEASE_ARCHES[@]} == 0)); then
-  printf 'no package architectures found under %s\n' "${SUITE_DIR}/${COMPONENT}" >&2
-  exit 1
-fi
+RELEASE_ARCHES=("${INDEX_ARCHES[@]}")
 
 RELEASE_ARCHITECTURES="${RELEASE_ARCHES[*]}"
 
