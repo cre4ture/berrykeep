@@ -122,7 +122,6 @@ const STORE_INDEX_PAGE_CACHE_MAX_SCOPES: usize = 2;
 const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
 const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
-const STORE_HISTORY_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
 const HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE: Duration = Duration::from_millis(25);
@@ -283,7 +282,7 @@ use storage::{
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, ObjectVersionMetadataRecord,
     PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
-    PutOptions, ReconcileVersionEntry, RecoverableHistoryEntries, RecoverableHistoryEntry,
+    PutOptions, ReconcileVersionEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
     RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
     S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
     StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
@@ -13941,13 +13940,13 @@ impl StoreIndexPageCache {
 
 #[derive(Debug, Clone)]
 enum StoreHistoryCacheValue {
-    Entries(Vec<RecoverableHistoryEntry>),
-    Oversized { minimum_entry_count: usize },
+    Entries(RecoverableHistoryListing),
 }
 
 #[derive(Debug)]
 struct StoreHistoryCacheEntry {
     prefix: String,
+    depth: usize,
     created_at: Instant,
     value: Arc<StoreHistoryCacheValue>,
 }
@@ -13959,23 +13958,24 @@ struct StoreHistoryCache {
 
 #[derive(Default)]
 struct StoreHistoryRefreshLocks {
-    by_prefix: HashMap<String, Arc<Mutex<()>>>,
+    by_scope: HashMap<(String, usize), Arc<Mutex<()>>>,
 }
 
 impl StoreHistoryRefreshLocks {
-    fn lock_for_prefix(&mut self, prefix: &str) -> Arc<Mutex<()>> {
-        if let Some(lock) = self.by_prefix.get(prefix) {
+    fn lock_for_scope(&mut self, prefix: &str, depth: usize) -> Arc<Mutex<()>> {
+        let scope = (prefix.to_string(), depth);
+        if let Some(lock) = self.by_scope.get(&scope) {
             return Arc::clone(lock);
         }
-        if self.by_prefix.len() >= STORE_HISTORY_CACHE_MAX_SCOPES {
+        if self.by_scope.len() >= STORE_HISTORY_CACHE_MAX_SCOPES {
             // Never evict a lock that is still referenced by an in-flight
             // refresh. Requests acquire the refresh permit before reaching
             // this map, so the small fixed map always has an inactive entry
             // to evict once it reaches capacity.
-            self.by_prefix.retain(|_, lock| Arc::strong_count(lock) > 1);
+            self.by_scope.retain(|_, lock| Arc::strong_count(lock) > 1);
         }
         let lock = Arc::new(Mutex::new(()));
-        self.by_prefix.insert(prefix.to_string(), Arc::clone(&lock));
+        self.by_scope.insert(scope, Arc::clone(&lock));
         lock
     }
 }
@@ -13985,43 +13985,26 @@ impl StoreHistoryCache {
         self.entries.clear();
     }
 
-    fn get(&self, prefix: &str) -> Option<Arc<StoreHistoryCacheValue>> {
+    fn get(&self, prefix: &str, depth: usize) -> Option<Arc<StoreHistoryCacheValue>> {
         self.entries
             .iter()
-            .find(|entry| entry.prefix == prefix)
+            .find(|entry| entry.prefix == prefix && entry.depth == depth)
             .and_then(|entry| {
                 (entry.created_at.elapsed() <= STORE_HISTORY_CACHE_TTL)
                     .then(|| Arc::clone(&entry.value))
             })
     }
 
-    fn insert(&mut self, prefix: &str, value: Arc<StoreHistoryCacheValue>) {
-        self.entries.retain(|entry| entry.prefix != prefix);
+    fn insert(&mut self, prefix: &str, depth: usize, value: Arc<StoreHistoryCacheValue>) {
+        self.entries
+            .retain(|entry| entry.prefix != prefix || entry.depth != depth);
         self.entries.push_front(StoreHistoryCacheEntry {
             prefix: prefix.to_string(),
+            depth,
             created_at: Instant::now(),
             value,
         });
         self.entries.truncate(STORE_HISTORY_CACHE_MAX_SCOPES);
-    }
-
-    fn remove_entries_for_paths(&mut self, paths: &HashSet<String>) {
-        if paths.is_empty() {
-            return;
-        }
-        for entry in &mut self.entries {
-            let StoreHistoryCacheValue::Entries(entries) = Arc::make_mut(&mut entry.value) else {
-                continue;
-            };
-            entries.retain(|entry| !paths.contains(&entry.path));
-        }
-    }
-}
-
-fn remove_restored_history_entries_from_cache(state: &ServerState, paths: &HashSet<String>) {
-    match state.storage.store_history_cache.lock() {
-        Ok(mut cache) => cache.remove_entries_for_paths(paths),
-        Err(poisoned) => poisoned.into_inner().remove_entries_for_paths(paths),
     }
 }
 
@@ -16607,8 +16590,8 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
         .to_string();
     let depth = query.depth.unwrap_or(1).clamp(1, 64);
     let cached = match state.storage.store_history_cache.lock() {
-        Ok(cache) => cache.get(&prefix),
-        Err(poisoned) => poisoned.into_inner().get(&prefix),
+        Ok(cache) => cache.get(&prefix, depth),
+        Err(poisoned) => poisoned.into_inner().get(&prefix, depth),
     };
     let history = match cached {
         Some(cached) => cached,
@@ -16651,13 +16634,13 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
             let refresh_lock = match state.storage.store_history_refresh_locks.lock() {
-                Ok(mut locks) => locks.lock_for_prefix(&prefix),
-                Err(poisoned) => poisoned.into_inner().lock_for_prefix(&prefix),
+                Ok(mut locks) => locks.lock_for_scope(&prefix, depth),
+                Err(poisoned) => poisoned.into_inner().lock_for_scope(&prefix, depth),
             };
             let _refresh_guard = refresh_lock.lock().await;
             let cached = match state.storage.store_history_cache.lock() {
-                Ok(cache) => cache.get(&prefix),
-                Err(poisoned) => poisoned.into_inner().get(&prefix),
+                Ok(cache) => cache.get(&prefix, depth),
+                Err(poisoned) => poisoned.into_inner().get(&prefix, depth),
             };
             if let Some(cached) = cached {
                 cached
@@ -16670,35 +16653,19 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                     .store_history_cache_generation
                     .load(Ordering::SeqCst);
                 let value = match history_inspector
-                    .list_recoverable_history_entries_bounded(
+                    .list_recoverable_history_listing(
                         &prefix,
-                        STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
+                        depth,
+                        STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT,
                     )
                     .await
                 {
-                    Ok(RecoverableHistoryEntries::Entries(entries)) => {
-                        Arc::new(StoreHistoryCacheValue::Entries(entries))
-                    }
-                    Ok(RecoverableHistoryEntries::ExceedsLimit {
-                        minimum_entry_count,
-                    }) => Arc::new(StoreHistoryCacheValue::Oversized {
-                        minimum_entry_count,
-                    }),
+                    Ok(listing) => Arc::new(StoreHistoryCacheValue::Entries(listing)),
                     Err(err) => {
                         tracing::error!(error = %err, prefix = %prefix, depth, "failed to list recoverable history entries");
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
-                if let StoreHistoryCacheValue::Oversized {
-                    minimum_entry_count,
-                } = value.as_ref()
-                {
-                    tracing::warn!(
-                        minimum_entry_count,
-                        cache_limit = STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
-                        "recoverable history exceeds the interactive explorer cache limit"
-                    );
-                }
                 match state.storage.store_history_cache.lock() {
                     Ok(mut cache) => {
                         if state
@@ -16707,7 +16674,7 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                             .load(Ordering::SeqCst)
                             == cache_generation
                         {
-                            cache.insert(&prefix, Arc::clone(&value));
+                            cache.insert(&prefix, depth, Arc::clone(&value));
                         }
                     }
                     Err(poisoned) => {
@@ -16718,7 +16685,7 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
                             .load(Ordering::SeqCst)
                             == cache_generation
                         {
-                            cache.insert(&prefix, Arc::clone(&value));
+                            cache.insert(&prefix, depth, Arc::clone(&value));
                         }
                     }
                 }
@@ -16726,119 +16693,44 @@ async fn list_store_history_response(state: &ServerState, query: StoreHistoryQue
             }
         }
     };
-    let entries = match history.as_ref() {
-        StoreHistoryCacheValue::Entries(entries) => entries,
-        StoreHistoryCacheValue::Oversized {
-            minimum_entry_count,
-        } => {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(json!({
-                    "error": "recoverable history exceeds the interactive explorer limit",
-                    "minimum_entry_count": minimum_entry_count,
-                    "max_entry_count": STORE_HISTORY_CACHE_MAX_ENTRY_COUNT,
-                })),
-            )
-                .into_response();
-        }
-    };
-    let projection = project_recoverable_history_entries(
-        entries,
-        &prefix,
-        depth,
-        STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT,
-    );
+    let StoreHistoryCacheValue::Entries(listing) = history.as_ref();
+    let entries: Vec<StoreHistoryEntryResponse> = listing
+        .entries
+        .iter()
+        .map(store_history_entry_response)
+        .collect();
     Json(StoreHistoryResponse {
         prefix: prefix.clone(),
         depth,
-        entry_count: projection.entries.len(),
-        truncated: projection.truncated,
-        entries: projection.entries,
+        entry_count: entries.len(),
+        truncated: listing.truncated,
+        entries,
     })
     .into_response()
 }
 
-struct StoreHistoryProjection {
-    entries: Vec<StoreHistoryEntryResponse>,
-    truncated: bool,
-}
-
-fn project_recoverable_history_entries(
-    entries: &[RecoverableHistoryEntry],
-    prefix: &str,
-    depth: usize,
-    max_entries: usize,
-) -> StoreHistoryProjection {
-    let max_entries = max_entries.max(1);
-    let mut projected = BTreeMap::<(String, u8), StoreHistoryEntryResponse>::new();
-    let mut truncated = false;
-    let scoped_prefix = (!prefix.is_empty()).then(|| format!("{prefix}/"));
-
-    for entry in entries {
-        let normalized_path = entry.path.trim_matches('/');
-        let relative_path = match scoped_prefix.as_deref() {
-            None => normalized_path,
-            Some(scoped_prefix) => match normalized_path.strip_prefix(scoped_prefix) {
-                Some(relative_path) => relative_path,
-                None => continue,
-            },
-        };
-        let segments = relative_path
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        if segments.is_empty() {
-            continue;
-        }
-
-        if segments.len() > depth {
-            let visible_path = segments[..depth].join("/");
-            let path = if prefix.is_empty() {
-                format!("{visible_path}/")
-            } else {
-                format!("{prefix}/{visible_path}/")
-            };
-            let projection_key = (path.clone(), 0);
-            if projected.len() < max_entries || projected.contains_key(&projection_key) {
-                projected
-                    .entry(projection_key)
-                    .or_insert(StoreHistoryEntryResponse {
-                        path,
-                        entry_type: "prefix",
-                        restore_source_path: None,
-                        restore_source_object_id: None,
-                        restore_version_id: None,
-                        removed_at_unix: None,
-                        moved_to_path: None,
-                    });
-            } else {
-                truncated = true;
-            }
-            continue;
-        }
-
-        let projection_key = (entry.path.clone(), 1);
-        if projected.len() < max_entries || projected.contains_key(&projection_key) {
-            projected.insert(
-                projection_key,
-                StoreHistoryEntryResponse {
-                    path: entry.path.clone(),
-                    entry_type: "historical",
-                    restore_source_path: Some(entry.restore_source_path.clone()),
-                    restore_source_object_id: Some(entry.restore_source_object_id.clone()),
-                    restore_version_id: Some(entry.restore_version_id.clone()),
-                    removed_at_unix: Some(entry.removed_at_unix),
-                    moved_to_path: entry.moved_to_path.clone(),
-                },
-            );
-        } else {
-            truncated = true;
-        }
-    }
-
-    StoreHistoryProjection {
-        entries: projected.into_values().collect(),
-        truncated,
+fn store_history_entry_response(
+    entry: &RecoverableHistoryListingEntry,
+) -> StoreHistoryEntryResponse {
+    match entry {
+        RecoverableHistoryListingEntry::Prefix { path } => StoreHistoryEntryResponse {
+            path: path.clone(),
+            entry_type: "prefix",
+            restore_source_path: None,
+            restore_source_object_id: None,
+            restore_version_id: None,
+            removed_at_unix: None,
+            moved_to_path: None,
+        },
+        RecoverableHistoryListingEntry::Historical(entry) => StoreHistoryEntryResponse {
+            path: entry.path.clone(),
+            entry_type: "historical",
+            restore_source_path: Some(entry.restore_source_path.clone()),
+            restore_source_object_id: Some(entry.restore_source_object_id.clone()),
+            restore_version_id: Some(entry.restore_version_id.clone()),
+            removed_at_unix: Some(entry.removed_at_unix),
+            moved_to_path: entry.moved_to_path.clone(),
+        },
     }
 }
 
@@ -16978,16 +16870,6 @@ async fn restore_history_entries_response(
     }
 
     if restored_count > 0 {
-        let restored_paths = responses
-            .iter()
-            .filter(|entry| entry.status == "restored")
-            .map(|entry| entry.path.clone())
-            .collect::<HashSet<_>>();
-        state
-            .storage
-            .store_history_cache_generation
-            .fetch_add(1, Ordering::SeqCst);
-        remove_restored_history_entries_from_cache(state, &restored_paths);
         publish_namespace_change(state);
         request_local_availability_refresh(state);
     }

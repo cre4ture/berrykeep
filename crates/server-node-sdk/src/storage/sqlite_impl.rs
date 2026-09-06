@@ -30,19 +30,19 @@ use super::{
     METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
     MetadataStore, OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker,
-    RecoverableHistoryEntries, RecoverableHistoryEntry, RepairAttemptRecord, RepairRunRecord,
-    S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState,
-    S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
-    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
-    TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
-    current_media_cache_metadata, decode_gallery_labels, decode_version_index,
-    decompress_snapshot_json, effective_gallery_captured_at_unix, encode_gallery_labels,
-    gallery_index_media_status, gallery_index_media_type_from_metadata,
+    RecoverableHistoryEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
+    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
+    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
+    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
+    StorageStatsSample, StorageStatsState, TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection,
+    compress_snapshot_json, current_media_cache_metadata, decode_gallery_labels,
+    decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
+    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
-    sqlite_like_prefix_pattern, version_created_at_unix_from_payload,
-    version_index_head_projection,
+    recoverable_history_listing_query_with_json_path, sqlite_like_prefix_pattern,
+    version_created_at_unix_from_payload, version_index_head_projection,
 };
 
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3970,137 +3970,53 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn list_recoverable_history_entries_bounded(
+    async fn list_recoverable_history_listing(
         &self,
         prefix: &str,
+        depth: usize,
         max_entries: usize,
-    ) -> Result<RecoverableHistoryEntries> {
+    ) -> Result<RecoverableHistoryListing> {
         let prefix = prefix.trim().trim_matches('/').to_string();
+        let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+        let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
+        let depth = i64::try_from(depth.max(1)).context("history listing depth overflow")?;
+        let max_entries = max_entries.max(1);
         let limit = max_entries
             .checked_add(1)
             .and_then(|value| i64::try_from(value).ok())
             .unwrap_or(i64::MAX);
-        let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
-        // Every descendant begins with `<prefix>/`; the byte after `/` sorts
-        // before `0`, so this is an indexable range without a JSON or LIKE
-        // predicate. Logical paths do not retain a trailing slash here.
-        let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
+        let query = recoverable_history_listing_query_with_json_path(!prefix.is_empty());
         self.read(move |db| {
-            let statement = if path_lower_bound.is_some() {
-                "WITH latest AS (
-                     SELECT
-                         history.logical_path,
-                         history.restore_source_path,
-                         history.restore_source_object_id,
-                         history.restore_version_id,
-                         history.removed_at_unix,
-                         history.moved_source_object_id,
-                         ROW_NUMBER() OVER (
-                             PARTITION BY history.logical_path
-                             ORDER BY history.removed_at_unix DESC,
-                                      history.restore_version_id DESC,
-                                      history.object_id DESC
-                         ) AS path_rank
-                     FROM version_index_heads AS history
-                     WHERE history.head_manifest_hash = ?1
-                       AND history.restore_source_path IS NOT NULL
-                       AND history.restore_source_object_id IS NOT NULL
-                       AND history.restore_version_id IS NOT NULL
-                       AND history.logical_path >= ?2
-                       AND history.logical_path < ?3
-                       AND NOT EXISTS (
-                           SELECT 1 FROM current_objects
-                           WHERE current_objects.key = history.logical_path
-                       )
-                 )
-                 SELECT
-                     latest.logical_path,
-                     latest.restore_source_path,
-                     latest.restore_source_object_id,
-                     latest.restore_version_id,
-                     latest.removed_at_unix,
-                     (
-                         SELECT MIN(current_objects.key)
-                         FROM current_objects
-                         WHERE current_objects.object_id = latest.moved_source_object_id
-                           AND current_objects.key != latest.logical_path
-                     ) AS moved_to_path
-                 FROM latest
-                 WHERE latest.path_rank = 1
-                 ORDER BY latest.logical_path
-                 LIMIT ?4"
-            } else {
-                "WITH latest AS (
-                     SELECT
-                         history.logical_path,
-                         history.restore_source_path,
-                         history.restore_source_object_id,
-                         history.restore_version_id,
-                         history.removed_at_unix,
-                         history.moved_source_object_id,
-                         ROW_NUMBER() OVER (
-                             PARTITION BY history.logical_path
-                             ORDER BY history.removed_at_unix DESC,
-                                      history.restore_version_id DESC,
-                                      history.object_id DESC
-                         ) AS path_rank
-                     FROM version_index_heads AS history
-                     WHERE history.head_manifest_hash = ?1
-                       AND history.restore_source_path IS NOT NULL
-                       AND history.restore_source_object_id IS NOT NULL
-                       AND history.restore_version_id IS NOT NULL
-                       AND NOT EXISTS (
-                           SELECT 1 FROM current_objects
-                           WHERE current_objects.key = history.logical_path
-                       )
-                 )
-                 SELECT
-                     latest.logical_path,
-                     latest.restore_source_path,
-                     latest.restore_source_object_id,
-                     latest.restore_version_id,
-                     latest.removed_at_unix,
-                     (
-                         SELECT MIN(current_objects.key)
-                         FROM current_objects
-                         WHERE current_objects.object_id = latest.moved_source_object_id
-                           AND current_objects.key != latest.logical_path
-                     ) AS moved_to_path
-                 FROM latest
-                 WHERE latest.path_rank = 1
-                 ORDER BY latest.logical_path
-                 LIMIT ?2"
-            };
-            let mut statement = db.prepare(statement)?;
-            let mut rows = if let (Some(path_lower_bound), Some(path_upper_bound)) =
-                (path_lower_bound.as_deref(), path_upper_bound.as_deref())
-            {
-                statement.query(params![
-                    TOMBSTONE_MANIFEST_HASH,
-                    path_lower_bound,
-                    path_upper_bound,
-                    limit,
-                ])?
-            } else {
-                statement.query(params![TOMBSTONE_MANIFEST_HASH, limit])?
-            };
+            let mut statement = db.prepare(&query)?;
+            let mut rows = statement.query(params![
+                TOMBSTONE_MANIFEST_HASH,
+                prefix,
+                path_lower_bound.unwrap_or_default(),
+                path_upper_bound.unwrap_or_default(),
+                depth,
+                limit,
+            ])?;
             let mut entries = Vec::new();
             while let Some(row) = rows.next()? {
-                entries.push(RecoverableHistoryEntry {
-                    path: row.get(0)?,
-                    restore_source_path: row.get(1)?,
-                    restore_source_object_id: row.get(2)?,
-                    restore_version_id: row.get(3)?,
-                    removed_at_unix: row.get(4)?,
-                    moved_to_path: row.get(5)?,
-                });
+                let path = row.get::<_, String>(0)?;
+                if row.get::<_, i64>(1)? != 0 {
+                    entries.push(RecoverableHistoryListingEntry::Historical(
+                        RecoverableHistoryEntry {
+                            path,
+                            restore_source_path: row.get(2)?,
+                            restore_source_object_id: row.get(3)?,
+                            restore_version_id: row.get(4)?,
+                            removed_at_unix: row.get(5)?,
+                            moved_to_path: row.get(6)?,
+                        },
+                    ));
+                } else {
+                    entries.push(RecoverableHistoryListingEntry::Prefix { path });
+                }
             }
-            if entries.len() > max_entries {
-                return Ok(RecoverableHistoryEntries::ExceedsLimit {
-                    minimum_entry_count: entries.len(),
-                });
-            }
-            Ok(RecoverableHistoryEntries::Entries(entries))
+            let truncated = entries.len() > max_entries;
+            entries.truncate(max_entries);
+            Ok(RecoverableHistoryListing { entries, truncated })
         })
         .await
     }

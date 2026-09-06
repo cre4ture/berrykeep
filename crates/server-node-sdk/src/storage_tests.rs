@@ -7003,17 +7003,51 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         PathMutationResult::Applied
     );
 
-    let history = match store
+    for path in ["rollup/deep/one.txt", "rollup/deep/two.txt"] {
+        store
+            .put_object_versioned(
+                path,
+                Bytes::from_static(b"rollup payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .tombstone_object(path, PutOptions::default())
+            .await
+            .unwrap();
+    }
+
+    let rollup_listing = store
         .store_history_inspector()
-        .list_recoverable_history_entries_bounded("", usize::MAX)
+        .list_recoverable_history_listing("rollup", 1, 1)
         .await
-        .unwrap()
-    {
-        RecoverableHistoryEntries::Entries(entries) => entries,
-        RecoverableHistoryEntries::ExceedsLimit { .. } => {
-            panic!("unbounded recoverable history scan unexpectedly exceeded its limit")
-        }
-    };
+        .unwrap();
+    assert!(
+        !rollup_listing.truncated,
+        "the visible prefix, not its descendants, must determine the listing limit"
+    );
+    assert_eq!(
+        rollup_listing.entries,
+        vec![RecoverableHistoryListingEntry::Prefix {
+            path: "rollup/deep/".to_string(),
+        }]
+    );
+
+    let history_listing = store
+        .store_history_inspector()
+        .list_recoverable_history_listing("", 64, usize::MAX)
+        .await
+        .unwrap();
+    assert!(!history_listing.truncated);
+    let history = history_listing
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            RecoverableHistoryListingEntry::Historical(entry) => Some(entry),
+            RecoverableHistoryListingEntry::Prefix { .. } => None,
+        })
+        .collect::<Vec<_>>();
     let deleted_entry = history
         .iter()
         .find(|entry| entry.path == "deleted.txt")
@@ -7037,17 +7071,20 @@ async fn recoverable_history_entries_include_deleted_and_moved_paths_impl(
         Some("moved/new-name.txt")
     );
 
-    let moved_history = match store
+    let moved_history_listing = store
         .store_history_inspector()
-        .list_recoverable_history_entries_bounded("moved", usize::MAX)
+        .list_recoverable_history_listing("moved", 64, usize::MAX)
         .await
-        .unwrap()
-    {
-        RecoverableHistoryEntries::Entries(entries) => entries,
-        RecoverableHistoryEntries::ExceedsLimit { .. } => {
-            panic!("unbounded recoverable history scan unexpectedly exceeded its limit")
-        }
-    };
+        .unwrap();
+    assert!(!moved_history_listing.truncated);
+    let moved_history = moved_history_listing
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            RecoverableHistoryListingEntry::Historical(entry) => Some(entry),
+            RecoverableHistoryListingEntry::Prefix { .. } => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
         moved_history
             .iter()
@@ -7194,23 +7231,17 @@ async fn recoverable_history_head_projection_backfill_rebuilds_legacy_indexes_im
         HistoryHeadProjectionBackfillState::Complete
     );
 
-    let history = match inspector
-        .list_recoverable_history_entries_bounded("legacy", usize::MAX)
+    let history = inspector
+        .list_recoverable_history_listing("legacy", 64, usize::MAX)
         .await
-        .unwrap()
-    {
-        RecoverableHistoryEntries::Entries(entries) => entries,
-        RecoverableHistoryEntries::ExceedsLimit { .. } => {
-            panic!("unbounded recoverable history projection unexpectedly exceeded its limit")
-        }
+        .unwrap();
+    assert!(!history.truncated);
+    let [RecoverableHistoryListingEntry::Historical(entry)] = history.entries.as_slice() else {
+        panic!("legacy history should have exactly one direct historical entry");
     };
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].path, "legacy/old-name.txt");
-    assert_eq!(history[0].restore_version_id, original.version_id);
-    assert_eq!(
-        history[0].moved_to_path.as_deref(),
-        Some("legacy/new-name.txt")
-    );
+    assert_eq!(entry.path, "legacy/old-name.txt");
+    assert_eq!(entry.restore_version_id, original.version_id);
+    assert_eq!(entry.moved_to_path.as_deref(), Some("legacy/new-name.txt"));
 
     let _ = fs::remove_dir_all(root).await;
 }

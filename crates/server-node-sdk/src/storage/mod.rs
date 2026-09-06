@@ -2901,14 +2901,15 @@ trait MetadataStore: Send + Sync {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Vec<u8>)>>;
-    /// Reads the indexed preferred-head projection for Explorer history. The
-    /// result contains at most `max_entries + 1` distinct paths so callers can
-    /// enforce a response bound without materializing the complete namespace.
-    async fn list_recoverable_history_entries_bounded(
+    /// Reads the indexed, depth-projected Explorer history. The result contains
+    /// at most `max_entries + 1` visible paths, rather than materializing every
+    /// historical descendant below the requested prefix.
+    async fn list_recoverable_history_listing(
         &self,
         prefix: &str,
+        depth: usize,
         max_entries: usize,
-    ) -> Result<RecoverableHistoryEntries>;
+    ) -> Result<RecoverableHistoryListing>;
     async fn history_head_projection_backfill_state(
         &self,
     ) -> Result<HistoryHeadProjectionBackfillState>;
@@ -3279,10 +3280,117 @@ impl StorageStatsCollector {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum RecoverableHistoryEntries {
-    Entries(Vec<RecoverableHistoryEntry>),
-    ExceedsLimit { minimum_entry_count: usize },
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoverableHistoryListingEntry {
+    Prefix { path: String },
+    Historical(RecoverableHistoryEntry),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoverableHistoryListing {
+    pub(crate) entries: Vec<RecoverableHistoryListingEntry>,
+    pub(crate) truncated: bool,
+}
+
+/// Uses JSON1's table-valued array iterator to form the visible path. This
+/// keeps the depth rollup inside the database query without recursive CTEs,
+/// which Turso does not support. The bound therefore applies to visible paths,
+/// not to every historical descendant below a large folder.
+pub(super) fn recoverable_history_listing_query_with_json_path(restrict_to_prefix: bool) -> String {
+    let prefix_filter = if restrict_to_prefix {
+        "AND history.logical_path >= ?3\n                           AND history.logical_path < ?4"
+    } else {
+        ""
+    };
+    format!(
+        r#"WITH latest AS (
+             SELECT
+                 history.logical_path,
+                 history.restore_source_path,
+                 history.restore_source_object_id,
+                 history.restore_version_id,
+                 history.removed_at_unix,
+                 history.moved_source_object_id,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY history.logical_path
+                     ORDER BY history.removed_at_unix DESC,
+                              history.restore_version_id DESC,
+                              history.object_id DESC
+                 ) AS path_rank
+             FROM version_index_heads AS history
+             WHERE history.head_manifest_hash = ?1
+               AND history.restore_source_path IS NOT NULL
+               AND history.restore_source_object_id IS NOT NULL
+               AND history.restore_version_id IS NOT NULL
+               {prefix_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM current_objects
+                   WHERE current_objects.key = history.logical_path
+               )
+         ),
+         scoped AS (
+             SELECT
+                 latest.logical_path,
+                 latest.restore_source_path,
+                 latest.restore_source_object_id,
+                 latest.restore_version_id,
+                 latest.removed_at_unix,
+                 latest.moved_source_object_id,
+                 CASE
+                     WHEN ?2 = '' THEN latest.logical_path
+                     ELSE substr(latest.logical_path, length(?2) + 2)
+                 END AS relative_path
+             FROM latest
+             WHERE latest.path_rank = 1
+         ),
+         visible AS (
+             SELECT
+                 scoped.*,
+                 json_array_length(
+                     '[' || replace(json_quote(relative_path), '/', char(34) || ',' || char(34)) || ']'
+                 ) AS segment_count,
+                 (
+                     SELECT group_concat(value, '/')
+                     FROM json_each(
+                         '[' || replace(json_quote(scoped.relative_path), '/', char(34) || ',' || char(34)) || ']'
+                     )
+                     WHERE key < ?5
+                 ) AS visible_path
+             FROM scoped
+         ),
+         projected AS (
+             SELECT
+                 CASE
+                     WHEN segment_count <= ?5 THEN logical_path
+                     WHEN ?2 = '' THEN visible_path || '/'
+                     ELSE ?2 || '/' || visible_path || '/'
+                 END AS display_path,
+                 CASE WHEN segment_count <= ?5 THEN 1 ELSE 0 END AS is_historical,
+                 restore_source_path,
+                 restore_source_object_id,
+                 restore_version_id,
+                 removed_at_unix,
+                 moved_source_object_id
+             FROM visible
+         )
+         SELECT
+             display_path,
+             is_historical,
+             CASE WHEN is_historical = 1 THEN restore_source_path END,
+             CASE WHEN is_historical = 1 THEN restore_source_object_id END,
+             CASE WHEN is_historical = 1 THEN restore_version_id END,
+             CASE WHEN is_historical = 1 THEN removed_at_unix END,
+             CASE WHEN is_historical = 1 THEN (
+                 SELECT MIN(current_objects.key)
+                 FROM current_objects
+                 WHERE current_objects.object_id = projected.moved_source_object_id
+                   AND current_objects.key != projected.display_path
+             ) END AS moved_to_path
+         FROM projected
+         GROUP BY display_path, is_historical
+         ORDER BY display_path, is_historical
+         LIMIT ?6"#
+    )
 }
 
 impl StoreHistoryInspector {
@@ -3456,13 +3564,14 @@ impl StoreHistoryInspector {
             .collect())
     }
 
-    pub(crate) async fn list_recoverable_history_entries_bounded(
+    pub(crate) async fn list_recoverable_history_listing(
         &self,
         prefix: &str,
+        depth: usize,
         max_entries: usize,
-    ) -> Result<RecoverableHistoryEntries> {
+    ) -> Result<RecoverableHistoryListing> {
         self.metadata_store
-            .list_recoverable_history_entries_bounded(prefix, max_entries)
+            .list_recoverable_history_listing(prefix, depth, max_entries)
             .await
     }
 

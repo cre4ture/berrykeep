@@ -54,134 +54,49 @@ fn reconciliation_object_paths_encode_store_keys_before_transport() {
 }
 
 #[test]
-fn recoverable_history_projection_keeps_folder_markers_and_child_rollups() {
-    let projection = super::project_recoverable_history_entries(
-        &[
-            super::storage::RecoverableHistoryEntry {
-                path: "docs/".to_string(),
-                restore_source_path: "docs/".to_string(),
-                restore_source_object_id: "object-folder".to_string(),
-                restore_version_id: "version-folder".to_string(),
-                removed_at_unix: 10,
-                moved_to_path: None,
-            },
-            super::storage::RecoverableHistoryEntry {
-                path: "docs/a.txt".to_string(),
-                restore_source_path: "docs/a.txt".to_string(),
-                restore_source_object_id: "object-child".to_string(),
-                restore_version_id: "version-child".to_string(),
-                removed_at_unix: 11,
-                moved_to_path: None,
-            },
-        ],
-        "",
-        1,
-        100,
-    );
-
-    assert!(!projection.truncated);
-    assert!(
-        projection
-            .entries
-            .iter()
-            .any(|entry| entry.path == "docs/" && entry.entry_type == "historical")
-    );
-    assert!(
-        projection
-            .entries
-            .iter()
-            .any(|entry| entry.path == "docs/" && entry.entry_type == "prefix")
-    );
-}
-
-#[test]
 fn store_history_cache_retains_entries() {
     let mut cache = super::StoreHistoryCache::default();
     cache.insert(
         "docs",
-        Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())),
+        1,
+        Arc::new(super::StoreHistoryCacheValue::Entries(
+            super::storage::RecoverableHistoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            },
+        )),
     );
 
-    assert!(cache.get("docs").is_some());
-    assert!(cache.get("").is_none());
-}
-
-#[test]
-fn store_history_cache_removes_restored_entries() {
-    let mut cache = super::StoreHistoryCache::default();
-    cache.insert(
-        "",
-        Arc::new(super::StoreHistoryCacheValue::Entries(vec![
-            super::storage::RecoverableHistoryEntry {
-                path: "deleted.txt".to_string(),
-                restore_source_path: "deleted.txt".to_string(),
-                restore_source_object_id: "object-deleted".to_string(),
-                restore_version_id: "version-deleted".to_string(),
-                removed_at_unix: 1,
-                moved_to_path: None,
-            },
-            super::storage::RecoverableHistoryEntry {
-                path: "other.txt".to_string(),
-                restore_source_path: "other.txt".to_string(),
-                restore_source_object_id: "object-other".to_string(),
-                restore_version_id: "version-other".to_string(),
-                removed_at_unix: 2,
-                moved_to_path: None,
-            },
-        ])),
-    );
-
-    cache.remove_entries_for_paths(&std::collections::HashSet::from(
-        ["deleted.txt".to_string()],
-    ));
-
-    let cached = cache.get("");
-    let Some(super::StoreHistoryCacheValue::Entries(entries)) = cached.as_deref() else {
-        panic!("history cache should retain the remaining entry");
-    };
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].path, "other.txt");
-}
-
-#[test]
-fn store_history_cache_retains_an_oversized_history_marker() {
-    let value = super::StoreHistoryCacheValue::Oversized {
-        minimum_entry_count: super::STORE_HISTORY_CACHE_MAX_ENTRY_COUNT + 1,
-    };
-    let mut cache = super::StoreHistoryCache::default();
-    cache.insert("", Arc::new(value));
-
-    assert!(matches!(
-        cache.get("").as_deref(),
-        Some(super::StoreHistoryCacheValue::Oversized { .. })
-    ));
+    assert!(cache.get("docs", 1).is_some());
+    assert!(cache.get("docs", 2).is_none());
+    assert!(cache.get("", 1).is_none());
 }
 
 #[test]
 fn store_history_refresh_locks_preserve_an_active_prefix_during_eviction() {
     let mut locks = super::StoreHistoryRefreshLocks::default();
-    let active = locks.lock_for_prefix("active");
+    let active = locks.lock_for_scope("active", 1);
     for prefix in ["idle-one", "idle-two", "idle-three"] {
-        drop(locks.lock_for_prefix(prefix));
+        drop(locks.lock_for_scope(prefix, 1));
     }
 
-    let replacement = locks.lock_for_prefix("replacement");
+    let replacement = locks.lock_for_scope("replacement", 1);
 
     assert!(Arc::ptr_eq(
         &active,
         locks
-            .by_prefix
-            .get("active")
+            .by_scope
+            .get(&("active".to_string(), 1))
             .expect("the active prefix lock should not be evicted")
     ));
     assert!(Arc::ptr_eq(
         &replacement,
         locks
-            .by_prefix
-            .get("replacement")
+            .by_scope
+            .get(&("replacement".to_string(), 1))
             .expect("the replacement prefix lock should be retained")
     ));
-    assert_eq!(locks.by_prefix.len(), 2);
+    assert_eq!(locks.by_scope.len(), 2);
 }
 
 #[test]
@@ -16614,7 +16529,13 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .expect("prepared page should be cached");
     state.storage.store_history_cache.lock().unwrap().insert(
         "",
-        Arc::new(super::StoreHistoryCacheValue::Entries(Vec::new())),
+        1,
+        Arc::new(super::StoreHistoryCacheValue::Entries(
+            super::storage::RecoverableHistoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            },
+        )),
     );
     super::publish_namespace_change(&state);
     assert!(
@@ -16623,7 +16544,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
             .store_history_cache
             .lock()
             .unwrap()
-            .get("")
+            .get("", 1)
             .is_none(),
         "ordinary namespace changes invalidate the recoverable-history cache"
     );
