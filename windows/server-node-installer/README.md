@@ -9,6 +9,11 @@ The MSI installs `berrykeep-server-node.exe` as the `BerryKeepServerNode`
 Windows service. The stable service identity and data root preserve existing
 Windows deployments during the executable-name transition.
 
+An MSI major upgrade replaces the old `ironmesh-server-node.exe` program
+component and its firewall rules with the BerryKeep executable. No manual
+program-file or firewall cleanup is required; service identity and node state
+are retained.
+
 ## What the MSI manages
 
 - `C:\Program Files\BerryKeep\Server Node\berrykeep-server-node.exe`
