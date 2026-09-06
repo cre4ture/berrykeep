@@ -995,16 +995,21 @@ pub(super) async fn start_operation_run(
     if operation_id != GEOLOCATION_PROPOSE_OPERATION_ID && !start_is_apply {
         return StatusCode::NOT_FOUND.into_response();
     }
+    // Every operation start persists a run and may trigger background metadata
+    // work, so it is never an audit dry-run. Proposing has no separate review
+    // confirmation; the explicit start request is its approval, whereas apply
+    // requires its request-body confirmation.
+    let approval_granted = !start_is_apply || request.approve.unwrap_or(false);
     let authorization = authorize_admin_request(
         &state,
         &headers,
         "auth/operations/run",
-        !start_is_apply,
-        !start_is_apply || request.approve.unwrap_or(false),
+        false,
+        approval_granted,
         json!({
             "operation_id": operation_id,
             "prefix": request.prefix,
-            "approve": request.approve.unwrap_or(false),
+            "approve": approval_granted,
         }),
     )
     .await;
