@@ -55,13 +55,13 @@ The rename is deliberately incremental. To preserve compatibility with
 existing installs, data, automation, and package upgrades, many technical
 identifiers still use the legacy `ironmesh` name. These include Cargo package
 and crate names, binary and command names, environment variables, systemd
-service and user names, data directories, the APT repository and package
-names, application identities, and some asset and source-file names.
+service and user names, data directories, package-transition names,
+application identities, and some asset and source-file names.
 
-No action is required from existing users: continue using the installation,
-service, and configuration commands in this README exactly as written. A
-future compatibility-aware migration will update the remaining identifiers;
-until then, an `ironmesh` reference in a command, path, package name, or
+Existing APT clients can continue using the legacy `/apt/ironmesh` URL; it is
+a signed compatibility mirror of the new BerryKeep repository. A future
+compatibility-aware migration will update the remaining identifiers; until
+then, an `ironmesh` reference in a command, path, package name, or
 configuration key is expected and does not identify a separate product.
 
 ## Project Status
@@ -137,8 +137,11 @@ desktop-client package: the server must run without a signed-in desktop user.
 BerryKeep Ubuntu packages are published from the signed APT repository at:
 
 ```text
-https://creax.de/apt/ironmesh
+https://creax.de/apt/berrykeep
 ```
+
+`https://creax.de/apt/ironmesh` remains available as a signed compatibility
+mirror for existing apt source entries.
 
 These packages follow the experimental status above and are intended for
 evaluation and controlled self-hosted testing.
@@ -161,28 +164,27 @@ sudo apt install ca-certificates curl gnupg
 sudo install -d -m 0755 /usr/share/keyrings
 ```
 
-Install the BerryKeep repository signing key. The repository URL stays stable
-so existing apt source entries continue to work:
+Install the BerryKeep repository signing key:
 
 ```bash
-curl -fsSL https://creax.de/apt/ironmesh/berrykeep-archive-keyring.asc \
+curl -fsSL https://creax.de/apt/berrykeep/berrykeep-archive-keyring.asc \
   | sudo gpg --dearmor --yes -o /usr/share/keyrings/berrykeep-archive-keyring.gpg
 ```
 
 Add exactly one apt source, matching the Ubuntu release and architecture of the
-host. Keep the established `ironmesh.list` filename so this replaces an
-existing source entry instead of creating a duplicate:
+host. New installations use `berrykeep.list`; existing clients can retain an
+`ironmesh.list` source because the legacy URL is a compatibility mirror:
 
 ```bash
 # Ubuntu 20.04 ARM64
-echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh focal main' \
-  | sudo tee /etc/apt/sources.list.d/ironmesh.list
+echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/berrykeep focal main' \
+  | sudo tee /etc/apt/sources.list.d/berrykeep.list
 ```
 
 ```bash
 # Ubuntu 24.04 AMD64
-echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/ironmesh noble main' \
-  | sudo tee /etc/apt/sources.list.d/ironmesh.list
+echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gpg] https://creax.de/apt/berrykeep noble main' \
+  | sudo tee /etc/apt/sources.list.d/berrykeep.list
 ```
 
 Install the server-node package:

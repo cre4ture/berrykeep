@@ -8,8 +8,8 @@ REPO_DIR="${APT_REPO_DIR:-${ROOT_DIR}/target/apt-repo}"
 DEFAULT_SUITE="${APT_REPO_SUITE:-}"
 COMPONENT="${APT_REPO_COMPONENT:-main}"
 REMOTE="${APT_REPO_REMOTE:-creature@creax.de}"
-REMOTE_DIR="${APT_REPO_REMOTE_DIR:-/home/creature/html/apt/ironmesh}"
-REMOTE_URL="${APT_REPO_URL:-https://creax.de/apt/ironmesh}"
+REMOTE_DIR="${APT_REPO_REMOTE_DIR:-/home/creature/html/apt/berrykeep}"
+REMOTE_URL="${APT_REPO_URL:-https://creax.de/apt/berrykeep}"
 DRY_RUN=false
 MATRIX_FILE=""
 SUITES=()
@@ -37,7 +37,7 @@ Options:
                      non-comment row is: SUITE ARCH PACKAGE_PATH. This is the
                      same matrix accepted by build-apt-repository.sh.
   --remote HOST      SSH remote. Defaults to creature@creax.de.
-  --remote-dir DIR   Remote web directory. Defaults to /home/creature/html/apt/ironmesh.
+  --remote-dir DIR   Remote web directory. Defaults to /home/creature/html/apt/berrykeep.
   --url URL          Public repository URL printed at the end.
   --dry-run          Show the rsync changes without uploading.
   -h, --help         Show this help text.

@@ -46,7 +46,7 @@ Options:
                        dpkg --print-architecture.
   --import-remote SRC  Rsync source for the published repository to import
                        before updating it, for example
-                       creature@creax.de:/home/creature/html/apt/ironmesh.
+                       creature@creax.de:/home/creature/html/apt/berrykeep.
   --sign-key KEY       GPG key ID or fingerprint used for Release signing.
   --server-node-only   Publish berrykeep-server-node and its Ironmesh
                        transition package. With no explicit .deb path,

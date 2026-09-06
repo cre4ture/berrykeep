@@ -241,14 +241,17 @@ jobs:
     environment: apt-repository
     timeout-minutes: 30
     env:
-      APT_REPO_SIGN_KEY: ${{ vars.IRONMESH_APT_ARCHIVE_GPG_FINGERPRINT }}
-      APT_REPO_GPG_PASSPHRASE: ${{ secrets.IRONMESH_APT_ARCHIVE_GPG_PASSPHRASE }}
-      APT_REPO_REMOTE: ${{ vars.IRONMESH_APT_REPOSITORY_REMOTE }}
-      APT_REPO_REMOTE_DIR: ${{ vars.IRONMESH_APT_REPOSITORY_REMOTE_DIR }}
-      APT_REPO_URL: ${{ vars.IRONMESH_APT_REPOSITORY_URL }}
-      IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64: ${{ secrets.IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64 }}
-      IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY: ${{ secrets.IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY }}
-      IRONMESH_APT_REPOSITORY_KNOWN_HOSTS: ${{ secrets.IRONMESH_APT_REPOSITORY_KNOWN_HOSTS }}
+      APT_REPO_SIGN_KEY: ${{ vars.BERRYKEEP_APT_ARCHIVE_GPG_FINGERPRINT }}
+      APT_REPO_GPG_PASSPHRASE: ${{ secrets.BERRYKEEP_APT_ARCHIVE_GPG_PASSPHRASE }}
+      APT_REPO_REMOTE: ${{ vars.BERRYKEEP_APT_REPOSITORY_REMOTE }}
+      APT_REPO_REMOTE_DIR: ${{ vars.BERRYKEEP_APT_REPOSITORY_REMOTE_DIR }}
+      APT_REPO_URL: ${{ vars.BERRYKEEP_APT_REPOSITORY_URL }}
+      APT_REPO_COMPATIBILITY_REMOTE: ${{ vars.BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE }}
+      APT_REPO_COMPATIBILITY_REMOTE_DIR: ${{ vars.BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE_DIR }}
+      APT_REPO_COMPATIBILITY_URL: ${{ vars.BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_URL }}
+      BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64: ${{ secrets.BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64 }}
+      BERRYKEEP_APT_REPOSITORY_SSH_PRIVATE_KEY: ${{ secrets.BERRYKEEP_APT_REPOSITORY_SSH_PRIVATE_KEY }}
+      BERRYKEEP_APT_REPOSITORY_KNOWN_HOSTS: ${{ secrets.BERRYKEEP_APT_REPOSITORY_KNOWN_HOSTS }}
 
     steps:
       - name: Checkout
@@ -270,19 +273,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          : "${APT_REPO_SIGN_KEY:?configure IRONMESH_APT_ARCHIVE_GPG_FINGERPRINT}"
-          : "${APT_REPO_GPG_PASSPHRASE:?configure IRONMESH_APT_ARCHIVE_GPG_PASSPHRASE}"
-          : "${APT_REPO_REMOTE:?configure IRONMESH_APT_REPOSITORY_REMOTE}"
-          : "${APT_REPO_REMOTE_DIR:?configure IRONMESH_APT_REPOSITORY_REMOTE_DIR}"
-          : "${APT_REPO_URL:?configure IRONMESH_APT_REPOSITORY_URL}"
-          : "${IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64:?configure IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64}"
-          : "${IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY:?configure IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY}"
-          : "${IRONMESH_APT_REPOSITORY_KNOWN_HOSTS:?configure IRONMESH_APT_REPOSITORY_KNOWN_HOSTS}"
+          : "${APT_REPO_SIGN_KEY:?configure BERRYKEEP_APT_ARCHIVE_GPG_FINGERPRINT}"
+          : "${APT_REPO_GPG_PASSPHRASE:?configure BERRYKEEP_APT_ARCHIVE_GPG_PASSPHRASE}"
+          : "${APT_REPO_REMOTE:?configure BERRYKEEP_APT_REPOSITORY_REMOTE}"
+          : "${APT_REPO_REMOTE_DIR:?configure BERRYKEEP_APT_REPOSITORY_REMOTE_DIR}"
+          : "${APT_REPO_URL:?configure BERRYKEEP_APT_REPOSITORY_URL}"
+          : "${APT_REPO_COMPATIBILITY_REMOTE:?configure BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE}"
+          : "${APT_REPO_COMPATIBILITY_REMOTE_DIR:?configure BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE_DIR}"
+          : "${APT_REPO_COMPATIBILITY_URL:?configure BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_URL}"
+          : "${BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64:?configure BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64}"
+          : "${BERRYKEEP_APT_REPOSITORY_SSH_PRIVATE_KEY:?configure BERRYKEEP_APT_REPOSITORY_SSH_PRIVATE_KEY}"
+          : "${BERRYKEEP_APT_REPOSITORY_KNOWN_HOSTS:?configure BERRYKEEP_APT_REPOSITORY_KNOWN_HOSTS}"
 
           export GNUPGHOME="$RUNNER_TEMP/apt-archive-gnupg"
           printf 'GNUPGHOME=%s\n' "$GNUPGHOME" >> "$GITHUB_ENV"
           install -d -m 700 "$GNUPGHOME" "$HOME/.ssh"
-          printf '%s' "$IRONMESH_APT_ARCHIVE_GPG_PRIVATE_KEY_B64" | base64 --decode \
+          printf '%s' "$BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64" | base64 --decode \
             | gpg --batch --import
           actual_fingerprint="$(gpg --batch --with-colons --fingerprint "$APT_REPO_SIGN_KEY" \
             | awk -F: '$1 == "fpr" { print $10; exit }')"
@@ -291,8 +297,8 @@ jobs:
           test "$actual_fingerprint" = "$expected_fingerprint"
 
           umask 077
-          printf '%s\n' "$IRONMESH_APT_REPOSITORY_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
-          printf '%s\n' "$IRONMESH_APT_REPOSITORY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          printf '%s\n' "$BERRYKEEP_APT_REPOSITORY_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$BERRYKEEP_APT_REPOSITORY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
 
       - name: Build signed repository matrix
         shell: bash
@@ -335,3 +341,9 @@ jobs:
             --remote "$APT_REPO_REMOTE" \
             --remote-dir "$APT_REPO_REMOTE_DIR" \
             --url "$APT_REPO_URL"
+          ./scripts/deploy-apt-repository.sh \
+            --repo-dir "$RUNNER_TEMP/apt-repo" \
+            --server-node-matrix "$RUNNER_TEMP/server-node-debian-matrix.txt" \
+            --remote "$APT_REPO_COMPATIBILITY_REMOTE" \
+            --remote-dir "$APT_REPO_COMPATIBILITY_REMOTE_DIR" \
+            --url "$APT_REPO_COMPATIBILITY_URL"
