@@ -3,14 +3,17 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGE_NAME="rendezvous-service"
-BINARY_NAME="ironmesh-rendezvous-service"
+BINARY_NAME="berrykeep-rendezvous-service"
+LEGACY_BINARY_NAME="ironmesh-rendezvous-service"
 MANIFEST_PATH="${ROOT_DIR}/apps/rendezvous-service/Cargo.toml"
 
 TARGET_TRIPLE="${IRONMESH_RENDEZVOUS_DEPLOY_TARGET:-${IRONMESH_RENDEZVOUS_TARGET:-x86_64-unknown-linux-musl}}"
 REMOTE_DIR="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_DIR:-${IRONMESH_RENDEZVOUS_REMOTE_DIR:-}}"
 REMOTE_BINARY="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_BINARY:-${IRONMESH_RENDEZVOUS_REMOTE_BINARY:-}}"
+LEGACY_REMOTE_BINARY="${IRONMESH_RENDEZVOUS_DEPLOY_LEGACY_REMOTE_BINARY:-}"
 REMOTE_WORKDIR="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_WORKDIR:-${IRONMESH_RENDEZVOUS_REMOTE_WORKDIR:-}}"
 REMOTE_PIDFILE="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_PIDFILE:-${IRONMESH_RENDEZVOUS_REMOTE_PIDFILE:-}}"
+LEGACY_REMOTE_PIDFILE="${IRONMESH_RENDEZVOUS_DEPLOY_LEGACY_REMOTE_PIDFILE:-}"
 REMOTE_LOGFILE="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_LOGFILE:-${IRONMESH_RENDEZVOUS_REMOTE_LOGFILE:-}}"
 REMOTE_START_CMD="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_START_CMD:-${IRONMESH_RENDEZVOUS_REMOTE_START_CMD:-}}"
 REMOTE_MATCH_PATTERN="${IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_MATCH_PATTERN:-${IRONMESH_RENDEZVOUS_REMOTE_MATCH_PATTERN:-}}"
@@ -66,8 +69,10 @@ Useful options:
 Environment overrides:
   IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_DIR
   IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_BINARY
+  IRONMESH_RENDEZVOUS_DEPLOY_LEGACY_REMOTE_BINARY
   IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_WORKDIR
   IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_PIDFILE
+  IRONMESH_RENDEZVOUS_DEPLOY_LEGACY_REMOTE_PIDFILE
   IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_LOGFILE
   IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_START_CMD
   IRONMESH_RENDEZVOUS_DEPLOY_REMOTE_MATCH_PATTERN
@@ -94,14 +99,17 @@ Notes:
   script handles the backgrounding with nohup itself.
   If you provide a custom --remote-start-cmd, make it end in exec <binary> so
   the pid file tracks the service process rather than a wrapper shell.
+  Deployments also update a sibling ironmesh-rendezvous-service symlink and
+  stop its former pid file, allowing existing service definitions to transition
+  to the BerryKeep binary without a coordinated remote edit.
   Configure IRONMESH_RENDEZVOUS_PEER_URLS in the remote environment file when
   deploying a multi-rendezvous mesh so /control/mesh and client discovery can
   surface healthy peer rendezvous URLs.
 
 Example:
   scripts/deploy-rendezvous-service.sh \
-    --remote-dir /srv/ironmesh/rendezvous \
-    --remote-start-cmd 'source /etc/ironmesh/rendezvous.env && exec ./ironmesh-rendezvous-service' \
+    --remote-dir /srv/berrykeep/rendezvous \
+    --remote-start-cmd 'source /etc/berrykeep/rendezvous.env && exec ./berrykeep-rendezvous-service' \
     rendezvous-a rendezvous-b
 EOF
 }
@@ -329,6 +337,10 @@ resolve_remote_layout() {
     REMOTE_DIR="$(dirname -- "$REMOTE_BINARY")"
   fi
 
+  if [[ -z "$LEGACY_REMOTE_BINARY" ]]; then
+    LEGACY_REMOTE_BINARY="${REMOTE_DIR}/${LEGACY_BINARY_NAME}"
+  fi
+
   [[ "$STOP_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || fail "--stop-timeout must be a non-negative integer"
 
   if [[ -z "$REMOTE_WORKDIR" ]]; then
@@ -337,6 +349,10 @@ resolve_remote_layout() {
 
   if [[ -z "$REMOTE_PIDFILE" ]]; then
     REMOTE_PIDFILE="${REMOTE_DIR}/${BINARY_NAME}.pid"
+  fi
+
+  if [[ -z "$LEGACY_REMOTE_PIDFILE" ]]; then
+    LEGACY_REMOTE_PIDFILE="${REMOTE_DIR}/${LEGACY_BINARY_NAME}.pid"
   fi
 
   if [[ -z "$REMOTE_LOGFILE" ]]; then
@@ -426,17 +442,19 @@ verify_local_binary_version() {
 
 stop_remote_service() {
   local host="$1"
-  local remote_dir_q remote_pidfile_q match_pattern_q stop_timeout_q force_kill_q
+  local remote_dir_q remote_pidfile_q legacy_pidfile_q match_pattern_q legacy_match_pattern_q stop_timeout_q force_kill_q
 
   remote_dir_q="$(quote_for_sh "$REMOTE_DIR")"
   remote_pidfile_q="$(quote_for_sh "$REMOTE_PIDFILE")"
+  legacy_pidfile_q="$(quote_for_sh "$LEGACY_REMOTE_PIDFILE")"
   match_pattern_q="$(quote_for_sh "$REMOTE_MATCH_PATTERN")"
+  legacy_match_pattern_q="$(quote_for_sh "$LEGACY_REMOTE_BINARY")"
   stop_timeout_q="$(quote_for_sh "$STOP_TIMEOUT_SECS")"
   force_kill_q="$(quote_for_sh "$FORCE_KILL")"
 
   log "[$host] stopping existing service"
   ssh "${SSH_OPTIONS[@]}" "$host" \
-    "REMOTE_DIR=${remote_dir_q} REMOTE_PIDFILE=${remote_pidfile_q} REMOTE_MATCH_PATTERN=${match_pattern_q} STOP_TIMEOUT_SECS=${stop_timeout_q} FORCE_KILL=${force_kill_q} bash -s" <<'REMOTE'
+    "REMOTE_DIR=${remote_dir_q} REMOTE_PIDFILE=${remote_pidfile_q} LEGACY_REMOTE_PIDFILE=${legacy_pidfile_q} REMOTE_MATCH_PATTERN=${match_pattern_q} LEGACY_REMOTE_BINARY=${legacy_match_pattern_q} STOP_TIMEOUT_SECS=${stop_timeout_q} FORCE_KILL=${force_kill_q} bash -s" <<'REMOTE'
 set -euo pipefail
 
 mkdir -p "$REMOTE_DIR"
@@ -457,15 +475,19 @@ if [[ -f "$REMOTE_PIDFILE" ]]; then
   pid="$(tr -d '[:space:]' <"$REMOTE_PIDFILE" || true)"
   record_pid "$pid"
 fi
+if [[ -f "$LEGACY_REMOTE_PIDFILE" ]]; then
+  pid="$(tr -d '[:space:]' <"$LEGACY_REMOTE_PIDFILE" || true)"
+  record_pid "$pid"
+fi
 
 while IFS= read -r line; do
-  [[ "$line" == *"$REMOTE_MATCH_PATTERN"* ]] || continue
+  [[ "$line" == *"$REMOTE_MATCH_PATTERN"* || "$line" == *"$LEGACY_REMOTE_BINARY"* ]] || continue
   read -r pid _ <<<"$line"
   record_pid "$pid"
 done < <(ps -eo pid=,args=)
 
 if [[ ${#pids[@]} -eq 0 ]]; then
-  rm -f "$REMOTE_PIDFILE"
+  rm -f "$REMOTE_PIDFILE" "$LEGACY_REMOTE_PIDFILE"
   echo "service not running"
   exit 0
 fi
@@ -487,7 +509,7 @@ while :; do
   done
 
   if [[ "$any_running" -eq 0 ]]; then
-    rm -f "$REMOTE_PIDFILE"
+    rm -f "$REMOTE_PIDFILE" "$LEGACY_REMOTE_PIDFILE"
     echo "service stopped"
     exit 0
   fi
@@ -525,19 +547,20 @@ for pid in "${pids[@]}"; do
   fi
 done
 
-rm -f "$REMOTE_PIDFILE"
+rm -f "$REMOTE_PIDFILE" "$LEGACY_REMOTE_PIDFILE"
 echo "service killed after timeout"
 REMOTE
 }
 
 upload_remote_binary() {
   local host="$1"
-  local remote_dir_q remote_tmp remote_tmp_q remote_binary_q remote_target
+  local remote_dir_q remote_tmp remote_tmp_q remote_binary_q legacy_remote_binary_q remote_target
 
   remote_tmp="${REMOTE_BINARY}.new.$$"
   remote_dir_q="$(quote_for_sh "$REMOTE_DIR")"
   remote_tmp_q="$(quote_for_sh "$remote_tmp")"
   remote_binary_q="$(quote_for_sh "$REMOTE_BINARY")"
+  legacy_remote_binary_q="$(quote_for_sh "$LEGACY_REMOTE_BINARY")"
   remote_target="${host}:${remote_tmp}"
 
   log "[$host] uploading ${BINARY_NAME}"
@@ -550,10 +573,13 @@ REMOTE
   scp "${SCP_OPTIONS[@]}" "$LOCAL_BINARY" "$remote_target"
 
   ssh "${SSH_OPTIONS[@]}" "$host" \
-    "REMOTE_TMP=${remote_tmp_q} REMOTE_BINARY=${remote_binary_q} bash -s" <<'REMOTE'
+    "REMOTE_TMP=${remote_tmp_q} REMOTE_BINARY=${remote_binary_q} LEGACY_REMOTE_BINARY=${legacy_remote_binary_q} bash -s" <<'REMOTE'
 set -euo pipefail
 chmod 0755 "$REMOTE_TMP"
 mv "$REMOTE_TMP" "$REMOTE_BINARY"
+if [[ "$LEGACY_REMOTE_BINARY" != "$REMOTE_BINARY" ]]; then
+  ln -sfn "$REMOTE_BINARY" "$LEGACY_REMOTE_BINARY"
+fi
 REMOTE
 }
 

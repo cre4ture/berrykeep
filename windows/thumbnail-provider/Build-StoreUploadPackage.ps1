@@ -362,24 +362,24 @@ if (-not $SkipSigning) {
     }
 }
 
-Write-Step 'Building windows-thumbnail-provider, cli-client, os-integration, ironmesh-folder-agent, ironmesh-background-launcher, and ironmesh-config-app (release)'
+Write-Step 'Building BerryKeep desktop-client artifacts (release)'
 $env:CARGO_TARGET_DIR = $cargoTargetDir
 Invoke-NativeChecked -FilePath 'cargo' -Arguments @('build', '-p', 'windows-thumbnail-provider', '-p', 'cli-client', '-p', 'os-integration', '-p', 'ironmesh-folder-agent', '-p', 'ironmesh-background-launcher', '-p', 'ironmesh-config-app', '--release')
 
 $releaseDir = Join-Path $cargoTargetDir 'release'
 $dllPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'windows_thumbnail_provider.dll' -FallbackPatterns @('windows_thumbnail_provider-*.dll')
-$clientCliPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh.exe' -FallbackPatterns @('ironmesh-*.exe')
-$exePath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-os-integration.exe' -FallbackPatterns @('ironmesh_os_integration-*.exe', 'ironmesh-os-integration-*.exe')
-$folderAgentPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-folder-agent.exe' -FallbackPatterns @('ironmesh_folder_agent-*.exe', 'ironmesh-folder-agent-*.exe')
-$backgroundLauncherPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-background-launcher.exe' -FallbackPatterns @('ironmesh_background_launcher-*.exe', 'ironmesh-background-launcher-*.exe')
-$configAppPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-config-app.exe' -FallbackPatterns @('ironmesh_config_app-*.exe', 'ironmesh-config-app-*.exe')
+$clientCliPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep.exe' -FallbackPatterns @('berrykeep-*.exe')
+$exePath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-os-integration.exe' -FallbackPatterns @('berrykeep_os_integration-*.exe', 'berrykeep-os-integration-*.exe')
+$folderAgentPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-folder-agent.exe' -FallbackPatterns @('berrykeep_folder_agent-*.exe', 'berrykeep-folder-agent-*.exe')
+$backgroundLauncherPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-background-launcher.exe' -FallbackPatterns @('berrykeep_background_launcher-*.exe', 'berrykeep-background-launcher-*.exe')
+$configAppPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-config-app.exe' -FallbackPatterns @('berrykeep_config_app-*.exe', 'berrykeep-config-app-*.exe')
 $pdbCandidates = @(
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'windows_thumbnail_provider.pdb' -FallbackPatterns @('windows_thumbnail_provider-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh.pdb' -FallbackPatterns @('ironmesh-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-os-integration.pdb' -FallbackPatterns @('ironmesh_os_integration-*.pdb', 'ironmesh-os-integration-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-folder-agent.pdb' -FallbackPatterns @('ironmesh_folder_agent-*.pdb', 'ironmesh-folder-agent-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-background-launcher.pdb' -FallbackPatterns @('ironmesh_background_launcher-*.pdb', 'ironmesh-background-launcher-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-config-app.pdb' -FallbackPatterns @('ironmesh_config_app-*.pdb', 'ironmesh-config-app-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep.pdb' -FallbackPatterns @('berrykeep-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-os-integration.pdb' -FallbackPatterns @('berrykeep_os_integration-*.pdb', 'berrykeep-os-integration-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-folder-agent.pdb' -FallbackPatterns @('berrykeep_folder_agent-*.pdb', 'berrykeep-folder-agent-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-background-launcher.pdb' -FallbackPatterns @('berrykeep_background_launcher-*.pdb', 'berrykeep-background-launcher-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-config-app.pdb' -FallbackPatterns @('berrykeep_config_app-*.pdb', 'berrykeep-config-app-*.pdb')
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 
 if (-not $dllPath -or -not (Test-Path -LiteralPath $dllPath)) {
@@ -404,11 +404,11 @@ if (-not $configAppPath -or -not (Test-Path -LiteralPath $configAppPath)) {
 Write-Step 'Staging Store package contents'
 Save-StagedManifest -SourcePath $manifestPath -DestinationPath (Join-Path $stagePath 'AppxManifest.xml') -Version $resolvedVersion
 Copy-Item $dllPath (Join-Path $stagePath 'windows_thumbnail_provider.dll')
-Copy-Item $clientCliPath (Join-Path $stagePath 'ironmesh.exe')
-Copy-Item $exePath (Join-Path $stagePath 'ironmesh-os-integration.exe')
-Copy-Item $folderAgentPath (Join-Path $stagePath 'ironmesh-folder-agent.exe')
-Copy-Item $backgroundLauncherPath (Join-Path $stagePath 'ironmesh-background-launcher.exe')
-Copy-Item $configAppPath (Join-Path $stagePath 'ironmesh-config-app.exe')
+Copy-Item $clientCliPath (Join-Path $stagePath 'berrykeep.exe')
+Copy-Item $exePath (Join-Path $stagePath 'berrykeep-os-integration.exe')
+Copy-Item $folderAgentPath (Join-Path $stagePath 'berrykeep-folder-agent.exe')
+Copy-Item $backgroundLauncherPath (Join-Path $stagePath 'berrykeep-background-launcher.exe')
+Copy-Item $configAppPath (Join-Path $stagePath 'berrykeep-config-app.exe')
 Copy-Item $assetsPath (Join-Path $stagePath 'Assets') -Recurse
 
 Write-Step 'Packing MSIX with MakeAppx.exe'

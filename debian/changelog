@@ -1,4 +1,4 @@
-ironmesh (1.1.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
+berrykeep (1.1.0-2~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add integrated private web service discovery, proxying, and progressive UI
     across desktop and mobile clients.
@@ -9,6 +9,10 @@ ironmesh (1.1.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
   * Strengthen mobile sync recovery, server-node setup and distribution, and
     production client routing.
   * Roll the workspace release to 1.1.0.
+  * Rename release binaries and Debian packages to BerryKeep, with
+    transitional Ironmesh packages for existing installations.
+  * Raise the Debian revision so deployed Ironmesh packages receive the
+    transition on their next normal apt upgrade.
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 29 Aug 2026 16:10:03 +0200
 

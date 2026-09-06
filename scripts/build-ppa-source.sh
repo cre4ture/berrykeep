@@ -55,7 +55,10 @@ clean_debian_build_outputs() {
     "${ROOT_DIR}/debian/tmp" \
     "${ROOT_DIR}/debian/ironmesh-client" \
     "${ROOT_DIR}/debian/ironmesh-rendezvous-service" \
-    "${ROOT_DIR}/debian/ironmesh-server-node"
+    "${ROOT_DIR}/debian/ironmesh-server-node" \
+    "${ROOT_DIR}/debian/berrykeep-client" \
+    "${ROOT_DIR}/debian/berrykeep-rendezvous-service" \
+    "${ROOT_DIR}/debian/berrykeep-server-node"
   rm -f \
     "${ROOT_DIR}/debian/debhelper-build-stamp" \
     "${ROOT_DIR}/debian/files" \

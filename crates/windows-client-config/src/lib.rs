@@ -7,14 +7,14 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CONFIG_APP_EXE: &str = if cfg!(windows) {
-    "ironmesh-config-app.exe"
+    "berrykeep-config-app.exe"
 } else {
-    "ironmesh-config-app"
+    "berrykeep-config-app"
 };
 pub const BACKGROUND_LAUNCHER_EXE: &str = if cfg!(windows) {
-    "ironmesh-background-launcher.exe"
+    "berrykeep-background-launcher.exe"
 } else {
-    "ironmesh-background-launcher"
+    "berrykeep-background-launcher"
 };
 pub const OS_INTEGRATION_EXE: &str = if cfg!(windows) {
     "os-integration.exe"
@@ -22,9 +22,9 @@ pub const OS_INTEGRATION_EXE: &str = if cfg!(windows) {
     "os-integration"
 };
 pub const FOLDER_AGENT_EXE: &str = if cfg!(windows) {
-    "ironmesh-folder-agent.exe"
+    "berrykeep-folder-agent.exe"
 } else {
-    "ironmesh-folder-agent"
+    "berrykeep-folder-agent"
 };
 pub const STARTUP_TASK_ID: &str = "IronmeshBackgroundLauncher";
 pub const PLATFORM_KIND: &str = env::consts::OS;
@@ -843,7 +843,7 @@ mod tests {
                 instance_kind: "folder-agent".to_string(),
                 id: "folder-1".to_string(),
                 label: "Folder".to_string(),
-                executable: "C:/Ironmesh/ironmesh-folder-agent.exe".to_string(),
+                executable: "C:/BerryKeep/berrykeep-folder-agent.exe".to_string(),
                 command_line: vec!["--root-dir".to_string(), "C:/Data".to_string()],
                 pid: Some(42),
                 error: None,

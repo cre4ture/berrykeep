@@ -105,7 +105,7 @@ async fn start_folder_agent(
     local_scan_interval_ms: u64,
     no_watch_local: bool,
 ) -> Result<ChildGuard> {
-    let agent_bin = binary_path("ironmesh-folder-agent")?;
+    let agent_bin = binary_path("berrykeep-folder-agent")?;
     let resource_guards = lock_test_resources([
         "folder-agent-process".to_string(),
         path_resource_key(root_dir),
@@ -134,14 +134,14 @@ async fn start_folder_agent(
 
     let mut child = command
         .spawn()
-        .context("failed to spawn ironmesh-folder-agent")?;
+        .context("failed to spawn berrykeep-folder-agent")?;
 
     sleep(Duration::from_millis(300)).await;
     if let Some(status) = child
         .try_wait()
         .context("failed to query folder-agent process state")?
     {
-        bail!("ironmesh-folder-agent exited early with status {status}");
+        bail!("berrykeep-folder-agent exited early with status {status}");
     }
 
     Ok(ChildGuard::with_resources(child, resource_guards))
@@ -156,7 +156,7 @@ async fn spawn_folder_agent_no_wait(
     extra_env: &[(&str, &str)],
     no_watch_local: bool,
 ) -> Result<ChildGuard> {
-    let agent_bin = binary_path("ironmesh-folder-agent")?;
+    let agent_bin = binary_path("berrykeep-folder-agent")?;
     let resource_guards = lock_test_resources([
         "folder-agent-process".to_string(),
         path_resource_key(root_dir),
@@ -189,7 +189,7 @@ async fn spawn_folder_agent_no_wait(
 
     let child = command
         .spawn()
-        .context("failed to spawn ironmesh-folder-agent")?;
+        .context("failed to spawn berrykeep-folder-agent")?;
 
     Ok(ChildGuard::with_resources(child, resource_guards))
 }
@@ -202,7 +202,7 @@ async fn run_folder_agent_once(
     local_scan_interval_ms: u64,
     no_watch_local: bool,
 ) -> Result<()> {
-    let agent_bin = binary_path("ironmesh-folder-agent")?;
+    let agent_bin = binary_path("berrykeep-folder-agent")?;
     let _resource_guards = lock_test_resources([
         "folder-agent-process".to_string(),
         path_resource_key(root_dir),
@@ -2190,7 +2190,7 @@ async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result
         )
         .await?;
 
-        let agent_bin = binary_path("ironmesh-folder-agent")?;
+        let agent_bin = binary_path("berrykeep-folder-agent")?;
         let mut crash_run = Command::new(agent_bin);
         crash_run
             .arg("--run-once")
@@ -2475,7 +2475,7 @@ async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Re
         let conflict_dir = local_root.join(".ironmesh-conflicts/remote/conflict-copy");
 
         // Deterministic crash injection: abort right after creating the conflict temp file.
-        let agent_bin = binary_path("ironmesh-folder-agent")?;
+        let agent_bin = binary_path("berrykeep-folder-agent")?;
         let mut crash_run = Command::new(agent_bin);
         crash_run
             .arg("--run-once")

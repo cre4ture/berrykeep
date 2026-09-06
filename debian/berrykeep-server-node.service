@@ -1,0 +1,19 @@
+[Unit]
+Description=BerryKeep server node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=berrykeep-server-node
+Group=berrykeep-server-node
+EnvironmentFile=-/etc/berrykeep/server-node.env
+StateDirectory=berrykeep-server-node
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/berrykeep-server-node
+ExecStart=/usr/bin/berrykeep-server-node
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

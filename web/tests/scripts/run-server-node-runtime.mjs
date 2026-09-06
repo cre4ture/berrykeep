@@ -9,7 +9,7 @@ const binaryPath = resolve(
   repoRoot,
   "target",
   "debug",
-  process.platform === "win32" ? "ironmesh-server-node.exe" : "ironmesh-server-node"
+  process.platform === "win32" ? "berrykeep-server-node.exe" : "berrykeep-server-node"
 );
 const publicOrigin = "https://127.0.0.1:18181";
 const runtimeAdminPassword = "playwright-runtime-password";

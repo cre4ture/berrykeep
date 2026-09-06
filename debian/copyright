@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: ironmesh
+Upstream-Name: BerryKeep
 Upstream-Contact: Ulrich Hornung <hornunguli@gmx.de>
-Source: https://github.com/cre4ture/ironmesh
+Source: https://github.com/cre4ture/berrykeep
 
 Files: *
 Copyright: 2026 Ulrich Hornung <hornunguli@gmx.de>

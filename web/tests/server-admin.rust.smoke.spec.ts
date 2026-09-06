@@ -124,7 +124,7 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
   await expect(page.locator("pre").filter({ hasText: "rendezvous.example:9443" }).first()).toBeVisible();
   await expect(page.getByText("Export rendezvous-only failover package")).toBeVisible();
-  await expect(page.getByText("Dedicated standalone ironmesh-rendezvous-service")).toBeVisible();
+  await expect(page.getByText("Dedicated standalone berrykeep-rendezvous-service")).toBeVisible();
 
   await expect(page.getByLabel("Primary navigation").getByText("Setup", { exact: true })).toHaveCount(0);
 });

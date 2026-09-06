@@ -1,4 +1,4 @@
-Source: ironmesh
+Source: berrykeep
 Section: utils
 Priority: optional
 Maintainer: Ulrich Hornung <hornunguli@gmx.de>
@@ -13,31 +13,35 @@ Build-Depends:
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 
-Package: ironmesh-server-node
+Package: berrykeep-server-node
 Section: net
 Architecture: any
 Depends:
  ${misc:Depends},
  ${shlibs:Depends}
-Description: Ironmesh storage server node
- Ironmesh server node for the distributed storage platform workspace.
- This package ships the `ironmesh-server-node` service binary with the embedded
+Description: BerryKeep storage server node
+ BerryKeep server node for the distributed storage platform workspace.
+ This package ships the `berrykeep-server-node` service binary with the embedded
  server-admin web UI.
+Breaks: ironmesh-server-node (<< ${binary:Version})
+Replaces: ironmesh-server-node (<< ${binary:Version})
 
-Package: ironmesh-server-node-map-tools
+Package: berrykeep-server-node-map-tools
 Section: net
 Architecture: any
 Build-Profiles: <!server-node-only>
 Depends:
  ${misc:Depends},
- ironmesh-server-node (>= ${source:Upstream-Version}),
+ berrykeep-server-node (>= ${source:Upstream-Version}),
  gdal-bin,
  unzip
-Description: Optional Natural Earth import tools for Ironmesh server nodes
+Description: Optional Natural Earth import tools for BerryKeep server nodes
  Installs the GDAL command-line tools and unzip utility used by the optional
- Natural Earth map import workflows in ironmesh-server-node.
+ Natural Earth map import workflows in berrykeep-server-node.
+Breaks: ironmesh-server-node-map-tools (<< ${binary:Version})
+Replaces: ironmesh-server-node-map-tools (<< ${binary:Version})
 
-Package: ironmesh-client
+Package: berrykeep-client
 Section: utils
 Architecture: any
 Build-Profiles: <!server-node-only>
@@ -45,19 +49,64 @@ Depends:
  ${misc:Depends},
  ${shlibs:Depends},
  fuse3
-Description: Ironmesh client CLI and desktop helper applications
- This package ships the public `ironmesh` CLI together with the packaged client
+Description: BerryKeep client CLI and desktop helper applications
+ This package ships the public `berrykeep` CLI together with the packaged client
  applications used for desktop workflows:
- `ironmesh-config-app`, `ironmesh-folder-agent`, `ironmesh-os-integration`,
- and the internal `ironmesh-background-launcher` helper.
+ `berrykeep-config-app`, `berrykeep-folder-agent`, `berrykeep-os-integration`,
+ and the internal `berrykeep-background-launcher` helper.
+Breaks: ironmesh-client (<< ${binary:Version})
+Replaces: ironmesh-client (<< ${binary:Version})
 
-Package: ironmesh-rendezvous-service
+Package: berrykeep-rendezvous-service
 Section: net
 Architecture: any
 Build-Profiles: <!server-node-only>
 Depends:
  ${misc:Depends},
  ${shlibs:Depends}
-Description: Ironmesh standalone rendezvous and relay service
- Ironmesh standalone rendezvous service for advanced deployments where the
+Description: BerryKeep standalone rendezvous and relay service
+ BerryKeep standalone rendezvous service for advanced deployments where the
  public connectivity service is run separately from the storage nodes.
+Breaks: ironmesh-rendezvous-service (<< ${binary:Version})
+Replaces: ironmesh-rendezvous-service (<< ${binary:Version})
+
+Package: ironmesh-server-node
+Section: oldlibs
+Priority: optional
+Architecture: all
+Depends: berrykeep-server-node (= ${binary:Version})
+Description: Transitional package for BerryKeep server node
+ This package keeps existing Ironmesh server-node installations upgrading to
+ the renamed BerryKeep package. It retains the legacy systemd service and
+ configuration paths during the compatibility window.
+
+Package: ironmesh-server-node-map-tools
+Section: oldlibs
+Priority: optional
+Architecture: all
+Build-Profiles: <!server-node-only>
+Depends: berrykeep-server-node-map-tools (= ${binary:Version})
+Description: Transitional package for BerryKeep server-node map tools
+ This package keeps existing Ironmesh map-tools installations upgrading to the
+ renamed BerryKeep package during the compatibility window.
+
+Package: ironmesh-client
+Section: oldlibs
+Priority: optional
+Architecture: all
+Build-Profiles: <!server-node-only>
+Depends: berrykeep-client (= ${binary:Version})
+Description: Transitional package for BerryKeep client applications
+ This package keeps existing Ironmesh client installations upgrading to the
+ renamed BerryKeep package during the compatibility window.
+
+Package: ironmesh-rendezvous-service
+Section: oldlibs
+Priority: optional
+Architecture: all
+Build-Profiles: <!server-node-only>
+Depends: berrykeep-rendezvous-service (= ${binary:Version})
+Description: Transitional package for BerryKeep rendezvous service
+ This package keeps existing Ironmesh rendezvous installations upgrading to
+ the renamed BerryKeep package. It retains the legacy systemd service and
+ configuration paths during the compatibility window.

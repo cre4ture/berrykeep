@@ -5,13 +5,13 @@ Server Node. It is intentionally separate from the Store/MSIX desktop-client
 package: a storage node must start at boot and continue running without a
 signed-in desktop user.
 
-The MSI installs `ironmesh-server-node.exe` as the `BerryKeepServerNode`
-Windows service. The legacy executable name remains part of the compatibility
-contract while the product name is BerryKeep.
+The MSI installs `berrykeep-server-node.exe` as the `BerryKeepServerNode`
+Windows service. The stable service identity and data root preserve existing
+Windows deployments during the executable-name transition.
 
 ## What the MSI manages
 
-- `C:\Program Files\BerryKeep\Server Node\ironmesh-server-node.exe`
+- `C:\Program Files\BerryKeep\Server Node\berrykeep-server-node.exe`
 - an automatic `NT AUTHORITY\LocalService` Windows service named
   `BerryKeepServerNode`
 - service recovery: restart after each of the first three failures, after five

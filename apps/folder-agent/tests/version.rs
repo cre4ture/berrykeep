@@ -16,16 +16,16 @@ fn expected_version_outputs(binary_name: &str) -> [String; 2] {
 
 #[test]
 fn version_reports_package_version() {
-    let output = Command::cargo_bin("ironmesh-folder-agent")
-        .expect("ironmesh-folder-agent binary should build")
+    let output = Command::cargo_bin("berrykeep-folder-agent")
+        .expect("berrykeep-folder-agent binary should build")
         .arg("--version")
         .output()
-        .expect("ironmesh-folder-agent --version should run");
+        .expect("berrykeep-folder-agent --version should run");
 
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("version output should be valid UTF-8");
-    let expected = expected_version_outputs("ironmesh-folder-agent");
+    let expected = expected_version_outputs("berrykeep-folder-agent");
     assert!(
         expected.iter().any(|candidate| candidate == &stdout),
         "unexpected stdout: {stdout}"

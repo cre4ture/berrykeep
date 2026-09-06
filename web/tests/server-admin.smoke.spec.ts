@@ -435,7 +435,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Save cluster contact list" }).click();
   await expect(page.locator("pre").filter({ hasText: "home-router.example:19080" }).first()).toBeVisible();
 
-  await page.getByLabel("Standalone ironmesh-rendezvous-service").click();
+  await page.getByLabel("Standalone berrykeep-rendezvous-service").click();
   await expect(page.getByRole("textbox", { name: "Target node ID" })).toHaveCount(1);
   await expect(page.getByText("No target node ID is needed for the standalone service package.")).toBeVisible();
   await expect(page.getByText(/Encrypts the exported JSON, including the service TLS private key/)).toBeVisible();

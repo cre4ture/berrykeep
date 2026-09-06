@@ -34,7 +34,7 @@ Notes:
 Examples:
   scripts/use-local-ironmesh.sh
   scripts/use-local-ironmesh.sh --profile debug
-  scripts/use-local-ironmesh.sh --local-binary /home/me/rust-dev/ironmesh/target/release/ironmesh
+  scripts/use-local-ironmesh.sh --local-binary /home/me/rust-dev/ironmesh/target/release/berrykeep
 EOF
 }
 
@@ -96,9 +96,9 @@ resolve_local_binary() {
     return
   fi
 
-  LOCAL_BINARY="${ROOT_DIR}/target/${PROFILE}/ironmesh"
+  LOCAL_BINARY="${ROOT_DIR}/target/${PROFILE}/berrykeep"
   if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    log "building local ironmesh binary with cargo profile=${PROFILE}"
+    log "building local berrykeep binary with cargo profile=${PROFILE}"
     cargo build --locked -p cli-client "--profile=${PROFILE}" --manifest-path "${ROOT_DIR}/Cargo.toml"
   fi
 
@@ -132,7 +132,7 @@ install_local_symlink() {
 print_result() {
   local resolved_target
   resolved_target="$(readlink -f "$PACKAGED_BINARY")"
-  log "active ironmesh target: ${resolved_target}"
+  log "active berrykeep target: ${resolved_target}"
   log "package symlink at /usr/bin/ironmesh remains unchanged"
   log "revert with: scripts/restore-packaged-ironmesh.sh"
 }

@@ -27,7 +27,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 );
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Parser)]
-#[command(name = "ironmesh-rendezvous-service")]
+#[command(name = "berrykeep-rendezvous-service")]
 #[command(about = "Standalone BerryKeep rendezvous plus relay service")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
@@ -922,7 +922,7 @@ mod tests {
     #[test]
     fn cli_config_parses_failover_args() {
         let cli = RendezvousServiceCliConfig::try_parse_from([
-            "ironmesh-rendezvous-service",
+            "berrykeep-rendezvous-service",
             "--bind-addr=0.0.0.0:44042",
             "--failover-package",
             "/tmp/failover.json",
@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn cli_config_rejects_failover_passphrase_flag() {
         let err = RendezvousServiceCliConfig::try_parse_from([
-            "ironmesh-rendezvous-service",
+            "berrykeep-rendezvous-service",
             "--failover-passphrase=super-secret",
         ])
         .expect_err("failover passphrase should not be a CLI flag");

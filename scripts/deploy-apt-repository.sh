@@ -20,7 +20,7 @@ log() {
 
 usage() {
   cat <<'EOF'
-Deploy generated Ironmesh apt repository updates to a static web directory.
+Deploy generated BerryKeep apt repository updates to a static web directory.
 
 Usage:
   ./scripts/deploy-apt-repository.sh [options]
@@ -106,7 +106,7 @@ verify_signed_release() {
   verification_keyring="${verification_home}/keyring.gpg"
   chmod 700 "${verification_home}"
   if ! gpg --batch --homedir "${verification_home}" --import \
-    "${REPO_DIR}/ironmesh-archive-keyring.asc" >/dev/null 2>&1 || \
+    "${REPO_DIR}/berrykeep-archive-keyring.asc" >/dev/null 2>&1 || \
     ! gpg --batch --homedir "${verification_home}" --output "${verification_keyring}" \
       --export >/dev/null 2>&1; then
     rm -rf "${verification_home}"
@@ -290,9 +290,9 @@ if [[ ! -d "${REPO_DIR}/pool" ]]; then
   exit 1
 fi
 
-if [[ ! -s "${REPO_DIR}/ironmesh-archive-keyring.asc" ]]; then
+if [[ ! -s "${REPO_DIR}/berrykeep-archive-keyring.asc" ]]; then
   printf 'archive signing key not found: %s\n' \
-    "${REPO_DIR}/ironmesh-archive-keyring.asc" >&2
+    "${REPO_DIR}/berrykeep-archive-keyring.asc" >&2
   exit 1
 fi
 
@@ -370,7 +370,11 @@ rsync "${RSYNC_ADDITION_ARGS[@]}" \
   "${REPO_DIR%/}/pool/" \
   "${REMOTE}:${REMOTE_DIR%/}/pool/"
 
-log "syncing archive signing key"
+log "syncing archive signing keys"
+rsync "${RSYNC_ADDITION_ARGS[@]}" \
+  --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+  "${REPO_DIR%/}/berrykeep-archive-keyring.asc" \
+  "${REMOTE}:${REMOTE_DIR%/}/berrykeep-archive-keyring.asc"
 rsync "${RSYNC_ADDITION_ARGS[@]}" \
   --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
   "${REPO_DIR%/}/ironmesh-archive-keyring.asc" \
@@ -387,16 +391,18 @@ done
 # Server-node-only publication prunes superseded files from a suite-scoped
 # pool. Apply this deletion only after the signed metadata no longer references
 # those files: a metadata-sync failure then leaves harmless extra files instead
-# of a published index with a missing package. The scope deliberately excludes
-# other suites and the legacy shared pool.
+# of a published index with a missing package. Each source package namespace is
+# pruned separately, so the transitional Ironmesh packages remain available.
 for suite in "${SUITES[@]}"; do
-  suite_pool_dir="${REPO_DIR}/pool/${COMPONENT}/i/ironmesh/${suite}"
-  [[ -d "${suite_pool_dir}" ]] || continue
-  log "pruning ${suite} package pool"
-  rsync "${RSYNC_ARGS[@]}" \
-    --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-    "${suite_pool_dir%/}/" \
-    "${REMOTE}:${REMOTE_DIR%/}/pool/${COMPONENT}/i/ironmesh/${suite}/"
+  for package_namespace in b/berrykeep i/ironmesh; do
+    suite_pool_dir="${REPO_DIR}/pool/${COMPONENT}/${package_namespace}/${suite}"
+    [[ -d "${suite_pool_dir}" ]] || continue
+    log "pruning ${suite} ${package_namespace} package pool"
+    rsync "${RSYNC_ARGS[@]}" \
+      --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+      "${suite_pool_dir%/}/" \
+      "${REMOTE}:${REMOTE_DIR%/}/pool/${COMPONENT}/${package_namespace}/${suite}/"
+  done
 done
 
 if [[ "${DRY_RUN}" == true ]]; then

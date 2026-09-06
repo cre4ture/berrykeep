@@ -67,11 +67,13 @@ if [[ ! -e "${CONFIG_PATH}" ]]; then
 fi
 
 chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}"
-chown root:wheel "${SERVICE_ROOT}/bin/ironmesh-server-node" \
+chown root:wheel "${SERVICE_ROOT}/bin/berrykeep-server-node" \
+  "${SERVICE_ROOT}/bin/ironmesh-server-node" \
   "${SERVICE_ROOT}/bin/ironmesh-server-node-launcher" \
   "${CONFIG_TEMPLATE_PATH}" \
   "${PLIST_PATH}"
-chmod 0755 "${SERVICE_ROOT}/bin/ironmesh-server-node" \
+chmod 0755 "${SERVICE_ROOT}/bin/berrykeep-server-node" \
+  "${SERVICE_ROOT}/bin/ironmesh-server-node" \
   "${SERVICE_ROOT}/bin/ironmesh-server-node-launcher"
 chmod 0644 "${CONFIG_TEMPLATE_PATH}" "${PLIST_PATH}"
 chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_PATH}"

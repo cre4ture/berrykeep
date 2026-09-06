@@ -1,0 +1,16 @@
+[Unit]
+Description=BerryKeep rendezvous service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/berrykeep/rendezvous-service.env
+StateDirectory=berrykeep-rendezvous-service
+WorkingDirectory=/var/lib/berrykeep-rendezvous-service
+ExecStart=/usr/bin/berrykeep-rendezvous-service
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -2,14 +2,14 @@
 set -euo pipefail
 
 PACKAGE_ROOT="/usr/lib/ironmesh-client"
-PACKAGED_BINARY="${PACKAGE_ROOT}/ironmesh"
-PACKAGED_BACKUP="${PACKAGE_ROOT}/ironmesh.packaged-deb"
+PACKAGED_BINARY="${PACKAGE_ROOT}/berrykeep"
+PACKAGED_BACKUP="${PACKAGE_ROOT}/berrykeep.packaged-deb"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/restore-packaged-ironmesh.sh
 
-Restore the packaged `ironmesh` client binary after testing a local build.
+Restore the packaged `berrykeep` client binary after testing a local build.
 EOF
 }
 
@@ -54,7 +54,7 @@ main() {
 
   log "restoring packaged binary from ${PACKAGED_BACKUP}"
   sudo mv "$PACKAGED_BACKUP" "$PACKAGED_BINARY"
-  log "active ironmesh target: $(readlink -f "$PACKAGED_BINARY")"
+  log "active berrykeep target: $(readlink -f "$PACKAGED_BINARY")"
 }
 
 main "$@"

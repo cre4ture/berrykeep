@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 build = "build.rs"
-default-run = "ironmesh-server-node"
+default-run = "berrykeep-server-node"
 autobins = false
 
 [features]
@@ -13,7 +13,7 @@ default = ["turso-metadata"]
 turso-metadata = ["server-node-sdk/turso-metadata"]
 
 [[bin]]
-name = "ironmesh-server-node"
+name = "berrykeep-server-node"
 path = "src/main.rs"
 
 [dependencies]
