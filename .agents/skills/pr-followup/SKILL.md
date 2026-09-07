@@ -17,8 +17,8 @@ Read [references/ironmesh-pr-facts.md](references/ironmesh-pr-facts.md) before t
    Let the watcher own polling. While it runs, do not issue parallel GitHub/`gh` status queries or periodic terminal reads. Use `--help` for the full CLI. Common options are `--repo [HOST/]OWNER/REPO`, `--timeout <duration>` (default `20m`; bare numbers mean minutes), `--no-timeout`, repeatable `--ignore-check <glob>`, `--ignore-existing-failures`, and `--state-file <path>`.
 3. Treat its exit code as control flow:
    - `1`: investigate the failed CI check, fix and push, then restart the watcher.
-   - `2`: address new review feedback; if it is ambiguous, conflicting, or changes product direction, ask the user.
-   - `3`: update from the target branch, resolve conflicts, push, then restart the watcher.
+   - `2`: triage every event in the reported batch and verify that no actionable unresolved thread was missed before addressing the feedback; ask the user only if it is ambiguous, conflicting, or changes product direction.
+   - `3`: merge the target branch into the PR branch, resolve conflicts, push, then restart the watcher. A merge is sufficient; rebase only when explicitly requested.
    - `0`: no actionable event occurred before the timeout; decide whether to rerun or hand over.
    - `4`: the PR was closed or merged; stop.
    - `64` / `70`: fix configuration or local tooling, then rerun.

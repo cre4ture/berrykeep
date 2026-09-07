@@ -151,8 +151,8 @@ fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
 }
 
 use super::storage::{
-    DataScrubRunTestHook, PersistentStore, PutOptions, S3ObjectVersionRecord, StoragePathConfig,
-    StoragePathState, StoragePoolConfig, VersionConsistencyState,
+    DataScrubRunTestHook, ObjectReadMode, PersistentStore, PutOptions, S3ObjectVersionRecord,
+    StoragePathConfig, StoragePathState, StoragePoolConfig, VersionConsistencyState,
 };
 use axum::Router;
 use axum::body::Body;
@@ -500,6 +500,422 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn sample_jpeg_with_incomplete_exif_gps() -> Vec<u8> {
+    let image = image::RgbImage::new(4, 3);
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .encode_image(&image)
+        .expect("test JPEG should encode");
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+
+    // A valid GPS IFD with a latitude but no longitude. The image is readable,
+    // but its coordinate is intentionally incomplete and must not be shadowed
+    // by a proposed sidecar location.
+    let gps_ifd_offset = 26u32;
+    let latitude_offset = 56u32;
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"MM");
+    tiff.extend_from_slice(&42u16.to_be_bytes());
+    tiff.extend_from_slice(&8u32.to_be_bytes());
+    tiff.extend_from_slice(&1u16.to_be_bytes());
+    tiff.extend_from_slice(&0x8825u16.to_be_bytes());
+    tiff.extend_from_slice(&4u16.to_be_bytes());
+    tiff.extend_from_slice(&1u32.to_be_bytes());
+    tiff.extend_from_slice(&gps_ifd_offset.to_be_bytes());
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    tiff.extend_from_slice(&2u16.to_be_bytes());
+    tiff.extend_from_slice(&1u16.to_be_bytes());
+    tiff.extend_from_slice(&2u16.to_be_bytes());
+    tiff.extend_from_slice(&2u32.to_be_bytes());
+    tiff.extend_from_slice(&[b'N', 0, 0, 0]);
+    tiff.extend_from_slice(&2u16.to_be_bytes());
+    tiff.extend_from_slice(&5u16.to_be_bytes());
+    tiff.extend_from_slice(&3u32.to_be_bytes());
+    tiff.extend_from_slice(&latitude_offset.to_be_bytes());
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    for (numerator, denominator) in [(47u32, 1u32), (22, 1), (37, 1)] {
+        tiff.extend_from_slice(&numerator.to_be_bytes());
+        tiff.extend_from_slice(&denominator.to_be_bytes());
+    }
+    assert_eq!(tiff.len(), 80);
+
+    let mut payload = b"Exif\0\0".to_vec();
+    payload.extend_from_slice(&tiff);
+    let mut app1 = vec![0xff, 0xe1];
+    app1.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    app1.extend_from_slice(&payload);
+
+    let mut encoded = Vec::with_capacity(jpeg.len() + app1.len());
+    encoded.extend_from_slice(&jpeg[..2]);
+    encoded.extend_from_slice(&app1);
+    encoded.extend_from_slice(&jpeg[2..]);
+    encoded
+}
+
+async fn run_selected_geo_apply_for_test(
+    state: &ServerState,
+    run_id: &str,
+    analysis_run_id: &str,
+    proposal_id: &str,
+) -> String {
+    let now = super::unix_ts();
+    super::operations::run_geo_apply_for_test(
+        state.clone(),
+        super::operations::OperationRun {
+            run_id: run_id.to_string(),
+            operation_id: super::operations::GEOLOCATION_APPLY_OPERATION_ID.to_string(),
+            status: super::operations::OperationRunStatus::Queued,
+            priority: super::operations::OperationPriority::Background,
+            created_at_unix: now,
+            started_at_unix: None,
+            finished_at_unix: None,
+            progress: super::operations::OperationProgress::default(),
+            input: serde_json::json!({}),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        },
+        analysis_run_id,
+        proposal_id,
+    )
+    .await;
+
+    let store = read_store(state, "test.geo_apply.outcome").await;
+    let chunks = store
+        .list_operation_result_chunks(run_id, None, 0)
+        .await
+        .expect("apply result chunks should load");
+    let run = store
+        .load_operation_run(run_id)
+        .await
+        .expect("apply run should load");
+    assert_eq!(chunks.len(), 1, "apply run={run:#?}");
+    chunks[0].payload["status"]
+        .as_str()
+        .expect("apply result status should be serialized")
+        .to_string()
+}
+
+async fn persist_test_geo_proposal(
+    state: &ServerState,
+    analysis_run_id: &str,
+    proposal: super::operations::GeoProposal,
+) {
+    let now = super::unix_ts();
+    let chunk_id = format!("{analysis_run_id}-proposal-chunk");
+    let store = read_store(state, "test.geo_apply.persist_analysis").await;
+    store
+        .persist_operation_run(&super::operations::OperationRun {
+            run_id: analysis_run_id.to_string(),
+            operation_id: super::operations::GEOLOCATION_PROPOSE_OPERATION_ID.to_string(),
+            status: super::operations::OperationRunStatus::Completed,
+            priority: super::operations::OperationPriority::Background,
+            created_at_unix: now,
+            started_at_unix: Some(now),
+            finished_at_unix: Some(now),
+            progress: super::operations::OperationProgress::default(),
+            input: serde_json::json!({}),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        })
+        .await
+        .expect("analysis run should persist");
+    store
+        .persist_operation_result_chunk(&super::operations::OperationResultChunk {
+            run_id: analysis_run_id.to_string(),
+            chunk_id: chunk_id.clone(),
+            result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+            created_at_unix: now,
+            payload: serde_json::to_value(super::operations::GeoProposalChunk {
+                id: chunk_id,
+                analysis_run_id: analysis_run_id.to_string(),
+                folder: "album".to_string(),
+                time_range_start: proposal.capture_time,
+                time_range_end: proposal.capture_time,
+                item_count: 1,
+                proposal_count: 1,
+                proposal_page: 0,
+                proposal_page_count: 1,
+                status: super::operations::GeoProposalChunkStatus::Ready,
+                proposals: vec![proposal],
+            })
+            .expect("proposal chunk should serialize"),
+        })
+        .await
+        .expect("proposal chunk should persist");
+}
+
+async fn geolocation_apply_revalidates_stale_and_already_geotagged_media_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let media_path = "album/IMG_20240102_030405.png";
+    let (manifest_hash, object_id, metadata) = {
+        let mut store = lock_store(&state, "test.geo_apply.seed_media").await;
+        let put = store
+            .put_object_versioned(
+                media_path,
+                Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("test media should persist");
+        let metadata = store
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .expect("test media metadata should load")
+            .expect("PNG should be recognized as media");
+        let object_id = store
+            .store_index_inspector()
+            .await
+            .expect("store index should load")
+            .current_object_ids()
+            .get(media_path)
+            .cloned()
+            .expect("test media should have an object id");
+        (put.manifest_hash, object_id, metadata)
+    };
+    let capture_time =
+        super::operations::capture_time_for_geolocation_for_test(media_path, &metadata)
+            .expect("the filename should supply a floating capture time");
+    let analysis_run_id = "analysis-run";
+    let proposal_id = "proposal-1";
+    let proposal = super::operations::GeoProposal {
+        id: proposal_id.to_string(),
+        media_path: media_path.to_string(),
+        object_id,
+        manifest_hash,
+        content_fingerprint: metadata.content_fingerprint.clone(),
+        capture_time,
+        proposed: super::operations::GeoCoordinate {
+            latitude: 47.3769,
+            longitude: 8.5417,
+        },
+        method: super::operations::GeoInferenceMethod::NearestAnchor,
+        previous_anchor: None,
+        next_anchor: None,
+        estimated_anchor_speed_kmh: None,
+        warnings: Vec::new(),
+    };
+    persist_test_geo_proposal(&state, analysis_run_id, proposal).await;
+
+    assert_eq!(
+        run_selected_geo_apply_for_test(&state, "apply-first", analysis_run_id, proposal_id).await,
+        "applied"
+    );
+    let store = read_store(&state, "test.geo_apply.data_change_actor").await;
+    let sidecar = store
+        .get_object(
+            &format!("{media_path}.xmp"),
+            None,
+            None,
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .expect("the applied sidecar should be readable");
+    let sidecar = std::str::from_utf8(&sidecar).expect("XMP sidecar should be UTF-8");
+    for field in [
+        "exif:DateTimeOriginal=\"2024-01-02T03:04:05\"",
+        "xmp:CreateDate=\"2024-01-02T03:04:05\"",
+        "photoshop:DateCreated=\"2024-01-02T03:04:05\"",
+        "berrykeep:GeoInferenceCaptureTimeSource=\"filename\"",
+    ] {
+        assert!(
+            sidecar.contains(field),
+            "applied sidecar is missing {field:?}"
+        );
+    }
+    let event = store
+        .list_data_change_events(&super::storage::DataChangeEventQuery::default())
+        .await
+        .expect("data-change events should load")
+        .into_iter()
+        .find(|event| event.path == format!("{media_path}.xmp"))
+        .expect("the applied sidecar must have a data-change event");
+    assert_eq!(event.actor_kind, super::storage::DataChangeActorKind::Admin);
+    assert_eq!(event.actor_id.as_deref(), Some("test-admin"));
+    assert_eq!(event.actor_source_node.as_deref(), Some("test-node"));
+    drop(store);
+    assert_eq!(
+        run_selected_geo_apply_for_test(&state, "apply-already-gps", analysis_run_id, proposal_id)
+            .await,
+        "already-has-gps"
+    );
+
+    let mut changed_pixels = image::RgbaImage::new(5, 3);
+    changed_pixels.put_pixel(0, 0, image::Rgba([12, 34, 56, 255]));
+    let mut changed_bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(changed_pixels)
+        .write_to(
+            &mut std::io::Cursor::new(&mut changed_bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("changed test PNG should encode");
+    {
+        let mut store = lock_store(&state, "test.geo_apply.change_media").await;
+        store
+            .put_object_versioned(
+                media_path,
+                Bytes::from(changed_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("changed media should persist");
+    }
+    assert_eq!(
+        run_selected_geo_apply_for_test(&state, "apply-stale", analysis_run_id, proposal_id).await,
+        "skipped-stale"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    geolocation_apply_revalidates_stale_and_already_geotagged_media_impl,
+    geolocation_apply_revalidates_stale_and_already_geotagged_media,
+    geolocation_apply_revalidates_stale_and_already_geotagged_media_turso
+);
+
+async fn geolocation_apply_does_not_shadow_unparseable_embedded_gps_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let media_path = "album/IMG_20240102_030405.jpg";
+    let (manifest_hash, object_id, metadata) = {
+        let mut store = lock_store(&state, "test.geo_apply.seed_unparseable_gps").await;
+        let put = store
+            .put_object_versioned(
+                media_path,
+                Bytes::from(sample_jpeg_with_incomplete_exif_gps()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("test media should persist");
+        let metadata = store
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .expect("test media metadata should load")
+            .expect("JPEG should be recognized as media");
+        let object_id = store
+            .store_index_inspector()
+            .await
+            .expect("store index should load")
+            .current_object_ids()
+            .get(media_path)
+            .cloned()
+            .expect("test media should have an object id");
+        (put.manifest_hash, object_id, metadata)
+    };
+    assert!(metadata.gps.is_none());
+    assert!(metadata.has_embedded_gps_properties);
+    let capture_time =
+        super::operations::capture_time_for_geolocation_for_test(media_path, &metadata)
+            .expect("the filename should supply a floating capture time");
+    let analysis_run_id = "analysis-run-unparseable-gps";
+    let proposal_id = "proposal-unparseable-gps";
+    persist_test_geo_proposal(
+        &state,
+        analysis_run_id,
+        super::operations::GeoProposal {
+            id: proposal_id.to_string(),
+            media_path: media_path.to_string(),
+            object_id,
+            manifest_hash,
+            content_fingerprint: metadata.content_fingerprint.clone(),
+            capture_time,
+            proposed: super::operations::GeoCoordinate {
+                latitude: 47.3769,
+                longitude: 8.5417,
+            },
+            method: super::operations::GeoInferenceMethod::NearestAnchor,
+            previous_anchor: None,
+            next_anchor: None,
+            estimated_anchor_speed_kmh: None,
+            warnings: Vec::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        run_selected_geo_apply_for_test(
+            &state,
+            "apply-unparseable-gps",
+            analysis_run_id,
+            proposal_id,
+        )
+        .await,
+        "already-has-gps"
+    );
+    let store = read_store(&state, "test.geo_apply.verify_unparseable_gps_sidecar").await;
+    assert!(
+        !store
+            .media_sidecar_metadata_overlay(media_path)
+            .await
+            .expect("sidecar state should load")
+            .has_geo_location_properties,
+        "apply must not create a competing XMP sidecar location"
+    );
+    drop(store);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    geolocation_apply_does_not_shadow_unparseable_embedded_gps_impl,
+    geolocation_apply_does_not_shadow_unparseable_embedded_gps,
+    geolocation_apply_does_not_shadow_unparseable_embedded_gps_turso
+);
+
+#[tokio::test]
+async fn multimedia_operation_admission_reserves_one_slot_per_kind() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+
+    assert!(
+        super::operations::try_reserve_multimedia_slot(&state, "scan-first", true).await,
+        "the first scan is admitted"
+    );
+    assert!(
+        !super::operations::try_reserve_multimedia_slot(&state, "scan-second", true).await,
+        "a second scan is rejected instead of accumulating a durable queue"
+    );
+    assert!(
+        super::operations::try_reserve_multimedia_slot(&state, "apply-first", false).await,
+        "apply work uses its own serialized slot"
+    );
+
+    super::operations::release_multimedia_slot(&state, "scan-first", true).await;
+    assert!(
+        super::operations::try_reserve_multimedia_slot(&state, "scan-second", true).await,
+        "releasing the owning run admits the next scan"
+    );
+    // A stale completion must not release a newer owner's slot.
+    super::operations::release_multimedia_slot(&state, "scan-first", true).await;
+    assert!(!super::operations::try_reserve_multimedia_slot(&state, "scan-third", true).await);
+
+    super::operations::release_multimedia_slot(&state, "scan-second", true).await;
+    super::operations::release_multimedia_slot(&state, "apply-first", false).await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn geolocation_apply_requires_explicit_approval() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::operations::start_operation_run(
+        State(state.clone()),
+        headers,
+        Path(super::operations::GEOLOCATION_APPLY_OPERATION_ID.to_string()),
+        Json(serde_json::from_value(serde_json::json!({})).unwrap()),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    cleanup_test_state(&state).await;
+}
+
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()
@@ -576,7 +992,7 @@ case "$input" in
   http+unix://*|http://127.0.0.1:*) ;;
   *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
 esac
-printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264","codec_tag_string":"avc1","avg_frame_rate":"30000/1001","bit_rate":"4000000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.125","bit_rate":"4500000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}}'
+printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264","codec_tag_string":"avc1","avg_frame_rate":"30000/1001","bit_rate":"4000000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.125","bit_rate":"4500000","tags":{"creation_time":"2024-03-04T05:06:07Z","com.apple.quicktime.creationdate":"2024-03-04T06:06:07+0100"}}}'
 "#;
     std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
 
@@ -15679,6 +16095,160 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_images_turso
 );
 
+async fn generic_store_index_applies_current_xmp_gps_overlay_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/geotagged.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+        let write = locked
+            .set_media_geolocation(
+                "gallery/geotagged.png",
+                common::xmp::XmpGeoInference {
+                    latitude: 47.3769,
+                    longitude: 8.5417,
+                    method: "nearest-anchor".to_string(),
+                    run_id: "analysis-run".to_string(),
+                    confidence: "reference_distance=180s".to_string(),
+                    reference_distance_seconds: Some(180),
+                    previous_anchor_distance_seconds: None,
+                    next_anchor_distance_seconds: None,
+                    estimated_speed_kmh: None,
+                    approved_capture_time: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            write,
+            super::storage::MediaGeolocationWrite::Applied(_)
+        ));
+    }
+
+    let generic_query = super::StoreIndexQuery {
+        prefix: Some("gallery".to_string()),
+        depth: Some(2),
+        snapshot: None,
+        view: Some(super::StoreIndexView::Tree),
+        cursor: None,
+        page_size: None,
+        offset: Some(0),
+        // The sidecar is deliberately visible in a generic file listing. Do
+        // not let its (newer) modification timestamp decide whether this
+        // test sees the media entry.
+        limit: Some(2),
+        sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+        media_filter: None,
+        captured_from_unix: None,
+        captured_until_unix: None,
+        south: None,
+        west: None,
+        north: None,
+        east: None,
+        require_labels: None,
+        exclude_labels: None,
+    };
+    let cursor_query = super::StoreIndexQuery {
+        view: None,
+        cursor: None,
+        page_size: Some(2),
+        offset: None,
+        limit: None,
+        sort: None,
+        ..generic_query.clone()
+    };
+    fn media_entry(payload: &serde_json::Value) -> &serde_json::Value {
+        payload["entries"]
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry["path"] == "gallery/geotagged.png")
+            })
+            .expect("the generic listing should include the geotagged media")
+    }
+
+    let first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(generic_query.clone()),
+        )
+        .await,
+    );
+    assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+    let first_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let first_media = media_entry(&first_payload);
+    assert_eq!(first_media["media"]["gps"]["latitude"], 47.3769);
+    assert_eq!(first_media["media"]["gps"]["longitude"], 8.5417);
+
+    let cached_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(generic_query),
+        )
+        .await,
+    );
+    assert_eq!(cached_response.status(), axum::http::StatusCode::OK);
+    assert!(
+        cached_response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("store-index-page-cache;desc=hit")),
+        "the cached generic response must reload path-scoped XMP GPS"
+    );
+    let cached_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(cached_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let cached_media = media_entry(&cached_payload);
+    assert_eq!(cached_media["media"]["gps"]["latitude"], 47.3769);
+    assert_eq!(cached_media["media"]["gps"]["longitude"], 8.5417);
+
+    let cursor_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(cursor_query),
+        )
+        .await,
+    );
+    assert_eq!(cursor_response.status(), axum::http::StatusCode::OK);
+    let cursor_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(cursor_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let cursor_media = media_entry(&cursor_payload);
+    assert_eq!(cursor_media["media"]["gps"]["latitude"], 47.3769);
+    assert_eq!(cursor_media["media"]["gps"]["longitude"], 8.5417);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    generic_store_index_applies_current_xmp_gps_overlay_impl,
+    generic_store_index_applies_current_xmp_gps_overlay,
+    generic_store_index_applies_current_xmp_gps_overlay_turso
+);
+
 async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_impl(
     backend: MainTestBackend,
 ) {
@@ -19213,6 +19783,9 @@ async fn build_test_state(
             repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
             manual_repair_activity: Arc::new(Mutex::new(
                 super::ManualRepairActionActivityRuntime::default(),
+            )),
+            operations_activity: Arc::new(Mutex::new(
+                super::operations::OperationActivityRuntime::default(),
             )),
             autonomous_post_write_repair: Arc::new(Mutex::new(
                 super::AutonomousPostWriteRepairRuntime::default(),

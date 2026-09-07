@@ -55,7 +55,7 @@ tokio.workspace = true
 tokio-rusqlite = "0.6"
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["compat"] }
-time = { version = "0.3", features = ["parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 transport-sdk = { path = "../transport-sdk" }
 turso = { version = "0.6.0-pre.2", optional = true }
 tower = "0.5"
