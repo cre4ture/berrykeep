@@ -69,6 +69,28 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+#[test]
+fn measured_embedded_gps_overrides_a_berrykeep_inferred_sidecar() {
+    let embedded = MediaGpsCoordinates {
+        latitude: 47.3769,
+        longitude: 8.5417,
+    };
+    let inferred_sidecar = MediaGpsCoordinates {
+        latitude: 47.4,
+        longitude: 8.6,
+    };
+
+    let effective = effective_gallery_gps(Some(&embedded), Some(&inferred_sidecar), true)
+        .expect("one location is available");
+    assert!((effective.latitude - embedded.latitude).abs() < f64::EPSILON);
+    assert!((effective.longitude - embedded.longitude).abs() < f64::EPSILON);
+
+    let user_sidecar = effective_gallery_gps(Some(&embedded), Some(&inferred_sidecar), false)
+        .expect("one location is available");
+    assert!((user_sidecar.latitude - inferred_sidecar.latitude).abs() < f64::EPSILON);
+    assert!((user_sidecar.longitude - inferred_sidecar.longitude).abs() < f64::EPSILON);
+}
+
 fn sample_heic_bytes() -> Vec<u8> {
     let hex: String = include_str!("../testdata/test-exif-orientation.heic.hex")
         .chars()
@@ -267,6 +289,16 @@ fn sample_media_jpeg_with_gps_bytes() -> Vec<u8> {
         sample_media_jpeg_bytes(),
         b'N',
         [(37, 1), (48, 1), (30, 1)],
+        b'W',
+        [(122, 1), (24, 1), (15, 1)],
+    )
+}
+
+fn sample_media_jpeg_with_unparseable_gps_bytes() -> Vec<u8> {
+    jpeg_with_exif_gps(
+        sample_media_jpeg_bytes(),
+        b'N',
+        [(37, 1), (48, 1), (30, 0)],
         b'W',
         [(122, 1), (24, 1), (15, 1)],
     )
@@ -538,6 +570,10 @@ fn ffprobe_frame_rate_and_timestamp_values_are_normalized() {
         parse_ffprobe_timestamp("2024-03-04T05:06:07Z"),
         Some(1_709_528_767)
     );
+    assert_eq!(
+        parse_ffprobe_timestamp("2024-03-04T06:06:07+0100"),
+        Some(1_709_528_767)
+    );
     assert_eq!(parse_ffprobe_timestamp("invalid"), None);
 }
 
@@ -588,7 +624,7 @@ case "$input" in
   http+unix://*|http://127.0.0.1:*) ;;
   *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
 esac
-printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264","codec_tag_string":"avc1","avg_frame_rate":"30000/1001","bit_rate":"4000000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.125","bit_rate":"4500000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}}'
+printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264","codec_tag_string":"avc1","avg_frame_rate":"30000/1001","bit_rate":"4000000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.125","bit_rate":"4500000","tags":{"creation_time":"2024-03-04T05:06:07Z","com.apple.quicktime.creationdate":"2024-03-04T06:06:07+0100"}}}'
 "#;
     std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
 
@@ -829,6 +865,48 @@ impl StorageTestBackend {
                     )
                     .await
                     .expect("legacy Turso label projection should persist");
+            }
+        }
+    }
+
+    /// Simulates an instance that completed the older label-only sidecar
+    /// backfill before GPS overlays were added.
+    async fn reset_gallery_sidecar_gps_backfill(self, root: &Path) {
+        match self {
+            Self::Sqlite => {
+                let database = rusqlite::Connection::open(root.join("state/metadata.sqlite"))
+                    .expect("sqlite metadata database should open");
+                database
+                    .execute_batch(
+                        "UPDATE gallery_objects
+                            SET sidecar_latitude = NULL,
+                                sidecar_longitude = NULL,
+                                sidecar_inferred_by_berrykeep = 0;
+                         DELETE FROM metadata_meta
+                          WHERE key = 'gallery_sidecar_gps_v2';",
+                    )
+                    .expect("legacy sqlite GPS projection should persist");
+            }
+            #[cfg(feature = "turso-metadata")]
+            Self::Turso => {
+                let database = turso::Builder::new_local(
+                    &root.join("state/metadata.turso.db").to_string_lossy(),
+                )
+                .build()
+                .await
+                .expect("turso metadata database should open");
+                let connection = database.connect().expect("turso metadata should connect");
+                connection
+                    .execute_batch(
+                        "UPDATE gallery_objects
+                            SET sidecar_latitude = NULL,
+                                sidecar_longitude = NULL,
+                                sidecar_inferred_by_berrykeep = 0;
+                         DELETE FROM metadata_meta
+                          WHERE key = 'gallery_sidecar_gps_v2';",
+                    )
+                    .await
+                    .expect("legacy Turso GPS projection should persist");
             }
         }
     }
@@ -8135,7 +8213,10 @@ async fn ensure_media_cache_generates_thumbnail_for_mp4_impl(backend: StorageTes
     assert_eq!(metadata.mime_type.as_deref(), Some("video/mp4"));
     assert_eq!(metadata.width, Some(1920));
     assert_eq!(metadata.height, Some(1080));
+    assert_eq!(metadata.taken_at_unix, None);
+    assert_eq!(metadata.taken_at_timezone_known, None);
     assert_eq!(metadata.date_encoded_unix, Some(1_709_528_767));
+    assert_eq!(metadata.date_encoded_timezone_known, Some(true));
     assert_eq!(metadata.duration_millis, Some(42_125));
     assert_eq!(metadata.frame_rate_millihertz, Some(29_970));
     assert_eq!(metadata.total_bitrate_bps, Some(4_500_000));
@@ -8659,6 +8740,7 @@ async fn ensure_media_metadata_refreshes_gps_after_overwrite_impl(backend: Stora
     let gps = updated_metadata
         .gps
         .expect("expected GPS metadata after overwrite");
+    assert!(updated_metadata.has_embedded_gps_properties);
     assert!((gps.latitude - 37.808_333_333_333_33).abs() < 0.000_001);
     assert!((gps.longitude - (-122.404_166_666_666_67)).abs() < 0.000_001);
 
@@ -8683,6 +8765,50 @@ run_on_all_metadata_backends!(
     ensure_media_metadata_refreshes_gps_after_overwrite_impl,
     ensure_media_metadata_refreshes_gps_after_overwrite,
     ensure_media_metadata_refreshes_gps_after_overwrite_turso
+);
+
+async fn ensure_media_metadata_marks_unparseable_gps_as_present_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("media-cache-unparseable-gps").await;
+    let put = store
+        .put_object_versioned(
+            "photos/unparseable-gps.jpg",
+            Bytes::from(sample_media_jpeg_with_unparseable_gps_bytes()),
+            PutOptions {
+                create_snapshot: false,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let metadata = store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected media metadata");
+    assert_eq!(metadata.status, MediaCacheStatus::Ready);
+    assert!(metadata.gps.is_none());
+    assert!(metadata.has_embedded_gps_properties);
+
+    let lookup = store
+        .lookup_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("expected media cache lookup");
+    assert!(
+        lookup
+            .metadata
+            .expect("expected cached media metadata")
+            .has_embedded_gps_properties
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    ensure_media_metadata_marks_unparseable_gps_as_present_impl,
+    ensure_media_metadata_marks_unparseable_gps_as_present,
+    ensure_media_metadata_marks_unparseable_gps_as_present_turso
 );
 
 async fn content_fingerprint_is_stable_across_distinct_keys_with_same_bytes_impl(
@@ -10394,6 +10520,35 @@ async fn gallery_labels_for_key(store: &PersistentStore, key: &str) -> Vec<Strin
         .labels
 }
 
+async fn gallery_gps_for_key(store: &PersistentStore, key: &str) -> Option<MediaGpsCoordinates> {
+    let page = store
+        .query_gallery_index(&GalleryIndexQuery {
+            prefix: String::new(),
+            depth: 8,
+            media_filter: GalleryIndexMediaFilter::All,
+            captured_sort: GalleryIndexCapturedSort::Desc,
+            captured_from_unix: None,
+            captured_until_unix: None,
+            offset: 0,
+            limit: 64,
+            viewport: None,
+            label_filter: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("the gallery projection should serve an index page");
+
+    page.entries
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .and_then(|entry| {
+            entry
+                .media_metadata
+                .and_then(|metadata| metadata.gps)
+                .or(entry.gps_override)
+        })
+}
+
 /// Lists the gallery keys that survive `label_filter`, sorted for comparison.
 async fn gallery_keys_matching_labels(
     store: &PersistentStore,
@@ -10694,6 +10849,492 @@ run_on_all_metadata_backends!(
     gallery_labels_follow_a_sidecar_upload_impl,
     gallery_labels_follow_a_sidecar_upload,
     gallery_labels_follow_a_sidecar_upload_turso
+);
+
+async fn gallery_gps_follows_a_geolocation_sidecar_write_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-sidecar-write")
+        .await;
+    let media_key = "album/photo.jpg";
+    let put = store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .ensure_media_metadata(&put.manifest_hash)
+        .await
+        .unwrap()
+        .expect("the source media needs a cached metadata record");
+    assert!(gallery_gps_for_key(&store, media_key).await.is_none());
+
+    let write = store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+                approved_capture_time: None,
+            },
+        )
+        .await
+        .expect("the XMP sidecar write should succeed");
+    assert!(matches!(write, MediaGeolocationWrite::Applied(_)));
+
+    let sidecar_location = store
+        .media_sidecar_metadata_overlay(media_key)
+        .await
+        .unwrap()
+        .location
+        .expect("the written sidecar should expose GPS");
+    assert!((sidecar_location.latitude - 47.3769).abs() < 0.000_001);
+    assert!((sidecar_location.longitude - 8.5417).abs() < 0.000_001);
+    let gallery_location = gallery_gps_for_key(&store, media_key)
+        .await
+        .expect("sidecar GPS must refresh the gallery projection");
+    assert!((gallery_location.latitude - 47.3769).abs() < 0.000_001);
+    assert!((gallery_location.longitude - 8.5417).abs() < 0.000_001);
+
+    let second_write = store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.4,
+                longitude: 8.6,
+                method: "nearest-anchor".to_string(),
+                run_id: "later-analysis-run".to_string(),
+                confidence: "reference_distance=60s".to_string(),
+                reference_distance_seconds: Some(60),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+                approved_capture_time: None,
+            },
+        )
+        .await
+        .expect("existing GPS check should not fail the sidecar mutation");
+    assert!(matches!(second_write, MediaGeolocationWrite::AlreadyHasGps));
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_gps_follows_a_geolocation_sidecar_write_impl,
+    gallery_gps_follows_a_geolocation_sidecar_write,
+    gallery_gps_follows_a_geolocation_sidecar_write_turso
+);
+
+async fn conditional_geolocation_write_skips_replaced_media_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-conditional-write")
+        .await;
+    let media_key = "album/photo.jpg";
+    let reviewed = store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from_static(b"replacement media object"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let write = store
+        .set_media_geolocation_if_current(
+            media_key,
+            &reviewed.manifest_hash,
+            &reviewed.object_id,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+                approved_capture_time: None,
+            },
+        )
+        .await
+        .expect("a stale media guard must not turn into a storage error");
+    assert!(matches!(write, MediaGeolocationWrite::MediaChanged));
+    assert!(
+        !store
+            .media_sidecar_metadata_overlay(media_key)
+            .await
+            .expect("sidecar state should load")
+            .has_geo_location_properties,
+        "the conditional write must not create a sidecar for replacement media"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    conditional_geolocation_write_skips_replaced_media_impl,
+    conditional_geolocation_write_skips_replaced_media,
+    conditional_geolocation_write_skips_replaced_media_turso
+);
+
+async fn gallery_gps_is_visible_before_media_cache_derivation_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-without-media-cache")
+        .await;
+    let media_key = "album/photo.jpg";
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+                approved_capture_time: None,
+            },
+        )
+        .await
+        .expect("sidecar GPS should persist before cache derivation");
+
+    let location = gallery_gps_for_key(&store, media_key)
+        .await
+        .expect("sidecar GPS must be returned while the media cache is absent");
+    assert!((location.latitude - 47.3769).abs() < 0.000_001);
+    assert!((location.longitude - 8.5417).abs() < 0.000_001);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_gps_is_visible_before_media_cache_derivation_impl,
+    gallery_gps_is_visible_before_media_cache_derivation,
+    gallery_gps_is_visible_before_media_cache_derivation_turso
+);
+
+async fn gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("gallery-sidecar-gps-backfill").await;
+    let media_key = "album/photo.jpg";
+    let media = store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .ensure_media_metadata(&media.manifest_hash)
+        .await
+        .unwrap()
+        .expect("the source media needs a cached metadata record");
+    store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+                approved_capture_time: None,
+            },
+        )
+        .await
+        .expect("sidecar GPS should persist");
+    assert!(gallery_gps_for_key(&store, media_key).await.is_some());
+    drop(store);
+
+    backend.reset_gallery_sidecar_gps_backfill(&root).await;
+    let store = backend.open_store(root.clone()).await;
+
+    let location = gallery_gps_for_key(&store, media_key)
+        .await
+        .expect("the dedicated GPS marker must replay existing sidecars");
+    assert!((location.latitude - 47.3769).abs() < 0.000_001);
+    assert!((location.longitude - 8.5417).abs() < 0.000_001);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_impl,
+    gallery_gps_backfill_replays_existing_sidecars_after_label_backfill,
+    gallery_gps_backfill_replays_existing_sidecars_after_label_backfill_turso
+);
+
+async fn unparseable_sidecar_gps_blocks_inferred_overwrite_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-unparseable-sidecar")
+        .await;
+    let media_key = "album/photo.jpg";
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let original = concat!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+        "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+        "<rdf:Description xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" ",
+        "exif:GPSLatitude=\"47.3769\" exif:GPSLongitude=\"8.5417\"/>",
+        "</rdf:RDF></x:xmpmeta>"
+    );
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            Bytes::from(original),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let write = store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.4,
+                longitude: 8.6,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=60s".to_string(),
+                reference_distance_seconds: Some(60),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+                approved_capture_time: None,
+            },
+        )
+        .await
+        .expect("existing malformed GPS must be a non-error skip");
+    assert!(matches!(write, MediaGeolocationWrite::AlreadyHasGps));
+    assert_eq!(
+        stored_sidecar_text(&store, media_key).await,
+        original,
+        "an inferred sidecar must never be appended next to unparseable user GPS"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    unparseable_sidecar_gps_blocks_inferred_overwrite_impl,
+    unparseable_sidecar_gps_blocks_inferred_overwrite,
+    unparseable_sidecar_gps_blocks_inferred_overwrite_turso
+);
+
+async fn existing_sidecar_capture_time_is_not_overwritten_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-existing-capture-time")
+        .await;
+    let media_key = "album/photo.jpg";
+    store
+        .put_object_versioned(
+            media_key,
+            Bytes::from(sample_media_jpeg_bytes()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let original = concat!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+        "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+        "<rdf:Description xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" ",
+        "xmp:CreateDate=\"2024-01-02T03:04:05\"/>",
+        "</rdf:RDF></x:xmpmeta>"
+    );
+    store
+        .put_object_versioned(
+            "album/photo.jpg.xmp",
+            Bytes::from(original),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let write = store
+        .set_media_geolocation(
+            media_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+                approved_capture_time: Some(common::xmp::XmpApprovedCaptureTime {
+                    value: "2024-01-02T03:04:05".to_string(),
+                    source: "filename".to_string(),
+                    basis: "floating_local".to_string(),
+                }),
+            },
+        )
+        .await
+        .expect("existing capture time should be a documented skip, not an error");
+    assert!(matches!(
+        write,
+        MediaGeolocationWrite::AlreadyHasCaptureTime
+    ));
+    assert_eq!(stored_sidecar_text(&store, media_key).await, original);
+    assert!(
+        store
+            .media_sidecar_metadata_overlay(media_key)
+            .await
+            .expect("sidecar state should load")
+            .has_capture_time_properties
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    existing_sidecar_capture_time_is_not_overwritten_impl,
+    existing_sidecar_capture_time_is_not_overwritten,
+    existing_sidecar_capture_time_is_not_overwritten_turso
+);
+
+async fn sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("gallery-geolocation-sidecar-duplicate-content")
+        .await;
+    let primary_key = "trip/photo.jpg";
+    let duplicate_key = "backup/photo.jpg";
+    let media = Bytes::from(sample_media_jpeg_bytes());
+    let primary = store
+        .put_object_versioned(primary_key, media.clone(), PutOptions::default())
+        .await
+        .unwrap();
+    let duplicate = store
+        .put_object_versioned(duplicate_key, media, PutOptions::default())
+        .await
+        .unwrap();
+    store
+        .ensure_media_metadata(&primary.manifest_hash)
+        .await
+        .unwrap()
+        .expect("the source media needs cached metadata");
+    store
+        .ensure_media_metadata(&duplicate.manifest_hash)
+        .await
+        .unwrap()
+        .expect("the duplicate media needs cached metadata");
+
+    let write = store
+        .set_media_geolocation(
+            primary_key,
+            common::xmp::XmpGeoInference {
+                latitude: 47.3769,
+                longitude: 8.5417,
+                method: "nearest-anchor".to_string(),
+                run_id: "analysis-run".to_string(),
+                confidence: "reference_distance=180s".to_string(),
+                reference_distance_seconds: Some(180),
+                previous_anchor_distance_seconds: None,
+                next_anchor_distance_seconds: None,
+                estimated_speed_kmh: None,
+                approved_capture_time: None,
+            },
+        )
+        .await
+        .expect("the XMP sidecar write should succeed");
+    assert!(matches!(write, MediaGeolocationWrite::Applied(_)));
+
+    assert!(
+        store
+            .media_sidecar_metadata_overlay(primary_key)
+            .await
+            .unwrap()
+            .location
+            .is_some(),
+        "the primary media must receive the inferred XMP location"
+    );
+    assert!(gallery_gps_for_key(&store, primary_key).await.is_some());
+    assert!(
+        gallery_gps_for_key(&store, duplicate_key).await.is_none(),
+        "a path-scoped XMP sidecar must not alter a byte-identical copy"
+    );
+    assert!(
+        store
+            .media_sidecar_metadata_overlay(duplicate_key)
+            .await
+            .unwrap()
+            .location
+            .is_none(),
+        "only the reviewed media key receives an XMP sidecar"
+    );
+    let gps_by_key = store
+        .gallery_object_gps_by_key(&[primary_key.to_string(), duplicate_key.to_string()])
+        .await
+        .expect("the current path-scoped GPS projection should be queryable in a batch");
+    let primary_gps = gps_by_key
+        .get(primary_key)
+        .expect("the reviewed media must expose its current projected GPS");
+    assert!((primary_gps.latitude - 47.3769).abs() < 0.000_001);
+    assert!((primary_gps.longitude - 8.5417).abs() < 0.000_001);
+    assert!(
+        !gps_by_key.contains_key(duplicate_key),
+        "the batch GPS projection must preserve the sidecar's path scope"
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    sidecar_gps_does_not_leak_to_same_content_at_other_paths_impl,
+    sidecar_gps_does_not_leak_to_same_content_at_other_paths,
+    sidecar_gps_does_not_leak_to_same_content_at_other_paths_turso
 );
 
 /// Existing XMP sidecars must populate the new projection column on upgrade;

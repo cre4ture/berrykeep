@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use common::NodeId;
+use common::xmp::XmpGeoLocation;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tokio_rusqlite::Connection as TokioConnection;
@@ -14,29 +15,34 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::cluster::NodeDescriptor;
+#[cfg(test)]
+use crate::operations::{OperationPriority, OperationProgress};
+use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
-    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
-    GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
-    GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
-    GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue,
-    GallerySummaryMiss, GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
+    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange, GalleryDeltaCursorError,
+    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
+    GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery,
+    GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
+    GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue, GallerySummaryMiss,
+    GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
     GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
     HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
     METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown,
-    MetadataStore, OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker,
-    RecoverableHistoryEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection,
-    compress_snapshot_json, current_media_cache_metadata, decode_gallery_labels,
-    decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
+    MediaGpsCoordinates, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
+    RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
+    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
+    current_media_cache_metadata, decode_gallery_labels, decode_version_index,
+    decompress_snapshot_json, effective_gallery_captured_at_unix, effective_gallery_gps,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
@@ -359,9 +365,12 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              geotagged,
              latitude,
              longitude,
+             sidecar_latitude,
+             sidecar_longitude,
+             sidecar_inferred_by_berrykeep,
              spatial_x,
              spatial_y
-         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL)
+         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL, NULL)
          ON CONFLICT(key) DO UPDATE SET
              manifest_hash = excluded.manifest_hash,
              object_id = excluded.object_id,
@@ -372,6 +381,9 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              geotagged = 0,
              latitude = NULL,
              longitude = NULL,
+             sidecar_latitude = NULL,
+             sidecar_longitude = NULL,
+             sidecar_inferred_by_berrykeep = 0,
              spatial_x = NULL,
              spatial_y = NULL
          WHERE gallery_objects.manifest_hash != excluded.manifest_hash
@@ -413,10 +425,13 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 && gps.longitude.is_finite()
                 && (-180.0..=180.0).contains(&gps.longitude)
         });
-    let spatial_position =
-        gps.and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
     let mut statement = db.prepare(
-        "SELECT gallery_objects.key, version_indexes.index_json
+        "SELECT
+             gallery_objects.key,
+             version_indexes.index_json,
+             gallery_objects.sidecar_latitude,
+             gallery_objects.sidecar_longitude,
+             gallery_objects.sidecar_inferred_by_berrykeep
          FROM gallery_objects
          LEFT JOIN version_indexes
            ON version_indexes.object_id = gallery_objects.object_id
@@ -424,12 +439,25 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
     )?;
     let entries = statement
         .query_map(params![manifest_hash], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
 
-    for (key, version_index_payload) in entries {
+    for (
+        key,
+        version_index_payload,
+        sidecar_latitude,
+        sidecar_longitude,
+        sidecar_inferred_by_berrykeep,
+    ) in entries
+    {
         let version_created_at_unix =
             version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
         let captured_at_unix = effective_gallery_captured_at_unix(
@@ -440,6 +468,27 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 .and_then(|metadata| metadata.taken_at_unix),
             version_created_at_unix,
         );
+        let sidecar_gps = match (sidecar_latitude, sidecar_longitude) {
+            (Some(latitude), Some(longitude))
+                if latitude.is_finite()
+                    && (-90.0..=90.0).contains(&latitude)
+                    && longitude.is_finite()
+                    && (-180.0..=180.0).contains(&longitude) =>
+            {
+                Some(MediaGpsCoordinates {
+                    latitude,
+                    longitude,
+                })
+            }
+            _ => None,
+        };
+        let effective_gps = effective_gallery_gps(
+            gps,
+            sidecar_gps.as_ref(),
+            sidecar_inferred_by_berrykeep != 0,
+        );
+        let spatial_position = effective_gps
+            .and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
         db.execute(
             "UPDATE gallery_objects
              SET media_type = COALESCE(?1, inferred_media_type),
@@ -455,9 +504,9 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 media_type,
                 u64_to_i64(captured_at_unix)?,
                 media_status,
-                if gps.is_some() { 1i64 } else { 0i64 },
-                gps.map(|gps| gps.latitude),
-                gps.map(|gps| gps.longitude),
+                if effective_gps.is_some() { 1i64 } else { 0i64 },
+                effective_gps.map(|gps| gps.latitude),
+                effective_gps.map(|gps| gps.longitude),
                 spatial_position.map(|position| position.0),
                 spatial_position.map(|position| position.1),
                 key,
@@ -964,7 +1013,9 @@ fn query_gallery_index_in_transaction(
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -991,6 +1042,8 @@ fn query_gallery_index_in_transaction(
             row.get::<_, Option<Vec<u8>>>(5)?,
             row.get::<_, Option<Vec<u8>>>(6)?,
             row.get::<_, String>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+            row.get::<_, Option<f64>>(9)?,
         ))
     })?;
     let mut entries = Vec::new();
@@ -1004,6 +1057,8 @@ fn query_gallery_index_in_transaction(
             metadata_payload,
             version_index_payload,
             labels_json,
+            gallery_latitude,
+            gallery_longitude,
         ) = row?;
         entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
             key,
@@ -1014,6 +1069,8 @@ fn query_gallery_index_in_transaction(
             metadata_payload,
             version_index_payload,
             labels_json,
+            gallery_latitude,
+            gallery_longitude,
         })?);
     }
     Ok(GalleryIndexPage {
@@ -1276,7 +1333,9 @@ fn gallery_map_cluster_cells_from_db(
                  MIN(manifest_summaries.content_fingerprint),
                  MIN(media_cache.metadata_json),
                  MIN(version_indexes.index_json),
-                 MIN(gallery_objects.labels_json)
+                 MIN(gallery_objects.labels_json),
+                 MIN(gallery_objects.latitude),
+                 MIN(gallery_objects.longitude)
              FROM gallery_objects
              LEFT JOIN manifest_summaries
                ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1317,6 +1376,8 @@ fn gallery_map_cluster_cells_from_db(
                     metadata_payload: row.get(14)?,
                     version_index_payload: row.get(15)?,
                     labels_json: row.get(16)?,
+                    gallery_latitude: row.get(17)?,
+                    gallery_longitude: row.get(18)?,
                 })?)
             } else {
                 None
@@ -1483,7 +1544,9 @@ fn query_gallery_map_cluster_entries_in_transaction(
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1512,6 +1575,8 @@ fn query_gallery_map_cluster_entries_in_transaction(
             row.get::<_, Option<Vec<u8>>>(5)?,
             row.get::<_, Option<Vec<u8>>>(6)?,
             row.get::<_, String>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+            row.get::<_, Option<f64>>(9)?,
         ))
     })?;
     let mut entries = Vec::new();
@@ -1525,6 +1590,8 @@ fn query_gallery_map_cluster_entries_in_transaction(
             metadata,
             version_index,
             labels_json,
+            gallery_latitude,
+            gallery_longitude,
         ) = row?;
         entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
             key,
@@ -1535,6 +1602,8 @@ fn query_gallery_map_cluster_entries_in_transaction(
             metadata_payload: metadata,
             version_index_payload: version_index,
             labels_json,
+            gallery_latitude,
+            gallery_longitude,
         })?);
     }
     Ok(GalleryIndexPage {
@@ -1555,6 +1624,8 @@ struct GalleryIndexEntrySource {
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
     labels_json: String,
+    gallery_latitude: Option<f64>,
+    gallery_longitude: Option<f64>,
 }
 
 fn materialize_gallery_index_entry(
@@ -1567,14 +1638,33 @@ fn materialize_gallery_index_entry(
         metadata_payload,
         version_index_payload,
         labels_json,
+        gallery_latitude,
+        gallery_longitude,
     }: GalleryIndexEntrySource,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
         .transpose()?;
-    let media_metadata = metadata_payload
+    let gallery_gps = match (gallery_latitude, gallery_longitude) {
+        (Some(latitude), Some(longitude))
+            if latitude.is_finite()
+                && (-90.0..=90.0).contains(&latitude)
+                && longitude.is_finite()
+                && (-180.0..=180.0).contains(&longitude) =>
+        {
+            Some(MediaGpsCoordinates {
+                latitude,
+                longitude,
+            })
+        }
+        _ => None,
+    };
+    let mut media_metadata = metadata_payload
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
+    if let (Some(gallery_gps), Some(metadata)) = (&gallery_gps, media_metadata.as_mut()) {
+        metadata.gps = Some(gallery_gps.clone());
+    }
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
     let labels = decode_gallery_labels(&labels_json)?;
@@ -1586,6 +1676,7 @@ fn materialize_gallery_index_entry(
         modified_at_unix,
         content_fingerprint,
         media_metadata,
+        gps_override: gallery_gps,
         labels,
     })
 }
@@ -1665,8 +1756,8 @@ fn query_gallery_entry_from_db(
             metadata,
             versions,
             _,
-            _,
-            _,
+            latitude,
+            longitude,
             labels_json,
         )| {
             materialize_gallery_index_entry(GalleryIndexEntrySource {
@@ -1678,6 +1769,8 @@ fn query_gallery_entry_from_db(
                 metadata_payload: metadata,
                 version_index_payload: versions,
                 labels_json,
+                gallery_latitude: latitude,
+                gallery_longitude: longitude,
             })
         },
     )
@@ -2102,6 +2195,32 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn gallery_sidecar_gps_backfill_needed(&self) -> Result<bool> {
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![GALLERY_SIDECAR_GPS_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none())
+        })
+        .await
+    }
+
+    async fn mark_gallery_sidecar_gps_backfill_complete(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![GALLERY_SIDECAR_GPS_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn load_current_state(&self) -> Result<CurrentState> {
         self.read(|db| load_current_state_from_db(db)).await
     }
@@ -2165,6 +2284,62 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn set_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<XmpGeoLocation>,
+    ) -> Result<()> {
+        let key = key.to_string();
+        self.write_tx(move |db| {
+            let Some((
+                manifest_hash,
+                existing_latitude,
+                existing_longitude,
+                existing_inferred_by_berrykeep,
+            )) = db
+                .query_row(
+                    "SELECT manifest_hash, sidecar_latitude, sidecar_longitude,
+                            sidecar_inferred_by_berrykeep
+                     FROM gallery_objects WHERE key = ?1",
+                    params![key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<f64>>(1)?,
+                            row.get::<_, Option<f64>>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+            else {
+                return Ok(());
+            };
+            let latitude = location.as_ref().map(|location| location.latitude);
+            let longitude = location.as_ref().map(|location| location.longitude);
+            let inferred_by_berrykeep = i64::from(
+                location
+                    .as_ref()
+                    .is_some_and(|location| location.inferred_by_berrykeep),
+            );
+            if existing_latitude == latitude
+                && existing_longitude == longitude
+                && existing_inferred_by_berrykeep == inferred_by_berrykeep
+            {
+                return Ok(());
+            }
+            db.execute(
+                "UPDATE gallery_objects
+                 SET sidecar_latitude = ?2, sidecar_longitude = ?3,
+                     sidecar_inferred_by_berrykeep = ?4
+                 WHERE key = ?1",
+                params![key, latitude, longitude, inferred_by_berrykeep],
+            )?;
+            refresh_gallery_objects_for_manifest(db, &manifest_hash)
+        })
+        .await
+    }
+
     async fn gallery_object_labels_by_key(
         &self,
         keys: &[String],
@@ -2194,6 +2369,56 @@ impl MetadataStore for SqliteMetadataStore {
                 }
             }
             Ok(labels_by_key)
+        })
+        .await
+    }
+
+    async fn gallery_object_gps_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, MediaGpsCoordinates>> {
+        const GPS_LOOKUP_CHUNK_SIZE: usize = 500;
+        let keys = keys.to_vec();
+        self.read(move |db| {
+            let mut gps_by_key = HashMap::new();
+            for keys in keys.chunks(GPS_LOOKUP_CHUNK_SIZE) {
+                if keys.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=keys.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT key, latitude, longitude FROM gallery_objects WHERE key IN ({placeholders})"
+                );
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement.query_map(params_from_iter(keys.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                        row.get::<_, Option<f64>>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (key, latitude, longitude) = row?;
+                    if let (Some(latitude), Some(longitude)) = (latitude, longitude)
+                        && latitude.is_finite()
+                        && (-90.0..=90.0).contains(&latitude)
+                        && longitude.is_finite()
+                        && (-180.0..=180.0).contains(&longitude)
+                    {
+                        gps_by_key.insert(
+                            key,
+                            MediaGpsCoordinates {
+                                latitude,
+                                longitude,
+                            },
+                        );
+                    }
+                }
+            }
+            Ok(gps_by_key)
         })
         .await
     }
@@ -2571,6 +2796,260 @@ impl MetadataStore for SqliteMetadataStore {
             db.execute(
                 "DELETE FROM manual_repair_action_run_history\n             WHERE finished_at_unix < ?1",
                 params![u64_to_i64(finished_before_unix)?],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_operation_runs(
+        &self,
+        operation_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationRun>> {
+        let operation_id = operation_id.map(str::to_string);
+        self.read(move |db| {
+            let mut query = String::from("SELECT record_json FROM operation_runs");
+            if operation_id.is_some() {
+                query.push_str(" WHERE operation_id = ?1");
+            }
+            query.push_str(" ORDER BY created_at_unix DESC, run_id DESC");
+            if limit.is_some() {
+                query.push_str(if operation_id.is_some() {
+                    " LIMIT ?2"
+                } else {
+                    " LIMIT ?1"
+                });
+            }
+            let mut statement = db.prepare(&query)?;
+            let mut records = Vec::new();
+            let mut append = |payload: Vec<u8>| -> Result<()> {
+                records.push(
+                    serde_json::from_slice::<OperationRun>(&payload)
+                        .context("invalid operation run record in sqlite")?,
+                );
+                Ok(())
+            };
+            match (operation_id, limit) {
+                (Some(operation_id), Some(limit)) => {
+                    for row in statement
+                        .query_map(params![operation_id, usize_to_i64(limit)?], |row| {
+                            row.get::<_, Vec<u8>>(0)
+                        })?
+                    {
+                        append(row?)?;
+                    }
+                }
+                (Some(operation_id), None) => {
+                    for row in statement
+                        .query_map(params![operation_id], |row| row.get::<_, Vec<u8>>(0))?
+                    {
+                        append(row?)?;
+                    }
+                }
+                (None, Some(limit)) => {
+                    for row in statement.query_map(params![usize_to_i64(limit)?], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })? {
+                        append(row?)?;
+                    }
+                }
+                (None, None) => {
+                    for row in statement.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
+                        append(row?)?;
+                    }
+                }
+            }
+            Ok(records)
+        })
+        .await
+    }
+
+    async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>> {
+        let run_id = run_id.to_string();
+        self.read(move |db| {
+            let payload = db
+                .query_row(
+                    "SELECT record_json FROM operation_runs WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            payload
+                .map(|payload| {
+                    serde_json::from_slice(&payload)
+                        .context("invalid operation run record in sqlite")
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    async fn persist_operation_run(&self, run: &OperationRun) -> Result<()> {
+        let run_id = run.run_id.clone();
+        let operation_id = run.operation_id.clone();
+        let status = serde_json::to_value(run.status)?
+            .as_str()
+            .context("operation status did not serialize as a string")?
+            .to_string();
+        let created_at_unix = run.created_at_unix;
+        let finished_at_unix = run.finished_at_unix.map(u64_to_i64).transpose()?;
+        let payload = serde_json::to_vec_pretty(run)?;
+        self.write(move |db| {
+            db.execute(
+                "INSERT INTO operation_runs (run_id, operation_id, status, created_at_unix, finished_at_unix, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                     operation_id = excluded.operation_id,
+                     status = excluded.status,
+                     created_at_unix = excluded.created_at_unix,
+                     finished_at_unix = excluded.finished_at_unix,
+                     record_json = excluded.record_json",
+                params![
+                    run_id,
+                    operation_id,
+                    status,
+                    u64_to_i64(created_at_unix)?,
+                    finished_at_unix,
+                    payload
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn prune_operation_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
+        self.write_tx(move |db| {
+            let finished_before_unix = u64_to_i64(finished_before_unix)?;
+            // Result chunks deliberately have no foreign key: older database
+            // versions already contain this table, and the explicit delete
+            // keeps the retention path compatible with them.
+            db.execute(
+                "DELETE FROM operation_result_chunks
+                 WHERE run_id IN (
+                     SELECT run_id FROM operation_runs
+                     WHERE finished_at_unix < ?1
+                       AND status NOT IN ('queued', 'running')
+                 )",
+                params![finished_before_unix],
+            )?;
+            db.execute(
+                "DELETE FROM operation_runs
+                 WHERE finished_at_unix < ?1
+                   AND status NOT IN ('queued', 'running')",
+                params![finished_before_unix],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn interrupt_unfinished_operation_runs(
+        &self,
+        finished_at_unix: u64,
+        termination_reason: &str,
+    ) -> Result<usize> {
+        let termination_reason = termination_reason.to_string();
+        self.write_tx(move |db| {
+            let mut statement = db.prepare(
+                "SELECT run_id, record_json FROM operation_runs
+                 WHERE status IN ('queued', 'running')",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut interrupted = Vec::new();
+            for row in rows {
+                let (run_id, payload) = row?;
+                let mut run: OperationRun = serde_json::from_slice(&payload)
+                    .context("invalid operation run record in sqlite")?;
+                if !run.status.is_unfinished() {
+                    continue;
+                }
+                run.status = OperationRunStatus::Interrupted;
+                run.finished_at_unix = Some(finished_at_unix);
+                run.termination_reason = Some(termination_reason.clone());
+                run.progress.message = Some("Interrupted after server restart.".to_string());
+                interrupted.push((run_id, serde_json::to_vec_pretty(&run)?));
+            }
+            for (run_id, payload) in &interrupted {
+                db.execute(
+                    "UPDATE operation_runs
+                     SET status = 'interrupted', finished_at_unix = ?2, record_json = ?3
+                     WHERE run_id = ?1",
+                    params![run_id, u64_to_i64(finished_at_unix)?, payload],
+                )?;
+            }
+            Ok(interrupted.len())
+        })
+        .await
+    }
+
+    async fn list_operation_result_chunks(
+        &self,
+        run_id: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<OperationResultChunk>> {
+        let run_id = run_id.to_string();
+        self.read(move |db| {
+            let query = if limit.is_some() {
+                "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                 ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2 OFFSET ?3"
+            } else {
+                "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                 ORDER BY created_at_unix ASC, chunk_id ASC LIMIT -1 OFFSET ?2"
+            };
+            let mut statement = db.prepare(query)?;
+            let mut chunks = Vec::new();
+            let mut append = |payload: Vec<u8>| -> Result<()> {
+                chunks.push(
+                    serde_json::from_slice::<OperationResultChunk>(&payload)
+                        .context("invalid operation result chunk in sqlite")?,
+                );
+                Ok(())
+            };
+            if let Some(limit) = limit {
+                for row in statement.query_map(
+                    params![run_id, usize_to_i64(limit)?, usize_to_i64(offset)?],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )? {
+                    append(row?)?;
+                }
+            } else {
+                for row in statement.query_map(params![run_id, usize_to_i64(offset)?], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })? {
+                    append(row?)?;
+                }
+            }
+            Ok(chunks)
+        })
+        .await
+    }
+
+    async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()> {
+        let run_id = chunk.run_id.clone();
+        let chunk_id = chunk.chunk_id.clone();
+        let result_type = chunk.result_type.clone();
+        let created_at_unix = chunk.created_at_unix;
+        let payload = serde_json::to_vec_pretty(chunk)?;
+        self.write(move |db| {
+            db.execute(
+                "INSERT INTO operation_result_chunks (run_id, chunk_id, result_type, created_at_unix, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id, chunk_id) DO UPDATE SET
+                     result_type = excluded.result_type,
+                     created_at_unix = excluded.created_at_unix,
+                     payload_json = excluded.payload_json",
+                params![
+                    run_id,
+                    chunk_id,
+                    result_type,
+                    u64_to_i64(created_at_unix)?,
+                    payload
+                ],
             )?;
             Ok(())
         })
@@ -4769,6 +5248,9 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             geotagged INTEGER NOT NULL DEFAULT 0,
             latitude REAL,
             longitude REAL,
+            sidecar_latitude REAL,
+            sidecar_longitude REAL,
+            sidecar_inferred_by_berrykeep INTEGER NOT NULL DEFAULT 0,
             spatial_x REAL,
             spatial_y REAL,
             labels_json TEXT NOT NULL DEFAULT '[]'
@@ -4854,6 +5336,24 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             run_id TEXT PRIMARY KEY,
             finished_at_unix INTEGER NOT NULL,
             record_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_runs (
+            run_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            finished_at_unix INTEGER,
+            record_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_result_chunks (
+            run_id TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            result_type TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            payload_json BLOB NOT NULL,
+            PRIMARY KEY(run_id, chunk_id)
         );
 
         CREATE TABLE IF NOT EXISTS data_scrub_run_history (
@@ -5001,6 +5501,15 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON repair_run_history(finished_at_unix DESC, run_id DESC);
         CREATE INDEX IF NOT EXISTS idx_manual_repair_action_run_history_finished
             ON manual_repair_action_run_history(finished_at_unix DESC, run_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_operation_runs_operation_created
+            ON operation_runs(operation_id, created_at_unix DESC, run_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_operation_runs_status
+            ON operation_runs(status, created_at_unix DESC, run_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_operation_result_chunks_run_created
+            ON operation_result_chunks(run_id, created_at_unix ASC, chunk_id ASC);
         CREATE INDEX IF NOT EXISTS idx_data_scrub_run_history_finished
             ON data_scrub_run_history(finished_at_unix DESC, run_id DESC);
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created
@@ -5038,6 +5547,14 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     )?;
     add_sqlite_column_if_missing(db, "gallery_objects", "latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "longitude", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "sidecar_latitude", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "sidecar_longitude", "REAL")?;
+    add_sqlite_column_if_missing(
+        db,
+        "gallery_objects",
+        "sidecar_inferred_by_berrykeep",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_sqlite_column_if_missing(db, "gallery_objects", "spatial_x", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "spatial_y", "REAL")?;
     add_sqlite_column_if_missing(
@@ -5067,6 +5584,19 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         "TEXT",
     )?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_media_type", "TEXT")?;
+    add_sqlite_column_if_missing(db, "operation_runs", "finished_at_unix", "INTEGER")?;
+    db.execute(
+        "UPDATE operation_runs
+         SET finished_at_unix = created_at_unix
+         WHERE finished_at_unix IS NULL
+           AND status NOT IN ('queued', 'running')",
+        [],
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_operation_runs_status_finished
+         ON operation_runs(status, finished_at_unix DESC, run_id DESC)",
+        [],
+    )?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_longitude", "REAL")?;
     add_sqlite_column_if_missing(
@@ -5437,6 +5967,128 @@ mod tests {
         assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
     }
 
+    #[tokio::test]
+    async fn interrupted_operation_runs_keep_their_persisted_result_chunks() {
+        let metadata_db_path = sqlite_test_db_path("operation-restart");
+        let store = SqliteMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("sqlite metadata store should open");
+        let run = OperationRun {
+            run_id: "analysis-run".to_string(),
+            operation_id: "multimedia.geolocation.propose".to_string(),
+            status: OperationRunStatus::Running,
+            priority: OperationPriority::Background,
+            created_at_unix: 10,
+            started_at_unix: Some(11),
+            finished_at_unix: None,
+            progress: OperationProgress {
+                phase: Some("persisting_results".to_string()),
+                completed: Some(1),
+                total: Some(2),
+                message: None,
+            },
+            input: serde_json::json!({ "prefix": "photos/" }),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        };
+        store
+            .persist_operation_run(&run)
+            .await
+            .expect("running operation should persist");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: run.run_id.clone(),
+                chunk_id: "folder-segment-a".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 12,
+                payload: serde_json::json!({ "id": "folder-segment-a", "proposals": [] }),
+            })
+            .await
+            .expect("proposal chunk should persist before completion");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: run.run_id.clone(),
+                chunk_id: "folder-segment-b".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 13,
+                payload: serde_json::json!({ "id": "folder-segment-b", "proposals": [] }),
+            })
+            .await
+            .expect("a second proposal chunk should persist before completion");
+
+        assert_eq!(
+            store
+                .interrupt_unfinished_operation_runs(20, "server_restart")
+                .await
+                .expect("restart cleanup should succeed"),
+            1
+        );
+        let interrupted = store
+            .load_operation_run(&run.run_id)
+            .await
+            .expect("operation should load")
+            .expect("operation should remain recorded");
+        assert_eq!(interrupted.status, OperationRunStatus::Interrupted);
+        assert_eq!(
+            interrupted.termination_reason.as_deref(),
+            Some("server_restart")
+        );
+        assert_eq!(interrupted.finished_at_unix, Some(20));
+        assert_eq!(
+            store
+                .list_operation_result_chunks(&run.run_id, None, 0)
+                .await
+                .expect("results should load")
+                .len(),
+            2,
+            "a restart must never discard reviewable proposal chunks"
+        );
+        let page = store
+            .list_operation_result_chunks(&run.run_id, Some(1), 1)
+            .await
+            .expect("result chunk page should load");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].chunk_id, "folder-segment-b");
+
+        store
+            .prune_operation_run_history_before(11)
+            .await
+            .expect("terminal operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&run.run_id)
+                .await
+                .expect("retained operation lookup should succeed")
+                .is_some(),
+            "retention must be measured from interruption, not the original queue time"
+        );
+
+        store
+            .prune_operation_run_history_before(21)
+            .await
+            .expect("expired operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&run.run_id)
+                .await
+                .expect("pruned operation lookup should succeed")
+                .is_none(),
+            "expired terminal operations must be removed"
+        );
+        assert!(
+            store
+                .list_operation_result_chunks(&run.run_id, None, 0)
+                .await
+                .expect("pruned result lookup should succeed")
+                .is_empty(),
+            "result chunks must be removed with their expired run"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
     #[test]
     fn init_metadata_db_accepts_missing_legacy_schema_version() {
         let db = Connection::open_in_memory().expect("in-memory sqlite should open");
@@ -5497,13 +6149,16 @@ mod tests {
             height: Some(48),
             orientation: Some(1),
             taken_at_unix: Some(1),
+            taken_at_timezone_known: None,
             date_encoded_unix: None,
+            date_encoded_timezone_known: None,
             duration_millis: None,
             frame_rate_millihertz: None,
             total_bitrate_bps: None,
             codec_name: None,
             codec_fourcc: None,
             gps: None,
+            has_embedded_gps_properties: false,
             photo: None,
             thumbnail: None,
             source_size_bytes: 1024,

@@ -14,6 +14,7 @@ import { LogsPage } from "../pages/LogsPage";
 import { GalleryPage } from "../pages/GalleryPage";
 import { ExplorerPage } from "../pages/ExplorerPage";
 import { MetadataPage } from "../pages/MetadataPage";
+import { MultimediaOperationsPage } from "../pages/MultimediaOperationsPage";
 import { S3ControlPlanePage } from "../pages/S3ControlPlanePage";
 import { WebServicesPage } from "../pages/WebServicesPage";
 
@@ -52,6 +53,13 @@ export const serverAdminRoutes = [
     description: "Browse image objects from the server node side using admin-authenticated snapshot, index, and preview routes.",
     icon: IconPhoto,
     element: <GalleryPage />
+  },
+  {
+    id: "multimedia-operations",
+    label: "Multimedia",
+    description: "Run and review persistent, bounded multimedia operations such as GPS location inference before applying sidecar changes.",
+    icon: IconPhoto,
+    element: <MultimediaOperationsPage />
   },
   {
     id: "explorer",
