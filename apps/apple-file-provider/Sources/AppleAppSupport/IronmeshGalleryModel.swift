@@ -226,6 +226,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
     private let fullImageSession: IronmeshGalleryRemoteSession
     private let cacheContextLock = NSLock()
     private var cacheContextGate = AppleGalleryCacheContextGate()
+    private let thumbnailRequestLimiter = IronmeshGalleryRequestLimiter(maximumConcurrentRequests: 4)
 
     init(
         thumbnailSessions: [IronmeshGalleryRemoteSession]? = nil,
@@ -303,12 +304,14 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
 
         let relativePath = AppleGalleryThumbnailPath.relativePath(for: entry, profile: profile)
         let thumbnailSession = thumbnailSession(for: entry.path)
-        let data = try await Task.detached(priority: priority) {
-            try thumbnailSession.fetchRelativeBytes(
-                path: relativePath,
-                configuration: configuration
-            )
-        }.value
+        let data = try await thumbnailRequestLimiter.perform {
+            try await Task.detached(priority: priority) {
+                try thumbnailSession.fetchRelativeBytes(
+                    path: relativePath,
+                    configuration: configuration
+                )
+            }.value
+        }
 
         try storeCacheResult(
             data,
@@ -384,6 +387,43 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
             hash = ((hash << 5) &+ hash) &+ UInt64(byte)
         }
         return thumbnailSessions[Int(hash % UInt64(thumbnailSessions.count))]
+    }
+}
+
+private actor IronmeshGalleryRequestLimiter {
+    private let maximumConcurrentRequests: Int
+    private var activeRequests = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(maximumConcurrentRequests: Int) {
+        self.maximumConcurrentRequests = maximumConcurrentRequests
+    }
+
+    func perform<T: Sendable>(
+        _ operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        await acquire()
+        defer { release() }
+        return try await operation()
+    }
+
+    private func acquire() async {
+        if activeRequests < maximumConcurrentRequests {
+            activeRequests += 1
+            return
+        }
+        await withCheckedContinuation { waiter in
+            waiters.append(waiter)
+        }
+    }
+
+    private func release() {
+        if let waiter = waiters.first {
+            waiters.removeFirst()
+            waiter.resume()
+        } else {
+            activeRequests -= 1
+        }
     }
 }
 
