@@ -644,12 +644,16 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
 
     func updateUIView(_ scrollView: UIScrollView, context: Context) {
         let isFirstImage = context.coordinator.imageView.image == nil
+        let layoutSize = scrollView.bounds.size
+        let needsLayout = context.coordinator.layoutSize != layoutSize
         context.coordinator.onZoomStarted = onZoomStarted
         context.coordinator.imageView.image = image
-        if isFirstImage {
+        if isFirstImage || needsLayout {
+            let zoomScale = scrollView.zoomScale
             context.coordinator.imageView.frame = scrollView.bounds
             scrollView.contentSize = scrollView.bounds.size
-            scrollView.setZoomScale(1, animated: false)
+            context.coordinator.layoutSize = layoutSize
+            scrollView.setZoomScale(isFirstImage ? 1 : zoomScale, animated: false)
         }
     }
 
@@ -657,6 +661,7 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
         let imageView = UIImageView()
         var onZoomStarted: () -> Void
         private var didRequestFullResolution = false
+        fileprivate var layoutSize: CGSize?
 
         init(onZoomStarted: @escaping () -> Void) {
             self.onZoomStarted = onZoomStarted
