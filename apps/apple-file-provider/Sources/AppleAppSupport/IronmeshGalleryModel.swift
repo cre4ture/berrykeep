@@ -231,10 +231,10 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
         thumbnailSessions: [IronmeshGalleryRemoteSession]? = nil,
         fullImageSession: IronmeshGalleryRemoteSession = IronmeshGalleryRemoteSession()
     ) {
-        let defaultSessions = (0..<4).map { _ in IronmeshGalleryRemoteSession() }
-        self.thumbnailSessions = thumbnailSessions?.isEmpty == false
-            ? thumbnailSessions ?? defaultSessions
-            : defaultSessions
+        let resolvedThumbnailSessions = thumbnailSessions?.isEmpty == false
+            ? thumbnailSessions!
+            : (0..<4).map { _ in IronmeshGalleryRemoteSession() }
+        self.thumbnailSessions = resolvedThumbnailSessions
         self.fullImageSession = fullImageSession
         thumbnailCache.countLimit = 160
         thumbnailCache.totalCostLimit = 48 * 1_024 * 1_024

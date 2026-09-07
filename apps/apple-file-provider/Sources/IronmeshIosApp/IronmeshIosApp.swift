@@ -206,7 +206,6 @@ private struct IronmeshGalleryMapContent: View {
                 accentColorHex: accentColorHex
             )
             .ignoresSafeArea()
-            .onDisappear(perform: onClose)
         } else {
             galleryMapStartCard
         }

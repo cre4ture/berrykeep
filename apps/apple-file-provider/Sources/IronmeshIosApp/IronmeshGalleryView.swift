@@ -15,17 +15,16 @@ struct IronmeshGalleryView: View {
     @State private var selection: IronmeshGallerySelection?
 
     init(remoteSession: IronmeshRemoteSession) {
-        let gallerySession = IronmeshGalleryRemoteSession(sharedSession: remoteSession)
-        let imageRepository = IronmeshGalleryImageRepository(
-            thumbnailSessions: [gallerySession],
-            fullImageSession: gallerySession
-        )
-        _galleryModel = StateObject(
-            wrappedValue: IronmeshGalleryModel(
+        _galleryModel = StateObject(wrappedValue: {
+            let gallerySession = IronmeshGalleryRemoteSession(sharedSession: remoteSession)
+            return IronmeshGalleryModel(
                 remoteSession: gallerySession,
-                imageRepository: imageRepository
+                imageRepository: IronmeshGalleryImageRepository(
+                    thumbnailSessions: [gallerySession],
+                    fullImageSession: gallerySession
+                )
             )
-        )
+        }())
     }
 
     private var loadID: IronmeshGalleryLoadID {
@@ -638,28 +637,8 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
 
         context.coordinator.imageView.contentMode = .scaleAspectFit
         context.coordinator.imageView.clipsToBounds = true
-        context.coordinator.imageView.translatesAutoresizingMaskIntoConstraints = false
+        context.coordinator.imageView.translatesAutoresizingMaskIntoConstraints = true
         scrollView.addSubview(context.coordinator.imageView)
-        NSLayoutConstraint.activate([
-            context.coordinator.imageView.leadingAnchor.constraint(
-                equalTo: scrollView.contentLayoutGuide.leadingAnchor
-            ),
-            context.coordinator.imageView.trailingAnchor.constraint(
-                equalTo: scrollView.contentLayoutGuide.trailingAnchor
-            ),
-            context.coordinator.imageView.topAnchor.constraint(
-                equalTo: scrollView.contentLayoutGuide.topAnchor
-            ),
-            context.coordinator.imageView.bottomAnchor.constraint(
-                equalTo: scrollView.contentLayoutGuide.bottomAnchor
-            ),
-            context.coordinator.imageView.widthAnchor.constraint(
-                equalTo: scrollView.frameLayoutGuide.widthAnchor
-            ),
-            context.coordinator.imageView.heightAnchor.constraint(
-                equalTo: scrollView.frameLayoutGuide.heightAnchor
-            ),
-        ])
         return scrollView
     }
 
@@ -668,6 +647,8 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
         context.coordinator.onZoomStarted = onZoomStarted
         context.coordinator.imageView.image = image
         if isFirstImage {
+            context.coordinator.imageView.frame = scrollView.bounds
+            scrollView.contentSize = scrollView.bounds.size
             scrollView.setZoomScale(1, animated: false)
         }
     }
