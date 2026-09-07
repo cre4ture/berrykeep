@@ -4,10 +4,24 @@ import UIKit
 
 struct IronmeshGalleryView: View {
     @EnvironmentObject private var browserModel: IronmeshBrowserModel
-    @StateObject private var galleryModel = IronmeshGalleryModel()
+    @StateObject private var galleryModel: IronmeshGalleryModel
     @State private var mode: AppleGalleryMode = .allImages
     @State private var sort: AppleGallerySort = .newest
     @State private var selection: IronmeshGallerySelection?
+
+    init(remoteSession: IronmeshRemoteSession) {
+        let gallerySession = IronmeshGalleryRemoteSession(sharedSession: remoteSession)
+        let imageRepository = IronmeshGalleryImageRepository(
+            thumbnailSessions: [gallerySession],
+            fullImageSession: gallerySession
+        )
+        _galleryModel = StateObject(
+            wrappedValue: IronmeshGalleryModel(
+                remoteSession: gallerySession,
+                imageRepository: imageRepository
+            )
+        )
+    }
 
     private var loadID: IronmeshGalleryLoadID {
         IronmeshGalleryLoadID(

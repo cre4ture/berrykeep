@@ -577,7 +577,7 @@ private struct IronmeshLibraryView: View {
                         }
                     }
                 } else {
-                    IronmeshGalleryView()
+                    IronmeshGalleryView(remoteSession: model.galleryRemoteSession)
                 }
             }
             .background(Color(uiColor: .systemGroupedBackground))
