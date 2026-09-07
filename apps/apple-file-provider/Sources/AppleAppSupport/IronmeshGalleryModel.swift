@@ -408,8 +408,10 @@ private actor IronmeshGalleryRequestLimiter {
     func perform<T: Sendable>(
         _ operation: @Sendable () async throws -> T
     ) async throws -> T {
+        try Task.checkCancellation()
         await acquire()
         defer { release() }
+        try Task.checkCancellation()
         return try await operation()
     }
 

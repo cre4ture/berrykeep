@@ -209,6 +209,11 @@ private struct IronmeshGalleryMapContent: View {
             .onDisappear(perform: onClose)
         } else {
             galleryMapStartCard
+                .onAppear {
+                    if session != nil {
+                        onClose()
+                    }
+                }
         }
     }
 
