@@ -648,12 +648,18 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
         let needsLayout = context.coordinator.layoutSize != layoutSize
         context.coordinator.onZoomStarted = onZoomStarted
         context.coordinator.imageView.image = image
-        if isFirstImage || needsLayout {
-            let zoomScale = scrollView.zoomScale
+        if isFirstImage {
             context.coordinator.imageView.frame = scrollView.bounds
             scrollView.contentSize = scrollView.bounds.size
             context.coordinator.layoutSize = layoutSize
-            scrollView.setZoomScale(isFirstImage ? 1 : zoomScale, animated: false)
+            scrollView.setZoomScale(1, animated: false)
+        } else if needsLayout {
+            let zoomScale = scrollView.zoomScale
+            scrollView.setZoomScale(1, animated: false)
+            context.coordinator.imageView.frame = scrollView.bounds
+            scrollView.contentSize = scrollView.bounds.size
+            context.coordinator.layoutSize = layoutSize
+            scrollView.setZoomScale(zoomScale, animated: false)
         }
     }
 
