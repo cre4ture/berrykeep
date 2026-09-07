@@ -50,7 +50,7 @@ pub const STARTUP_INTEGRATION_LABEL: &str = if cfg!(windows) {
 pub const STARTUP_INTEGRATION_VALUE: &str = if cfg!(windows) {
     STARTUP_TASK_ID
 } else {
-    "ironmesh-config-app-background.desktop"
+    "berrykeep-config-app-background.desktop"
 };
 pub const STARTUP_INTEGRATION_NOTE: &str = if cfg!(windows) {
     "Enabled services can restart after sign-in through the packaged startup task."
