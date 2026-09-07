@@ -3,7 +3,7 @@ berrykeep (1.1.0-3~repo1~ubuntu24.04.1) noble; urgency=medium
   * Preserve legacy desktop integration during the Ironmesh-to-BerryKeep
     transition without starting duplicate background config apps.
 
- -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 08 Sep 2026 00:15:00 +0200
+ -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 08 Sep 2026 00:15:00 +0200
 
 berrykeep (1.1.0-2~repo1~ubuntu24.04.1) noble; urgency=medium
 
