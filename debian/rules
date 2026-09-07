@@ -58,6 +58,7 @@ CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/berrykeep-client/usr/lib/berrykeep-clien
 CLIENT_EXTENSION_ROOT := $(CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
 LEGACY_CLIENT_PACKAGE_ROOT := $(CURDIR)/debian/berrykeep-client/usr/lib/ironmesh-client
 LEGACY_CLIENT_EXTENSION_ROOT := $(LEGACY_CLIENT_PACKAGE_ROOT)/gnome-shell-extension/ironmesh-status@ironmesh.io
+IRONMESH_CLIENT_TRANSITION_ROOT := $(CURDIR)/debian/ironmesh-client
 
 %:
 	dh $@ --with sysuser
@@ -245,10 +246,20 @@ ifeq ($(SERVER_NODE_ONLY),)
 
 	install -d $(CURDIR)/debian/berrykeep-client/usr/share/applications
 	install -m0644 debian/ironmesh-config-app.desktop \
-		$(CURDIR)/debian/berrykeep-client/usr/share/applications/ironmesh-config-app.desktop
+		$(CURDIR)/debian/berrykeep-client/usr/share/applications/berrykeep-config-app.desktop
 	install -d $(CURDIR)/debian/berrykeep-client/etc/xdg/autostart
 	install -m0644 debian/ironmesh-config-app-background.desktop \
-		$(CURDIR)/debian/berrykeep-client/etc/xdg/autostart/ironmesh-config-app-background.desktop
+		$(CURDIR)/debian/berrykeep-client/etc/xdg/autostart/berrykeep-config-app-background.desktop
+
+	# Retain the legacy desktop files in the transitional package. This prevents
+	# dpkg from removing the old autostart conffile after berrykeep-client has
+	# taken it over during an upgrade.
+	install -d $(IRONMESH_CLIENT_TRANSITION_ROOT)/usr/share/applications
+	install -m0644 debian/ironmesh-config-app.desktop \
+		$(IRONMESH_CLIENT_TRANSITION_ROOT)/usr/share/applications/ironmesh-config-app.desktop
+	install -d $(IRONMESH_CLIENT_TRANSITION_ROOT)/etc/xdg/autostart
+	install -m0644 debian/ironmesh-config-app-background.desktop \
+		$(IRONMESH_CLIENT_TRANSITION_ROOT)/etc/xdg/autostart/ironmesh-config-app-background.desktop
 endif
 
 override_dh_installsystemd:

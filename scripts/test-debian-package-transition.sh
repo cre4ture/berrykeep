@@ -156,6 +156,8 @@ for package_name in \
 done
 
 test -x "${DPKG_ROOT}/usr/bin/berrykeep"
+test -f "${DPKG_ROOT}/usr/share/applications/berrykeep-config-app.desktop"
+test -f "${DPKG_ROOT}/etc/xdg/autostart/berrykeep-config-app-background.desktop"
 test "$(readlink "${DPKG_ROOT}/usr/bin/ironmesh")" = ../lib/berrykeep-client/ironmesh
 test -d "${DPKG_ROOT}/usr/lib/ironmesh-client"
 test "$(readlink "${DPKG_ROOT}/usr/lib/ironmesh-client/ironmesh-config-app")" = ../berrykeep-client/berrykeep-config-app
