@@ -1720,14 +1720,10 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     }
 
     func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
-        lock.lock()
-        defer { lock.unlock() }
-        return try bridge.startWebUI(configuration: configuration)
+        try bridge.startWebUI(configuration: configuration)
     }
 
     func stopWebUI() throws {
-        lock.lock()
-        defer { lock.unlock() }
         try bridge.stopWebUI()
     }
 
