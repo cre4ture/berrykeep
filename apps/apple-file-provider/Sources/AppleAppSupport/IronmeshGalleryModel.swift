@@ -452,6 +452,14 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
         labels: [String],
         configuration: AppleConnectionConfiguration
     ) throws {
+        if let sharedSession {
+            try sharedSession.setMediaLabels(
+                path: path,
+                labels: labels,
+                configuration: configuration
+            )
+            return
+        }
         try withBridge(configuration: configuration) { bridge in
             try bridge.setMediaLabels(path: path, labels: labels)
         }

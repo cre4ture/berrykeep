@@ -1647,6 +1647,15 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         return try bridge.download(path: path, revisionHint: revisionHint)
     }
 
+    func setMediaLabels(
+        path: String,
+        labels: [String],
+        configuration: AppleConnectionConfiguration
+    ) throws {
+        try connectIfNeeded(configuration)
+        try bridge.setMediaLabels(path: path, labels: labels)
+    }
+
     func connectionDiagnostics(
         configuration: AppleConnectionConfiguration
     ) throws -> IronmeshConnectionDiagnosticsSnapshot {
