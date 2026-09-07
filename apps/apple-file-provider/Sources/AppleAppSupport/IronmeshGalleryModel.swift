@@ -227,7 +227,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
     private let fullImageSession: IronmeshGalleryRemoteSession
     private let cacheContextLock = NSLock()
     private var cacheContextGate = AppleGalleryCacheContextGate()
-    private let thumbnailRequestLimiter = IronmeshGalleryRequestLimiter(maximumConcurrentRequests: 4)
+    private let galleryRequestLimiter: IronmeshGalleryRequestLimiter
 
     init(
         thumbnailSessions: [IronmeshGalleryRemoteSession]? = nil,
@@ -237,6 +237,9 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
             ? thumbnailSessions!
             : (0..<4).map { _ in IronmeshGalleryRemoteSession() }
         self.thumbnailSessions = resolvedThumbnailSessions
+        galleryRequestLimiter = IronmeshGalleryRequestLimiter(
+            maximumConcurrentRequests: resolvedThumbnailSessions.count
+        )
         self.fullImageSession = fullImageSession
         thumbnailCache.countLimit = 160
         thumbnailCache.totalCostLimit = 48 * 1_024 * 1_024
@@ -305,7 +308,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
 
         let relativePath = AppleGalleryThumbnailPath.relativePath(for: entry, profile: profile)
         let thumbnailSession = thumbnailSession(for: entry.path)
-        let data = try await thumbnailRequestLimiter.perform {
+        let data = try await galleryRequestLimiter.perform {
             try await Task.detached(priority: priority) {
                 try thumbnailSession.fetchRelativeBytes(
                     path: relativePath,
@@ -339,9 +342,11 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
         }
 
         let fullImageSession = fullImageSession
-        let data = try await Task.detached(priority: .userInitiated) {
-            try fullImageSession.download(path: entry.path, configuration: configuration)
-        }.value
+        let data = try await galleryRequestLimiter.perform {
+            try await Task.detached(priority: .userInitiated) {
+                try fullImageSession.download(path: entry.path, configuration: configuration)
+            }.value
+        }
 
         try storeCacheResult(
             data,

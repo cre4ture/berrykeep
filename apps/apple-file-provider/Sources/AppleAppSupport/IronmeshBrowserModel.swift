@@ -1618,24 +1618,27 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     }
 
     func list(path: String, configuration: AppleConnectionConfiguration) throws -> [AppleBridgeItem] {
-        try connectIfNeeded(configuration)
-        return sortedItems(try bridge.list(path: path, depth: 1))
+        try withBridge(configuration) { bridge in
+            sortedItems(try bridge.list(path: path, depth: 1))
+        }
     }
 
     func storeIndex(
         _ request: AppleStoreIndexRequest,
         configuration: AppleConnectionConfiguration
     ) throws -> AppleStoreIndexResponse {
-        try connectIfNeeded(configuration)
-        return try bridge.storeIndex(request)
+        try withBridge(configuration) { bridge in
+            try bridge.storeIndex(request)
+        }
     }
 
     func fetchRelativeBytes(
         path: String,
         configuration: AppleConnectionConfiguration
     ) throws -> Data {
-        try connectIfNeeded(configuration)
-        return try bridge.fetchRelativeBytes(path: path)
+        try withBridge(configuration) { bridge in
+            try bridge.fetchRelativeBytes(path: path)
+        }
     }
 
     func download(
@@ -1643,8 +1646,9 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         revisionHint: String?,
         configuration: AppleConnectionConfiguration
     ) throws -> Data {
-        try connectIfNeeded(configuration)
-        return try bridge.download(path: path, revisionHint: revisionHint)
+        try withBridge(configuration) { bridge in
+            try bridge.download(path: path, revisionHint: revisionHint)
+        }
     }
 
     func setMediaLabels(
@@ -1652,15 +1656,17 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         labels: [String],
         configuration: AppleConnectionConfiguration
     ) throws {
-        try connectIfNeeded(configuration)
-        try bridge.setMediaLabels(path: path, labels: labels)
+        try withBridge(configuration) { bridge in
+            try bridge.setMediaLabels(path: path, labels: labels)
+        }
     }
 
     func connectionDiagnostics(
         configuration: AppleConnectionConfiguration
     ) throws -> IronmeshConnectionDiagnosticsSnapshot {
-        try connectIfNeeded(configuration)
-        let json = try bridge.connectionDiagnosticsJSON()
+        let json = try withBridge(configuration) { bridge in
+            try bridge.connectionDiagnosticsJSON()
+        }
         return try decode(IronmeshConnectionDiagnosticsSnapshot.self, from: json)
     }
 
@@ -1668,41 +1674,44 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         configuration: AppleConnectionConfiguration,
         refresh: Bool
     ) throws -> AppleConnectionRouteSnapshot {
-        try connectIfNeeded(configuration)
-        let json = try bridge.connectionRouteSnapshotJSON(refresh: refresh)
+        let json = try withBridge(configuration) { bridge in
+            try bridge.connectionRouteSnapshotJSON(refresh: refresh)
+        }
         return try decode(AppleConnectionRouteSnapshot.self, from: json)
     }
 
     func notifyForegrounded(
         configuration: AppleConnectionConfiguration
     ) throws -> String? {
-        try connectIfNeeded(configuration)
-        try bridge.notifyForegrounded()
-        return try bridge.takeClientIdentityUpdateJSON().nilIfBlank
+        try withBridge(configuration) { bridge in
+            try bridge.notifyForegrounded()
+            return try bridge.takeClientIdentityUpdateJSON().nilIfBlank
+        }
     }
 
     func configureTitleLatencyMonitor(
         configuration: AppleConnectionConfiguration,
         settings: AppleTitleLatencyMonitorSettings
     ) throws -> AppleTitleLatencyStatus {
-        try connectIfNeeded(configuration)
-        let json = try bridge.configureTitleLatencyMonitorJSON(settings: settings)
+        let json = try withBridge(configuration) { bridge in
+            try bridge.configureTitleLatencyMonitorJSON(settings: settings)
+        }
         return try decode(AppleTitleLatencyStatus.self, from: json)
     }
 
     func titleLatencyStatus(
         configuration: AppleConnectionConfiguration
     ) throws -> AppleTitleLatencyStatus {
-        try connectIfNeeded(configuration)
-        let json = try bridge.titleLatencyStatusJSON()
+        let json = try withBridge(configuration) { bridge in
+            try bridge.titleLatencyStatusJSON()
+        }
         return try decode(AppleTitleLatencyStatus.self, from: json)
     }
 
     func disableTitleLatencyMonitor() throws {
         lock.lock()
-        let hasConnection = configurationKey != nil
-        lock.unlock()
-        guard hasConnection else {
+        defer { lock.unlock() }
+        guard configurationKey != nil else {
             return
         }
         _ = try bridge.configureTitleLatencyMonitorJSON(
@@ -1711,24 +1720,30 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     }
 
     func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
-        try bridge.startWebUI(configuration: configuration)
+        lock.lock()
+        defer { lock.unlock() }
+        return try bridge.startWebUI(configuration: configuration)
     }
 
     func stopWebUI() throws {
+        lock.lock()
+        defer { lock.unlock() }
         try bridge.stopWebUI()
     }
 
-    private func connectIfNeeded(_ configuration: AppleConnectionConfiguration) throws {
+    private func withBridge<T>(
+        _ configuration: AppleConnectionConfiguration,
+        operation: (AppleCFacadeBridge) throws -> T
+    ) throws -> T {
         let nextKey = configuration.cacheKey
 
         lock.lock()
         defer { lock.unlock() }
-        guard configurationKey != nextKey else {
-            return
+        if configurationKey != nextKey {
+            _ = try bridge.connect(configuration)
+            configurationKey = nextKey
         }
-
-        _ = try bridge.connect(configuration)
-        configurationKey = nextKey
+        return try operation(bridge)
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from json: String) throws -> T {
