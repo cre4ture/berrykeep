@@ -5,13 +5,18 @@ Server Node. It is intentionally separate from the Store/MSIX desktop-client
 package: a storage node must start at boot and continue running without a
 signed-in desktop user.
 
-The MSI installs `ironmesh-server-node.exe` as the `BerryKeepServerNode`
-Windows service. The legacy executable name remains part of the compatibility
-contract while the product name is BerryKeep.
+The MSI installs `berrykeep-server-node.exe` as the `BerryKeepServerNode`
+Windows service. The stable service identity and data root preserve existing
+Windows deployments during the executable-name transition.
+
+An MSI major upgrade replaces the old `ironmesh-server-node.exe` program
+component and its firewall rules with the BerryKeep executable. No manual
+program-file or firewall cleanup is required; service identity and node state
+are retained.
 
 ## What the MSI manages
 
-- `C:\Program Files\BerryKeep\Server Node\ironmesh-server-node.exe`
+- `C:\Program Files\BerryKeep\Server Node\berrykeep-server-node.exe`
 - an automatic `NT AUTHORITY\LocalService` Windows service named
   `BerryKeepServerNode`
 - service recovery: restart after each of the first three failures, after five
@@ -54,6 +59,19 @@ powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Build-M
   -SigningCertificatePath C:\secure\berrykeep-release.pfx `
   -SigningCertificatePassword $env:BERRYKEEP_SIGNING_PASSWORD `
   -TimestampUrl https://<approved-rfc3161-timestamp-service>
+```
+
+`Sign-Msi.ps1` signs an already-built MSI and verifies its signer. Release CI
+uses it in a separate protected job after the unsigned build artifact is
+available, so the build itself never receives private-key material:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Sign-Msi.ps1 `
+  -MsiPath .\windows\server-node-installer\out\BerryKeepServerNode_1.0.38_x64\BerryKeepServerNode.msi `
+  -SigningCertificatePath C:\secure\berrykeep-release.pfx `
+  -SigningCertificatePassword $env:BERRYKEEP_SIGNING_PASSWORD `
+  -TimestampUrl https://<approved-rfc3161-timestamp-service> `
+  -SigningCertificateThumbprint <certificate-thumbprint>
 ```
 
 ## Automatic updates

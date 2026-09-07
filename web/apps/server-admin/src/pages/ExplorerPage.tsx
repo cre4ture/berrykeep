@@ -4,8 +4,10 @@ import {
   getAdminStoreValue,
   getAdminVersionGraph,
   listAdminSnapshots,
+  listAdminStoreHistoryEntries,
   listAdminStoreEntries,
   renameAdminStorePath,
+  restoreAdminStoreHistoryEntries,
   restoreAdminStoreVersion,
   restoreAdminStorePathFromSnapshot
 } from "@ironmesh/api";
@@ -30,8 +32,21 @@ export function ExplorerPage() {
     [adminTokenOverride]
   );
   const readValue = useCallback(
-    (key: string, snapshotId: string | null, versionId: string | null, previewBytes: number) =>
-      getAdminStoreValue(key, snapshotId, versionId, previewBytes, adminTokenOverride),
+    (
+      key: string,
+      snapshotId: string | null,
+      versionId: string | null,
+      previewBytes: number,
+      sourceObjectId?: string | null
+    ) =>
+      getAdminStoreValue(
+        key,
+        snapshotId,
+        versionId,
+        previewBytes,
+        adminTokenOverride,
+        sourceObjectId
+      ),
     [adminTokenOverride]
   );
   const loadVersions = useCallback(
@@ -44,6 +59,9 @@ export function ExplorerPage() {
       intro="Browse the node-side object index with the same shared explorer surface used by the client UI. The admin wrapper uses authenticated snapshot, object, and version routes, and it enables rename and delete against current data while also allowing snapshot restore, while leaving upload and folder creation disabled."
       loadSnapshots={loadSnapshots}
       loadEntries={loadEntries}
+      loadHistoricalEntries={(prefix, depth) =>
+        listAdminStoreHistoryEntries(prefix, depth, adminTokenOverride)
+      }
       readValue={readValue}
       getDownloadUrl={(key, snapshotId, versionId) =>
         getAdminStoreDownloadUrl(key, snapshotId, versionId)
@@ -55,6 +73,8 @@ export function ExplorerPage() {
           renameAdminStorePath(fromPath, toPath, false, adminTokenOverride),
         restoreVersion: (key, versionId, targetPath) =>
           restoreAdminStoreVersion(key, versionId, targetPath, adminTokenOverride),
+        restoreHistoryEntries: (entries) =>
+          restoreAdminStoreHistoryEntries(entries, adminTokenOverride),
         restoreSnapshotPath: (snapshotId, sourcePath, targetPath, recursive) =>
           restoreAdminStorePathFromSnapshot(
             snapshotId,

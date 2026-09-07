@@ -1445,7 +1445,7 @@ async fn start_folder_agent_with_bootstrap_and_state_root(
     remote_refresh_interval_ms: u64,
     local_scan_interval_ms: u64,
 ) -> Result<ChildGuard> {
-    let agent_bin = binary_path("ironmesh-folder-agent")?;
+    let agent_bin = binary_path("berrykeep-folder-agent")?;
     let resource_guards = lock_test_resources([
         "folder-agent-process".to_string(),
         path_resource_key(root_dir),
@@ -1488,14 +1488,14 @@ async fn start_folder_agent_with_bootstrap_and_state_root(
 
     let mut child = command
         .spawn()
-        .context("failed to spawn ironmesh-folder-agent")?;
+        .context("failed to spawn berrykeep-folder-agent")?;
 
     sleep(Duration::from_millis(300)).await;
     if let Some(status) = child
         .try_wait()
         .context("failed to query folder-agent process state")?
     {
-        bail!("ironmesh-folder-agent exited early with status {status}");
+        bail!("berrykeep-folder-agent exited early with status {status}");
     }
 
     Ok(ChildGuard::with_resources(child, resource_guards))

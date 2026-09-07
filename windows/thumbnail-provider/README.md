@@ -49,18 +49,18 @@ This must stay aligned with:
 The prototype package root should contain at least:
 
 - `AppxManifest.xml`
-- `ironmesh.exe`
-- `ironmesh-config-app.exe`
-- `ironmesh-background-launcher.exe`
+- `berrykeep.exe`
+- `berrykeep-config-app.exe`
+- `berrykeep-background-launcher.exe`
 - `windows_thumbnail_provider.dll`
-- `ironmesh-os-integration.exe`
-- `ironmesh-folder-agent.exe`
+- `berrykeep-os-integration.exe`
+- `berrykeep-folder-agent.exe`
 - `Assets/SmallLogo.png`
 - `Assets/StoreLogo.png`
 
-The manifest now exposes the packaged `ironmesh-config-app.exe` as the visible user-facing entry point, registers `ironmesh-background-launcher.exe` as the login-time startup task, and keeps `ironmesh.exe`, `ironmesh-os-integration.exe`, plus `ironmesh-folder-agent.exe` as hidden packaged full-trust entry points.
+The manifest now exposes the packaged `berrykeep-config-app.exe` as the visible user-facing entry point, registers `berrykeep-background-launcher.exe` as the login-time startup task, and keeps `berrykeep.exe`, `berrykeep-os-integration.exe`, plus `berrykeep-folder-agent.exe` as hidden packaged full-trust entry points. Legacy IronMesh execution aliases remain available during the transition.
 
-For normal packaged-client testing, start IronMesh through the packaged config app and define instances there first. The direct `ironmesh-os-integration.exe serve ...` flow below remains useful when you need low-level CFAPI or thumbnail-provider verification.
+For normal packaged-client testing, start BerryKeep through the packaged config app and define instances there first. The direct `berrykeep-os-integration.exe serve ...` flow below remains useful when you need low-level CFAPI or thumbnail-provider verification.
 
 ## Typical manual prototype flow
 
@@ -71,10 +71,10 @@ For normal packaged-client testing, start IronMesh through the packaged config a
 3. Copy the outputs into a package staging folder next to `AppxManifest.xml`.
 4. Register/install the package using your normal Windows packaging workflow.
 5. Unregister any existing unpackaged Ironmesh sync root registration for the test root.
-6. Re-register and serve the sync root using the packaged `ironmesh-os-integration.exe` from the installed package location, not the repo-local `target\debug\ironmesh-os-integration.exe`.
+6. Re-register and serve the sync root using the packaged `berrykeep-os-integration.exe` from the installed package location, not the repo-local `target\debug\berrykeep-os-integration.exe`.
    - Example PowerShell:
    - `$pkg = Get-AppxPackage UlrichHornung.IronMesh`
-   - `$exe = Join-Path $pkg.InstallLocation 'ironmesh-os-integration.exe'`
+   - `$exe = Join-Path $pkg.InstallLocation 'berrykeep-os-integration.exe'`
      - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
    - The first run uses `--bootstrap-file` to seed `%LocalAppData%\Ironmesh\sync-roots\...`.
    - Later runs for the same sync root can omit `--bootstrap-file`.
@@ -89,7 +89,7 @@ Why this matters:
 
 - the thumbnail handler is registered as a packaged Cloud Files extension
 - installing the package does not retroactively convert an already-running unpackaged sync-root registration into a packaged one
-- if the sync root is still being served by `target\debug\ironmesh-os-integration.exe`, Explorer may continue using the old unpackaged registration path and never call the prototype thumbnail provider
+- if the sync root is still being served by `target\debug\berrykeep-os-integration.exe`, Explorer may continue using the old unpackaged registration path and never call the prototype thumbnail provider
 
 ## Important note
 
@@ -125,7 +125,7 @@ The helper will:
 - build `ironmesh-folder-agent`
 - build `ironmesh-background-launcher`
 - build `ironmesh-config-app`
-- stage `AppxManifest.xml`, `Assets`, `windows_thumbnail_provider.dll`, `ironmesh.exe`, `ironmesh-os-integration.exe`, `ironmesh-folder-agent.exe`, `ironmesh-background-launcher.exe`, and `ironmesh-config-app.exe`
+- stage `AppxManifest.xml`, `Assets`, `windows_thumbnail_provider.dll`, `berrykeep.exe`, `berrykeep-os-integration.exe`, `berrykeep-folder-agent.exe`, `berrykeep-background-launcher.exe`, and `berrykeep-config-app.exe`
 - if the Windows SDK tools are installed, also:
   - create/reuse a self-signed developer certificate
   - generate an `.msix`
@@ -157,8 +157,8 @@ Typical usage:
 
 The helper will:
 
-- build `windows-thumbnail-provider`, `cli-client`, `os-integration`, `ironmesh-folder-agent`, `ironmesh-background-launcher`, and `ironmesh-config-app` in release mode
-- stage the Store manifest, assets, DLL, and EXEs
+- build the desktop-client sources in release mode
+- stage the Store manifest, assets, DLL, and BerryKeep EXEs
 - create an `.msix`
 - sign the `.msix` with a local self-signed certificate matching the Store publisher by default
 - create a `.msixupload` archive for Partner Center
@@ -176,6 +176,36 @@ Notes:
 - `-SkipSigning` leaves the package unsigned for upload-only scenarios; local installation will not work until the package is signed
 - `-IncludePdbSymbols` packages raw PDBs into `.appxsym`; use that only if you are comfortable uploading private symbol information
 - the script prepares the upload artifact only; Partner Center metadata, screenshots, age ratings, privacy policy, and certification notes still have to be filled manually
+
+## Signing with an existing certificate
+
+Both MSIX helpers retain their local self-signed development-certificate mode,
+but can also sign with an existing PFX. Use that path for a controlled
+test/sideload release; it verifies that the PFX thumbprint and subject match
+the package before publishing only the signed MSIX and its public `.cer` file.
+
+The signing certificate subject must exactly equal the `Publisher` value in
+`AppxManifest.xml`. Provide the three external-signing parameters together;
+the local self-signed certificate does not require a timestamp server:
+
+```powershell
+$env:BERRYKEEP_CLIENT_PFX = 'C:\secure\berrykeep-client.pfx'
+$env:BERRYKEEP_CLIENT_PFX_PASSWORD = '<PFX password>'
+$env:BERRYKEEP_CLIENT_PFX_THUMBPRINT = '<40-character SHA-1 thumbprint>'
+
+powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-StoreUploadPackage.ps1 `
+  -SigningCertificatePath $env:BERRYKEEP_CLIENT_PFX `
+  -SigningCertificatePassword $env:BERRYKEEP_CLIENT_PFX_PASSWORD `
+  -SigningCertificateThumbprint $env:BERRYKEEP_CLIENT_PFX_THUMBPRINT
+```
+
+`-TimestampUrl https://<approved-rfc3161-endpoint>` remains available when a
+timestamped signature is needed later.
+
+The PFX remains at its supplied path and is never copied into the output
+directory. The generated `.cer` contains the public certificate only. A test
+machine must trust that `.cer` in `LocalMachine\TrustedPeople` before it can
+install the signed MSIX.
 
 ## Installing a locally signed MSIX on another PC
 
@@ -206,27 +236,27 @@ This trust step is only for direct sideload testing. Partner Center distribution
 
 ## Install and Reinstall Workflow
 
-Use this when iterating on the thumbnail provider DLL, the manifest, or the packaged `ironmesh-os-integration.exe`.
+Use this when iterating on the thumbnail provider DLL, the manifest, or the packaged `berrykeep-os-integration.exe`.
 
 1. Build, pack, sign, and install from an elevated PowerShell:
    - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Install`
 2. The helper starts the packaged background launcher after install. To inspect or start the Explorer host manually from the installed package location:
    - `$pkg = Get-AppxPackage UlrichHornung.IronMesh`
-   - `$exe = Join-Path $pkg.InstallLocation 'ironmesh-os-integration.exe'`
+   - `$exe = Join-Path $pkg.InstallLocation 'berrykeep-os-integration.exe'`
    - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
    - After that first successful run, the packaged host will reuse the canonical `%LocalAppData%\Ironmesh\sync-roots\...` bootstrap and client identity for the same sync root.
 3. If you changed any packaged content and Windows reports `0x80073CFB`, bump the package version in `windows/thumbnail-provider/AppxManifest.xml`:
    - update `<Identity ... Version="...">` using Store-compatible versioning such as `0.1.1.0`
    - reinstall with the helper script
-4. If Windows reports `0x80073D02`, the installed package is still loaded by Explorer, `dllhost.exe`, or the packaged `ironmesh-os-integration.exe`:
+4. If Windows reports `0x80073D02`, the installed package is still loaded by Explorer, `dllhost.exe`, or the packaged `berrykeep-os-integration.exe`:
    - the helper now installs with `Add-AppxPackage -ForceApplicationShutdown`, which is usually enough
    - if that still fails, stop the packaged host if it is running, restart Explorer, and rerun the helper
    - example fallback:
      - `Stop-Process -Name explorer -Force`
      - `Start-Process explorer.exe`
-5. After a successful reinstall, start the packaged `ironmesh-os-integration.exe` again from the installed package location before testing Explorer integration.
+5. After a successful reinstall, start the packaged `berrykeep-os-integration.exe` again from the installed package location before testing Explorer integration.
 6. For manual hydration cancellation without Explorer, you can also use the packaged or local CLI:
-   - `ironmesh-os-integration cancel-hydration --root-path <sync-root> --path <relative-or-absolute-path>`
+   - `berrykeep-os-integration cancel-hydration --root-path <sync-root> --path <relative-or-absolute-path>`
    - the command succeeds only while that placeholder currently has an active hydration in flight
 
 Why the version bump matters:

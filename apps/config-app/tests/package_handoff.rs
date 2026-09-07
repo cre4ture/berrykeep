@@ -40,12 +40,12 @@ impl Drop for BackgroundAppGuard {
 
 #[test]
 fn background_config_app_restarts_after_packaged_binary_replacement() {
-    let source_binary = cargo_bin("ironmesh-config-app");
+    let source_binary = cargo_bin("berrykeep-config-app");
     let temp_root = unique_temp_dir("config-app-package-handoff");
     let package_root = temp_root.join("package-root");
     let xdg_config_home = temp_root.join("xdg-config");
     let xdg_state_home = temp_root.join("xdg-state");
-    let package_binary = package_root.join("ironmesh-config-app");
+    let package_binary = package_root.join("berrykeep-config-app");
     let client = test_http_client();
     let port = reserve_local_port();
     let base_url = format!("http://127.0.0.1:{port}");

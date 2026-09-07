@@ -29,7 +29,8 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="BerryKeepProgramFiles" Name="BerryKeep">
         <Directory Id="ServerNodeProgramFiles" Name="Server Node">
-          <Component Id="ServerNodeService" Guid="84842F64-678E-4E34-BBAA-C9B8A0689B76" Bitness="always64">
+          <!-- New for the berrykeep-server-node.exe key path; retain this GUID for future releases. -->
+          <Component Id="ServerNodeService" Guid="8861B9C9-4599-4D4A-AFC5-EB87448213C9" Bitness="always64">
             <File
               Id="ServerNodeExecutable"
               Source="$(var.ServerNodeExecutable)"

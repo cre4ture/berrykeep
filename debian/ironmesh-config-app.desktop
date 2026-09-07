@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=Ironmesh Config App
-Comment=Configure packaged Ironmesh background services
-Exec=ironmesh-config-app
+Name=BerryKeep Config App
+Comment=Configure packaged BerryKeep background services
+Exec=berrykeep-config-app
 Terminal=false
 Categories=Network;Utility;

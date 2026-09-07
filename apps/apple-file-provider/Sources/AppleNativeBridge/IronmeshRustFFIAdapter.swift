@@ -68,16 +68,20 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
     ) throws -> String {
         var urlPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
+        let cacheDirectory = ironmeshCachesDirectory().path
         let status = withOptionalCString(connectionInput) { connectionPointer in
             withOptionalCString(serverCAPem) { serverPointer in
                 withOptionalCString(clientIdentityJSON) { identityPointer in
-                    ironmesh_ios_facade_start_web_ui(
-                        connectionPointer,
-                        serverPointer,
-                        identityPointer,
-                        &urlPointer,
-                        &errorPointer
-                    )
+                    cacheDirectory.withCString { cacheDirectoryPointer in
+                        ironmesh_ios_facade_start_web_ui(
+                            connectionPointer,
+                            serverPointer,
+                            identityPointer,
+                            cacheDirectoryPointer,
+                            &urlPointer,
+                            &errorPointer
+                        )
+                    }
                 }
             }
         }
@@ -129,6 +133,64 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         sort: String?,
         mediaFilter: String?
     ) throws -> String {
+        try storeIndexJSON(
+            handle: handle,
+            prefix: prefix,
+            depth: depth,
+            snapshot: snapshot,
+            view: view,
+            offset: offset,
+            limit: limit,
+            sort: sort,
+            mediaFilter: mediaFilter,
+            capturedFromUnix: nil,
+            capturedUntilUnix: nil,
+            excludeLabels: nil
+        )
+    }
+
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?,
+        excludeLabels: String?
+    ) throws -> String {
+        try storeIndexJSON(
+            handle: handle,
+            prefix: prefix,
+            depth: depth,
+            snapshot: snapshot,
+            view: view,
+            offset: offset,
+            limit: limit,
+            sort: sort,
+            mediaFilter: mediaFilter,
+            capturedFromUnix: nil,
+            capturedUntilUnix: nil,
+            excludeLabels: excludeLabels
+        )
+    }
+
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?,
+        capturedFromUnix: UInt64?,
+        capturedUntilUnix: UInt64?,
+        excludeLabels: String?
+    ) throws -> String {
         var jsonPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = withOptionalCString(prefix) { prefixPointer in
@@ -136,19 +198,24 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
                 withOptionalCString(view) { viewPointer in
                     withOptionalCString(sort) { sortPointer in
                         withOptionalCString(mediaFilter) { mediaFilterPointer in
-                            ironmesh_ios_facade_store_index_with_options_json(
-                                handle,
-                                prefixPointer,
-                                numericCast(max(depth, 1)),
-                                snapshotPointer,
-                                viewPointer,
-                                offset ?? -1,
-                                limit ?? -1,
-                                sortPointer,
-                                mediaFilterPointer,
-                                &jsonPointer,
-                                &errorPointer
-                            )
+                            withOptionalCString(excludeLabels) { excludeLabelsPointer in
+                                ironmesh_ios_facade_store_index_with_options_json(
+                                    handle,
+                                    prefixPointer,
+                                    numericCast(max(depth, 1)),
+                                    snapshotPointer,
+                                    viewPointer,
+                                    offset ?? -1,
+                                    limit ?? -1,
+                                    sortPointer,
+                                    mediaFilterPointer,
+                                    capturedFromUnix ?? UInt64.max,
+                                    capturedUntilUnix ?? UInt64.max,
+                                    excludeLabelsPointer,
+                                    &jsonPointer,
+                                    &errorPointer
+                                )
+                            }
                         }
                     }
                 }
@@ -160,6 +227,21 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
             throw IronmeshRustFFIError(message: "Rust bridge returned no store index JSON.")
         }
         return consumeString(jsonPointer)
+    }
+
+    func setMediaLabels(handle: AppleRustHandle, key: String, labelsJSON: String) throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = withOptionalCString(key) { keyPointer in
+            withOptionalCString(labelsJSON) { labelsPointer in
+                ironmesh_ios_facade_set_media_labels_json(
+                    handle,
+                    keyPointer,
+                    labelsPointer,
+                    &errorPointer
+                )
+            }
+        }
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
     }
 
     func metadataJSON(handle: AppleRustHandle, key: String) throws -> String {
@@ -456,16 +538,20 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
     ) throws -> String {
         var urlPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
+        let cacheDirectory = ironmeshCachesDirectory().path
         let status = withOptionalCString(connectionInput) { connectionPointer in
             withOptionalCString(serverCAPem) { serverPointer in
                 withOptionalCString(clientIdentityJSON) { identityPointer in
-                    ironmesh_ios_facade_start_web_ui(
-                        connectionPointer,
-                        serverPointer,
-                        identityPointer,
-                        &urlPointer,
-                        &errorPointer
-                    )
+                    cacheDirectory.withCString { cacheDirectoryPointer in
+                        ironmesh_ios_facade_start_web_ui(
+                            connectionPointer,
+                            serverPointer,
+                            identityPointer,
+                            cacheDirectoryPointer,
+                            &urlPointer,
+                            &errorPointer
+                        )
+                    }
                 }
             }
         }
@@ -549,4 +635,12 @@ private func normalizedOptionalString(_ value: String?) -> String? {
         return nil
     }
     return value
+}
+
+private func ironmeshCachesDirectory() -> URL {
+    let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        ?? FileManager.default.temporaryDirectory
+    let directory = root.appendingPathComponent("IronMesh", isDirectory: true)
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
 }

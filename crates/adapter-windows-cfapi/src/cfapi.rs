@@ -4,7 +4,9 @@ use crate::cfapi_safe_wrap::{
     set_in_sync_state, set_pin_state, update_placeholder, update_placeholder_hresult,
     with_cf_oplock_handle,
 };
-use crate::helpers::{encode_placeholder_file_identity, hresult_nonneg};
+use crate::helpers::{
+    decode_placeholder_file_identity, encode_placeholder_file_identity, hresult_nonneg,
+};
 use anyhow::{Context, Result};
 use std::mem::offset_of;
 use std::os::windows::fs::MetadataExt;
@@ -256,13 +258,27 @@ pub fn cf_dehydrate_placeholder_with_oplock(path: &Path, relative_path: &str) ->
                         path.display()
                     )
                 })?;
-            let synthesized_identity;
-            let file_identity = if placeholder_info.file_identity().is_empty() {
-                synthesized_identity = encode_placeholder_file_identity(relative_path, None);
-                synthesized_identity.as_slice()
-            } else {
-                placeholder_info.file_identity()
-            };
+            let file_identity = placeholder_info.file_identity();
+            let identity = decode_placeholder_file_identity(file_identity).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "refusing to dehydrate {} without a decodable object identity",
+                    relative_path
+                )
+            })?;
+            if identity
+                .object_id
+                .as_deref()
+                .is_none_or(|object_id| object_id.trim().is_empty())
+                || identity
+                    .remote_version
+                    .as_deref()
+                    .is_none_or(|revision| revision.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "cannot dehydrate legacy or unbound placeholder {} until reconciliation binds object_id and expected_revision; keeping local data hydrated to avoid losing an unresolved remote baseline",
+                    relative_path
+                );
+            }
             let dehydrate_range = CF_FILE_RANGE {
                 StartingOffset: 0,
                 Length: placeholder_info.info().OnDiskDataSize,

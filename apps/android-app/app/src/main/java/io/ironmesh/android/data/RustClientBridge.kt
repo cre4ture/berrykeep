@@ -63,9 +63,23 @@ object RustClientBridge {
         limit: Int,
         sort: String?,
         mediaFilter: String?,
+        capturedFromUnixPresent: Boolean,
+        capturedFromUnix: Long,
+        capturedUntilUnixPresent: Boolean,
+        capturedUntilUnix: Long,
+        excludeLabels: String?,
         serverCaPem: String?,
         clientIdentityJson: String?,
     ): String
+
+    @JvmStatic
+    external fun setMediaLabels(
+        connectionInput: String,
+        key: String,
+        labelsJson: String,
+        serverCaPem: String?,
+        clientIdentityJson: String?,
+    ): Int
 
     @JvmStatic
     external fun streamPutObject(
@@ -136,6 +150,10 @@ object RustClientBridge {
 
     @JvmStatic
     external fun stopWebUi()
+
+    /** Clears the app's discardable cache files and stops a currently hosted local Web UI. */
+    @JvmStatic
+    external fun clearCachedData()
 
     @JvmStatic
     external fun configureTitleLatencyMonitor(

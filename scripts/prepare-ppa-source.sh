@@ -151,10 +151,8 @@ CARGO_BIN="$(find_cargo_bin)"
 log "preparing generated packaging inputs under debian/"
 mkdir -p "${PREBUILT_WEB_DIR}"
 
-if [[ ! -d "${ROOT_DIR}/web/node_modules" ]]; then
-  log "web/node_modules missing; running pnpm install"
-  pnpm --dir "${ROOT_DIR}/web" install --frozen-lockfile
-fi
+log "installing locked web workspace dependencies"
+pnpm --dir "${ROOT_DIR}/web" install --frozen-lockfile
 
 log "building bundled web applications"
 pnpm --dir "${ROOT_DIR}/web" build

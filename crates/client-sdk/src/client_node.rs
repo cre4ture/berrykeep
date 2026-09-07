@@ -117,6 +117,17 @@ impl ClientNode {
         Ok(payload)
     }
 
+    pub async fn get_history_source_version(
+        &self,
+        key: impl AsRef<str>,
+        source_object_id: &str,
+        version: &str,
+    ) -> Result<Bytes> {
+        self.client
+            .get_history_source_version(key, source_object_id, version)
+            .await
+    }
+
     pub async fn rename_path(
         &self,
         from_path: impl Into<String>,

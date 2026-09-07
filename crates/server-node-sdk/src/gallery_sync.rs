@@ -194,6 +194,8 @@ mod tests {
             depth: 64,
             media_filter: storage::GalleryIndexMediaFilter::Image,
             captured_sort: storage::GalleryIndexCapturedSort::Desc,
+            captured_from_unix: None,
+            captured_until_unix: None,
             offset: 0,
             limit: 100,
             viewport: Some(storage::GalleryViewportBounds {

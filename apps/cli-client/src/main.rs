@@ -194,7 +194,7 @@ fn build_managed_cli_client(
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "ironmesh")]
+#[command(name = "berrykeep")]
 #[command(about = "CLI client for BerryKeep distributed storage")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
@@ -2053,7 +2053,7 @@ mod tests {
     #[test]
     fn cli_accepts_server_base_url_flag() {
         let cli = Cli::try_parse_from([
-            "ironmesh",
+            "berrykeep",
             "--server-base-url",
             "http://127.0.0.1:8080",
             "health",
@@ -2070,7 +2070,7 @@ mod tests {
     #[test]
     fn cli_accepts_legacy_server_url_alias() {
         let cli = Cli::try_parse_from([
-            "ironmesh",
+            "berrykeep",
             "--server-url",
             "http://127.0.0.1:8080",
             "health",
@@ -2087,7 +2087,7 @@ mod tests {
     #[test]
     fn cli_accepts_serve_s3_subcommand() {
         let cli = Cli::try_parse_from([
-            "ironmesh",
+            "berrykeep",
             "--server-base-url",
             "http://127.0.0.1:8080",
             "serve-s3",

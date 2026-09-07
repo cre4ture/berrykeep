@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 build = "build.rs"
-default-run = "ironmesh"
+default-run = "berrykeep"
 autobins = false
 
 [[bin]]
-name = "ironmesh"
+name = "berrykeep"
 path = "src/main.rs"
 
 [dependencies]

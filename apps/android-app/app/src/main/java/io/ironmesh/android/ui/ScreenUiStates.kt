@@ -68,6 +68,8 @@ data class LibraryUiState(
     val breadcrumbs: List<GalleryBreadcrumbItem>,
     val currentDirectoryPath: String,
     val sort: GallerySortOption,
+    val captureDateRange: GalleryCaptureDateRange,
+    val showSensitiveContent: Boolean,
     val loading: Boolean,
     val error: GalleryLoadError?,
 )
@@ -81,6 +83,8 @@ internal fun MainUiState.toLibraryUiState(): LibraryUiState =
         breadcrumbs = galleryBreadcrumbs,
         currentDirectoryPath = galleryCurrentDirectoryPath,
         sort = gallerySort,
+        captureDateRange = galleryCaptureDateRange,
+        showSensitiveContent = galleryShowSensitiveContent,
         loading = galleryLoading,
         error = galleryError,
     )

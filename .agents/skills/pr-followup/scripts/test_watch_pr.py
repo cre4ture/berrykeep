@@ -188,7 +188,7 @@ def inline_with_event() -> list[dict[str, object]]:
             "body": "Use a helper here.",
             "created_at": "2026-08-17T18:02:00Z",
             "html_url": "https://github.example/octo/repo/pull/42#discussion_r1",
-            "path": "skills/pr-followup/scripts/watch_pr.py",
+            "path": ".agents/skills/pr-followup/scripts/watch_pr.py",
             "line": 1,
         }
     ]

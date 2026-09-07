@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./fleet-telemetry": "./src/fleet-telemetry.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json"

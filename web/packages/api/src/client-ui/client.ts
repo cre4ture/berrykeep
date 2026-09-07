@@ -27,6 +27,9 @@ import type {
   LogsResponse,
   SnapshotSummary,
   StoreGetResponse,
+  StoreHistoryRestoreEntry,
+  StoreHistoryRestoreResponse,
+  StoreHistoryResponse,
   StoreListRequestOptions,
   StoreListResponse,
   StoreListView,
@@ -317,13 +320,52 @@ export async function listStoreEntries(
   if (options.mediaFilter) {
     query.set("media_filter", options.mediaFilter);
   }
+  if (options.capturedFromUnix !== undefined) {
+    query.set("captured_from_unix", String(options.capturedFromUnix));
+  }
+  if (options.capturedUntilUnix !== undefined) {
+    query.set("captured_until_unix", String(options.capturedUntilUnix));
+  }
   if (options.viewport) {
     query.set("south", String(options.viewport.south));
     query.set("west", String(options.viewport.west));
     query.set("north", String(options.viewport.north));
     query.set("east", String(options.viewport.east));
   }
+  appendLabelFilter(query, "require_labels", options.requireLabels);
+  appendLabelFilter(query, "exclude_labels", options.excludeLabels);
   return fetchJson<StoreListResponse>(`${apiV1("/store/list")}?${query.toString()}`);
+}
+
+export async function listStoreHistoryEntries(
+  prefix?: string,
+  depth = 1
+): Promise<StoreHistoryResponse> {
+  const query = new URLSearchParams({
+    depth: String(Math.max(1, Math.floor(depth)))
+  });
+  if (prefix?.trim()) {
+    query.set("prefix", prefix.trim());
+  }
+  return fetchJson<StoreHistoryResponse>(`${apiV1("/store/history")}?${query.toString()}`);
+}
+
+export async function restoreStoreHistoryEntries(
+  entries: StoreHistoryRestoreEntry[]
+): Promise<StoreHistoryRestoreResponse> {
+  return fetchJson<StoreHistoryRestoreResponse>(apiV1("/store/history/restore"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ entries })
+  });
+}
+
+export async function setStoreMediaLabels(path: string, labels: string[]): Promise<void> {
+  await fetchJson<unknown>(apiV1("/store/labels"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path, labels })
+  });
 }
 
 export async function getGalleryMapClusters(
@@ -364,10 +406,39 @@ function galleryMapClusterQuery(request: GalleryMapClustersRequest): URLSearchPa
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());
   }
+  if (request.resolutionViewport) {
+    query.set("resolution_south", String(request.resolutionViewport.south));
+    query.set("resolution_west", String(request.resolutionViewport.west));
+    query.set("resolution_north", String(request.resolutionViewport.north));
+    query.set("resolution_east", String(request.resolutionViewport.east));
+  }
   if (cellSizePx !== null) {
     query.set("cluster_cell_size_px", String(cellSizePx));
   }
+  if (request.capturedFromUnix !== undefined) {
+    query.set("captured_from_unix", String(request.capturedFromUnix));
+  }
+  if (request.capturedUntilUnix !== undefined) {
+    query.set("captured_until_unix", String(request.capturedUntilUnix));
+  }
+  appendLabelFilter(query, "require_labels", request.requireLabels);
+  appendLabelFilter(query, "exclude_labels", request.excludeLabels);
   return query;
+}
+
+function appendLabelFilter(
+  query: URLSearchParams,
+  parameter: "require_labels" | "exclude_labels",
+  labels: string[] | undefined
+): void {
+  const value = (labels ?? [])
+    .map((label) => label.trim())
+    .filter(Boolean)
+    .map((label) => label.replaceAll("\\", "\\\\").replaceAll(",", "\\,"))
+    .join(",");
+  if (value) {
+    query.set(parameter, value);
+  }
 }
 
 export async function getStoreIndexDelta(
@@ -414,7 +485,8 @@ export async function getStoreValue(
   key: string,
   snapshot?: string | null,
   version?: string | null,
-  previewBytes?: number | null
+  previewBytes?: number | null,
+  sourceObjectId?: string | null
 ): Promise<StoreGetResponse> {
   const query = new URLSearchParams({ key });
   if (snapshot?.trim()) {
@@ -422,6 +494,9 @@ export async function getStoreValue(
   }
   if (version?.trim()) {
     query.set("version", version.trim());
+  }
+  if (sourceObjectId?.trim()) {
+    query.set("object_id", sourceObjectId.trim());
   }
   if (previewBytes && previewBytes > 0) {
     query.set("preview_bytes", String(Math.floor(previewBytes)));

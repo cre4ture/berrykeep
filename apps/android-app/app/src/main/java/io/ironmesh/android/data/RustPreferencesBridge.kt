@@ -8,6 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONObject
+import java.io.File
 
 object RustPreferencesBridge {
     private const val MAX_USER_FACING_FAILED_CONNECTION_ATTEMPTS = 12
@@ -227,10 +228,11 @@ object RustPreferencesBridge {
             .sortedByDescending { attempt -> attempt.finishedUnixMs ?: attempt.startedUnixMs }
     }
 
+    /** Removes only discardable app cache files; enrollment and user settings live elsewhere. */
     @JvmStatic
-    fun cacheDirPath(): String {
+    fun clearCacheDirectory() {
         val context = appContext ?: error("RustPreferencesBridge is not initialized")
-        return context.cacheDir.absolutePath
+        File(context.cacheDir, "ironmesh-client").deleteRecursively()
     }
 
     @JvmStatic

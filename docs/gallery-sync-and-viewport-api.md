@@ -8,7 +8,7 @@ same admin authorization as the existing admin store index.
 
 Request a current, paginated gallery view through `GET /api/v1/store/index` (or
 `GET /api/v1/auth/store/index`). Gallery fast-path responses backed by persistent metadata include an opaque
-`sync_token`. Store the response and token atomically on the client. The token is versioned but
+`sync_token`, except for capture-date-filtered responses described below. Store the response and token atomically on the client. The token is versioned but
 must not be parsed by clients. It binds the persistent server history and the normalized query
 membership (`prefix`, `depth`, media filter, captured sort, optional viewport, and optional label
 filter). Offset and limit are intentionally excluded, so pages from the same bootstrap have
@@ -84,6 +84,31 @@ would otherwise be in range. On any reset response, discard incremental assumpti
 the full bootstrap against the selected endpoint. The `current_token` is diagnostic and is not a
 replacement for a token obtained with the new full response.
 
+## Capture-date filters
+
+Current store-index requests can restrict media by its effective capture timestamp:
+
+```text
+captured_from_unix=1709251200&captured_until_unix=1711929600
+```
+
+`captured_from_unix` is inclusive and `captured_until_unix` is exclusive. Either bound may be
+used alone; when both are present the lower bound must not be later than the upper bound. Equal
+bounds form a valid empty interval. Client dates before the unsigned Unix epoch are clamped to
+zero, so a fully pre-epoch range becomes the empty interval `[0, 0)`. Mobile
+clients convert the selected local calendar days to the start of the first day and the start of
+the day after the last day. This keeps an inclusive user-facing date range correct across daylight
+saving transitions.
+
+Capture-date-filtered responses intentionally omit `sync_token`: the retained delta log does not
+store an entry's previous effective capture timestamp, so it cannot faithfully emit every removal
+when an entry crosses a date boundary. Clients should reload these filtered pages instead of
+attempting incremental reconciliation.
+
+Gallery map-cluster requests accept the same bounds. The returned `query_token` carries the
+normalized capture range so paginated cluster-entry requests cannot escape the selected dates.
+Map summaries cache each capture range as part of its bounded LRU scope.
+
 ## Viewport queries
 
 The existing store-index routes accept all four bounds together:
@@ -125,9 +150,22 @@ from the visible map area (smaller maps favor legible bubbles; larger displays f
 grid). The server clamps and quantizes all supplied values to `16`, `24`, `32`, `48`, or `64`
 pixels, with `32` pixels as the default; it rejects non-finite values. Older nodes ignore this
 additive parameter and retain their default clustering behavior. The Gallery UI starts with the
-world viewport and the maximum supported UI depth (`64`), then issues a new request after each map
-movement. Map clustering is available for current data; selecting an immutable snapshot switches
-the Gallery to grid view.
+world viewport and the maximum supported UI depth (`64`). For a rendered map camera, it queries a
+prefetch envelope twice as wide and twice as high as the visible viewport (bounded by the poles and
+the full world, and preserving antimeridian wrapping). The regular bounds filter that prefetch
+envelope; the additive `resolution_south`, `resolution_west`, `resolution_north`, and
+`resolution_east` parameters carry the unbuffered visible bounds. They must be supplied together
+when present and must be fully contained in a query viewport no more than twice as wide or high.
+The server uses the visible bounds as the reference for its 2,048-cell on-screen budget. For a
+prefetch envelope, it scales the response budget by the bounded cell-area ratio (up to 8,192 cells
+for the 2× width and height envelope) and applies that paired budget to the prefetched viewport.
+This preserves the on-screen grid density while bounding the returned cells. Small pans therefore
+already have server clusters to render before the next request completes. The client additionally groups nearby
+server-cluster bubbles in screen space on every camera update, so their display reacts smoothly to
+live pans and fractional zoom changes. A client-merged bubble retains the underlying server clusters
+for selection and Ctrl- or Cmd-click zooming; the server remains authoritative for paging their
+entries. Map clustering is available for current data; selecting an immutable snapshot switches the
+Gallery to grid view.
 
 For cluster diagnostics, the Gallery map display controls offer **Show cluster cells (debug)**.
 It renders the occupied Web Mercator cells from the current server response using that response's

@@ -39,6 +39,11 @@ import {
   type GalleryBasemapConfig,
   type GalleryMapProjection
 } from "./GalleryBasemapMap";
+import {
+  galleryCaptureDateBounds,
+  galleryCaptureDateRangeIsValid,
+  type GalleryCaptureDateBounds
+} from "./gallery-capture-date";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
@@ -102,6 +107,8 @@ const GALLERY_VIRTUAL_PAGE_PRELOAD_RADIUS = 1;
 const GALLERY_VIRTUAL_PAGE_KEEP_RADIUS = 2;
 const GALLERY_VIRTUAL_PAGE_ROOT_MARGIN = "900px 0px";
 const GALLERY_GRID_PAGE_CACHE_MAX_ENTRY_COUNT = 2_048;
+const GALLERY_CAPTURE_DATE_RELOAD_DEBOUNCE_MS = 300;
+const GALLERY_SENSITIVE_LABELS = ["private", "nsfw"] as const;
 
 function isInitialGalleryMapViewport(viewport: GalleryMapViewport): boolean {
   return (
@@ -151,6 +158,8 @@ export type GallerySnapshot = {
 export type GalleryEntry = {
   path: string;
   entry_type: string;
+  labels?: string[];
+  labels_resolved?: boolean;
   version?: string | null;
   size_bytes?: number | null;
   media?: {
@@ -232,6 +241,10 @@ export type GalleryLoadEntriesOptions = {
   limit?: number;
   sort?: GallerySortOrder;
   mediaFilter?: GalleryMediaFilter;
+  capturedFromUnix?: number;
+  capturedUntilUnix?: number;
+  requireLabels?: string[];
+  excludeLabels?: string[];
   /** Bypasses application caches when a consistent multi-page read must be retried. */
   fresh?: boolean;
 };
@@ -304,6 +317,26 @@ type GalleryLoadedScope = {
   snapshotId: string | null;
 };
 
+function galleryReloadSignature(
+  viewMode: GalleryViewMode,
+  sortOrder: GallerySortOrder,
+  mediaFilter: GalleryMediaFilter,
+  showSensitiveContent: boolean,
+  capturedFromUnix: number | undefined,
+  capturedUntilUnix: number | undefined,
+  pageSize: number | null
+): string {
+  return JSON.stringify([
+    viewMode,
+    sortOrder,
+    mediaFilter,
+    showSensitiveContent,
+    capturedFromUnix ?? null,
+    capturedUntilUnix ?? null,
+    pageSize
+  ]);
+}
+
 type GalleryGridSelection = {
   source: "grid";
   index: number;
@@ -364,8 +397,13 @@ export type GalleryDataSource = {
     depth: number;
     mediaFilter: GalleryMediaFilter;
     viewport: GalleryMapViewport;
+    resolutionViewport?: GalleryMapViewport;
     zoom: number;
     clusterCellSizePx?: number;
+    capturedFromUnix?: number;
+    capturedUntilUnix?: number;
+    requireLabels?: string[];
+    excludeLabels?: string[];
   }) => Promise<GalleryMapClustersPayload>;
   loadMapClusterEntries: (
     queryToken: string,
@@ -384,6 +422,8 @@ export type GalleryDataSource = {
     entry: GalleryEntry,
     snapshotId: string | null
   ) => Promise<GalleryEntry["media"] | null>;
+  /** Replaces all labels stored in the media object's XMP sidecar. */
+  setMediaLabels?: (entry: GalleryEntry, labels: string[]) => Promise<unknown>;
   /** Marks the next reads of this resource kind for a network revalidation. */
   requestRevalidation?: (kind: GalleryDataUpdateKind) => void;
   /** Announces that a background revalidation replaced cached data. */
@@ -427,6 +467,7 @@ export function GallerySurface({
     loadVersions,
     restoreVersion,
     retryMediaEntry,
+    setMediaLabels,
     requestRevalidation,
     subscribeToUpdates
   } = dataSource;
@@ -434,6 +475,13 @@ export function GallerySurface({
   const [depth, setDepth] = useState(GALLERY_MAX_DEPTH);
   const [thumbnailsPerRow, setThumbnailsPerRow] = useState(loadStoredThumbnailsPerRow);
   const [showMetadata, setShowMetadata] = useState(loadStoredShowMetadata);
+  // Sensitive-content visibility is intentionally scoped to this mounted gallery. Persisting it
+  // at the browser-origin level would reveal media after the user switches to another gallery.
+  const [showSensitiveContent, setShowSensitiveContent] = useState(false);
+  const [captureDateFrom, setCaptureDateFrom] = useState("");
+  const [captureDateThrough, setCaptureDateThrough] = useState("");
+  const [captureDateReloadBounds, setCaptureDateReloadBounds] =
+    useState<GalleryCaptureDateBounds>({});
   const { ref: galleryGridRef, width: galleryGridWidth } = useElementSize();
   const [viewMode, setViewMode] = useState(() => loadInitialViewMode(initialViewMode));
   const [activeBasemapId, setActiveBasemapId] = useState(loadStoredBasemapId);
@@ -467,8 +515,10 @@ export function GallerySurface({
   const [notice, setNotice] = useState<string | null>(null);
   const [debugPayloadOpened, setDebugPayloadOpened] = useState(false);
   const [retryingSelectedMedia, setRetryingSelectedMedia] = useState(false);
+  const [updatingSelectedLabels, setUpdatingSelectedLabels] = useState(false);
   const [selectedMediaRetryError, setSelectedMediaRetryError] = useState<string | null>(null);
   const loadedScopeRef = useRef<GalleryLoadedScope | null>(null);
+  const requestedScopeRef = useRef<GalleryLoadedScope | null>(null);
   const gridCollectionRef = useRef<GalleryGridCollection | null>(null);
   const gridPagesRef = useRef<Record<number, GalleryGridPageState>>({});
   const gridPageCacheRef = useRef<GalleryGridPageCache>(new Map());
@@ -477,13 +527,18 @@ export function GallerySurface({
   const lastMapViewportRequestRef = useRef({
     viewport: GALLERY_MAP_INITIAL_VIEWPORT,
     zoom: GALLERY_MAP_INITIAL_ZOOM,
-    clusterCellSizePx: undefined as number | undefined
+    clusterCellSizePx: undefined as number | undefined,
+    resolutionViewport: undefined as GalleryMapViewport | undefined
   });
   const galleryRequestVersionRef = useRef(0);
+  const lastStartedGalleryReloadSignatureRef = useRef<string | null>(null);
   const activeGalleryRequestRef = useRef({
     viewMode,
     sortOrder,
-    requestedServerMediaFilter: "image" as GalleryMediaFilter
+    requestedServerMediaFilter: "image" as GalleryMediaFilter,
+    showSensitiveContent,
+    capturedFromUnix: undefined as number | undefined,
+    capturedUntilUnix: undefined as number | undefined
   });
 
   useEffect(() => {
@@ -491,7 +546,15 @@ export function GallerySurface({
       return;
     }
     return subscribeToUpdates(handleGalleryDataUpdate);
-  }, [mediaFilter, sortOrder, subscribeToUpdates, viewMode]);
+  }, [
+    captureDateReloadBounds.capturedFromUnix,
+    captureDateReloadBounds.capturedUntilUnix,
+    mediaFilter,
+    showSensitiveContent,
+    sortOrder,
+    subscribeToUpdates,
+    viewMode
+  ]);
 
   useEffect(() => {
     void refreshSnapshots(false);
@@ -562,10 +625,43 @@ export function GallerySurface({
     enabledMediaKinds,
     mediaFilter
   );
+  const captureDateBounds = galleryCaptureDateBounds(captureDateFrom, captureDateThrough);
+  const hasValidCaptureDateRange = galleryCaptureDateRangeIsValid(
+    captureDateFrom,
+    captureDateThrough
+  );
+  const captureDateFilterActive =
+    captureDateBounds.capturedFromUnix !== undefined ||
+    captureDateBounds.capturedUntilUnix !== undefined;
+  useEffect(() => {
+    if (!hasValidCaptureDateRange) {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      setCaptureDateReloadBounds(captureDateBounds);
+    }, GALLERY_CAPTURE_DATE_RELOAD_DEBOUNCE_MS);
+    return () => window.clearTimeout(timeout);
+  }, [
+    captureDateBounds.capturedFromUnix,
+    captureDateBounds.capturedUntilUnix,
+    hasValidCaptureDateRange
+  ]);
+  const currentGalleryReloadSignature = galleryReloadSignature(
+    viewMode,
+    sortOrder,
+    requestedServerMediaFilter,
+    showSensitiveContent,
+    captureDateReloadBounds.capturedFromUnix,
+    captureDateReloadBounds.capturedUntilUnix,
+    galleryReloadPageSize
+  );
   activeGalleryRequestRef.current = {
     viewMode,
     sortOrder,
-    requestedServerMediaFilter
+    requestedServerMediaFilter,
+    showSensitiveContent,
+    capturedFromUnix: captureDateReloadBounds.capturedFromUnix,
+    capturedUntilUnix: captureDateReloadBounds.capturedUntilUnix
   };
   const availableBasemaps = basemaps ?? [];
   const basemapIdSignature = availableBasemaps.map((candidate) => candidate.id).join("\u0000");
@@ -593,14 +689,37 @@ export function GallerySurface({
     const entriesByPath = new Map<string, GalleryEntry>();
     for (const cluster of mapClustersPayload?.clusters ?? []) {
       if (cluster.entry) {
+        if (!showSensitiveContent && isSensitiveGalleryEntry(cluster.entry)) {
+          continue;
+        }
         entriesByPath.set(cluster.entry.path, cluster.entry);
       }
     }
     for (const entry of mapSelectionEntries) {
+      if (!showSensitiveContent && isSensitiveGalleryEntry(entry)) {
+        continue;
+      }
       entriesByPath.set(entry.path, entry);
     }
     return [...entriesByPath.values()];
-  }, [mapClustersPayload, mapSelectionEntries]);
+  }, [mapClustersPayload, mapSelectionEntries, showSensitiveContent]);
+  // Cluster totals and representative entries are filtered by current servers.
+  // Older nodes ignore the additive label query parameter, so clear a sensitive
+  // representative entry locally before it can render as a map thumbnail.
+  const visibleMapClustersPayload = useMemo(() => {
+    if (!mapClustersPayload || showSensitiveContent) {
+      return mapClustersPayload;
+    }
+    return {
+      ...mapClustersPayload,
+      clusters: mapClustersPayload.clusters.map((cluster) =>
+        cluster.entry && isSensitiveGalleryEntry(cluster.entry)
+          ? { ...cluster, entry: null }
+          : cluster
+      )
+    };
+  }, [mapClustersPayload, showSensitiveContent]);
+  const visibleMapInitialOverviewPayload = mapInitialOverviewPayload;
   const mapMediaEntriesByPath = useMemo(
     () => new Map(mapMediaEntries.map((entry) => [entry.path, entry] as const)),
     [mapMediaEntries]
@@ -776,12 +895,16 @@ export function GallerySurface({
   }, [visiblePageSet, gridCollection, selection, viewMode]);
 
   useEffect(() => {
-    if (!loadedScopeRef.current) {
+    const scope = loadedScopeRef.current ?? requestedScopeRef.current;
+    if (
+      !scope ||
+      lastStartedGalleryReloadSignatureRef.current === currentGalleryReloadSignature
+    ) {
       return;
     }
 
-    void reloadAppliedEntries();
-  }, [galleryReloadPageSize, mediaFilter, sortOrder, viewMode]);
+    void loadGalleryScope(scope, false);
+  }, [currentGalleryReloadSignature]);
 
   async function refreshSnapshots(forceRevalidation = true) {
     if (forceRevalidation) {
@@ -821,7 +944,7 @@ export function GallerySurface({
   }
 
   async function reloadAppliedEntries() {
-    const scope = loadedScopeRef.current;
+    const scope = loadedScopeRef.current ?? requestedScopeRef.current;
     if (!scope) {
       return;
     }
@@ -861,7 +984,13 @@ export function GallerySurface({
     const matchesCurrentMediaRequest =
       update.depth === scope.depth &&
       update.options.sort === activeRequest.sortOrder &&
-      update.options.mediaFilter === activeRequest.requestedServerMediaFilter;
+      update.options.mediaFilter === activeRequest.requestedServerMediaFilter &&
+      update.options.capturedFromUnix === activeRequest.capturedFromUnix &&
+      update.options.capturedUntilUnix === activeRequest.capturedUntilUnix &&
+      arraysEqual(
+        update.options.excludeLabels ?? [],
+        activeRequest.showSensitiveContent ? [] : GALLERY_SENSITIVE_LABELS
+      );
     if (!matchesCurrentMediaRequest) {
       // A slow response for old controls must never replace the user's current
       // view or reset its scroll position.
@@ -869,8 +998,9 @@ export function GallerySurface({
     }
 
     if (activeRequest.viewMode === "map") {
-      const { viewport, zoom, clusterCellSizePx } = lastMapViewportRequestRef.current;
-      void loadMapClustersForViewport(viewport, zoom, clusterCellSizePx, scope);
+      const { viewport, zoom, clusterCellSizePx, resolutionViewport } =
+        lastMapViewportRequestRef.current;
+      void loadMapClustersForViewport(viewport, zoom, clusterCellSizePx, resolutionViewport, scope);
       return;
     }
 
@@ -992,16 +1122,52 @@ export function GallerySurface({
     }
   }
 
+  async function toggleSensitiveLabel(entry: GalleryEntry, label: (typeof GALLERY_SENSITIVE_LABELS)[number]) {
+    if (!setMediaLabels) {
+      setError("Editing image labels is not available on this surface.");
+      return;
+    }
+    if (entry.labels_resolved !== true) {
+      setError("Image labels are temporarily unavailable. Refresh before editing them.");
+      return;
+    }
+
+    const currentLabels = entry.labels ?? [];
+    const nextLabels = currentLabels.includes(label)
+      ? currentLabels.filter((currentLabel) => currentLabel !== label)
+      : [...currentLabels, label];
+    setUpdatingSelectedLabels(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await setMediaLabels(entry, nextLabels);
+      requestRevalidation?.("entries");
+      setSelection(null);
+      setMapSelectionEntries([]);
+      await reloadAppliedEntries();
+      setNotice(
+        nextLabels.includes(label)
+          ? `Added the ${label} label to ${entry.path}.`
+          : `Removed the ${label} label from ${entry.path}.`
+      );
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Failed to update image labels");
+    } finally {
+      setUpdatingSelectedLabels(false);
+    }
+  }
+
   async function loadMapClustersForViewport(
     viewport: GalleryMapViewport,
     zoom: number,
     clusterCellSizePx?: number,
+    resolutionViewport?: GalleryMapViewport,
     targetScope = loadedScopeRef.current
   ): Promise<GalleryMapClustersPayload | null> {
     if (!targetScope || targetScope.snapshotId) {
       return null;
     }
-    lastMapViewportRequestRef.current = { viewport, zoom, clusterCellSizePx };
+    lastMapViewportRequestRef.current = { viewport, zoom, clusterCellSizePx, resolutionViewport };
     const requestVersion = mapClusterRequestVersionRef.current + 1;
     mapClusterRequestVersionRef.current = requestVersion;
     try {
@@ -1010,8 +1176,11 @@ export function GallerySurface({
         depth: targetScope.depth,
         mediaFilter: requestedServerMediaFilter,
         viewport,
+        resolutionViewport,
         zoom,
-        clusterCellSizePx
+        clusterCellSizePx,
+        ...captureDateReloadBounds,
+        excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS]
       });
       if (requestVersion !== mapClusterRequestVersionRef.current) {
         return null;
@@ -1035,13 +1204,20 @@ export function GallerySurface({
     limit: number
   ): Promise<GalleryMapClusterEntriesPayload> {
     try {
-      return await loadMapClusterEntries(queryToken, clusterId, offset, limit);
+      const payload = await loadMapClusterEntries(queryToken, clusterId, offset, limit);
+      return showSensitiveContent
+        ? payload
+        : {
+            ...payload,
+            entries: payload.entries.filter((entry) => !isSensitiveGalleryEntry(entry))
+          };
     } catch (clusterError) {
       if (!isGalleryMapClusterStaleError(clusterError)) {
         throw clusterError;
       }
-      const { viewport, zoom, clusterCellSizePx } = lastMapViewportRequestRef.current;
-      await loadMapClustersForViewport(viewport, zoom, clusterCellSizePx);
+      const { viewport, zoom, clusterCellSizePx, resolutionViewport } =
+        lastMapViewportRequestRef.current;
+      await loadMapClustersForViewport(viewport, zoom, clusterCellSizePx, resolutionViewport);
       throw new Error("The gallery changed. Map clusters were refreshed; select the cluster again.");
     }
   }
@@ -1051,6 +1227,16 @@ export function GallerySurface({
     syncPrefixInput: boolean,
     targetViewMode: GalleryViewMode = viewMode
   ) {
+    requestedScopeRef.current = targetScope;
+    lastStartedGalleryReloadSignatureRef.current = galleryReloadSignature(
+      targetViewMode,
+      sortOrder,
+      requestedServerMediaFilter,
+      showSensitiveContent,
+      captureDateReloadBounds.capturedFromUnix,
+      captureDateReloadBounds.capturedUntilUnix,
+      targetViewMode === "grid" ? galleryVirtualPageSize : null
+    );
     const mapViewportRequest = lastMapViewportRequestRef.current;
     const shouldFitInitialMapOverview =
       targetViewMode === "map" &&
@@ -1091,8 +1277,11 @@ export function GallerySurface({
             depth: targetScope.depth,
             mediaFilter: requestedServerMediaFilter,
             viewport: mapViewportRequest.viewport,
+            resolutionViewport: mapViewportRequest.resolutionViewport,
             zoom: mapViewportRequest.zoom,
-            clusterCellSizePx: mapViewportRequest.clusterCellSizePx
+            clusterCellSizePx: mapViewportRequest.clusterCellSizePx,
+            ...captureDateReloadBounds,
+            excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS]
           })
         ]);
 
@@ -1117,6 +1306,8 @@ export function GallerySurface({
           view: "tree",
           sort: sortOrder,
           mediaFilter: requestedServerMediaFilter,
+          ...captureDateReloadBounds,
+          excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS],
           offset: 0,
           limit: galleryVirtualPageSize
         })
@@ -1199,6 +1390,8 @@ export function GallerySurface({
         view: "tree",
         sort: sortOrder,
         mediaFilter: requestedServerMediaFilter,
+        ...captureDateReloadBounds,
+        excludeLabels: showSensitiveContent ? [] : [...GALLERY_SENSITIVE_LABELS],
         offset: pageIndex * collection.pageSize,
         limit: collection.pageSize
       });
@@ -1648,6 +1841,11 @@ export function GallerySurface({
               ) : null}
               {entry.media?.mime_type ? <Badge variant="dot">{entry.media.mime_type}</Badge> : null}
               {entry.media?.gps ? <Badge color="grape" variant="dot">GPS</Badge> : null}
+              {(entry.labels ?? []).map((label) => (
+                <Badge key={label} color={sensitiveLabelColor(label)} variant="dot">
+                  {label}
+                </Badge>
+              ))}
             </Group>
             {entry.media?.taken_at_unix ? (
               <Text size="sm" c="dimmed">
@@ -1786,6 +1984,43 @@ export function GallerySurface({
                     }}
                   />
                 ) : null}
+                <TextInput
+                  label="Captured from"
+                  type="date"
+                  value={captureDateFrom}
+                  max={captureDateThrough || undefined}
+                  onChange={(event) => setCaptureDateFrom(event.currentTarget.value)}
+                  onBlur={(event) => {
+                    const nextDate = event.currentTarget.value;
+                    if (captureDateThrough && nextDate > captureDateThrough) {
+                      setCaptureDateThrough(nextDate);
+                    }
+                  }}
+                />
+                <TextInput
+                  label="Captured through"
+                  type="date"
+                  value={captureDateThrough}
+                  min={captureDateFrom || undefined}
+                  onChange={(event) => setCaptureDateThrough(event.currentTarget.value)}
+                  onBlur={(event) => {
+                    const nextDate = event.currentTarget.value;
+                    if (captureDateFrom && nextDate && nextDate < captureDateFrom) {
+                      setCaptureDateFrom(nextDate);
+                    }
+                  }}
+                />
+                <Button
+                  variant="default"
+                  disabled={!captureDateFilterActive}
+                  onClick={() => {
+                    setCaptureDateFrom("");
+                    setCaptureDateThrough("");
+                  }}
+                  mt={25}
+                >
+                  Clear capture dates
+                </Button>
                 <Stack gap={6}>
                   <Text size="sm" fw={500}>
                     Grid / Map
@@ -1826,6 +2061,13 @@ export function GallerySurface({
                   label="Show metadata"
                   checked={showMetadata}
                   onChange={(event) => setShowMetadata(event.currentTarget.checked)}
+                  mt={34}
+                />
+                <Switch
+                  label="Show private / NSFW media"
+                  description="Hidden by default"
+                  checked={showSensitiveContent}
+                  onChange={(event) => setShowSensitiveContent(event.currentTarget.checked)}
                   mt={34}
                 />
               </SimpleGrid>
@@ -1916,8 +2158,8 @@ export function GallerySurface({
                 </Group>
               ) : null}
 
-              {mapClustersPayload !== null &&
-              mapClustersPayload.clusters.length === 0 &&
+              {visibleMapClustersPayload !== null &&
+              visibleMapClustersPayload.clusters.length === 0 &&
               activeMediaSummary.geotagged_count === 0 ? (
                 <Card withBorder radius="md" padding="xl">
                   <Stack gap="xs" align="center">
@@ -1941,13 +2183,18 @@ export function GallerySurface({
                   onSelectProjection={setActiveMapProjection}
                   showClusterGrid={showMapClusterGrid}
                   onShowClusterGridChange={setShowMapClusterGrid}
-                  clustersPayload={mapClustersPayload}
-                  initialOverviewPayload={mapInitialOverviewPayload}
+                  clustersPayload={visibleMapClustersPayload}
+                  initialOverviewPayload={visibleMapInitialOverviewPayload}
                   hiddenOnMapCount={hiddenOnMapCount}
                   selectedPath={selection?.path ?? null}
                   getMarkerRequest={(entry) => getMediaRequests(entry, activeSnapshotId).thumbnail ?? null}
-                  onViewportChange={(viewport, zoom, clusterCellSizePx) =>
-                    void loadMapClustersForViewport(viewport, zoom, clusterCellSizePx)
+                  onViewportChange={(viewport, zoom, clusterCellSizePx, resolutionViewport) =>
+                    void loadMapClustersForViewport(
+                      viewport,
+                      zoom,
+                      clusterCellSizePx,
+                      resolutionViewport
+                    )
                   }
                   loadClusterEntries={loadMapClusterEntriesWithRecovery}
                   onSwitchToGrid={switchToGridView}
@@ -1976,8 +2223,9 @@ export function GallerySurface({
               <Stack gap="xs" align="center">
                 <Text fw={700}>No media objects in view</Text>
                 <Text c="dimmed" ta="center">
-                  Load a different prefix or increase the depth to include nested photo or movie
-                  keys.
+                  {captureDateFilterActive
+                    ? "Choose different capture dates or clear the date filter."
+                    : "Load a different prefix or increase the depth to include nested photo or movie keys."}
                 </Text>
               </Stack>
             </Card>
@@ -2182,14 +2430,37 @@ export function GallerySurface({
             : undefined
         }
         extraActions={
-          loadVersions && activeMediaHistoryKey ? (
-            <Button
-              variant="default"
-              size="xs"
-              onClick={() => void openVersionHistoryDrawer(activeMediaHistoryKey)}
-            >
-              Version history
-            </Button>
+          (loadVersions && activeMediaHistoryKey) || (setMediaLabels && selectedEntry) ? (
+            <Group gap="xs">
+              {loadVersions && activeMediaHistoryKey ? (
+                <Button
+                  variant="default"
+                  size="xs"
+                  onClick={() => void openVersionHistoryDrawer(activeMediaHistoryKey)}
+                >
+                  Version history
+                </Button>
+              ) : null}
+              {setMediaLabels && versionPreviewIndex === null && selectedEntry ? (
+                <>
+                  {GALLERY_SENSITIVE_LABELS.map((label) => {
+                    const enabled = (selectedEntry.labels ?? []).includes(label);
+                    return (
+                      <Button
+                        key={label}
+                        variant={enabled ? "filled" : "default"}
+                        color={label === "nsfw" ? "red" : "orange"}
+                        size="xs"
+                        loading={updatingSelectedLabels}
+                        onClick={() => void toggleSensitiveLabel(selectedEntry, label)}
+                      >
+                        {enabled ? `Remove ${label}` : `Mark ${label}`}
+                      </Button>
+                    );
+                  })}
+                </>
+              ) : null}
+            </Group>
           ) : null
         }
         renderDetails={() =>
@@ -2488,7 +2759,8 @@ type GalleryMapPanelProps = {
   onViewportChange: (
     viewport: GalleryMapViewport,
     zoom: number,
-    clusterCellSizePx: number
+    clusterCellSizePx: number,
+    resolutionViewport: GalleryMapViewport
   ) => void;
   loadClusterEntries: GalleryDataSource["loadMapClusterEntries"];
   onSelectPath: (path: string, visibleEntries: GalleryEntry[]) => void;
@@ -2842,6 +3114,7 @@ function GalleryWorldMap({
     cluster: GalleryMapCluster;
     queryToken: string;
     entries: GalleryEntry[];
+    nextOffset: number;
     totalEntryCount: number;
     hasMore: boolean;
     loading: boolean;
@@ -2884,10 +3157,12 @@ function GalleryWorldMap({
       return;
     }
     const existingEntries = append ? clusterDialog?.entries ?? [] : [];
+    const nextOffset = append ? clusterDialog?.nextOffset ?? 0 : 0;
     setClusterDialog({
       cluster,
       queryToken,
       entries: existingEntries,
+      nextOffset,
       totalEntryCount: append ? clusterDialog?.totalEntryCount ?? cluster.count : cluster.count,
       hasMore: append ? clusterDialog?.hasMore ?? true : true,
       loading: true,
@@ -2897,13 +3172,14 @@ function GalleryWorldMap({
       const page = await loadClusterEntries(
         queryToken,
         cluster.cluster_id,
-        existingEntries.length,
+        nextOffset,
         GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE
       );
       setClusterDialog({
         cluster,
         queryToken,
         entries: [...existingEntries, ...page.entries],
+        nextOffset: page.offset + page.limit,
         totalEntryCount: page.total_entry_count,
         hasMore: page.has_more,
         loading: false,
@@ -2914,6 +3190,7 @@ function GalleryWorldMap({
         cluster,
         queryToken,
         entries: existingEntries,
+        nextOffset,
         totalEntryCount: cluster.count,
         hasMore: append,
         loading: false,
@@ -4439,6 +4716,26 @@ function parseShowMetadata(value: boolean | string | null | undefined): boolean 
   }
 
   return true;
+}
+
+function isSensitiveGalleryEntry(entry: GalleryEntry): boolean {
+  return (entry.labels ?? []).some((label) =>
+    (GALLERY_SENSITIVE_LABELS as readonly string[]).includes(label)
+  );
+}
+
+function sensitiveLabelColor(label: string): string {
+  if (label === "nsfw") {
+    return "red";
+  }
+  if (label === "private") {
+    return "orange";
+  }
+  return "gray";
+}
+
+function arraysEqual(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function resolveGalleryGridColumns(

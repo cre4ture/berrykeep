@@ -23,7 +23,7 @@ The server-side implementation is already present and is exercised by the galler
 Confirmed implementation surfaces:
 
 - `crates/server-node-sdk/src/lib.rs`: synchronous read-through chunk hydration on object reads,
-- `crates/web-ui-backend/src/mbtiles.rs`: logical-file chunk caching used by map tile reads,
+- `crates/server-node-sdk/src/web_maps.rs`: server-side MBTiles lookups for Gallery raster and vector tiles,
 - `tests/system-tests/src/cluster_test.rs`: five-node non-replica read-through coverage.
 
 So the client-side routing work should treat read-through cache as an existing server capability,

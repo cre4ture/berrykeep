@@ -49,7 +49,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 
 #[derive(Debug, Parser)]
-#[command(name = "ironmesh-config-app")]
+#[command(name = "berrykeep-config-app")]
 #[command(about = "Local configuration UI for packaged BerryKeep background services")]
 struct Cli {
     #[command(subcommand)]

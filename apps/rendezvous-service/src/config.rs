@@ -27,7 +27,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 );
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Parser)]
-#[command(name = "ironmesh-rendezvous-service")]
+#[command(name = "berrykeep-rendezvous-service")]
 #[command(about = "Standalone BerryKeep rendezvous plus relay service")]
 #[command(version = PACKAGE_VERSION)]
 #[command(long_version = LONG_VERSION)]
@@ -304,7 +304,7 @@ impl RendezvousServiceConfig {
         }
 
         anyhow::bail!(
-            "ironmesh-rendezvous-service refuses insecure HTTP startup without mTLS; configure IRONMESH_RENDEZVOUS_CLIENT_CA_CERT plus IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY, or use a failover package with IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE and IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE, or set IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true for local development/testing only"
+            "berrykeep-rendezvous-service refuses insecure HTTP startup without mTLS; configure IRONMESH_RENDEZVOUS_CLIENT_CA_CERT plus IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY, or use a failover package with IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE and IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE, or set IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true for local development/testing only"
         )
     }
 
@@ -922,7 +922,7 @@ mod tests {
     #[test]
     fn cli_config_parses_failover_args() {
         let cli = RendezvousServiceCliConfig::try_parse_from([
-            "ironmesh-rendezvous-service",
+            "berrykeep-rendezvous-service",
             "--bind-addr=0.0.0.0:44042",
             "--failover-package",
             "/tmp/failover.json",
@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn cli_config_rejects_failover_passphrase_flag() {
         let err = RendezvousServiceCliConfig::try_parse_from([
-            "ironmesh-rendezvous-service",
+            "berrykeep-rendezvous-service",
             "--failover-passphrase=super-secret",
         ])
         .expect_err("failover passphrase should not be a CLI flag");

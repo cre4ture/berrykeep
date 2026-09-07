@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACKAGE_ROOT="/usr/lib/ironmesh-client"
-PACKAGED_BINARY="${PACKAGE_ROOT}/ironmesh-config-app"
-PACKAGED_BACKUP="${PACKAGE_ROOT}/ironmesh-config-app.packaged-deb"
+PACKAGE_ROOT="/usr/lib/berrykeep-client"
+PACKAGED_BINARY="${PACKAGE_ROOT}/berrykeep-config-app"
+PACKAGED_BACKUP="${PACKAGE_ROOT}/berrykeep-config-app.packaged-deb"
 DEFAULT_PROFILE="release"
 
 PROFILE="${IRONMESH_LOCAL_PROFILE:-${DEFAULT_PROFILE}}"
@@ -15,7 +15,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/use-local-ironmesh-config-app.sh [options]
 
-Build the local `ironmesh-config-app` binary and replace the packaged config
+Build the local `berrykeep-config-app` binary and replace the packaged config
 app binary with a symlink to the local build for testing.
 
 Options:
@@ -29,12 +29,12 @@ Environment:
 
 Notes:
   The packaged binary is backed up once at:
-    /usr/lib/ironmesh-client/ironmesh-config-app.packaged-deb
+    /usr/lib/berrykeep-client/berrykeep-config-app.packaged-deb
 
 Examples:
   scripts/use-local-ironmesh-config-app.sh
   scripts/use-local-ironmesh-config-app.sh --profile debug
-  scripts/use-local-ironmesh-config-app.sh --local-binary /home/me/rust-dev/ironmesh/target/release/ironmesh-config-app
+  scripts/use-local-ironmesh-config-app.sh --local-binary /home/me/rust-dev/ironmesh/target/release/berrykeep-config-app
 EOF
 }
 
@@ -96,9 +96,9 @@ resolve_local_binary() {
     return
   fi
 
-  LOCAL_BINARY="${ROOT_DIR}/target/${PROFILE}/ironmesh-config-app"
+  LOCAL_BINARY="${ROOT_DIR}/target/${PROFILE}/berrykeep-config-app"
   if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    log "building local ironmesh-config-app binary with cargo profile=${PROFILE}"
+    log "building local berrykeep-config-app binary with cargo profile=${PROFILE}"
     cargo build --locked -p ironmesh-config-app "--profile=${PROFILE}" --manifest-path "${ROOT_DIR}/Cargo.toml"
   fi
 
@@ -132,9 +132,9 @@ install_local_symlink() {
 print_result() {
   local resolved_target
   resolved_target="$(readlink -f "$PACKAGED_BINARY")"
-  log "active ironmesh-config-app target: ${resolved_target}"
-  log "package symlink at /usr/bin/ironmesh-config-app remains unchanged"
-  log "restart any running ironmesh-config-app --background process to pick up the new binary"
+  log "active berrykeep-config-app target: ${resolved_target}"
+  log "package symlink at /usr/bin/berrykeep-config-app remains unchanged"
+  log "restart any running berrykeep-config-app --background process to pick up the new binary"
   log "revert with: scripts/restore-packaged-ironmesh-config-app.sh"
 }
 

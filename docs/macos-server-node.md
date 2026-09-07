@@ -51,7 +51,7 @@ Rust for package-only validation.
 Install the generated or released package on the target Mac:
 
 ```bash
-sudo installer -pkg target/macos/ironmesh-server-node-<version>.pkg -target /
+sudo installer -pkg target/macos/berrykeep-server-node-<version>.pkg -target /
 ```
 
 The installer creates the `_ironmesh` non-login account, starts the daemon, and

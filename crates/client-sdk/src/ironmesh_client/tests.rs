@@ -1092,6 +1092,9 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         StoreIndexEntry {
             path: "docs/".to_string(),
             entry_type: "prefix".to_string(),
+            object_id: None,
+            labels: Vec::new(),
+            labels_resolved: false,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -1102,6 +1105,9 @@ fn snapshot_conversion_maps_prefix_and_keys() {
         StoreIndexEntry {
             path: "docs/readme.txt".to_string(),
             entry_type: "key".to_string(),
+            object_id: Some("obj-readme".to_string()),
+            labels: Vec::new(),
+            labels_resolved: false,
             version: None,
             content_hash: None,
             size_bytes: Some(42),
@@ -1148,11 +1154,9 @@ fn snapshot_conversion_maps_prefix_and_keys() {
     assert_eq!(snapshot.remote.len(), 2);
     assert_eq!(snapshot.remote[0], NamespaceEntry::directory("docs"));
     assert_eq!(snapshot.remote[1].path, "docs/readme.txt");
-    assert_eq!(snapshot.remote[1].version.as_deref(), Some("server-head"));
-    assert_eq!(
-        snapshot.remote[1].content_hash.as_deref(),
-        Some("server-head:docs/readme.txt")
-    );
+    assert_eq!(snapshot.remote[1].object_id, None);
+    assert_eq!(snapshot.remote[1].version, None);
+    assert_eq!(snapshot.remote[1].content_hash, None);
     assert_eq!(
         snapshot.remote[1].content_fingerprint.as_deref(),
         Some("cfp-readme")
@@ -1176,10 +1180,131 @@ fn snapshot_conversion_maps_prefix_and_keys() {
 }
 
 #[test]
+fn snapshot_entries_without_revisions_omit_cas_identity() {
+    let entries = [
+        ("docs/first.txt", "manifest-first", 1_723_456_789),
+        ("docs/second.txt", "manifest-second", 1_723_456_790),
+    ]
+    .into_iter()
+    .map(|(path, content_hash, modified_at_unix)| StoreIndexEntry {
+        path: path.to_string(),
+        entry_type: "key".to_string(),
+        object_id: Some(format!("object-{path}")),
+        labels: Vec::new(),
+        labels_resolved: false,
+        version: None,
+        content_hash: Some(content_hash.to_string()),
+        size_bytes: Some(42),
+        modified_at_unix: Some(modified_at_unix),
+        content_fingerprint: Some(format!("fingerprint-{content_hash}")),
+        media: None,
+    })
+    .collect();
+
+    let snapshot = snapshot_from_store_index_entries(entries);
+
+    assert_eq!(snapshot.remote.len(), 2);
+    assert!(
+        snapshot
+            .remote
+            .iter()
+            .all(|entry| entry.object_id.is_none())
+    );
+    assert!(snapshot.remote.iter().all(|entry| entry.version.is_none()));
+}
+
+#[test]
+fn desired_behavior_snapshot_entries_never_use_server_head_as_a_revision_identity() {
+    let snapshot = snapshot_from_store_index_entries(vec![StoreIndexEntry {
+        path: "docs/readme.txt".to_string(),
+        entry_type: "key".to_string(),
+        object_id: None,
+        labels: Vec::new(),
+        labels_resolved: false,
+        version: None,
+        content_hash: Some("manifest-readme".to_string()),
+        size_bytes: Some(42),
+        modified_at_unix: Some(1_723_456_789),
+        content_fingerprint: Some("fingerprint-readme".to_string()),
+        media: None,
+    }]);
+
+    assert_eq!(snapshot.remote[0].version, None);
+    assert_eq!(snapshot.remote[0].object_id, None);
+}
+
+fn completed_upload_mapping_fixture() -> (UploadSessionView, UploadSessionCompleteResponse) {
+    let completed = UploadSessionCompleteResponse {
+        object_id: "obj-upload".to_string(),
+        snapshot_id: "snapshot-after-upload".to_string(),
+        version_id: "revision-after-upload".to_string(),
+        manifest_hash: "manifest-after-upload".to_string(),
+        state: "confirmed".to_string(),
+        new_chunks: 1,
+        dedup_reused_chunks: 0,
+        created_new_version: true,
+        total_size_bytes: 42,
+    };
+    let session = UploadSessionView {
+        upload_id: "upload-1".to_string(),
+        key: "docs/readme.txt".to_string(),
+        total_size_bytes: 42,
+        chunk_size_bytes: 42,
+        chunk_count: 1,
+        received_indexes: vec![0],
+        completed: true,
+        completed_result: Some(completed.clone()),
+        expires_at_unix: 1_723_456_999,
+    };
+    (session, completed)
+}
+
+/// Temporary green characterization of undesired current behavior.
+/// Remove this test when upload results retain the confirmed revision and hash.
+#[test]
+fn undesired_current_behavior_upload_result_discards_server_revision_and_manifest_hash() {
+    let (session, completed) = completed_upload_mapping_fixture();
+
+    let result = upload_result_from_session_complete("docs/readme.txt", &session, &completed);
+    let serialized = serde_json::to_value(result).expect("upload result should serialize");
+
+    assert!(
+        serialized.get("version_id").is_none() && serialized.get("manifest_hash").is_none(),
+        "UNDESIRED CURRENT BEHAVIOR: the client receives revision/hash metadata but drops both from UploadResult"
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "completed upload result must retain the confirmed server revision and manifest hash"
+)]
+fn desired_behavior_upload_result_retains_server_revision_and_manifest_hash() {
+    let (session, completed) = completed_upload_mapping_fixture();
+
+    let result = upload_result_from_session_complete("docs/readme.txt", &session, &completed);
+    let serialized = serde_json::to_value(result).expect("upload result should serialize");
+
+    assert!(
+        serialized
+            .get("version_id")
+            .and_then(serde_json::Value::as_str)
+            == Some("revision-after-upload")
+            && serialized
+                .get("manifest_hash")
+                .and_then(serde_json::Value::as_str)
+                == Some("manifest-after-upload"),
+        "completed upload result must retain the confirmed server revision and manifest hash"
+    );
+}
+
+#[test]
 fn ensure_missing_folder_markers_adds_nested_parents() {
     let mut entries = vec![StoreIndexEntry {
         path: "a/b/c.txt".to_string(),
         entry_type: "key".to_string(),
+        object_id: None,
+        labels: Vec::new(),
+        labels_resolved: false,
         version: None,
         content_hash: None,
         size_bytes: Some(7),
@@ -1203,6 +1328,9 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
         StoreIndexEntry {
             path: "docs/".to_string(),
             entry_type: "prefix".to_string(),
+            object_id: None,
+            labels: Vec::new(),
+            labels_resolved: false,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -1213,6 +1341,9 @@ fn ensure_missing_folder_markers_keeps_existing_markers_unique() {
         StoreIndexEntry {
             path: "docs/guides/readme.md".to_string(),
             entry_type: "key".to_string(),
+            object_id: None,
+            labels: Vec::new(),
+            labels_resolved: false,
             version: None,
             content_hash: None,
             size_bytes: Some(11),
@@ -1239,6 +1370,9 @@ fn ensure_missing_folder_markers_stays_within_the_requested_prefix() {
     let mut entries = vec![StoreIndexEntry {
         path: "devices/Oppo-uli/Fotos/image.jpg".to_string(),
         entry_type: "key".to_string(),
+        object_id: None,
+        labels: Vec::new(),
+        labels_resolved: false,
         version: None,
         content_hash: None,
         size_bytes: Some(7),
@@ -1358,6 +1492,9 @@ fn store_index_test_entry(path: &str) -> StoreIndexEntry {
     StoreIndexEntry {
         path: path.to_string(),
         entry_type: "key".to_string(),
+        object_id: None,
+        labels: Vec::new(),
+        labels_resolved: false,
         version: None,
         content_hash: None,
         size_bytes: None,
@@ -1621,6 +1758,125 @@ async fn spawn_direct_http_route_server(
     .await
 }
 
+#[tokio::test]
+async fn untracked_relative_path_requests_keep_server_failures_out_of_route_diagnostics() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("test listener should have an address");
+    let server = tokio::spawn(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/maps/test-success",
+                get(|| async {
+                    // Make the raw wall-clock duration unusable as a route
+                    // latency sample. Untracked requests must still apply the
+                    // server-work exclusion used by ordinary requests.
+                    (
+                        [(HEADER_SERVER_PROCESSING_DURATION_US, "1000000")],
+                        StatusCode::OK,
+                    )
+                }),
+            )
+            .route(
+                "/api/v1/maps/test-failure",
+                get(|| async { StatusCode::BAD_GATEWAY }),
+            );
+        let _ = axum::serve(listener, app).await;
+    });
+    let client = IronMeshClient::from_direct_base_url(format!("http://{address}"));
+
+    let success = client
+        .request_relative_path_without_route_diagnostics(
+            Method::GET,
+            "/maps/test-success",
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("untracked success request should complete");
+    assert_eq!(success.status, StatusCode::OK);
+
+    let failure = client
+        .request_relative_path_without_route_diagnostics(
+            Method::GET,
+            "/maps/test-failure",
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("server response should remain available to the caller");
+    assert_eq!(failure.status, StatusCode::BAD_GATEWAY);
+
+    let endpoint = &client.connection_diagnostics().endpoints[0];
+    assert_eq!(endpoint.consecutive_failures, 0);
+    assert_eq!(endpoint.total_failures, 0);
+    assert_eq!(endpoint.total_successes, 1);
+    assert!(endpoint.last_error.is_none());
+    assert_eq!(
+        client.connection_route_snapshot().endpoints[0].ewma_latency_ms,
+        Some(0.0)
+    );
+    assert!(endpoint.last_used_unix_ms.is_none());
+    assert!(endpoint.recent_attempts.is_empty());
+
+    server.abort();
+
+    let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("temporary listener should bind");
+    let unavailable_address = unavailable_listener
+        .local_addr()
+        .expect("temporary listener should have an address");
+    drop(unavailable_listener);
+    let unavailable_client =
+        IronMeshClient::from_direct_base_url(format!("http://{unavailable_address}"));
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let observed_refreshes = Arc::clone(&refreshes);
+    unavailable_client.set_transport_failure_refresh_observer(Some(Arc::new(move || {
+        observed_refreshes.fetch_add(1, Ordering::SeqCst);
+    })));
+    unavailable_client
+        .request_relative_path_without_route_diagnostics(
+            Method::GET,
+            "/maps/test-unavailable",
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect_err("unreachable map endpoint should fail");
+    let endpoint = &unavailable_client.connection_diagnostics().endpoints[0];
+    assert_eq!(endpoint.consecutive_failures, 1);
+    assert_eq!(endpoint.total_failures, 1);
+    assert!(endpoint.recent_attempts.is_empty());
+    assert!(
+        unavailable_client.connection_route_snapshot().endpoints[0]
+            .circuit_open_until_unix_ms
+            .is_some()
+    );
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+
+    let endpoint = unavailable_client
+        .transport_router
+        .endpoint(0)
+        .expect("unavailable endpoint should remain registered");
+    unavailable_client.record_transport_success_without_diagnostics(0, &endpoint, 1.0, 128);
+
+    let endpoint = &unavailable_client.connection_diagnostics().endpoints[0];
+    assert_eq!(endpoint.consecutive_failures, 0);
+    assert_eq!(endpoint.total_failures, 1);
+    assert_eq!(endpoint.total_successes, 1);
+    assert!(endpoint.last_error.is_none());
+    assert!(endpoint.recent_attempts.is_empty());
+    assert!(
+        unavailable_client.connection_route_snapshot().endpoints[0]
+            .circuit_open_until_unix_ms
+            .is_none()
+    );
+}
+
 #[derive(Clone)]
 struct SnapshotHttpRouteState {
     hits: Arc<AtomicUsize>,
@@ -1755,6 +2011,9 @@ fn snapshot_index_response_body(path: &str) -> Vec<u8> {
         entries: vec![StoreIndexEntry {
             path: path.to_string(),
             entry_type: "key".to_string(),
+            object_id: Some("obj-snapshot".to_string()),
+            labels: Vec::new(),
+            labels_resolved: false,
             version: Some("v1".to_string()),
             content_hash: Some("hash-1".to_string()),
             size_bytes: Some(42),
@@ -1894,6 +2153,7 @@ async fn upload_session_http_complete(
     state.complete_hits.fetch_add(1, Ordering::SeqCst);
     session.completed = true;
     let response = UploadSessionCompleteResponse {
+        object_id: "obj-test".to_string(),
         snapshot_id: "snap-test".to_string(),
         version_id: "ver-test".to_string(),
         manifest_hash: "manifest-test".to_string(),
@@ -1962,6 +2222,134 @@ async fn spawn_upload_session_http_server_with_start_gate(
             .expect("upload session http server should run");
     });
     (format!("http://{addr}"), state, server)
+}
+
+#[tokio::test]
+async fn large_identity_upload_conflict_is_reported_as_object_mutation_conflict() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("listener address should be available");
+    let server = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/api/v1/store/uploads/start",
+            post(|| async { StatusCode::CONFLICT }),
+        );
+        axum::serve(listener, app)
+            .await
+            .expect("conflict test server should run");
+    });
+
+    let client = IronMeshClient::from_direct_base_url(format!("http://{addr}"));
+    let payload = vec![0_u8; LARGE_UPLOAD_THRESHOLD_BYTES + 1];
+    let error = tokio::task::spawn_blocking(move || {
+        let mut reader = std::io::Cursor::new(payload);
+        match client.put_reader_with_identity_blocking(
+            "docs/large.bin",
+            Some("obj-large"),
+            Some("revision-stale"),
+            &mut reader,
+            (LARGE_UPLOAD_THRESHOLD_BYTES + 1) as u64,
+        ) {
+            Ok(_) => panic!("stale object mutation should not upload"),
+            Err(error) => error,
+        }
+    })
+    .await
+    .expect("blocking upload task should not panic");
+
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<ObjectMutationConflict>()),
+        "large upload conflicts must use the same conflict type as direct mutations: {error:#}"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn large_identity_upload_completion_conflict_is_reported_as_object_mutation_conflict() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("listener address should be available");
+    let server = tokio::spawn(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/store/uploads/start",
+                post(
+                    |Json(request): Json<UploadSessionStartRequest>| async move {
+                        (
+                            StatusCode::CREATED,
+                            Json(UploadSessionView {
+                                upload_id: "upload-stale-cas".to_string(),
+                                key: request.key,
+                                total_size_bytes: request.total_size_bytes,
+                                chunk_size_bytes: CHUNK_UPLOAD_SIZE_BYTES,
+                                chunk_count: 2,
+                                received_indexes: Vec::new(),
+                                completed: false,
+                                completed_result: None,
+                                expires_at_unix: unix_ts().saturating_add(60),
+                            }),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/store/uploads/{upload_id}/chunk/{index}",
+                put(
+                    |AxumPath((_, index)): AxumPath<(String, usize)>| async move {
+                        (
+                            StatusCode::OK,
+                            Json(UploadSessionChunkResponse {
+                                stored: true,
+                                received_index: index,
+                            }),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/store/uploads/{upload_id}/complete",
+                post(|| async { StatusCode::CONFLICT }),
+            );
+        axum::serve(listener, app)
+            .await
+            .expect("completion-conflict test server should run");
+    });
+
+    let client = IronMeshClient::from_direct_base_url(format!("http://{addr}"));
+    let payload = vec![0_u8; LARGE_UPLOAD_THRESHOLD_BYTES + 1];
+    let error = tokio::task::spawn_blocking(move || {
+        let mut reader = std::io::Cursor::new(payload);
+        match client.put_reader_with_identity_blocking(
+            "docs/large.bin",
+            Some("obj-large"),
+            Some("revision-stale"),
+            &mut reader,
+            (LARGE_UPLOAD_THRESHOLD_BYTES + 1) as u64,
+        ) {
+            Ok(_) => panic!("stale object mutation should not upload"),
+            Err(error) => error,
+        }
+    })
+    .await
+    .expect("blocking upload task should not panic");
+
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<ObjectMutationConflict>()),
+        "large completion conflicts must preserve the object mutation conflict: {error:#}"
+    );
+    server.abort();
+    let _ = server.await;
 }
 
 #[derive(Clone)]
@@ -3529,7 +3917,49 @@ fn gallery_map_clusters_request() -> GalleryMapClustersRequest {
             east: 180.0,
         },
         zoom: 1.0,
+        require_labels: Vec::new(),
+        exclude_labels: Vec::new(),
     }
+}
+
+#[test]
+fn gallery_map_label_filters_use_one_comma_separated_query_value_each() {
+    let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:18080/");
+    let mut request = gallery_map_clusters_request();
+    request.require_labels = vec![" private ".to_string()];
+    request.exclude_labels = vec!["nsfw ".to_string()];
+
+    let url = client
+        .gallery_map_clusters_url("/api/v1/gallery/map/clusters", &request, 1, 1.0)
+        .expect("gallery map URL should build");
+    let query = url
+        .query_pairs()
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        query.get("require_labels").map(|value| value.as_ref()),
+        Some("private")
+    );
+    assert_eq!(
+        query.get("exclude_labels").map(|value| value.as_ref()),
+        Some("nsfw")
+    );
+}
+
+#[test]
+fn label_filter_wire_format_escapes_commas_and_backslashes() {
+    let mut url = Url::parse("http://127.0.0.1:18080/store/list")
+        .expect("label filter test URL should parse");
+    append_comma_separated_labels(
+        &mut url,
+        "require_labels",
+        &["family, close".to_string(), "travel\\journal".to_string()],
+    );
+
+    assert_eq!(
+        url.query_pairs()
+            .find_map(|(key, value)| (key == "require_labels").then_some(value.into_owned())),
+        Some(r"family\, close,travel\\journal".to_string())
+    );
 }
 
 fn gallery_map_clusters_response_body() -> Vec<u8> {
@@ -3821,6 +4251,9 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
                         entry_type: "key".to_string(),
+                        object_id: Some("obj-readme".to_string()),
+                        labels: Vec::new(),
+                        labels_resolved: false,
                         version: Some("v1".to_string()),
                         content_hash: Some("hash-1".to_string()),
                         size_bytes: Some(42),
@@ -3849,6 +4282,9 @@ async fn relay_transport_executes_store_index_request_with_signed_device_identit
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
+                object_id: Some("obj-readme".to_string()),
+                labels: Vec::new(),
+                labels_resolved: false,
                 version: Some("v1".to_string()),
                 content_hash: Some("hash-1".to_string()),
                 size_bytes: Some(42),
@@ -5136,6 +5572,9 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
                     entries: vec![StoreIndexEntry {
                         path: "docs/readme.txt".to_string(),
                         entry_type: "key".to_string(),
+                        object_id: Some("obj-readme".to_string()),
+                        labels: Vec::new(),
+                        labels_resolved: false,
                         version: Some("v1".to_string()),
                         content_hash: Some("hash-1".to_string()),
                         size_bytes: Some(42),
@@ -5164,6 +5603,9 @@ async fn direct_transport_executes_store_index_request_with_signed_device_identi
             entries: vec![StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
+                object_id: Some("obj-readme".to_string()),
+                labels: Vec::new(),
+                labels_resolved: false,
                 version: Some("v1".to_string()),
                 content_hash: Some("hash-1".to_string()),
                 size_bytes: Some(42),

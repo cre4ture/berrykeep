@@ -12,6 +12,7 @@ BIND_ADDR="${IRONMESH_STATS_COLLECTOR_DEPLOY_BIND_ADDR:-0.0.0.0:44044}"
 TLS_CERT_PATH="${IRONMESH_STATS_COLLECTOR_DEPLOY_TLS_CERT_PATH:-}"
 TLS_KEY_PATH="${IRONMESH_STATS_COLLECTOR_DEPLOY_TLS_KEY_PATH:-}"
 HEALTH_URL="${IRONMESH_STATS_COLLECTOR_DEPLOY_HEALTH_URL:-}"
+DASHBOARD_URL="${IRONMESH_STATS_COLLECTOR_DEPLOY_DASHBOARD_URL:-}"
 TLS_SERVER_NAME="${IRONMESH_STATS_COLLECTOR_DEPLOY_TLS_SERVER_NAME:-}"
 STOP_TIMEOUT_SECS="${IRONMESH_STATS_COLLECTOR_DEPLOY_STOP_TIMEOUT_SECS:-20}"
 AUTO_ADD_TARGET="${IRONMESH_STATS_COLLECTOR_DEPLOY_AUTO_ADD_TARGET:-true}"
@@ -49,10 +50,10 @@ Usage:
   scripts/deploy-stats-collector-service.sh [options] --dry-run HOST
 
 Build the standalone stats collector as a static MUSL binary with the bundled
-offline country resolver, deploy it to one remote host over key-only SSH, and
-verify the public HTTPS health endpoint. Existing database and environment
-files are preserved. On first deployment, an admin token is generated on the
-remote host without printing or transferring it.
+offline country resolver and Fleet Reliability dashboard, deploy it to one
+remote host over key-only SSH, and verify the public HTTPS endpoints. Existing
+database and environment files are preserved. On first deployment, an admin
+token is generated on the remote host without printing or transferring it.
 
 Required:
   --remote-dir PATH       Remote service directory.
@@ -63,6 +64,7 @@ Required:
 
 Options:
   --bind-addr ADDR        Listener address (default: 0.0.0.0:44044).
+  --dashboard-url URL     Public HTTPS dashboard URL (default: health URL's origin).
   --tls-server-name NAME  Expected certificate hostname; defaults to the host
                           parsed from --health-url.
   --target TRIPLE         Rust target (default: x86_64-unknown-linux-musl).
@@ -81,8 +83,10 @@ The remote layout is:
   <remote-dir>/start.sh
   <remote-dir>/data/stats-collector.sqlite3
 
-The script never prints the admin token or private-key contents. If activation
-or health verification fails, the previous binary is restored and restarted.
+The Fleet Reliability dashboard and all of its static assets are compiled into
+the collector binary. The script never prints the admin token or private-key
+contents. If activation or health verification fails, the previous binary is
+restored and restarted.
 EOF
 }
 
@@ -115,6 +119,15 @@ parse_args() {
         (($# >= 2)) || fail '--remote-dir requires a value'
         REMOTE_DIR="$2"
         shift 2
+        ;;
+      --dashboard-url)
+        (($# >= 2)) || fail '--dashboard-url requires a value'
+        DASHBOARD_URL="$2"
+        shift 2
+        ;;
+      --dashboard-url=*)
+        DASHBOARD_URL="${1#*=}"
+        shift
         ;;
       --remote-dir=*)
         REMOTE_DIR="${1#*=}"
@@ -238,6 +251,10 @@ resolve_layout() {
   [[ -n "${TLS_KEY_PATH}" ]] || fail 'set --tls-key-path'
   [[ -n "${HEALTH_URL}" ]] || fail 'set --health-url'
   [[ "${HEALTH_URL}" == https://* ]] || fail '--health-url must use https://'
+  if [[ -z "${DASHBOARD_URL}" ]]; then
+    DASHBOARD_URL="${HEALTH_URL%/health}/"
+  fi
+  [[ "${DASHBOARD_URL}" == https://* ]] || fail '--dashboard-url must use https://'
   if [[ -z "${TLS_SERVER_NAME}" ]]; then
     TLS_SERVER_NAME="${HEALTH_URL#https://}"
     TLS_SERVER_NAME="${TLS_SERVER_NAME%%/*}"
@@ -264,8 +281,9 @@ print_dry_run() {
   log "listener: ${BIND_ADDR} with native TLS"
   log "certificate: ${TLS_CERT_PATH}"
   log "health verification: ${HEALTH_URL}"
-  log "build: ${PACKAGE_NAME} --features bundled-country-db --target ${TARGET_TRIPLE}"
-  log 'plan: key-only SSH preflight, MUSL build, checksum-verified upload, restart, version/HTTPS verification, rollback on failure'
+  log "public dashboard verification: ${DASHBOARD_URL}"
+  log "build: ${PACKAGE_NAME} with the compiled-in Fleet Reliability dashboard --features bundled-country-db --target ${TARGET_TRIPLE}"
+  log 'plan: key-only SSH preflight, single checksum-verified binary upload, restart, version/HTTPS verification, rollback on failure'
 }
 
 resolve_local_build_artifact() {
@@ -306,6 +324,7 @@ build_binary() {
     log "reusing existing ${TARGET_TRIPLE} release binary"
   else
     ensure_target_installed
+    require_command corepack
     log "building ${PACKAGE_NAME} ${EXPECTED_PACKAGE_VERSION} for ${TARGET_TRIPLE}"
     cargo build \
       --locked \
@@ -579,7 +598,7 @@ REMOTE
 }
 
 verify_deployment() {
-  local binary_q pidfile_q env_q db_q expected_q health_body
+  local binary_q pidfile_q env_q db_q expected_q health_body dashboard_body
   binary_q="$(quote_for_sh "${REMOTE_BINARY}")"
   pidfile_q="$(quote_for_sh "${REMOTE_PIDFILE}")"
   env_q="$(quote_for_sh "${REMOTE_ENV_FILE}")"
@@ -622,6 +641,23 @@ REMOTE
     return 1
   fi
   log "public HTTPS health verified for version ${EXPECTED_PACKAGE_VERSION}"
+
+  log "verifying public fleet dashboard ${DASHBOARD_URL}"
+  if ! dashboard_body="$(curl \
+    --silent \
+    --show-error \
+    --fail \
+    --connect-timeout 7 \
+    --max-time 15 \
+    "${DASHBOARD_URL}")"
+  then
+    return 1
+  fi
+  if ! grep -Fq '<title>IronMesh Fleet Reliability</title>' <<<"${dashboard_body}"; then
+    log 'public fleet dashboard did not contain its expected document title'
+    return 1
+  fi
+  log 'public fleet dashboard verified'
 }
 
 rollback_remote() {
@@ -669,9 +705,11 @@ main() {
   upload_binary
   configure_remote
   stop_remote_service
-  activate_uploaded_binary
 
-  if ! start_remote_service || ! verify_deployment; then
+  if ! activate_uploaded_binary ||
+    ! start_remote_service ||
+    ! verify_deployment
+  then
     rollback_remote
     fail 'deployment failed and rollback was attempted'
   fi

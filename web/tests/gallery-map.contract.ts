@@ -10,6 +10,7 @@ export type GalleryMapContractTarget = {
   name: string;
   setup: (page: Page, setup: GalleryMapContractSetup) => Promise<void>;
   setupInitialOverviewScenario: (page: Page) => Promise<void>;
+  setupLiveClusterScenario: (page: Page) => Promise<void>;
   openGallery: (page: Page) => Promise<void>;
 };
 
@@ -132,6 +133,30 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     const responsiveClusterUrl = new URL((await responsiveClusterRequest).url());
     expect(responsiveClusterUrl.searchParams.get("cluster_cell_size_px")).toMatch(
       /^(16|24|32|48|64)$/
+    );
+    const mapViewportDiagnostics = page.locator("[data-gallery-map-prefetch-viewport]");
+    await expect(mapViewportDiagnostics).toHaveAttribute("data-gallery-map-visible-viewport", /.+/);
+    const visibleViewport = galleryMapViewportFromDiagnostic(
+      await mapViewportDiagnostics.getAttribute("data-gallery-map-visible-viewport")
+    );
+    const prefetchViewport = galleryMapViewportFromDiagnostic(
+      await mapViewportDiagnostics.getAttribute("data-gallery-map-prefetch-viewport")
+    );
+    const resolutionViewport = {
+      south: Number(responsiveClusterUrl.searchParams.get("resolution_south")),
+      west: Number(responsiveClusterUrl.searchParams.get("resolution_west")),
+      north: Number(responsiveClusterUrl.searchParams.get("resolution_north")),
+      east: Number(responsiveClusterUrl.searchParams.get("resolution_east"))
+    };
+    expect(Object.values(resolutionViewport).every(Number.isFinite)).toBe(true);
+    expect(resolutionViewport.south).toBeLessThanOrEqual(resolutionViewport.north);
+    expect(galleryMapLatitudeSpan(prefetchViewport)).toBeCloseTo(
+      Math.min(180, galleryMapLatitudeSpan(visibleViewport) * 2),
+      6
+    );
+    expect(galleryMapLongitudeSpan(prefetchViewport)).toBeCloseTo(
+      Math.min(360, galleryMapLongitudeSpan(visibleViewport) * 2),
+      6
     );
     const clusterGridSwitch = page.getByLabel("Show cluster cells (debug)");
     await expect(clusterGridSwitch).not.toBeChecked();
@@ -278,16 +303,66 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await expect(page.getByRole("dialog", { name: "2 items in map cluster" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Open map cluster with 2 items" })).toHaveCount(0);
   });
+
+  test(`${target.name} gallery map contract live-merges nearby server clusters`, async ({ page }) => {
+    await target.setupLiveClusterScenario(page);
+    await target.openGallery(page);
+    await page.getByRole("button", { name: "Map" }).click();
+
+    const mergedCluster = page.getByRole("button", { name: "Open map cluster with 4 items" });
+    await expect(mergedCluster).toBeVisible();
+    await mergedCluster.click();
+    const chooser = page.getByRole("dialog", { name: "4 items in nearby map clusters" });
+    await expect(chooser).toBeVisible();
+    await expect(chooser.getByRole("button", { name: "Server cluster 1: 2 items" })).toBeVisible();
+    await expect(chooser.getByRole("button", { name: "Server cluster 2: 2 items" })).toBeVisible();
+  });
 }
 
 function webMercatorLatitudeForGridY(y: number): number {
   return (Math.atan(Math.sinh(Math.PI * (1 - 2 * y))) * 180) / Math.PI;
 }
 
+type GalleryMapViewportDiagnostic = {
+  south: number;
+  west: number;
+  north: number;
+  east: number;
+};
+
+function galleryMapViewportFromDiagnostic(value: string | null): GalleryMapViewportDiagnostic {
+  const values = value?.split(",").map(Number) ?? [];
+  if (values.length !== 4 || !values.every(Number.isFinite)) {
+    throw new Error(`Invalid gallery map viewport diagnostic: ${value}`);
+  }
+  const [south, west, north, east] = values;
+  return { south: south!, west: west!, north: north!, east: east! };
+}
+
+function galleryMapLatitudeSpan(viewport: GalleryMapViewportDiagnostic): number {
+  return viewport.north - viewport.south;
+}
+
+function galleryMapLongitudeSpan(viewport: GalleryMapViewportDiagnostic): number {
+  const rawSpan = viewport.east - viewport.west;
+  return Math.abs(rawSpan) >= 360 ? 360 : ((rawSpan % 360) + 360) % 360;
+}
+
 export function createInitialOverviewGalleryEntries() {
   return [
     createGalleryEntry("gallery/new-york-a.png", 40.7128, -74.006),
     createGalleryEntry("gallery/new-york-b.png", 40.7628, -74.056),
+    createGalleryEntry("gallery/tokyo-a.png", 35.6762, 139.6503),
+    createGalleryEntry("gallery/tokyo-b.png", 35.7262, 139.7003)
+  ];
+}
+
+export function createLiveClusterGalleryEntries() {
+  return [
+    createGalleryEntry("gallery/pittsburgh-a.png", 40.4406, -77.4),
+    createGalleryEntry("gallery/pittsburgh-b.png", 40.4906, -77.45),
+    createGalleryEntry("gallery/philadelphia-a.png", 39.9526, -71.4),
+    createGalleryEntry("gallery/philadelphia-b.png", 40.0026, -71.45),
     createGalleryEntry("gallery/tokyo-a.png", 35.6762, 139.6503),
     createGalleryEntry("gallery/tokyo-b.png", 35.7262, 139.7003)
   ];

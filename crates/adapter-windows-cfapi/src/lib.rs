@@ -19,3 +19,13 @@ pub mod runtime;
 pub mod snapshot_cache;
 pub mod sync_root_identity;
 pub(crate) mod windows_status;
+
+#[cfg(test)]
+static SYNC_ROOT_REGISTRATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_sync_root_registration_tests() -> std::sync::MutexGuard<'static, ()> {
+    SYNC_ROOT_REGISTRATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

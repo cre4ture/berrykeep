@@ -6,7 +6,8 @@ mod tests {
         ChildGuard, EnrolledTestClient, TEST_ADMIN_TOKEN, binary_path, fresh_data_dir,
         issue_bootstrap_bundle, issue_bootstrap_bundle_and_enroll_client,
         latest_snapshot_id_for_client, lock_test_resources, run_cli, start_authenticated_server,
-        start_open_server_with_env, start_rendezvous_service, stop_server, tcp_resource_key,
+        start_authenticated_server_with_env_options, start_open_server_with_env,
+        start_rendezvous_service, stop_server, tcp_resource_key,
         wait_for_rendezvous_registered_endpoints, wait_for_url_status,
     };
     use anyhow::{Context, Result};
@@ -318,12 +319,21 @@ mod tests {
         web_bind: &str,
         server_name: &str,
         client_name: &str,
-        web_env: &[(&str, &str)],
+        server_env: &[(&str, &str)],
     ) -> Result<(ChildGuard, ChildGuard, EnrolledTestClient)> {
         let data_dir = fresh_data_dir(server_name);
         let client_dir = fresh_data_dir(client_name);
         let node_id = Uuid::new_v4().to_string();
-        let server = start_authenticated_server(server_bind, &data_dir, &node_id, 1).await?;
+        let server = start_authenticated_server_with_env_options(
+            server_bind,
+            &data_dir,
+            &node_id,
+            1,
+            None,
+            None,
+            server_env,
+        )
+        .await?;
         let base_url = format!("http://{server_bind}");
         let http = reqwest::Client::new();
         let enrolled = issue_bootstrap_bundle_and_enroll_client(
@@ -337,12 +347,9 @@ mod tests {
         )
         .await?;
         let bootstrap_arg = enrolled.bootstrap_path.to_string_lossy().into_owned();
-        let web = start_web_backend_with_args_and_env(
-            web_bind,
-            &["--bootstrap-file", bootstrap_arg.as_str()],
-            web_env,
-        )
-        .await?;
+        let web =
+            start_web_backend_with_args(web_bind, &["--bootstrap-file", bootstrap_arg.as_str()])
+                .await?;
         Ok((server, web, enrolled))
     }
 
@@ -1161,6 +1168,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_ui_backend_lists_and_batch_restores_deleted_and_moved_paths() -> Result<()> {
+        let server_bind = "127.0.0.1:19424";
+        let web_bind = "127.0.0.1:19425";
+        let web_base = format!("http://{web_bind}");
+        let client = reqwest::Client::new();
+
+        let (mut server, mut web, _enrolled) = start_authenticated_web_backend(
+            server_bind,
+            web_bind,
+            "web-ui-history-server",
+            "web-ui-history-client",
+        )
+        .await?;
+
+        let result = async {
+            for (key, value) in [
+                ("deleted.txt", "deleted payload"),
+                ("old-name.txt", "moved payload"),
+            ] {
+                client
+                    .post(format!("{web_base}/api/store/put"))
+                    .json(&serde_json::json!({ "key": key, "value": value }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+
+            client
+                .delete(format!("{web_base}/api/store/delete"))
+                .query(&[("key", "deleted.txt")])
+                .send()
+                .await?
+                .error_for_status()?;
+            client
+                .post(format!("{web_base}/api/store/rename"))
+                .json(&serde_json::json!({
+                    "from_path": "old-name.txt",
+                    "to_path": "new-name.txt",
+                    "overwrite": false,
+                }))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let history: serde_json::Value = client
+                .get(format!("{web_base}/api/store/history"))
+                .query(&[("depth", 1)])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let entries = history
+                .get("entries")
+                .and_then(|value| value.as_array())
+                .context("history response should include entries")?;
+            let deleted = entries
+                .iter()
+                .find(|entry| entry.get("path").and_then(|value| value.as_str()) == Some("deleted.txt"))
+                .context("deleted entry should be listed")?;
+            let moved = entries
+                .iter()
+                .find(|entry| entry.get("path").and_then(|value| value.as_str()) == Some("old-name.txt"))
+                .context("moved entry should be listed")?;
+            assert_eq!(deleted.get("entry_type").and_then(|value| value.as_str()), Some("historical"));
+            assert_eq!(moved.get("moved_to_path").and_then(|value| value.as_str()), Some("new-name.txt"));
+
+            let batch_restore: serde_json::Value = client
+                .post(format!("{web_base}/api/store/history/restore"))
+                .json(&serde_json::json!({
+                    "entries": [
+                        {
+                            "path": deleted["path"],
+                            "restore_source_path": deleted["restore_source_path"],
+                            "restore_source_object_id": deleted["restore_source_object_id"],
+                            "restore_version_id": deleted["restore_version_id"],
+                        },
+                        {
+                            "path": moved["path"],
+                            "restore_source_path": moved["restore_source_path"],
+                            "restore_source_object_id": moved["restore_source_object_id"],
+                            "restore_version_id": moved["restore_version_id"],
+                        },
+                    ],
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(
+                batch_restore
+                    .get("restored_count")
+                    .and_then(|value| value.as_u64()),
+                Some(2)
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "deleted.txt").await?,
+                "deleted payload"
+            );
+            assert_eq!(
+                get_text_via_web(&client, &web_base, "old-name.txt").await?,
+                "moved payload"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut web).await;
+        stop_server(&mut server).await;
+        result
+    }
+
+    #[tokio::test]
     async fn web_ui_backend_proxies_media_thumbnail_requests() -> Result<()> {
         let server_bind = "127.0.0.1:19386";
         let web_bind = "127.0.0.1:19387";
@@ -1421,6 +1543,20 @@ mod tests {
         let part_ac = fixture_bytes[split_two..].to_vec();
 
         let result = async {
+            for map_api_path in [
+                "/api/v1/maps/mbtiles-metadata",
+                "/api/v1/maps/logical-file",
+                "/api/maps/mbtiles-metadata",
+                "/api/maps/logical-file",
+            ] {
+                let unauthenticated_response = client
+                    .get(format!("http://{server_bind}{map_api_path}"))
+                    .query(&[("manifest_key", manifest_key)])
+                    .send()
+                    .await?;
+                assert_eq!(unauthenticated_response.status(), StatusCode::UNAUTHORIZED);
+            }
+
             for (key, payload) in [
                 (part_aa_key, part_aa.clone()),
                 (part_ab_key, part_ab.clone()),
@@ -1609,6 +1745,13 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some("gzip")
             );
+            assert_eq!(
+                tile_response
+                    .headers()
+                    .get(reqwest::header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, max-age=3600, stale-while-revalidate=86400")
+            );
             let tile_body = tile_response.bytes().await?;
             assert_eq!(tile_body.as_ref(), expected_tile_bytes.as_slice());
 
@@ -1625,6 +1768,13 @@ mod tests {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok()),
                 Some("application/x-protobuf")
+            );
+            assert_eq!(
+                glyph_response
+                    .headers()
+                    .get(reqwest::header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, max-age=86400, stale-while-revalidate=604800")
             );
             let glyph_body = glyph_response.bytes().await?;
             assert_eq!(glyph_body.as_ref(), glyph_bytes.as_slice());
@@ -2034,6 +2184,7 @@ mod tests {
             ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
             ("IRONMESH_ADMIN_TOKEN", admin_token),
             ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("IRONMESH_MAP_GLYPHS_DIR", glyphs_dir_env.as_str()),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -2084,12 +2235,9 @@ mod tests {
             bootstrap.relay_mode = RelayMode::Required;
             bootstrap.write_to_path(&bootstrap_path)?;
 
-            let mut web = start_web_backend_with_args_and_env(
-                web_bind,
-                &["--bootstrap-file", bootstrap_arg.as_str()],
-                &[("IRONMESH_MAP_GLYPHS_DIR", glyphs_dir_env.as_str())],
-            )
-            .await?;
+            let mut web =
+                start_web_backend_with_args(web_bind, &["--bootstrap-file", bootstrap_arg.as_str()])
+                    .await?;
 
             let result = async {
                 let rendezvous_refresh: serde_json::Value = http

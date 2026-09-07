@@ -41,8 +41,9 @@ artifact contract described here.
 
 - Compile the Server Node once per CPU ABI, not once per distribution suite.
 - Remove the server executable's glibc and shared-library ABI dependency.
-- Keep `ironmesh-server-node` as the public executable, package, service, user,
-  configuration, and state-directory name during the BerryKeep rename.
+- Use `berrykeep-server-node` as the public executable, package, service, user,
+  configuration, and state-directory name. Transitional IronMesh packages keep
+  existing deployments on their legacy service and state paths.
 - Preserve ordinary signed apt installation and update behavior.
 - Make every published artifact independently inspectable and reproducible
   from its recorded target, CPU setting, source revision, and checksum.
@@ -71,7 +72,7 @@ artifact contract described here.
    inherit host-specific CPU options;
 6. checks the ELF machine, program interpreter, and dynamic `DT_NEEDED`
    entries;
-7. runs `ironmesh-server-node --version` when the target matches the host;
+7. runs `berrykeep-server-node --version` when the target matches the host;
 8. writes a tar archive containing the executable, `SHA256SUMS`, and
    `build-metadata.json`, plus a checksum for the archive.
 
@@ -102,29 +103,31 @@ The normal CI workflow builds and verifies `x86_64-generic` on an x86_64
 GitHub runner. The static build is part of the `Required CI` aggregate and
 uploads `static-server-node-linux-amd64`.
 
-The ARM64 packaging workflow builds and verifies `aarch64-generic` on an
-AArch64 GitHub runner and uploads `static-server-node-linux-arm64`. The
-executable runs natively for its version smoke test before it is passed into
-the Focal packaging container.
+The Server Node Debian package workflow builds and verifies both
+`aarch64-generic` and `x86_64-generic` on an x86_64 GitHub runner with Zig,
+then uploads `static-server-node-linux-arm64` and
+`static-server-node-linux-amd64`. The static artifact checks each ELF contract;
+the workflow runs the AArch64 version smoke test under `qemu-aarch64-static`
+before that artifact enters a package container.
 
-Both current Debian package paths consume the verified static executable:
+The workflow passes the matching archive into Focal and Trixie containers for
+both architectures and into a Noble container for AMD64. Each container checks
+the archive checksum and metadata against the checked-out Git revision, then
+assembles a `berrykeep-server-node` package with the `server-node-only` build
+profile. The profile skips source compilation and does not execute the target
+binary, so the package-wrapper matrix needs no architecture-specific runner.
 
-- the AMD64 package job combines the static server with the separately built
-  client and rendezvous binaries before invoking the existing prebuilt-bundle
-  package path;
-- the Focal ARM64 package job passes the static server through
-  `build-local-debs.sh --prebuilt-server-node`, while compiling only the other
-  package binaries in the Focal userspace.
-
-This removes distribution-specific compilation of the Server Node without
-changing the current client or rendezvous compatibility matrix.
+The final protected, manual CI job imports the archive key into a temporary
+keyring, signs all suite metadata, deploys the matrix, and re-verifies the
+remote and public `InRelease` copies. Client and rendezvous packages remain on
+their distribution-specific native package path.
 
 ## Portable package contract
 
 The core package remains:
 
 ```text
-ironmesh-server-node
+berrykeep-server-node
 ```
 
 It contains the static server executable, systemd unit, environment template,
@@ -138,12 +141,12 @@ Natural Earth conversion is optional server functionality. Its host tools are
 therefore provided through a companion metapackage:
 
 ```text
-ironmesh-server-node-map-tools
-  Depends: ironmesh-server-node (= ${binary:Version}), gdal-bin, unzip
+berrykeep-server-node-map-tools
+  Depends: berrykeep-server-node (= ${binary:Version}), gdal-bin, unzip
 ```
 
-Installing only `ironmesh-server-node` provides the complete storage server.
-Installing `ironmesh-server-node-map-tools` additionally enables the GDAL- and
+Installing only `berrykeep-server-node` provides the complete storage server.
+Installing `berrykeep-server-node-map-tools` additionally enables the GDAL- and
 unzip-backed Natural Earth import workflows. The server's dependency-health
 API continues to report whether those commands are available.
 
@@ -202,7 +205,7 @@ identical package in every supported suite during the transition.
 ### Phase 2 — Portable core package: partially implemented
 
 - [x] Remove GDAL and unzip from the core package dependency closure.
-- [x] Add the optional `ironmesh-server-node-map-tools` metapackage.
+- [x] Add the optional `berrykeep-server-node-map-tools` metapackage.
 - [x] Allow a verified prebuilt Server Node to be combined with source-built
   client and rendezvous packages.
 - [ ] Add a dedicated package job that builds only the portable Server Node

@@ -6,7 +6,8 @@ import {
   listAdminSnapshots,
   listAdminStoreEntries,
   restoreAdminStoreVersion,
-  retryAdminMediaCacheEntry
+  retryAdminMediaCacheEntry,
+  setAdminStoreMediaLabels
 } from "@ironmesh/api";
 import {
   GallerySurface,
@@ -78,7 +79,8 @@ export function GalleryPage() {
         retryAdminMediaCacheEntry(entry.path, undefined, {
           snapshot: snapshotId,
           version: typeof entry.version === "string" ? entry.version : null
-        })
+        }),
+      setMediaLabels: (entry, labels) => setAdminStoreMediaLabels(entry.path, labels)
     }),
     []
   );

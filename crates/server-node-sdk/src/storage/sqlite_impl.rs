@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use common::NodeId;
+use common::xmp::XmpGeoLocation;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tokio_rusqlite::Connection as TokioConnection;
@@ -14,30 +15,40 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::cluster::NodeDescriptor;
+#[cfg(test)]
+use crate::operations::{OperationPriority, OperationProgress};
+use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
-    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
-    GalleryDeltaChange, GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary,
-    GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery,
-    GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue,
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
+    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange, GalleryDeltaCursorError,
+    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
+    GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery,
+    GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
+    GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue, GallerySummaryMiss,
     GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
-    GalleryViewportBounds, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, current_media_cache_metadata,
-    decode_gallery_labels, decompress_snapshot_json, effective_gallery_captured_at_unix,
+    GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
+    METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
+    MediaGpsCoordinates, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
+    RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
+    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
+    current_media_cache_metadata, decode_gallery_labels, decode_version_index,
+    decompress_snapshot_json, effective_gallery_captured_at_unix, effective_gallery_gps,
     encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
-    metadata_db_logical_table_specs, sqlite_like_prefix_pattern,
-    version_created_at_unix_from_payload,
+    metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
+    recoverable_history_listing_query, sqlite_like_prefix_pattern,
+    version_created_at_unix_from_payload, version_index_head_projection,
 };
 
 const SQLITE_METADATA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -111,64 +122,92 @@ impl SqliteMetadataStore {
     /// - Cache hit, fresh: returned as-is, nothing scheduled.
     /// - Cache hit, stale: returned as-is; a background refresh is scheduled unless one is
     ///   already running for this scope.
-    /// - Cache miss: computed synchronously (once) so the first caller for a scope still gets a
-    ///   real answer, then cached for everyone after it.
+    /// - Cache miss: computed synchronously by one leader so the first caller still gets a real
+    ///   answer; simultaneous callers for the same scope wait for its cached result.
     async fn gallery_map_summary(
         &self,
         scope: GallerySummaryScope,
         history_id: &str,
         revision: u64,
+        cached: Option<GallerySummaryCacheValue>,
     ) -> Result<(usize, GalleryIndexMediaSummary, GallerySummaryRefreshStatus)> {
-        if let Some(cached) = self.gallery_map_summary_cache.cached(&scope) {
-            if cached.history_id == history_id && cached.revision == revision {
-                return Ok((
-                    cached.total_entry_count,
-                    cached.media_summary,
-                    GallerySummaryRefreshStatus::default(),
-                ));
-            }
-            if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
-                let reader = self.gallery_summary_reader.clone();
-                let cache = self.gallery_map_summary_cache.clone();
-                let refresh_scope = scope.clone();
-                let estimate = Some(cached.total_entry_count);
-                tokio::spawn(async move {
-                    let query_scope = refresh_scope.clone();
-                    let result = reader
-                        .call(move |db| {
-                            Ok(query_gallery_map_summary_from_db(
-                                db,
-                                &query_scope,
-                                estimate,
-                                Some(&progress),
-                            ))
-                        })
-                        .await
-                        .map_err(map_tokio_rusqlite_error)
-                        .and_then(|value| value);
-                    match result {
-                        Ok(value) => cache.store(refresh_scope.clone(), value),
-                        Err(error) => {
-                            warn!(error = %error, "failed to refresh gallery map summary in background")
+        let mut cached_snapshot = cached;
+        let mut summary_miss = None;
+        loop {
+            // Prefer a value populated while the viewport query was running, but retain the
+            // preflight snapshot in case that scope was evicted in the meantime.
+            let cached = self
+                .gallery_map_summary_cache
+                .cached(&scope)
+                .or(cached_snapshot.take());
+            if let Some(cached) = cached {
+                if cached.history_id == history_id && cached.revision == revision {
+                    return Ok((
+                        cached.total_entry_count,
+                        cached.media_summary,
+                        GallerySummaryRefreshStatus::default(),
+                    ));
+                }
+                if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
+                    let reader = self.gallery_summary_reader.clone();
+                    let cache = self.gallery_map_summary_cache.clone();
+                    let refresh_scope = scope.clone();
+                    let estimate = Some(cached.total_entry_count);
+                    tokio::spawn(async move {
+                        let query_scope = refresh_scope.clone();
+                        let result = reader
+                            .call(move |db| {
+                                Ok(query_gallery_map_summary_from_db(
+                                    db,
+                                    &query_scope,
+                                    estimate,
+                                    Some(&progress),
+                                ))
+                            })
+                            .await
+                            .map_err(map_tokio_rusqlite_error)
+                            .and_then(|value| value);
+                        match result {
+                            Ok(value) => cache.store(refresh_scope.clone(), value),
+                            Err(error) => {
+                                warn!(error = %error, "failed to refresh gallery map summary in background")
+                            }
                         }
-                    }
-                    cache.finish_refresh(&refresh_scope);
-                });
+                        cache.finish_refresh(&refresh_scope);
+                    });
+                }
+                let status = self.gallery_map_summary_cache.status(&scope);
+                return Ok((cached.total_entry_count, cached.media_summary, status));
             }
-            let status = self.gallery_map_summary_cache.status(&scope);
-            return Ok((cached.total_entry_count, cached.media_summary, status));
-        }
 
-        let compute_scope = scope.clone();
-        let value = self
-            .read(move |db| query_gallery_map_summary_from_db(db, &compute_scope, None, None))
-            .await?;
-        self.gallery_map_summary_cache.store(scope, value.clone());
-        Ok((
-            value.total_entry_count,
-            value.media_summary,
-            GallerySummaryRefreshStatus::default(),
-        ))
+            match summary_miss.take() {
+                Some(GallerySummaryMiss::Follower(completion)) => {
+                    self.gallery_map_summary_cache
+                        .wait_for_summary_miss(&scope, &completion)
+                        .await;
+                }
+                Some(GallerySummaryMiss::Leader(_computation)) => {
+                    let compute_scope = scope.clone();
+                    let value = self
+                        .read(move |db| {
+                            query_gallery_map_summary_from_db(db, &compute_scope, None, None)
+                        })
+                        .await?;
+                    self.gallery_map_summary_cache.store(scope, value.clone());
+                    return Ok((
+                        value.total_entry_count,
+                        value.media_summary,
+                        GallerySummaryRefreshStatus::default(),
+                    ));
+                }
+                None => {
+                    summary_miss = Some(
+                        self.gallery_map_summary_cache
+                            .try_start_summary_miss(&scope)?,
+                    );
+                }
+            }
+        }
     }
 
     async fn write<T, F>(&self, f: F) -> Result<T>
@@ -326,9 +365,12 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              geotagged,
              latitude,
              longitude,
+             sidecar_latitude,
+             sidecar_longitude,
+             sidecar_inferred_by_berrykeep,
              spatial_x,
              spatial_y
-         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL)
+         ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL, NULL)
          ON CONFLICT(key) DO UPDATE SET
              manifest_hash = excluded.manifest_hash,
              object_id = excluded.object_id,
@@ -339,6 +381,9 @@ fn upsert_gallery_object(db: &Connection, key: &str, entry: &CurrentObjectEntry)
              geotagged = 0,
              latitude = NULL,
              longitude = NULL,
+             sidecar_latitude = NULL,
+             sidecar_longitude = NULL,
+             sidecar_inferred_by_berrykeep = 0,
              spatial_x = NULL,
              spatial_y = NULL
          WHERE gallery_objects.manifest_hash != excluded.manifest_hash
@@ -380,10 +425,13 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 && gps.longitude.is_finite()
                 && (-180.0..=180.0).contains(&gps.longitude)
         });
-    let spatial_position =
-        gps.and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
     let mut statement = db.prepare(
-        "SELECT gallery_objects.key, version_indexes.index_json
+        "SELECT
+             gallery_objects.key,
+             version_indexes.index_json,
+             gallery_objects.sidecar_latitude,
+             gallery_objects.sidecar_longitude,
+             gallery_objects.sidecar_inferred_by_berrykeep
          FROM gallery_objects
          LEFT JOIN version_indexes
            ON version_indexes.object_id = gallery_objects.object_id
@@ -391,12 +439,25 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
     )?;
     let entries = statement
         .query_map(params![manifest_hash], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
 
-    for (key, version_index_payload) in entries {
+    for (
+        key,
+        version_index_payload,
+        sidecar_latitude,
+        sidecar_longitude,
+        sidecar_inferred_by_berrykeep,
+    ) in entries
+    {
         let version_created_at_unix =
             version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
         let captured_at_unix = effective_gallery_captured_at_unix(
@@ -407,6 +468,27 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 .and_then(|metadata| metadata.taken_at_unix),
             version_created_at_unix,
         );
+        let sidecar_gps = match (sidecar_latitude, sidecar_longitude) {
+            (Some(latitude), Some(longitude))
+                if latitude.is_finite()
+                    && (-90.0..=90.0).contains(&latitude)
+                    && longitude.is_finite()
+                    && (-180.0..=180.0).contains(&longitude) =>
+            {
+                Some(MediaGpsCoordinates {
+                    latitude,
+                    longitude,
+                })
+            }
+            _ => None,
+        };
+        let effective_gps = effective_gallery_gps(
+            gps,
+            sidecar_gps.as_ref(),
+            sidecar_inferred_by_berrykeep != 0,
+        );
+        let spatial_position = effective_gps
+            .and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
         db.execute(
             "UPDATE gallery_objects
              SET media_type = COALESCE(?1, inferred_media_type),
@@ -422,9 +504,9 @@ fn refresh_gallery_objects_for_manifest(db: &Connection, manifest_hash: &str) ->
                 media_type,
                 u64_to_i64(captured_at_unix)?,
                 media_status,
-                if gps.is_some() { 1i64 } else { 0i64 },
-                gps.map(|gps| gps.latitude),
-                gps.map(|gps| gps.longitude),
+                if effective_gps.is_some() { 1i64 } else { 0i64 },
+                effective_gps.map(|gps| gps.latitude),
+                effective_gps.map(|gps| gps.longitude),
                 spatial_position.map(|position| position.0),
                 spatial_position.map(|position| position.1),
                 key,
@@ -669,6 +751,8 @@ fn query_gallery_map_cluster_cells_from_db(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
     let (resolution, clusters) = gallery_map_cluster_cells_from_db(
@@ -680,6 +764,7 @@ fn query_gallery_map_cluster_cells_from_db(
             query.max_clusters,
         ),
         query.max_clusters,
+        &query.label_filter,
     )?;
     transaction.commit()?;
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
@@ -712,6 +797,10 @@ fn query_gallery_map_summary_from_db(
         sqlite_like_prefix_pattern(&format!("{}/", scope.prefix))
     };
     let depth = i64::try_from(scope.depth).context("gallery map summary depth overflow")?;
+    let capture_sql = gallery_map_summary_capture_sql(
+        scope.captured_from_unix.is_some(),
+        scope.captured_until_unix.is_some(),
+    );
     let scope_values = vec![
         Value::Text(scope.prefix.clone()),
         Value::Text(prefix_pattern),
@@ -721,15 +810,24 @@ fn query_gallery_map_summary_from_db(
             .media_type()
             .map(|value| Value::Text(value.to_string()))
             .unwrap_or(Value::Null),
+        optional_gallery_map_timestamp(scope.captured_from_unix, "lower")?,
+        optional_gallery_map_timestamp(scope.captured_until_unix, "upper")?,
     ];
     let (total_entry_count, media_summary) = match progress {
         Some(progress) => gallery_map_summary_chunked_from_db(
             &transaction,
             &scope_values,
+            capture_sql,
+            &scope.label_filter,
             total_estimate,
             progress,
         )?,
-        None => gallery_map_summary_from_db(&transaction, &scope_values)?,
+        None => gallery_map_summary_from_db(
+            &transaction,
+            &scope_values,
+            capture_sql,
+            &scope.label_filter,
+        )?,
     };
     transaction.commit()?;
     Ok(GallerySummaryCacheValue {
@@ -766,6 +864,8 @@ fn gallery_scope_values(
     depth: i64,
     media_type: Option<&str>,
     viewport: (Option<f64>, Option<f64>, Option<f64>, Option<f64>),
+    captured_from_unix: Option<i64>,
+    captured_until_unix: Option<i64>,
 ) -> Vec<Value> {
     let (south, north, west, east) = viewport;
     let real = |value: Option<f64>| value.map_or(Value::Null, Value::Real);
@@ -778,6 +878,8 @@ fn gallery_scope_values(
         real(north),
         real(west),
         real(east),
+        captured_from_unix.map_or(Value::Null, Value::Integer),
+        captured_until_unix.map_or(Value::Null, Value::Integer),
     ]
 }
 
@@ -818,7 +920,9 @@ fn query_gallery_index_in_transaction(
                     OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
                 )
             )
-        )";
+        )
+        AND (?9 IS NULL OR gallery_objects.captured_at_unix >= ?9)
+        AND (?10 IS NULL OR gallery_objects.captured_at_unix < ?10)";
     let (south, north, west, east) = query
         .viewport
         .map(|bounds| {
@@ -836,6 +940,16 @@ fn query_gallery_index_in_transaction(
         depth,
         media_type,
         (south, north, west, east),
+        query
+            .captured_from_unix
+            .map(i64::try_from)
+            .transpose()
+            .context("gallery capture-time lower bound overflow")?,
+        query
+            .captured_until_unix
+            .map(i64::try_from)
+            .transpose()
+            .context("gallery capture-time upper bound overflow")?,
     );
     let (summary_label_sql, summary_label_values) =
         gallery_label_predicates(&query.label_filter, scope_values.len() + 1)?;
@@ -888,15 +1002,20 @@ fn query_gallery_index_in_transaction(
     // placeholders continue after those two.
     let (page_label_sql, page_label_values) =
         gallery_label_predicates(&query.label_filter, scope_values.len() + 3)?;
+    let limit_parameter = scope_values.len() + 1;
+    let offset_parameter = limit_parameter + 1;
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -906,7 +1025,7 @@ fn query_gallery_index_in_transaction(
            ON version_indexes.object_id = gallery_objects.object_id
          WHERE {scope}{page_label_sql}
          ORDER BY gallery_objects.captured_at_unix {sort_direction}, gallery_objects.key ASC
-         LIMIT ?9 OFFSET ?10"
+         LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
     );
     let mut statement = db.prepare(&page_sql)?;
     let mut page_values = scope_values;
@@ -917,33 +1036,42 @@ fn query_gallery_index_in_transaction(
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<Vec<u8>>>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+            row.get::<_, Option<f64>>(9)?,
         ))
     })?;
     let mut entries = Vec::new();
     for row in rows {
         let (
             key,
+            object_id,
             manifest_hash,
             size_bytes,
             content_fingerprint,
             metadata_payload,
             version_index_payload,
             labels_json,
+            gallery_latitude,
+            gallery_longitude,
         ) = row?;
-        entries.push(materialize_gallery_index_entry(
+        entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
             key,
+            object_id,
             manifest_hash,
             size_bytes,
             content_fingerprint,
             metadata_payload,
             version_index_payload,
             labels_json,
-        )?);
+            gallery_latitude,
+            gallery_longitude,
+        })?);
     }
     Ok(GalleryIndexPage {
         history_id,
@@ -969,16 +1097,42 @@ const GALLERY_MAP_SCOPE_SQL: &str = "
     AND gallery_objects.inferred_media_type IS NOT NULL
     AND (?4 IS NULL OR gallery_objects.media_type = ?4)";
 
+const GALLERY_MAP_OPTIONAL_CAPTURE_SQL: &str = "
+    AND (?5 IS NULL OR gallery_objects.captured_at_unix >= ?5)
+    AND (?6 IS NULL OR gallery_objects.captured_at_unix < ?6)";
+
+const GALLERY_MAP_CAPTURE_NONE_SQL: &str = "
+    AND ?5 IS NULL
+    AND ?6 IS NULL";
+const GALLERY_MAP_CAPTURE_FROM_SQL: &str = "
+    AND gallery_objects.captured_at_unix >= ?5
+    AND ?6 IS NULL";
+const GALLERY_MAP_CAPTURE_UNTIL_SQL: &str = "
+    AND ?5 IS NULL
+    AND gallery_objects.captured_at_unix < ?6";
+const GALLERY_MAP_CAPTURE_RANGE_SQL: &str = "
+    AND gallery_objects.captured_at_unix >= ?5
+    AND gallery_objects.captured_at_unix < ?6";
+
+fn gallery_map_summary_capture_sql(has_from: bool, has_until: bool) -> &'static str {
+    match (has_from, has_until) {
+        (false, false) => GALLERY_MAP_CAPTURE_NONE_SQL,
+        (true, false) => GALLERY_MAP_CAPTURE_FROM_SQL,
+        (false, true) => GALLERY_MAP_CAPTURE_UNTIL_SQL,
+        (true, true) => GALLERY_MAP_CAPTURE_RANGE_SQL,
+    }
+}
+
 const GALLERY_MAP_VIEWPORT_SQL: &str = "
-    gallery_objects.latitude BETWEEN ?5 AND ?6
+    gallery_objects.latitude BETWEEN ?7 AND ?8
     AND (
-        (?7 <= ?8 AND gallery_objects.longitude BETWEEN ?7 AND ?8)
-        OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
+        (?9 <= ?10 AND gallery_objects.longitude BETWEEN ?9 AND ?10)
+        OR (?9 > ?10 AND (gallery_objects.longitude >= ?9 OR gallery_objects.longitude <= ?10))
     )
-    AND gallery_objects.spatial_y BETWEEN ?9 AND ?10
+    AND gallery_objects.spatial_y BETWEEN ?11 AND ?12
     AND (
-        (?11 <= ?12 AND gallery_objects.spatial_x BETWEEN ?11 AND ?12)
-        OR (?11 > ?12 AND (gallery_objects.spatial_x >= ?11 OR gallery_objects.spatial_x <= ?12))
+        (?13 <= ?14 AND gallery_objects.spatial_x BETWEEN ?13 AND ?14)
+        OR (?13 > ?14 AND (gallery_objects.spatial_x >= ?13 OR gallery_objects.spatial_x <= ?14))
     )";
 
 fn sqlite_gallery_map_scope_values(
@@ -986,6 +1140,8 @@ fn sqlite_gallery_map_scope_values(
     prefix_pattern: &str,
     depth: usize,
     media_filter: super::GalleryIndexMediaFilter,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     viewport: GalleryViewportBounds,
 ) -> Result<Vec<Value>> {
     let (spatial_west, spatial_south) =
@@ -1002,6 +1158,8 @@ fn sqlite_gallery_map_scope_values(
             .media_type()
             .map(|value| Value::Text(value.to_string()))
             .unwrap_or(Value::Null),
+        optional_gallery_map_timestamp(captured_from_unix, "lower")?,
+        optional_gallery_map_timestamp(captured_until_unix, "upper")?,
         Value::Real(viewport.south),
         Value::Real(viewport.north),
         Value::Real(viewport.west),
@@ -1013,10 +1171,21 @@ fn sqlite_gallery_map_scope_values(
     ])
 }
 
+fn optional_gallery_map_timestamp(value: Option<u64>, bound: &str) -> Result<Value> {
+    value
+        .map(i64::try_from)
+        .transpose()
+        .with_context(|| format!("gallery map capture-time {bound} bound overflow"))
+        .map(|value| value.map_or(Value::Null, Value::Integer))
+}
+
 fn gallery_map_summary_from_db(
     db: &Connection,
     scope_values: &[Value],
+    capture_sql: &str,
+    label_filter: &super::GalleryLabelFilter,
 ) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let (label_sql, label_values) = gallery_label_predicates(label_filter, scope_values.len() + 1)?;
     let summary_sql = format!(
         "SELECT
              COUNT(*),
@@ -1027,56 +1196,35 @@ fn gallery_map_summary_from_db(
              COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(geotagged), 0)
          FROM gallery_objects
-         WHERE {GALLERY_MAP_SCOPE_SQL}"
+         WHERE {GALLERY_MAP_SCOPE_SQL}{capture_sql}{label_sql}"
     );
-    Ok(
-        db.query_row(&summary_sql, params_from_iter(scope_values.iter()), |row| {
-            let count = |index| {
-                row.get::<_, i64>(index).and_then(|value| {
-                    usize::try_from(value).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            index,
-                            rusqlite::types::Type::Integer,
-                            Box::new(error),
-                        )
-                    })
+    let mut values = scope_values.to_vec();
+    values.extend(label_values.into_iter().map(Value::Text));
+    Ok(db.query_row(&summary_sql, params_from_iter(values), |row| {
+        let count = |index| {
+            row.get::<_, i64>(index).and_then(|value| {
+                usize::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        index,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
                 })
-            };
-            Ok((
-                count(0)?,
-                GalleryIndexMediaSummary {
-                    ready_count: count(1)?,
-                    pending_count: count(2)?,
-                    incomplete_count: count(3)?,
-                    image_count: count(4)?,
-                    video_count: count(5)?,
-                    geotagged_count: count(6)?,
-                },
-            ))
-        })?,
-    )
+            })
+        };
+        Ok((
+            count(0)?,
+            GalleryIndexMediaSummary {
+                ready_count: count(1)?,
+                pending_count: count(2)?,
+                incomplete_count: count(3)?,
+                image_count: count(4)?,
+                video_count: count(5)?,
+                geotagged_count: count(6)?,
+            },
+        ))
+    })?)
 }
-
-const GALLERY_MAP_SUMMARY_CHUNK_SQL: &str = "
-    SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
-           gallery_objects.geotagged
-    FROM gallery_objects
-    WHERE (?1 = '' OR gallery_objects.key = ?1 OR gallery_objects.key LIKE ?2 ESCAPE '\\')
-      AND CASE
-            WHEN ?1 = '' THEN CASE
-                WHEN trim(gallery_objects.key, '/') = '' THEN 0
-                ELSE length(trim(gallery_objects.key, '/'))
-                     - length(replace(trim(gallery_objects.key, '/'), '/', '')) + 1
-            END
-            WHEN gallery_objects.key = ?1 THEN 0
-            ELSE length(substr(gallery_objects.key, length(?1) + 2))
-                 - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
-        END <= ?3
-      AND gallery_objects.inferred_media_type IS NOT NULL
-      AND (?4 IS NULL OR gallery_objects.media_type = ?4)
-      AND (?5 IS NULL OR gallery_objects.key > ?5)
-    ORDER BY gallery_objects.key
-    LIMIT ?6";
 
 const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
 
@@ -1088,16 +1236,31 @@ const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
 fn gallery_map_summary_chunked_from_db(
     db: &Connection,
     scope_values: &[Value],
+    capture_sql: &str,
+    label_filter: &super::GalleryLabelFilter,
     total_estimate: Option<usize>,
     progress: &GallerySummaryProgress,
 ) -> Result<(usize, GalleryIndexMediaSummary)> {
-    let mut statement = db.prepare_cached(GALLERY_MAP_SUMMARY_CHUNK_SQL)?;
+    let (label_sql, label_values) = gallery_label_predicates(label_filter, scope_values.len() + 1)?;
+    let cursor_parameter = scope_values.len() + label_values.len() + 1;
+    let limit_parameter = cursor_parameter + 1;
+    let sql = format!(
+        "SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
+                gallery_objects.geotagged
+           FROM gallery_objects
+          WHERE {GALLERY_MAP_SCOPE_SQL}{capture_sql}{label_sql}
+            AND (?{cursor_parameter} IS NULL OR gallery_objects.key > ?{cursor_parameter})
+          ORDER BY gallery_objects.key
+          LIMIT ?{limit_parameter}"
+    );
+    let mut statement = db.prepare_cached(&sql)?;
     let mut cursor: Option<String> = None;
     let mut total = 0usize;
     let mut summary = GalleryIndexMediaSummary::default();
     loop {
         let cursor_value = cursor.clone().map(Value::Text).unwrap_or(Value::Null);
         let mut values = scope_values.to_vec();
+        values.extend(label_values.iter().cloned().map(Value::Text));
         values.push(cursor_value);
         values.push(Value::Integer(GALLERY_MAP_SUMMARY_CHUNK_ROWS));
         let mut rows = statement.query(params_from_iter(values))?;
@@ -1143,14 +1306,19 @@ fn gallery_map_cluster_cells_from_db(
     base_values: &[Value],
     requested_resolution: u32,
     max_clusters: usize,
+    label_filter: &super::GalleryLabelFilter,
 ) -> Result<(u32, Vec<GalleryMapCluster>)> {
     let max_clusters = max_clusters.max(1);
     let mut resolution = requested_resolution.max(1);
     let clusters = loop {
+        let resolution_parameter = base_values.len() + 1;
+        let (label_sql, label_values) =
+            gallery_label_predicates(label_filter, base_values.len() + 2)?;
+        let limit_parameter = base_values.len() + 2 + label_values.len();
         let sql = format!(
             "SELECT
-                 CAST(gallery_objects.spatial_x * ?13 AS INTEGER),
-                 CAST(gallery_objects.spatial_y * ?13 AS INTEGER),
+                 CAST(gallery_objects.spatial_x * ?{resolution_parameter} AS INTEGER),
+                 CAST(gallery_objects.spatial_y * ?{resolution_parameter} AS INTEGER),
                  COUNT(*),
                  AVG(gallery_objects.latitude),
                  AVG(gallery_objects.longitude),
@@ -1159,12 +1327,15 @@ fn gallery_map_cluster_cells_from_db(
                  MIN(gallery_objects.longitude),
                  MAX(gallery_objects.longitude),
                  MIN(gallery_objects.key),
+                 MIN(gallery_objects.object_id),
                  MIN(gallery_objects.manifest_hash),
                  MIN(manifest_summaries.total_size_bytes),
                  MIN(manifest_summaries.content_fingerprint),
                  MIN(media_cache.metadata_json),
                  MIN(version_indexes.index_json),
-                 MIN(gallery_objects.labels_json)
+                 MIN(gallery_objects.labels_json),
+                 MIN(gallery_objects.latitude),
+                 MIN(gallery_objects.longitude)
              FROM gallery_objects
              LEFT JOIN manifest_summaries
                ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1172,13 +1343,15 @@ fn gallery_map_cluster_cells_from_db(
                ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
-             WHERE {GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
+             WHERE {GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_OPTIONAL_CAPTURE_SQL}
+               AND {GALLERY_MAP_VIEWPORT_SQL}{label_sql}
              GROUP BY 1, 2
              ORDER BY 2 ASC, 1 ASC
-             LIMIT ?14"
+             LIMIT ?{limit_parameter}"
         );
         let mut values = base_values.to_vec();
         values.push(Value::Integer(i64::from(resolution)));
+        values.extend(label_values.into_iter().map(Value::Text));
         values.push(Value::Integer(
             i64::try_from(max_clusters.saturating_add(1))
                 .context("gallery map cluster limit overflow")?,
@@ -1194,15 +1367,18 @@ fn gallery_map_cluster_cells_from_db(
             let count = usize::try_from(row.get::<_, i64>(2)?)
                 .context("gallery map cluster count overflow")?;
             let entry = if count == 1 {
-                Some(materialize_gallery_index_entry(
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                    row.get(12)?,
-                    row.get(13)?,
-                    row.get(14)?,
-                    row.get(15)?,
-                )?)
+                Some(materialize_gallery_index_entry(GalleryIndexEntrySource {
+                    key: row.get(9)?,
+                    object_id: row.get(10)?,
+                    manifest_hash: row.get(11)?,
+                    size_bytes: row.get(12)?,
+                    content_fingerprint: row.get(13)?,
+                    metadata_payload: row.get(14)?,
+                    version_index_payload: row.get(15)?,
+                    labels_json: row.get(16)?,
+                    gallery_latitude: row.get(17)?,
+                    gallery_longitude: row.get(18)?,
+                })?)
             } else {
                 None
             };
@@ -1247,9 +1423,19 @@ fn query_gallery_map_clusters_in_transaction(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
-    let (total_entry_count, media_summary) = gallery_map_summary_from_db(db, &base_values[..4])?;
+    let (total_entry_count, media_summary) = gallery_map_summary_from_db(
+        db,
+        &base_values[..6],
+        gallery_map_summary_capture_sql(
+            query.captured_from_unix.is_some(),
+            query.captured_until_unix.is_some(),
+        ),
+        &query.label_filter,
+    )?;
     let (resolution, clusters) = gallery_map_cluster_cells_from_db(
         db,
         &base_values,
@@ -1259,6 +1445,7 @@ fn query_gallery_map_clusters_in_transaction(
             query.max_clusters,
         ),
         query.max_clusters,
+        &query.label_filter,
     )?;
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
     Ok(GalleryMapClusterPage {
@@ -1290,15 +1477,26 @@ fn query_gallery_map_cluster_entries_in_transaction(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
+    let resolution_parameter = values.len() + 1;
+    let cell_x_parameter = resolution_parameter + 1;
+    let cell_y_parameter = resolution_parameter + 2;
     values.push(Value::Integer(i64::from(query.resolution.max(1))));
     values.push(Value::Integer(i64::from(query.cell_x)));
     values.push(Value::Integer(i64::from(query.cell_y)));
+    let (label_sql, label_values) =
+        gallery_label_predicates(&query.label_filter, values.len() + 1)?;
+    values.extend(label_values.into_iter().map(Value::Text));
+    let limit_parameter = values.len() + 1;
+    let offset_parameter = limit_parameter + 1;
     let cell_scope = format!(
-        "{GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
-         AND CAST(gallery_objects.spatial_x * ?13 AS INTEGER) = ?14
-         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15"
+        "{GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_OPTIONAL_CAPTURE_SQL}
+         AND {GALLERY_MAP_VIEWPORT_SQL}
+         AND CAST(gallery_objects.spatial_x * ?{resolution_parameter} AS INTEGER) = ?{cell_x_parameter}
+         AND CAST(gallery_objects.spatial_y * ?{resolution_parameter} AS INTEGER) = ?{cell_y_parameter}{label_sql}"
     );
     let summary_sql = format!(
         "SELECT
@@ -1340,12 +1538,15 @@ fn query_gallery_map_cluster_entries_in_transaction(
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1355,7 +1556,7 @@ fn query_gallery_map_cluster_entries_in_transaction(
            ON version_indexes.object_id = gallery_objects.object_id
          WHERE {cell_scope}
          ORDER BY gallery_objects.captured_at_unix DESC, gallery_objects.key ASC
-         LIMIT ?16 OFFSET ?17"
+         LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
     );
     values.push(Value::Integer(
         i64::try_from(query.limit.max(1)).context("gallery map entry limit overflow")?,
@@ -1368,25 +1569,42 @@ fn query_gallery_map_cluster_entries_in_transaction(
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<Vec<u8>>>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+            row.get::<_, Option<f64>>(9)?,
         ))
     })?;
     let mut entries = Vec::new();
     for row in rows {
-        let (key, manifest_hash, size, fingerprint, metadata, version_index, labels_json) = row?;
-        entries.push(materialize_gallery_index_entry(
+        let (
             key,
+            object_id,
             manifest_hash,
             size,
             fingerprint,
             metadata,
             version_index,
             labels_json,
-        )?);
+            gallery_latitude,
+            gallery_longitude,
+        ) = row?;
+        entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
+            key,
+            object_id,
+            manifest_hash,
+            size_bytes: size,
+            content_fingerprint: fingerprint,
+            metadata_payload: metadata,
+            version_index_payload: version_index,
+            labels_json,
+            gallery_latitude,
+            gallery_longitude,
+        })?);
     }
     Ok(GalleryIndexPage {
         history_id,
@@ -1397,31 +1615,68 @@ fn query_gallery_map_cluster_entries_in_transaction(
     })
 }
 
-fn materialize_gallery_index_entry(
+struct GalleryIndexEntrySource {
     key: String,
+    object_id: String,
     manifest_hash: String,
     size_bytes: Option<i64>,
     content_fingerprint: Option<String>,
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
     labels_json: String,
+    gallery_latitude: Option<f64>,
+    gallery_longitude: Option<f64>,
+}
+
+fn materialize_gallery_index_entry(
+    GalleryIndexEntrySource {
+        key,
+        object_id,
+        manifest_hash,
+        size_bytes,
+        content_fingerprint,
+        metadata_payload,
+        version_index_payload,
+        labels_json,
+        gallery_latitude,
+        gallery_longitude,
+    }: GalleryIndexEntrySource,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in sqlite"))
         .transpose()?;
-    let media_metadata = metadata_payload
+    let gallery_gps = match (gallery_latitude, gallery_longitude) {
+        (Some(latitude), Some(longitude))
+            if latitude.is_finite()
+                && (-90.0..=90.0).contains(&latitude)
+                && longitude.is_finite()
+                && (-180.0..=180.0).contains(&longitude) =>
+        {
+            Some(MediaGpsCoordinates {
+                latitude,
+                longitude,
+            })
+        }
+        _ => None,
+    };
+    let mut media_metadata = metadata_payload
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
+    if let (Some(gallery_gps), Some(metadata)) = (&gallery_gps, media_metadata.as_mut()) {
+        metadata.gps = Some(gallery_gps.clone());
+    }
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
     let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,
+        object_id,
         manifest_hash,
         size_bytes,
         modified_at_unix,
         content_fingerprint,
         media_metadata,
+        gps_override: gallery_gps,
         labels,
     })
 }
@@ -1442,6 +1697,7 @@ fn query_gallery_entry_from_db(
             &format!(
                 "SELECT
                  gallery_objects.key,
+                 gallery_objects.object_id,
                  gallery_objects.manifest_hash,
                  manifest_summaries.total_size_bytes,
                  manifest_summaries.content_fingerprint,
@@ -1466,32 +1722,56 @@ fn query_gallery_entry_from_db(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<Vec<u8>>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<f64>>(8)?,
-                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
         .optional()?;
-    row.filter(|(key, _, _, _, _, _, media_type, latitude, longitude, _)| {
-        gallery_entry_matches_delta_scope(key, media_type.as_deref(), *latitude, *longitude, scope)
-    })
-    .map(
-        |(key, manifest_hash, size, fingerprint, metadata, versions, _, _, _, labels_json)| {
-            materialize_gallery_index_entry(
+    row.filter(
+        |(key, _, _, _, _, _, _, media_type, latitude, longitude, _)| {
+            gallery_entry_matches_delta_scope(
                 key,
-                manifest_hash,
-                size,
-                fingerprint,
-                metadata,
-                versions,
-                labels_json,
+                media_type.as_deref(),
+                *latitude,
+                *longitude,
+                scope,
             )
+        },
+    )
+    .map(
+        |(
+            key,
+            object_id,
+            manifest_hash,
+            size,
+            fingerprint,
+            metadata,
+            versions,
+            _,
+            latitude,
+            longitude,
+            labels_json,
+        )| {
+            materialize_gallery_index_entry(GalleryIndexEntrySource {
+                key,
+                object_id,
+                manifest_hash,
+                size_bytes: size,
+                content_fingerprint: fingerprint,
+                metadata_payload: metadata,
+                version_index_payload: versions,
+                labels_json,
+                gallery_latitude: latitude,
+                gallery_longitude: longitude,
+            })
         },
     )
     .transpose()
@@ -1782,8 +2062,113 @@ fn map_tokio_rusqlite_error(error: tokio_rusqlite::Error) -> anyhow::Error {
     }
 }
 
+fn upsert_version_index_head_projection(
+    db: &Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    db.execute(
+        "INSERT INTO version_index_heads (
+             object_id,
+             head_version_id,
+             head_manifest_hash,
+             logical_path,
+             removed_at_unix,
+             restore_source_path,
+             restore_source_object_id,
+             restore_version_id,
+             moved_source_object_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(object_id) DO UPDATE SET
+             head_version_id = excluded.head_version_id,
+             head_manifest_hash = excluded.head_manifest_hash,
+             logical_path = excluded.logical_path,
+             removed_at_unix = excluded.removed_at_unix,
+             restore_source_path = excluded.restore_source_path,
+             restore_source_object_id = excluded.restore_source_object_id,
+             restore_version_id = excluded.restore_version_id,
+             moved_source_object_id = excluded.moved_source_object_id",
+        params![
+            projection.object_id.as_str(),
+            projection.head_version_id.as_deref(),
+            projection.head_manifest_hash.as_deref(),
+            projection.logical_path.as_deref(),
+            projection.removed_at_unix.map(u64_to_i64).transpose()?,
+            projection.restore_source_path.as_deref(),
+            projection.restore_source_object_id.as_deref(),
+            projection.restore_version_id.as_deref(),
+            projection.moved_source_object_id.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_version_index_head_projection_if_missing(
+    db: &Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    // The backfill may race a normal version-index write or a deletion. Only
+    // insert while the source index still exists and never replace a row a
+    // normal write has already brought up to date.
+    db.execute(
+        "INSERT INTO version_index_heads (
+             object_id,
+             head_version_id,
+             head_manifest_hash,
+             logical_path,
+             removed_at_unix,
+             restore_source_path,
+             restore_source_object_id,
+             restore_version_id,
+             moved_source_object_id
+         )
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+         WHERE EXISTS (
+             SELECT 1 FROM version_indexes WHERE object_id = ?1
+         )
+         ON CONFLICT(object_id) DO NOTHING",
+        params![
+            projection.object_id.as_str(),
+            projection.head_version_id.as_deref(),
+            projection.head_manifest_hash.as_deref(),
+            projection.logical_path.as_deref(),
+            projection.removed_at_unix.map(u64_to_i64).transpose()?,
+            projection.restore_source_path.as_deref(),
+            projection.restore_source_object_id.as_deref(),
+            projection.restore_version_id.as_deref(),
+            projection.moved_source_object_id.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
+    async fn object_id_backfill_needed(&self) -> Result<bool> {
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![OBJECT_ID_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none())
+        })
+        .await
+    }
+
+    async fn mark_object_id_backfill_complete(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![OBJECT_ID_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
         self.read(|db| {
             Ok(db
@@ -1804,6 +2189,32 @@ impl MetadataStore for SqliteMetadataStore {
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![GALLERY_SIDECAR_LABEL_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn gallery_sidecar_gps_backfill_needed(&self) -> Result<bool> {
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![GALLERY_SIDECAR_GPS_BACKFILL_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_none())
+        })
+        .await
+    }
+
+    async fn mark_gallery_sidecar_gps_backfill_complete(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![GALLERY_SIDECAR_GPS_BACKFILL_KEY],
             )?;
             Ok(())
         })
@@ -1873,6 +2284,145 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn set_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<XmpGeoLocation>,
+    ) -> Result<()> {
+        let key = key.to_string();
+        self.write_tx(move |db| {
+            let Some((
+                manifest_hash,
+                existing_latitude,
+                existing_longitude,
+                existing_inferred_by_berrykeep,
+            )) = db
+                .query_row(
+                    "SELECT manifest_hash, sidecar_latitude, sidecar_longitude,
+                            sidecar_inferred_by_berrykeep
+                     FROM gallery_objects WHERE key = ?1",
+                    params![key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<f64>>(1)?,
+                            row.get::<_, Option<f64>>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+            else {
+                return Ok(());
+            };
+            let latitude = location.as_ref().map(|location| location.latitude);
+            let longitude = location.as_ref().map(|location| location.longitude);
+            let inferred_by_berrykeep = i64::from(
+                location
+                    .as_ref()
+                    .is_some_and(|location| location.inferred_by_berrykeep),
+            );
+            if existing_latitude == latitude
+                && existing_longitude == longitude
+                && existing_inferred_by_berrykeep == inferred_by_berrykeep
+            {
+                return Ok(());
+            }
+            db.execute(
+                "UPDATE gallery_objects
+                 SET sidecar_latitude = ?2, sidecar_longitude = ?3,
+                     sidecar_inferred_by_berrykeep = ?4
+                 WHERE key = ?1",
+                params![key, latitude, longitude, inferred_by_berrykeep],
+            )?;
+            refresh_gallery_objects_for_manifest(db, &manifest_hash)
+        })
+        .await
+    }
+
+    async fn gallery_object_labels_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        const LABEL_LOOKUP_CHUNK_SIZE: usize = 500;
+        let keys = keys.to_vec();
+        self.read(move |db| {
+            let mut labels_by_key = HashMap::new();
+            for keys in keys.chunks(LABEL_LOOKUP_CHUNK_SIZE) {
+                if keys.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=keys.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT key, labels_json FROM gallery_objects WHERE key IN ({placeholders})"
+                );
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement.query_map(params_from_iter(keys.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (key, labels_json) = row?;
+                    labels_by_key.insert(key, decode_gallery_labels(&labels_json)?);
+                }
+            }
+            Ok(labels_by_key)
+        })
+        .await
+    }
+
+    async fn gallery_object_gps_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, MediaGpsCoordinates>> {
+        const GPS_LOOKUP_CHUNK_SIZE: usize = 500;
+        let keys = keys.to_vec();
+        self.read(move |db| {
+            let mut gps_by_key = HashMap::new();
+            for keys in keys.chunks(GPS_LOOKUP_CHUNK_SIZE) {
+                if keys.is_empty() {
+                    continue;
+                }
+                let placeholders = (1..=keys.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT key, latitude, longitude FROM gallery_objects WHERE key IN ({placeholders})"
+                );
+                let mut statement = db.prepare(&sql)?;
+                let rows = statement.query_map(params_from_iter(keys.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                        row.get::<_, Option<f64>>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (key, latitude, longitude) = row?;
+                    if let (Some(latitude), Some(longitude)) = (latitude, longitude)
+                        && latitude.is_finite()
+                        && (-90.0..=90.0).contains(&latitude)
+                        && longitude.is_finite()
+                        && (-180.0..=180.0).contains(&longitude)
+                    {
+                        gps_by_key.insert(
+                            key,
+                            MediaGpsCoordinates {
+                                latitude,
+                                longitude,
+                            },
+                        );
+                    }
+                }
+            }
+            Ok(gps_by_key)
+        })
+        .await
+    }
+
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -1886,18 +2436,22 @@ impl MetadataStore for SqliteMetadataStore {
         &self,
         query: &GalleryMapClusterQuery,
     ) -> Result<Option<GalleryMapClusterPage>> {
+        let scope = GallerySummaryScope {
+            prefix: query.prefix.trim().trim_matches('/').to_string(),
+            depth: query.depth,
+            media_filter: query.media_filter,
+            captured_from_unix: query.captured_from_unix,
+            captured_until_unix: query.captured_until_unix,
+            label_filter: query.label_filter.clone(),
+        };
+        let cached_summary = self.gallery_map_summary_cache.cached(&scope);
         let cluster_query = query.clone();
         let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) =
             self.read(move |db| query_gallery_map_cluster_cells_from_db(db, &cluster_query))
                 .await?;
 
-        let scope = GallerySummaryScope {
-            prefix: query.prefix.trim().trim_matches('/').to_string(),
-            depth: query.depth,
-            media_filter: query.media_filter,
-        };
         let (total_entry_count, media_summary, summary_status) = self
-            .gallery_map_summary(scope, &history_id, cache_revision)
+            .gallery_map_summary(scope, &history_id, cache_revision, cached_summary)
             .await?;
 
         Ok(Some(GalleryMapClusterPage {
@@ -2242,6 +2796,260 @@ impl MetadataStore for SqliteMetadataStore {
             db.execute(
                 "DELETE FROM manual_repair_action_run_history\n             WHERE finished_at_unix < ?1",
                 params![u64_to_i64(finished_before_unix)?],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_operation_runs(
+        &self,
+        operation_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationRun>> {
+        let operation_id = operation_id.map(str::to_string);
+        self.read(move |db| {
+            let mut query = String::from("SELECT record_json FROM operation_runs");
+            if operation_id.is_some() {
+                query.push_str(" WHERE operation_id = ?1");
+            }
+            query.push_str(" ORDER BY created_at_unix DESC, run_id DESC");
+            if limit.is_some() {
+                query.push_str(if operation_id.is_some() {
+                    " LIMIT ?2"
+                } else {
+                    " LIMIT ?1"
+                });
+            }
+            let mut statement = db.prepare(&query)?;
+            let mut records = Vec::new();
+            let mut append = |payload: Vec<u8>| -> Result<()> {
+                records.push(
+                    serde_json::from_slice::<OperationRun>(&payload)
+                        .context("invalid operation run record in sqlite")?,
+                );
+                Ok(())
+            };
+            match (operation_id, limit) {
+                (Some(operation_id), Some(limit)) => {
+                    for row in statement
+                        .query_map(params![operation_id, usize_to_i64(limit)?], |row| {
+                            row.get::<_, Vec<u8>>(0)
+                        })?
+                    {
+                        append(row?)?;
+                    }
+                }
+                (Some(operation_id), None) => {
+                    for row in statement
+                        .query_map(params![operation_id], |row| row.get::<_, Vec<u8>>(0))?
+                    {
+                        append(row?)?;
+                    }
+                }
+                (None, Some(limit)) => {
+                    for row in statement.query_map(params![usize_to_i64(limit)?], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })? {
+                        append(row?)?;
+                    }
+                }
+                (None, None) => {
+                    for row in statement.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
+                        append(row?)?;
+                    }
+                }
+            }
+            Ok(records)
+        })
+        .await
+    }
+
+    async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>> {
+        let run_id = run_id.to_string();
+        self.read(move |db| {
+            let payload = db
+                .query_row(
+                    "SELECT record_json FROM operation_runs WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            payload
+                .map(|payload| {
+                    serde_json::from_slice(&payload)
+                        .context("invalid operation run record in sqlite")
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    async fn persist_operation_run(&self, run: &OperationRun) -> Result<()> {
+        let run_id = run.run_id.clone();
+        let operation_id = run.operation_id.clone();
+        let status = serde_json::to_value(run.status)?
+            .as_str()
+            .context("operation status did not serialize as a string")?
+            .to_string();
+        let created_at_unix = run.created_at_unix;
+        let finished_at_unix = run.finished_at_unix.map(u64_to_i64).transpose()?;
+        let payload = serde_json::to_vec_pretty(run)?;
+        self.write(move |db| {
+            db.execute(
+                "INSERT INTO operation_runs (run_id, operation_id, status, created_at_unix, finished_at_unix, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                     operation_id = excluded.operation_id,
+                     status = excluded.status,
+                     created_at_unix = excluded.created_at_unix,
+                     finished_at_unix = excluded.finished_at_unix,
+                     record_json = excluded.record_json",
+                params![
+                    run_id,
+                    operation_id,
+                    status,
+                    u64_to_i64(created_at_unix)?,
+                    finished_at_unix,
+                    payload
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn prune_operation_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
+        self.write_tx(move |db| {
+            let finished_before_unix = u64_to_i64(finished_before_unix)?;
+            // Result chunks deliberately have no foreign key: older database
+            // versions already contain this table, and the explicit delete
+            // keeps the retention path compatible with them.
+            db.execute(
+                "DELETE FROM operation_result_chunks
+                 WHERE run_id IN (
+                     SELECT run_id FROM operation_runs
+                     WHERE finished_at_unix < ?1
+                       AND status NOT IN ('queued', 'running')
+                 )",
+                params![finished_before_unix],
+            )?;
+            db.execute(
+                "DELETE FROM operation_runs
+                 WHERE finished_at_unix < ?1
+                   AND status NOT IN ('queued', 'running')",
+                params![finished_before_unix],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn interrupt_unfinished_operation_runs(
+        &self,
+        finished_at_unix: u64,
+        termination_reason: &str,
+    ) -> Result<usize> {
+        let termination_reason = termination_reason.to_string();
+        self.write_tx(move |db| {
+            let mut statement = db.prepare(
+                "SELECT run_id, record_json FROM operation_runs
+                 WHERE status IN ('queued', 'running')",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut interrupted = Vec::new();
+            for row in rows {
+                let (run_id, payload) = row?;
+                let mut run: OperationRun = serde_json::from_slice(&payload)
+                    .context("invalid operation run record in sqlite")?;
+                if !run.status.is_unfinished() {
+                    continue;
+                }
+                run.status = OperationRunStatus::Interrupted;
+                run.finished_at_unix = Some(finished_at_unix);
+                run.termination_reason = Some(termination_reason.clone());
+                run.progress.message = Some("Interrupted after server restart.".to_string());
+                interrupted.push((run_id, serde_json::to_vec_pretty(&run)?));
+            }
+            for (run_id, payload) in &interrupted {
+                db.execute(
+                    "UPDATE operation_runs
+                     SET status = 'interrupted', finished_at_unix = ?2, record_json = ?3
+                     WHERE run_id = ?1",
+                    params![run_id, u64_to_i64(finished_at_unix)?, payload],
+                )?;
+            }
+            Ok(interrupted.len())
+        })
+        .await
+    }
+
+    async fn list_operation_result_chunks(
+        &self,
+        run_id: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<OperationResultChunk>> {
+        let run_id = run_id.to_string();
+        self.read(move |db| {
+            let query = if limit.is_some() {
+                "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                 ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2 OFFSET ?3"
+            } else {
+                "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                 ORDER BY created_at_unix ASC, chunk_id ASC LIMIT -1 OFFSET ?2"
+            };
+            let mut statement = db.prepare(query)?;
+            let mut chunks = Vec::new();
+            let mut append = |payload: Vec<u8>| -> Result<()> {
+                chunks.push(
+                    serde_json::from_slice::<OperationResultChunk>(&payload)
+                        .context("invalid operation result chunk in sqlite")?,
+                );
+                Ok(())
+            };
+            if let Some(limit) = limit {
+                for row in statement.query_map(
+                    params![run_id, usize_to_i64(limit)?, usize_to_i64(offset)?],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )? {
+                    append(row?)?;
+                }
+            } else {
+                for row in statement.query_map(params![run_id, usize_to_i64(offset)?], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })? {
+                    append(row?)?;
+                }
+            }
+            Ok(chunks)
+        })
+        .await
+    }
+
+    async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()> {
+        let run_id = chunk.run_id.clone();
+        let chunk_id = chunk.chunk_id.clone();
+        let result_type = chunk.result_type.clone();
+        let created_at_unix = chunk.created_at_unix;
+        let payload = serde_json::to_vec_pretty(chunk)?;
+        self.write(move |db| {
+            db.execute(
+                "INSERT INTO operation_result_chunks (run_id, chunk_id, result_type, created_at_unix, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id, chunk_id) DO UPDATE SET
+                     result_type = excluded.result_type,
+                     created_at_unix = excluded.created_at_unix,
+                     payload_json = excluded.payload_json",
+                params![
+                    run_id,
+                    chunk_id,
+                    result_type,
+                    u64_to_i64(created_at_unix)?,
+                    payload
+                ],
             )?;
             Ok(())
         })
@@ -2717,9 +3525,10 @@ impl MetadataStore for SqliteMetadataStore {
         match payload {
             Some(payload) => {
                 let payload = decompress_snapshot_json(&payload)?;
-                serde_json::from_slice::<SnapshotManifest>(&payload)
-                    .map(Some)
-                    .context("invalid snapshot manifest in sqlite")
+                let mut snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .context("invalid snapshot manifest in sqlite")?;
+                normalize_snapshot_manifest_object_ids(&mut snapshot);
+                Ok(Some(snapshot))
             }
             None => Ok(None),
         }
@@ -3121,11 +3930,12 @@ impl MetadataStore for SqliteMetadataStore {
         object_id: &str,
     ) -> Result<Option<FileVersionIndex>> {
         let object_id = object_id.to_string();
+        let query_object_id = object_id.clone();
         let payload = self
             .read(move |db| {
                 db.query_row(
                     "SELECT index_json FROM version_indexes WHERE object_id = ?1",
-                    params![object_id],
+                    params![query_object_id],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .optional()
@@ -3134,9 +3944,7 @@ impl MetadataStore for SqliteMetadataStore {
             .await?;
 
         match payload {
-            Some(payload) => serde_json::from_slice::<FileVersionIndex>(&payload)
-                .map(Some)
-                .context("invalid version index in sqlite"),
+            Some(payload) => decode_version_index(&object_id, &payload, "sqlite").map(Some),
             None => Ok(None),
         }
     }
@@ -3547,6 +4355,7 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
         let object_id = object_id.to_string();
+        let head_projection = version_index_head_projection(&object_id, index);
         self.write_tx(move |db| {
             let changed = db.execute(
                 "INSERT INTO version_indexes (object_id, index_json)
@@ -3555,6 +4364,7 @@ impl MetadataStore for SqliteMetadataStore {
                  WHERE version_indexes.index_json != excluded.index_json",
                 params![object_id, payload],
             )?;
+            upsert_version_index_head_projection(db, &head_projection)?;
             if changed > 0 {
                 let unchanged_projection_keys =
                     refresh_gallery_objects_for_object_id_and_collect_unchanged_keys(
@@ -3570,20 +4380,203 @@ impl MetadataStore for SqliteMetadataStore {
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
         self.read(|db| {
             let mut stmt = db.prepare(
-                "SELECT index_json
+                "SELECT object_id, index_json
                  FROM version_indexes
                  ORDER BY object_id",
             )?;
-            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
             let mut indexes = Vec::new();
             for row in rows {
-                let payload = row?;
-                indexes.push(
-                    serde_json::from_slice::<FileVersionIndex>(&payload)
-                        .context("invalid version index in sqlite")?,
-                );
+                let (object_id, payload) = row?;
+                indexes.push(decode_version_index(&object_id, &payload, "sqlite")?);
             }
             Ok(indexes)
+        })
+        .await
+    }
+
+    async fn load_version_indexes_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>> {
+        let after_object_id = after_object_id.map(str::to_owned);
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        self.read(move |db| {
+            let mut statement = db.prepare(
+                "SELECT object_id, index_json
+                 FROM version_indexes
+                 WHERE ?1 IS NULL OR object_id > ?1
+                 ORDER BY object_id
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![after_object_id, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut indexes = Vec::new();
+            for row in rows {
+                let (object_id, payload) = row?;
+                indexes.push(decode_version_index(&object_id, &payload, "sqlite")?);
+            }
+            Ok(indexes)
+        })
+        .await
+    }
+
+    async fn load_version_index_payloads_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let after_object_id = after_object_id.map(str::to_owned);
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        self.read(move |db| {
+            let mut statement = db.prepare(
+                "SELECT object_id, index_json
+                 FROM version_indexes
+                 WHERE ?1 IS NULL OR object_id > ?1
+                 ORDER BY object_id
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![after_object_id, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    async fn list_recoverable_history_listing(
+        &self,
+        prefix: &str,
+        depth: usize,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryListing> {
+        let prefix = prefix.trim().trim_matches('/').to_string();
+        let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+        let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
+        let depth = depth.clamp(1, 64);
+        let depth = i64::try_from(depth).context("history listing depth overflow")?;
+        let max_entries = max_entries.max(1);
+        let limit = max_entries
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(i64::MAX);
+        let query = recoverable_history_listing_query(!prefix.is_empty());
+        self.read(move |db| {
+            let mut statement = db.prepare(&query)?;
+            let mut rows = statement.query(params![
+                TOMBSTONE_MANIFEST_HASH,
+                prefix,
+                path_lower_bound.unwrap_or_default(),
+                path_upper_bound.unwrap_or_default(),
+                depth,
+                limit,
+            ])?;
+            let mut entries = Vec::new();
+            while let Some(row) = rows.next()? {
+                let path = row.get::<_, String>(0)?;
+                if row.get::<_, i64>(1)? != 0 {
+                    entries.push(RecoverableHistoryListingEntry::Historical(
+                        RecoverableHistoryEntry {
+                            path,
+                            restore_source_path: row.get(2)?,
+                            restore_source_object_id: row.get(3)?,
+                            restore_version_id: row.get(4)?,
+                            removed_at_unix: row.get(5)?,
+                            moved_to_path: row.get(6)?,
+                        },
+                    ));
+                } else {
+                    entries.push(RecoverableHistoryListingEntry::Prefix { path });
+                }
+            }
+            let truncated = entries.len() > max_entries;
+            entries.truncate(max_entries);
+            Ok(RecoverableHistoryListing { entries, truncated })
+        })
+        .await
+    }
+
+    async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState> {
+        self.read(|db| {
+            let complete = db
+                .query_row(
+                    "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY],
+                    |_row| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if complete {
+                return Ok(HistoryHeadProjectionBackfillState::Complete);
+            }
+            let after_object_id = db
+                .query_row(
+                    "SELECT value FROM metadata_meta WHERE key = ?1",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(HistoryHeadProjectionBackfillState::Pending { after_object_id })
+        })
+        .await
+    }
+
+    async fn persist_history_head_projection_backfill_batch(
+        &self,
+        projections: &[VersionIndexHeadProjection],
+        next_after_object_id: Option<&str>,
+        complete: bool,
+    ) -> Result<()> {
+        let projections = projections.to_vec();
+        let next_after_object_id = next_after_object_id.map(str::to_owned);
+        self.write_tx(move |db| {
+            for projection in &projections {
+                insert_version_index_head_projection_if_missing(db, projection)?;
+            }
+            if complete {
+                db.execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY],
+                )?;
+                db.execute(
+                    "DELETE FROM metadata_meta WHERE key = ?1",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY],
+                )?;
+            } else {
+                let after_object_id = next_after_object_id.as_deref().ok_or_else(|| {
+                    anyhow!("history head projection backfill has no next cursor")
+                })?;
+                db.execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, after_object_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn clear_history_head_projections_for_test(&self) -> Result<()> {
+        self.write_tx(|db| {
+            db.execute("DELETE FROM version_index_heads", [])?;
+            db.execute(
+                "DELETE FROM metadata_meta WHERE key IN (?1, ?2)",
+                params![
+                    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
+                    HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+                ],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -3639,10 +4632,10 @@ impl MetadataStore for SqliteMetadataStore {
             for row in rows {
                 let payload = row?;
                 let payload = decompress_snapshot_json(&payload)?;
-                snapshots.push(
-                    serde_json::from_slice::<SnapshotManifest>(&payload)
-                        .context("invalid snapshot manifest in sqlite")?,
-                );
+                let mut snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .context("invalid snapshot manifest in sqlite")?;
+                normalize_snapshot_manifest_object_ids(&mut snapshot);
+                snapshots.push(snapshot);
             }
             Ok(snapshots)
         })
@@ -3665,9 +4658,10 @@ impl MetadataStore for SqliteMetadataStore {
         match payload {
             Some(payload) => {
                 let payload = decompress_snapshot_json(&payload)?;
-                serde_json::from_slice::<SnapshotManifest>(&payload)
-                    .map(Some)
-                    .context("invalid snapshot manifest in sqlite")
+                let mut snapshot = serde_json::from_slice::<SnapshotManifest>(&payload)
+                    .context("invalid snapshot manifest in sqlite")?;
+                normalize_snapshot_manifest_object_ids(&mut snapshot);
+                Ok(Some(snapshot))
             }
             None => Ok(None),
         }
@@ -4120,9 +5114,13 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
         let object_id = object_id.to_string();
-        self.write(move |db| {
+        self.write_tx(move |db| {
             db.execute(
                 "DELETE FROM version_indexes WHERE object_id = ?1",
+                params![object_id],
+            )?;
+            db.execute(
+                "DELETE FROM version_index_heads WHERE object_id = ?1",
                 params![object_id],
             )?;
             Ok(())
@@ -4250,6 +5248,9 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             geotagged INTEGER NOT NULL DEFAULT 0,
             latitude REAL,
             longitude REAL,
+            sidecar_latitude REAL,
+            sidecar_longitude REAL,
+            sidecar_inferred_by_berrykeep INTEGER NOT NULL DEFAULT 0,
             spatial_x REAL,
             spatial_y REAL,
             labels_json TEXT NOT NULL DEFAULT '[]'
@@ -4269,6 +5270,18 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS version_indexes (
             object_id TEXT PRIMARY KEY,
             index_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS version_index_heads (
+            object_id TEXT PRIMARY KEY,
+            head_version_id TEXT,
+            head_manifest_hash TEXT,
+            logical_path TEXT,
+            removed_at_unix INTEGER,
+            restore_source_path TEXT,
+            restore_source_object_id TEXT,
+            restore_version_id TEXT,
+            moved_source_object_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS snapshots (
@@ -4323,6 +5336,24 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             run_id TEXT PRIMARY KEY,
             finished_at_unix INTEGER NOT NULL,
             record_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_runs (
+            run_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            finished_at_unix INTEGER,
+            record_json BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_result_chunks (
+            run_id TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            result_type TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            payload_json BLOB NOT NULL,
+            PRIMARY KEY(run_id, chunk_id)
         );
 
         CREATE TABLE IF NOT EXISTS data_scrub_run_history (
@@ -4448,14 +5479,20 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             PRIMARY KEY(source_node_id, key, source_version_id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
-            ON current_objects(object_id);
         CREATE INDEX IF NOT EXISTS idx_gallery_objects_media_order
             ON gallery_objects(media_type, captured_at_unix DESC, key ASC);
         CREATE INDEX IF NOT EXISTS idx_gallery_objects_manifest_hash
             ON gallery_objects(manifest_hash);
         CREATE INDEX IF NOT EXISTS idx_manifest_summaries_content_fingerprint
             ON manifest_summaries(content_fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_version_index_heads_history_path
+            ON version_index_heads(
+                head_manifest_hash,
+                logical_path,
+                removed_at_unix DESC,
+                restore_version_id DESC,
+                object_id DESC
+            );
         CREATE INDEX IF NOT EXISTS idx_snapshots_created
             ON snapshots(created_at_unix DESC, snapshot_id DESC);
         CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected
@@ -4464,6 +5501,15 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON repair_run_history(finished_at_unix DESC, run_id DESC);
         CREATE INDEX IF NOT EXISTS idx_manual_repair_action_run_history_finished
             ON manual_repair_action_run_history(finished_at_unix DESC, run_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_operation_runs_operation_created
+            ON operation_runs(operation_id, created_at_unix DESC, run_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_operation_runs_status
+            ON operation_runs(status, created_at_unix DESC, run_id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_operation_result_chunks_run_created
+            ON operation_result_chunks(run_id, created_at_unix ASC, chunk_id ASC);
         CREATE INDEX IF NOT EXISTS idx_data_scrub_run_history_finished
             ON data_scrub_run_history(finished_at_unix DESC, run_id DESC);
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created
@@ -4482,8 +5528,33 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON s3_object_versions(bucket_name, ironmesh_key, created_at_unix DESC, version_id DESC);
         ",
     )?;
+    add_sqlite_column_if_missing(
+        db,
+        "current_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_sqlite_column_if_missing(
+        db,
+        "gallery_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
+         ON current_objects(object_id)",
+        [],
+    )?;
     add_sqlite_column_if_missing(db, "gallery_objects", "latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "longitude", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "sidecar_latitude", "REAL")?;
+    add_sqlite_column_if_missing(db, "gallery_objects", "sidecar_longitude", "REAL")?;
+    add_sqlite_column_if_missing(
+        db,
+        "gallery_objects",
+        "sidecar_inferred_by_berrykeep",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_sqlite_column_if_missing(db, "gallery_objects", "spatial_x", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_objects", "spatial_y", "REAL")?;
     add_sqlite_column_if_missing(
@@ -4492,6 +5563,20 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         GALLERY_LABELS_COLUMN,
         GALLERY_LABELS_COLUMN_DEFINITION,
     )?;
+    // Chunked summary refreshes need `key` for stable pagination. Keep large label JSON out of
+    // this otherwise covering index: label-filtered summaries can fetch it from the table.
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gallery_objects_capture_summary
+         ON gallery_objects(
+             captured_at_unix,
+             inferred_media_type,
+             media_type,
+             media_status,
+             geotagged,
+             key
+         )",
+        [],
+    )?;
     add_sqlite_column_if_missing(
         db,
         "gallery_changes",
@@ -4499,6 +5584,19 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         "TEXT",
     )?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_media_type", "TEXT")?;
+    add_sqlite_column_if_missing(db, "operation_runs", "finished_at_unix", "INTEGER")?;
+    db.execute(
+        "UPDATE operation_runs
+         SET finished_at_unix = created_at_unix
+         WHERE finished_at_unix IS NULL
+           AND status NOT IN ('queued', 'running')",
+        [],
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_operation_runs_status_finished
+         ON operation_runs(status, finished_at_unix DESC, run_id DESC)",
+        [],
+    )?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_latitude", "REAL")?;
     add_sqlite_column_if_missing(db, "gallery_changes", "previous_longitude", "REAL")?;
     add_sqlite_column_if_missing(
@@ -4561,7 +5659,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         None => METADATA_SCHEMA_VERSION_CURRENT,
     };
 
-    if schema_version != METADATA_SCHEMA_VERSION_CURRENT {
+    if !(1..=METADATA_SCHEMA_VERSION_CURRENT).contains(&schema_version) {
         anyhow::bail!(
             "unsupported sqlite metadata schema version: {} (current={})",
             schema_version,
@@ -4869,6 +5967,128 @@ mod tests {
         assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
     }
 
+    #[tokio::test]
+    async fn interrupted_operation_runs_keep_their_persisted_result_chunks() {
+        let metadata_db_path = sqlite_test_db_path("operation-restart");
+        let store = SqliteMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("sqlite metadata store should open");
+        let run = OperationRun {
+            run_id: "analysis-run".to_string(),
+            operation_id: "multimedia.geolocation.propose".to_string(),
+            status: OperationRunStatus::Running,
+            priority: OperationPriority::Background,
+            created_at_unix: 10,
+            started_at_unix: Some(11),
+            finished_at_unix: None,
+            progress: OperationProgress {
+                phase: Some("persisting_results".to_string()),
+                completed: Some(1),
+                total: Some(2),
+                message: None,
+            },
+            input: serde_json::json!({ "prefix": "photos/" }),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        };
+        store
+            .persist_operation_run(&run)
+            .await
+            .expect("running operation should persist");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: run.run_id.clone(),
+                chunk_id: "folder-segment-a".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 12,
+                payload: serde_json::json!({ "id": "folder-segment-a", "proposals": [] }),
+            })
+            .await
+            .expect("proposal chunk should persist before completion");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: run.run_id.clone(),
+                chunk_id: "folder-segment-b".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 13,
+                payload: serde_json::json!({ "id": "folder-segment-b", "proposals": [] }),
+            })
+            .await
+            .expect("a second proposal chunk should persist before completion");
+
+        assert_eq!(
+            store
+                .interrupt_unfinished_operation_runs(20, "server_restart")
+                .await
+                .expect("restart cleanup should succeed"),
+            1
+        );
+        let interrupted = store
+            .load_operation_run(&run.run_id)
+            .await
+            .expect("operation should load")
+            .expect("operation should remain recorded");
+        assert_eq!(interrupted.status, OperationRunStatus::Interrupted);
+        assert_eq!(
+            interrupted.termination_reason.as_deref(),
+            Some("server_restart")
+        );
+        assert_eq!(interrupted.finished_at_unix, Some(20));
+        assert_eq!(
+            store
+                .list_operation_result_chunks(&run.run_id, None, 0)
+                .await
+                .expect("results should load")
+                .len(),
+            2,
+            "a restart must never discard reviewable proposal chunks"
+        );
+        let page = store
+            .list_operation_result_chunks(&run.run_id, Some(1), 1)
+            .await
+            .expect("result chunk page should load");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].chunk_id, "folder-segment-b");
+
+        store
+            .prune_operation_run_history_before(11)
+            .await
+            .expect("terminal operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&run.run_id)
+                .await
+                .expect("retained operation lookup should succeed")
+                .is_some(),
+            "retention must be measured from interruption, not the original queue time"
+        );
+
+        store
+            .prune_operation_run_history_before(21)
+            .await
+            .expect("expired operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&run.run_id)
+                .await
+                .expect("pruned operation lookup should succeed")
+                .is_none(),
+            "expired terminal operations must be removed"
+        );
+        assert!(
+            store
+                .list_operation_result_chunks(&run.run_id, None, 0)
+                .await
+                .expect("pruned result lookup should succeed")
+                .is_empty(),
+            "result chunks must be removed with their expired run"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
     #[test]
     fn init_metadata_db_accepts_missing_legacy_schema_version() {
         let db = Connection::open_in_memory().expect("in-memory sqlite should open");
@@ -4929,13 +6149,16 @@ mod tests {
             height: Some(48),
             orientation: Some(1),
             taken_at_unix: Some(1),
+            taken_at_timezone_known: None,
             date_encoded_unix: None,
+            date_encoded_timezone_known: None,
             duration_millis: None,
             frame_rate_millihertz: None,
             total_bitrate_bps: None,
             codec_name: None,
             codec_fourcc: None,
             gps: None,
+            has_embedded_gps_properties: false,
             photo: None,
             thumbnail: None,
             source_size_bytes: 1024,

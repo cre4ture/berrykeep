@@ -47,7 +47,8 @@ export function makeViteConfig(appName: string) {
     },
     server: {
       host: "127.0.0.1",
-      port: appName === "server-admin" ? 4173 : 4174
+      port:
+        appName === "server-admin" ? 4173 : appName === "client-ui" ? 4174 : 4175
     }
   });
 }

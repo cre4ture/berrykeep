@@ -16,16 +16,16 @@ fn expected_version_outputs(binary_name: &str) -> [String; 2] {
 
 #[test]
 fn version_reports_package_version() {
-    let output = Command::cargo_bin("ironmesh")
-        .expect("ironmesh binary should build")
+    let output = Command::cargo_bin("berrykeep")
+        .expect("berrykeep binary should build")
         .arg("--version")
         .output()
-        .expect("ironmesh --version should run");
+        .expect("berrykeep --version should run");
 
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("version output should be valid UTF-8");
-    let expected = expected_version_outputs("ironmesh");
+    let expected = expected_version_outputs("berrykeep");
     assert!(
         expected.iter().any(|candidate| candidate == &stdout),
         "unexpected stdout: {stdout}"

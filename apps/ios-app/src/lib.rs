@@ -15,6 +15,7 @@ use common::StorageObjectMeta;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::{Builder, Runtime};
@@ -717,6 +718,7 @@ fn start_embedded_web_ui(
     bootstrap_json: String,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
+    _cache_root: PathBuf,
 ) -> Result<EmbeddedWebUiLaunch> {
     init_ios_tracing();
     let runtime = web_ui_runtime()?;
@@ -839,6 +841,9 @@ fn store_index_with_options_json(
     limit: Option<usize>,
     sort: Option<&str>,
     media_filter: Option<&str>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
+    exclude_labels: Vec<String>,
 ) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
     let options = StoreIndexRequestOptions {
@@ -849,7 +854,11 @@ fn store_index_with_options_json(
         limit,
         sort: parse_store_index_sort_order(sort)?,
         media_filter: parse_store_index_media_filter(media_filter)?,
+        captured_from_unix,
+        captured_until_unix,
         viewport: None,
+        require_labels: Vec::new(),
+        exclude_labels,
         synthesize_missing_folder_markers: matches!(view, Some("tree"))
             && offset.is_none()
             && limit.is_none()
@@ -1177,6 +1186,9 @@ pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
     limit: isize,
     sort: *const c_char,
     media_filter: *const c_char,
+    captured_from_unix: u64,
+    captured_until_unix: u64,
+    exclude_labels: *const c_char,
     out_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
 ) -> c_int {
@@ -1188,6 +1200,16 @@ pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
         let view = optional_c_string(view)?;
         let sort = optional_c_string(sort)?;
         let media_filter = optional_c_string(media_filter)?;
+        let exclude_labels = optional_c_string(exclude_labels)?
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let offset = if offset < 0 {
             None
         } else {
@@ -1208,7 +1230,37 @@ pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
             limit,
             sort.as_deref(),
             media_filter.as_deref(),
+            (captured_from_unix != u64::MAX).then_some(captured_from_unix),
+            (captured_until_unix != u64::MAX).then_some(captured_until_unix),
+            exclude_labels,
         )
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+/// Replaces the XMP-sidecar labels for one media path.
+///
+/// # Safety
+///
+/// `handle` must be a live handle returned by this facade. `key` and
+/// `labels_json` must each point to valid, NUL-terminated UTF-8 strings for
+/// the duration of the call. When non-null, `out_error` must point to writable
+/// storage for a C string pointer owned by this facade.
+pub unsafe extern "C" fn ironmesh_ios_facade_set_media_labels_json(
+    handle: *mut c_void,
+    key: *const c_char,
+    labels_json: *const c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_error(out_error);
+    run_ffi_unit_result(out_error, || {
+        let app = unsafe { handle_to_app(handle)? };
+        let key = required_c_string(key, "key")?;
+        let labels_json = required_c_string(labels_json, "labels_json")?;
+        let labels = serde_json::from_str::<Vec<String>>(&labels_json)
+            .context("failed to parse media label JSON")?;
+        app.sdk.set_media_labels_blocking(key, labels)
     })
 }
 
@@ -1556,6 +1608,7 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui(
     connection_input: *const c_char,
     server_ca_pem: *const c_char,
     client_identity_json: *const c_char,
+    cache_root: *const c_char,
     out_url: *mut *mut c_char,
     out_error: *mut *mut c_char,
 ) -> c_int {
@@ -1566,6 +1619,7 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui(
             required_c_string(connection_input, "connection_input")?,
             optional_c_string(server_ca_pem)?,
             optional_c_string(client_identity_json)?,
+            PathBuf::from(required_c_string(cache_root, "cache_root")?),
         )?)
         .context("failed to serialize embedded web ui launch")
     })
@@ -2181,6 +2235,9 @@ mod tests {
             entries.push(StoreIndexEntry {
                 path: key.clone(),
                 entry_type: "key".to_string(),
+                object_id: Some(object.object_id.clone()),
+                labels: Vec::new(),
+                labels_resolved: false,
                 version: None,
                 content_hash: Some(format!("hash-{}", object.object_id)),
                 size_bytes: Some(object.bytes.len() as u64),
@@ -2194,6 +2251,9 @@ mod tests {
             entries.push(StoreIndexEntry {
                 path: prefix,
                 entry_type: "prefix".to_string(),
+                object_id: None,
+                labels: Vec::new(),
+                labels_resolved: false,
                 version: None,
                 content_hash: None,
                 size_bytes: None,
@@ -2523,6 +2583,9 @@ mod tests {
             32,
             sort.as_ptr(),
             media_filter.as_ptr(),
+            1_700_000_000,
+            1_700_086_400,
+            ptr::null(),
             &mut json_out,
             &mut index_error,
         );
@@ -2539,7 +2602,7 @@ mod tests {
                 .expect("lock poisoned")
                 .as_deref(),
             Some(
-                "depth=64&prefix=photos&view=raw&offset=32&limit=32&sort=captured_desc&media_filter=image"
+                "depth=64&prefix=photos&view=raw&offset=32&limit=32&sort=captured_desc&media_filter=image&captured_from_unix=1700000000&captured_until_unix=1700086400"
             )
         );
 

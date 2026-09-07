@@ -16,29 +16,29 @@ pub const DESKTOP_CLIENT_CONFIG_REVISION: &str = git_version::git_version!(
     args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]
 );
 pub const CONFIG_APP_EXE: &str = if cfg!(windows) {
-    "ironmesh-config-app.exe"
+    "berrykeep-config-app.exe"
 } else {
-    "ironmesh-config-app"
+    "berrykeep-config-app"
 };
 pub const BACKGROUND_LAUNCHER_EXE: &str = if cfg!(windows) {
-    "ironmesh-background-launcher.exe"
+    "berrykeep-background-launcher.exe"
 } else {
-    "ironmesh-background-launcher"
+    "berrykeep-background-launcher"
 };
 pub const OS_INTEGRATION_EXE: &str = if cfg!(windows) {
-    "ironmesh-os-integration.exe"
+    "berrykeep-os-integration.exe"
 } else {
-    "ironmesh-os-integration"
+    "berrykeep-os-integration"
 };
 pub const FOLDER_AGENT_EXE: &str = if cfg!(windows) {
-    "ironmesh-folder-agent.exe"
+    "berrykeep-folder-agent.exe"
 } else {
-    "ironmesh-folder-agent"
+    "berrykeep-folder-agent"
 };
 pub const CLIENT_CLI_EXE: &str = if cfg!(windows) {
-    "ironmesh.exe"
+    "berrykeep.exe"
 } else {
-    "ironmesh"
+    "berrykeep"
 };
 pub const STARTUP_TASK_ID: &str = "IronmeshBackgroundLauncher";
 pub const PLATFORM_KIND: &str = env::consts::OS;
@@ -55,7 +55,7 @@ pub const STARTUP_INTEGRATION_VALUE: &str = if cfg!(windows) {
 pub const STARTUP_INTEGRATION_NOTE: &str = if cfg!(windows) {
     "Enabled services can restart after sign-in through the packaged startup task."
 } else {
-    "Packaged Linux installs can start the background config app after graphical sign-in through XDG Autostart. Run ironmesh-config-app --background to start it in the current session."
+    "Packaged Linux installs can start the background config app after graphical sign-in through XDG Autostart. Run berrykeep-config-app --background to start it in the current session."
 };
 pub const OS_INTEGRATION_MANAGEMENT_SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 
@@ -1856,7 +1856,7 @@ mod tests {
                 instance_kind: "folder-agent".to_string(),
                 id: "folder-1".to_string(),
                 label: "Folder".to_string(),
-                executable: "/opt/ironmesh/ironmesh-folder-agent".to_string(),
+                executable: "/opt/berrykeep/berrykeep-folder-agent".to_string(),
                 command_line: vec!["--root-dir".to_string(), "/tmp/folder".to_string()],
                 log_file: Some("/tmp/ironmesh/folder-agent-folder-1.log".to_string()),
                 pid: Some(42),
@@ -1873,9 +1873,9 @@ mod tests {
         assert_eq!(
             OS_INTEGRATION_EXE,
             if cfg!(windows) {
-                "ironmesh-os-integration.exe"
+                "berrykeep-os-integration.exe"
             } else {
-                "ironmesh-os-integration"
+                "berrykeep-os-integration"
             }
         );
 

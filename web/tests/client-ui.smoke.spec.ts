@@ -4,6 +4,7 @@ import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import {
   createInitialOverviewGalleryEntries,
+  createLiveClusterGalleryEntries,
   registerGalleryMapContractTests
 } from "./gallery-map.contract";
 import { GalleryMapMockSession } from "./gallery-map.mock";
@@ -47,11 +48,36 @@ registerGalleryMapContractTests({
       storeEntries: createInitialOverviewGalleryEntries(),
       mapMetadataCenter: [8.5417, 47.3769, 3]
     }),
+  setupLiveClusterScenario: (page) =>
+    installClientUiMocks(page, {
+      storeEntries: createLiveClusterGalleryEntries(),
+      mapMetadataCenter: [8.5417, 47.3769, 3]
+    }),
   openGallery: async (page) => {
     await page.goto("/");
     await page.getByText("Gallery", { exact: true }).click();
     await expect(page.getByRole("heading", { name: "Gallery" })).toBeVisible();
   }
+});
+
+test("embedded Android accent color overrides the browser-local preference", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("ironmesh-accent-color", "#db2777");
+  });
+  await installClientUiMocks(page);
+  await page.goto("/?embedded_client=android&accent_color=%232563eb");
+
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        document.documentElement.style.getPropertyValue("--ironmesh-accent-rgb").trim()
+      )
+    )
+    .toBe("37, 99, 235");
+
+  await page.getByRole("button", { name: /Style:/ }).click();
+  await expect(page.getByText("Synced from the Android app.")).toBeVisible();
+  await expect(page.locator('input[type="color"]')).toHaveCount(0);
 });
 
 test("private service origins keep the launch cookie and sibling sites isolated", async ({
@@ -163,6 +189,15 @@ test("a blocked service popup leaves the client UI open", async ({ page }) => {
     page.getByText("The browser blocked the service popup. Allow popups and try again.")
   ).toBeVisible();
   await expect(page.getByRole("heading", { name: "Web services" })).toBeVisible();
+});
+
+test("the embedded Android client offers in-app and external private-service handoff", async ({ page }) => {
+  await installClientUiMocks(page);
+  await page.goto("/?embedded_client=android");
+  await page.getByText("Web services", { exact: true }).click();
+
+  await expect(page.getByRole("button", { name: "Open in BerryKeep" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open in browser" })).toBeVisible();
 });
 
 test("web service results appear while another node is still checking", async ({ page }) => {
@@ -803,6 +838,170 @@ test("client-ui gallery loads bounded server-side map clusters", async ({ page }
         request.searchParams.has("zoom")
     )
   ).toBe(true);
+});
+
+test("client-ui gallery sends capture-date bounds to grid and map queries", async ({ page }) => {
+  const gridRequests: URL[] = [];
+  const mapRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list")) {
+      gridRequests.push(url);
+    }
+    if (url.pathname === apiV1("/gallery/map/clusters")) {
+      mapRequests.push(url);
+    }
+  });
+
+  const mocks = await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+  await expect.poll(() => mocks.galleryStoreListRequestCount()).toBe(2);
+  const [capturedFromUnix, capturedUntilUnix] = await page.evaluate(() => [
+    Math.floor(new Date(2024, 3, 5).getTime() / 1_000),
+    Math.floor(new Date(2024, 3, 7).getTime() / 1_000)
+  ]);
+  const includesCaptureBounds = (request: URL) =>
+    request.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
+    request.searchParams.get("captured_until_unix") === String(capturedUntilUnix);
+
+  mocks.setGalleryStoreListDelay(750);
+  const fromOnlyRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return (
+      url.pathname === apiV1("/store/list") &&
+      url.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
+      !url.searchParams.has("captured_until_unix")
+    );
+  });
+  await page.getByLabel("Captured from").fill("2024-04-05");
+  await fromOnlyRequest;
+  const completedRangeResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === apiV1("/store/list") && includesCaptureBounds(url);
+  });
+  await page.getByLabel("Captured through").fill("2024-04-06");
+  await completedRangeResponse;
+  mocks.setGalleryStoreListDelay(0);
+
+  await page.getByLabel("Captured from").fill("1965-04-05");
+  await page.getByLabel("Captured through").fill("1965-04-06");
+  const includesEmptyPreEpochBounds = (request: URL) =>
+    request.searchParams.get("captured_from_unix") === "0" &&
+    request.searchParams.get("captured_until_unix") === "0";
+  await expect.poll(() => gridRequests.some(includesEmptyPreEpochBounds)).toBe(true);
+
+  await page.getByLabel("Captured from").fill("2024-04-05");
+  await page.getByLabel("Captured through").fill("2024-04-06");
+  await page.getByRole("button", { name: "Map" }).click();
+  await expect.poll(() => mapRequests.some(includesCaptureBounds)).toBe(true);
+});
+
+test("client-ui gallery preserves the lower capture date while editing the upper date", async ({
+  page
+}) => {
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  const capturedFrom = page.getByLabel("Captured from");
+  const capturedThrough = page.getByLabel("Captured through");
+  await capturedFrom.fill("2024-04-05");
+
+  // Chromium emits a change event for intermediate year values while a native date input is
+  // edited by keyboard. Such values must not move the lower bound before the upper date has
+  // been committed.
+  await capturedThrough.fill("0002-04-06");
+  await expect(capturedFrom).toHaveValue("2024-04-05");
+  await capturedThrough.fill("2024-04-06");
+  await expect(capturedFrom).toHaveValue("2024-04-05");
+});
+
+test("client-ui gallery retains its applied range while a date range is reversed", async ({
+  page
+}) => {
+  const gridRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list")) {
+      gridRequests.push(url);
+    }
+  });
+
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  const capturedFrom = page.getByLabel("Captured from");
+  const capturedThrough = page.getByLabel("Captured through");
+  await capturedFrom.fill("2024-04-05");
+  await capturedThrough.fill("2024-04-06");
+  await expect
+    .poll(() =>
+      gridRequests.some(
+        (request) =>
+          request.searchParams.has("captured_from_unix") &&
+          request.searchParams.has("captured_until_unix")
+      )
+    )
+    .toBe(true);
+  gridRequests.length = 0;
+
+  await capturedFrom.fill("2030-01-01");
+  await page.waitForTimeout(500);
+  expect(gridRequests).toHaveLength(0);
+
+  await capturedThrough.focus();
+  await expect(capturedThrough).toHaveValue("2030-01-01");
+  const [capturedFromUnix, capturedUntilUnix] = await page.evaluate(() => [
+    Math.floor(new Date(2030, 0, 1).getTime() / 1_000),
+    Math.floor(new Date(2030, 0, 2).getTime() / 1_000)
+  ]);
+  await expect
+    .poll(() =>
+      gridRequests.some(
+        (request) =>
+          request.searchParams.get("captured_from_unix") === String(capturedFromUnix) &&
+          request.searchParams.get("captured_until_unix") === String(capturedUntilUnix)
+      )
+    )
+    .toBe(true);
+});
+
+test("client-ui gallery debounces automatic capture-date reloads", async ({ page }) => {
+  const filteredGridRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list") && url.searchParams.has("captured_from_unix")) {
+      filteredGridRequests.push(url);
+    }
+  });
+
+  await installClientUiMocks(page);
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+  await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
+
+  await page.getByLabel("Captured from").fill("2024-04-03");
+  await page.getByLabel("Captured from").fill("2024-04-04");
+  await page.getByLabel("Captured from").fill("2024-04-05");
+
+  const capturedFromUnix = await page.evaluate(() =>
+    Math.floor(new Date(2024, 3, 5).getTime() / 1_000)
+  );
+  await expect
+    .poll(() =>
+      filteredGridRequests.filter(
+        (request) =>
+          request.searchParams.get("captured_from_unix") === String(capturedFromUnix)
+      ).length
+    )
+    .toBe(1);
+  await page.waitForTimeout(500);
+  expect(filteredGridRequests).toHaveLength(1);
 });
 
 test("client-ui gallery falls back to an older map API", async ({ page }) => {
@@ -1630,6 +1829,264 @@ test("client-ui explorer fetches result pages instead of the complete index", as
   expect(requestPages.every((request) => request.limit === "100")).toBe(true);
 });
 
+test("client-ui explorer refreshes history while paging current entries", async ({ page }) => {
+  let historyRequestCount = 0;
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/history") && request.method() === "GET") {
+      historyRequestCount += 1;
+    }
+  });
+
+  await installClientUiMocks(page, {
+    storeEntries: createGalleryPaginationMockStoreEntries(250),
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted-001",
+        restore_version_id: "version-deleted-001",
+        removed_at_unix: 1_712_345_600
+      }
+    ]
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
+  await expect.poll(() => historyRequestCount).toBe(1);
+
+  await page.locator('[data-explorer-pagination="true"]').getByRole("button", { name: "2" }).click();
+  await expect(page.locator('[data-explorer-pagination="true"]')).toContainText("Showing 101–200 of");
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
+  await expect.poll(() => historyRequestCount).toBe(2);
+});
+
+test("client-ui explorer refreshes history after navigation", async ({ page }) => {
+  let historyRequestCount = 0;
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/history") && request.method() === "GET") {
+      historyRequestCount += 1;
+    }
+  });
+
+  await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "docs/deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "docs/deleted.txt",
+        restore_source_object_id: "object-deleted-001",
+        restore_version_id: "version-deleted-001",
+        removed_at_unix: 1_712_345_600
+      }
+    ]
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "docs/deleted.txt", exact: true })).toBeVisible();
+  await expect.poll(() => historyRequestCount).toBe(1);
+
+  const docsRow = page.getByRole("cell", { name: "docs/", exact: true }).locator("..");
+  await docsRow.getByRole("button", { name: "Open", exact: true }).click();
+  await expect.poll(() => historyRequestCount).toBe(2);
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
+  await expect(page.getByText("Loading historical entries…")).toBeHidden();
+});
+
+test("client-ui explorer reads historical entries by source object ID", async ({ page }) => {
+  let historicalReadQuery: URLSearchParams | null = null;
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (
+      url.pathname === apiV1("/store/get") &&
+      url.searchParams.get("object_id") === "object-deleted-001"
+    ) {
+      historicalReadQuery = url.searchParams;
+    }
+  });
+
+  await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted-001",
+        restore_version_id: "version-deleted-001",
+        removed_at_unix: 1_712_345_600
+      }
+    ]
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  const row = page.getByRole("cell", { name: "deleted.txt", exact: true }).locator("..");
+  await row.getByRole("button", { name: "Read", exact: true }).click();
+
+  await expect.poll(() => historicalReadQuery?.get("key")).toBe("deleted.txt");
+  expect(historicalReadQuery?.get("version")).toBe("version-deleted-001");
+  expect(historicalReadQuery?.get("object_id")).toBe("object-deleted-001");
+});
+
+test("client-ui explorer only caps depth for historical entries", async ({ page }) => {
+  const currentDepths: string[] = [];
+  const historyDepths: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/store/list")) {
+      currentDepths.push(url.searchParams.get("depth") ?? "");
+    }
+    if (url.pathname === apiV1("/store/history")) {
+      historyDepths.push(url.searchParams.get("depth") ?? "");
+    }
+  });
+
+  await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted",
+        restore_version_id: "version-deleted",
+        removed_at_unix: 1_712_345_600
+      }
+    ]
+  });
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await page.getByLabel("Depth").fill("65");
+  await page.getByRole("button", { name: "Refresh entries" }).click();
+
+  await expect.poll(() => currentDepths.includes("65")).toBe(true);
+  await expect.poll(() => historyDepths.includes("64")).toBe(true);
+});
+
+test("client-ui explorer restores selected deleted and moved entries in one batch", async ({
+  page
+}) => {
+  const mockState = await installClientUiMocks(page, {
+    historyEntries: [
+      {
+        path: "deleted.txt",
+        entry_type: "historical",
+        restore_source_path: "deleted.txt",
+        restore_source_object_id: "object-deleted-001",
+        restore_version_id: "version-deleted-001",
+        removed_at_unix: 1_712_345_600,
+        moved_to_path: null
+      },
+      {
+        path: "old-name.txt",
+        entry_type: "historical",
+        restore_source_path: "old-name.txt",
+        restore_source_object_id: "object-moved-001",
+        restore_version_id: "version-moved-001",
+        removed_at_unix: 1_712_345_601,
+        moved_to_path: "new-name.txt"
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
+  await expect(page.getByRole("row", { name: /old-name\.txt/ })).toContainText(
+    "moved to new-name.txt"
+  );
+
+  await page.getByLabel("Select historical entry deleted.txt").check();
+  await page.getByLabel("Select historical entry old-name.txt").check();
+  await page.getByRole("button", { name: "Restore selected" }).click();
+
+  await expect
+    .poll(() =>
+      mockState
+        .restoredHistoryEntries()
+        .flat()
+        .map((entry) => entry.path)
+        .sort()
+    )
+    .toEqual(["deleted.txt", "old-name.txt"]);
+  await expect(page.getByText('"requested_count": 2')).toBeVisible();
+
+  await page.getByRole("textbox", { name: "Snapshot" }).click();
+  await page.getByRole("option", { name: "snapshot-001" }).click();
+  await page.getByRole("button", { name: "Load entries" }).click();
+  await expect(page.getByText("Recoverable deleted and moved files")).toBeHidden();
+});
+
+test("client-ui explorer splits historical restores into supported batch sizes", async ({ page }) => {
+  const mockState = await installClientUiMocks(page, {
+    historyEntries: Array.from({ length: 101 }, (_, index) => {
+      const path = `deleted-${String(index + 1).padStart(3, "0")}.txt`;
+      return {
+        path,
+        entry_type: "historical",
+        restore_source_path: path,
+        restore_source_object_id: `object-deleted-${String(index + 1).padStart(3, "0")}`,
+        restore_version_id: `version-deleted-${String(index + 1).padStart(3, "0")}`,
+        removed_at_unix: 1_712_345_600 + index
+      };
+    })
+  });
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted-001.txt", exact: true })).toBeVisible();
+
+  await page.getByLabel("Select all historical entries").check();
+  await expect(page.getByText("101 historical items selected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Restore selected" }).click();
+
+  await expect
+    .poll(() => mockState.restoredHistoryEntries().map((entries) => entries.length))
+    .toEqual([100, 1]);
+});
+
+test("client-ui explorer retains completed historical restore batches after a later request fails", async ({
+  page
+}) => {
+  const mockState = await installClientUiMocks(page, {
+    historyRestoreFailureAtCall: 2,
+    historyEntries: Array.from({ length: 101 }, (_, index) => {
+      const path = `deleted-${String(index + 1).padStart(3, "0")}.txt`;
+      return {
+        path,
+        entry_type: "historical",
+        restore_source_path: path,
+        restore_source_object_id: `object-deleted-${String(index + 1).padStart(3, "0")}`,
+        restore_version_id: `version-deleted-${String(index + 1).padStart(3, "0")}`,
+        removed_at_unix: 1_712_345_600 + index
+      };
+    })
+  });
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  await page.getByText("Show deleted or moved files", { exact: true }).click();
+  await expect(page.getByRole("cell", { name: "deleted-001.txt", exact: true })).toBeVisible();
+
+  await page.getByLabel("Select all historical entries").check();
+  await page.getByRole("button", { name: "Restore selected" }).click();
+
+  await expect
+    .poll(() => mockState.restoredHistoryEntries().map((entries) => entries.length))
+    .toEqual([100]);
+  await expect(page.getByRole("cell", { name: "deleted-001.txt", exact: true })).toBeHidden();
+  await expect(page.getByRole("cell", { name: "deleted-101.txt", exact: true })).toBeVisible();
+  await expect(page.getByLabel("Select historical entry deleted-101.txt")).toBeChecked();
+  await expect(page.getByText(/restored before a later batch failed/)).toBeVisible();
+});
+
 test("client-ui desktop navigation can collapse and scroll on short viewports", async ({ page }) => {
   test.setTimeout(45_000);
 
@@ -1709,6 +2166,8 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
+  historyEntries?: MockHistoryEntry[];
+  historyRestoreFailureAtCall?: number;
   cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapMetadataCenter?: [number, number, number];
@@ -1717,6 +2176,16 @@ type InstallClientUiMocksOptions = {
   mapClusterRefreshDelayMs?: number;
   mapClusterEntriesDelayMs?: number;
   legacyGalleryMapApiOnly?: boolean;
+};
+
+type MockHistoryEntry = {
+  path: string;
+  entry_type: "historical";
+  restore_source_path: string;
+  restore_source_object_id: string;
+  restore_version_id: string;
+  removed_at_unix: number;
+  moved_to_path?: string | null;
 };
 
 type MockGalleryMapConfiguration = {
@@ -1759,6 +2228,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const diagnosticContexts = new Set<string>();
   let diagnosticContextRequestCount = 0;
   const storeEntries = options?.storeEntries ?? createMockStoreEntries();
+  let historyEntries = options?.historyEntries?.slice() ?? [];
   let cacheScope = options?.cacheScope === undefined ? "a".repeat(64) : options.cacheScope;
   let galleryOffline = false;
   let galleryStoreListRequestCount = 0;
@@ -1767,6 +2237,8 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   let galleryStoreListDelayMs = 0;
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
+  const restoredHistoryEntries: MockHistoryEntry[][] = [];
+  let historyRestoreRequestCount = 0;
   const currentVersionByKey = new Map<string, string>([["gallery/cat.png", "version-cat-001"]]);
   const connectionRoutesPayload = {
     generated_at_unix_ms: 1_712_345_600_000,
@@ -2170,6 +2642,47 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       });
     }
 
+    if (pathname === apiV1("/store/history") && method === "GET") {
+      return json(route, {
+        prefix: searchParams.get("prefix") ?? "",
+        depth: Number(searchParams.get("depth") ?? "1"),
+        entry_count: historyEntries.length,
+        truncated: false,
+        entries: historyEntries
+      });
+    }
+
+    if (pathname === apiV1("/store/history/restore") && method === "POST") {
+      historyRestoreRequestCount += 1;
+      if (historyRestoreRequestCount === options?.historyRestoreFailureAtCall) {
+        return route.fulfill({
+          status: 502,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "simulated history restore failure" })
+        });
+      }
+      const body = route.request().postDataJSON() as {
+        entries: Array<{
+          path: string;
+          restore_source_path: string;
+          restore_source_object_id: string;
+          restore_version_id: string;
+        }>;
+      };
+      const restoredPaths = new Set(body.entries.map((entry) => entry.path));
+      const restored = historyEntries.filter((entry) => restoredPaths.has(entry.path));
+      restoredHistoryEntries.push(restored);
+      historyEntries = historyEntries.filter((entry) => !restoredPaths.has(entry.path));
+      return json(route, {
+        restored_count: restored.length,
+        failed_count: body.entries.length - restored.length,
+        entries: body.entries.map((entry) => ({
+          ...entry,
+          status: restoredPaths.has(entry.path) ? "restored" : "failed"
+        }))
+      });
+    }
+
     if (pathname === apiV1("/maps/logical-file")) {
       const rangeHeader = route.request().headers().range;
       const commonHeaders = {
@@ -2541,6 +3054,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     diagnosticContexts: () => Array.from(diagnosticContexts),
     diagnosticContextRequestCount: () => diagnosticContextRequestCount,
     restoredVersions: () => restoredVersions.slice(),
+    restoredHistoryEntries: () => restoredHistoryEntries.slice(),
     galleryStoreListRequestCount: () => galleryStoreListRequestCount,
     replaceStoreEntries: (entries: MockStoreEntry[]) => {
       storeEntries.splice(0, storeEntries.length, ...entries);

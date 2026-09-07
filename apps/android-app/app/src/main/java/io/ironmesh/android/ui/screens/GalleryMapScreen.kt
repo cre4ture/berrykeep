@@ -19,11 +19,13 @@ import androidx.compose.ui.unit.dp
 import io.ironmesh.android.data.EmbeddedWebUiSession
 import io.ironmesh.android.ui.GalleryMapUiState
 import io.ironmesh.android.ui.components.IronmeshEmbeddedWebUi
+import io.ironmesh.android.ui.theme.DEFAULT_IRONMESH_ACCENT_COLOR_HEX
 
 @Composable
 fun GalleryMapScreen(
     state: GalleryMapUiState,
     onStartGalleryMap: () -> Unit,
+    accentColorHex: String = DEFAULT_IRONMESH_ACCENT_COLOR_HEX,
     onFullscreenChanged: (Boolean) -> Unit = {},
     onWebViewCreated: (WebView) -> Unit = {},
 ) {
@@ -32,6 +34,7 @@ fun GalleryMapScreen(
     if (galleryMapSession != null) {
         IronmeshEmbeddedWebUi(
             session = galleryMapSession,
+            accentColorHex = accentColorHex,
             modifier = Modifier.fillMaxSize(),
             onCreated = onWebViewCreated,
             onGalleryMapFullscreenChanged = onFullscreenChanged,

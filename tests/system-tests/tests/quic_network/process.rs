@@ -244,10 +244,10 @@ pub(super) fn artifact_dir(scenario: &str) -> Result<PathBuf> {
 
 fn binary_path(name: &str) -> Result<PathBuf> {
     let artifact = match name {
-        "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_ironmesh-server-node"),
-        "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_ironmesh"),
+        "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_berrykeep-server-node"),
+        "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_berrykeep"),
         "rendezvous-service" => {
-            option_env!("CARGO_BIN_FILE_RENDEZVOUS_SERVICE_ironmesh-rendezvous-service")
+            option_env!("CARGO_BIN_FILE_RENDEZVOUS_SERVICE_berrykeep-rendezvous-service")
         }
         _ => None,
     };
@@ -256,9 +256,9 @@ fn binary_path(name: &str) -> Result<PathBuf> {
     }
 
     let executable = match name {
-        "server-node" => "ironmesh-server-node",
-        "cli-client" => "ironmesh",
-        "rendezvous-service" => "ironmesh-rendezvous-service",
+        "server-node" => "berrykeep-server-node",
+        "cli-client" => "berrykeep",
+        "rendezvous-service" => "berrykeep-rendezvous-service",
         other => other,
     };
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -376,7 +376,10 @@ final class AppleCFacadeBridgeTests: XCTestCase {
                     offset: 32,
                     limit: 32,
                     sort: .capturedDescending,
-                    mediaFilter: .image
+                    mediaFilter: .image,
+                    capturedFromUnix: 1_700_000_000,
+                    capturedUntilUnix: 1_700_086_400,
+                    excludeLabels: ["private", "nsfw"]
                 )
             )
         )
@@ -389,6 +392,9 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         XCTAssertEqual(ffi.lastStoreIndexLimit, 32)
         XCTAssertEqual(ffi.lastStoreIndexSort, "captured_desc")
         XCTAssertEqual(ffi.lastStoreIndexMediaFilter, "image")
+        XCTAssertEqual(ffi.lastStoreIndexCapturedFromUnix, 1_700_000_000)
+        XCTAssertEqual(ffi.lastStoreIndexCapturedUntilUnix, 1_700_086_400)
+        XCTAssertEqual(ffi.lastStoreIndexExcludeLabels, "private,nsfw")
         XCTAssertEqual(ffi.lastRelativePath, "/media/thumbnail?key=photos%2Fcat.jpg")
         XCTAssertEqual(String(decoding: thumbnail, as: UTF8.self), "thumbnail")
     }
@@ -437,6 +443,9 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var lastStoreIndexLimit: Int?
     var lastStoreIndexSort: String?
     var lastStoreIndexMediaFilter: String?
+    var lastStoreIndexCapturedFromUnix: UInt64?
+    var lastStoreIndexCapturedUntilUnix: UInt64?
+    var lastStoreIndexExcludeLabels: String?
     var lastRelativePath: String?
     var lastObjectSizeKey: String?
     var lastObjectSizeSnapshot: String?
@@ -539,6 +548,62 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         lastStoreIndexSort = sort
         lastStoreIndexMediaFilter = mediaFilter
         return storeIndexResponseJSON
+    }
+
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?,
+        excludeLabels: String?
+    ) throws -> String {
+        lastStoreIndexExcludeLabels = excludeLabels
+        return try storeIndexJSON(
+            handle: handle,
+            prefix: prefix,
+            depth: depth,
+            snapshot: snapshot,
+            view: view,
+            offset: offset,
+            limit: limit,
+            sort: sort,
+            mediaFilter: mediaFilter
+        )
+    }
+
+    func storeIndexJSON(
+        handle: AppleRustHandle,
+        prefix: String?,
+        depth: Int,
+        snapshot: String?,
+        view: String?,
+        offset: Int?,
+        limit: Int?,
+        sort: String?,
+        mediaFilter: String?,
+        capturedFromUnix: UInt64?,
+        capturedUntilUnix: UInt64?,
+        excludeLabels: String?
+    ) throws -> String {
+        lastStoreIndexCapturedFromUnix = capturedFromUnix
+        lastStoreIndexCapturedUntilUnix = capturedUntilUnix
+        return try storeIndexJSON(
+            handle: handle,
+            prefix: prefix,
+            depth: depth,
+            snapshot: snapshot,
+            view: view,
+            offset: offset,
+            limit: limit,
+            sort: sort,
+            mediaFilter: mediaFilter,
+            excludeLabels: excludeLabels
+        )
     }
 
     func fetchBytes(handle: AppleRustHandle, key: String) throws -> Data {

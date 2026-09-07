@@ -5,10 +5,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DEFAULT_HOST="root@192.168.178.132"
-DEFAULT_REMOTE_PATH="/userdata/ironmesh-server-node"
+DEFAULT_REMOTE_PATH="/userdata/berrykeep-server-node"
+DEFAULT_LEGACY_REMOTE_PATH="/userdata/ironmesh-server-node"
 
 HOST="${IRONMESH_LUCKFOX_HOST:-${DEFAULT_HOST}}"
 REMOTE_PATH="${IRONMESH_LUCKFOX_REMOTE_PATH:-${DEFAULT_REMOTE_PATH}}"
+LEGACY_REMOTE_PATH="${IRONMESH_LUCKFOX_LEGACY_REMOTE_PATH:-${DEFAULT_LEGACY_REMOTE_PATH}}"
 
 log() {
   printf '[deploy-server-node-to-luckfox] %s\n' "$*"
@@ -21,7 +23,7 @@ fail() {
 
 usage() {
   cat <<EOF
-Cross-compile ironmesh-server-node and deploy it to a LuckFox PicoKVM (or
+Cross-compile berrykeep-server-node and deploy it to a LuckFox PicoKVM (or
 similar armv7 hardfloat board) over SSH.
 
 Thin wrapper around scripts/build-server-node-armv7-musl.sh --deploy; see
@@ -38,6 +40,9 @@ Options:
 Environment:
   IRONMESH_LUCKFOX_HOST         Default for --host.
   IRONMESH_LUCKFOX_REMOTE_PATH  Default for --remote-path.
+  IRONMESH_LUCKFOX_LEGACY_REMOTE_PATH
+                              Legacy command path kept as a symlink to the
+                              deployed BerryKeep binary.
 EOF
 }
 
@@ -78,6 +83,11 @@ log "building and deploying to ${HOST}:${REMOTE_PATH}"
 
 log "marking remote binary executable"
 ssh "${HOST}" "chmod +x '${REMOTE_PATH}'"
+
+if [[ "${LEGACY_REMOTE_PATH}" != "${REMOTE_PATH}" ]]; then
+  log "updating legacy command alias at ${LEGACY_REMOTE_PATH}"
+  ssh "${HOST}" "ln -sfn '${REMOTE_PATH}' '${LEGACY_REMOTE_PATH}'"
+fi
 
 log "deployed: ${HOST}:${REMOTE_PATH}"
 ssh "${HOST}" "'${REMOTE_PATH}' --version"

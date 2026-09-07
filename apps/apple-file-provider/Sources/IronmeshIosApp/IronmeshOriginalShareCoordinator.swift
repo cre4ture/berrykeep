@@ -157,13 +157,22 @@ enum IronmeshOriginalShareCoordinatorError: LocalizedError {
     }
 }
 
-func ironmeshIosEmbeddedWebURL(_ url: URL) -> URL {
+func ironmeshIosEmbeddedWebURL(
+    _ url: URL,
+    accentColorHex: String = AppleAccentColor.defaultHex
+) -> URL {
     guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
         return url
     }
     var queryItems = components.queryItems ?? []
-    queryItems.removeAll { $0.name == "embedded_client" }
+    queryItems.removeAll { $0.name == "embedded_client" || $0.name == "accent_color" }
     queryItems.append(URLQueryItem(name: "embedded_client", value: "ios"))
+    queryItems.append(
+        URLQueryItem(
+            name: "accent_color",
+            value: AppleAccentColor.normalizedHex(accentColorHex) ?? AppleAccentColor.defaultHex
+        )
+    )
     components.queryItems = queryItems
     return components.url ?? url
 }

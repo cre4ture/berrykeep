@@ -1,5 +1,5 @@
 use crate::bootstrap::ConnectionBootstrap;
-use crate::ironmesh_client::IronMeshClient;
+use crate::ironmesh_client::{IronMeshClient, namespace_entry_from_store_index_entry};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -99,6 +99,32 @@ impl RemoteSyncScheduler {
 pub struct RemoteSnapshotUpdate {
     pub snapshot: SyncSnapshot,
     pub changed_paths: Vec<String>,
+    /// Object-centric changes derived from two authoritative snapshots. These
+    /// retain the previous object identity and revision for safe reconciliation.
+    pub object_changes: Vec<RemoteObjectChange>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoteObjectChange {
+    Created {
+        current: NamespaceEntry,
+    },
+    Modified {
+        previous: NamespaceEntry,
+        current: NamespaceEntry,
+    },
+    Renamed {
+        previous: NamespaceEntry,
+        current: NamespaceEntry,
+    },
+    Deleted {
+        previous: NamespaceEntry,
+    },
+    /// Compatibility signal for servers that do not expose object identities.
+    /// Consumers must not use this to perform a destructive operation.
+    LegacyPathChanged {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -232,30 +258,14 @@ where
     let mut directory_count = 0u64;
 
     for (index, entry) in entries.into_iter().enumerate() {
-        if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
-            let directory_path = entry.path.trim_end_matches('/').to_string();
-            if !directory_path.is_empty() {
+        let is_directory = (entry.entry_type == "prefix") || entry.path.ends_with('/');
+        if let Some(entry) = namespace_entry_from_store_index_entry(entry) {
+            if is_directory {
                 directory_count += 1;
-                remote.push(NamespaceEntry::directory(directory_path));
+            } else {
+                file_count += 1;
             }
-        } else {
-            let version = entry.version.unwrap_or_else(|| "server-head".to_string());
-            let content_hash = entry
-                .content_hash
-                .unwrap_or_else(|| format!("server-head:{}", entry.path));
-            let mut remote_entry = NamespaceEntry::file_sized(
-                entry.path.clone(),
-                version,
-                content_hash,
-                entry.size_bytes,
-            );
-            remote_entry.content_fingerprint = entry.content_fingerprint;
-            remote_entry.modified_at_unix = entry.modified_at_unix;
-            remote_entry.media = entry
-                .media
-                .map(crate::ironmesh_client::namespace_media_metadata);
-            file_count += 1;
-            remote.push(remote_entry);
+            remote.push(entry);
         }
 
         let processed_entry_count = (index + 1) as u64;
@@ -318,12 +328,42 @@ impl RemoteSnapshotPoller {
     where
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
     {
-        self.spawn_fetcher_loop_with_fetch(
+        self.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
             running,
             initial_snapshot,
             fetcher,
             |fetcher| fetcher.fetch_snapshot_blocking(),
             on_change,
+            || false,
+        )
+    }
+
+    /// Like [`Self::spawn_fetcher_loop`], but emits an update with empty
+    /// change sets after an unchanged snapshot refresh while
+    /// `needs_unchanged_snapshot_refresh` returns `true`.
+    ///
+    /// This is deliberately driven by the poller's existing notification
+    /// wait or polling cadence. It lets consumers retry deferred
+    /// object-identity work without adding a separate short-interval loop.
+    pub fn spawn_fetcher_loop_with_unchanged_snapshot_refresh<C, R>(
+        &self,
+        running: Arc<AtomicBool>,
+        initial_snapshot: Option<SyncSnapshot>,
+        fetcher: RemoteSnapshotFetcher,
+        on_change: C,
+        needs_unchanged_snapshot_refresh: R,
+    ) -> JoinHandle<()>
+    where
+        C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+        R: FnMut() -> bool + Send + 'static,
+    {
+        self.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            running,
+            initial_snapshot,
+            fetcher,
+            |fetcher| fetcher.fetch_snapshot_blocking(),
+            on_change,
+            needs_unchanged_snapshot_refresh,
         )
     }
 
@@ -332,20 +372,46 @@ impl RemoteSnapshotPoller {
         running: Arc<AtomicBool>,
         initial_snapshot: Option<SyncSnapshot>,
         fetcher: RemoteSnapshotFetcher,
-        mut fetch_snapshot: F,
-        mut on_change: C,
+        fetch_snapshot: F,
+        on_change: C,
     ) -> JoinHandle<()>
     where
         F: FnMut(&RemoteSnapshotFetcher) -> Result<SyncSnapshot> + Send + 'static,
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
     {
+        self.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            running,
+            initial_snapshot,
+            fetcher,
+            fetch_snapshot,
+            on_change,
+            || false,
+        )
+    }
+
+    fn spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh<F, C, R>(
+        &self,
+        running: Arc<AtomicBool>,
+        initial_snapshot: Option<SyncSnapshot>,
+        fetcher: RemoteSnapshotFetcher,
+        mut fetch_snapshot: F,
+        mut on_change: C,
+        mut needs_unchanged_snapshot_refresh: R,
+    ) -> JoinHandle<()>
+    where
+        F: FnMut(&RemoteSnapshotFetcher) -> Result<SyncSnapshot> + Send + 'static,
+        C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+        R: FnMut() -> bool + Send + 'static,
+    {
         match self.scheduler.strategy.mode {
-            RemoteSyncMode::Polling { .. } => self.spawn_changed_paths_loop(
-                running,
-                initial_snapshot,
-                move || fetch_snapshot(&fetcher),
-                on_change,
-            ),
+            RemoteSyncMode::Polling { .. } => self
+                .spawn_changed_paths_loop_with_unchanged_snapshot_refresh(
+                    running,
+                    initial_snapshot,
+                    move || fetch_snapshot(&fetcher),
+                    on_change,
+                    needs_unchanged_snapshot_refresh,
+                ),
             RemoteSyncMode::ServerNotifications {
                 wait_timeout,
                 retry_interval: _,
@@ -406,6 +472,9 @@ impl RemoteSnapshotPoller {
                         if !running.load(Ordering::SeqCst) {
                             break;
                         }
+                        let refresh_unchanged_snapshot =
+                            current_snapshot.is_some() && needs_unchanged_snapshot_refresh();
+                        should_fetch |= refresh_unchanged_snapshot;
                         if !should_fetch {
                             continue;
                         }
@@ -418,7 +487,12 @@ impl RemoteSnapshotPoller {
                             }
                         };
                         last_sequence = observed_sequence;
-                        apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
+                        apply_snapshot_update_with_unchanged_refresh(
+                            &mut current_snapshot,
+                            next_snapshot,
+                            &mut on_change,
+                            refresh_unchanged_snapshot,
+                        );
                     }
                 })
             }
@@ -428,13 +502,35 @@ impl RemoteSnapshotPoller {
     pub fn spawn_changed_paths_loop<F, C>(
         &self,
         running: Arc<AtomicBool>,
-        mut current_snapshot: Option<SyncSnapshot>,
-        mut fetch_snapshot: F,
-        mut on_change: C,
+        current_snapshot: Option<SyncSnapshot>,
+        fetch_snapshot: F,
+        on_change: C,
     ) -> JoinHandle<()>
     where
         F: FnMut() -> Result<SyncSnapshot> + Send + 'static,
         C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+    {
+        self.spawn_changed_paths_loop_with_unchanged_snapshot_refresh(
+            running,
+            current_snapshot,
+            fetch_snapshot,
+            on_change,
+            || false,
+        )
+    }
+
+    fn spawn_changed_paths_loop_with_unchanged_snapshot_refresh<F, C, R>(
+        &self,
+        running: Arc<AtomicBool>,
+        mut current_snapshot: Option<SyncSnapshot>,
+        mut fetch_snapshot: F,
+        mut on_change: C,
+        mut needs_unchanged_snapshot_refresh: R,
+    ) -> JoinHandle<()>
+    where
+        F: FnMut() -> Result<SyncSnapshot> + Send + 'static,
+        C: FnMut(RemoteSnapshotUpdate) + Send + 'static,
+        R: FnMut() -> bool + Send + 'static,
     {
         let scheduler = self.scheduler.clone();
         thread::spawn(move || {
@@ -453,7 +549,13 @@ impl RemoteSnapshotPoller {
                         continue;
                     }
                 };
-                apply_snapshot_update(&mut current_snapshot, next_snapshot, &mut on_change);
+                let refresh_unchanged_snapshot = needs_unchanged_snapshot_refresh();
+                apply_snapshot_update_with_unchanged_refresh(
+                    &mut current_snapshot,
+                    next_snapshot,
+                    &mut on_change,
+                    refresh_unchanged_snapshot,
+                );
             }
         })
     }
@@ -471,6 +573,7 @@ fn should_fallback_to_polling_after_wait_error(error: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(test)]
 fn apply_snapshot_update<C>(
     current_snapshot: &mut Option<SyncSnapshot>,
     next_snapshot: SyncSnapshot,
@@ -478,17 +581,134 @@ fn apply_snapshot_update<C>(
 ) where
     C: FnMut(RemoteSnapshotUpdate),
 {
+    apply_snapshot_update_with_unchanged_refresh(current_snapshot, next_snapshot, on_change, false);
+}
+
+fn apply_snapshot_update_with_unchanged_refresh<C>(
+    current_snapshot: &mut Option<SyncSnapshot>,
+    next_snapshot: SyncSnapshot,
+    on_change: &mut C,
+    refresh_unchanged_snapshot: bool,
+) where
+    C: FnMut(RemoteSnapshotUpdate),
+{
     if let Some(previous) = current_snapshot.as_ref() {
         let changed_paths = changed_paths_between(previous, &next_snapshot);
-        if !changed_paths.is_empty() {
+        if !changed_paths.is_empty() || refresh_unchanged_snapshot {
+            let object_changes = object_changes_between(previous, &next_snapshot);
             on_change(RemoteSnapshotUpdate {
                 snapshot: next_snapshot.clone(),
                 changed_paths,
+                object_changes,
             });
         }
     }
 
     *current_snapshot = Some(next_snapshot);
+}
+
+pub fn object_changes_between(
+    previous: &SyncSnapshot,
+    current: &SyncSnapshot,
+) -> Vec<RemoteObjectChange> {
+    let (previous_by_id, previous_ambiguous_ids) = remote_files_by_object_id(previous);
+    let (current_by_id, current_ambiguous_ids) = remote_files_by_object_id(current);
+    let mut all_object_ids = BTreeSet::new();
+    all_object_ids.extend(previous_by_id.keys().cloned());
+    all_object_ids.extend(current_by_id.keys().cloned());
+
+    let mut changes = Vec::new();
+    for object_id in all_object_ids {
+        if previous_ambiguous_ids.contains(&object_id) || current_ambiguous_ids.contains(&object_id)
+        {
+            continue;
+        }
+        match (
+            previous_by_id.get(&object_id),
+            current_by_id.get(&object_id),
+        ) {
+            (Some(previous), Some(current)) if previous.path != current.path => {
+                changes.push(RemoteObjectChange::Renamed {
+                    previous: (*previous).clone(),
+                    current: (*current).clone(),
+                });
+            }
+            (Some(previous), Some(current)) if *previous != *current => {
+                changes.push(RemoteObjectChange::Modified {
+                    previous: (*previous).clone(),
+                    current: (*current).clone(),
+                });
+            }
+            (Some(previous), None) => changes.push(RemoteObjectChange::Deleted {
+                previous: (*previous).clone(),
+            }),
+            (None, Some(current)) => changes.push(RemoteObjectChange::Created {
+                current: (*current).clone(),
+            }),
+            _ => {}
+        }
+    }
+
+    let previous_legacy = legacy_remote_snapshot_index(previous);
+    let current_legacy = legacy_remote_snapshot_index(current);
+    let mut legacy_paths = BTreeSet::new();
+    legacy_paths.extend(previous_legacy.keys().cloned());
+    legacy_paths.extend(current_legacy.keys().cloned());
+    for path in legacy_paths {
+        if previous_legacy.get(&path) != current_legacy.get(&path) {
+            changes.push(RemoteObjectChange::LegacyPathChanged { path });
+        }
+    }
+
+    changes
+}
+
+fn remote_files_by_object_id(
+    snapshot: &SyncSnapshot,
+) -> (BTreeMap<String, &NamespaceEntry>, BTreeSet<String>) {
+    let mut unique = BTreeMap::<String, &NamespaceEntry>::new();
+    let mut ambiguous = BTreeSet::new();
+    for entry in &snapshot.remote {
+        let Some(object_id) = entry
+            .object_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|object_id| !object_id.is_empty())
+        else {
+            continue;
+        };
+        if ambiguous.contains(object_id) {
+            continue;
+        }
+        if unique
+            .get(object_id)
+            .is_some_and(|existing| existing.path == entry.path)
+        {
+            // Tree listings can expose the directory marker and the matching
+            // common-prefix projection together. They describe the same
+            // namespace entry, not an object-id collision.
+            continue;
+        }
+        if unique.insert(object_id.to_string(), entry).is_some() {
+            unique.remove(object_id);
+            ambiguous.insert(object_id.to_string());
+        }
+    }
+    (unique, ambiguous)
+}
+
+fn legacy_remote_snapshot_index(snapshot: &SyncSnapshot) -> RemoteSnapshotIndex {
+    let mut legacy = BTreeMap::new();
+    for entry in &snapshot.remote {
+        if entry
+            .object_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            legacy.insert(entry.path.clone(), remote_entry_signature(entry));
+        }
+    }
+    legacy
 }
 
 pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) -> Vec<String> {
@@ -507,30 +727,31 @@ pub fn changed_paths_between(previous: &SyncSnapshot, current: &SyncSnapshot) ->
     changed_paths
 }
 
-type RemoteSnapshotIndex = BTreeMap<
-    String,
+type RemoteEntrySignature = (
+    EntryKind,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u64>,
+);
+type RemoteSnapshotIndex = BTreeMap<String, RemoteEntrySignature>;
+
+fn remote_entry_signature(entry: &NamespaceEntry) -> RemoteEntrySignature {
     (
-        EntryKind,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<u64>,
-    ),
->;
+        entry.kind,
+        entry.object_id.clone(),
+        entry.version.clone(),
+        entry.content_hash.clone(),
+        entry.content_fingerprint.clone(),
+        entry.size_bytes,
+    )
+}
 
 fn remote_snapshot_index(snapshot: &SyncSnapshot) -> RemoteSnapshotIndex {
     let mut index = BTreeMap::new();
     for entry in &snapshot.remote {
-        index.insert(
-            entry.path.clone(),
-            (
-                entry.kind,
-                entry.version.clone(),
-                entry.content_hash.clone(),
-                entry.content_fingerprint.clone(),
-                entry.size_bytes,
-            ),
-        );
+        index.insert(entry.path.clone(), remote_entry_signature(entry));
     }
     index
 }
@@ -655,6 +876,347 @@ mod tests {
                 "docs/readme.md".to_string(),
             ],
         );
+    }
+
+    /// Characterization only: an older snapshot can replace a newer accepted
+    /// snapshot and report a path removal. This is the unsafe behaviour seen
+    /// when a delayed server refresh is applied after newer state exists.
+    ///
+    /// Remove this test when snapshot ordering/freshness validation is added.
+    #[test]
+    fn undesired_current_behavior_apply_snapshot_update_accepts_an_out_of_order_removal() {
+        let newer_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file(
+                "photos/newly-uploaded.jpg",
+                "revision-2",
+                "hash-2",
+            )],
+        };
+        let older_snapshot_without_the_file = SyncSnapshot {
+            local: Vec::new(),
+            remote: Vec::new(),
+        };
+        let mut current_snapshot = Some(newer_snapshot);
+        let mut updates = Vec::new();
+
+        apply_snapshot_update(
+            &mut current_snapshot,
+            older_snapshot_without_the_file,
+            &mut |update| updates.push(update),
+        );
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].changed_paths,
+            vec!["photos/newly-uploaded.jpg".to_string()]
+        );
+        assert!(updates[0].snapshot.remote.is_empty());
+        assert!(
+            current_snapshot
+                .expect("the old snapshot is retained")
+                .remote
+                .is_empty()
+        );
+    }
+
+    /// Desired safety contract for the characterization above.
+    ///
+    /// The expected panic keeps the current failure executable in normal CI.
+    /// Remove it when snapshot ordering/freshness validation is implemented.
+    #[test]
+    #[should_panic(expected = "an older snapshot must not emit a removal")]
+    fn desired_behavior_out_of_order_snapshot_removal_is_rejected_until_a_fresh_snapshot_is_available()
+     {
+        let newer_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file(
+                "photos/newly-uploaded.jpg",
+                "revision-2",
+                "hash-2",
+            )],
+        };
+        let older_snapshot_without_the_file = SyncSnapshot {
+            local: Vec::new(),
+            remote: Vec::new(),
+        };
+        let mut current_snapshot = Some(newer_snapshot.clone());
+        let mut updates = Vec::new();
+
+        apply_snapshot_update(
+            &mut current_snapshot,
+            older_snapshot_without_the_file,
+            &mut |update| updates.push(update),
+        );
+
+        assert!(
+            updates.is_empty(),
+            "an older snapshot must not emit a removal"
+        );
+        assert_eq!(current_snapshot, Some(newer_snapshot));
+    }
+
+    #[test]
+    fn removal_update_retains_object_id_and_predecessor_revision() {
+        let previous = NamespaceEntry::file("photos/possibly-stale.jpg", "revision-7", "hash-7")
+            .with_object_id("obj-photo");
+        let mut current_snapshot = Some(SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![previous.clone()],
+        });
+        let mut updates = Vec::new();
+
+        apply_snapshot_update(
+            &mut current_snapshot,
+            SyncSnapshot {
+                local: Vec::new(),
+                remote: Vec::new(),
+            },
+            &mut |update| updates.push(update),
+        );
+
+        let update = updates.pop().expect("an object deletion update");
+        let RemoteSnapshotUpdate {
+            snapshot,
+            changed_paths,
+            object_changes,
+        } = update;
+        assert_eq!(changed_paths, vec!["photos/possibly-stale.jpg".to_string()]);
+        assert!(snapshot.remote.is_empty());
+        assert_eq!(
+            object_changes,
+            vec![RemoteObjectChange::Deleted { previous }]
+        );
+    }
+
+    #[test]
+    fn object_changes_keep_identity_across_content_revision() {
+        let previous_entry = NamespaceEntry::file("docs/readme.md", "revision-1", "hash-1")
+            .with_object_id("obj-readme");
+        let current_entry = NamespaceEntry::file("docs/readme.md", "revision-2", "hash-2")
+            .with_object_id("obj-readme");
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous_entry.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current_entry.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Modified {
+                previous: previous_entry,
+                current: current_entry,
+            }]
+        );
+    }
+
+    #[test]
+    fn object_changes_recognize_rename_by_stable_identity() {
+        let previous_entry = NamespaceEntry::file("docs/old.md", "revision-1", "hash-1")
+            .with_object_id("obj-readme");
+        let current_entry = NamespaceEntry::file("archive/new.md", "revision-2", "hash-1")
+            .with_object_id("obj-readme");
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous_entry.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current_entry.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Renamed {
+                previous: previous_entry,
+                current: current_entry,
+            }]
+        );
+    }
+
+    #[test]
+    fn object_changes_recognize_directory_rename_by_stable_identity() {
+        let mut previous_entry = NamespaceEntry::directory("docs");
+        previous_entry.object_id = Some("obj-directory".to_string());
+        previous_entry.version = Some("revision-1".to_string());
+        let mut current_entry = NamespaceEntry::directory("archive");
+        current_entry.object_id = Some("obj-directory".to_string());
+        current_entry.version = Some("revision-2".to_string());
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous_entry.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current_entry.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Renamed {
+                previous: previous_entry,
+                current: current_entry,
+            }]
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_directory_marker_identity_and_revision() {
+        let snapshot = snapshot_from_store_index_entries_with_progress(
+            vec![crate::ironmesh_client::StoreIndexEntry {
+                path: "docs/".to_string(),
+                entry_type: "prefix".to_string(),
+                object_id: Some("obj-directory".to_string()),
+                version: Some("revision-7".to_string()),
+                content_hash: Some("directory-marker".to_string()),
+                size_bytes: Some(5),
+                modified_at_unix: Some(1_725_000_000),
+                content_fingerprint: Some("fingerprint-directory".to_string()),
+                media: None,
+                labels: Vec::new(),
+                labels_resolved: false,
+            }],
+            |_| {},
+        );
+
+        let directory = snapshot
+            .remote
+            .first()
+            .expect("directory should be present");
+        assert_eq!(directory.kind, EntryKind::Directory);
+        assert_eq!(directory.path, "docs");
+        assert_eq!(directory.object_id.as_deref(), Some("obj-directory"));
+        assert_eq!(directory.version.as_deref(), Some("revision-7"));
+    }
+
+    #[test]
+    fn snapshot_omits_object_identity_when_store_index_lacks_revision() {
+        let snapshot = snapshot_from_store_index_entries_with_progress(
+            vec![crate::ironmesh_client::StoreIndexEntry {
+                path: "docs/readme.txt".to_string(),
+                entry_type: "key".to_string(),
+                object_id: Some("obj-readme".to_string()),
+                version: None,
+                content_hash: Some("manifest-readme".to_string()),
+                size_bytes: Some(42),
+                modified_at_unix: Some(1_725_000_000),
+                content_fingerprint: None,
+                media: None,
+                labels: Vec::new(),
+                labels_resolved: false,
+            }],
+            |_| {},
+        );
+
+        let entry = snapshot.remote.first().expect("file should be present");
+        assert_eq!(entry.content_hash.as_deref(), Some("manifest-readme"));
+        assert_eq!(entry.object_id, None);
+        assert_eq!(entry.version, None);
+    }
+
+    #[test]
+    fn same_path_with_new_object_id_is_delete_and_recreate() {
+        let deleted = NamespaceEntry::file("docs/readme.md", "revision-1", "hash-1")
+            .with_object_id("obj-old");
+        let created = NamespaceEntry::file("docs/readme.md", "revision-1", "hash-2")
+            .with_object_id("obj-new");
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![deleted.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![created.clone()],
+            },
+        );
+
+        assert!(changes.contains(&RemoteObjectChange::Deleted { previous: deleted }));
+        assert!(changes.contains(&RemoteObjectChange::Created { current: created }));
+        assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_object_id_in_snapshot_suppresses_ambiguous_mutation() {
+        let previous = NamespaceEntry::file("docs/readme.md", "revision-1", "hash-1")
+            .with_object_id("obj-duplicate");
+        let duplicate_a = NamespaceEntry::file("docs/a.md", "revision-2", "hash-1")
+            .with_object_id("obj-duplicate");
+        let duplicate_b = NamespaceEntry::file("docs/b.md", "revision-2", "hash-1")
+            .with_object_id("obj-duplicate");
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![duplicate_a, duplicate_b],
+            },
+        );
+
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn duplicate_directory_projection_at_same_path_keeps_rename_identity() {
+        let mut previous = NamespaceEntry::directory("docs");
+        previous.object_id = Some("obj-directory".to_string());
+        previous.version = Some("revision-1".to_string());
+        let mut current = NamespaceEntry::directory("archive");
+        current.object_id = Some("obj-directory".to_string());
+        current.version = Some("revision-2".to_string());
+
+        let changes = object_changes_between(
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![previous.clone()],
+            },
+            &SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![current.clone(), current.clone()],
+            },
+        );
+
+        assert_eq!(
+            changes,
+            vec![RemoteObjectChange::Renamed { previous, current }]
+        );
+    }
+
+    #[test]
+    fn duplicate_snapshot_does_not_emit_a_second_update() {
+        let snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file(
+                "photos/holiday.jpg",
+                "revision-2",
+                "hash-2",
+            )],
+        };
+        let mut current_snapshot = Some(snapshot.clone());
+        let mut updates = Vec::new();
+
+        apply_snapshot_update(&mut current_snapshot, snapshot.clone(), &mut |update| {
+            updates.push(update)
+        });
+
+        assert!(updates.is_empty());
+        assert_eq!(current_snapshot, Some(snapshot));
     }
 
     #[test]
@@ -897,6 +1459,60 @@ mod tests {
     }
 
     #[test]
+    fn server_notification_loop_refreshes_an_unchanged_snapshot_when_requested() {
+        let router = Router::new().route(
+            "/api/v1/store/index/changes/wait",
+            get(|| async { Json(serde_json::json!({ "sequence": 0, "changed": false })) }),
+        );
+        let (addr, shutdown_tx, server) = spawn_test_server(router);
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let initial_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+        };
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fetch_count_for_loop = Arc::clone(&fetch_count);
+        let running_for_callback = Arc::clone(&running);
+        let snapshot_for_fetch = initial_snapshot.clone();
+        let (tx, rx) = mpsc::channel();
+
+        let handle = poller.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            Arc::clone(&running),
+            Some(initial_snapshot.clone()),
+            fetcher,
+            move |_fetcher| {
+                fetch_count_for_loop.fetch_add(1, Ordering::SeqCst);
+                Ok(snapshot_for_fetch.clone())
+            },
+            move |update| {
+                running_for_callback.store(false, Ordering::SeqCst);
+                tx.send(update).expect("unchanged refresh should send");
+            },
+            || true,
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("requested unchanged refresh should produce an update");
+        handle
+            .join()
+            .expect("notification loop should stop cleanly");
+
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert!(update.changed_paths.is_empty());
+        assert!(update.object_changes.is_empty());
+        assert_eq!(update.snapshot, initial_snapshot);
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
     fn server_notification_loop_falls_back_to_polling_when_wait_is_unavailable() {
         let (addr, shutdown_tx, server) = spawn_test_server(Router::new());
 
@@ -946,6 +1562,55 @@ mod tests {
             update.changed_paths,
             vec!["docs/new.txt".to_string(), "docs/readme.md".to_string()],
         );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+    }
+
+    #[test]
+    fn polling_fallback_refreshes_an_unchanged_snapshot_when_requested() {
+        let (addr, shutdown_tx, server) = spawn_test_server(Router::new());
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let initial_snapshot = SyncSnapshot {
+            local: Vec::new(),
+            remote: vec![NamespaceEntry::file("docs/readme.md", "v1", "h1")],
+        };
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let fetch_count_for_loop = Arc::clone(&fetch_count);
+        let snapshot_for_fetch = initial_snapshot.clone();
+        let running_for_callback = Arc::clone(&running);
+        let (tx, rx) = mpsc::channel();
+
+        let handle = poller.spawn_fetcher_loop_with_fetch_and_unchanged_snapshot_refresh(
+            Arc::clone(&running),
+            Some(initial_snapshot.clone()),
+            fetcher,
+            move |_fetcher| {
+                fetch_count_for_loop.fetch_add(1, Ordering::SeqCst);
+                Ok(snapshot_for_fetch.clone())
+            },
+            move |update| {
+                running_for_callback.store(false, Ordering::SeqCst);
+                tx.send(update)
+                    .expect("unchanged fallback refresh should send");
+            },
+            || true,
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("requested fallback refresh should produce an update");
+        handle.join().expect("fallback loop should stop cleanly");
+
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert!(update.changed_paths.is_empty());
+        assert!(update.object_changes.is_empty());
+        assert_eq!(update.snapshot, initial_snapshot);
 
         let _ = shutdown_tx.send(());
         let _ = server.join();
@@ -1155,6 +1820,150 @@ mod tests {
         let _ = server.join();
     }
 
+    fn run_sequence_regression_scenario(
+        second_update_timeout: Duration,
+    ) -> (
+        Result<RemoteSnapshotUpdate, mpsc::RecvTimeoutError>,
+        Result<RemoteSnapshotUpdate, mpsc::RecvTimeoutError>,
+        usize,
+        usize,
+    ) {
+        let wait_attempts = Arc::new(AtomicUsize::new(0));
+        let wait_attempts_for_route = Arc::clone(&wait_attempts);
+        let router = Router::new().route(
+            "/api/v1/store/index/changes/wait",
+            get(move || {
+                let wait_attempts = Arc::clone(&wait_attempts_for_route);
+                async move {
+                    let attempt = wait_attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Json(serde_json::json!({ "sequence": 5, "changed": true }))
+                    } else {
+                        Json(serde_json::json!({ "sequence": 0, "changed": false }))
+                    }
+                }
+            }),
+        );
+        let (addr, shutdown_tx, server) = spawn_test_server(router);
+
+        let poller =
+            RemoteSnapshotPoller::server_notifications(Duration::from_millis(250), Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+        let fetcher =
+            RemoteSnapshotFetcher::from_direct_base_url(format!("http://{addr}"), None, 1, None);
+        let fetch_attempts = Arc::new(AtomicUsize::new(0));
+        let fetch_attempts_for_loop = Arc::clone(&fetch_attempts);
+        let update_count = Arc::new(AtomicUsize::new(0));
+        let update_count_for_callback = Arc::clone(&update_count);
+        let (tx, rx) = mpsc::channel();
+        let running_for_callback = Arc::clone(&running);
+
+        let handle = poller.spawn_fetcher_loop_with_fetch(
+            Arc::clone(&running),
+            Some(SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![NamespaceEntry::file(
+                    "photos/holiday.jpg",
+                    "revision-1",
+                    "hash-1",
+                )],
+            }),
+            fetcher,
+            move |_fetcher| {
+                let attempt = fetch_attempts_for_loop.fetch_add(1, Ordering::SeqCst);
+                Ok(if attempt == 0 {
+                    SyncSnapshot {
+                        local: Vec::new(),
+                        remote: vec![NamespaceEntry::file(
+                            "photos/holiday.jpg",
+                            "revision-2",
+                            "hash-2",
+                        )],
+                    }
+                } else {
+                    SyncSnapshot {
+                        local: Vec::new(),
+                        remote: Vec::new(),
+                    }
+                })
+            },
+            move |update| {
+                let count = update_count_for_callback.fetch_add(1, Ordering::SeqCst) + 1;
+                tx.send(update).expect("update should send");
+                if count == 2 {
+                    running_for_callback.store(false, Ordering::SeqCst);
+                }
+            },
+        );
+
+        let first_update = rx.recv_timeout(Duration::from_secs(2));
+        let second_update = rx.recv_timeout(second_update_timeout);
+        running.store(false, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("notification loop should stop cleanly");
+
+        let _ = shutdown_tx.send(());
+        let _ = server.join();
+
+        (
+            first_update,
+            second_update,
+            wait_attempts.load(Ordering::SeqCst),
+            fetch_attempts.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Characterization only: after a server notification sequence regression,
+    /// the loop fetches and applies the returned snapshot even when that
+    /// snapshot is older and omits a file accepted by the preceding refresh.
+    ///
+    /// Remove this test when a sequence regression enters a deletion-safe
+    /// rebaseline mode instead of applying potentially stale removals.
+    #[test]
+    fn undesired_current_behavior_sequence_regression_can_emit_a_stale_file_removal() {
+        let (first_update, stale_removal, wait_attempts, fetch_attempts) =
+            run_sequence_regression_scenario(Duration::from_secs(2));
+
+        let first_update = first_update.expect("first refresh should update the file revision");
+        let stale_removal =
+            stale_removal.expect("sequence regression should apply the older empty snapshot");
+
+        assert_eq!(wait_attempts, 2);
+        assert_eq!(fetch_attempts, 2);
+        assert_eq!(
+            first_update.changed_paths,
+            vec!["photos/holiday.jpg".to_string()]
+        );
+        assert_eq!(
+            stale_removal.changed_paths,
+            vec!["photos/holiday.jpg".to_string()]
+        );
+        assert!(stale_removal.snapshot.remote.is_empty());
+    }
+
+    /// Desired safety contract for the sequence-regression characterization
+    /// above. It uses the production notification loop and fails today because
+    /// the second fetch emits a removal from the older empty snapshot.
+    #[test]
+    #[should_panic(
+        expected = "a sequence regression must not emit a removal from an older snapshot"
+    )]
+    fn desired_behavior_sequence_regression_does_not_emit_a_stale_file_removal() {
+        let (first_update, unexpected_removal, _, _) =
+            run_sequence_regression_scenario(Duration::from_secs(2));
+
+        let first_update = first_update.expect("first refresh should update the file revision");
+        assert_eq!(
+            first_update.changed_paths,
+            vec!["photos/holiday.jpg".to_string()]
+        );
+        assert!(
+            unexpected_removal.is_err(),
+            "a sequence regression must not emit a removal from an older snapshot"
+        );
+    }
+
     #[test]
     fn server_notification_loop_retries_changed_snapshot_after_fetch_failure() {
         use axum::extract::Query;
@@ -1306,6 +2115,9 @@ mod tests {
                 entries: vec![crate::ironmesh_client::StoreIndexEntry {
                     path: "docs/readme.txt".to_string(),
                     entry_type: "key".to_string(),
+                    object_id: Some("obj-readme".to_string()),
+                    labels: Vec::new(),
+                    labels_resolved: false,
                     version: Some("v1".to_string()),
                     content_hash: Some("hash-1".to_string()),
                     size_bytes: Some(42),
@@ -1354,7 +2166,8 @@ mod tests {
             snapshot.remote,
             vec![
                 NamespaceEntry::directory("docs"),
-                NamespaceEntry::file_sized("docs/readme.txt", "v1", "hash-1", Some(42)),
+                NamespaceEntry::file_sized("docs/readme.txt", "v1", "hash-1", Some(42))
+                    .with_object_id("obj-readme"),
             ]
         );
 

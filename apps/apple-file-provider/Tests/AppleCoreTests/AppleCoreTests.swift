@@ -2,6 +2,16 @@ import XCTest
 @testable import AppleCore
 
 final class AppleCoreTests: XCTestCase {
+    func testAccentColorNormalizesShortAndLongHexValues() {
+        XCTAssertEqual(AppleAccentColor.normalizedHex("#2ae"), "#22AAEE")
+        XCTAssertEqual(AppleAccentColor.normalizedHex(" 2563eb "), "#2563EB")
+    }
+
+    func testAccentColorRejectsInvalidValues() {
+        XCTAssertNil(AppleAccentColor.normalizedHex("#12"))
+        XCTAssertNil(AppleAccentColor.normalizedHex("orange"))
+    }
+
     func testRootSnapshotRefreshDoesNotBecomeCurrentDirectoryWhenBrowsingNestedPath() {
         var coordinator = AppleDirectoryLoadCoordinator()
 

@@ -97,8 +97,8 @@ function Resolve-DriverExecutable {
 if (-not $SkipBuild) {
     Push-Location $repoRoot
     try {
-        cargo build --locked -p server-node --bin ironmesh-server-node
-        cargo build --locked -p ironmesh-folder-agent --bin ironmesh-folder-agent
+        cargo build --locked -p server-node --bin berrykeep-server-node
+        cargo build --locked -p ironmesh-folder-agent --bin berrykeep-folder-agent
         cargo build --locked --manifest-path tests\system-tests\Cargo.toml --bin windows_folder_agent_cluster_workload_driver
     }
     finally {

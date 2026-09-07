@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use super::manifest_reader::ManifestReader;
 use super::media_tools::{
-    FFMPEG_TIMEOUT_SECS, FFPROBE_TIMEOUT_SECS, FfprobeOutput, MediaToolPaths,
+    FFMPEG_TIMEOUT_SECS, FFPROBE_TIMEOUT_SECS, FfprobeOutput, FfprobeTags, MediaToolPaths,
     VIDEO_THUMBNAIL_SEEK_FRACTION, VIDEO_THUMBNAIL_SEEK_MAX_SECS, VIDEO_THUMBNAIL_SEEK_MIN_SECS,
     VIDEO_THUMBNAIL_UNKNOWN_DURATION_SEEK_SECS,
 };
@@ -34,7 +34,7 @@ use super::{
     content_fingerprint_from_manifest, hash_hex, unix_ts, write_atomic,
 };
 
-pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 8;
+pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 13;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
 const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
 const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
@@ -155,8 +155,16 @@ pub struct CachedMediaMetadata {
     pub height: Option<u32>,
     pub orientation: Option<u16>,
     pub taken_at_unix: Option<u64>,
+    /// Whether `taken_at_unix` came with an explicit UTC offset. A missing
+    /// offset is a floating local wall-clock value, not a trustworthy UTC time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_at_timezone_known: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_encoded_unix: Option<u64>,
+    /// Whether `date_encoded_unix` came with an explicit UTC offset. A missing
+    /// offset is a floating local wall-clock value, not a trustworthy UTC time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_encoded_timezone_known: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_millis: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +176,11 @@ pub struct CachedMediaMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codec_fourcc: Option<String>,
     pub gps: Option<MediaGpsCoordinates>,
+    /// Whether the original media contains GPS coordinate properties, even
+    /// when their values cannot be parsed into a usable location. This keeps
+    /// inference from adding a competing sidecar location to user media.
+    #[serde(default)]
+    pub has_embedded_gps_properties: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub photo: Option<CachedPhotoMetadata>,
     pub thumbnail: Option<CachedThumbnailInfo>,
@@ -182,6 +195,10 @@ pub struct CachedMediaMetadata {
 pub struct MediaCacheLookup {
     pub content_fingerprint: String,
     pub metadata: Option<CachedMediaMetadata>,
+    /// Path-scoped GPS supplied by an XMP sidecar projection. Unlike cached
+    /// metadata, this must not be shared by byte-identical objects at other
+    /// paths.
+    pub gps_override: Option<MediaGpsCoordinates>,
 }
 
 struct RenderedThumbnail {
@@ -772,13 +789,16 @@ fn base_media_metadata(
         height: None,
         orientation: None,
         taken_at_unix: None,
+        taken_at_timezone_known: None,
         date_encoded_unix: None,
+        date_encoded_timezone_known: None,
         duration_millis: None,
         frame_rate_millihertz: None,
         total_bitrate_bps: None,
         codec_name: None,
         codec_fourcc: None,
         gps: None,
+        has_embedded_gps_properties: false,
         photo: None,
         thumbnail: None,
         source_size_bytes,
@@ -1260,7 +1280,7 @@ async fn derive_video_media_cache(
             .arg("v:0")
             .arg("-show_entries")
             .arg(
-                "stream=width,height,codec_name,codec_tag_string,avg_frame_rate,bit_rate:stream_tags=creation_time:format=format_name,duration,bit_rate:format_tags=creation_time",
+                "stream=width,height,codec_name,codec_tag_string,avg_frame_rate,bit_rate:stream_tags=creation_time,com.apple.quicktime.creationdate,location,location-eng,com.apple.quicktime.location.ISO6709:format=format_name,duration,bit_rate:format_tags=creation_time,com.apple.quicktime.creationdate,location,location-eng,com.apple.quicktime.location.ISO6709",
             )
             .arg("-of")
             .arg("json")
@@ -1291,25 +1311,45 @@ async fn derive_video_media_cache(
             .as_ref()
             .and_then(|format| format.duration.as_deref())
             .and_then(parse_positive_f64);
-        let date_encoded_unix = probe
-            .format
-            .as_ref()
-            .and_then(|format| format.tags.creation_time.as_deref())
-            .or(stream.tags.creation_time.as_deref())
-            .and_then(parse_ffprobe_timestamp);
+        // ffprobe turns QuickTime's integer `mvhd` creation time into an RFC
+        // 3339 `creation_time`, including a synthetic trailing `Z`. Cameras
+        // often store local wall-clock time there, so it is not UTC-safe on
+        // its own. Prefer Apple's offset-bearing creation-date tag when it is
+        // available. A `creation_time` with an explicit numeric offset is
+        // also a real instant; only the synthetic `Z` form remains floating.
+        let (date_encoded_unix, date_encoded_timezone_known) = ffprobe_capture_time(
+            probe.format.as_ref().map(|format| &format.tags),
+            &stream.tags,
+        );
         let total_bitrate_bps = probe
             .format
             .as_ref()
             .and_then(|format| format.bit_rate.as_deref())
             .or(stream.bit_rate.as_deref())
             .and_then(parse_positive_u64);
+        let gps = probe
+            .format
+            .as_ref()
+            .and_then(|format| ffprobe_gps(&format.tags))
+            .or_else(|| ffprobe_gps(&stream.tags));
+        let has_embedded_gps_properties = probe
+            .format
+            .as_ref()
+            .is_some_and(|format| ffprobe_has_gps_properties(&format.tags))
+            || ffprobe_has_gps_properties(&stream.tags);
         let metadata = CachedMediaMetadata {
             status: MediaCacheStatus::Ready,
             media_type: Some("video".to_string()),
             mime_type,
             width: stream.width,
             height: stream.height,
+            // Container creation time is less reliable than an actual media
+            // capture timestamp. Keep gallery ordering unchanged and expose it
+            // only as the final geo-inference fallback below a precise filename.
+            taken_at_unix: None,
+            taken_at_timezone_known: None,
             date_encoded_unix,
+            date_encoded_timezone_known,
             duration_millis: duration_secs.and_then(seconds_to_millis),
             frame_rate_millihertz: stream
                 .avg_frame_rate
@@ -1318,6 +1358,8 @@ async fn derive_video_media_cache(
             total_bitrate_bps,
             codec_name: trimmed_metadata_string(stream.codec_name.as_deref()),
             codec_fourcc: trimmed_metadata_string(stream.codec_tag_string.as_deref()),
+            gps,
+            has_embedded_gps_properties,
             ..base_media_metadata(
                 manifest_hash,
                 content_fingerprint,
@@ -1445,10 +1487,133 @@ pub(super) fn parse_frame_rate_millihertz(value: &str) -> Option<u32> {
 }
 
 pub(super) fn parse_ffprobe_timestamp(value: &str) -> Option<u64> {
-    let timestamp = OffsetDateTime::parse(value.trim(), &Rfc3339)
+    let value = value.trim();
+    let timestamp = OffsetDateTime::parse(value, &Rfc3339)
+        .or_else(|_| parse_ffprobe_basic_offset_timestamp(value))
         .ok()?
         .unix_timestamp();
     u64::try_from(timestamp).ok()
+}
+
+/// Returns whether `value` ends in a numeric ISO 8601 UTC offset. Unlike a
+/// trailing `Z`, ffprobe's numeric offsets are carried by the source tag and
+/// therefore distinguish an actual instant from QuickTime's synthetic `Z`.
+fn ffprobe_has_explicit_numeric_offset(value: &str) -> bool {
+    let value = value.trim().as_bytes();
+    let compact_offset = value.len().checked_sub(5).and_then(|start| {
+        let offset = &value[start..];
+        (matches!(offset.first(), Some(b'+' | b'-')) && offset[1..].iter().all(u8::is_ascii_digit))
+            .then_some(())
+    });
+    if compact_offset.is_some() {
+        return true;
+    }
+    value.len().checked_sub(6).is_some_and(|start| {
+        let offset = &value[start..];
+        matches!(offset.first(), Some(b'+' | b'-'))
+            && offset[1..3].iter().all(u8::is_ascii_digit)
+            && offset[3] == b':'
+            && offset[4..].iter().all(u8::is_ascii_digit)
+    })
+}
+
+/// ffprobe normally emits RFC 3339 offsets with a colon, but Apple QuickTime
+/// creation-date tags also commonly use ISO 8601's compact `+HHMM` form.
+fn parse_ffprobe_basic_offset_timestamp(value: &str) -> Result<OffsetDateTime, time::error::Parse> {
+    let offset_start = value.len().saturating_sub(5);
+    let Some(offset) = value.get(offset_start..) else {
+        return OffsetDateTime::parse(value, &Rfc3339);
+    };
+    if offset.len() != 5
+        || !matches!(offset.as_bytes().first(), Some(b'+' | b'-'))
+        || !offset.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+    {
+        return OffsetDateTime::parse(value, &Rfc3339);
+    }
+    let normalized = format!(
+        "{}{}:{}",
+        &value[..offset_start],
+        &offset[..3],
+        &offset[3..]
+    );
+    OffsetDateTime::parse(&normalized, &Rfc3339)
+}
+
+fn ffprobe_capture_time(
+    format_tags: Option<&FfprobeTags>,
+    stream_tags: &FfprobeTags,
+) -> (Option<u64>, Option<bool>) {
+    let offset_bearing = [
+        format_tags.and_then(|tags| tags.quicktime_creation_date.as_deref()),
+        stream_tags.quicktime_creation_date.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(parse_ffprobe_timestamp);
+    if let Some(timestamp) = offset_bearing {
+        return (Some(timestamp), Some(true));
+    }
+
+    let creation_time = [
+        format_tags.and_then(|tags| tags.creation_time.as_deref()),
+        stream_tags.creation_time.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        parse_ffprobe_timestamp(value)
+            .map(|timestamp| (timestamp, ffprobe_has_explicit_numeric_offset(value)))
+    });
+    match creation_time {
+        Some((timestamp, timezone_known)) => (Some(timestamp), Some(timezone_known)),
+        None => (None, None),
+    }
+}
+
+fn ffprobe_gps(tags: &super::media_tools::FfprobeTags) -> Option<MediaGpsCoordinates> {
+    [
+        tags.quicktime_location_iso6709.as_deref(),
+        tags.location.as_deref(),
+        tags.location_eng.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(parse_iso6709_location)
+}
+
+fn ffprobe_has_gps_properties(tags: &FfprobeTags) -> bool {
+    tags.quicktime_location_iso6709.is_some()
+        || tags.location.is_some()
+        || tags.location_eng.is_some()
+}
+
+/// Parses the latitude/longitude portion of ISO 6709 values commonly exposed
+/// by ffprobe for QuickTime location atoms, e.g. `+47.3769+008.5417/`.
+pub(super) fn parse_iso6709_location(value: &str) -> Option<MediaGpsCoordinates> {
+    let value = value.trim().strip_suffix('/').unwrap_or(value.trim());
+    let first = value.as_bytes().first().copied()?;
+    if !matches!(first, b'+' | b'-') {
+        return None;
+    }
+    let longitude_start = value
+        .char_indices()
+        .skip(1)
+        .find_map(|(index, character)| matches!(character, '+' | '-').then_some(index))?;
+    let latitude = value[..longitude_start].parse::<f64>().ok()?;
+    let longitude_end = value
+        .char_indices()
+        .skip_while(|(index, _)| *index <= longitude_start)
+        .find_map(|(index, character)| matches!(character, '+' | '-').then_some(index))
+        .unwrap_or(value.len());
+    let longitude = value[longitude_start..longitude_end].parse::<f64>().ok()?;
+    (latitude.is_finite()
+        && longitude.is_finite()
+        && (-90.0..=90.0).contains(&latitude)
+        && (-180.0..=180.0).contains(&longitude))
+    .then_some(MediaGpsCoordinates {
+        latitude,
+        longitude,
+    })
 }
 
 fn trimmed_metadata_string(value: Option<&str>) -> Option<String> {
@@ -1578,7 +1743,14 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
     };
 
     let (width, height) = image_dimensions_from_reader(reader, format)?;
-    let (orientation, gps, taken_at_unix, photo) = extract_exif_fields_from_reader(reader);
+    let (
+        orientation,
+        gps,
+        has_embedded_gps_properties,
+        taken_at_unix,
+        taken_at_timezone_known,
+        photo,
+    ) = extract_exif_fields_from_reader(reader);
     let mut metadata = CachedMediaMetadata {
         status: MediaCacheStatus::Ready,
         media_type: Some("image".to_string()),
@@ -1587,7 +1759,9 @@ fn derive_image_media_cache_from_reader<R: BufRead + Seek>(
         height: Some(height),
         orientation,
         taken_at_unix,
+        taken_at_timezone_known,
         gps,
+        has_embedded_gps_properties,
         photo,
         ..base_media_metadata(
             manifest_hash,
@@ -1918,7 +2092,7 @@ fn render_image_thumbnail_payload(
         return Ok(None);
     }
 
-    let (orientation, _, _, _) = extract_exif_fields_from_reader(&mut reader);
+    let (orientation, _, _, _, _, _) = extract_exif_fields_from_reader(&mut reader);
     let rendered =
         match render_thumbnail_from_reader(&mut reader, format, orientation, profile, image_limits)
         {
@@ -1954,20 +2128,22 @@ fn apply_exif_orientation(image: &mut DynamicImage, orientation: Option<u16>) {
     image.apply_orientation(orientation);
 }
 
-fn extract_exif_fields_from_reader<R: BufRead + Seek>(
-    reader: &mut R,
-) -> (
+type ExifExtraction = (
     Option<u16>,
     Option<MediaGpsCoordinates>,
+    bool,
     Option<u64>,
+    Option<bool>,
     Option<CachedPhotoMetadata>,
-) {
+);
+
+fn extract_exif_fields_from_reader<R: BufRead + Seek>(reader: &mut R) -> ExifExtraction {
     if reader.seek(SeekFrom::Start(0)).is_err() {
-        return (None, None, None, None);
+        return (None, None, false, None, None, None);
     }
     let exif = match ExifReader::new().read_from_container(reader) {
         Ok(value) => value,
-        Err(_) => return (None, None, None, None),
+        Err(_) => return (None, None, false, None, None, None),
     };
 
     let orientation = exif
@@ -2001,11 +2177,32 @@ fn extract_exif_fields_from_reader<R: BufRead + Seek>(
         }),
         _ => None,
     };
+    let has_embedded_gps_properties = exif_has_gps_properties(&exif);
 
-    let taken_at_unix = exif_taken_at_unix(&exif);
+    let (taken_at_unix, taken_at_timezone_known) = exif_capture_time(&exif)
+        .map(|(unix, timezone_known)| (Some(unix), Some(timezone_known)))
+        .unwrap_or((None, None));
     let photo = exif_photo_metadata(&exif);
 
-    (orientation, gps, taken_at_unix, photo)
+    (
+        orientation,
+        gps,
+        has_embedded_gps_properties,
+        taken_at_unix,
+        taken_at_timezone_known,
+        photo,
+    )
+}
+
+fn exif_has_gps_properties(exif: &exif::Exif) -> bool {
+    [
+        Tag::GPSLatitude,
+        Tag::GPSLatitudeRef,
+        Tag::GPSLongitude,
+        Tag::GPSLongitudeRef,
+    ]
+    .into_iter()
+    .any(|tag| exif.get_field(tag, In::PRIMARY).is_some())
 }
 
 fn exif_photo_metadata(exif: &exif::Exif) -> Option<CachedPhotoMetadata> {
@@ -2063,24 +2260,27 @@ fn exif_first_f64(exif: &exif::Exif, tag: Tag) -> Option<f64> {
     (value.is_finite() && value > 0.0).then_some(value)
 }
 
-fn exif_taken_at_unix(exif: &exif::Exif) -> Option<u64> {
-    parse_exif_taken_at(
-        exif_ascii_string(exif.get_field(Tag::DateTimeOriginal, In::PRIMARY)),
-        exif_ascii_string(exif.get_field(Tag::OffsetTimeOriginal, In::PRIMARY))
-            .or_else(|| exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY))),
-    )
-    .or_else(|| {
-        parse_exif_taken_at(
+fn exif_capture_time(exif: &exif::Exif) -> Option<(u64, bool)> {
+    [
+        (
+            exif_ascii_string(exif.get_field(Tag::DateTimeOriginal, In::PRIMARY)),
+            exif_ascii_string(exif.get_field(Tag::OffsetTimeOriginal, In::PRIMARY))
+                .or_else(|| exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY))),
+        ),
+        (
             exif_ascii_string(exif.get_field(Tag::DateTimeDigitized, In::PRIMARY)),
             exif_ascii_string(exif.get_field(Tag::OffsetTimeDigitized, In::PRIMARY))
                 .or_else(|| exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY))),
-        )
-    })
-    .or_else(|| {
-        parse_exif_taken_at(
+        ),
+        (
             exif_ascii_string(exif.get_field(Tag::DateTime, In::PRIMARY)),
             exif_ascii_string(exif.get_field(Tag::OffsetTime, In::PRIMARY)),
-        )
+        ),
+    ]
+    .into_iter()
+    .find_map(|(datetime, offset)| {
+        parse_exif_taken_at(datetime, offset)
+            .map(|unix| (unix, offset.and_then(parse_exif_offset).is_some()))
     })
 }
 
@@ -2432,6 +2632,56 @@ mod tests {
                 .context("thumbnail generation failed");
 
         assert!(is_thumbnail_limit_error(&error));
+    }
+
+    #[test]
+    fn parses_quicktime_iso6709_video_locations() {
+        let location = parse_iso6709_location("+47.3769+008.5417+00450.0/")
+            .expect("ISO 6709 location should parse");
+        assert!((location.latitude - 47.3769).abs() < 0.000_001);
+        assert!((location.longitude - 8.5417).abs() < 0.000_001);
+        assert!(parse_iso6709_location("not-a-location").is_none());
+        assert!(parse_iso6709_location("+91.0+008.5/").is_none());
+    }
+
+    #[test]
+    fn ffprobe_capture_time_distinguishes_synthetic_z_from_explicit_offsets() {
+        let floating_stream_tags = FfprobeTags {
+            creation_time: Some("2024-03-04T05:06:07Z".to_string()),
+            ..FfprobeTags::default()
+        };
+        assert_eq!(
+            ffprobe_capture_time(None, &floating_stream_tags),
+            (Some(1_709_528_767), Some(false))
+        );
+
+        let offset_format_tags = FfprobeTags {
+            creation_time: Some("2024-03-04T05:06:07Z".to_string()),
+            quicktime_creation_date: Some("2024-03-04T06:06:07+0100".to_string()),
+            ..FfprobeTags::default()
+        };
+        assert_eq!(
+            ffprobe_capture_time(Some(&offset_format_tags), &floating_stream_tags),
+            (Some(1_709_528_767), Some(true))
+        );
+
+        let offset_creation_time = FfprobeTags {
+            creation_time: Some("2024-03-04T06:06:07+01:00".to_string()),
+            ..FfprobeTags::default()
+        };
+        assert_eq!(
+            ffprobe_capture_time(None, &offset_creation_time),
+            (Some(1_709_528_767), Some(true))
+        );
+
+        let compact_offset_creation_time = FfprobeTags {
+            creation_time: Some("2024-03-04T06:06:07+0100".to_string()),
+            ..FfprobeTags::default()
+        };
+        assert_eq!(
+            ffprobe_capture_time(None, &compact_offset_creation_time),
+            (Some(1_709_528_767), Some(true))
+        );
     }
 
     #[test]

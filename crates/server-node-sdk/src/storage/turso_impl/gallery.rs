@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
+use common::xmp::XmpGeoLocation;
 use tracing::warn;
 use turso::transaction::{DropBehavior, Transaction, TransactionBehavior};
 use turso::{Value, params_from_iter};
@@ -13,17 +14,18 @@ use super::super::{
     GalleryDeltaScope, GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaFilter,
     GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery, GalleryMapCluster,
     GalleryMapClusterEntriesQuery, GalleryMapClusterPage, GalleryMapClusterQuery,
-    GallerySummaryCacheValue, GallerySummaryProgress, GallerySummaryRefreshStatus,
-    GallerySummaryScope, GalleryViewportBounds, ManifestSummary, current_media_cache_metadata,
-    decode_gallery_labels, effective_gallery_captured_at_unix, encode_gallery_labels,
+    GallerySummaryCacheValue, GallerySummaryMiss, GallerySummaryProgress,
+    GallerySummaryRefreshStatus, GallerySummaryScope, GalleryViewportBounds, ManifestSummary,
+    MediaGpsCoordinates, current_media_cache_metadata, decode_gallery_labels,
+    effective_gallery_captured_at_unix, effective_gallery_gps, encode_gallery_labels,
     gallery_index_media_status, gallery_index_media_type_from_metadata,
     gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
     gallery_media_type_for_path, gallery_web_mercator_position, sqlite_like_prefix_pattern,
-    version_created_at_unix_from_payload,
+    version_created_at_unix_from_payload, version_index_head_projection,
 };
 #[cfg(test)]
 use super::turso_test_db_path;
-use super::{TursoMetadataStore, row_string, row_u64};
+use super::{TursoMetadataStore, row_string, row_u64, upsert_version_index_head_projection};
 
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
 const GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS: i64 = 1_000;
@@ -54,6 +56,9 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
                 geotagged INTEGER NOT NULL DEFAULT 0,
                 latitude REAL,
                 longitude REAL,
+                sidecar_latitude REAL,
+                sidecar_longitude REAL,
+                sidecar_inferred_by_berrykeep INTEGER NOT NULL DEFAULT 0,
                 spatial_x REAL,
                 spatial_y REAL,
                 labels_json TEXT NOT NULL DEFAULT '[]'
@@ -83,8 +88,23 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
             ",
         )
         .await?;
+    super::add_column_if_missing(
+        connection,
+        "gallery_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
     add_gallery_projection_column(connection, "spatial_x", "REAL").await?;
     add_gallery_projection_column(connection, "spatial_y", "REAL").await?;
+    add_gallery_projection_column(connection, "sidecar_latitude", "REAL").await?;
+    add_gallery_projection_column(connection, "sidecar_longitude", "REAL").await?;
+    add_gallery_projection_column(
+        connection,
+        "sidecar_inferred_by_berrykeep",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     connection
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_gallery_objects_spatial
@@ -111,6 +131,22 @@ pub(super) async fn init_gallery_projection(connection: &turso::Connection) -> R
         GALLERY_LABELS_COLUMN_DEFINITION,
     )
     .await?;
+    // Chunked summary refreshes need `key` for stable pagination. Keep large label JSON out of
+    // this otherwise covering index: label-filtered summaries can fetch it from the table.
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_gallery_objects_capture_summary
+             ON gallery_objects(
+                 captured_at_unix,
+                 inferred_media_type,
+                 media_type,
+                 media_status,
+                 geotagged,
+                 key
+             )",
+            (),
+        )
+        .await?;
     super::add_column_if_missing(
         connection,
         "gallery_changes",
@@ -435,6 +471,73 @@ impl TursoMetadataStore {
         finish_gallery_transaction(transaction, result).await
     }
 
+    /// Stores a GPS overlay belonging to one XMP sidecar. This is deliberately
+    /// path-scoped: the media cache is keyed by content fingerprint and may be
+    /// shared by byte-identical objects at unrelated paths.
+    pub(super) async fn store_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<XmpGeoLocation>,
+    ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        let connection = &self.connection;
+        let transaction =
+            Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
+        let result = async {
+            let mut rows = connection
+                .query(
+                    "SELECT manifest_hash, sidecar_latitude, sidecar_longitude,
+                            sidecar_inferred_by_berrykeep
+                     FROM gallery_objects WHERE key = ?1",
+                    (key,),
+                )
+                .await?;
+            let (
+                manifest_hash,
+                existing_latitude,
+                existing_longitude,
+                existing_inferred_by_berrykeep,
+            ) = match rows.next().await? {
+                Some(row) => (
+                    row_string(&row, 0, "gallery_objects.manifest_hash")?,
+                    row_opt_f64(&row, 1, "gallery_objects.sidecar_latitude")?,
+                    row_opt_f64(&row, 2, "gallery_objects.sidecar_longitude")?,
+                    row_u64(&row, 3, "gallery_objects.sidecar_inferred_by_berrykeep")?,
+                ),
+                None => return Ok(()),
+            };
+            drop(rows);
+            let latitude = location.as_ref().map(|location| location.latitude);
+            let longitude = location.as_ref().map(|location| location.longitude);
+            let inferred_by_berrykeep = location
+                .as_ref()
+                .is_some_and(|location| location.inferred_by_berrykeep);
+            if existing_latitude == latitude
+                && existing_longitude == longitude
+                && existing_inferred_by_berrykeep == u64::from(inferred_by_berrykeep)
+            {
+                return Ok(());
+            }
+            connection
+                .execute(
+                    "UPDATE gallery_objects
+                     SET sidecar_latitude = ?2, sidecar_longitude = ?3,
+                         sidecar_inferred_by_berrykeep = ?4
+                     WHERE key = ?1",
+                    params_from_iter(vec![
+                        Value::from(key),
+                        optional_real_value(latitude),
+                        optional_real_value(longitude),
+                        Value::from(i64::from(inferred_by_berrykeep)),
+                    ]),
+                )
+                .await?;
+            refresh_gallery_objects_for_manifest(connection, &manifest_hash).await
+        }
+        .await;
+        finish_gallery_transaction(transaction, result).await
+    }
+
     pub(super) async fn persist_media_cache_record_with_gallery(
         &self,
         metadata: &CachedMediaMetadata,
@@ -580,6 +683,7 @@ impl TursoMetadataStore {
         index: &FileVersionIndex,
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
+        let head_projection = version_index_head_projection(object_id, index);
         let _writer = self.writer_lock.lock().await;
         let connection = &self.connection;
         let transaction =
@@ -594,6 +698,7 @@ impl TursoMetadataStore {
                     (object_id, payload),
                 )
                 .await?;
+            upsert_version_index_head_projection(connection, &head_projection).await?;
             if changed > 0 {
                 let unchanged_projection_keys =
                     refresh_gallery_objects_for_object_id_and_collect_unchanged_keys(
@@ -628,6 +733,15 @@ impl TursoMetadataStore {
         &self,
         query: &GalleryMapClusterQuery,
     ) -> Result<GalleryMapClusterPage> {
+        let scope = GallerySummaryScope {
+            prefix: query.prefix.trim().trim_matches('/').to_string(),
+            depth: query.depth,
+            media_filter: query.media_filter,
+            captured_from_unix: query.captured_from_unix,
+            captured_until_unix: query.captured_until_unix,
+            label_filter: query.label_filter.clone(),
+        };
+        let cached_summary = self.gallery_map_summary_cache.cached(&scope);
         let (history_id, cache_revision, revision, resolution, visible_geotagged_count, clusters) = {
             let connection = self.gallery_read_connection().await?;
             let transaction =
@@ -656,13 +770,8 @@ impl TursoMetadataStore {
             finish_gallery_read_transaction(transaction, result).await?
         };
 
-        let scope = GallerySummaryScope {
-            prefix: query.prefix.trim().trim_matches('/').to_string(),
-            depth: query.depth,
-            media_filter: query.media_filter,
-        };
         let (total_entry_count, media_summary, summary_status) = self
-            .gallery_map_summary(scope, &history_id, cache_revision)
+            .gallery_map_summary(scope, &history_id, cache_revision, cached_summary)
             .await?;
 
         Ok(GalleryMapClusterPage {
@@ -679,64 +788,90 @@ impl TursoMetadataStore {
 
     /// Returns the whole-scope gallery map summary for `scope`, serving a cached (possibly
     /// stale) value immediately rather than blocking the caller on the underlying aggregate
-    /// query. See `SqliteMetadataStore::gallery_map_summary` for the same policy on the SQLite
-    /// backend.
+    /// query. A cold cache is computed by one leader while callers for the same scope wait for
+    /// its result. See `SqliteMetadataStore::gallery_map_summary` for the SQLite policy.
     async fn gallery_map_summary(
         &self,
         scope: GallerySummaryScope,
         history_id: &str,
         revision: u64,
+        cached: Option<GallerySummaryCacheValue>,
     ) -> Result<(usize, GalleryIndexMediaSummary, GallerySummaryRefreshStatus)> {
-        if let Some(cached) = self.gallery_map_summary_cache.cached(&scope) {
-            if cached.history_id == history_id && cached.revision == revision {
-                return Ok((
-                    cached.total_entry_count,
-                    cached.media_summary,
-                    GallerySummaryRefreshStatus::default(),
-                ));
-            }
-            if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
-                let connections = self.gallery_summary_read_connection_factory();
-                let cache = self.gallery_map_summary_cache.clone();
-                let refresh_scope = scope.clone();
-                let estimate = Some(cached.total_entry_count);
-                tokio::spawn(async move {
-                    let result = match connections.open().await {
-                        Ok(connection) => {
-                            let result = query_gallery_map_summary(
-                                &connection,
-                                &refresh_scope,
-                                estimate,
-                                Some(&progress),
-                            )
-                            .await;
-                            drop(connection);
-                            result
+        let mut cached_snapshot = cached;
+        let mut summary_miss = None;
+        loop {
+            // Prefer a value populated while the viewport query was running, but retain the
+            // preflight snapshot in case that scope was evicted in the meantime.
+            let cached = self
+                .gallery_map_summary_cache
+                .cached(&scope)
+                .or(cached_snapshot.take());
+            if let Some(cached) = cached {
+                if cached.history_id == history_id && cached.revision == revision {
+                    return Ok((
+                        cached.total_entry_count,
+                        cached.media_summary,
+                        GallerySummaryRefreshStatus::default(),
+                    ));
+                }
+                if let Some(progress) = self.gallery_map_summary_cache.try_start_refresh(&scope) {
+                    let connections = self.gallery_summary_read_connection_factory();
+                    let cache = self.gallery_map_summary_cache.clone();
+                    let refresh_scope = scope.clone();
+                    let estimate = Some(cached.total_entry_count);
+                    tokio::spawn(async move {
+                        let result = match connections.open().await {
+                            Ok(connection) => {
+                                let result = query_gallery_map_summary(
+                                    &connection,
+                                    &refresh_scope,
+                                    estimate,
+                                    Some(&progress),
+                                )
+                                .await;
+                                drop(connection);
+                                result
+                            }
+                            Err(error) => Err(error),
+                        };
+                        match result {
+                            Ok(value) => cache.store(refresh_scope.clone(), value),
+                            Err(error) => {
+                                warn!(error = %error, "failed to refresh gallery map summary in background")
+                            }
                         }
-                        Err(error) => Err(error),
-                    };
-                    match result {
-                        Ok(value) => cache.store(refresh_scope.clone(), value),
-                        Err(error) => {
-                            warn!(error = %error, "failed to refresh gallery map summary in background")
-                        }
-                    }
-                    cache.finish_refresh(&refresh_scope);
-                });
+                        cache.finish_refresh(&refresh_scope);
+                    });
+                }
+                let status = self.gallery_map_summary_cache.status(&scope);
+                return Ok((cached.total_entry_count, cached.media_summary, status));
             }
-            let status = self.gallery_map_summary_cache.status(&scope);
-            return Ok((cached.total_entry_count, cached.media_summary, status));
-        }
 
-        let connection = self.gallery_read_connection().await?;
-        let value = query_gallery_map_summary(&connection, &scope, None, None).await?;
-        drop(connection);
-        self.gallery_map_summary_cache.store(scope, value.clone());
-        Ok((
-            value.total_entry_count,
-            value.media_summary,
-            GallerySummaryRefreshStatus::default(),
-        ))
+            match summary_miss.take() {
+                Some(GallerySummaryMiss::Follower(completion)) => {
+                    self.gallery_map_summary_cache
+                        .wait_for_summary_miss(&scope, &completion)
+                        .await;
+                }
+                Some(GallerySummaryMiss::Leader(_computation)) => {
+                    let connection = self.gallery_read_connection().await?;
+                    let value = query_gallery_map_summary(&connection, &scope, None, None).await?;
+                    drop(connection);
+                    self.gallery_map_summary_cache.store(scope, value.clone());
+                    return Ok((
+                        value.total_entry_count,
+                        value.media_summary,
+                        GallerySummaryRefreshStatus::default(),
+                    ));
+                }
+                None => {
+                    summary_miss = Some(
+                        self.gallery_map_summary_cache
+                            .try_start_summary_miss(&scope)?,
+                    );
+                }
+            }
+        }
     }
 
     pub(super) async fn query_turso_gallery_map_cluster_entries(
@@ -820,8 +955,9 @@ async fn upsert_gallery_object(
             "INSERT INTO gallery_objects (
                  key, manifest_hash, object_id, inferred_media_type, media_type,
                  captured_at_unix, media_status, geotagged, latitude, longitude,
+                 sidecar_latitude, sidecar_longitude, sidecar_inferred_by_berrykeep,
                  spatial_x, spatial_y
-             ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL)
+             ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL, NULL)
              ON CONFLICT(key) DO UPDATE SET
                  manifest_hash = excluded.manifest_hash,
                  object_id = excluded.object_id,
@@ -832,6 +968,9 @@ async fn upsert_gallery_object(
                  geotagged = 0,
                  latitude = NULL,
                  longitude = NULL,
+                 sidecar_latitude = NULL,
+                 sidecar_longitude = NULL,
+                 sidecar_inferred_by_berrykeep = 0,
                  spatial_x = NULL,
                  spatial_y = NULL
              WHERE gallery_objects.manifest_hash != excluded.manifest_hash
@@ -880,11 +1019,14 @@ async fn refresh_gallery_objects_for_manifest(
                 && gps.longitude.is_finite()
                 && (-180.0..=180.0).contains(&gps.longitude)
         });
-    let spatial_position =
-        gps.and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
     let mut rows = connection
         .query(
-            "SELECT gallery_objects.key, version_indexes.index_json
+            "SELECT
+                 gallery_objects.key,
+                 version_indexes.index_json,
+                 gallery_objects.sidecar_latitude,
+                 gallery_objects.sidecar_longitude,
+                 gallery_objects.sidecar_inferred_by_berrykeep
              FROM gallery_objects
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
@@ -897,11 +1039,21 @@ async fn refresh_gallery_objects_for_manifest(
         entries.push((
             row_string(&row, 0, "gallery_objects.key")?,
             row_opt_blob(&row, 1, "version_indexes.index_json")?,
+            row_opt_f64(&row, 2, "gallery_objects.sidecar_latitude")?,
+            row_opt_f64(&row, 3, "gallery_objects.sidecar_longitude")?,
+            row_u64(&row, 4, "gallery_objects.sidecar_inferred_by_berrykeep")?,
         ));
     }
     drop(rows);
 
-    for (key, version_index_payload) in entries {
+    for (
+        key,
+        version_index_payload,
+        sidecar_latitude,
+        sidecar_longitude,
+        sidecar_inferred_by_berrykeep,
+    ) in entries
+    {
         let version_created_at_unix =
             version_created_at_unix_from_payload(version_index_payload.as_deref(), manifest_hash)?;
         let captured_at_unix = effective_gallery_captured_at_unix(
@@ -912,6 +1064,27 @@ async fn refresh_gallery_objects_for_manifest(
                 .and_then(|metadata| metadata.taken_at_unix),
             version_created_at_unix,
         );
+        let sidecar_gps = match (sidecar_latitude, sidecar_longitude) {
+            (Some(latitude), Some(longitude))
+                if latitude.is_finite()
+                    && (-90.0..=90.0).contains(&latitude)
+                    && longitude.is_finite()
+                    && (-180.0..=180.0).contains(&longitude) =>
+            {
+                Some(MediaGpsCoordinates {
+                    latitude,
+                    longitude,
+                })
+            }
+            _ => None,
+        };
+        let effective_gps = effective_gallery_gps(
+            gps,
+            sidecar_gps.as_ref(),
+            sidecar_inferred_by_berrykeep != 0,
+        );
+        let spatial_position = effective_gps
+            .and_then(|gps| gallery_web_mercator_position(gps.latitude, gps.longitude));
         connection
             .execute(
                 "UPDATE gallery_objects
@@ -930,10 +1103,12 @@ async fn refresh_gallery_objects_for_manifest(
                         i64::try_from(captured_at_unix).context("gallery capture time overflow")?,
                     ),
                     optional_text_value(media_status),
-                    Value::from(i64::from(gps.is_some())),
-                    gps.map(|gps| Value::from(gps.latitude))
+                    Value::from(i64::from(effective_gps.is_some())),
+                    effective_gps
+                        .map(|gps| Value::from(gps.latitude))
                         .unwrap_or(Value::Null),
-                    gps.map(|gps| Value::from(gps.longitude))
+                    effective_gps
+                        .map(|gps| Value::from(gps.longitude))
                         .unwrap_or(Value::Null),
                     spatial_position
                         .map(|position| Value::from(position.0))
@@ -1196,8 +1371,10 @@ async fn query_gallery_index(
                     OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
                 )
             )
-        )";
-    let params = gallery_scope_values(&prefix, &prefix_pattern, depth, query);
+        )
+        AND (?9 IS NULL OR gallery_objects.captured_at_unix >= ?9)
+        AND (?10 IS NULL OR gallery_objects.captured_at_unix < ?10)";
+    let params = gallery_scope_values(&prefix, &prefix_pattern, depth, query)?;
     let (summary_label_sql, summary_label_values) =
         gallery_label_predicates(&query.label_filter, params.len() + 1)?;
     let summary_sql = format!(
@@ -1242,15 +1419,20 @@ async fn query_gallery_index(
     // placeholders continue after those two.
     let (page_label_sql, page_label_values) =
         gallery_label_predicates(&query.label_filter, params.len() + 3)?;
+    let limit_parameter = params.len() + 1;
+    let offset_parameter = limit_parameter + 1;
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1260,7 +1442,7 @@ async fn query_gallery_index(
            ON version_indexes.object_id = gallery_objects.object_id
          WHERE {scope}{page_label_sql}
          ORDER BY gallery_objects.captured_at_unix {sort_direction}, gallery_objects.key ASC
-         LIMIT ?9 OFFSET ?10"
+         LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
     );
     let mut page_params = params;
     page_params.push(Value::from(
@@ -1275,15 +1457,18 @@ async fn query_gallery_index(
         .await?;
     let mut entries = Vec::new();
     while let Some(row) = rows.next().await? {
-        entries.push(materialize_gallery_index_entry(
-            row_string(&row, 0, "gallery_objects.key")?,
-            row_string(&row, 1, "gallery_objects.manifest_hash")?,
-            row_opt_i64(&row, 2, "manifest_summaries.total_size_bytes")?,
-            row_opt_string(&row, 3, "manifest_summaries.content_fingerprint")?,
-            row_opt_blob(&row, 4, "media_cache.metadata_json")?,
-            row_opt_blob(&row, 5, "version_indexes.index_json")?,
-            row_string(&row, 6, "gallery_objects.labels_json")?,
-        )?);
+        entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
+            key: row_string(&row, 0, "gallery_objects.key")?,
+            object_id: row_string(&row, 1, "gallery_objects.object_id")?,
+            manifest_hash: row_string(&row, 2, "gallery_objects.manifest_hash")?,
+            size_bytes: row_opt_i64(&row, 3, "manifest_summaries.total_size_bytes")?,
+            content_fingerprint: row_opt_string(&row, 4, "manifest_summaries.content_fingerprint")?,
+            metadata_payload: row_opt_blob(&row, 5, "media_cache.metadata_json")?,
+            version_index_payload: row_opt_blob(&row, 6, "version_indexes.index_json")?,
+            labels_json: row_string(&row, 7, "gallery_objects.labels_json")?,
+            gallery_latitude: row_opt_f64(&row, 8, "gallery_objects.latitude")?,
+            gallery_longitude: row_opt_f64(&row, 9, "gallery_objects.longitude")?,
+        })?);
     }
     Ok(GalleryIndexPage {
         history_id,
@@ -1309,16 +1494,42 @@ const GALLERY_MAP_SCOPE_SQL: &str = "
     AND gallery_objects.inferred_media_type IS NOT NULL
     AND (?4 IS NULL OR gallery_objects.media_type = ?4)";
 
+const GALLERY_MAP_OPTIONAL_CAPTURE_SQL: &str = "
+    AND (?5 IS NULL OR gallery_objects.captured_at_unix >= ?5)
+    AND (?6 IS NULL OR gallery_objects.captured_at_unix < ?6)";
+
+const GALLERY_MAP_CAPTURE_NONE_SQL: &str = "
+    AND ?5 IS NULL
+    AND ?6 IS NULL";
+const GALLERY_MAP_CAPTURE_FROM_SQL: &str = "
+    AND gallery_objects.captured_at_unix >= ?5
+    AND ?6 IS NULL";
+const GALLERY_MAP_CAPTURE_UNTIL_SQL: &str = "
+    AND ?5 IS NULL
+    AND gallery_objects.captured_at_unix < ?6";
+const GALLERY_MAP_CAPTURE_RANGE_SQL: &str = "
+    AND gallery_objects.captured_at_unix >= ?5
+    AND gallery_objects.captured_at_unix < ?6";
+
+fn gallery_map_summary_capture_sql(has_from: bool, has_until: bool) -> &'static str {
+    match (has_from, has_until) {
+        (false, false) => GALLERY_MAP_CAPTURE_NONE_SQL,
+        (true, false) => GALLERY_MAP_CAPTURE_FROM_SQL,
+        (false, true) => GALLERY_MAP_CAPTURE_UNTIL_SQL,
+        (true, true) => GALLERY_MAP_CAPTURE_RANGE_SQL,
+    }
+}
+
 const GALLERY_MAP_VIEWPORT_SQL: &str = "
-    gallery_objects.latitude BETWEEN ?5 AND ?6
+    gallery_objects.latitude BETWEEN ?7 AND ?8
     AND (
-        (?7 <= ?8 AND gallery_objects.longitude BETWEEN ?7 AND ?8)
-        OR (?7 > ?8 AND (gallery_objects.longitude >= ?7 OR gallery_objects.longitude <= ?8))
+        (?9 <= ?10 AND gallery_objects.longitude BETWEEN ?9 AND ?10)
+        OR (?9 > ?10 AND (gallery_objects.longitude >= ?9 OR gallery_objects.longitude <= ?10))
     )
-    AND gallery_objects.spatial_y BETWEEN ?9 AND ?10
+    AND gallery_objects.spatial_y BETWEEN ?11 AND ?12
     AND (
-        (?11 <= ?12 AND gallery_objects.spatial_x BETWEEN ?11 AND ?12)
-        OR (?11 > ?12 AND (gallery_objects.spatial_x >= ?11 OR gallery_objects.spatial_x <= ?12))
+        (?13 <= ?14 AND gallery_objects.spatial_x BETWEEN ?13 AND ?14)
+        OR (?13 > ?14 AND (gallery_objects.spatial_x >= ?13 OR gallery_objects.spatial_x <= ?14))
     )";
 
 fn turso_gallery_map_scope_values(
@@ -1326,6 +1537,8 @@ fn turso_gallery_map_scope_values(
     prefix_pattern: &str,
     depth: usize,
     media_filter: GalleryIndexMediaFilter,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     viewport: GalleryViewportBounds,
 ) -> Result<Vec<Value>> {
     let (spatial_west, spatial_south) =
@@ -1339,6 +1552,8 @@ fn turso_gallery_map_scope_values(
         Value::from(prefix_pattern),
         Value::from(i64::try_from(depth).context("gallery map depth overflow")?),
         optional_text_value(media_filter.media_type()),
+        optional_integer_value(captured_from_unix, "gallery map capture-time lower bound")?,
+        optional_integer_value(captured_until_unix, "gallery map capture-time upper bound")?,
         Value::from(viewport.south),
         Value::from(viewport.north),
         Value::from(viewport.west),
@@ -1353,7 +1568,10 @@ fn turso_gallery_map_scope_values(
 async fn gallery_map_summary_query(
     connection: &turso::Connection,
     scope_values: &[Value],
+    capture_sql: &str,
+    label_filter: &super::super::GalleryLabelFilter,
 ) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let (label_sql, label_values) = gallery_label_predicates(label_filter, scope_values.len() + 1)?;
     let summary_sql = format!(
         "SELECT
              COUNT(*),
@@ -1364,10 +1582,12 @@ async fn gallery_map_summary_query(
              COALESCE(SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(geotagged), 0)
          FROM gallery_objects
-         WHERE {GALLERY_MAP_SCOPE_SQL}"
+         WHERE {GALLERY_MAP_SCOPE_SQL}{capture_sql}{label_sql}"
     );
+    let mut values = scope_values.to_vec();
+    values.extend(label_values.into_iter().map(Value::Text));
     let mut summary_rows = connection
-        .query(summary_sql, params_from_iter(scope_values.iter().cloned()))
+        .query(summary_sql, params_from_iter(values))
         .await?;
     let summary = summary_rows
         .next()
@@ -1390,27 +1610,6 @@ async fn gallery_map_summary_query(
     Ok((total_entry_count, media_summary))
 }
 
-const GALLERY_MAP_SUMMARY_CHUNK_SQL: &str = "
-    SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
-           gallery_objects.geotagged
-    FROM gallery_objects
-    WHERE (?1 = '' OR gallery_objects.key = ?1 OR gallery_objects.key LIKE ?2 ESCAPE '\\')
-      AND CASE
-            WHEN ?1 = '' THEN CASE
-                WHEN trim(gallery_objects.key, '/') = '' THEN 0
-                ELSE length(trim(gallery_objects.key, '/'))
-                     - length(replace(trim(gallery_objects.key, '/'), '/', '')) + 1
-            END
-            WHEN gallery_objects.key = ?1 THEN 0
-            ELSE length(substr(gallery_objects.key, length(?1) + 2))
-                 - length(replace(substr(gallery_objects.key, length(?1) + 2), '/', '')) + 1
-        END <= ?3
-      AND gallery_objects.inferred_media_type IS NOT NULL
-      AND (?4 IS NULL OR gallery_objects.media_type = ?4)
-      AND (?5 IS NULL OR gallery_objects.key > ?5)
-    ORDER BY gallery_objects.key
-    LIMIT ?6";
-
 const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
 
 /// Same result as [`gallery_map_summary_query`], but computed in small ordered chunks so a
@@ -1421,19 +1620,32 @@ const GALLERY_MAP_SUMMARY_CHUNK_ROWS: i64 = 5_000;
 async fn gallery_map_summary_chunked_query(
     connection: &turso::Connection,
     scope_values: &[Value],
+    capture_sql: &str,
+    label_filter: &super::super::GalleryLabelFilter,
     total_estimate: Option<usize>,
     progress: &GallerySummaryProgress,
 ) -> Result<(usize, GalleryIndexMediaSummary)> {
+    let (label_sql, label_values) = gallery_label_predicates(label_filter, scope_values.len() + 1)?;
+    let cursor_parameter = scope_values.len() + label_values.len() + 1;
+    let limit_parameter = cursor_parameter + 1;
+    let sql = format!(
+        "SELECT gallery_objects.key, gallery_objects.media_status, gallery_objects.media_type,
+                gallery_objects.geotagged
+           FROM gallery_objects
+          WHERE {GALLERY_MAP_SCOPE_SQL}{capture_sql}{label_sql}
+            AND (?{cursor_parameter} IS NULL OR gallery_objects.key > ?{cursor_parameter})
+          ORDER BY gallery_objects.key
+          LIMIT ?{limit_parameter}"
+    );
     let mut cursor: Option<String> = None;
     let mut total = 0usize;
     let mut summary = GalleryIndexMediaSummary::default();
     loop {
         let mut values = scope_values.to_vec();
+        values.extend(label_values.iter().cloned().map(Value::Text));
         values.push(optional_text_value(cursor.as_deref()));
         values.push(Value::from(GALLERY_MAP_SUMMARY_CHUNK_ROWS));
-        let mut rows = connection
-            .query(GALLERY_MAP_SUMMARY_CHUNK_SQL, params_from_iter(values))
-            .await?;
+        let mut rows = connection.query(&sql, params_from_iter(values)).await?;
         let mut chunk_len = 0usize;
         let mut last_key = None;
         while let Some(row) = rows.next().await? {
@@ -1476,14 +1688,19 @@ async fn gallery_map_cluster_cells_query(
     base_values: &[Value],
     requested_resolution: u32,
     max_clusters: usize,
+    label_filter: &super::super::GalleryLabelFilter,
 ) -> Result<(u32, Vec<GalleryMapCluster>)> {
     let max_clusters = max_clusters.max(1);
     let mut resolution = requested_resolution.max(1);
     let clusters = loop {
+        let resolution_parameter = base_values.len() + 1;
+        let (label_sql, label_values) =
+            gallery_label_predicates(label_filter, base_values.len() + 2)?;
+        let limit_parameter = base_values.len() + 2 + label_values.len();
         let sql = format!(
             "SELECT
-                 CAST(gallery_objects.spatial_x * ?13 AS INTEGER),
-                 CAST(gallery_objects.spatial_y * ?13 AS INTEGER),
+                 CAST(gallery_objects.spatial_x * ?{resolution_parameter} AS INTEGER),
+                 CAST(gallery_objects.spatial_y * ?{resolution_parameter} AS INTEGER),
                  COUNT(*),
                  AVG(gallery_objects.latitude),
                  AVG(gallery_objects.longitude),
@@ -1492,12 +1709,15 @@ async fn gallery_map_cluster_cells_query(
                  MIN(gallery_objects.longitude),
                  MAX(gallery_objects.longitude),
                  MIN(gallery_objects.key),
+                 MIN(gallery_objects.object_id),
                  MIN(gallery_objects.manifest_hash),
                  MIN(manifest_summaries.total_size_bytes),
                  MIN(manifest_summaries.content_fingerprint),
                  MIN(media_cache.metadata_json),
                  MIN(version_indexes.index_json),
-                 MIN(gallery_objects.labels_json)
+                 MIN(gallery_objects.labels_json),
+                 MIN(gallery_objects.latitude),
+                 MIN(gallery_objects.longitude)
              FROM gallery_objects
              LEFT JOIN manifest_summaries
                ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1505,13 +1725,15 @@ async fn gallery_map_cluster_cells_query(
                ON media_cache.content_fingerprint = manifest_summaries.content_fingerprint
              LEFT JOIN version_indexes
                ON version_indexes.object_id = gallery_objects.object_id
-             WHERE {GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
+             WHERE {GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_OPTIONAL_CAPTURE_SQL}
+               AND {GALLERY_MAP_VIEWPORT_SQL}{label_sql}
              GROUP BY 1, 2
              ORDER BY 2 ASC, 1 ASC
-             LIMIT ?14"
+             LIMIT ?{limit_parameter}"
         );
         let mut values = base_values.to_vec();
         values.push(Value::from(i64::from(resolution)));
+        values.extend(label_values.into_iter().map(Value::Text));
         values.push(Value::from(
             i64::try_from(max_clusters.saturating_add(1))
                 .context("gallery map cluster limit overflow")?,
@@ -1526,15 +1748,22 @@ async fn gallery_map_cluster_cells_query(
             let cluster_count = usize::try_from(row_u64(&row, 2, "gallery map cluster count")?)
                 .context("gallery map cluster count overflow")?;
             let entry = if cluster_count == 1 {
-                Some(materialize_gallery_index_entry(
-                    row_string(&row, 9, "gallery_objects.key")?,
-                    row_string(&row, 10, "gallery_objects.manifest_hash")?,
-                    row_opt_i64(&row, 11, "manifest_summaries.total_size_bytes")?,
-                    row_opt_string(&row, 12, "manifest_summaries.content_fingerprint")?,
-                    row_opt_blob(&row, 13, "media_cache.metadata_json")?,
-                    row_opt_blob(&row, 14, "version_indexes.index_json")?,
-                    row_string(&row, 15, "gallery_objects.labels_json")?,
-                )?)
+                Some(materialize_gallery_index_entry(GalleryIndexEntrySource {
+                    key: row_string(&row, 9, "gallery_objects.key")?,
+                    object_id: row_string(&row, 10, "gallery_objects.object_id")?,
+                    manifest_hash: row_string(&row, 11, "gallery_objects.manifest_hash")?,
+                    size_bytes: row_opt_i64(&row, 12, "manifest_summaries.total_size_bytes")?,
+                    content_fingerprint: row_opt_string(
+                        &row,
+                        13,
+                        "manifest_summaries.content_fingerprint",
+                    )?,
+                    metadata_payload: row_opt_blob(&row, 14, "media_cache.metadata_json")?,
+                    version_index_payload: row_opt_blob(&row, 15, "version_indexes.index_json")?,
+                    labels_json: row_string(&row, 16, "gallery_objects.labels_json")?,
+                    gallery_latitude: row_opt_f64(&row, 17, "gallery_objects.latitude")?,
+                    gallery_longitude: row_opt_f64(&row, 18, "gallery_objects.longitude")?,
+                })?)
             } else {
                 None
             };
@@ -1583,10 +1812,20 @@ async fn query_gallery_map_clusters(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
-    let (total_entry_count, media_summary) =
-        gallery_map_summary_query(connection, &base_values[..4]).await?;
+    let (total_entry_count, media_summary) = gallery_map_summary_query(
+        connection,
+        &base_values[..6],
+        gallery_map_summary_capture_sql(
+            query.captured_from_unix.is_some(),
+            query.captured_until_unix.is_some(),
+        ),
+        &query.label_filter,
+    )
+    .await?;
     let (resolution, clusters) = gallery_map_cluster_cells_query(
         connection,
         &base_values,
@@ -1596,6 +1835,7 @@ async fn query_gallery_map_clusters(
             query.max_clusters,
         ),
         query.max_clusters,
+        &query.label_filter,
     )
     .await?;
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
@@ -1629,6 +1869,8 @@ pub(super) async fn query_gallery_map_cluster_cells(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
     let (resolution, clusters) = gallery_map_cluster_cells_query(
@@ -1640,6 +1882,7 @@ pub(super) async fn query_gallery_map_cluster_cells(
             query.max_clusters,
         ),
         query.max_clusters,
+        &query.label_filter,
     )
     .await?;
     let visible_geotagged_count = clusters.iter().map(|cluster| cluster.count).sum();
@@ -1667,23 +1910,45 @@ pub(super) async fn query_gallery_map_summary(
             sqlite_like_prefix_pattern(&format!("{}/", scope.prefix))
         };
         let depth = i64::try_from(scope.depth).context("gallery map summary depth overflow")?;
+        let capture_sql = gallery_map_summary_capture_sql(
+            scope.captured_from_unix.is_some(),
+            scope.captured_until_unix.is_some(),
+        );
         let scope_values = vec![
             Value::from(scope.prefix.as_str()),
             Value::from(prefix_pattern.as_str()),
             Value::from(depth),
             optional_text_value(scope.media_filter.media_type()),
+            optional_integer_value(
+                scope.captured_from_unix,
+                "gallery map capture-time lower bound",
+            )?,
+            optional_integer_value(
+                scope.captured_until_unix,
+                "gallery map capture-time upper bound",
+            )?,
         ];
         let (total_entry_count, media_summary) = match progress {
             Some(progress) => {
                 gallery_map_summary_chunked_query(
                     &transaction,
                     &scope_values,
+                    capture_sql,
+                    &scope.label_filter,
                     total_estimate,
                     progress,
                 )
                 .await?
             }
-            None => gallery_map_summary_query(&transaction, &scope_values).await?,
+            None => {
+                gallery_map_summary_query(
+                    &transaction,
+                    &scope_values,
+                    capture_sql,
+                    &scope.label_filter,
+                )
+                .await?
+            }
         };
         Ok(GallerySummaryCacheValue {
             history_id,
@@ -1713,15 +1978,26 @@ async fn query_gallery_map_cluster_entries(
         &prefix_pattern,
         query.depth,
         query.media_filter,
+        query.captured_from_unix,
+        query.captured_until_unix,
         query.viewport,
     )?;
+    let resolution_parameter = values.len() + 1;
+    let cell_x_parameter = resolution_parameter + 1;
+    let cell_y_parameter = resolution_parameter + 2;
     values.push(Value::from(i64::from(query.resolution.max(1))));
     values.push(Value::from(i64::from(query.cell_x)));
     values.push(Value::from(i64::from(query.cell_y)));
+    let (label_sql, label_values) =
+        gallery_label_predicates(&query.label_filter, values.len() + 1)?;
+    values.extend(label_values.into_iter().map(Value::Text));
+    let limit_parameter = values.len() + 1;
+    let offset_parameter = limit_parameter + 1;
     let cell_scope = format!(
-        "{GALLERY_MAP_SCOPE_SQL} AND {GALLERY_MAP_VIEWPORT_SQL}
-         AND CAST(gallery_objects.spatial_x * ?13 AS INTEGER) = ?14
-         AND CAST(gallery_objects.spatial_y * ?13 AS INTEGER) = ?15"
+        "{GALLERY_MAP_SCOPE_SQL}{GALLERY_MAP_OPTIONAL_CAPTURE_SQL}
+         AND {GALLERY_MAP_VIEWPORT_SQL}
+         AND CAST(gallery_objects.spatial_x * ?{resolution_parameter} AS INTEGER) = ?{cell_x_parameter}
+         AND CAST(gallery_objects.spatial_y * ?{resolution_parameter} AS INTEGER) = ?{cell_y_parameter}{label_sql}"
     );
     let summary_sql = format!(
         "SELECT
@@ -1759,12 +2035,15 @@ async fn query_gallery_map_cluster_entries(
     let page_sql = format!(
         "SELECT
              gallery_objects.key,
+             gallery_objects.object_id,
              gallery_objects.manifest_hash,
              manifest_summaries.total_size_bytes,
              manifest_summaries.content_fingerprint,
              media_cache.metadata_json,
              version_indexes.index_json,
-             gallery_objects.labels_json
+             gallery_objects.labels_json,
+             gallery_objects.latitude,
+             gallery_objects.longitude
          FROM gallery_objects
          LEFT JOIN manifest_summaries
            ON manifest_summaries.manifest_hash = gallery_objects.manifest_hash
@@ -1774,7 +2053,7 @@ async fn query_gallery_map_cluster_entries(
            ON version_indexes.object_id = gallery_objects.object_id
          WHERE {cell_scope}
          ORDER BY gallery_objects.captured_at_unix DESC, gallery_objects.key ASC
-         LIMIT ?16 OFFSET ?17"
+         LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
     );
     values.push(Value::from(
         i64::try_from(query.limit.max(1)).context("gallery map entry limit overflow")?,
@@ -1785,15 +2064,18 @@ async fn query_gallery_map_cluster_entries(
     let mut rows = connection.query(page_sql, params_from_iter(values)).await?;
     let mut entries = Vec::new();
     while let Some(row) = rows.next().await? {
-        entries.push(materialize_gallery_index_entry(
-            row_string(&row, 0, "gallery_objects.key")?,
-            row_string(&row, 1, "gallery_objects.manifest_hash")?,
-            row_opt_i64(&row, 2, "manifest_summaries.total_size_bytes")?,
-            row_opt_string(&row, 3, "manifest_summaries.content_fingerprint")?,
-            row_opt_blob(&row, 4, "media_cache.metadata_json")?,
-            row_opt_blob(&row, 5, "version_indexes.index_json")?,
-            row_string(&row, 6, "gallery_objects.labels_json")?,
-        )?);
+        entries.push(materialize_gallery_index_entry(GalleryIndexEntrySource {
+            key: row_string(&row, 0, "gallery_objects.key")?,
+            object_id: row_string(&row, 1, "gallery_objects.object_id")?,
+            manifest_hash: row_string(&row, 2, "gallery_objects.manifest_hash")?,
+            size_bytes: row_opt_i64(&row, 3, "manifest_summaries.total_size_bytes")?,
+            content_fingerprint: row_opt_string(&row, 4, "manifest_summaries.content_fingerprint")?,
+            metadata_payload: row_opt_blob(&row, 5, "media_cache.metadata_json")?,
+            version_index_payload: row_opt_blob(&row, 6, "version_indexes.index_json")?,
+            labels_json: row_string(&row, 7, "gallery_objects.labels_json")?,
+            gallery_latitude: row_opt_f64(&row, 8, "gallery_objects.latitude")?,
+            gallery_longitude: row_opt_f64(&row, 9, "gallery_objects.longitude")?,
+        })?);
     }
     Ok(GalleryIndexPage {
         history_id,
@@ -1938,6 +2220,7 @@ async fn query_gallery_entry(
             &format!(
                 "SELECT
                  gallery_objects.key,
+                 gallery_objects.object_id,
                  gallery_objects.manifest_hash,
                  manifest_summaries.total_size_bytes,
                  manifest_summaries.content_fingerprint,
@@ -1964,20 +2247,25 @@ async fn query_gallery_entry(
         return Ok(None);
     };
     let key = row_string(&row, 0, "gallery_objects.key")?;
-    let media_type = row_opt_string(&row, 6, "gallery_objects.media_type")?;
-    let latitude = row_opt_f64(&row, 7, "gallery_objects.latitude")?;
-    let longitude = row_opt_f64(&row, 8, "gallery_objects.longitude")?;
+    let media_type = row_opt_string(&row, 7, "gallery_objects.media_type")?;
+    let latitude = row_opt_f64(&row, 8, "gallery_objects.latitude")?;
+    let longitude = row_opt_f64(&row, 9, "gallery_objects.longitude")?;
     if !gallery_entry_matches_delta_scope(&key, media_type.as_deref(), latitude, longitude, scope) {
         return Ok(None);
     }
     Ok(Some(materialize_gallery_index_entry(
-        key,
-        row_string(&row, 1, "gallery_objects.manifest_hash")?,
-        row_opt_i64(&row, 2, "manifest_summaries.total_size_bytes")?,
-        row_opt_string(&row, 3, "manifest_summaries.content_fingerprint")?,
-        row_opt_blob(&row, 4, "media_cache.metadata_json")?,
-        row_opt_blob(&row, 5, "version_indexes.index_json")?,
-        row_string(&row, 9, "gallery_objects.labels_json")?,
+        GalleryIndexEntrySource {
+            key,
+            object_id: row_string(&row, 1, "gallery_objects.object_id")?,
+            manifest_hash: row_string(&row, 2, "gallery_objects.manifest_hash")?,
+            size_bytes: row_opt_i64(&row, 3, "manifest_summaries.total_size_bytes")?,
+            content_fingerprint: row_opt_string(&row, 4, "manifest_summaries.content_fingerprint")?,
+            metadata_payload: row_opt_blob(&row, 5, "media_cache.metadata_json")?,
+            version_index_payload: row_opt_blob(&row, 6, "version_indexes.index_json")?,
+            labels_json: row_string(&row, 10, "gallery_objects.labels_json")?,
+            gallery_latitude: latitude,
+            gallery_longitude: longitude,
+        },
     )?))
 }
 
@@ -1986,7 +2274,7 @@ fn gallery_scope_values(
     prefix_pattern: &str,
     depth: i64,
     query: &GalleryIndexQuery,
-) -> Vec<Value> {
+) -> Result<Vec<Value>> {
     let media_type = query.media_filter.media_type();
     let (south, north, west, east) = query
         .viewport
@@ -1999,7 +2287,7 @@ fn gallery_scope_values(
             )
         })
         .unwrap_or((None, None, None, None));
-    vec![
+    Ok(vec![
         Value::from(prefix),
         Value::from(prefix_pattern),
         Value::from(depth),
@@ -2008,34 +2296,76 @@ fn gallery_scope_values(
         optional_real_value(north),
         optional_real_value(west),
         optional_real_value(east),
-    ]
+        optional_integer_value(query.captured_from_unix, "gallery capture-time lower bound")?,
+        optional_integer_value(
+            query.captured_until_unix,
+            "gallery capture-time upper bound",
+        )?,
+    ])
 }
 
-fn materialize_gallery_index_entry(
+struct GalleryIndexEntrySource {
     key: String,
+    object_id: String,
     manifest_hash: String,
     size_bytes: Option<i64>,
     content_fingerprint: Option<String>,
     metadata_payload: Option<Vec<u8>>,
     version_index_payload: Option<Vec<u8>>,
     labels_json: String,
+    gallery_latitude: Option<f64>,
+    gallery_longitude: Option<f64>,
+}
+
+fn materialize_gallery_index_entry(
+    GalleryIndexEntrySource {
+        key,
+        object_id,
+        manifest_hash,
+        size_bytes,
+        content_fingerprint,
+        metadata_payload,
+        version_index_payload,
+        labels_json,
+        gallery_latitude,
+        gallery_longitude,
+    }: GalleryIndexEntrySource,
 ) -> Result<GalleryIndexEntry> {
     let size_bytes = size_bytes
         .map(|value| u64::try_from(value).context("negative gallery entry size in Turso"))
         .transpose()?;
-    let media_metadata = metadata_payload
+    let gallery_gps = match (gallery_latitude, gallery_longitude) {
+        (Some(latitude), Some(longitude))
+            if latitude.is_finite()
+                && (-90.0..=90.0).contains(&latitude)
+                && longitude.is_finite()
+                && (-180.0..=180.0).contains(&longitude) =>
+        {
+            Some(MediaGpsCoordinates {
+                latitude,
+                longitude,
+            })
+        }
+        _ => None,
+    };
+    let mut media_metadata = metadata_payload
         .and_then(|payload| serde_json::from_slice::<CachedMediaMetadata>(&payload).ok())
         .and_then(|metadata| current_media_cache_metadata(Some(metadata)));
+    if let (Some(gallery_gps), Some(metadata)) = (&gallery_gps, media_metadata.as_mut()) {
+        metadata.gps = Some(gallery_gps.clone());
+    }
     let modified_at_unix =
         version_created_at_unix_from_payload(version_index_payload.as_deref(), &manifest_hash)?;
     let labels = decode_gallery_labels(&labels_json)?;
     Ok(GalleryIndexEntry {
         key,
+        object_id,
         manifest_hash,
         size_bytes,
         modified_at_unix,
         content_fingerprint,
         media_metadata,
+        gps_override: gallery_gps,
         labels,
     })
 }
@@ -2173,6 +2503,15 @@ fn optional_real_value(value: Option<f64>) -> Value {
     value.map(Value::from).unwrap_or(Value::Null)
 }
 
+fn optional_integer_value(value: Option<u64>, label: &str) -> Result<Value> {
+    match value {
+        Some(value) => Ok(Value::from(
+            i64::try_from(value).with_context(|| format!("{label} overflow"))?,
+        )),
+        None => Ok(Value::Null),
+    }
+}
+
 fn row_opt_string(row: &turso::Row, idx: usize, label: &str) -> Result<Option<String>> {
     match row.get_value(idx)? {
         Value::Null => Ok(None),
@@ -2207,7 +2546,7 @@ fn row_opt_u64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<u64>>
         .transpose()
 }
 
-fn row_opt_f64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<f64>> {
+pub(super) fn row_opt_f64(row: &turso::Row, idx: usize, label: &str) -> Result<Option<f64>> {
     match row.get_value(idx)? {
         Value::Null => Ok(None),
         Value::Real(value) => Ok(Some(value)),
@@ -2286,9 +2625,12 @@ mod tests {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: GalleryIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport,
             requested_resolution,
             max_clusters,
+            label_filter: Default::default(),
         }
     }
 
@@ -2493,12 +2835,15 @@ mod tests {
                 prefix: "gallery".to_string(),
                 depth: 64,
                 media_filter: GalleryIndexMediaFilter::Image,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 viewport,
                 resolution: clusters.resolution,
                 cell_x: cluster.cell_x,
                 cell_y: cluster.cell_y,
                 offset: 0,
                 limit: 1,
+                label_filter: Default::default(),
             },
             history_id,
             revision,
@@ -2626,12 +2971,15 @@ mod tests {
                 prefix: "gallery".to_string(),
                 depth: 64,
                 media_filter: GalleryIndexMediaFilter::Image,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 viewport,
                 resolution: clusters.resolution,
                 cell_x: cluster.cell_x,
                 cell_y: cluster.cell_y,
                 offset: 0,
                 limit: 100,
+                label_filter: Default::default(),
             })
             .await
             .expect("cluster page should load after unrelated ingest")
@@ -2652,12 +3000,15 @@ mod tests {
                 prefix: "gallery".to_string(),
                 depth: 64,
                 media_filter: GalleryIndexMediaFilter::Image,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 viewport,
                 resolution: clusters.resolution,
                 cell_x: cluster.cell_x,
                 cell_y: cluster.cell_y,
                 offset: 0,
                 limit: 100,
+                label_filter: Default::default(),
             })
             .await
             .expect("cluster page should load after in-scope change")
@@ -2978,6 +3329,8 @@ mod tests {
             depth: 64,
             media_filter: GalleryIndexMediaFilter::All,
             captured_sort: GalleryIndexCapturedSort::Desc,
+            captured_from_unix: None,
+            captured_until_unix: None,
             offset: 0,
             limit: 10,
             viewport: None,
@@ -3024,6 +3377,8 @@ mod tests {
             depth: 64,
             media_filter: GalleryIndexMediaFilter::All,
             captured_sort: GalleryIndexCapturedSort::Desc,
+            captured_from_unix: None,
+            captured_until_unix: None,
             offset: 0,
             limit: 10,
             viewport: None,
@@ -3232,13 +3587,16 @@ mod tests {
             height: Some(48),
             orientation: Some(1),
             taken_at_unix: Some(10),
+            taken_at_timezone_known: None,
             date_encoded_unix: None,
+            date_encoded_timezone_known: None,
             duration_millis: None,
             frame_rate_millihertz: None,
             total_bitrate_bps: None,
             codec_name: None,
             codec_fourcc: None,
             gps: None,
+            has_embedded_gps_properties: false,
             photo: None,
             thumbnail: None,
             source_size_bytes: 100,

@@ -16,22 +16,23 @@ use crate::{
     PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE, PUBLIC_API_V1_PREFIX, ServerState,
     StoreIndexChangeWaitQuery, StoreIndexDeltaQuery, StoreIndexQuery, TransportHeader,
     build_internal_peer_api, cluster_status, commit_version, complete_upload_session_route,
-    confirm_version, copy_object_path, delete_object, delete_object_by_query,
+    confirm_version, copy_object_path, delete_object, delete_object_by_id, delete_object_by_query,
     delete_upload_session, enroll_client_device, execute_replication_cleanup, get_media_thumbnail,
-    get_media_thumbnail_response, get_object, get_object_response, get_store_index_delta,
-    get_upload_session, head_object, health, latency_diagnostic, list_gallery_map_cluster_entries,
-    list_gallery_map_clusters, list_nodes, list_snapshots, list_store_index,
-    list_store_index_response, list_tombstone_archives, list_versions, list_versions_response,
-    placement_for_key, process_stats_current, process_stats_history, put_object,
-    reconcile_from_node, redeem_client_bootstrap_claim, rename_object_path,
+    get_media_thumbnail_response, get_object, get_object_by_id, get_object_response,
+    get_store_index_delta, get_upload_session, head_object, health, latency_diagnostic,
+    list_gallery_map_cluster_entries, list_gallery_map_clusters, list_nodes, list_snapshots,
+    list_store_history, list_store_index, list_store_index_response, list_tombstone_archives,
+    list_versions, list_versions_response, placement_for_key, process_stats_current,
+    process_stats_history, put_object, put_object_by_id, reconcile_from_node,
+    redeem_client_bootstrap_claim, rename_object_by_id, rename_object_path,
     rendezvous_contact_config, renew_device_rendezvous_identity, replication, replication_plan,
     request_has_admin_auth, require_client_auth, require_client_or_admin_auth,
-    require_internal_caller, restore_snapshot_path, restore_version_path, run_cleanup,
-    run_tombstone_archive_purge, run_tombstone_archive_restore, run_tombstone_compaction,
-    s3_frontend, set_media_labels, start_upload_session, storage_stats_current,
-    storage_stats_history, store_index_delta_response, transport_headers_from_response,
-    trigger_replication_audit, upload_session_chunk, validate_client_auth_request,
-    wait_for_store_index_change,
+    require_internal_caller, require_signed_client_auth, restore_history_entries,
+    restore_snapshot_path, restore_version_path, run_cleanup, run_tombstone_archive_purge,
+    run_tombstone_archive_restore, run_tombstone_compaction, s3_frontend, set_media_labels,
+    start_upload_session, storage_stats_current, storage_stats_history, store_index_delta_response,
+    transport_headers_from_response, trigger_replication_audit, upload_session_chunk,
+    validate_client_auth_request, wait_for_store_index_change, web_maps, web_service_proxy,
 };
 
 #[derive(Clone)]
@@ -63,7 +64,11 @@ pub(super) fn normalize_public_api_v1_path_and_query(path_and_query: &str) -> Co
 fn is_reserved_store_api_path(path: &str) -> bool {
     matches!(
         path,
-        "/store/index" | "/store/index/delta" | "/store/index/changes/wait"
+        "/store/history"
+            | "/store/history/restore"
+            | "/store/index"
+            | "/store/index/delta"
+            | "/store/index/changes/wait"
     ) || path.starts_with("/store/uploads/")
 }
 
@@ -552,6 +557,18 @@ async fn buffered_response_from_axum_response(
 }
 
 fn build_public_transport_router(state: ServerState) -> Router {
+    // Web service ACLs are device-specific, including when the request reaches
+    // the public API through a multiplexed direct or relay transport session.
+    let web_service_client_api = Router::new()
+        .route(
+            "/web-services",
+            get(web_service_proxy::list_client_services),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_signed_client_auth,
+        ));
+
     let public_client_api = Router::new()
         .route("/diagnostics/latency", get(latency_diagnostic))
         .route(
@@ -560,6 +577,8 @@ fn build_public_transport_router(state: ServerState) -> Router {
         )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/history", get(list_store_history))
+        .route("/store/history/restore", post(restore_history_entries))
         .route("/store/index/delta", get(get_store_index_delta))
         .route("/gallery/map/clusters", get(list_gallery_map_clusters))
         .route(
@@ -591,6 +610,10 @@ fn build_public_transport_router(state: ServerState) -> Router {
         )
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/maps/config", get(crate::map_config::public_config))
+        .route("/maps/mbtiles-metadata", get(web_maps::mbtiles_metadata))
+        .route("/maps/tiles/{z}/{x}/{y}", get(web_maps::xyz_tile))
+        .route("/maps/vector-tiles/{z}/{x}/{y}", get(web_maps::vector_tile))
+        .route("/maps/fonts/{fontstack}/{range}", get(web_maps::font_range))
         .route(
             "/cluster/rendezvous-contacts",
             get(rendezvous_contact_config::public_config),
@@ -600,6 +623,13 @@ fn build_public_transport_router(state: ServerState) -> Router {
         .route("/store/copy", post(copy_object_path))
         .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
+        .route(
+            "/objects/{object_id}",
+            get(get_object_by_id)
+                .put(put_object_by_id)
+                .delete(delete_object_by_id),
+        )
+        .route("/objects/{object_id}/rename", post(rename_object_by_id))
         .route(
             "/store/{key}",
             put(put_object)
@@ -674,6 +704,7 @@ fn build_public_transport_router(state: ServerState) -> Router {
             post(run_tombstone_archive_purge),
         )
         .merge(public_cluster_info_api.clone())
+        .merge(web_service_client_api.clone())
         .merge(public_client_api.clone());
 
     let legacy_public_api = Router::new()
@@ -719,6 +750,7 @@ fn build_public_transport_router(state: ServerState) -> Router {
             post(run_tombstone_archive_purge),
         )
         .merge(public_cluster_info_api)
+        .merge(web_service_client_api)
         .merge(public_client_api);
 
     Router::new()
@@ -782,6 +814,13 @@ fn build_internal_transport_router(state: ServerState) -> Router {
         .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
         .route(
+            "/objects/{object_id}",
+            get(get_object_by_id)
+                .put(put_object_by_id)
+                .delete(delete_object_by_id),
+        )
+        .route("/objects/{object_id}/rename", post(rename_object_by_id))
+        .route(
             "/store/{key}",
             put(put_object)
                 .get(get_object)
@@ -828,6 +867,8 @@ mod tests {
         assert!(!is_streamed_object_read_path(
             "/store/index/changes/wait?since=1"
         ));
+        assert!(!is_streamed_object_read_path("/store/history"));
+        assert!(!is_streamed_object_read_path("/store/history/restore"));
         assert!(is_streamed_object_read_path(
             "/store/map/clusters?version=test"
         ));

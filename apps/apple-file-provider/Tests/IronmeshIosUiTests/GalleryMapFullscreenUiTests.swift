@@ -50,15 +50,26 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         let cluster = element(in: webView, labelled: "Open map cluster with 2 items")
         XCTAssertTrue(cluster.waitForExistence(timeout: 45), "The Gallery map should expose its cluster")
         cluster.tap()
-        let firstImage = element(in: webView, labelled: "gallery/runtime-map-a.png")
-        guard firstImage.waitForExistence(timeout: 45) else {
-            XCTFail("The cluster chooser should expose an image after loading its server page")
-            return
+
+        // Nearby server clusters can now merge live while the map camera moves. Selecting a
+        // merged bubble opens a server-cluster chooser before the existing image chooser.
+        let serverCluster = firstServerCluster(in: webView)
+        if serverCluster.waitForExistence(timeout: 10) {
+            serverCluster.tap()
         }
-        firstImage.tap()
+
+        let shareOriginal = element(in: webView, labelled: "Share original")
+        if !shareOriginal.waitForExistence(timeout: 10) {
+            let firstImage = element(in: webView, labelled: "gallery/runtime-map-a.png")
+            guard firstImage.waitForExistence(timeout: 45) else {
+                XCTFail("The cluster chooser should expose an image after loading its server page")
+                return
+            }
+            firstImage.tap()
+        }
 
         XCTAssertTrue(
-            element(in: webView, labelled: "Share original").waitForExistence(timeout: 10),
+            shareOriginal.waitForExistence(timeout: 10),
             "The embedded iOS viewer should expose native sharing"
         )
         XCTAssertFalse(
@@ -93,6 +104,12 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         XCTAssertTrue(cluster.waitForExistence(timeout: 45), "The fullscreen map should expose the clustered image bubble")
         cluster.tap()
 
+        let serverCluster = firstServerCluster(in: webView)
+        if serverCluster.waitForExistence(timeout: 10) {
+            XCTAssertGreaterThan(serverCluster.frame.height, 0, "The live cluster chooser must be visible")
+            return
+        }
+
         let chooser = element(in: webView, labelled: "2 items in map cluster")
         XCTAssertTrue(chooser.waitForExistence(timeout: 45), "Selecting a map bubble should open its image chooser")
         XCTAssertGreaterThan(chooser.frame.height, 0, "The image chooser must have a visible height")
@@ -120,6 +137,14 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
     private func largestElement(in webView: XCUIElement, labelled label: String) -> XCUIElement {
         let matches = elements(in: webView, labelled: label).allElementsBoundByIndex
         return matches.max(by: { $0.frame.height < $1.frame.height }) ?? element(in: webView, labelled: label)
+    }
+
+    @MainActor
+    private func firstServerCluster(in webView: XCUIElement) -> XCUIElement {
+        webView
+            .descendants(matching: .any)
+            .matching(NSPredicate(format: "label BEGINSWITH %@", "Server cluster "))
+            .firstMatch
     }
 
     @MainActor

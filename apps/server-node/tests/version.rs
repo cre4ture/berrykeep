@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
-const EXPECTED_NAME: &str = "ironmesh-server-node";
+const EXPECTED_NAME: &str = "berrykeep-server-node";
 
 fn expected_version_outputs(binary_name: &str) -> [String; 2] {
     let build_revision = git_version::git_version!(
@@ -18,10 +18,10 @@ fn expected_version_outputs(binary_name: &str) -> [String; 2] {
 #[test]
 fn version_reports_package_version() {
     let output = Command::cargo_bin(EXPECTED_NAME)
-        .expect("ironmesh-server-node binary should build")
+        .expect("berrykeep-server-node binary should build")
         .arg("--version")
         .output()
-        .expect("ironmesh-server-node --version should run");
+        .expect("berrykeep-server-node --version should run");
 
     assert!(output.status.success());
 

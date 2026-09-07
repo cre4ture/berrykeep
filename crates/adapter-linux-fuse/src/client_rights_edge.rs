@@ -381,6 +381,7 @@ impl ClientRightsEdgeState {
                 NamespaceEntry {
                     path: entry.path.clone(),
                     kind: EntryKind::File,
+                    object_id: None,
                     version: local_version,
                     content_hash: Some(entry.content_hash.clone()),
                     content_fingerprint: None,

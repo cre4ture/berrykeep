@@ -22,6 +22,11 @@ non-persistent data store. Both restrict navigation to the active loopback
 origin so authorization material cannot be carried into external browsing
 state.
 
+Both native clients also pass their selected accent color into the embedded UI
+when it opens. The Web UI treats that value as host-managed for the active
+session, so its appearance follows the native app instead of retaining a
+separate WebView-local color preference.
+
 The shared media viewer exposes an original-file download action. Android
 accepts downloads only from the active loopback origin and forwards the
 WebView session cookie to the system download manager. iOS converts the same

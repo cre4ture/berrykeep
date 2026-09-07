@@ -223,6 +223,11 @@ class IronmeshRepository {
                 options.limit ?: -1,
                 options.sort?.wireValue,
                 options.mediaFilter?.wireValue,
+                options.capturedFromUnix != null,
+                options.capturedFromUnix?.coerceAtLeast(0L) ?: 0L,
+                options.capturedUntilUnix != null,
+                options.capturedUntilUnix?.coerceAtLeast(0L) ?: 0L,
+                options.excludeLabels.joinToString(",").takeIf { it.isNotBlank() },
                 serverCaPem,
                 normalizedClientIdentityJson(clientIdentityJson),
             )
@@ -237,6 +242,9 @@ class IronmeshRepository {
         offset: Int,
         limit: Int,
         sort: StoreIndexSortOrder,
+        capturedFromUnix: Long? = null,
+        capturedUntilUnix: Long? = null,
+        excludeLabels: List<String> = listOf("private", "nsfw"),
         snapshot: String? = null,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
@@ -252,10 +260,32 @@ class IronmeshRepository {
                 limit = limit.coerceAtLeast(1),
                 sort = sort,
                 mediaFilter = StoreIndexMediaFilter.IMAGE,
+                capturedFromUnix = capturedFromUnix,
+                capturedUntilUnix = capturedUntilUnix,
+                excludeLabels = excludeLabels,
             ),
             serverCaPem = serverCaPem,
             clientIdentityJson = clientIdentityJson,
         )
+    }
+
+    suspend fun setMediaLabels(
+        connectionInput: String,
+        key: String,
+        labels: List<String>,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ) {
+        val status = RustClientBridge.setMediaLabels(
+            normalizedConnectionInput(connectionInput),
+            key,
+            Moshi.Builder().build().adapter<List<String>>(
+                com.squareup.moshi.Types.newParameterizedType(List::class.java, String::class.java),
+            ).toJson(labels),
+            serverCaPem,
+            normalizedClientIdentityJson(clientIdentityJson),
+        )
+        check(status == 204) { "Failed to update media labels (status $status)" }
     }
 
     suspend fun storeIndexDirectoryListing(
@@ -434,6 +464,10 @@ class IronmeshRepository {
 
     fun stopWebUi() {
         RustClientBridge.stopWebUi()
+    }
+
+    fun clearCachedData() {
+        RustClientBridge.clearCachedData()
     }
 
     fun configureTitleLatencyMonitor(

@@ -43,7 +43,7 @@ pub(crate) fn decode_gallery_labels(raw: &str) -> Result<Vec<String>> {
 /// The motivating case is keeping media labelled `private` out of the default
 /// view, but the filter is deliberately symmetric so a caller can also ask for
 /// exactly those entries.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct GalleryLabelFilter {
     /// Labels an entry must carry to be listed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

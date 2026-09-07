@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-linux-fuse"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-windows-cfapi"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -153,7 +153,7 @@ checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
 name = "android-app"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "android-server-node-app"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "jni 0.21.1",
@@ -981,7 +981,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli-client"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "client-sdk"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-client-config"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "git-version",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-status"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "client-sdk",
@@ -2887,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "ios-app"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3122,7 +3122,7 @@ dependencies = [
 
 [[package]]
 name = "ironmesh-background-launcher"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "desktop-client-config",
@@ -3131,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "ironmesh-config-app"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3151,7 +3151,7 @@ dependencies = [
 
 [[package]]
 name = "ironmesh-folder-agent"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4229,7 +4229,7 @@ dependencies = [
 
 [[package]]
 name = "os-integration"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "adapter-linux-fuse",
  "adapter-windows-cfapi",
@@ -4982,7 +4982,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-server"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5017,7 +5017,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-service"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -5589,7 +5589,7 @@ dependencies = [
 
 [[package]]
 name = "server-node"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -5603,7 +5603,7 @@ dependencies = [
 
 [[package]]
 name = "server-node-sdk"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "aead",
  "aes-gcm-siv",
@@ -5657,6 +5657,7 @@ dependencies = [
  "transport-sdk",
  "turso",
  "uuid",
+ "web-ui-backend",
  "x509-parser 0.16.0",
  "zstd",
 ]
@@ -5940,12 +5941,14 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stats-collector-server"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "axum-server",
+ "fs2",
  "iptocc",
+ "percent-encoding",
  "rand 0.8.7",
  "serde",
  "serde_json",
@@ -6041,7 +6044,7 @@ dependencies = [
 
 [[package]]
 name = "sync-agent-core"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -6061,7 +6064,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "serde",
 ]
@@ -6382,7 +6385,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-display-status"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "embedded-graphics",
@@ -6752,7 +6755,7 @@ dependencies = [
 
 [[package]]
 name = "transport-sdk"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -7071,16 +7074,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
-name = "unicode-ident"
-version = "1.0.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
 name = "unicode-general-category"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
+
+[[package]]
+name = "unicode-ident"
+version = "1.0.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "unicode-segmentation"
@@ -7317,7 +7320,7 @@ dependencies = [
 
 [[package]]
 name = "web-ui-backend"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -7335,10 +7338,8 @@ dependencies = [
  "hyper-util",
  "mime_guess",
  "reqwest 0.12.28",
- "rusqlite",
  "serde",
  "serde_json",
- "sqlite-vfs",
  "tokio",
  "tokio-util",
  "tower-service",
@@ -7743,7 +7744,7 @@ dependencies = [
 
 [[package]]
 name = "windows-thumbnail-provider"
-version = "1.0.46"
+version = "1.1.0"
 dependencies = [
  "adapter-windows-cfapi",
  "anyhow",

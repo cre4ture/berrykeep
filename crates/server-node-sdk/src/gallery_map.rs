@@ -23,8 +23,14 @@ pub(super) struct GalleryMapQueryTokenPayload {
     pub(super) prefix: String,
     pub(super) depth: usize,
     pub(super) media_filter: StoreIndexMediaFilter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) captured_from_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) captured_until_unix: Option<u64>,
     pub(super) viewport: GalleryMapViewport,
     pub(super) resolution: u32,
+    #[serde(default, skip_serializing_if = "storage::GalleryLabelFilter::is_empty")]
+    pub(super) label_filter: storage::GalleryLabelFilter,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -55,6 +61,10 @@ pub(super) fn decode_gallery_map_query_token(token: &str) -> Option<GalleryMapQu
         || payload.prefix != payload.prefix.trim().trim_matches('/')
         || payload.resolution == 0
         || payload.resolution > MAX_GALLERY_MAP_RESOLUTION
+        || !super::gallery_label_filter_is_within_limit(&payload.label_filter)
+        || !super::gallery_map_label_filter_is_supported(&payload.label_filter)
+        || super::validate_capture_range(payload.captured_from_unix, payload.captured_until_unix)
+            .is_err()
         || !gallery_map_viewport_is_valid(payload.viewport)
     {
         return None;
@@ -72,6 +82,69 @@ pub(super) fn gallery_map_viewport_is_valid(viewport: GalleryMapViewport) -> boo
         && viewport.south <= viewport.north
         && (-180.0..=180.0).contains(&viewport.west)
         && (-180.0..=180.0).contains(&viewport.east)
+}
+
+/// Returns whether `inner` is fully covered by `outer`, including wrapped longitude intervals.
+pub(super) fn gallery_map_viewport_contains(
+    outer: GalleryMapViewport,
+    inner: GalleryMapViewport,
+) -> bool {
+    outer.south <= inner.south
+        && inner.north <= outer.north
+        && gallery_map_longitude_interval_contains(outer, inner)
+}
+
+/// Validates the bounded 2× prefetch envelope used by Gallery map clients. Keeping this
+/// relationship server-enforced prevents a tiny resolution viewport from weakening the query
+/// resolution bound for an arbitrarily large data viewport.
+pub(super) fn gallery_map_viewport_is_prefetch_envelope(
+    viewport: GalleryMapViewport,
+    resolution_viewport: GalleryMapViewport,
+) -> bool {
+    const PREFETCH_ENVELOPE_FACTOR: f64 = 2.0;
+    const FLOATING_POINT_MARGIN: f64 = 1e-9;
+
+    gallery_map_viewport_contains(viewport, resolution_viewport)
+        && viewport.north - viewport.south
+            <= (resolution_viewport.north - resolution_viewport.south) * PREFETCH_ENVELOPE_FACTOR
+                + FLOATING_POINT_MARGIN
+        && gallery_map_longitude_span(viewport)
+            <= gallery_map_longitude_span(resolution_viewport) * PREFETCH_ENVELOPE_FACTOR
+                + FLOATING_POINT_MARGIN
+}
+
+fn gallery_map_longitude_interval_contains(
+    outer: GalleryMapViewport,
+    inner: GalleryMapViewport,
+) -> bool {
+    let outer_span = gallery_map_longitude_span(outer);
+    let inner_span = gallery_map_longitude_span(inner);
+    if outer_span >= 360.0 {
+        return true;
+    }
+    if inner_span > outer_span {
+        return false;
+    }
+
+    let outer_start = gallery_map_normalized_longitude(outer.west);
+    let mut inner_start = gallery_map_normalized_longitude(inner.west);
+    if inner_start < outer_start {
+        inner_start += 360.0;
+    }
+    inner_start + inner_span <= outer_start + outer_span
+}
+
+fn gallery_map_longitude_span(viewport: GalleryMapViewport) -> f64 {
+    let raw_span = viewport.east - viewport.west;
+    if raw_span.abs() >= 360.0 {
+        360.0
+    } else {
+        raw_span.rem_euclid(360.0)
+    }
+}
+
+fn gallery_map_normalized_longitude(longitude: f64) -> f64 {
+    (longitude + 180.0).rem_euclid(360.0)
 }
 
 pub(super) fn gallery_map_cluster_cell_width_px(
@@ -165,6 +238,8 @@ mod tests {
             prefix: "gallery".to_string(),
             depth: 64,
             media_filter: StoreIndexMediaFilter::Image,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport: GalleryMapViewport {
                 south: -85.0,
                 west: 170.0,
@@ -172,6 +247,7 @@ mod tests {
                 east: -170.0,
             },
             resolution: 1024,
+            label_filter: storage::GalleryLabelFilter::default(),
         }
     }
 
@@ -194,10 +270,81 @@ mod tests {
     }
 
     #[test]
+    fn map_query_token_rejects_label_filters_over_the_index_limit() {
+        let mut payload = token_payload();
+        payload.label_filter.required = (0..=super::super::MAX_GALLERY_LABEL_FILTER_LABELS)
+            .map(|index| format!("label-{index}"))
+            .collect();
+
+        assert!(
+            decode_gallery_map_query_token(&encode_gallery_map_query_token(&payload)).is_none()
+        );
+    }
+
+    #[test]
+    fn map_query_token_rejects_non_privacy_label_filters() {
+        let mut payload = token_payload();
+        payload.label_filter.excluded = vec!["archived".to_string()];
+
+        assert!(
+            decode_gallery_map_query_token(&encode_gallery_map_query_token(&payload)).is_none()
+        );
+    }
+
+    #[test]
     fn map_cluster_id_is_bounded_by_resolution() {
         assert_eq!(decode_gallery_map_cluster_id("7_3", 8), Some((7, 3)));
         assert_eq!(decode_gallery_map_cluster_id("8_3", 8), None);
         assert_eq!(decode_gallery_map_cluster_id("7_8", 8), None);
+    }
+
+    #[test]
+    fn map_viewport_containment_preserves_antimeridian_intervals() {
+        let world = GalleryMapViewport {
+            south: -90.0,
+            west: -180.0,
+            north: 90.0,
+            east: 180.0,
+        };
+        let prefetched_antimeridian_viewport = GalleryMapViewport {
+            south: -10.0,
+            west: 160.0,
+            north: 10.0,
+            east: -160.0,
+        };
+        let visible_antimeridian_viewport = GalleryMapViewport {
+            south: -5.0,
+            west: 170.0,
+            north: 5.0,
+            east: -170.0,
+        };
+        let outside_viewport = GalleryMapViewport {
+            south: -5.0,
+            west: 150.0,
+            north: 5.0,
+            east: 170.0,
+        };
+
+        assert!(gallery_map_viewport_contains(
+            world,
+            prefetched_antimeridian_viewport
+        ));
+        assert!(gallery_map_viewport_contains(
+            prefetched_antimeridian_viewport,
+            visible_antimeridian_viewport
+        ));
+        assert!(!gallery_map_viewport_contains(
+            prefetched_antimeridian_viewport,
+            outside_viewport
+        ));
+        assert!(gallery_map_viewport_is_prefetch_envelope(
+            prefetched_antimeridian_viewport,
+            visible_antimeridian_viewport
+        ));
+        assert!(!gallery_map_viewport_is_prefetch_envelope(
+            world,
+            visible_antimeridian_viewport
+        ));
     }
 
     #[test]

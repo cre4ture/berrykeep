@@ -137,7 +137,7 @@ wait_for_screen_session_exit() {
 start_node() {
   local node_name="$1"
   local session_name bind_addr url data_dir log_file start_command
-  local server_node_binary="$REPO_ROOT/target/release/ironmesh-server-node"
+  local server_node_binary="$REPO_ROOT/target/release/berrykeep-server-node"
 
   require_screen
   mkdir -p "$ROOT"

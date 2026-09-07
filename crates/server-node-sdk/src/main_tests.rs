@@ -54,6 +54,52 @@ fn reconciliation_object_paths_encode_store_keys_before_transport() {
 }
 
 #[test]
+fn store_history_cache_retains_entries() {
+    let mut cache = super::StoreHistoryCache::default();
+    cache.insert(
+        "docs",
+        1,
+        Arc::new(super::StoreHistoryCacheValue::Entries(
+            super::storage::RecoverableHistoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            },
+        )),
+    );
+
+    assert!(cache.get("docs", 1).is_some());
+    assert!(cache.get("docs", 2).is_none());
+    assert!(cache.get("", 1).is_none());
+}
+
+#[test]
+fn store_history_refresh_locks_preserve_an_active_prefix_during_eviction() {
+    let mut locks = super::StoreHistoryRefreshLocks::default();
+    let active = locks.lock_for_scope("active", 1);
+    for prefix in ["idle-one", "idle-two", "idle-three"] {
+        drop(locks.lock_for_scope(prefix, 1));
+    }
+
+    let replacement = locks.lock_for_scope("replacement", 1);
+
+    assert!(Arc::ptr_eq(
+        &active,
+        locks
+            .by_scope
+            .get(&("active".to_string(), 1))
+            .expect("the active prefix lock should not be evicted")
+    ));
+    assert!(Arc::ptr_eq(
+        &replacement,
+        locks
+            .by_scope
+            .get(&("replacement".to_string(), 1))
+            .expect("the replacement prefix lock should be retained")
+    ));
+    assert_eq!(locks.by_scope.len(), 2);
+}
+
+#[test]
 fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
     let tickets = HashMap::from([
         (
@@ -105,8 +151,8 @@ fn rendezvous_iroh_relay_tickets_are_merged_deterministically() {
 }
 
 use super::storage::{
-    DataScrubRunTestHook, PersistentStore, PutOptions, S3ObjectVersionRecord, StoragePathConfig,
-    StoragePathState, StoragePoolConfig, VersionConsistencyState,
+    DataScrubRunTestHook, ObjectReadMode, PersistentStore, PutOptions, S3ObjectVersionRecord,
+    StoragePathConfig, StoragePathState, StoragePoolConfig, VersionConsistencyState,
 };
 use axum::Router;
 use axum::body::Body;
@@ -123,7 +169,7 @@ use futures_util::{Sink, Stream};
 use hmac::{Hmac, Mac};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -454,6 +500,422 @@ fn sample_png_bytes() -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn sample_jpeg_with_incomplete_exif_gps() -> Vec<u8> {
+    let image = image::RgbImage::new(4, 3);
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .encode_image(&image)
+        .expect("test JPEG should encode");
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+
+    // A valid GPS IFD with a latitude but no longitude. The image is readable,
+    // but its coordinate is intentionally incomplete and must not be shadowed
+    // by a proposed sidecar location.
+    let gps_ifd_offset = 26u32;
+    let latitude_offset = 56u32;
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"MM");
+    tiff.extend_from_slice(&42u16.to_be_bytes());
+    tiff.extend_from_slice(&8u32.to_be_bytes());
+    tiff.extend_from_slice(&1u16.to_be_bytes());
+    tiff.extend_from_slice(&0x8825u16.to_be_bytes());
+    tiff.extend_from_slice(&4u16.to_be_bytes());
+    tiff.extend_from_slice(&1u32.to_be_bytes());
+    tiff.extend_from_slice(&gps_ifd_offset.to_be_bytes());
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    tiff.extend_from_slice(&2u16.to_be_bytes());
+    tiff.extend_from_slice(&1u16.to_be_bytes());
+    tiff.extend_from_slice(&2u16.to_be_bytes());
+    tiff.extend_from_slice(&2u32.to_be_bytes());
+    tiff.extend_from_slice(&[b'N', 0, 0, 0]);
+    tiff.extend_from_slice(&2u16.to_be_bytes());
+    tiff.extend_from_slice(&5u16.to_be_bytes());
+    tiff.extend_from_slice(&3u32.to_be_bytes());
+    tiff.extend_from_slice(&latitude_offset.to_be_bytes());
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    for (numerator, denominator) in [(47u32, 1u32), (22, 1), (37, 1)] {
+        tiff.extend_from_slice(&numerator.to_be_bytes());
+        tiff.extend_from_slice(&denominator.to_be_bytes());
+    }
+    assert_eq!(tiff.len(), 80);
+
+    let mut payload = b"Exif\0\0".to_vec();
+    payload.extend_from_slice(&tiff);
+    let mut app1 = vec![0xff, 0xe1];
+    app1.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    app1.extend_from_slice(&payload);
+
+    let mut encoded = Vec::with_capacity(jpeg.len() + app1.len());
+    encoded.extend_from_slice(&jpeg[..2]);
+    encoded.extend_from_slice(&app1);
+    encoded.extend_from_slice(&jpeg[2..]);
+    encoded
+}
+
+async fn run_selected_geo_apply_for_test(
+    state: &ServerState,
+    run_id: &str,
+    analysis_run_id: &str,
+    proposal_id: &str,
+) -> String {
+    let now = super::unix_ts();
+    super::operations::run_geo_apply_for_test(
+        state.clone(),
+        super::operations::OperationRun {
+            run_id: run_id.to_string(),
+            operation_id: super::operations::GEOLOCATION_APPLY_OPERATION_ID.to_string(),
+            status: super::operations::OperationRunStatus::Queued,
+            priority: super::operations::OperationPriority::Background,
+            created_at_unix: now,
+            started_at_unix: None,
+            finished_at_unix: None,
+            progress: super::operations::OperationProgress::default(),
+            input: serde_json::json!({}),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        },
+        analysis_run_id,
+        proposal_id,
+    )
+    .await;
+
+    let store = read_store(state, "test.geo_apply.outcome").await;
+    let chunks = store
+        .list_operation_result_chunks(run_id, None, 0)
+        .await
+        .expect("apply result chunks should load");
+    let run = store
+        .load_operation_run(run_id)
+        .await
+        .expect("apply run should load");
+    assert_eq!(chunks.len(), 1, "apply run={run:#?}");
+    chunks[0].payload["status"]
+        .as_str()
+        .expect("apply result status should be serialized")
+        .to_string()
+}
+
+async fn persist_test_geo_proposal(
+    state: &ServerState,
+    analysis_run_id: &str,
+    proposal: super::operations::GeoProposal,
+) {
+    let now = super::unix_ts();
+    let chunk_id = format!("{analysis_run_id}-proposal-chunk");
+    let store = read_store(state, "test.geo_apply.persist_analysis").await;
+    store
+        .persist_operation_run(&super::operations::OperationRun {
+            run_id: analysis_run_id.to_string(),
+            operation_id: super::operations::GEOLOCATION_PROPOSE_OPERATION_ID.to_string(),
+            status: super::operations::OperationRunStatus::Completed,
+            priority: super::operations::OperationPriority::Background,
+            created_at_unix: now,
+            started_at_unix: Some(now),
+            finished_at_unix: Some(now),
+            progress: super::operations::OperationProgress::default(),
+            input: serde_json::json!({}),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        })
+        .await
+        .expect("analysis run should persist");
+    store
+        .persist_operation_result_chunk(&super::operations::OperationResultChunk {
+            run_id: analysis_run_id.to_string(),
+            chunk_id: chunk_id.clone(),
+            result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+            created_at_unix: now,
+            payload: serde_json::to_value(super::operations::GeoProposalChunk {
+                id: chunk_id,
+                analysis_run_id: analysis_run_id.to_string(),
+                folder: "album".to_string(),
+                time_range_start: proposal.capture_time,
+                time_range_end: proposal.capture_time,
+                item_count: 1,
+                proposal_count: 1,
+                proposal_page: 0,
+                proposal_page_count: 1,
+                status: super::operations::GeoProposalChunkStatus::Ready,
+                proposals: vec![proposal],
+            })
+            .expect("proposal chunk should serialize"),
+        })
+        .await
+        .expect("proposal chunk should persist");
+}
+
+async fn geolocation_apply_revalidates_stale_and_already_geotagged_media_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let media_path = "album/IMG_20240102_030405.png";
+    let (manifest_hash, object_id, metadata) = {
+        let mut store = lock_store(&state, "test.geo_apply.seed_media").await;
+        let put = store
+            .put_object_versioned(
+                media_path,
+                Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("test media should persist");
+        let metadata = store
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .expect("test media metadata should load")
+            .expect("PNG should be recognized as media");
+        let object_id = store
+            .store_index_inspector()
+            .await
+            .expect("store index should load")
+            .current_object_ids()
+            .get(media_path)
+            .cloned()
+            .expect("test media should have an object id");
+        (put.manifest_hash, object_id, metadata)
+    };
+    let capture_time =
+        super::operations::capture_time_for_geolocation_for_test(media_path, &metadata)
+            .expect("the filename should supply a floating capture time");
+    let analysis_run_id = "analysis-run";
+    let proposal_id = "proposal-1";
+    let proposal = super::operations::GeoProposal {
+        id: proposal_id.to_string(),
+        media_path: media_path.to_string(),
+        object_id,
+        manifest_hash,
+        content_fingerprint: metadata.content_fingerprint.clone(),
+        capture_time,
+        proposed: super::operations::GeoCoordinate {
+            latitude: 47.3769,
+            longitude: 8.5417,
+        },
+        method: super::operations::GeoInferenceMethod::NearestAnchor,
+        previous_anchor: None,
+        next_anchor: None,
+        estimated_anchor_speed_kmh: None,
+        warnings: Vec::new(),
+    };
+    persist_test_geo_proposal(&state, analysis_run_id, proposal).await;
+
+    assert_eq!(
+        run_selected_geo_apply_for_test(&state, "apply-first", analysis_run_id, proposal_id).await,
+        "applied"
+    );
+    let store = read_store(&state, "test.geo_apply.data_change_actor").await;
+    let sidecar = store
+        .get_object(
+            &format!("{media_path}.xmp"),
+            None,
+            None,
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .expect("the applied sidecar should be readable");
+    let sidecar = std::str::from_utf8(&sidecar).expect("XMP sidecar should be UTF-8");
+    for field in [
+        "exif:DateTimeOriginal=\"2024-01-02T03:04:05\"",
+        "xmp:CreateDate=\"2024-01-02T03:04:05\"",
+        "photoshop:DateCreated=\"2024-01-02T03:04:05\"",
+        "berrykeep:GeoInferenceCaptureTimeSource=\"filename\"",
+    ] {
+        assert!(
+            sidecar.contains(field),
+            "applied sidecar is missing {field:?}"
+        );
+    }
+    let event = store
+        .list_data_change_events(&super::storage::DataChangeEventQuery::default())
+        .await
+        .expect("data-change events should load")
+        .into_iter()
+        .find(|event| event.path == format!("{media_path}.xmp"))
+        .expect("the applied sidecar must have a data-change event");
+    assert_eq!(event.actor_kind, super::storage::DataChangeActorKind::Admin);
+    assert_eq!(event.actor_id.as_deref(), Some("test-admin"));
+    assert_eq!(event.actor_source_node.as_deref(), Some("test-node"));
+    drop(store);
+    assert_eq!(
+        run_selected_geo_apply_for_test(&state, "apply-already-gps", analysis_run_id, proposal_id)
+            .await,
+        "already-has-gps"
+    );
+
+    let mut changed_pixels = image::RgbaImage::new(5, 3);
+    changed_pixels.put_pixel(0, 0, image::Rgba([12, 34, 56, 255]));
+    let mut changed_bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(changed_pixels)
+        .write_to(
+            &mut std::io::Cursor::new(&mut changed_bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("changed test PNG should encode");
+    {
+        let mut store = lock_store(&state, "test.geo_apply.change_media").await;
+        store
+            .put_object_versioned(
+                media_path,
+                Bytes::from(changed_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("changed media should persist");
+    }
+    assert_eq!(
+        run_selected_geo_apply_for_test(&state, "apply-stale", analysis_run_id, proposal_id).await,
+        "skipped-stale"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    geolocation_apply_revalidates_stale_and_already_geotagged_media_impl,
+    geolocation_apply_revalidates_stale_and_already_geotagged_media,
+    geolocation_apply_revalidates_stale_and_already_geotagged_media_turso
+);
+
+async fn geolocation_apply_does_not_shadow_unparseable_embedded_gps_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let media_path = "album/IMG_20240102_030405.jpg";
+    let (manifest_hash, object_id, metadata) = {
+        let mut store = lock_store(&state, "test.geo_apply.seed_unparseable_gps").await;
+        let put = store
+            .put_object_versioned(
+                media_path,
+                Bytes::from(sample_jpeg_with_incomplete_exif_gps()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("test media should persist");
+        let metadata = store
+            .ensure_media_metadata(&put.manifest_hash)
+            .await
+            .expect("test media metadata should load")
+            .expect("JPEG should be recognized as media");
+        let object_id = store
+            .store_index_inspector()
+            .await
+            .expect("store index should load")
+            .current_object_ids()
+            .get(media_path)
+            .cloned()
+            .expect("test media should have an object id");
+        (put.manifest_hash, object_id, metadata)
+    };
+    assert!(metadata.gps.is_none());
+    assert!(metadata.has_embedded_gps_properties);
+    let capture_time =
+        super::operations::capture_time_for_geolocation_for_test(media_path, &metadata)
+            .expect("the filename should supply a floating capture time");
+    let analysis_run_id = "analysis-run-unparseable-gps";
+    let proposal_id = "proposal-unparseable-gps";
+    persist_test_geo_proposal(
+        &state,
+        analysis_run_id,
+        super::operations::GeoProposal {
+            id: proposal_id.to_string(),
+            media_path: media_path.to_string(),
+            object_id,
+            manifest_hash,
+            content_fingerprint: metadata.content_fingerprint.clone(),
+            capture_time,
+            proposed: super::operations::GeoCoordinate {
+                latitude: 47.3769,
+                longitude: 8.5417,
+            },
+            method: super::operations::GeoInferenceMethod::NearestAnchor,
+            previous_anchor: None,
+            next_anchor: None,
+            estimated_anchor_speed_kmh: None,
+            warnings: Vec::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        run_selected_geo_apply_for_test(
+            &state,
+            "apply-unparseable-gps",
+            analysis_run_id,
+            proposal_id,
+        )
+        .await,
+        "already-has-gps"
+    );
+    let store = read_store(&state, "test.geo_apply.verify_unparseable_gps_sidecar").await;
+    assert!(
+        !store
+            .media_sidecar_metadata_overlay(media_path)
+            .await
+            .expect("sidecar state should load")
+            .has_geo_location_properties,
+        "apply must not create a competing XMP sidecar location"
+    );
+    drop(store);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    geolocation_apply_does_not_shadow_unparseable_embedded_gps_impl,
+    geolocation_apply_does_not_shadow_unparseable_embedded_gps,
+    geolocation_apply_does_not_shadow_unparseable_embedded_gps_turso
+);
+
+#[tokio::test]
+async fn multimedia_operation_admission_reserves_one_slot_per_kind() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+
+    assert!(
+        super::operations::try_reserve_multimedia_slot(&state, "scan-first", true).await,
+        "the first scan is admitted"
+    );
+    assert!(
+        !super::operations::try_reserve_multimedia_slot(&state, "scan-second", true).await,
+        "a second scan is rejected instead of accumulating a durable queue"
+    );
+    assert!(
+        super::operations::try_reserve_multimedia_slot(&state, "apply-first", false).await,
+        "apply work uses its own serialized slot"
+    );
+
+    super::operations::release_multimedia_slot(&state, "scan-first", true).await;
+    assert!(
+        super::operations::try_reserve_multimedia_slot(&state, "scan-second", true).await,
+        "releasing the owning run admits the next scan"
+    );
+    // A stale completion must not release a newer owner's slot.
+    super::operations::release_multimedia_slot(&state, "scan-first", true).await;
+    assert!(!super::operations::try_reserve_multimedia_slot(&state, "scan-third", true).await);
+
+    super::operations::release_multimedia_slot(&state, "scan-second", true).await;
+    super::operations::release_multimedia_slot(&state, "apply-first", false).await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn geolocation_apply_requires_explicit_approval() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::operations::start_operation_run(
+        State(state.clone()),
+        headers,
+        Path(super::operations::GEOLOCATION_APPLY_OPERATION_ID.to_string()),
+        Json(serde_json::from_value(serde_json::json!({})).unwrap()),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    cleanup_test_state(&state).await;
+}
+
 fn sample_large_chunked_payload() -> Vec<u8> {
     let size = 2 * 1024 * 1024 + 1536;
     (0..size).map(|index| (index % 251) as u8).collect()
@@ -530,7 +992,7 @@ case "$input" in
   http+unix://*|http://127.0.0.1:*) ;;
   *) printf 'unexpected input: %s\n' "$input" >&2; exit 1 ;;
 esac
-printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264","codec_tag_string":"avc1","avg_frame_rate":"30000/1001","bit_rate":"4000000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.125","bit_rate":"4500000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}}'
+printf '%s\n' '{"streams":[{"width":1920,"height":1080,"codec_name":"h264","codec_tag_string":"avc1","avg_frame_rate":"30000/1001","bit_rate":"4000000","tags":{"creation_time":"2024-03-04T05:06:07Z"}}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"42.125","bit_rate":"4500000","tags":{"creation_time":"2024-03-04T05:06:07Z","com.apple.quicktime.creationdate":"2024-03-04T06:06:07+0100"}}}'
 "#;
     std::fs::write(&ffprobe_path, ffprobe_script).unwrap();
 
@@ -2011,34 +2473,59 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
             });
             locked.persist_media_cache_record(&metadata).await.unwrap();
         }
+        locked
+            .set_media_labels("gallery/second.png", vec!["private".to_string()])
+            .await
+            .unwrap();
         first.manifest_hash
     };
 
+    let cluster_query = super::GalleryMapClustersQuery {
+        prefix: Some("gallery".to_string()),
+        depth: Some(64),
+        media_filter: Some(super::StoreIndexMediaFilter::Image),
+        captured_from_unix: None,
+        captured_until_unix: None,
+        south: Some(46.5),
+        west: Some(7.5),
+        north: Some(48.5),
+        east: Some(9.5),
+        resolution_south: Some(47.0),
+        resolution_west: Some(8.0),
+        resolution_north: Some(48.0),
+        resolution_east: Some(9.0),
+        zoom: Some(3),
+        zoom_precise: Some(3.75),
+        cluster_cell_size_px: Some(16.0),
+        require_labels: None,
+        exclude_labels: Some("private".to_string()),
+    };
     let clusters = super::gallery_map_clusters_response(
         &state,
-        super::GalleryMapClustersQuery {
-            prefix: Some("gallery".to_string()),
-            depth: Some(64),
-            media_filter: Some(super::StoreIndexMediaFilter::Image),
-            south: Some(-90.0),
-            west: Some(-180.0),
-            north: Some(90.0),
-            east: Some(180.0),
-            zoom: Some(3),
-            zoom_precise: Some(3.75),
-            cluster_cell_size_px: Some(16.0),
-        },
+        cluster_query.clone(),
         super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
     )
     .await;
     assert_eq!(clusters.status(), StatusCode::OK);
     let clusters_payload: serde_json::Value =
         serde_json::from_slice(&to_bytes(clusters.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(clusters_payload["total_entry_count"], 2);
-    assert_eq!(clusters_payload["visible_geotagged_count"], 2);
+    assert_eq!(clusters_payload["total_entry_count"], 1);
+    assert_eq!(clusters_payload["visible_geotagged_count"], 1);
     assert_eq!(clusters_payload["zoom"].as_u64(), Some(3));
+    assert_eq!(clusters_payload["resolution"].as_u64(), Some(512));
     assert_eq!(clusters_payload["clusters"].as_array().unwrap().len(), 1);
-    assert_eq!(clusters_payload["clusters"][0]["count"], 2);
+    assert_eq!(clusters_payload["clusters"][0]["count"], 1);
+
+    let mut unsupported_label_query = cluster_query;
+    unsupported_label_query.exclude_labels = Some("archived".to_string());
+    let unsupported_labels = super::gallery_map_clusters_response(
+        &state,
+        unsupported_label_query,
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(unsupported_labels.status(), StatusCode::BAD_REQUEST);
+
     let query_token = clusters_payload["query_token"].as_str().unwrap();
     let cluster_id = clusters_payload["clusters"][0]["cluster_id"]
         .as_str()
@@ -2060,11 +2547,11 @@ async fn gallery_map_cluster_leaf_pages_reject_stale_query_tokens_impl(backend: 
         serde_json::from_slice(&to_bytes(first_page.into_body(), usize::MAX).await.unwrap())
             .unwrap();
     assert_eq!(first_page_payload["entry_count"], 1);
-    assert_eq!(first_page_payload["total_entry_count"], 2);
-    assert_eq!(first_page_payload["has_more"], true);
+    assert_eq!(first_page_payload["total_entry_count"], 1);
+    assert_eq!(first_page_payload["has_more"], false);
     assert_eq!(
         first_page_payload["entries"][0]["path"],
-        "gallery/second.png"
+        "gallery/first.png"
     );
 
     {
@@ -2127,6 +2614,12 @@ fn gallery_sync_token_is_opaque_versioned_and_rejects_malformed_values() {
 }
 
 #[test]
+fn capture_time_range_accepts_empty_intervals_and_rejects_reversed_bounds() {
+    assert_eq!(super::validate_capture_range(Some(0), Some(0)), Ok(()));
+    assert!(super::validate_capture_range(Some(1), Some(0)).is_err());
+}
+
+#[test]
 fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
     let query = |south, west, north, east| super::StoreIndexQuery {
         prefix: Some("gallery".to_string()),
@@ -2139,6 +2632,8 @@ fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
         limit: Some(100),
         sort: Some(super::StoreIndexSortOrder::CapturedDesc),
         media_filter: Some(super::StoreIndexMediaFilter::Image),
+        captured_from_unix: None,
+        captured_until_unix: None,
         south,
         west,
         north,
@@ -2168,6 +2663,21 @@ fn gallery_viewport_bounds_validate_complete_finite_ranges_and_antimeridian() {
     assert!(antimeridian.west > antimeridian.east);
 }
 
+#[test]
+fn store_index_label_filters_preserve_escaped_commas_and_backslashes() {
+    let filter = super::label_filter_from_query_values(
+        Some(r"family\, close,travel\\journal"),
+        Some(r"private\, archive"),
+    )
+    .expect("escaped label filters should parse");
+    assert_eq!(
+        filter.required,
+        vec!["family, close".to_string(), "travel\\journal".to_string()]
+    );
+    assert_eq!(filter.excluded, vec!["private, archive".to_string()]);
+    assert!(super::label_filter_from_query_values(Some("invalid\\escape"), None).is_err());
+}
+
 #[tokio::test]
 async fn gallery_label_filter_limit_returns_bad_request() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
@@ -2189,6 +2699,8 @@ async fn gallery_label_filter_limit_returns_bad_request() {
                 limit: Some(100),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -2252,6 +2764,8 @@ async fn turso_gallery_projection_supports_viewport_and_delta() {
                 limit: Some(100),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: Some(45.0),
                 west: Some(5.0),
                 north: Some(49.0),
@@ -11633,6 +12147,169 @@ async fn web_service_listing_requires_identity_even_when_legacy_client_auth_is_o
     cleanup_test_state(&state).await;
 }
 
+async fn register_test_client_identity(
+    state: &ServerState,
+    label: &str,
+) -> transport_sdk::ClientIdentityMaterial {
+    let mut identity =
+        transport_sdk::ClientIdentityMaterial::generate(state.cluster_id, None, None).unwrap();
+    let credential_pem = super::generate_client_credential_pem(
+        state.cluster_id,
+        &identity.device_id.to_string(),
+        &identity.public_key_pem,
+        super::unix_ts(),
+        None,
+    );
+    identity.credential_pem = Some(credential_pem.clone());
+    state
+        .access
+        .client_credentials
+        .lock()
+        .await
+        .credentials
+        .push(super::ClientCredentialRecord {
+            device_id: identity.device_id.to_string(),
+            label: Some(label.to_string()),
+            public_key_pem: Some(identity.public_key_pem.clone()),
+            public_key_fingerprint: None,
+            issued_credential_pem: Some(credential_pem),
+            credential_fingerprint: None,
+            created_at_unix: super::unix_ts(),
+            revocation_reason: None,
+            revoked_by_source_node: None,
+            revoked_by_actor: None,
+            revoked_at_unix: None,
+        });
+    identity
+}
+
+#[tokio::test]
+async fn persisted_web_service_is_visible_through_signed_client_and_web_ui_node_api() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let identity =
+        register_test_client_identity(&state, "Web service discovery integration test client")
+            .await;
+    let denied_identity = register_test_client_identity(
+        &state,
+        "Web service discovery integration test denied client",
+    )
+    .await;
+
+    state
+        .web_services
+        .upsert(super::web_service_proxy::WebServiceConfig {
+            id: "jonsbo-nas".to_string(),
+            name: "Jonsbo NAS".to_string(),
+            description: Some("Private home NAS".to_string()),
+            upstream_url: "https://nas.example.invalid".to_string(),
+            allowed_device_ids: vec![identity.device_id.to_string()],
+            enabled: true,
+            tls_ca_pem: None,
+            tls_certificate_sha256: None,
+            tls_server_name: None,
+        })
+        .await
+        .unwrap();
+    state.web_services = super::web_service_proxy::WebServiceRegistry::load(&state.data_dir)
+        .await
+        .expect("persisted web service configuration should reload");
+
+    let server_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_address = server_listener.local_addr().unwrap();
+    let server_app = super::build_server_apps(&state).public_app;
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(server_listener, server_app).await;
+    });
+
+    let bootstrap = client_sdk::ConnectionBootstrap {
+        version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+        cluster_id: state.cluster_id,
+        rendezvous_urls: Vec::new(),
+        rendezvous_contact_list: None,
+        rendezvous_mtls_required: false,
+        direct_endpoints: vec![transport_sdk::BootstrapEndpoint {
+            url: format!("http://{server_address}"),
+            usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+            node_id: Some(state.node_id),
+            node_hostname: None,
+        }],
+        relay_mode: transport_sdk::RelayMode::Disabled,
+        trust_roots: transport_sdk::BootstrapTrustRoots {
+            cluster_ca_pem: None,
+            public_api_ca_pem: None,
+            rendezvous_ca_pem: None,
+        },
+        pairing_token: None,
+        device_label: None,
+        device_id: Some(identity.device_id.to_string()),
+        node_priority_overrides: BTreeMap::new(),
+    };
+
+    // Use a newly built client for the Web UI's first request. Reusing the
+    // direct listing client here would mask failures that only occur while
+    // establishing its initial signed multiplex transport session.
+    let cold_web_ui_client = bootstrap
+        .build_client_with_identity(&identity)
+        .expect("signed client should build from the persisted bootstrap");
+    let web_ui =
+        web_ui_backend::router(web_ui_backend::WebUiConfig::from_client(cold_web_ui_client));
+
+    let response = web_ui
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/web-services/nodes/{}", state.node_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    let direct_client = bootstrap
+        .build_client_with_identity(&identity)
+        .expect("signed client should build from the persisted bootstrap");
+    assert_eq!(direct_client.target_node_ids(), vec![state.node_id]);
+    let direct_services = direct_client
+        .list_web_services_on_node(state.node_id)
+        .await
+        .expect("signed client should receive the persisted web service from its node");
+
+    let denied_bootstrap = client_sdk::ConnectionBootstrap {
+        device_id: Some(denied_identity.device_id.to_string()),
+        ..bootstrap.clone()
+    };
+    let denied_client = denied_bootstrap
+        .build_client_with_identity(&denied_identity)
+        .expect("other signed client should build from the persisted bootstrap");
+    let denied_response = denied_client
+        .get_relative_path("/web-services")
+        .await
+        .expect("other signed client should receive the filtered service list");
+
+    server_task.abort();
+    let _ = server_task.await;
+    cleanup_test_state(&state).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["nodeId"], state.node_id.to_string());
+    assert_eq!(body["available"], true);
+    assert_eq!(body["services"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["services"][0]["id"], "jonsbo-nas");
+    assert_eq!(body["services"][0]["name"], "Jonsbo NAS");
+    assert_eq!(body["services"][0]["description"], "Private home NAS");
+    assert_eq!(body["services"][0]["nodeId"], state.node_id.to_string());
+
+    assert_eq!(direct_services.len(), 1);
+    assert_eq!(direct_services[0].id, "jonsbo-nas");
+    assert_eq!(denied_response.status, StatusCode::OK);
+    let denied_services: Vec<serde_json::Value> =
+        serde_json::from_slice(&denied_response.body).unwrap();
+    assert!(denied_services.is_empty());
+}
+
 #[tokio::test]
 async fn authenticated_web_service_stream_reaches_only_the_configured_upstream() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
@@ -12070,6 +12747,7 @@ async fn store_index_change_wait_unblocks_after_put_impl(backend: MainTestBacken
             state: None,
             parent: Vec::new(),
             expected_revision: None,
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -12542,6 +13220,8 @@ async fn multiplex_transport_get_upload_session_routes_to_handler_impl(backend: 
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                object_id: None,
+                expected_revision: None,
                 assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
                 multipart_parts: std::collections::BTreeMap::new(),
@@ -12610,6 +13290,8 @@ async fn start_upload_session_prefills_existing_chunk_refs_impl(backend: MainTes
             state: None,
             parent: Vec::new(),
             version_id: None,
+            object_id: None,
+            expected_revision: None,
             chunk_refs: vec![
                 super::UploadChunkRef {
                     hash: first_chunk_hash,
@@ -12649,6 +13331,99 @@ run_on_main_metadata_backends!(
     start_upload_session_prefills_existing_chunk_refs_impl,
     start_upload_session_prefills_existing_chunk_refs,
     start_upload_session_prefills_existing_chunk_refs_turso
+);
+
+async fn complete_upload_session_with_tombstoned_object_id_conflicts_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.upload-session-tombstone-create").await;
+        store
+            .put_object_versioned(
+                "uploads/tombstoned-large-object.bin",
+                Bytes::from_static(b"old contents"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("object should be created")
+    };
+    let deleted = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(created.version_id.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::CREATED);
+
+    let payload = b"replacement contents".to_vec();
+    let payload_hash = blake3::hash(&payload).to_hex().to_string();
+    state
+        .storage
+        .upload_chunk_ingestor
+        .ingest_chunk(&payload_hash, &payload)
+        .await
+        .expect("replacement chunk should be staged");
+    let started = super::start_upload_session(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::UploadSessionStartRequest {
+            key: "uploads/tombstoned-large-object.bin".to_string(),
+            total_size_bytes: payload.len() as u64,
+            state: None,
+            parent: Vec::new(),
+            version_id: None,
+            object_id: Some(created.object_id.clone()),
+            expected_revision: Some(created.version_id),
+            chunk_refs: vec![super::UploadChunkRef {
+                hash: payload_hash,
+                size_bytes: payload.len(),
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(started.status(), StatusCode::CREATED);
+    let started_body = to_bytes(started.into_body(), usize::MAX)
+        .await
+        .expect("upload session start response should be readable");
+    let session: super::UploadSessionView =
+        serde_json::from_slice(&started_body).expect("upload session start response should parse");
+
+    let completed =
+        super::complete_upload_session_response(&state, &HeaderMap::new(), &session.upload_id)
+            .await;
+    assert_eq!(
+        completed.status(),
+        StatusCode::CONFLICT,
+        "a tombstoned object ID must remain a mutation conflict, not become a path-based recreate"
+    );
+
+    let sessions =
+        super::read_upload_sessions(&state, "tests.upload-session-tombstone-assert").await;
+    let pending = sessions
+        .sessions
+        .get(&session.upload_id)
+        .expect("conflicted upload session should remain retryable");
+    assert!(!pending.finalizing);
+    assert!(!pending.completed);
+    drop(sessions);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    complete_upload_session_with_tombstoned_object_id_conflicts_impl,
+    complete_upload_session_with_tombstoned_object_id_conflicts,
+    complete_upload_session_with_tombstoned_object_id_conflicts_turso
 );
 
 #[tokio::test]
@@ -12716,6 +13491,8 @@ async fn start_upload_session_replays_same_response_for_same_operation_id_impl(
         state: None,
         parent: Vec::new(),
         version_id: None,
+        object_id: None,
+        expected_revision: None,
         chunk_refs: Vec::new(),
     };
     let mut headers = HeaderMap::new();
@@ -12789,6 +13566,8 @@ async fn start_upload_session_conflicts_on_operation_id_payload_mismatch_impl(
             state: None,
             parent: Vec::new(),
             version_id: None,
+            object_id: None,
+            expected_revision: None,
             chunk_refs: Vec::new(),
         }),
     )
@@ -12805,6 +13584,8 @@ async fn start_upload_session_conflicts_on_operation_id_payload_mismatch_impl(
             state: None,
             parent: Vec::new(),
             version_id: None,
+            object_id: None,
+            expected_revision: None,
             chunk_refs: Vec::new(),
         }),
     )
@@ -12986,6 +13767,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
         super::StoreIndexEntry {
             path: "images/".to_string(),
             entry_type: "prefix".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -12993,21 +13775,25 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             content_fingerprint: None,
             media: None,
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "images/".to_string(),
             entry_type: "key".to_string(),
-            version: None,
+            object_id: Some("obj-directory-marker".to_string()),
+            version: Some("revision-directory-marker".to_string()),
             content_hash: Some("marker".to_string()),
             size_bytes: Some(0),
             modified_at_unix: None,
             content_fingerprint: None,
             media: None,
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "images/cat.png".to_string(),
             entry_type: "key".to_string(),
+            object_id: Some("obj-cat".to_string()),
             version: None,
             content_hash: Some("content".to_string()),
             size_bytes: Some(123),
@@ -13015,6 +13801,7 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
             content_fingerprint: None,
             media: None,
             labels: Vec::new(),
+            labels_resolved: false,
         },
     ];
 
@@ -13023,7 +13810,15 @@ fn collapse_store_index_entries_for_tree_view_deduplicates_folder_markers() {
     assert_eq!(collapsed.len(), 2);
     assert_eq!(collapsed[0].path, "images/");
     assert_eq!(collapsed[0].entry_type, "prefix");
-    assert_eq!(collapsed[0].content_hash, None);
+    assert_eq!(
+        collapsed[0].object_id.as_deref(),
+        Some("obj-directory-marker")
+    );
+    assert_eq!(
+        collapsed[0].version.as_deref(),
+        Some("revision-directory-marker")
+    );
+    assert_eq!(collapsed[0].content_hash.as_deref(), Some("marker"));
     assert_eq!(collapsed[1].path, "images/cat.png");
     assert_eq!(collapsed[1].entry_type, "key");
 }
@@ -13045,10 +13840,13 @@ fn build_store_index_entries_with_hashes_propagates_content_fingerprints() {
         &keys,
         "",
         2,
-        Some(&hashes),
-        Some(&sizes),
-        Some(&content_fingerprints),
-        None,
+        super::StoreIndexEntryTestMetadata {
+            object_ids_by_key: None,
+            hashes_by_key: Some(&hashes),
+            sizes_by_key: Some(&sizes),
+            content_fingerprints_by_key: Some(&content_fingerprints),
+            modified_times_by_key: None,
+        },
     );
 
     let file_entry = entries
@@ -13634,6 +14432,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(original_revision.clone()),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13652,6 +14451,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(original_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13678,6 +14478,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(current_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13706,6 +14507,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(accepted_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13736,6 +14538,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             to_path: "renamed-stale.txt".to_string(),
             overwrite: false,
             expected_revision: Some("stale-revision".to_string()),
+            object_id: None,
         }),
     )
     .await
@@ -13750,6 +14553,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             to_path: "renamed-current.txt".to_string(),
             overwrite: false,
             expected_revision: Some(rename_revision),
+            object_id: None,
         }),
     )
     .await
@@ -13794,6 +14598,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(stale_directory_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: true,
@@ -13811,6 +14616,7 @@ async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: Some(current_directory_revision),
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: true,
@@ -13827,6 +14633,780 @@ run_on_main_metadata_backends!(
     expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl,
     expected_revision_compare_and_swap_rejects_stale_put_and_delete,
     expected_revision_compare_and_swap_rejects_stale_put_and_delete_turso
+);
+
+async fn copy_object_path_honors_object_id_and_expected_revision_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_path = "copy-object-id-source.txt".to_string();
+    let target_path = "copy-object-id-target.txt".to_string();
+    let original = {
+        let mut store = lock_store(&state, "tests.copy-object-id-original").await;
+        store
+            .put_object_versioned(
+                &source_path,
+                Bytes::from_static(b"original"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let deleted = super::delete_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(source_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(original.version_id.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(deleted.status(), StatusCode::CREATED);
+
+    let replacement = {
+        let mut store = lock_store(&state, "tests.copy-object-id-replacement").await;
+        store
+            .put_object_versioned(
+                &source_path,
+                Bytes::from_static(b"replacement"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let wrong_identity = super::copy_object_path(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::PathMutationRequest {
+            from_path: source_path.clone(),
+            to_path: target_path.clone(),
+            overwrite: false,
+            expected_revision: None,
+            object_id: Some(original.object_id),
+        }),
+    )
+    .await;
+    assert_eq!(wrong_identity.status(), StatusCode::CONFLICT);
+
+    let stale_revision = super::copy_object_path(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::PathMutationRequest {
+            from_path: source_path.clone(),
+            to_path: target_path.clone(),
+            overwrite: false,
+            expected_revision: Some(original.version_id),
+            object_id: Some(replacement.object_id.clone()),
+        }),
+    )
+    .await;
+    assert_eq!(stale_revision.status(), StatusCode::CONFLICT);
+
+    let accepted = super::copy_object_path(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::PathMutationRequest {
+            from_path: source_path,
+            to_path: target_path.clone(),
+            overwrite: false,
+            expected_revision: Some(replacement.version_id),
+            object_id: Some(replacement.object_id),
+        }),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+    {
+        let store = lock_store(&state, "tests.copy-object-id-target").await;
+        assert_eq!(
+            store
+                .get_object(
+                    &target_path,
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .unwrap(),
+            Bytes::from_static(b"replacement")
+        );
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    copy_object_path_honors_object_id_and_expected_revision_impl,
+    copy_object_path_honors_object_id_and_expected_revision,
+    copy_object_path_honors_object_id_and_expected_revision_turso
+);
+
+async fn object_id_rename_replays_same_operation_id_after_delete_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-rename-idempotency-create").await;
+        store
+            .put_object_versioned(
+                "object-id-rename-idempotency-source.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-object-id-rename"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-object-id-rename"),
+    );
+    let request = super::ObjectRenameRequest {
+        to_path: "object-id-rename-idempotency-target.txt".to_string(),
+        overwrite: false,
+        expected_revision: Some(created.version_id),
+    };
+
+    let first = super::rename_object_by_id(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.object_id.clone()),
+        Json(request.clone()),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let first_mutation: super::ObjectMutationResponse =
+        serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(first_mutation.object_id, created.object_id);
+    assert_eq!(
+        first_mutation.path,
+        "object-id-rename-idempotency-target.txt"
+    );
+
+    let delete = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(delete.status(), StatusCode::CREATED);
+
+    let replay = super::rename_object_by_id(
+        State(state.clone()),
+        headers,
+        Path(created.object_id.clone()),
+        Json(request),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
+
+    let current_path = {
+        let store = lock_store(&state, "tests.object-id-rename-idempotency-verify").await;
+        store
+            .current_path_for_object_id(&created.object_id)
+            .await
+            .unwrap()
+    };
+    assert!(current_path.is_none());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_rename_replays_same_operation_id_after_delete_impl,
+    object_id_rename_replays_same_operation_id_after_delete,
+    object_id_rename_replays_same_operation_id_after_delete_turso
+);
+
+async fn object_id_delete_replays_same_operation_id_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-delete-idempotency-create").await;
+        store
+            .put_object_versioned(
+                "object-id-delete-idempotency.txt",
+                Bytes::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-object-id-delete"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-object-id-delete"),
+    );
+    let query = super::PutObjectQuery {
+        state: None,
+        parent: Vec::new(),
+        expected_revision: Some(created.version_id),
+        object_id: None,
+        version_id: None,
+        internal_replication: false,
+        recursive: false,
+    };
+
+    let first = super::delete_object_by_id(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.object_id.clone()),
+        Query(query.clone()),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+
+    let replay = super::delete_object_by_id(
+        State(state.clone()),
+        headers,
+        Path(created.object_id),
+        Query(query),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_delete_replays_same_operation_id_impl,
+    object_id_delete_replays_same_operation_id,
+    object_id_delete_replays_same_operation_id_turso
+);
+
+async fn object_id_put_replays_same_operation_id_after_rename_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let source_path = "object-id-put-idempotency-source.txt";
+    let target_path = "object-id-put-idempotency-target.txt";
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-put-idempotency-create").await;
+        store
+            .put_object_versioned(
+                source_path,
+                Bytes::from_static(b"initial payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        transport_sdk::HEADER_DEVICE_ID,
+        HeaderValue::from_static("device-object-id-put"),
+    );
+    headers.insert(
+        transport_sdk::HEADER_OPERATION_ID,
+        HeaderValue::from_static("operation-object-id-put"),
+    );
+    let query = super::PutObjectQuery {
+        state: None,
+        parent: Vec::new(),
+        expected_revision: Some(created.version_id),
+        object_id: None,
+        version_id: None,
+        internal_replication: false,
+        recursive: false,
+    };
+
+    let first = super::put_object_by_id(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.object_id.clone()),
+        Query(query.clone()),
+        Bytes::from_static(b"updated payload"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    let updated: super::ObjectMutationResponse = serde_json::from_slice(&first_body).unwrap();
+
+    let rename_response = super::rename_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Json(super::ObjectRenameRequest {
+            to_path: target_path.to_string(),
+            overwrite: false,
+            expected_revision: Some(updated.revision),
+        }),
+    )
+    .await;
+    assert_eq!(rename_response.status(), StatusCode::OK);
+
+    let replay = super::put_object_by_id(
+        State(state.clone()),
+        headers,
+        Path(created.object_id),
+        Query(query),
+        Bytes::from_static(b"updated payload"),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+        first_body
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_put_replays_same_operation_id_after_rename_impl,
+    object_id_put_replays_same_operation_id_after_rename,
+    object_id_put_replays_same_operation_id_after_rename_turso
+);
+
+#[test]
+fn upload_session_complete_response_accepts_legacy_payload_without_object_id() {
+    let response =
+        serde_json::from_value::<super::UploadSessionCompleteResponse>(serde_json::json!({
+            "snapshot_id": "snapshot-legacy",
+            "version_id": "version-legacy",
+            "manifest_hash": "manifest-legacy",
+            "state": "confirmed",
+            "new_chunks": 1,
+            "dedup_reused_chunks": 0,
+            "created_new_version": true,
+            "total_size_bytes": 1,
+        }))
+        .unwrap();
+    assert!(response.object_id.is_empty());
+    assert_eq!(response.version_id, "version-legacy");
+}
+
+async fn object_id_api_serializes_and_mutates_by_identity_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let original_path = "object-id-api.txt".to_string();
+    let moved_path = "object-id-api-moved.txt".to_string();
+
+    let created_response = super::put_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(original_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"created"),
+    )
+    .await
+    .into_response();
+    assert_eq!(created_response.status(), StatusCode::CREATED);
+    let created: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(created_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!created.object_id.is_empty());
+    assert_eq!(created.path, original_path);
+
+    let lookup_response = super::get_object_by_id_response(&state, &created.object_id).await;
+    assert_eq!(lookup_response.status(), StatusCode::OK);
+    let lookup: super::ObjectLookupResponse = serde_json::from_slice(
+        &to_bytes(lookup_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(lookup.object_id, created.object_id);
+    assert_eq!(lookup.path, original_path);
+    assert_eq!(lookup.revision.as_deref(), Some(created.revision.as_str()));
+    assert_eq!(lookup.entry_type, "key");
+
+    let index_response = super::list_store_index_response(
+        &state,
+        super::StoreIndexQuery {
+            prefix: None,
+            depth: Some(1),
+            snapshot: None,
+            view: Some(super::StoreIndexView::Raw),
+            cursor: None,
+            page_size: None,
+            offset: None,
+            limit: None,
+            sort: None,
+            media_filter: None,
+            captured_from_unix: None,
+            captured_until_unix: None,
+            south: None,
+            west: None,
+            north: None,
+            east: None,
+            require_labels: None,
+            exclude_labels: None,
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(index_response.status(), StatusCode::OK);
+    let index_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(index_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let indexed = index_json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == original_path)
+        .expect("store index should contain the created object");
+    assert_eq!(indexed["object_id"], created.object_id);
+
+    let modified_response = super::put_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(created.revision.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"modified"),
+    )
+    .await;
+    assert_eq!(modified_response.status(), StatusCode::CREATED);
+    let modified: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(modified_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(modified.object_id, created.object_id);
+    assert_eq!(modified.path, original_path);
+    assert_ne!(modified.revision, created.revision);
+
+    let rename_response = super::rename_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Json(super::ObjectRenameRequest {
+            to_path: moved_path.clone(),
+            overwrite: false,
+            expected_revision: Some(modified.revision.clone()),
+        }),
+    )
+    .await;
+    assert_eq!(rename_response.status(), StatusCode::OK);
+    let renamed: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(rename_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(renamed.object_id, created.object_id);
+    assert_eq!(renamed.path, moved_path);
+    assert_ne!(renamed.revision, modified.revision);
+
+    let moved_lookup_response = super::get_object_by_id_response(&state, &created.object_id).await;
+    assert_eq!(moved_lookup_response.status(), StatusCode::OK);
+    let moved_lookup: super::ObjectLookupResponse = serde_json::from_slice(
+        &to_bytes(moved_lookup_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(moved_lookup.object_id, created.object_id);
+    assert_eq!(moved_lookup.path, moved_path);
+    assert_eq!(moved_lookup.entry_type, "key");
+
+    let deleted_response = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(created.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: moved_lookup.revision.clone(),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(deleted_response.status(), StatusCode::CREATED);
+    let deleted: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(deleted_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(deleted.object_id, created.object_id);
+    assert_eq!(deleted.path, moved_path);
+
+    let tombstone_lookup_response =
+        super::get_object_by_id_response(&state, &created.object_id).await;
+    assert_eq!(tombstone_lookup_response.status(), StatusCode::OK);
+    let tombstone_lookup: super::ObjectLookupResponse = serde_json::from_slice(
+        &to_bytes(tombstone_lookup_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(tombstone_lookup.object_id, created.object_id);
+    assert_eq!(tombstone_lookup.path, moved_path);
+    assert_eq!(
+        tombstone_lookup.revision.as_deref(),
+        Some(deleted.revision.as_str())
+    );
+    assert_eq!(
+        tombstone_lookup.tombstone_predecessor_revision.as_deref(),
+        moved_lookup.revision.as_deref()
+    );
+    assert_eq!(tombstone_lookup.entry_type, "tombstone");
+
+    let directory_path = "object-id-directory/".to_string();
+    let child_path = "object-id-directory/child.txt".to_string();
+    let directory_response = super::put_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(directory_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(directory_response.status(), StatusCode::CREATED);
+    let directory: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(directory_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let child_response = super::put_object(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(child_path.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: None,
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+        Bytes::from_static(b"child"),
+    )
+    .await
+    .into_response();
+    assert_eq!(child_response.status(), StatusCode::CREATED);
+
+    let rejected_directory_delete = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(directory.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(directory.revision.clone()),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: false,
+        }),
+    )
+    .await;
+    assert_eq!(rejected_directory_delete.status(), StatusCode::BAD_REQUEST);
+    {
+        let store = lock_store(&state, "tests.object-id-directory-intact").await;
+        assert_eq!(
+            store
+                .get_object(
+                    &child_path,
+                    None,
+                    None,
+                    super::storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .unwrap(),
+            Bytes::from_static(b"child")
+        );
+    }
+
+    let recursive_directory_delete = super::delete_object_by_id(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(directory.object_id.clone()),
+        Query(super::PutObjectQuery {
+            state: None,
+            parent: Vec::new(),
+            expected_revision: Some(directory.revision),
+            object_id: None,
+            version_id: None,
+            internal_replication: false,
+            recursive: true,
+        }),
+    )
+    .await;
+    assert_eq!(recursive_directory_delete.status(), StatusCode::CREATED);
+    let recursive_deleted: super::ObjectMutationResponse = serde_json::from_slice(
+        &to_bytes(recursive_directory_delete.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recursive_deleted.object_id, directory.object_id);
+    assert_eq!(recursive_deleted.path, directory_path);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_api_serializes_and_mutates_by_identity_impl,
+    object_id_api_serializes_and_mutates_by_identity,
+    object_id_api_serializes_and_mutates_by_identity_turso
+);
+
+async fn execute_public_object_id_transport_request(
+    state: &super::ServerState,
+    request: transport_sdk::BufferedTransportRequest,
+) -> transport_sdk::BufferedTransportResponse {
+    Box::pin(
+        super::transport_service::execute_buffered_transport_request(
+            state,
+            &super::transport_service::TransportExecutionScope::Public,
+            &request,
+        ),
+    )
+    .await
+    .unwrap()
+}
+
+async fn object_id_routes_reach_multiplex_transport_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let created = {
+        let mut store = lock_store(&state, "tests.object-id-transport-create").await;
+        store
+            .put_object_versioned(
+                "object-id-transport.txt",
+                Bytes::from_static(b"created"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+
+    let lookup = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "GET",
+            format!("/objects/{}", created.object_id),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    assert_eq!(lookup.status, StatusCode::OK.as_u16());
+
+    let modified = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "PUT",
+            format!("/objects/{}", created.object_id),
+            Vec::new(),
+            b"modified".to_vec(),
+        ),
+    )
+    .await;
+    assert_eq!(modified.status, StatusCode::CREATED.as_u16());
+
+    let renamed = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "POST",
+            format!("/objects/{}/rename", created.object_id),
+            vec![transport_sdk::TransportHeader {
+                name: "content-type".to_string(),
+                value: "application/json".to_string(),
+            }],
+            serde_json::to_vec(&super::ObjectRenameRequest {
+                to_path: "object-id-transport-moved.txt".to_string(),
+                overwrite: false,
+                expected_revision: None,
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::OK.as_u16());
+    let rename_result: super::ObjectMutationResponse =
+        serde_json::from_slice(&renamed.body).expect("object-id rename response should parse");
+    assert_eq!(rename_result.object_id, created.object_id);
+    assert_eq!(rename_result.path, "object-id-transport-moved.txt");
+
+    let deleted = execute_public_object_id_transport_request(
+        &state,
+        transport_sdk::BufferedTransportRequest::new(
+            transport_sdk::TransportStreamKind::Rpc,
+            "DELETE",
+            format!("/objects/{}", created.object_id),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::CREATED.as_u16());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    object_id_routes_reach_multiplex_transport_impl,
+    object_id_routes_reach_multiplex_transport,
+    object_id_routes_reach_multiplex_transport_turso
 );
 
 async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
@@ -13853,6 +15433,7 @@ async fn delete_object_handler_marks_tombstone_and_removes_current_key_impl(
         state: Some("confirmed".to_string()),
         parent: Vec::new(),
         expected_revision: None,
+        object_id: None,
         version_id: None,
         internal_replication: false,
         recursive: false,
@@ -13919,6 +15500,7 @@ async fn delete_object_handler_cascades_sidecars_only_for_public_deletes_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: None,
+            object_id: None,
             version_id: None,
             internal_replication: false,
             recursive: false,
@@ -13969,6 +15551,7 @@ async fn delete_object_handler_cascades_sidecars_only_for_public_deletes_impl(
             state: None,
             parent: Vec::new(),
             expected_revision: None,
+            object_id: None,
             version_id: Some("repl-media-delete".to_string()),
             internal_replication: true,
             recursive: false,
@@ -14196,6 +15779,7 @@ async fn delete_object_handler_recursively_tombstones_directory_subtree_impl(
         state: Some("confirmed".to_string()),
         parent: Vec::new(),
         expected_revision: None,
+        object_id: None,
         version_id: None,
         internal_replication: false,
         recursive: true,
@@ -14253,6 +15837,7 @@ async fn delete_object_handler_allows_internal_versioned_tombstone_for_directory
         state: Some("confirmed".to_string()),
         parent: Vec::new(),
         expected_revision: None,
+        object_id: None,
         version_id: Some("repl-tomb-docs-marker".to_string()),
         internal_replication: true,
         recursive: false,
@@ -14298,8 +15883,15 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
             .unwrap()
     };
     {
-        let locked = lock_store(&state, "tests.state.store").await;
+        let mut locked = lock_store(&state, "tests.state.store").await;
         locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+        locked
+            .set_media_labels(
+                "gallery/cat.png",
+                vec!["private".to_string(), "travel".to_string()],
+            )
+            .await
+            .unwrap();
     }
 
     let response = axum::response::IntoResponse::into_response(
@@ -14316,6 +15908,8 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -14338,11 +15932,158 @@ async fn list_store_index_includes_cached_media_metadata_for_images_impl(backend
     assert_eq!(media["mime_type"], "image/png");
     assert_eq!(media["width"], 4);
     assert_eq!(media["height"], 3);
+    assert_eq!(
+        entries[0]["labels"],
+        serde_json::json!(["private", "travel"])
+    );
+    assert_eq!(entries[0]["labels_resolved"], true);
     assert!(
         media["thumbnail"]["url"]
             .as_str()
             .unwrap()
             .contains("/media/thumbnail?key=gallery%2Fcat.png")
+    );
+
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/readme.txt",
+                bytes::Bytes::from_static(b"readme"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        locked
+            .put_object_versioned(
+                "gallery/public.txt",
+                bytes::Bytes::from_static(b"public notes"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Path sorting takes the generic listing route rather than the captured
+    // gallery projection. It must still apply labels before pagination so the
+    // default UI filter cannot display this private thumbnail.
+    let filtered = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(100),
+                sort: Some(super::StoreIndexSortOrder::PathAsc),
+                media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
+                require_labels: None,
+                exclude_labels: Some("private".to_string()),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(filtered.status(), axum::http::StatusCode::OK);
+    let filtered_payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(filtered.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(filtered_payload["total_entry_count"], 0);
+    assert_eq!(filtered_payload["entries"], serde_json::json!([]));
+
+    // Label filters apply to gallery media. Generic file listings must retain
+    // non-media entries instead of discarding them for lacking a media label
+    // projection.
+    let filtered_non_media = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: None,
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(100),
+                sort: Some(super::StoreIndexSortOrder::PathAsc),
+                media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
+                require_labels: None,
+                exclude_labels: Some("private".to_string()),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(filtered_non_media.status(), axum::http::StatusCode::OK);
+    let filtered_non_media_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(filtered_non_media.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        filtered_non_media_payload["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"].as_str() == Some("gallery/readme.txt")),
+        "a non-media entry must remain in the generic label-filtered listing"
+    );
+    assert!(
+        filtered_non_media_payload["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"].as_str() == Some("gallery/public.txt")),
+        "an unlabelled non-media entry must remain in the generic label-filtered listing"
+    );
+
+    // Historical snapshots have no historical label projection. Rejecting the
+    // request keeps the privacy default fail-closed rather than returning a
+    // silently incomplete snapshot listing.
+    let snapshot_filter = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(super::StoreIndexQuery {
+                prefix: Some("gallery".to_string()),
+                depth: Some(2),
+                snapshot: Some("historical".to_string()),
+                view: Some(super::StoreIndexView::Tree),
+                cursor: None,
+                page_size: None,
+                offset: Some(0),
+                limit: Some(100),
+                sort: Some(super::StoreIndexSortOrder::PathAsc),
+                media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
+                south: None,
+                west: None,
+                north: None,
+                east: None,
+                require_labels: None,
+                exclude_labels: Some("private".to_string()),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        snapshot_filter.status(),
+        axum::http::StatusCode::BAD_REQUEST
     );
 
     cleanup_test_state(&state).await;
@@ -14352,6 +16093,160 @@ run_on_main_metadata_backends!(
     list_store_index_includes_cached_media_metadata_for_images_impl,
     list_store_index_includes_cached_media_metadata_for_images,
     list_store_index_includes_cached_media_metadata_for_images_turso
+);
+
+async fn generic_store_index_applies_current_xmp_gps_overlay_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let put = {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked
+            .put_object_versioned(
+                "gallery/geotagged.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        locked.ensure_media_cache(&put.manifest_hash).await.unwrap();
+        let write = locked
+            .set_media_geolocation(
+                "gallery/geotagged.png",
+                common::xmp::XmpGeoInference {
+                    latitude: 47.3769,
+                    longitude: 8.5417,
+                    method: "nearest-anchor".to_string(),
+                    run_id: "analysis-run".to_string(),
+                    confidence: "reference_distance=180s".to_string(),
+                    reference_distance_seconds: Some(180),
+                    previous_anchor_distance_seconds: None,
+                    next_anchor_distance_seconds: None,
+                    estimated_speed_kmh: None,
+                    approved_capture_time: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            write,
+            super::storage::MediaGeolocationWrite::Applied(_)
+        ));
+    }
+
+    let generic_query = super::StoreIndexQuery {
+        prefix: Some("gallery".to_string()),
+        depth: Some(2),
+        snapshot: None,
+        view: Some(super::StoreIndexView::Tree),
+        cursor: None,
+        page_size: None,
+        offset: Some(0),
+        // The sidecar is deliberately visible in a generic file listing. Do
+        // not let its (newer) modification timestamp decide whether this
+        // test sees the media entry.
+        limit: Some(2),
+        sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+        media_filter: None,
+        captured_from_unix: None,
+        captured_until_unix: None,
+        south: None,
+        west: None,
+        north: None,
+        east: None,
+        require_labels: None,
+        exclude_labels: None,
+    };
+    let cursor_query = super::StoreIndexQuery {
+        view: None,
+        cursor: None,
+        page_size: Some(2),
+        offset: None,
+        limit: None,
+        sort: None,
+        ..generic_query.clone()
+    };
+    fn media_entry(payload: &serde_json::Value) -> &serde_json::Value {
+        payload["entries"]
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry["path"] == "gallery/geotagged.png")
+            })
+            .expect("the generic listing should include the geotagged media")
+    }
+
+    let first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(generic_query.clone()),
+        )
+        .await,
+    );
+    assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+    let first_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let first_media = media_entry(&first_payload);
+    assert_eq!(first_media["media"]["gps"]["latitude"], 47.3769);
+    assert_eq!(first_media["media"]["gps"]["longitude"], 8.5417);
+
+    let cached_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(generic_query),
+        )
+        .await,
+    );
+    assert_eq!(cached_response.status(), axum::http::StatusCode::OK);
+    assert!(
+        cached_response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("store-index-page-cache;desc=hit")),
+        "the cached generic response must reload path-scoped XMP GPS"
+    );
+    let cached_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(cached_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let cached_media = media_entry(&cached_payload);
+    assert_eq!(cached_media["media"]["gps"]["latitude"], 47.3769);
+    assert_eq!(cached_media["media"]["gps"]["longitude"], 8.5417);
+
+    let cursor_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(cursor_query),
+        )
+        .await,
+    );
+    assert_eq!(cursor_response.status(), axum::http::StatusCode::OK);
+    let cursor_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(cursor_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let cursor_media = media_entry(&cursor_payload);
+    assert_eq!(cursor_media["media"]["gps"]["latitude"], 47.3769);
+    assert_eq!(cursor_media["media"]["gps"]["longitude"], 8.5417);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    generic_store_index_applies_current_xmp_gps_overlay_impl,
+    generic_store_index_applies_current_xmp_gps_overlay,
+    generic_store_index_applies_current_xmp_gps_overlay_turso
 );
 
 async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_impl(
@@ -14402,6 +16297,8 @@ async fn list_store_index_batches_media_cache_lookup_for_duplicate_fingerprints_
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -14481,6 +16378,8 @@ async fn list_store_index_keeps_batch_media_lookup_failures_best_effort_impl(
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -14556,6 +16455,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_images_impl(
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -14636,6 +16537,8 @@ async fn list_store_index_includes_thumbnail_url_for_metadata_only_videos_impl(
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -14718,6 +16621,8 @@ async fn list_store_index_includes_cached_media_metadata_for_videos_impl(backend
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -14794,6 +16699,8 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -14866,6 +16773,8 @@ async fn list_store_index_sets_timing_headers_impl(backend: MainTestBackend) {
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -14948,6 +16857,8 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -14986,6 +16897,8 @@ async fn list_store_index_cursor_mode_pages_raw_entries_impl(backend: MainTestBa
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15052,6 +16965,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15100,6 +17015,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15158,6 +17075,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         limit: Some(1),
         sort: Some(super::StoreIndexSortOrder::CapturedDesc),
         media_filter: None,
+        captured_from_unix: None,
+        captured_until_unix: None,
         south: None,
         west: None,
         north: None,
@@ -15172,6 +17091,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
     let cached_key = super::store_index_page_cache_key(
         &cached_query,
         super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+        &Default::default(),
     )
     .expect("paginated tree query should have a cache key");
     let stale_cached = state
@@ -15181,7 +17101,27 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
         .unwrap()
         .get(&cached_key, cached_sequence)
         .expect("prepared page should be cached");
+    state.storage.store_history_cache.lock().unwrap().insert(
+        "",
+        1,
+        Arc::new(super::StoreHistoryCacheValue::Entries(
+            super::storage::RecoverableHistoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            },
+        )),
+    );
     super::publish_namespace_change(&state);
+    assert!(
+        state
+            .storage
+            .store_history_cache
+            .lock()
+            .unwrap()
+            .get("", 1)
+            .is_none(),
+        "ordinary namespace changes invalidate the recoverable-history cache"
+    );
     assert!(
         super::cached_store_index_page_response(
             &state,
@@ -15191,6 +17131,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
             std::time::Instant::now(),
             stale_cached,
         )
+        .await
         .is_none(),
         "a mutation between cache lookup and response must reject the stale page"
     );
@@ -15222,6 +17163,8 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15322,27 +17265,32 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
         (older, newer)
     };
 
+    let gallery_page_query =
+        |offset, captured_from_unix, captured_until_unix| super::StoreIndexQuery {
+            prefix: Some("gallery".to_string()),
+            depth: Some(64),
+            snapshot: None,
+            view: Some(super::StoreIndexView::Tree),
+            cursor: None,
+            page_size: None,
+            offset: Some(offset),
+            limit: Some(1),
+            sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+            media_filter: Some(super::StoreIndexMediaFilter::Image),
+            captured_from_unix,
+            captured_until_unix,
+            south: None,
+            west: None,
+            north: None,
+            east: None,
+            require_labels: None,
+            exclude_labels: None,
+        };
+
     let first_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
-            axum::extract::Query(super::StoreIndexQuery {
-                prefix: Some("gallery".to_string()),
-                depth: Some(64),
-                snapshot: None,
-                view: Some(super::StoreIndexView::Tree),
-                cursor: None,
-                page_size: None,
-                offset: Some(0),
-                limit: Some(1),
-                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-                media_filter: Some(super::StoreIndexMediaFilter::Image),
-                south: None,
-                west: None,
-                north: None,
-                east: None,
-                require_labels: None,
-                exclude_labels: None,
-            }),
+            axum::extract::Query(gallery_page_query(0, None, None)),
         )
         .await,
     );
@@ -15377,28 +17325,13 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     );
     assert_eq!(first_payload["total_entry_count"], 2);
     assert_eq!(first_payload["media_summary"]["ready_count"], 2);
+    assert!(first_payload["sync_token"].as_str().is_some());
+    assert!(first_payload["consistency_token"].as_str().is_some());
 
     let second_response = axum::response::IntoResponse::into_response(
         super::list_store_index(
             axum::extract::State(state.clone()),
-            axum::extract::Query(super::StoreIndexQuery {
-                prefix: Some("gallery".to_string()),
-                depth: Some(64),
-                snapshot: None,
-                view: Some(super::StoreIndexView::Tree),
-                cursor: None,
-                page_size: None,
-                offset: Some(1),
-                limit: Some(1),
-                sort: Some(super::StoreIndexSortOrder::CapturedDesc),
-                media_filter: Some(super::StoreIndexMediaFilter::Image),
-                south: None,
-                west: None,
-                north: None,
-                east: None,
-                require_labels: None,
-                exclude_labels: None,
-            }),
+            axum::extract::Query(gallery_page_query(1, None, None)),
         )
         .await,
     );
@@ -15422,6 +17355,96 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     assert_eq!(
         first_payload["media_summary"], second_payload["media_summary"],
         "media summaries cover the whole filtered scope on every page"
+    );
+
+    let captured_first_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(gallery_page_query(0, Some(50), Some(250))),
+        )
+        .await,
+    );
+    assert_eq!(captured_first_response.status(), StatusCode::OK);
+    let captured_first_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(captured_first_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        captured_first_payload["entries"][0]["path"],
+        "gallery/newer.png"
+    );
+    assert!(captured_first_payload["sync_token"].is_null());
+    assert!(
+        captured_first_payload["consistency_token"]
+            .as_str()
+            .is_some()
+    );
+
+    let captured_second_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(gallery_page_query(1, Some(50), Some(250))),
+        )
+        .await,
+    );
+    assert_eq!(captured_second_response.status(), StatusCode::OK);
+    let captured_second_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(captured_second_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        captured_second_payload["entries"][0]["path"],
+        "gallery/older.png"
+    );
+    assert!(captured_second_payload["sync_token"].is_null());
+    assert_eq!(
+        captured_first_payload["consistency_token"], captured_second_payload["consistency_token"],
+        "captured-sort pages must identify the same gallery revision"
+    );
+    assert_eq!(
+        captured_first_payload["media_summary"], captured_second_payload["media_summary"],
+        "media summaries cover the whole capture-filtered scope on every page"
+    );
+
+    {
+        let mut locked = lock_store(&state, "tests.state.store").await;
+        let added = locked
+            .put_object_versioned(
+                "gallery/middle.png",
+                bytes::Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut metadata = locked
+            .ensure_media_metadata(&added.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        metadata.taken_at_unix = Some(150);
+        locked.persist_media_cache_record(&metadata).await.unwrap();
+    }
+    let invalidated_response = axum::response::IntoResponse::into_response(
+        super::list_store_index(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(gallery_page_query(0, Some(50), Some(250))),
+        )
+        .await,
+    );
+    assert_eq!(invalidated_response.status(), StatusCode::OK);
+    let invalidated_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(invalidated_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        captured_first_payload["consistency_token"], invalidated_payload["consistency_token"],
+        "a gallery revision must invalidate capture-filtered offset pages"
     );
 
     assert_ne!(older.manifest_hash, newer.manifest_hash);
@@ -15517,6 +17540,8 @@ async fn list_store_index_uses_filename_capture_fallback_after_extraction_impl(
                     limit: Some(3),
                     sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                     media_filter: Some(super::StoreIndexMediaFilter::Image),
+                    captured_from_unix: None,
+                    captured_until_unix: None,
                     south: None,
                     west: None,
                     north: None,
@@ -15582,6 +17607,8 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::PathAsc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15614,6 +17641,8 @@ async fn list_store_index_gallery_projection_matches_generic_pending_media_on_ca
                 limit: Some(1),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15731,6 +17760,8 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 limit: Some(10),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15763,6 +17794,8 @@ async fn list_store_index_gallery_projection_matches_generic_snapshot_order_for_
                 limit: Some(10),
                 sort: Some(super::StoreIndexSortOrder::CapturedDesc),
                 media_filter: Some(super::StoreIndexMediaFilter::Image),
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -15832,6 +17865,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
         super::StoreIndexEntry {
             path: "gallery/older.jpg".to_string(),
             entry_type: "key".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -15858,10 +17892,12 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 error: None,
             }),
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "gallery/newer.jpg".to_string(),
             entry_type: "key".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -15891,10 +17927,12 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 error: None,
             }),
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "gallery/clip.mp4".to_string(),
             entry_type: "key".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -15921,10 +17959,12 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
                 error: None,
             }),
             labels: Vec::new(),
+            labels_resolved: false,
         },
         super::StoreIndexEntry {
             path: "gallery/subdir/".to_string(),
             entry_type: "prefix".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -15932,6 +17972,7 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
             content_fingerprint: None,
             media: None,
             labels: Vec::new(),
+            labels_resolved: false,
         },
     ];
 
@@ -15980,6 +18021,46 @@ fn store_index_media_filter_and_captured_sort_apply_before_pagination() {
 }
 
 #[test]
+fn store_index_capture_range_preserves_prefix_entries() {
+    let entry = |path: &str, entry_type: &str, modified_at_unix| super::StoreIndexEntry {
+        path: path.to_string(),
+        entry_type: entry_type.to_string(),
+        object_id: None,
+        version: None,
+        content_hash: None,
+        size_bytes: None,
+        modified_at_unix,
+        content_fingerprint: None,
+        media: None,
+        labels: Vec::new(),
+        labels_resolved: false,
+    };
+    let prefix = entry("gallery/trip/", "prefix", None);
+    let key = entry("gallery/trip/photo.jpg", "key", Some(50));
+
+    assert!(super::matches_store_index_capture_range(
+        &prefix,
+        Some(100),
+        Some(200)
+    ));
+    assert!(super::matches_store_index_capture_range(
+        &key,
+        Some(50),
+        Some(51)
+    ));
+    assert!(!super::matches_store_index_capture_range(
+        &key,
+        Some(51),
+        None
+    ));
+    assert!(!super::matches_store_index_capture_range(
+        &key,
+        None,
+        Some(50)
+    ));
+}
+
+#[test]
 fn store_index_media_filter_prefilters_metadata_lookup_plan() {
     let keys = vec![
         "gallery/a.jpg".to_string(),
@@ -16015,6 +18096,7 @@ fn store_index_prepared_sort_materializes_only_requested_prefix() {
         .map(|index| super::StoreIndexEntry {
             path: format!("gallery/{index:03}.jpg"),
             entry_type: "key".to_string(),
+            object_id: None,
             version: None,
             content_hash: None,
             size_bytes: None,
@@ -16041,6 +18123,7 @@ fn store_index_prepared_sort_materializes_only_requested_prefix() {
                 error: None,
             }),
             labels: Vec::new(),
+            labels_resolved: false,
         })
         .collect::<Vec<_>>();
     let mut prepared = super::StoreIndexPreparedEntries::new(
@@ -16199,6 +18282,8 @@ async fn metadata_import_makes_store_index_visible_without_marking_local_replica
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -16349,6 +18434,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
         super::ObjectGetQuery {
             snapshot: None,
             version: None,
+            object_id: None,
             read_mode: None,
         },
         &HeaderMap::new(),
@@ -16517,6 +18603,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -16546,6 +18633,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -16648,6 +18736,8 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
                 limit: None,
                 sort: None,
                 media_filter: None,
+                captured_from_unix: None,
+                captured_until_unix: None,
                 south: None,
                 west: None,
                 north: None,
@@ -17352,6 +19442,7 @@ async fn get_object_admin_returns_bytes_with_admin_token_impl(backend: MainTestB
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -17394,6 +19485,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -17425,6 +19517,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -17461,6 +19554,7 @@ async fn get_object_supports_range_requests_impl(backend: MainTestBackend) {
             axum::extract::Query(super::ObjectGetQuery {
                 snapshot: None,
                 version: None,
+                object_id: None,
                 read_mode: None,
             }),
         )
@@ -17587,6 +19681,16 @@ async fn build_test_state(
             store_index_page_cache: Arc::new(std::sync::Mutex::new(
                 super::StoreIndexPageCache::default(),
             )),
+            store_history_cache: Arc::new(std::sync::Mutex::new(
+                super::StoreHistoryCache::default(),
+            )),
+            store_history_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            store_history_refresh_locks: Arc::new(std::sync::Mutex::new(
+                super::StoreHistoryRefreshLocks::default(),
+            )),
+            store_history_refresh_permits: Arc::new(tokio::sync::Semaphore::new(
+                super::STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
+            )),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<
@@ -17680,6 +19784,9 @@ async fn build_test_state(
             manual_repair_activity: Arc::new(Mutex::new(
                 super::ManualRepairActionActivityRuntime::default(),
             )),
+            operations_activity: Arc::new(Mutex::new(
+                super::operations::OperationActivityRuntime::default(),
+            )),
             autonomous_post_write_repair: Arc::new(Mutex::new(
                 super::AutonomousPostWriteRepairRuntime::default(),
             )),
@@ -17769,6 +19876,8 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                object_id: None,
+                expected_revision: None,
                 assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
                 multipart_parts: std::collections::BTreeMap::new(),
@@ -17863,6 +19972,8 @@ async fn process_stats_memory_reports_current_objects_uploads_and_last_gc_pass()
                 state: VersionConsistencyState::Confirmed,
                 parent_version_ids: Vec::new(),
                 explicit_version_id: None,
+                object_id: None,
+                expected_revision: None,
                 assembly_mode: super::UploadAssemblyMode::FixedSequence,
                 received_chunks: vec![None],
                 multipart_parts: std::collections::BTreeMap::new(),
@@ -21606,6 +23717,30 @@ fn rendezvous_relay_accept_retry_delay_backs_off_and_caps() {
     assert_eq!(
         super::rendezvous_relay_accept_retry_delay(999),
         Duration::from_secs(super::RENDEZVOUS_RELAY_ACCEPT_MAX_RETRY_SECS)
+    );
+}
+
+#[test]
+fn history_head_projection_backfill_retry_delay_backs_off_and_caps() {
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(1),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(2),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(9),
+        Duration::from_secs(256)
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(10),
+        super::HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY
+    );
+    assert_eq!(
+        super::history_head_projection_backfill_retry_delay(u32::MAX),
+        super::HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY
     );
 }
 

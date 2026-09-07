@@ -17,6 +17,10 @@
 //!   serving HTTPS directly. Both must be set together. The files are reloaded periodically so a
 //!   hosting provider can renew them in place without requiring a redeployment.
 //! - `STATS_COLLECTOR_TLS_RELOAD_SECS`: TLS file reload interval, defaults to 24 hours.
+//!
+//! The public fleet dashboard is compiled into this binary. It is served from the same HTTPS
+//! origin as `/v1/stats/dashboard`, so browser requests need no cross-origin privileges or a
+//! separate static-file deployment.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,7 +29,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::Router;
+use axum::extract::OriginalUri;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use axum_server::tls_rustls::RustlsConfig;
+use percent_encoding::percent_decode_str;
 #[cfg(feature = "bundled-country-db")]
 use stats_collector_server::country::BundledCountryResolver;
 use stats_collector_server::{
@@ -34,6 +44,39 @@ use stats_collector_server::{
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+mod embedded_dashboard {
+    use super::*;
+
+    mod generated_assets {
+        include!(concat!(env!("OUT_DIR"), "/fleet_telemetry_assets.rs"));
+    }
+
+    pub async fn serve(OriginalUri(uri): OriginalUri) -> Response {
+        let request_path = uri.path().strip_prefix('/').unwrap_or(uri.path());
+        let asset_path = if request_path.is_empty() {
+            "index.html".into()
+        } else {
+            match percent_decode_str(request_path).decode_utf8() {
+                Ok(path) => path,
+                Err(_) => return StatusCode::NOT_FOUND.into_response(),
+            }
+        };
+
+        match generated_assets::asset(&asset_path) {
+            Some((bytes, content_type, cache_control)) => (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CACHE_CONTROL, cache_control),
+                ],
+                bytes,
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+}
 
 /// How often to sweep stale per-key rate-limit bookkeeping (see
 /// `StatsCollectorAppState::cleanup_rate_limiters`).
@@ -101,7 +144,7 @@ async fn main() -> Result<()> {
     spawn_rate_limit_cleanup(state.clone());
     spawn_retention_sweeper(state.clone(), retention_days);
 
-    let app = build_router(state);
+    let app = build_app(state);
 
     info!(
         %bind_addr,
@@ -109,6 +152,7 @@ async fn main() -> Result<()> {
         k_anonymity_min,
         retention_days,
         tls = tls_files.is_some(),
+        public_dashboard = true,
         "stats-collector-server listening"
     );
 
@@ -143,6 +187,10 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn build_app(state: StatsCollectorAppState) -> Router {
+    build_router(state).fallback(get(embedded_dashboard::serve))
 }
 
 fn tls_files_from_env() -> Result<Option<TlsFiles>> {
@@ -229,4 +277,110 @@ fn spawn_retention_sweeper(state: StatsCollectorAppState, retention_days: u64) {
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use stats_collector_server::storage::IngestStorage;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn compiled_in_dashboard_serves_the_index_and_hashed_assets() {
+        let storage = IngestStorage::open_in_memory()
+            .await
+            .expect("storage should open");
+        let app = build_app(StatsCollectorAppState::new(storage));
+
+        let index_response = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .expect("dashboard should respond");
+        assert_eq!(index_response.status(), StatusCode::OK);
+        assert_eq!(index_response.headers()[header::CACHE_CONTROL], "no-cache");
+        let index_body = axum::body::to_bytes(index_response.into_body(), usize::MAX)
+            .await
+            .expect("dashboard index should be readable");
+        let index_html = String::from_utf8(index_body.to_vec()).expect("dashboard index is UTF-8");
+        assert!(index_html.contains("<title>IronMesh Fleet Reliability</title>"));
+        let script_path = index_html
+            .split("<script")
+            .find_map(|tag| tag.split("src=\"").nth(1))
+            .and_then(|value| value.split('"').next())
+            .expect("dashboard index should reference a script");
+        assert!(script_path.starts_with("/assets/"));
+        assert!(script_path.ends_with(".js"));
+
+        let asset_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(script_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("embedded dashboard asset should respond");
+        assert_eq!(asset_response.status(), StatusCode::OK);
+        assert_eq!(
+            asset_response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            asset_response.headers()[header::CONTENT_TYPE],
+            "application/javascript; charset=utf-8"
+        );
+
+        let favicon_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ironmesh-favicon.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("compiled-in public asset should respond");
+        assert_eq!(favicon_response.status(), StatusCode::OK);
+        assert_eq!(
+            favicon_response.headers()[header::CONTENT_TYPE],
+            "image/svg+xml"
+        );
+
+        let percent_encoded_favicon_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/%69ronmesh-favicon.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("percent-encoded compiled-in public asset should respond");
+        assert_eq!(percent_encoded_favicon_response.status(), StatusCode::OK);
+
+        let unknown_path_response = app
+            .clone()
+            .oneshot(Request::builder().uri("/v1").body(Body::empty()).unwrap())
+            .await
+            .expect("unknown API-adjacent path should respond");
+        assert_eq!(unknown_path_response.status(), StatusCode::NOT_FOUND);
+
+        let unreferenced_documentation_asset_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ironmesh-at-a-glance.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("unreferenced documentation asset should respond");
+        assert_eq!(
+            unreferenced_documentation_asset_response.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
 }

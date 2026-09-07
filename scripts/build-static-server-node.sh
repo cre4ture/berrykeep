@@ -9,7 +9,7 @@ CARGO_ZIGBUILD_VERSION="0.23.0"
 ZIG_CACHE_DIR="${IRONMESH_ZIG_CACHE_DIR:-${HOME}/.cache/ironmesh-build-tools}"
 
 PACKAGE_NAME="server-node"
-BINARY_NAME="ironmesh-server-node"
+BINARY_NAME="berrykeep-server-node"
 TARGET_TRIPLE=""
 TARGET_CPU=""
 VARIANT_ID=""

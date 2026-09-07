@@ -4,7 +4,7 @@
 
 - `main` is the default protected target unless the PR explicitly targets another branch.
 - Treat the PR's actual base branch and the latest remote head SHA as the source of truth.
-- [../../docs/ci-runbook.md](../../docs/ci-runbook.md) summarizes the current required checks and mitigation guidance.
+- [../../../../docs/ci-runbook.md](../../../../docs/ci-runbook.md) summarizes the current required checks and mitigation guidance.
 - `just ci-required` is the closest local reproduction of the protected check set.
 - `just ci-stable`, `just coverage`, `just ci-web-smoke`, and `just test-system-nightly` are the usual narrower reproductions.
 

@@ -7,6 +7,11 @@ struct IronmeshGalleryView: View {
     @StateObject private var galleryModel: IronmeshGalleryModel
     @State private var mode: AppleGalleryMode = .allImages
     @State private var sort: AppleGallerySort = .newest
+    @State private var captureDateRange = AppleGalleryCaptureDateRange()
+    @State private var showingCaptureDateFilter = false
+    // Do not persist a reveal decision across connection configurations. A different gallery
+    // must start private and NSFW media hidden until the user explicitly opts in again.
+    @State private var showSensitiveContent = false
     @State private var selection: IronmeshGallerySelection?
 
     init(remoteSession: IronmeshRemoteSession) {
@@ -27,6 +32,8 @@ struct IronmeshGalleryView: View {
         IronmeshGalleryLoadID(
             mode: mode,
             sort: sort,
+            captureDateRange: captureDateRange,
+            showSensitiveContent: showSensitiveContent,
             currentPath: mode == .currentFolder ? browserModel.currentPath : "",
             configuration: browserModel.draft.connectionConfiguration
         )
@@ -51,11 +58,27 @@ struct IronmeshGalleryView: View {
                 mode: mode,
                 sort: sort,
                 currentPath: browserModel.currentPath,
-                configuration: browserModel.draft.connectionConfiguration
+                configuration: browserModel.draft.connectionConfiguration,
+                showSensitiveContent: showSensitiveContent,
+                captureDateRange: captureDateRange
             )
         }
         .onChange(of: loadID) { _ in
             selection = nil
+        }
+        .onChange(of: browserModel.draft.connectionConfiguration) { _ in
+            showSensitiveContent = false
+        }
+        .sheet(isPresented: $showingCaptureDateFilter) {
+            IronmeshGalleryCaptureDateFilterSheet(
+                currentRange: captureDateRange,
+                onApply: { range in
+                    captureDateRange = range
+                    showingCaptureDateFilter = false
+                },
+                onCancel: { showingCaptureDateFilter = false }
+            )
+            .presentationDetents([.medium])
         }
         .fullScreenCover(item: $selection) { selection in
             if let configuration = browserModel.draft.connectionConfiguration {
@@ -98,6 +121,25 @@ struct IronmeshGalleryView: View {
                 Text("Name").tag(AppleGallerySort.path)
             }
             .pickerStyle(.segmented)
+
+            HStack {
+                Button {
+                    showingCaptureDateFilter = true
+                } label: {
+                    Label(captureDateFilterLabel, systemImage: "calendar")
+                }
+                .buttonStyle(.bordered)
+
+                if captureDateRange.isActive {
+                    Button("Clear date") {
+                        captureDateRange = AppleGalleryCaptureDateRange()
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            Toggle("Show private / NSFW media", isOn: $showSensitiveContent)
+                .font(.subheadline)
         }
         .padding(14)
         .background(.background, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -142,10 +184,12 @@ struct IronmeshGalleryView: View {
         } else if galleryModel.entries.isEmpty {
             IronmeshGalleryMessageView(
                 systemImage: "photo.on.rectangle.angled",
-                title: "No images found",
-                message: mode == .allImages
-                    ? "The media index does not contain images yet."
-                    : "No indexed images are available under \(displayPath(browserModel.currentPath))."
+                title: captureDateRange.isActive ? "No images in this date range" : "No images found",
+                message: captureDateRange.isActive
+                    ? "Choose a different capture-date range or clear the date filter."
+                    : mode == .allImages
+                        ? "The media index does not contain images yet."
+                        : "No indexed images are available under \(displayPath(browserModel.currentPath))."
             )
         } else if let configuration = browserModel.draft.connectionConfiguration {
             if let error = galleryModel.errorMessage {
@@ -191,13 +235,82 @@ struct IronmeshGalleryView: View {
             }
         }
     }
+
+    private var captureDateFilterLabel: String {
+        guard
+            let startDate = captureDateRange.startDate,
+            let endDate = captureDateRange.endDate
+        else {
+            return "Capture date"
+        }
+        if Calendar.current.isDate(startDate, inSameDayAs: endDate) {
+            return startDate.formatted(date: .abbreviated, time: .omitted)
+        }
+        return "\(startDate.formatted(date: .abbreviated, time: .omitted)) – \(endDate.formatted(date: .abbreviated, time: .omitted))"
+    }
 }
 
 private struct IronmeshGalleryLoadID: Equatable {
     let mode: AppleGalleryMode
     let sort: AppleGallerySort
+    let captureDateRange: AppleGalleryCaptureDateRange
+    let showSensitiveContent: Bool
     let currentPath: String
     let configuration: AppleConnectionConfiguration?
+}
+
+private struct IronmeshGalleryCaptureDateFilterSheet: View {
+    let onApply: (AppleGalleryCaptureDateRange) -> Void
+    let onCancel: () -> Void
+
+    @State private var startDate: Date
+    @State private var endDate: Date
+
+    init(
+        currentRange: AppleGalleryCaptureDateRange,
+        onApply: @escaping (AppleGalleryCaptureDateRange) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        self.onApply = onApply
+        self.onCancel = onCancel
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        _startDate = State(initialValue: currentRange.startDate ?? today)
+        _endDate = State(initialValue: currentRange.endDate ?? today)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Capture date") {
+                    DatePicker("From", selection: $startDate, displayedComponents: .date)
+                    DatePicker("Through", selection: $endDate, in: startDate..., displayedComponents: .date)
+                }
+            }
+            .navigationTitle("Filter photos")
+            .navigationBarTitleDisplayMode(.inline)
+            .onChange(of: startDate) { newStartDate in
+                if endDate < newStartDate {
+                    endDate = newStartDate
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onCancel)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Apply") {
+                        onApply(
+                            AppleGalleryCaptureDateRange(
+                                startDate: startDate,
+                                endDate: endDate
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 private struct IronmeshGallerySelection: Identifiable {
@@ -259,6 +372,12 @@ private struct IronmeshGalleryThumbnailCell: View {
                 Text(Date(timeIntervalSince1970: TimeInterval(takenAtUnix)), style: .date)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            }
+            if let labels = entry.labels, !labels.isEmpty {
+                Text(labels.joined(separator: " · "))
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
             }
         }
         .task(id: "\(entry.path)-\(retryGeneration)") {
@@ -354,8 +473,22 @@ private struct IronmeshGalleryViewer: View {
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
-                        dismiss()
+                    HStack {
+                        if let entry = galleryModel.entries.first(where: { $0.path == selectedPath }) {
+                            Menu {
+                                ForEach(["private", "nsfw"], id: \.self) { label in
+                                    let enabled = (entry.labels ?? []).contains(label)
+                                    Button(enabled ? "Remove \(label)" : "Mark \(label)") {
+                                        galleryModel.toggleSensitiveLabel(for: entry, label: label)
+                                    }
+                                }
+                            } label: {
+                                Label("Labels", systemImage: "tag")
+                            }
+                        }
+                        Button("Done") {
+                            dismiss()
+                        }
                     }
                 }
             }

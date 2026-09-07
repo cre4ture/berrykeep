@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sync_core::{NamespaceEntry, SyncSnapshot};
+use sync_core::{EntryKind, NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
     ClientIdentityMaterial, ConnectionCandidate, ExpectedNodeServerIdentity,
@@ -471,6 +471,59 @@ struct ClientRequestSuccessMeasurement<'a> {
     response_body_complete: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ClientRequestSuccessTiming {
+    total_duration_us: u64,
+    server_processing_duration_us: Option<u64>,
+    transport_overhead_us: Option<u64>,
+    session_pool_after: TransportSessionPoolSnapshot,
+    session_setup_duration_us: u64,
+    relay_pairing_duration_us: u64,
+    network_transfer_duration_us: Option<u64>,
+    route_latency_us: u64,
+}
+
+impl ClientRequestSuccessTiming {
+    fn measure(
+        endpoint: &ClientEndpoint,
+        attempt: ClientRequestAttemptContext<'_>,
+        measurement: &ClientRequestSuccessMeasurement<'_>,
+    ) -> Self {
+        let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
+        let server_processing_duration_us = parse_header_u64(
+            measurement.response_headers,
+            HEADER_SERVER_PROCESSING_DURATION_US,
+        );
+        let transport_overhead_us = server_processing_duration_us
+            .map(|server_duration| total_duration_us.saturating_sub(server_duration));
+        let session_pool_after = endpoint.transport.session_pool_snapshot();
+        let session_setup_duration_us = session_pool_after
+            .connect_duration_us
+            .saturating_sub(attempt.session_pool_before.connect_duration_us);
+        let relay_pairing_duration_us = session_pool_after
+            .relay_pairing_duration_us
+            .saturating_sub(attempt.session_pool_before.relay_pairing_duration_us);
+        let network_transfer_duration_us = transport_overhead_us
+            .map(|overhead| overhead.saturating_sub(session_setup_duration_us));
+        let route_latency_us = route_latency_duration_us(
+            total_duration_us,
+            server_processing_duration_us,
+            session_setup_duration_us,
+        );
+
+        Self {
+            total_duration_us,
+            server_processing_duration_us,
+            transport_overhead_us,
+            session_pool_after,
+            session_setup_duration_us,
+            relay_pairing_duration_us,
+            network_transfer_duration_us,
+            route_latency_us,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ClientEndpoint {
     descriptor: ClientEndpointDescriptor,
@@ -732,21 +785,64 @@ struct RoutedBufferedTransportResponse {
     response: BufferedTransportResponse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteDiagnosticsTracking {
+    Enabled,
+    Disabled,
+}
+
+impl RouteDiagnosticsTracking {
+    const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 /// Shared foreground failover policy. Transport-specific functions perform I/O and construct
 /// measurements; this executor is the single owner of stable candidate resolution, admission,
 /// retry/stop classification, circuit transitions, and terminal diagnostics publication.
 struct ForegroundRequestExecutor<'a> {
     client: &'a IronMeshClient,
     routes: RequestExecutor,
+    route_diagnostics_tracking: RouteDiagnosticsTracking,
     last_error: Option<anyhow::Error>,
     last_completed_operation: Option<ClientConnectionOperationResult>,
 }
 
 impl<'a> ForegroundRequestExecutor<'a> {
     fn new(client: &'a IronMeshClient, route_ids: Vec<RouteId>) -> Self {
+        Self::new_with_route_diagnostics_tracking(
+            client,
+            route_ids,
+            RouteDiagnosticsTracking::Enabled,
+        )
+    }
+
+    /// Some high-volume auxiliary requests, such as map tiles, use normal
+    /// route selection and transport-error failover without adding their
+    /// request attempts to foreground connection diagnostics. Retryable HTTP
+    /// responses are returned to the caller without route fanout because they
+    /// can describe an application-level map-data failure rather than an
+    /// unhealthy transport.
+    fn new_without_route_diagnostics_tracking(
+        client: &'a IronMeshClient,
+        route_ids: Vec<RouteId>,
+    ) -> Self {
+        Self::new_with_route_diagnostics_tracking(
+            client,
+            route_ids,
+            RouteDiagnosticsTracking::Disabled,
+        )
+    }
+
+    fn new_with_route_diagnostics_tracking(
+        client: &'a IronMeshClient,
+        route_ids: Vec<RouteId>,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
+    ) -> Self {
         Self {
             client,
             routes: RequestExecutor::new(route_ids),
+            route_diagnostics_tracking,
             last_error: None,
             last_completed_operation: None,
         }
@@ -769,9 +865,19 @@ impl<'a> ForegroundRequestExecutor<'a> {
         None
     }
 
+    fn record_route_used(&self, index: usize, endpoint: &ClientEndpoint, used_at_unix_ms: u64) {
+        if self.route_diagnostics_tracking.is_enabled() {
+            self.client
+                .record_route_used(index, endpoint, used_at_unix_ms);
+        }
+    }
+
     fn record_preflight_failure(&mut self, endpoint: &ClientEndpoint, error: anyhow::Error) {
         self.client
             .record_route_failure(endpoint, &format!("{error:#}"));
+        if !self.route_diagnostics_tracking.is_enabled() {
+            self.client.signal_route_supervisor();
+        }
         self.last_error = Some(error);
     }
 
@@ -787,13 +893,15 @@ impl<'a> ForegroundRequestExecutor<'a> {
             RequestExecutor::classify_http_status(is_retryable_transport_status(status)),
             AttemptDisposition::RetryNextRoute
         );
-        self.last_completed_operation = Some(self.client.record_request_failure_with_status(
-            index,
-            endpoint,
-            attempt,
-            &format!("{error:#}"),
-            Some(status),
-        ));
+        if self.route_diagnostics_tracking.is_enabled() {
+            self.last_completed_operation = Some(self.client.record_request_failure_with_status(
+                index,
+                endpoint,
+                attempt,
+                &format!("{error:#}"),
+                Some(status),
+            ));
+        }
         self.last_error = Some(error);
     }
 
@@ -809,12 +917,21 @@ impl<'a> ForegroundRequestExecutor<'a> {
             should_suppress_route_fanout(&error),
             request_body_reusable,
         );
-        self.last_completed_operation = Some(self.client.record_request_failure(
-            index,
-            endpoint,
-            attempt,
-            &format!("{error:#}"),
-        ));
+        if self.route_diagnostics_tracking.is_enabled() {
+            self.last_completed_operation = Some(self.client.record_request_failure(
+                index,
+                endpoint,
+                attempt,
+                &format!("{error:#}"),
+            ));
+        } else {
+            self.client.record_transport_failure_without_diagnostics(
+                index,
+                endpoint,
+                &format!("{error:#}"),
+            );
+            self.client.signal_route_supervisor();
+        }
         self.last_error = Some(error);
         if disposition == AttemptDisposition::Stop {
             tracing::info!(
@@ -837,19 +954,31 @@ impl<'a> ForegroundRequestExecutor<'a> {
         attempt: ClientRequestAttemptContext<'_>,
         measurement: ClientRequestSuccessMeasurement<'_>,
     ) {
-        let completed_operation =
+        if self.route_diagnostics_tracking.is_enabled() {
+            let completed_operation =
+                self.client
+                    .record_request_success(index, endpoint, attempt, measurement);
             self.client
-                .record_request_success(index, endpoint, attempt, measurement);
-        self.client
-            .publish_connection_diagnostics(Some(completed_operation));
-        self.client.signal_route_supervisor();
+                .publish_connection_diagnostics(Some(completed_operation));
+            self.client.signal_route_supervisor();
+        } else {
+            let timing = ClientRequestSuccessTiming::measure(endpoint, attempt, &measurement);
+            self.client.record_transport_success_without_diagnostics(
+                index,
+                endpoint,
+                timing.route_latency_us as f64 / 1_000.0,
+                measurement.response_bytes,
+            );
+        }
     }
 
     fn finish<T>(self, no_routes: impl FnOnce() -> anyhow::Error) -> Result<T> {
         let error = self.last_error.unwrap_or_else(no_routes);
-        self.client
-            .publish_connection_diagnostics(self.last_completed_operation);
-        self.client.signal_route_supervisor();
+        if self.route_diagnostics_tracking.is_enabled() {
+            self.client
+                .publish_connection_diagnostics(self.last_completed_operation);
+            self.client.signal_route_supervisor();
+        }
         Err(error)
     }
 }
@@ -1531,6 +1660,43 @@ impl ClientEndpointRouter {
         self.notify_transport_failure_when_exhausted(had_selectable_route);
     }
 
+    /// Updates failure backoff for an actual transport error without adding a
+    /// high-volume auxiliary request to the foreground attempt history.
+    fn record_transport_failure_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        error: &str,
+    ) {
+        let had_selectable_route = self.has_selectable_route();
+        let mut state = lock_endpoint_state(&endpoint.state);
+        record_endpoint_failure_sample(&mut state, error, false);
+        drop(state);
+        if is_timeout_error_message(error) {
+            self.log_timeout_route_reprioritized(index, error);
+        }
+        self.notify_transport_failure_when_exhausted(had_selectable_route);
+    }
+
+    /// Updates endpoint health for a successful high-volume auxiliary request
+    /// without adding an entry to the foreground attempt history.
+    fn record_transport_success_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        route_latency_ms: f64,
+        response_bytes: usize,
+    ) {
+        let mut state = lock_endpoint_state(&endpoint.state);
+        let first_relay_connection =
+            state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
+        record_endpoint_success_sample(&mut state, route_latency_ms, response_bytes, false);
+        drop(state);
+        if first_relay_connection {
+            self.notify_first_relay_connection(index, endpoint);
+        }
+    }
+
     #[cfg(test)]
     fn record_background_probe_successes(&self, index: usize, latency_samples_ms: &[f64]) {
         let Some(candidate) = self.background_probe_candidate_at_index(index) else {
@@ -1678,35 +1844,15 @@ impl ClientEndpointRouter {
         let first_relay_connection =
             state.total_successes == 0 && endpoint.transport.relay_target_node_id().is_some();
         let finished_unix_ms = unix_ts_ms();
-        let total_duration_us = duration_ms_as_u64_micros(measurement.total_duration_ms);
-        let server_processing_duration_us = parse_header_u64(
-            measurement.response_headers,
-            HEADER_SERVER_PROCESSING_DURATION_US,
-        );
-        let transport_overhead_us = server_processing_duration_us
-            .map(|server_duration| total_duration_us.saturating_sub(server_duration));
-        let session_pool_after = endpoint.transport.session_pool_snapshot();
-        let session_setup_duration_us = session_pool_after
-            .connect_duration_us
-            .saturating_sub(attempt.session_pool_before.connect_duration_us);
-        let relay_pairing_duration_us = session_pool_after
-            .relay_pairing_duration_us
-            .saturating_sub(attempt.session_pool_before.relay_pairing_duration_us);
-        let network_transfer_duration_us = transport_overhead_us
-            .map(|overhead| overhead.saturating_sub(session_setup_duration_us));
-        let route_latency_us = route_latency_duration_us(
-            total_duration_us,
-            server_processing_duration_us,
-            session_setup_duration_us,
-        );
+        let timing = ClientRequestSuccessTiming::measure(endpoint, attempt, &measurement);
         record_endpoint_success_sample(
             &mut state,
-            route_latency_us as f64 / 1_000.0,
+            timing.route_latency_us as f64 / 1_000.0,
             measurement.response_bytes,
             false,
         );
         let session_reused =
-            session_pool_after.reuse_count > attempt.session_pool_before.reuse_count;
+            timing.session_pool_after.reuse_count > attempt.session_pool_before.reuse_count;
         let server_received_unix_ms =
             parse_header_u64(measurement.response_headers, HEADER_SERVER_RECEIVED_UNIX_MS);
         let server_responded_unix_ms = parse_header_u64(
@@ -1718,7 +1864,7 @@ impl ClientEndpointRouter {
             finished_unix_ms,
             server_received_unix_ms,
             server_responded_unix_ms,
-            transport_overhead_us,
+            timing.transport_overhead_us,
         );
         let display_url = attempt_display_url(endpoint, attempt.url);
         if impact.affects_user_facing_connection_status() {
@@ -1734,12 +1880,12 @@ impl ClientEndpointRouter {
             timeout_ms: attempt.timeout.and_then(duration_to_u64_ms),
             outcome: "success".to_string(),
             status_code: Some(measurement.status.as_u16()),
-            total_duration_us: Some(total_duration_us),
-            server_processing_duration_us,
-            transport_overhead_us,
-            session_setup_duration_us,
-            relay_pairing_duration_us,
-            network_transfer_duration_us,
+            total_duration_us: Some(timing.total_duration_us),
+            server_processing_duration_us: timing.server_processing_duration_us,
+            transport_overhead_us: timing.transport_overhead_us,
+            session_setup_duration_us: timing.session_setup_duration_us,
+            relay_pairing_duration_us: timing.relay_pairing_duration_us,
+            network_transfer_duration_us: timing.network_transfer_duration_us,
             session_reused,
             request_bytes: usize_as_u64(measurement.request_bytes),
             response_bytes: usize_as_u64(measurement.response_bytes),
@@ -3313,6 +3459,10 @@ struct UploadSessionStartRequest {
     parent: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     chunk_refs: Vec<UploadSessionChunkRef>,
 }
@@ -3342,6 +3492,8 @@ struct UploadSessionChunkResponse {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct UploadSessionCompleteResponse {
+    #[serde(default)]
+    object_id: String,
     snapshot_id: String,
     version_id: String,
     manifest_hash: String,
@@ -3385,6 +3537,14 @@ struct ResumableDownloadFileState {
 pub struct StoreIndexEntry {
     pub path: String,
     pub entry_type: String,
+    #[serde(default)]
+    pub object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// True only when the response could authoritatively read the entry's
+    /// XMP-sidecar labels. Callers must not replace labels when false.
+    #[serde(default)]
+    pub labels_resolved: bool,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -3556,7 +3716,15 @@ pub struct StoreIndexRequestOptions {
     pub limit: Option<usize>,
     pub sort: Option<StoreIndexSortOrder>,
     pub media_filter: Option<StoreIndexMediaFilter>,
+    /// Inclusive lower bound for the effective media capture timestamp.
+    pub captured_from_unix: Option<u64>,
+    /// Exclusive upper bound for the effective media capture timestamp.
+    pub captured_until_unix: Option<u64>,
     pub viewport: Option<StoreIndexViewport>,
+    /// Labels that must all be present on an entry.
+    pub require_labels: Vec<String>,
+    /// Labels that must not be present on an entry.
+    pub exclude_labels: Vec<String>,
     pub synthesize_missing_folder_markers: bool,
 }
 
@@ -3570,7 +3738,11 @@ impl Default for StoreIndexRequestOptions {
             limit: None,
             sort: None,
             media_filter: None,
+            captured_from_unix: None,
+            captured_until_unix: None,
             viewport: None,
+            require_labels: Vec::new(),
+            exclude_labels: Vec::new(),
             synthesize_missing_folder_markers: true,
         }
     }
@@ -3591,6 +3763,10 @@ pub struct GalleryMapClustersRequest {
     pub media_filter: StoreIndexMediaFilter,
     pub viewport: StoreIndexViewport,
     pub zoom: f64,
+    /// Labels that must all be present in map aggregates.
+    pub require_labels: Vec<String>,
+    /// Labels that must not affect map aggregates or cluster entries.
+    pub exclude_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -3762,7 +3938,72 @@ struct PathMutationRequest {
     overwrite: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     expected_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object_id: Option<String>,
 }
+
+#[derive(Debug, Serialize)]
+struct ObjectRenameRequest {
+    to_path: String,
+    overwrite: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectLookup {
+    pub object_id: String,
+    pub path: String,
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub tombstone_predecessor_revision: Option<String>,
+    pub entry_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectMutationResult {
+    pub object_id: String,
+    pub path: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectMutationUploadResult {
+    pub object_id: String,
+    pub path: String,
+    pub revision: String,
+    pub size_bytes: usize,
+}
+
+/// A server-side compare-and-swap or namespace collision rejected an object mutation.
+/// Callers must preserve the local change and reconcile instead of retrying the
+/// mutation as an unguarded path operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMutationConflict {
+    operation: &'static str,
+    target: String,
+}
+
+impl ObjectMutationConflict {
+    fn new(operation: &'static str, target: impl Into<String>) -> Self {
+        Self {
+            operation,
+            target: target.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ObjectMutationConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "409 Conflict during {} for {}",
+            self.operation, self.target
+        )
+    }
+}
+
+impl std::error::Error for ObjectMutationConflict {}
 
 #[derive(Debug, Serialize)]
 struct SnapshotRestoreRequest {
@@ -3777,6 +4018,12 @@ struct SnapshotRestoreRequest {
 struct VersionRestoreRequest {
     to_path: String,
     overwrite: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MediaLabelsRequest {
+    path: String,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4267,6 +4514,32 @@ impl IronMeshClient {
             .record_endpoint_failure(endpoint, error);
     }
 
+    fn record_transport_failure_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        error: &str,
+    ) {
+        self.transport_router
+            .record_transport_failure_without_diagnostics(index, endpoint, error);
+    }
+
+    fn record_transport_success_without_diagnostics(
+        &self,
+        index: usize,
+        endpoint: &ClientEndpoint,
+        route_latency_ms: f64,
+        response_bytes: usize,
+    ) {
+        self.transport_router
+            .record_transport_success_without_diagnostics(
+                index,
+                endpoint,
+                route_latency_ms,
+                response_bytes,
+            );
+    }
+
     fn record_request_failure(
         &self,
         index: usize,
@@ -4504,16 +4777,62 @@ impl IronMeshClient {
         &self,
         method: Method,
         url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+        route_ids: &[RouteId],
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_on_routes_with_route_diagnostics_tracking(
+            method,
+            url,
+            headers,
+            body,
+            route_ids,
+            RouteDiagnosticsTracking::Enabled,
+        )
+        .await
+    }
+
+    async fn execute_buffered_request_on_routes_without_route_diagnostics_tracking(
+        &self,
+        method: Method,
+        url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+        route_ids: &[RouteId],
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_on_routes_with_route_diagnostics_tracking(
+            method,
+            url,
+            headers,
+            body,
+            route_ids,
+            RouteDiagnosticsTracking::Disabled,
+        )
+        .await
+    }
+
+    async fn execute_buffered_request_on_routes_with_route_diagnostics_tracking(
+        &self,
+        method: Method,
+        url: Url,
         mut headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
         route_ids: &[RouteId],
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
     ) -> Result<RoutedBufferedTransportResponse> {
         ensure_operation_id_header(&method, &mut headers);
         let request_timeout = buffered_request_timeout(&url);
 
         let auth = self.auth_snapshot();
 
-        let mut execution = ForegroundRequestExecutor::new(self, route_ids.to_vec());
+        let mut execution = if route_diagnostics_tracking.is_enabled() {
+            ForegroundRequestExecutor::new(self, route_ids.to_vec())
+        } else {
+            ForegroundRequestExecutor::new_without_route_diagnostics_tracking(
+                self,
+                route_ids.to_vec(),
+            )
+        };
         while let Some((index, endpoint)) = execution.next() {
             let endpoint_context = endpoint_context(index, &endpoint);
             let endpoint_url = endpoint
@@ -4537,7 +4856,7 @@ impl IronMeshClient {
             let session_pool_before = endpoint.transport.session_pool_snapshot();
             let started_at = std::time::Instant::now();
             let started_unix_ms = unix_ts_ms();
-            self.record_route_used(index, &endpoint, started_unix_ms);
+            execution.record_route_used(index, &endpoint, started_unix_ms);
             match execute_buffered_request_for_transport(
                 &endpoint.transport,
                 &auth,
@@ -4554,6 +4873,13 @@ impl IronMeshClient {
                         response.status,
                     )) == AttemptDisposition::RetryNextRoute =>
                 {
+                    if !route_diagnostics_tracking.is_enabled() {
+                        return Ok(RoutedBufferedTransportResponse {
+                            route_affinity: NodeRouteAffinity::from_endpoint(&endpoint),
+                            endpoint_context,
+                            response,
+                        });
+                    }
                     execution.record_retryable_status(
                         index,
                         &endpoint,
@@ -4793,17 +5119,42 @@ impl IronMeshClient {
     async fn execute_buffered_request_with_route(
         &self,
         method: Method,
+        url: Url,
+        headers: Vec<RelayHttpHeader>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.execute_buffered_request_with_route_diagnostics_tracking(
+            method,
+            url,
+            headers,
+            body,
+            RouteDiagnosticsTracking::Enabled,
+        )
+        .await
+    }
+
+    async fn execute_buffered_request_with_route_diagnostics_tracking(
+        &self,
+        method: Method,
         mut url: Url,
         headers: Vec<RelayHttpHeader>,
         body: Option<Vec<u8>>,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
     ) -> Result<RoutedBufferedTransportResponse> {
         let snapshot_owner_node_id = normalize_client_snapshot_selector_in_url(&mut url)?;
         let route_ids = match snapshot_owner_node_id {
             Some(node_id) => self.route_ids_for_target_node(node_id)?,
             None => self.transport_router.foreground_route_ids(),
         };
-        self.execute_buffered_request_on_routes(method, url, headers, body, &route_ids)
+        if route_diagnostics_tracking.is_enabled() {
+            self.execute_buffered_request_on_routes(method, url, headers, body, &route_ids)
+                .await
+        } else {
+            self.execute_buffered_request_on_routes_without_route_diagnostics_tracking(
+                method, url, headers, body, &route_ids,
+            )
             .await
+        }
     }
 
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
@@ -4817,6 +5168,25 @@ impl IronMeshClient {
         expected_revision: Option<&str>,
     ) -> Result<StorageObjectMeta> {
         let key = key.into();
+        let size_bytes = data.len();
+        let mutation = self
+            .put_with_expected_revision_result(key.clone(), data, expected_revision)
+            .await?;
+        Ok(StorageObjectMeta {
+            key,
+            size_bytes,
+            object_id: mutation.map(|mutation| mutation.object_id),
+        })
+    }
+
+    pub async fn put_with_expected_revision_result(
+        &self,
+        key: impl Into<String>,
+        data: Bytes,
+        expected_revision: Option<&str>,
+    ) -> Result<Option<ObjectMutationUploadResult>> {
+        let key = key.into();
+        let size_bytes = data.len();
         let mut url = self.store_key_url(&key)?;
         append_optional_query(&mut url, "expected_revision", expected_revision);
 
@@ -4824,14 +5194,214 @@ impl IronMeshClient {
             .execute_buffered_request(Method::PUT, url, Vec::new(), Some(data.to_vec()))
             .await
             .with_context(|| format!("failed to PUT object key={key}"))?;
+        if response.status == StatusCode::CONFLICT {
+            return Err(ObjectMutationConflict::new("PUT", format!("path={key}")).into());
+        }
         if !response.status.is_success() {
             bail!("server rejected PUT for key={key}: {}", response.status);
         }
 
+        let mutation = if response.body.is_empty() {
+            None
+        } else {
+            let mutation = serde_json::from_slice::<ObjectMutationResult>(&response.body)
+                .context("failed to parse PUT object identity response")?;
+            if mutation.path != key || mutation.revision.trim().is_empty() {
+                bail!("server returned an inconsistent PUT object identity response");
+            }
+            Some(ObjectMutationUploadResult {
+                object_id: mutation.object_id,
+                path: mutation.path,
+                revision: mutation.revision,
+                size_bytes,
+            })
+        };
+        Ok(mutation)
+    }
+
+    pub async fn lookup_object_by_id(
+        &self,
+        object_id: impl AsRef<str>,
+    ) -> Result<Option<ObjectLookup>> {
+        let object_id = object_id.as_ref();
+        let url = self.object_url(object_id)?;
+        let response = self
+            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to look up object_id={object_id}"))?;
+        match response.status {
+            StatusCode::OK => serde_json::from_slice::<ObjectLookup>(&response.body)
+                .map(Some)
+                .context("failed to parse object identity lookup response"),
+            StatusCode::NOT_FOUND => Ok(None),
+            status => Err(anyhow!(
+                "object identity lookup failed for {object_id}: {status}"
+            )),
+        }
+    }
+
+    pub async fn put_by_object_id(
+        &self,
+        object_id: impl AsRef<str>,
+        data: Bytes,
+        expected_revision: Option<&str>,
+    ) -> Result<StorageObjectMeta> {
+        let mutation = self
+            .put_by_object_id_with_result(object_id, data, expected_revision)
+            .await?;
         Ok(StorageObjectMeta {
-            key,
-            size_bytes: data.len(),
+            key: mutation.path,
+            size_bytes: mutation.size_bytes,
+            object_id: Some(mutation.object_id),
         })
+    }
+
+    pub async fn put_by_object_id_with_result(
+        &self,
+        object_id: impl AsRef<str>,
+        data: Bytes,
+        expected_revision: Option<&str>,
+    ) -> Result<ObjectMutationUploadResult> {
+        let object_id = object_id.as_ref();
+        let size_bytes = data.len();
+        let mut url = self.object_url(object_id)?;
+        append_optional_query(&mut url, "expected_revision", expected_revision);
+        let response = self
+            .execute_buffered_request(Method::PUT, url, Vec::new(), Some(data.to_vec()))
+            .await
+            .with_context(|| format!("failed to PUT object_id={object_id}"))?;
+        if response.status == StatusCode::CONFLICT {
+            return Err(
+                ObjectMutationConflict::new("PUT", format!("object_id={object_id}")).into(),
+            );
+        }
+        if !response.status.is_success() {
+            bail!(
+                "server rejected PUT for object_id={object_id}: {}",
+                response.status
+            );
+        }
+        let mutation = serde_json::from_slice::<ObjectMutationResult>(&response.body)
+            .context("failed to parse object-id PUT response")?;
+        if mutation.object_id != object_id || mutation.revision.trim().is_empty() {
+            bail!("server returned an inconsistent object-id PUT response");
+        }
+        Ok(ObjectMutationUploadResult {
+            object_id: mutation.object_id,
+            path: mutation.path,
+            revision: mutation.revision,
+            size_bytes,
+        })
+    }
+
+    pub async fn rename_object_by_id(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        self.rename_object_by_id_with_result(object_id, to_path, overwrite, expected_revision)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn rename_object_by_id_with_result(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<ObjectMutationResult> {
+        let object_id = object_id.as_ref();
+        let to_path = to_path.into();
+        let payload = serde_json::to_vec(&ObjectRenameRequest {
+            to_path: to_path.clone(),
+            overwrite,
+            expected_revision: expected_revision.map(str::to_string),
+        })
+        .context("failed to encode object-id rename request")?;
+        let response = self
+            .execute_buffered_request(
+                Method::POST,
+                self.object_rename_url(object_id)?,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
+            .await
+            .with_context(|| format!("failed to rename object_id={object_id} to {to_path}"))?;
+        match response.status {
+            StatusCode::OK => {
+                let mutation = serde_json::from_slice::<ObjectMutationResult>(&response.body)
+                    .context("failed to parse object-id rename response")?;
+                if mutation.object_id != object_id || mutation.revision.trim().is_empty() {
+                    bail!("server returned an inconsistent object-id rename response");
+                }
+                Ok(mutation)
+            }
+            // Older servers returned 204. Resolve the identity immediately so
+            // callers never mark a locally renamed object in sync with the
+            // predecessor revision that was just consumed by the rename CAS.
+            StatusCode::NO_CONTENT => {
+                let resolved = self
+                    .lookup_object_by_id(object_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("renamed object identity not found: {object_id}"))?;
+                let revision = resolved
+                    .revision
+                    .filter(|revision| !revision.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("renamed object has no concrete revision: {object_id}")
+                    })?;
+                Ok(ObjectMutationResult {
+                    object_id: resolved.object_id,
+                    path: resolved.path,
+                    revision,
+                })
+            }
+            StatusCode::NOT_FOUND => bail!("object identity not found: {object_id}"),
+            StatusCode::CONFLICT => Err(ObjectMutationConflict::new(
+                "rename",
+                format!("object_id={object_id} target={to_path}"),
+            )
+            .into()),
+            status => Err(anyhow!("rename failed for object_id={object_id}: {status}")),
+        }
+    }
+
+    pub async fn delete_object_by_id(
+        &self,
+        object_id: impl AsRef<str>,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        self.delete_object_by_id_with_recursive(object_id, expected_revision, false)
+            .await
+    }
+
+    pub async fn delete_object_by_id_with_recursive(
+        &self,
+        object_id: impl AsRef<str>,
+        expected_revision: Option<&str>,
+        recursive: bool,
+    ) -> Result<()> {
+        let object_id = object_id.as_ref();
+        let mut url = self.object_url(object_id)?;
+        append_optional_query(&mut url, "expected_revision", expected_revision);
+        if recursive {
+            url.query_pairs_mut().append_pair("recursive", "true");
+        }
+        let response = self
+            .execute_buffered_request(Method::DELETE, url, Vec::new(), None)
+            .await
+            .with_context(|| format!("failed to delete object_id={object_id}"))?;
+        match response.status {
+            StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::NOT_FOUND => bail!("object identity not found: {object_id}"),
+            StatusCode::CONFLICT => {
+                Err(ObjectMutationConflict::new("delete", format!("object_id={object_id}")).into())
+            }
+            status => Err(anyhow!("delete failed for object_id={object_id}: {status}")),
+        }
     }
 
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Bytes> {
@@ -4864,6 +5434,37 @@ impl IronMeshClient {
         Ok(response.body)
     }
 
+    pub async fn get_history_source_version(
+        &self,
+        key: impl AsRef<str>,
+        source_object_id: &str,
+        version: &str,
+    ) -> Result<Bytes> {
+        let key = key.as_ref();
+        let source_object_id = source_object_id.trim();
+        let version = version.trim();
+        if source_object_id.is_empty() || version.is_empty() {
+            bail!("history source object id and version must not be empty");
+        }
+        let mut url = self.store_key_url(key)?;
+        append_optional_query(&mut url, "object_id", Some(source_object_id));
+        append_optional_query(&mut url, "version", Some(version));
+
+        let routed = self
+            .execute_buffered_request_with_route(Method::GET, url, Vec::new(), None)
+            .await
+            .map_err(|error| anyhow!("failed to GET historical object key={key}: {error:#}"))?;
+        let endpoint_context = routed.endpoint_context;
+        let response = routed.response;
+        if !response.status.is_success() {
+            bail!(
+                "historical object not found or inaccessible key={key}: {} ({endpoint_context})",
+                response.status,
+            );
+        }
+        Ok(response.body)
+    }
+
     pub async fn rename_path(
         &self,
         from_path: impl Into<String>,
@@ -4889,6 +5490,7 @@ impl IronMeshClient {
             to_path: to_path.clone(),
             overwrite,
             expected_revision: expected_revision.map(str::to_string),
+            object_id: None,
         })
         .context("failed to encode rename request")?;
 
@@ -4926,6 +5528,7 @@ impl IronMeshClient {
             to_path: to_path.clone(),
             overwrite,
             expected_revision: None,
+            object_id: None,
         })
         .context("failed to encode copy request")?;
 
@@ -5212,6 +5815,14 @@ impl IronMeshClient {
             url.query_pairs_mut()
                 .append_pair("media_filter", media_filter.as_query_value());
         }
+        if let Some(captured_from_unix) = options.captured_from_unix {
+            url.query_pairs_mut()
+                .append_pair("captured_from_unix", &captured_from_unix.to_string());
+        }
+        if let Some(captured_until_unix) = options.captured_until_unix {
+            url.query_pairs_mut()
+                .append_pair("captured_until_unix", &captured_until_unix.to_string());
+        }
         if let Some(viewport) = options.viewport {
             url.query_pairs_mut()
                 .append_pair("south", &viewport.south.to_string())
@@ -5219,6 +5830,8 @@ impl IronMeshClient {
                 .append_pair("north", &viewport.north.to_string())
                 .append_pair("east", &viewport.east.to_string());
         }
+        append_comma_separated_labels(&mut url, "require_labels", &options.require_labels);
+        append_comma_separated_labels(&mut url, "exclude_labels", &options.exclude_labels);
 
         let response = self
             .execute_buffered_request(Method::GET, url, Vec::new(), None)
@@ -5282,6 +5895,47 @@ impl IronMeshClient {
     ) -> Result<StoreIndexResponse> {
         let runtime = blocking_runtime()?;
         runtime.block_on(self.store_index_with_options(prefix, depth, snapshot, options))
+    }
+
+    /// Replaces the XMP sidecar labels attached to a media object.
+    pub async fn set_media_labels(
+        &self,
+        key: impl Into<String>,
+        labels: Vec<String>,
+    ) -> Result<()> {
+        let key = key.into();
+        let payload = serde_json::to_vec(&MediaLabelsRequest {
+            path: key.clone(),
+            labels,
+        })
+        .context("failed to encode media labels request")?;
+        let response = self
+            .execute_buffered_request(
+                Method::POST,
+                self.store_labels_url()?,
+                vec![json_content_type_header()],
+                Some(payload),
+            )
+            .await
+            .with_context(|| format!("failed to update media labels for {key}"))?;
+
+        if response.status == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            bail!(
+                "updating media labels for {key} returned non-success status: {}",
+                response.status
+            )
+        }
+    }
+
+    pub fn set_media_labels_blocking(
+        &self,
+        key: impl Into<String>,
+        labels: Vec<String>,
+    ) -> Result<()> {
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.set_media_labels(key, labels))
     }
 
     pub async fn wait_for_store_index_change(
@@ -5370,6 +6024,8 @@ impl IronMeshClient {
             .append_pair("zoom", &zoom.to_string())
             .append_pair("zoom_precise", &zoom_precise.to_string());
         drop(query);
+        append_comma_separated_labels(&mut url, "require_labels", &request.require_labels);
+        append_comma_separated_labels(&mut url, "exclude_labels", &request.exclude_labels);
         Ok(url)
     }
 
@@ -5528,19 +6184,70 @@ impl IronMeshClient {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<RelativePathResponse> {
+        self.request_relative_path_with_route_diagnostics_tracking(
+            method,
+            path,
+            headers,
+            body,
+            RouteDiagnosticsTracking::Enabled,
+        )
+        .await
+    }
+
+    /// Requests a relative path using normal route selection and transport-error
+    /// failover, but leaves high-volume request attempts out of connection
+    /// diagnostics. Retryable HTTP responses are returned without route fanout.
+    ///
+    /// This is for high-volume auxiliary traffic where an HTTP failure does not
+    /// by itself indicate an unhealthy transport or failed product operation.
+    /// Actual transport failures still update route backoff so this traffic
+    /// cannot hammer an unreachable endpoint. Callers should keep ordinary
+    /// application requests on [`Self::request_relative_path`] so connection
+    /// diagnostics continue to represent product traffic.
+    pub async fn request_relative_path_without_route_diagnostics(
+        &self,
+        method: Method,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+    ) -> Result<RelativePathResponse> {
+        self.request_relative_path_with_route_diagnostics_tracking(
+            method,
+            path,
+            headers,
+            body,
+            RouteDiagnosticsTracking::Disabled,
+        )
+        .await
+    }
+
+    async fn request_relative_path_with_route_diagnostics_tracking(
+        &self,
+        method: Method,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+        route_diagnostics_tracking: RouteDiagnosticsTracking,
+    ) -> Result<RelativePathResponse> {
         let url = self.relative_url(path)?;
         let headers = headers
             .into_iter()
             .map(|(name, value)| RelayHttpHeader { name, value })
             .collect::<Vec<_>>();
         let response = self
-            .execute_buffered_request(method, url, headers, body)
+            .execute_buffered_request_with_route_diagnostics_tracking(
+                method,
+                url,
+                headers,
+                body,
+                route_diagnostics_tracking,
+            )
             .await
             .with_context(|| format!("failed to request {path}"))?;
         Ok(RelativePathResponse {
-            status: response.status,
-            headers: response.headers,
-            body: response.body,
+            status: response.response.status,
+            headers: response.response.headers,
+            body: response.response.body,
         })
     }
 
@@ -6052,6 +6759,18 @@ impl IronMeshClient {
         total_size_bytes: u64,
         chunk_refs: Vec<UploadSessionChunkRef>,
     ) -> Result<UploadSessionView> {
+        self.start_upload_session_with_mutation(key, total_size_bytes, chunk_refs, None, None)
+            .await
+    }
+
+    async fn start_upload_session_with_mutation(
+        &self,
+        key: &str,
+        total_size_bytes: u64,
+        chunk_refs: Vec<UploadSessionChunkRef>,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+    ) -> Result<UploadSessionView> {
         let url = self.store_upload_session_start_url()?;
         let payload = serde_json::to_vec(&UploadSessionStartRequest {
             key: key.to_string(),
@@ -6059,6 +6778,8 @@ impl IronMeshClient {
             state: None,
             parent: Vec::new(),
             version_id: None,
+            object_id: object_id.map(ToString::to_string),
+            expected_revision: expected_revision.map(ToString::to_string),
             chunk_refs,
         })
         .context("failed to encode upload session start payload")?;
@@ -6074,6 +6795,19 @@ impl IronMeshClient {
             .await
             .with_context(|| format!("failed to start upload session for key={key}"))?;
         let response = routed.response;
+        if response.status == StatusCode::CONFLICT {
+            return Err(ObjectMutationConflict::new(
+                "upload-session-start",
+                match (object_id, expected_revision) {
+                    (Some(object_id), Some(expected_revision)) => {
+                        format!("object_id={object_id} expected_revision={expected_revision}")
+                    }
+                    (Some(object_id), None) => format!("object_id={object_id}"),
+                    _ => format!("path={key}"),
+                },
+            )
+            .into());
+        }
         if !response.status.is_success() {
             bail!(
                 "server rejected upload session start for key={key}: {}",
@@ -6202,6 +6936,14 @@ impl IronMeshClient {
             .with_context(|| format!("failed to complete upload session {upload_id}"))?;
         let response = routed.response;
 
+        if response.status == StatusCode::CONFLICT {
+            self.clear_upload_session_affinity(upload_id);
+            return Err(ObjectMutationConflict::new(
+                "upload-session-complete",
+                format!("session={upload_id}"),
+            )
+            .into());
+        }
         if !response.status.is_success() {
             bail!(
                 "upload session completion rejected for session={upload_id}: {}",
@@ -6878,6 +7620,72 @@ impl IronMeshClient {
         ))
     }
 
+    fn put_sized_reader_via_upload_session_with_identity(
+        &self,
+        path: &str,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+        reader: &mut dyn Read,
+        total_size_bytes: u64,
+    ) -> Result<ObjectMutationUploadResult> {
+        let runtime = blocking_runtime()?;
+        let session = runtime.block_on(self.start_upload_session_with_mutation(
+            path,
+            total_size_bytes,
+            Vec::new(),
+            object_id,
+            expected_revision,
+        ))?;
+        let mut buffer = vec![0_u8; session.chunk_size_bytes];
+
+        for index in 0..session.chunk_count {
+            let expected_size = expected_chunk_size(
+                total_size_bytes,
+                session.chunk_size_bytes,
+                session.chunk_count,
+                index,
+            )
+            .context("failed to determine expected upload chunk size")?;
+            reader
+                .read_exact(&mut buffer[..expected_size])
+                .with_context(|| {
+                    format!("failed reading upload chunk index={index} for key={path}")
+                })?;
+            let response = runtime.block_on(self.upload_session_chunk(
+                &session.upload_id,
+                index,
+                buffer[..expected_size].to_vec(),
+            ))?;
+            if response.received_index != index {
+                bail!(
+                    "server acknowledged unexpected upload chunk index={} expected={index}",
+                    response.received_index
+                );
+            }
+        }
+
+        let completed = runtime.block_on(self.complete_upload_session(&session.upload_id))?;
+        self.clear_upload_session_affinity(&session.upload_id);
+        let returned_object_id = completed.object_id.trim();
+        if returned_object_id.is_empty() {
+            bail!("server did not return object identity for chunked upload path={path}");
+        }
+        if let Some(expected_object_id) = object_id
+            && returned_object_id != expected_object_id
+        {
+            bail!(
+                "server returned a different object identity for chunked upload path={path}: expected={expected_object_id} actual={returned_object_id}"
+            );
+        }
+        Ok(ObjectMutationUploadResult {
+            object_id: returned_object_id.to_string(),
+            path: path.to_string(),
+            revision: completed.version_id,
+            size_bytes: usize::try_from(total_size_bytes)
+                .context("chunked upload size exceeds this platform's addressable range")?,
+        })
+    }
+
     pub fn download_file_resumable(
         &self,
         key: impl AsRef<str>,
@@ -7105,6 +7913,111 @@ impl IronMeshClient {
         runtime.block_on(self.delete_path(key))
     }
 
+    pub fn lookup_object_by_id_blocking(
+        &self,
+        object_id: impl AsRef<str>,
+    ) -> Result<Option<ObjectLookup>> {
+        let object_id = object_id.as_ref().to_string();
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.lookup_object_by_id(object_id))
+    }
+
+    pub fn put_reader_with_identity_blocking(
+        &self,
+        path: impl Into<String>,
+        object_id: Option<&str>,
+        expected_revision: Option<&str>,
+        reader: &mut dyn std::io::Read,
+        length: u64,
+    ) -> Result<ObjectMutationUploadResult> {
+        let path = path.into();
+        let object_id = object_id.map(str::trim).filter(|value| !value.is_empty());
+        if length > LARGE_UPLOAD_THRESHOLD_BYTES as u64 {
+            return self.put_sized_reader_via_upload_session_with_identity(
+                &path,
+                object_id,
+                expected_revision,
+                reader,
+                length,
+            );
+        }
+        let initial_capacity = usize::try_from(length)
+            .unwrap_or(8_192)
+            .min(LARGE_UPLOAD_THRESHOLD_BYTES);
+        let mut payload = Vec::with_capacity(initial_capacity);
+        reader
+            .take(length)
+            .read_to_end(&mut payload)
+            .with_context(|| format!("failed reading upload payload for {path}"))?;
+        if payload.len() as u64 != length {
+            bail!(
+                "upload payload length changed while reading {path}: expected={length} actual={}",
+                payload.len()
+            );
+        }
+        let runtime = blocking_runtime()?;
+        match object_id {
+            Some(object_id) => runtime.block_on(self.put_by_object_id_with_result(
+                object_id,
+                Bytes::from(payload),
+                expected_revision,
+            )),
+            None => runtime
+                .block_on(self.put_with_expected_revision_result(
+                    path.clone(),
+                    Bytes::from(payload),
+                    expected_revision,
+                ))?
+                .ok_or_else(|| {
+                    anyhow!("server did not return object identity for newly created path {path}")
+                }),
+        }
+    }
+
+    pub fn rename_object_by_id_blocking(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        self.rename_object_by_id_with_result_blocking(
+            object_id,
+            to_path,
+            overwrite,
+            expected_revision,
+        )
+        .map(|_| ())
+    }
+
+    pub fn rename_object_by_id_with_result_blocking(
+        &self,
+        object_id: impl AsRef<str>,
+        to_path: impl Into<String>,
+        overwrite: bool,
+        expected_revision: Option<&str>,
+    ) -> Result<ObjectMutationResult> {
+        let object_id = object_id.as_ref().to_string();
+        let to_path = to_path.into();
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.rename_object_by_id_with_result(
+            object_id,
+            to_path,
+            overwrite,
+            expected_revision,
+        ))
+    }
+
+    pub fn delete_object_by_id_blocking(
+        &self,
+        object_id: impl AsRef<str>,
+        expected_revision: Option<&str>,
+    ) -> Result<()> {
+        let object_id = object_id.as_ref().to_string();
+        let runtime = blocking_runtime()?;
+        runtime.block_on(self.delete_object_by_id(object_id, expected_revision))
+    }
+
     pub fn rename_path_blocking(
         &self,
         from_path: impl Into<String>,
@@ -7318,6 +8231,25 @@ impl IronMeshClient {
         Ok(url)
     }
 
+    fn object_url(&self, object_id: &str) -> Result<Url> {
+        let mut url = self.client_api_base_url()?;
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("server URL cannot be a base"))?;
+        segments.push("objects");
+        segments.push(object_id);
+        drop(segments);
+        Ok(url)
+    }
+
+    fn object_rename_url(&self, object_id: &str) -> Result<Url> {
+        let mut url = self.object_url(object_id)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("server URL cannot be a base"))?
+            .push("rename");
+        Ok(url)
+    }
+
     fn relative_url(&self, path: &str) -> Result<Url> {
         let path = path.trim();
         if path.is_empty() {
@@ -7347,6 +8279,20 @@ impl IronMeshClient {
                 .map_err(|_| anyhow!("server URL cannot be a base"))?;
             segments.push("store");
             segments.push("index");
+        }
+
+        Ok(url)
+    }
+
+    fn store_labels_url(&self) -> Result<Url> {
+        let mut url = self.client_api_base_url()?;
+
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("server URL cannot be a base"))?;
+            segments.push("store");
+            segments.push("labels");
         }
 
         Ok(url)
@@ -7515,6 +8461,23 @@ impl IronMeshClient {
         }
 
         Ok(url)
+    }
+}
+
+/// Appends a label filter using the stable comma-separated wire format accepted
+/// by the node and web proxy. Commas and backslashes inside label names are
+/// escaped so the server can recover each exact label. Empty labels are ignored
+/// consistently across the store index and map clients.
+fn append_comma_separated_labels(url: &mut Url, parameter: &str, labels: &[String]) {
+    let labels = labels
+        .iter()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .map(|label| label.replace('\\', "\\\\").replace(',', "\\,"))
+        .collect::<Vec<_>>();
+    if !labels.is_empty() {
+        url.query_pairs_mut()
+            .append_pair(parameter, &labels.join(","));
     }
 }
 
@@ -8646,6 +9609,7 @@ fn upload_result_from_session_complete(
         meta: StorageObjectMeta {
             key: key.to_string(),
             size_bytes: completed.total_size_bytes as usize,
+            object_id: (!completed.object_id.is_empty()).then(|| completed.object_id.clone()),
         },
         upload_mode: UploadMode::Chunked,
         chunk_size_bytes: Some(session.chunk_size_bytes),
@@ -8904,6 +9868,9 @@ fn ensure_missing_folder_markers(entries: &mut Vec<StoreIndexEntry>, scope_prefi
             entries.push(StoreIndexEntry {
                 path: marker,
                 entry_type: "prefix".to_string(),
+                object_id: None,
+                labels: Vec::new(),
+                labels_resolved: false,
                 version: None,
                 content_hash: None,
                 size_bytes: None,
@@ -9020,30 +9987,56 @@ pub fn snapshot_from_store_index_entries(entries: Vec<StoreIndexEntry>) -> SyncS
     let mut remote = Vec::with_capacity(entries.len());
 
     for entry in entries {
-        if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
-            let directory_path = entry.path.trim_end_matches('/').to_string();
-            if !directory_path.is_empty() {
-                remote.push(NamespaceEntry::directory(directory_path));
-            }
-            continue;
+        if let Some(entry) = namespace_entry_from_store_index_entry(entry) {
+            remote.push(entry);
         }
-
-        let version = entry.version.unwrap_or_else(|| "server-head".to_string());
-        let content_hash = entry
-            .content_hash
-            .unwrap_or_else(|| format!("server-head:{}", entry.path));
-        let mut remote_entry =
-            NamespaceEntry::file_sized(entry.path.clone(), version, content_hash, entry.size_bytes);
-        remote_entry.content_fingerprint = entry.content_fingerprint;
-        remote_entry.modified_at_unix = entry.modified_at_unix;
-        remote_entry.media = entry.media.map(namespace_media_metadata);
-        remote.push(remote_entry);
     }
 
     SyncSnapshot {
         local: Vec::new(),
         remote,
     }
+}
+
+/// Converts a store-index result without inventing a revision. A file can
+/// carry its stable object identity only together with the concrete revision
+/// required for a subsequent compare-and-swap mutation.
+pub(crate) fn namespace_entry_from_store_index_entry(
+    entry: StoreIndexEntry,
+) -> Option<NamespaceEntry> {
+    if (entry.entry_type == "prefix") || entry.path.ends_with('/') {
+        let directory_path = entry.path.trim_end_matches('/').to_string();
+        if directory_path.is_empty() {
+            return None;
+        }
+
+        let revision = entry.version.filter(|value| !value.trim().is_empty());
+        let mut directory = NamespaceEntry::directory(directory_path);
+        directory.object_id = revision.is_some().then_some(entry.object_id).flatten();
+        directory.version = revision;
+        directory.content_hash = entry.content_hash;
+        directory.content_fingerprint = entry.content_fingerprint;
+        directory.size_bytes = entry.size_bytes;
+        directory.modified_at_unix = entry.modified_at_unix;
+        directory.media = entry.media.map(namespace_media_metadata);
+        return Some(directory);
+    }
+
+    let revision = entry.version.filter(|value| !value.trim().is_empty());
+    let has_cas_baseline = revision.is_some();
+    Some(NamespaceEntry {
+        path: entry.path,
+        kind: EntryKind::File,
+        // A response without a concrete revision cannot safely be used for a
+        // mutation. Retain neither half of the CAS tuple in the snapshot.
+        object_id: has_cas_baseline.then_some(entry.object_id).flatten(),
+        version: revision,
+        content_hash: entry.content_hash,
+        content_fingerprint: entry.content_fingerprint,
+        size_bytes: entry.size_bytes,
+        modified_at_unix: entry.modified_at_unix,
+        media: entry.media.map(namespace_media_metadata),
+    })
 }
 
 pub fn namespace_media_metadata(media: StoreIndexMedia) -> sync_core::NamespaceMediaMetadata {

@@ -8,7 +8,7 @@ PACKAGE_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' "${ROOT_DIR}/C
 PACKAGE_VERSION="${PACKAGE_VERSION:?failed to determine workspace package version}"
 CARGO_BUILD_DIR=""
 
-OUTPUT_PATH="${ROOT_DIR}/target/macos/ironmesh-server-node-${PACKAGE_VERSION}.pkg"
+OUTPUT_PATH="${ROOT_DIR}/target/macos/berrykeep-server-node-${PACKAGE_VERSION}.pkg"
 SOURCE_BINARY=""
 ARCH="native"
 CODE_SIGN_IDENTITY=""
@@ -30,7 +30,7 @@ require_command() {
 
 usage() {
   cat <<'EOF'
-Build a native macOS installer package for the Ironmesh server node.
+Build a native macOS installer package for the BerryKeep server node.
 
 Usage:
   ./scripts/build-macos-server-node-pkg.sh [options]
@@ -114,10 +114,10 @@ done
 build_target() {
   local target="$1"
 
-  log "building ironmesh-server-node for ${target}"
+  log "building berrykeep-server-node for ${target}"
   (
     cd "${ROOT_DIR}"
-    cargo build --locked --release -p server-node --bin ironmesh-server-node --target "${target}"
+    cargo build --locked --release -p server-node --bin berrykeep-server-node --target "${target}"
   )
 }
 
@@ -147,20 +147,20 @@ build_source_binary() {
 
   case "${ARCH}" in
     native)
-      log "building ironmesh-server-node for the current Mac" >&2
+      log "building berrykeep-server-node for the current Mac" >&2
       (
         cd "${ROOT_DIR}"
-        cargo build --locked --release -p server-node --bin ironmesh-server-node
+        cargo build --locked --release -p server-node --bin berrykeep-server-node
       )
-      printf '%s\n' "${CARGO_BUILD_DIR}/release/ironmesh-server-node"
+      printf '%s\n' "${CARGO_BUILD_DIR}/release/berrykeep-server-node"
       ;;
     arm64)
       build_target aarch64-apple-darwin >&2
-      printf '%s\n' "${CARGO_BUILD_DIR}/aarch64-apple-darwin/release/ironmesh-server-node"
+      printf '%s\n' "${CARGO_BUILD_DIR}/aarch64-apple-darwin/release/berrykeep-server-node"
       ;;
     x86_64)
       build_target x86_64-apple-darwin >&2
-      printf '%s\n' "${CARGO_BUILD_DIR}/x86_64-apple-darwin/release/ironmesh-server-node"
+      printf '%s\n' "${CARGO_BUILD_DIR}/x86_64-apple-darwin/release/berrykeep-server-node"
       ;;
     universal)
       require_command lipo
@@ -168,10 +168,10 @@ build_source_binary() {
       build_target x86_64-apple-darwin >&2
       universal_dir="${CARGO_BUILD_DIR}/macos/universal"
       mkdir -p "${universal_dir}"
-      lipo -create -output "${universal_dir}/ironmesh-server-node" \
-        "${CARGO_BUILD_DIR}/aarch64-apple-darwin/release/ironmesh-server-node" \
-        "${CARGO_BUILD_DIR}/x86_64-apple-darwin/release/ironmesh-server-node"
-      printf '%s\n' "${universal_dir}/ironmesh-server-node"
+      lipo -create -output "${universal_dir}/berrykeep-server-node" \
+        "${CARGO_BUILD_DIR}/aarch64-apple-darwin/release/berrykeep-server-node" \
+        "${CARGO_BUILD_DIR}/x86_64-apple-darwin/release/berrykeep-server-node"
+      printf '%s\n' "${universal_dir}/berrykeep-server-node"
       ;;
     *)
       fail "--arch must be native, arm64, x86_64, or universal"
@@ -199,7 +199,7 @@ main() {
   binary_path="$(build_source_binary)"
   [[ -f "${binary_path}" ]] || fail "expected built server-node binary was not found: ${binary_path}"
 
-  STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ironmesh-server-node-pkg.XXXXXX")"
+  STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/berrykeep-server-node-pkg.XXXXXX")"
   trap cleanup EXIT
   payload_dir="${STAGE_DIR}/payload"
   scripts_dir="${ROOT_DIR}/macos/server-node/pkg-scripts"
@@ -209,6 +209,8 @@ main() {
   install -d "${payload_dir}/Library/LaunchDaemons"
   install -d "${payload_dir}/Library/Logs/Ironmesh"
   install -m 0755 "${binary_path}" \
+    "${payload_dir}/Library/Application Support/Ironmesh/bin/berrykeep-server-node"
+  ln -sf berrykeep-server-node \
     "${payload_dir}/Library/Application Support/Ironmesh/bin/ironmesh-server-node"
   install -m 0755 "${ROOT_DIR}/macos/server-node/ironmesh-server-node-launcher" \
     "${payload_dir}/Library/Application Support/Ironmesh/bin/ironmesh-server-node-launcher"
@@ -221,7 +223,7 @@ main() {
     require_command codesign
     log "signing staged server-node executable"
     codesign --force --options runtime --timestamp --sign "${CODE_SIGN_IDENTITY}" \
-      "${payload_dir}/Library/Application Support/Ironmesh/bin/ironmesh-server-node"
+      "${payload_dir}/Library/Application Support/Ironmesh/bin/berrykeep-server-node"
   fi
 
   # Do not carry Finder or provenance attributes from a checkout or build

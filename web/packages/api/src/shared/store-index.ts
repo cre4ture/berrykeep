@@ -38,6 +38,8 @@ export type StoreIndexMediaSummary = {
 export type StoreIndexEntry = {
   path: string;
   entry_type: string;
+  labels?: string[];
+  labels_resolved?: boolean;
   version?: string | null;
   content_hash?: string | null;
   size_bytes?: number | null;
@@ -131,10 +133,21 @@ export type GalleryMapClustersRequest = {
   prefix?: string;
   depth: number;
   mediaFilter: StoreListMediaFilter;
+  /** Bounds used to fetch server clusters, including the client-side prefetch buffer. */
   viewport: StoreIndexViewport;
+  /** Visible camera bounds used only to preserve the requested grid density under response caps. */
+  resolutionViewport?: StoreIndexViewport;
   zoom: number;
   /** Desired cluster-cell width in CSS pixels; the server bounds and quantizes it. */
   clusterCellSizePx?: number;
+  /** Inclusive effective media capture timestamp. */
+  capturedFromUnix?: number;
+  /** Exclusive effective media capture timestamp. */
+  capturedUntilUnix?: number;
+  /** Labels every mapped entry must contain. */
+  requireLabels?: string[];
+  /** Labels excluded from map totals, clusters, and cluster entries. */
+  excludeLabels?: string[];
 };
 
 /** Keeps fractional MapLibre zoom while constraining requests to supported map levels. */
@@ -181,5 +194,11 @@ export type StoreListRequestOptions = {
   limit?: number;
   sort?: StoreListSortOrder;
   mediaFilter?: StoreListMediaFilter;
+  /** Inclusive effective media capture timestamp. */
+  capturedFromUnix?: number;
+  /** Exclusive effective media capture timestamp. */
+  capturedUntilUnix?: number;
   viewport?: StoreIndexViewport;
+  requireLabels?: string[];
+  excludeLabels?: string[];
 };

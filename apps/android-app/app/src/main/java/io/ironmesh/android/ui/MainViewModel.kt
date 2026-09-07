@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.webkit.WebStorage
 import android.os.SystemClock
 import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
@@ -23,6 +24,7 @@ import io.ironmesh.android.data.writeAndroidDiagnosticLogExport
 import io.ironmesh.android.data.DeviceAuthState
 import io.ironmesh.android.data.EnrollmentAccessVerification
 import io.ironmesh.android.data.EmbeddedWebUiSessionRegistry
+import io.ironmesh.android.data.PrivateWebServiceBrowserSession
 import io.ironmesh.android.data.DeviceIdentityStorageException
 import io.ironmesh.android.data.FolderSyncConfig
 import io.ironmesh.android.data.FolderSyncNetworkPolicy
@@ -135,6 +137,13 @@ class MainViewModel(
     }
 
     init {
+        PrivateWebServiceBrowserSession.registerBackgroundSessionEndedCallback {
+            runOnMainThread {
+                if (uiState.value.webUiSession != null && !uiObservationGate.observationJobsActive) {
+                    webUiSessionBackgroundGrace.schedule()
+                }
+            }
+        }
         registerProcessLifecycleObserver()
         loadPersistedState()
     }
@@ -142,6 +151,7 @@ class MainViewModel(
     override fun onCleared() {
         processLifecycleObserverActive = false
         unregisterProcessLifecycleObserver()
+        PrivateWebServiceBrowserSession.clearBackgroundSessionEndedCallback()
         webUiSessionBackgroundGrace.cancel()
         titleLatencyBackgroundGrace.cancel()
         titleLatencyNativeControlGate.next()
@@ -197,6 +207,7 @@ class MainViewModel(
     }
 
     private fun handleProcessStarted() {
+        PrivateWebServiceBrowserSession.appForegrounded(getApplication())
         webUiSessionBackgroundGrace.cancel()
         titleLatencyBackgroundGrace.cancel()
         titleLatencyNativeControlGate.next()
@@ -208,6 +219,7 @@ class MainViewModel(
     }
 
     private fun handleProcessStopped() {
+        PrivateWebServiceBrowserSession.appBackgrounded()
         if (uiObservationGate.leaveForeground() == UiObservationTransition.STOP) {
             stopUiObservationJobs()
         }
@@ -219,7 +231,7 @@ class MainViewModel(
                 },
             )
         }
-        if (uiState.value.webUiSession != null) {
+        if (uiState.value.webUiSession != null && !PrivateWebServiceBrowserSession.isActive()) {
             webUiSessionBackgroundGrace.schedule()
         }
         if (uiState.value.titleLatencyMonitorSettings.enabled) {
@@ -487,6 +499,33 @@ class MainViewModel(
             )
             uiState.value = uiState.value.copy(objectBody = body)
             "GET ok: ${body.length} bytes"
+        }
+    }
+
+    fun clearCachedData() {
+        webUiSessionBackgroundGrace.cancel()
+        uiState.value = uiState.value.copy(status = "Clearing cached data…")
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.Main) {
+                    WebStorage.getInstance().deleteAllData()
+                }
+                withContext(Dispatchers.IO) {
+                    repository.clearCachedData()
+                }
+            }
+            result.onSuccess {
+                ThumbnailBitmapCache.clear()
+                EmbeddedWebUiSessionRegistry.clear()
+                uiState.value = uiState.value.copy(
+                    webUiSession = null,
+                    status = "Cached data cleared. Reopen the Web UI to fetch fresh map data.",
+                )
+            }.onFailure { error ->
+                uiState.value = uiState.value.copy(
+                    status = "Failed to clear cached data: ${error.message}",
+                )
+            }
         }
     }
 
@@ -761,6 +800,64 @@ class MainViewModel(
             galleryPages = emptyMap(),
         )
         refreshGallery()
+    }
+
+    fun updateGalleryCaptureDateRange(captureDateRange: GalleryCaptureDateRange) {
+        if (uiState.value.galleryCaptureDateRange == captureDateRange) {
+            return
+        }
+        uiState.value = uiState.value.copy(
+            galleryCaptureDateRange = captureDateRange,
+            galleryCollection = null,
+            galleryPages = emptyMap(),
+        )
+        refreshGallery()
+    }
+
+    fun updateGalleryShowSensitiveContent(showSensitiveContent: Boolean) {
+        if (uiState.value.galleryShowSensitiveContent == showSensitiveContent) {
+            return
+        }
+        uiState.value = uiState.value.copy(
+            galleryShowSensitiveContent = showSensitiveContent,
+            galleryCollection = null,
+            galleryPages = emptyMap(),
+        )
+        refreshGallery()
+    }
+
+    fun toggleGalleryMediaLabel(item: GalleryImageItem, label: String) {
+        if (!item.labelsResolved) {
+            uiState.value = uiState.value.copy(
+                status = "Image labels are temporarily unavailable. Refresh before editing them.",
+            )
+            return
+        }
+        val nextLabels = if (item.labels.contains(label)) {
+            item.labels.filterNot { it == label }
+        } else {
+            item.labels + label
+        }
+        viewModelScope.launch {
+            runCatching {
+                val deviceAuth = refreshPersistedDeviceAuthState()
+                withContext(Dispatchers.IO) {
+                    repository.setMediaLabels(
+                        connectionInput = deviceAuth.connectionBootstrapJson(),
+                        key = item.remotePath,
+                        labels = nextLabels,
+                        serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                        clientIdentityJson = deviceAuth.toClientIdentityJson(),
+                    )
+                }
+            }.onSuccess {
+                refreshGallery()
+            }.onFailure { error ->
+                uiState.value = uiState.value.copy(
+                    status = "Failed to update labels: ${error.message}",
+                )
+            }
+        }
     }
 
     fun updateGalleryViewMode(mode: GalleryViewMode) {
@@ -1261,7 +1358,11 @@ class MainViewModel(
     }
 
     private fun stopWebUiAfterBackgroundGrace() {
-        if (uiState.value.webUiSession == null) {
+        if (
+            uiState.value.webUiSession == null ||
+                uiObservationGate.observationJobsActive ||
+                PrivateWebServiceBrowserSession.isActive()
+        ) {
             return
         }
         EmbeddedWebUiSessionRegistry.clear()
@@ -1384,6 +1485,7 @@ class MainViewModel(
                 connectionRoutesError = null,
                 connectionRoutesLastLoadedUnixMs = 0L,
                 selectedSection = MainSection.HOME,
+                galleryShowSensitiveContent = false,
                 webUiSession = null,
                 status = "Device enrolled: ${authState.deviceId}",
             )
@@ -1661,6 +1763,8 @@ class MainViewModel(
         val currentDirectoryPath: String,
         val breadcrumbs: List<GalleryBreadcrumbItem>,
         val sort: GallerySortOption,
+        val captureTimestampRange: GalleryCaptureTimestampRange,
+        val showSensitiveContent: Boolean,
         val pageSize: Int,
     )
 
@@ -1682,6 +1786,8 @@ class MainViewModel(
             currentDirectoryPath = current.galleryCurrentDirectoryPath,
             breadcrumbs = current.galleryBreadcrumbs,
             sort = current.gallerySort,
+            captureTimestampRange = current.galleryCaptureDateRange.toTimestampRange(),
+            showSensitiveContent = current.galleryShowSensitiveContent,
             pageSize = pageSize.coerceAtLeast(1),
         )
     }
@@ -1709,6 +1815,9 @@ class MainViewModel(
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            capturedFromUnix = request.captureTimestampRange.fromUnix,
+            capturedUntilUnix = request.captureTimestampRange.untilUnix,
+            excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
             clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
@@ -1751,6 +1860,9 @@ class MainViewModel(
             offset = 0,
             limit = request.pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            capturedFromUnix = request.captureTimestampRange.fromUnix,
+            capturedUntilUnix = request.captureTimestampRange.untilUnix,
+            excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = serverCaPem,
             clientIdentityJson = clientIdentityJson,
         )
@@ -1796,6 +1908,9 @@ class MainViewModel(
             offset = offset,
             limit = pageSize,
             sort = resolveGalleryStoreSortOrder(request.sort),
+            capturedFromUnix = request.captureTimestampRange.fromUnix,
+            capturedUntilUnix = request.captureTimestampRange.untilUnix,
+            excludeLabels = if (request.showSensitiveContent) emptyList() else listOf("private", "nsfw"),
             serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
             clientIdentityJson = deviceAuth.toClientIdentityJson(),
         )
@@ -1805,6 +1920,7 @@ class MainViewModel(
         val persisted = withContext(Dispatchers.IO) {
             IronmeshPreferences.getDeviceAuthState(getApplication())
         }
+        val previousDeviceId = deviceAuthState.deviceId
         deviceAuthState = persisted
         val identity = persisted.toDeviceIdentityUiState()
         val nodePriorityOverrides = persisted.nodePriorityOverrides()
@@ -1816,6 +1932,14 @@ class MainViewModel(
                 deviceIdentity = identity,
                 nodePriorityOverrides = nodePriorityOverrides,
             )
+        }
+        if (
+            previousDeviceId.isNotBlank() &&
+                persisted.deviceId.isNotBlank() &&
+                previousDeviceId != persisted.deviceId &&
+                uiState.value.galleryShowSensitiveContent
+        ) {
+            uiState.value = uiState.value.copy(galleryShowSensitiveContent = false)
         }
         return persisted
     }
@@ -2164,6 +2288,8 @@ class MainViewModel(
             width = entry.media?.width,
             height = entry.media?.height,
             thumbnailStatus = entry.media?.status,
+            labels = entry.labels,
+            labelsResolved = entry.labels_resolved,
         )
     }
 

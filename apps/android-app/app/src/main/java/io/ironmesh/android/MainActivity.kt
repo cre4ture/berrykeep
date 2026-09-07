@@ -139,6 +139,8 @@ class MainActivity : ComponentActivity() {
                     refresh = vm::refreshGallery,
                     updateViewMode = vm::updateGalleryViewMode,
                     updateSort = vm::updateGallerySort,
+                    updateCaptureDateRange = vm::updateGalleryCaptureDateRange,
+                    updateShowSensitiveContent = vm::updateGalleryShowSensitiveContent,
                     navigateToRoot = vm::navigateGalleryToRoot,
                     navigateUp = vm::navigateGalleryUp,
                     navigateToBreadcrumb = vm::navigateGalleryToBreadcrumb,
@@ -147,6 +149,7 @@ class MainActivity : ComponentActivity() {
                     itemAt = vm::galleryItemAt,
                     ensureItemLoaded = vm::ensureGalleryItemLoaded,
                     pinItem = vm::pinGalleryItem,
+                    toggleMediaLabel = vm::toggleGalleryMediaLabel,
                 )
             }
             IronmeshTheme(accentColorHex = state.themeAccentColorHex) {
@@ -393,6 +396,7 @@ class MainActivity : ComponentActivity() {
                                 MainSection.GALLERY_MAP -> GalleryMapScreen(
                                     state = state.toGalleryMapUiState(),
                                     onStartGalleryMap = vm::startWebUi,
+                                    accentColorHex = state.themeAccentColorHex,
                                     onFullscreenChanged = { fullscreen ->
                                         galleryMapFullscreen = fullscreen
                                     },
@@ -431,6 +435,7 @@ class MainActivity : ComponentActivity() {
                                         vm.selectSection(MainSection.REQUEST_TIMINGS)
                                     },
                                     onOpenWebConsole = onOpenWebConsole,
+                                    onClearCachedData = vm::clearCachedData,
                                     onThemeAccentColorChange = vm::updateThemeAccentColor,
                                     onTitleLatencyMonitorEnabledChange = vm::updateTitleLatencyMonitorEnabled,
                                     onTitleLatencyMonitorPeriodSecondsChange =

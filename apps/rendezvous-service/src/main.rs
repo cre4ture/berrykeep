@@ -954,12 +954,15 @@ mod tests {
                 entries: vec![client_sdk::StoreIndexEntry {
                     path: "readme.txt".to_string(),
                     entry_type: "key".to_string(),
+                    object_id: Some("obj-readme".to_string()),
                     version: Some("v1".to_string()),
                     content_hash: Some("hash-1".to_string()),
                     size_bytes: Some(7),
                     modified_at_unix: None,
                     content_fingerprint: None,
                     media: None,
+                    labels: Vec::new(),
+                    labels_resolved: false,
                 }],
             })
             .expect("store index should serialize");

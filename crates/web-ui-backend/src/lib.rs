@@ -23,14 +23,16 @@ use client_sdk::{
     ironmesh_client::{DownloadRangeRequest, RelativePathResponse},
     public_key_fingerprint,
 };
-use common::logging::{LogBuffer, LogBufferEntry};
+use common::{
+    logging::{LogBuffer, LogBufferEntry},
+    parse_comma_separated_labels,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,7 +60,6 @@ const EMBEDDED_WEB_UI_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
 mod binary_stream_tests;
 mod bounded_body;
-mod mbtiles;
 mod web_service_gateway;
 
 #[derive(Clone, Default)]
@@ -195,7 +196,6 @@ pub struct WebUiConfig {
     pub connection_bootstrap_persistence: Option<WebUiBootstrapPersistence>,
     pub transport_client: Option<IronMeshClient>,
     pub log_buffer: Option<Arc<LogBuffer>>,
-    pub map_glyphs_root: Option<PathBuf>,
     embedded_session_authorization: Option<EmbeddedWebUiSessionAuthorization>,
 }
 
@@ -238,7 +238,6 @@ impl WebUiConfig {
             connection_bootstrap_persistence: None,
             transport_client: None,
             log_buffer: None,
-            map_glyphs_root: None,
             embedded_session_authorization: None,
         }
     }
@@ -253,7 +252,6 @@ impl WebUiConfig {
             connection_bootstrap_persistence: None,
             transport_client: Some(client),
             log_buffer: None,
-            map_glyphs_root: None,
             embedded_session_authorization: None,
         }
     }
@@ -296,11 +294,6 @@ impl WebUiConfig {
         self
     }
 
-    pub fn with_map_glyphs_root(mut self, map_glyphs_root: impl Into<PathBuf>) -> Self {
-        self.map_glyphs_root = Some(map_glyphs_root.into());
-        self
-    }
-
     pub fn with_embedded_session_authorization(
         mut self,
         authorization: EmbeddedWebUiSessionAuthorization,
@@ -313,12 +306,10 @@ impl WebUiConfig {
 #[derive(Clone)]
 struct WebState {
     map_perf_logging_enabled: bool,
-    map_glyphs_root: Option<PathBuf>,
     service_name: String,
     client_cache_scope: Option<String>,
     client_device_identity: WebClientDeviceIdentityView,
     log_buffer: Arc<LogBuffer>,
-    mbtiles_sources: Arc<RwLock<HashMap<String, Arc<mbtiles::LogicalMbtilesSource>>>>,
     gallery_map_upstream_routes: Arc<RwLock<GalleryMapUpstreamRoutes>>,
     web_service_gateway: web_service_gateway::WebServiceGateway,
     runtime: Arc<RwLock<WebRuntime>>,
@@ -417,12 +408,10 @@ pub fn router(config: WebUiConfig) -> Router {
         .unwrap_or_else(|| Arc::new(LogBuffer::new(LogBuffer::DEFAULT_DIAGNOSTIC_CAPACITY)));
     let state = WebState {
         map_perf_logging_enabled,
-        map_glyphs_root: resolve_map_glyphs_root(config.map_glyphs_root),
         service_name: config.service_name,
         client_cache_scope,
         client_device_identity,
         log_buffer,
-        mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
         gallery_map_upstream_routes: Arc::new(RwLock::new(GalleryMapUpstreamRoutes::default())),
         web_service_gateway: web_service_gateway::WebServiceGateway::default(),
         runtime: Arc::new(RwLock::new(WebRuntime {
@@ -464,6 +453,8 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/cluster/nodes", get(web_cluster_nodes))
         .route("/cluster/replication/plan", get(web_replication_plan))
         .route("/store/list", get(web_store_list))
+        .route("/store/history", get(web_store_history))
+        .route("/store/history/restore", post(web_store_history_restore))
         .route("/store/index/delta", get(web_store_index_delta))
         .route("/gallery/map/clusters", get(web_gallery_map_clusters))
         .route(
@@ -478,6 +469,7 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/store/get", get(web_store_get))
         .route("/store/put", post(web_store_put))
+        .route("/store/labels", post(web_store_labels))
         .route("/store/rename", post(web_store_rename))
         .route("/store/delete", delete(web_store_delete))
         .route("/store/restore", post(web_store_restore))
@@ -551,6 +543,11 @@ pub fn router(config: WebUiConfig) -> Router {
         .route("/api/cluster/nodes", get(web_cluster_nodes))
         .route("/api/cluster/replication/plan", get(web_replication_plan))
         .route("/api/store/list", get(web_store_list))
+        .route("/api/store/history", get(web_store_history))
+        .route(
+            "/api/store/history/restore",
+            post(web_store_history_restore),
+        )
         .route("/api/store/index/delta", get(web_store_index_delta))
         .route("/api/gallery/map/clusters", get(web_gallery_map_clusters))
         .route(
@@ -565,6 +562,7 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/api/store/get", get(web_store_get))
         .route("/api/store/put", post(web_store_put))
+        .route("/api/store/labels", post(web_store_labels))
         .route("/api/store/rename", post(web_store_rename))
         .route("/api/store/delete", delete(web_store_delete))
         .route("/api/store/restore", post(web_store_restore))
@@ -620,6 +618,8 @@ async fn require_embedded_web_ui_session(
     request: Request,
     next: Next,
 ) -> Response {
+    let preserves_map_asset_cache_control =
+        is_embedded_web_ui_cacheable_map_asset_request(request.method(), request.uri().path());
     let supplied_header = request
         .headers()
         .get(EMBEDDED_WEB_UI_SESSION_HEADER)
@@ -633,9 +633,14 @@ async fn require_embedded_web_ui_session(
     }
 
     let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+    if !preserves_map_asset_cache_control
+        || !response.status().is_success()
+        || !response.headers().contains_key(CACHE_CONTROL)
+    {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+    }
     response
         .headers_mut()
         .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
@@ -647,6 +652,23 @@ async fn require_embedded_web_ui_session(
         response.headers_mut().append(SET_COOKIE, cookie);
     }
     response
+}
+
+fn is_embedded_web_ui_cacheable_map_asset_request(method: &Method, path: &str) -> bool {
+    if *method != Method::GET {
+        return false;
+    }
+
+    let Some(asset_path) = path
+        .strip_prefix("/api/v1/maps/")
+        .or_else(|| path.strip_prefix("/api/maps/"))
+    else {
+        return false;
+    };
+
+    asset_path.starts_with("tiles/")
+        || asset_path.starts_with("vector-tiles/")
+        || asset_path.starts_with("fonts/")
 }
 
 async fn require_same_origin_web_ui_write(request: Request, next: Next) -> Response {
@@ -708,26 +730,6 @@ fn cookie_values<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Ite
         })
 }
 
-fn resolve_map_glyphs_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
-    if let Some(path) = explicit.filter(|path| path.is_dir()) {
-        return Some(path);
-    }
-
-    if let Ok(value) = std::env::var("IRONMESH_MAP_GLYPHS_DIR") {
-        let path = PathBuf::from(value);
-        if path.is_dir() {
-            return Some(path);
-        }
-    }
-
-    let repo_relative = PathBuf::from("map/maptiler-server-map-styles-and-samples-3.15/fonts");
-    if repo_relative.is_dir() {
-        return Some(repo_relative);
-    }
-
-    None
-}
-
 fn env_flag_is_truthy(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -761,10 +763,20 @@ struct WebStoreListQuery {
     limit: Option<usize>,
     sort: Option<String>,
     media_filter: Option<String>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
+    require_labels: Option<String>,
+    exclude_labels: Option<String>,
     south: Option<f64>,
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreHistoryQuery {
+    prefix: Option<String>,
+    depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -778,6 +790,8 @@ struct WebGalleryMapClustersQuery {
     prefix: Option<String>,
     depth: Option<usize>,
     media_filter: Option<String>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     south: f64,
     west: f64,
     north: f64,
@@ -786,6 +800,8 @@ struct WebGalleryMapClustersQuery {
     zoom: Option<u8>,
     /// Additive fractional camera zoom, ignored by nodes that predate it.
     zoom_precise: Option<f64>,
+    require_labels: Option<String>,
+    exclude_labels: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -801,6 +817,7 @@ struct WebStoreGetQuery {
     key: String,
     snapshot: Option<String>,
     version: Option<String>,
+    object_id: Option<String>,
     preview_bytes: Option<usize>,
 }
 
@@ -808,6 +825,12 @@ struct WebStoreGetQuery {
 struct WebStorePutRequest {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebStoreLabelsRequest {
+    path: String,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -830,6 +853,19 @@ struct WebStoreRestoreRequest {
     target_path: String,
     #[serde(default)]
     recursive: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WebStoreHistoryRestoreEntry {
+    path: String,
+    restore_source_path: String,
+    restore_source_object_id: String,
+    restore_version_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WebStoreHistoryRestoreRequest {
+    entries: Vec<WebStoreHistoryRestoreEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -867,18 +903,6 @@ struct WebMediaThumbnailQuery {
 #[derive(Debug, Deserialize)]
 struct WebMapLogicalFileQuery {
     manifest_key: String,
-}
-
-#[derive(Debug, Serialize)]
-struct WebMapMbtilesMetadataResponse {
-    attribution: Option<String>,
-    center: Option<[f64; 3]>,
-    format: Option<String>,
-    id: Option<String>,
-    minzoom: Option<u8>,
-    maxzoom: Option<u8>,
-    name: Option<String>,
-    version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1311,6 +1335,106 @@ async fn proxy_gallery_map_request(
             .await?;
     }
     Ok(response)
+}
+
+fn relative_request_path(url: &Url) -> String {
+    let mut path = url.path().to_string();
+    if let Some(query) = url.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    path
+}
+
+fn server_map_manifest_path(route: &str, manifest_key: &str) -> String {
+    let mut url =
+        Url::parse("http://web-ui.invalid").expect("the local web UI origin is a valid URL");
+    url.set_path(route);
+    url.query_pairs_mut()
+        .append_pair("manifest_key", manifest_key);
+    relative_request_path(&url)
+}
+
+fn server_map_font_path(fontstack: &str, range: &str) -> String {
+    let mut url =
+        Url::parse("http://web-ui.invalid/").expect("the server map font route is a valid URL");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("the server map font URL supports path segments");
+        segments
+            .push("maps")
+            .push("fonts")
+            .push(fontstack)
+            .push(range);
+    }
+    relative_request_path(&url)
+}
+
+fn is_safe_map_fontstack_segment(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed != "."
+        && trimmed != ".."
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains('\0')
+}
+
+fn is_safe_map_glyph_range_segment(value: &str) -> bool {
+    if value.contains('/') || value.contains('\\') || value.contains('\0') {
+        return false;
+    }
+    let Some((start, end)) = value.split_once('-') else {
+        return false;
+    };
+    let Some(end) = end.strip_suffix(".pbf") else {
+        return false;
+    };
+    !start.is_empty()
+        && !end.is_empty()
+        && start.chars().all(|character| character.is_ascii_digit())
+        && end.chars().all(|character| character.is_ascii_digit())
+}
+
+async fn proxy_server_map_request(state: &WebState, path: &str) -> Result<RelativePathResponse> {
+    current_sdk(state)
+        .await
+        .request_relative_path_without_route_diagnostics(Method::GET, path, Vec::new(), None)
+        .await
+}
+
+fn proxied_map_response(response: RelativePathResponse) -> Response {
+    let mut headers = HeaderMap::new();
+    for header_name in [CONTENT_TYPE, CONTENT_ENCODING] {
+        if let Some(value) = response.headers.get(&header_name).cloned() {
+            headers.insert(header_name, value);
+        }
+    }
+    if let Some(value) = response.headers.get(CACHE_CONTROL) {
+        headers.insert(CACHE_CONTROL, private_map_asset_cache_control(value));
+    }
+    (response.status, headers, response.body).into_response()
+}
+
+fn private_map_asset_cache_control(value: &HeaderValue) -> HeaderValue {
+    let Ok(value) = value.to_str() else {
+        return HeaderValue::from_static("private");
+    };
+    let mut directives = value
+        .split(',')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty() && !directive.eq_ignore_ascii_case("public"))
+        .collect::<Vec<_>>();
+    if !directives
+        .iter()
+        .any(|directive| directive.eq_ignore_ascii_case("private"))
+    {
+        directives.push("private");
+    }
+
+    HeaderValue::from_str(&directives.join(", "))
+        .unwrap_or_else(|_| HeaderValue::from_static("private"))
 }
 
 async fn current_client(state: &WebState) -> ClientNode {
@@ -1882,6 +2006,20 @@ fn build_versions_request_path(key: &str) -> Result<String> {
     build_relative_path(&["versions", key], &[])
 }
 
+fn build_store_history_request_path(query: &WebStoreHistoryQuery) -> Result<String> {
+    let depth = query.depth.unwrap_or(1).clamp(1, 64).to_string();
+    let mut query_pairs = vec![("depth", depth.as_str())];
+    if let Some(prefix) = query
+        .prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+    {
+        query_pairs.push(("prefix", prefix));
+    }
+    build_relative_path(&["store", "history"], &query_pairs)
+}
+
 fn media_selector_query_pairs(query: &WebMediaThumbnailQuery) -> Vec<(&str, &str)> {
     let mut query_pairs = vec![("key", query.key.as_str())];
     if let Some(snapshot) = query.snapshot.as_deref() {
@@ -2082,69 +2220,6 @@ async fn load_split_logical_file_manifest(
         manifest,
         etag: format!("\"{}\"", blake3::hash(&manifest_payload).to_hex()),
     })
-}
-
-async fn get_or_create_mbtiles_source(
-    state: &WebState,
-    manifest_key: &str,
-) -> Result<Arc<mbtiles::LogicalMbtilesSource>> {
-    let started = Instant::now();
-    if let Some(source) = state
-        .mbtiles_sources
-        .read()
-        .await
-        .get(manifest_key)
-        .cloned()
-    {
-        if state.map_perf_logging_enabled {
-            info!(
-                manifest_key = %manifest_key,
-                cache = "hit",
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "map perf: reusing cached MBTiles source"
-            );
-        }
-        return Ok(source);
-    }
-
-    let loaded_manifest = load_split_logical_file_manifest(state, manifest_key).await?;
-    let sdk = current_sdk(state).await;
-    let manifest_key_owned = manifest_key.to_string();
-    let perf_logging_enabled = state.map_perf_logging_enabled;
-    let source = tokio::task::spawn_blocking(move || {
-        mbtiles::LogicalMbtilesSource::new(
-            manifest_key_owned,
-            sdk,
-            loaded_manifest,
-            perf_logging_enabled,
-        )
-    })
-    .await
-    .context("MBTiles source construction task join failed")??;
-    let source = Arc::new(source);
-
-    let mut sources = state.mbtiles_sources.write().await;
-    if let Some(existing) = sources.get(manifest_key) {
-        if state.map_perf_logging_enabled {
-            info!(
-                manifest_key = %manifest_key,
-                cache = "race-hit",
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "map perf: reusing concurrently initialized MBTiles source"
-            );
-        }
-        return Ok(existing.clone());
-    }
-    sources.insert(manifest_key.to_string(), source.clone());
-    if state.map_perf_logging_enabled {
-        info!(
-            manifest_key = %manifest_key,
-            cache = "miss",
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "map perf: initialized MBTiles source"
-        );
-    }
-    Ok(source)
 }
 
 struct ObjectRangeSelection {
@@ -2608,47 +2683,21 @@ async fn web_map_mbtiles_metadata(
     State(state): State<WebState>,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
-    let started = Instant::now();
-    if query.manifest_key.trim().is_empty() {
+    let manifest_key = query.manifest_key.trim();
+    if manifest_key.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "manifest_key must not be empty");
     }
 
-    let source = match get_or_create_mbtiles_source(&state, query.manifest_key.trim()).await {
-        Ok(source) => source,
-        Err(err) => {
-            return logged_error_response(
-                &state,
-                StatusCode::BAD_GATEWAY,
-                "map metadata request failed",
-                err.to_string(),
-            );
-        }
-    };
-    let metadata = source.metadata();
-    if state.map_perf_logging_enabled {
-        info!(
-            manifest_key = %query.manifest_key.trim(),
-            minzoom = metadata.minzoom.unwrap_or_default(),
-            maxzoom = metadata.maxzoom.unwrap_or_default(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "map perf: served MBTiles metadata"
-        );
+    let path = server_map_manifest_path("/maps/mbtiles-metadata", manifest_key);
+    match proxy_server_map_request(&state, &path).await {
+        Ok(response) => proxied_map_response(response),
+        Err(error) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "map metadata request failed",
+            error.to_string(),
+        ),
     }
-
-    (
-        StatusCode::OK,
-        Json(WebMapMbtilesMetadataResponse {
-            attribution: metadata.attribution.clone(),
-            center: metadata.center,
-            format: metadata.format.clone(),
-            id: metadata.id.clone(),
-            minzoom: metadata.minzoom,
-            maxzoom: metadata.maxzoom,
-            name: metadata.name.clone(),
-            version: metadata.version.clone(),
-        }),
-    )
-        .into_response()
 }
 
 async fn web_map_logical_file(
@@ -2853,49 +2902,16 @@ async fn web_map_xyz_tile(
     Path((z, x, y)): Path<(u32, u32, u32)>,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
-    let request_cancellation = RequestCancellation::new();
-    let _request_cancellation_guard = request_cancellation.guard();
-    let started = Instant::now();
-    if query.manifest_key.trim().is_empty() {
+    let manifest_key = query.manifest_key.trim();
+    if manifest_key.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let source = match get_or_create_mbtiles_source(&state, query.manifest_key.trim()).await {
-        Ok(source) => source,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-
-    let tile_lookup = tokio::task::spawn_blocking({
-        let cancelled = request_cancellation.flag();
-        move || source.lookup_tile_with_cancellation(z, x, y, cancelled)
-    })
-    .await;
-    let tile = match tile_lookup {
-        Ok(Ok(Some(tile))) => tile,
-        Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(Err(_)) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-    if state.map_perf_logging_enabled {
-        info!(
-            manifest_key = %query.manifest_key.trim(),
-            z,
-            x,
-            y,
-            bytes = tile.bytes.len(),
-            content_type = tile.content_type,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "map perf: served raster XYZ tile"
-        );
+    let path = server_map_manifest_path(&format!("/maps/tiles/{z}/{x}/{y}"), manifest_key);
+    match proxy_server_map_request(&state, &path).await {
+        Ok(response) => proxied_map_response(response),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
-
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.content_type));
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
-    );
-
-    (StatusCode::OK, headers, tile.bytes).into_response()
 }
 
 async fn web_map_vector_tile(
@@ -2903,130 +2919,33 @@ async fn web_map_vector_tile(
     Path((z, x, y)): Path<(u32, u32, u32)>,
     Query(query): Query<WebMapLogicalFileQuery>,
 ) -> impl IntoResponse {
-    let request_cancellation = RequestCancellation::new();
-    let _request_cancellation_guard = request_cancellation.guard();
-    let started = Instant::now();
-    if query.manifest_key.trim().is_empty() {
+    let manifest_key = query.manifest_key.trim();
+    if manifest_key.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let source = match get_or_create_mbtiles_source(&state, query.manifest_key.trim()).await {
-        Ok(source) => source,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-
-    let tile_lookup = tokio::task::spawn_blocking({
-        let cancelled = request_cancellation.flag();
-        move || source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
-    })
-    .await;
-    let tile = match tile_lookup {
-        Ok(Ok(Some(tile))) => tile,
-        Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(Err(_)) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-    if state.map_perf_logging_enabled {
-        info!(
-            manifest_key = %query.manifest_key.trim(),
-            z,
-            x,
-            y,
-            bytes = tile.bytes.len(),
-            content_encoding = tile.content_encoding.unwrap_or("identity"),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "map perf: served vector XYZ tile"
-        );
+    let path = server_map_manifest_path(&format!("/maps/vector-tiles/{z}/{x}/{y}"), manifest_key);
+    match proxy_server_map_request(&state, &path).await {
+        Ok(response) => proxied_map_response(response),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
-
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(tile.content_type));
-    if let Some(content_encoding) = tile.content_encoding {
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static(content_encoding));
-    }
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
-    );
-
-    (StatusCode::OK, headers, tile.bytes).into_response()
 }
 
 async fn web_map_font_range(
     State(state): State<WebState>,
     Path((fontstack, range)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let Some(glyphs_root) = state.map_glyphs_root.clone() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    if !is_safe_fontstack_segment(&fontstack) || !is_safe_glyph_range_segment(&range) {
+    // Reject dot segments before constructing the SDK URL. Url::join normalizes
+    // them and could otherwise redirect a malformed font request to another
+    // authenticated /maps endpoint.
+    if !is_safe_map_fontstack_segment(&fontstack) || !is_safe_map_glyph_range_segment(&range) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-
-    let path = glyphs_root.join(&fontstack).join(&range);
-    // Defense in depth: even though `is_safe_fontstack_segment` and
-    // `is_safe_glyph_range_segment` should already reject path separators and
-    // literal ".." components, guard against any lexical path traversal by
-    // rejecting `..`/`.` components outright and verifying the joined path is
-    // still lexically contained within `glyphs_root`. `Path::starts_with`
-    // compares components, not resolved filesystem locations, so it must be
-    // combined with the component check to be meaningful for unresolved
-    // (non-canonicalized) paths like this one.
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-        || !path.starts_with(&glyphs_root)
-    {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("application/x-protobuf"),
-            );
-            headers.insert(
-                CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, stale-while-revalidate=604800"),
-            );
-            (StatusCode::OK, headers, bytes).into_response()
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            StatusCode::NOT_FOUND.into_response()
-        }
+    let path = server_map_font_path(&fontstack, &range);
+    match proxy_server_map_request(&state, &path).await {
+        Ok(response) => proxied_map_response(response),
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
-}
-
-fn is_safe_fontstack_segment(value: &str) -> bool {
-    // Note: `value.split('.').any(|segment| segment == "..")` would NOT catch
-    // `value == ".."` (splitting ".." on '.' yields ["", "", ""], never "..").
-    // Compare the whole (trimmed) value against "." / ".." directly instead.
-    let trimmed = value.trim();
-    !trimmed.is_empty()
-        && trimmed != "."
-        && trimmed != ".."
-        && !value.contains('/')
-        && !value.contains('\\')
-        && !value.contains('\0')
-}
-
-fn is_safe_glyph_range_segment(value: &str) -> bool {
-    if value.contains('/') || value.contains('\\') || value.contains('\0') {
-        return false;
-    }
-    let Some((start, end)) = value.split_once('-') else {
-        return false;
-    };
-    let Some(end) = end.strip_suffix(".pbf") else {
-        return false;
-    };
-    !start.is_empty()
-        && !end.is_empty()
-        && start.chars().all(|ch| ch.is_ascii_digit())
-        && end.chars().all(|ch| ch.is_ascii_digit())
 }
 
 async fn web_cluster_status(
@@ -3138,6 +3057,14 @@ async fn web_store_list(
             );
         }
     };
+    let require_labels = match web_label_filter_values(query.require_labels.as_deref()) {
+        Ok(labels) => labels,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    let exclude_labels = match web_label_filter_values(query.exclude_labels.as_deref()) {
+        Ok(labels) => labels,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
 
     match current_sdk(&state)
         .await
@@ -3153,7 +3080,11 @@ async fn web_store_list(
                 limit: query.limit,
                 sort,
                 media_filter,
+                captured_from_unix: query.captured_from_unix,
+                captured_until_unix: query.captured_until_unix,
                 viewport,
+                require_labels,
+                exclude_labels,
                 synthesize_missing_folder_markers: matches!(view, Some(StoreIndexView::Tree))
                     && query.offset.is_none()
                     && query.limit.is_none()
@@ -3168,6 +3099,70 @@ async fn web_store_list(
             &state,
             StatusCode::BAD_GATEWAY,
             "store list request failed",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn web_store_history(
+    State(state): State<WebState>,
+    Query(query): Query<WebStoreHistoryQuery>,
+) -> impl IntoResponse {
+    let request_path = match build_store_history_request_path(&query) {
+        Ok(path) => path,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    match current_sdk(&state)
+        .await
+        .request_relative_path(Method::GET, &request_path, Vec::new(), None)
+        .await
+    {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+                headers.insert(CONTENT_TYPE, value);
+            }
+            (response.status, headers, response.body).into_response()
+        }
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store history request failed",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn web_store_history_restore(
+    State(state): State<WebState>,
+    Json(request): Json<WebStoreHistoryRestoreRequest>,
+) -> impl IntoResponse {
+    let payload = match serde_json::to_vec(&request) {
+        Ok(payload) => payload,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    match current_sdk(&state)
+        .await
+        .request_relative_path(
+            Method::POST,
+            "/store/history/restore",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            Some(payload),
+        )
+        .await
+    {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = response.headers.get(CONTENT_TYPE).cloned() {
+                headers.insert(CONTENT_TYPE, value);
+            }
+            (response.status, headers, response.body).into_response()
+        }
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store history restore request failed",
             err.to_string(),
         ),
     }
@@ -3227,6 +3222,28 @@ async fn web_gallery_map_clusters(
         if let Some(zoom_precise) = zoom_precise {
             params.append_pair("zoom_precise", &zoom_precise.to_string());
         }
+        if let Some(captured_from_unix) = query.captured_from_unix {
+            params.append_pair("captured_from_unix", &captured_from_unix.to_string());
+        }
+        if let Some(captured_until_unix) = query.captured_until_unix {
+            params.append_pair("captured_until_unix", &captured_until_unix.to_string());
+        }
+        if let Some(require_labels) = query
+            .require_labels
+            .as_deref()
+            .map(str::trim)
+            .filter(|labels| !labels.is_empty())
+        {
+            params.append_pair("require_labels", require_labels);
+        }
+        if let Some(exclude_labels) = query
+            .exclude_labels
+            .as_deref()
+            .map(str::trim)
+            .filter(|labels| !labels.is_empty())
+        {
+            params.append_pair("exclude_labels", exclude_labels);
+        }
     }
     let mut path = request_url.path().to_string();
     if let Some(query) = request_url.query() {
@@ -3248,6 +3265,10 @@ async fn web_gallery_map_clusters(
             error.to_string(),
         ),
     }
+}
+
+fn web_label_filter_values(raw: Option<&str>) -> std::result::Result<Vec<String>, &'static str> {
+    parse_comma_separated_labels(raw)
 }
 
 async fn web_gallery_map_cluster_entries(
@@ -3332,8 +3353,27 @@ async fn web_store_get(
         return error_response(StatusCode::BAD_REQUEST, "key must not be empty");
     }
 
+    let source_object_id = query.object_id.as_deref().map(str::trim);
+    if source_object_id.is_some_and(str::is_empty)
+        || (source_object_id.is_some() && query.snapshot.is_some())
+        || (source_object_id.is_some() && query.version.is_none())
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "object_id requires a version and cannot be combined with a snapshot",
+        );
+    }
+
     let client = current_client(&state).await;
-    let payload_result = if query.snapshot.is_none() && query.version.is_none() {
+    let payload_result = if let Some(object_id) = source_object_id {
+        client
+            .get_history_source_version(
+                &query.key,
+                object_id,
+                query.version.as_deref().expect("checked above"),
+            )
+            .await
+    } else if query.snapshot.is_none() && query.version.is_none() {
         client.get_cached_or_fetch(&query.key).await
     } else {
         client
@@ -3410,6 +3450,30 @@ async fn web_store_put(
             &state,
             StatusCode::BAD_GATEWAY,
             "store put request failed",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn web_store_labels(
+    State(state): State<WebState>,
+    Json(request): Json<WebStoreLabelsRequest>,
+) -> impl IntoResponse {
+    let path = request.path.trim();
+    if path.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "path must not be empty");
+    }
+
+    match current_sdk(&state)
+        .await
+        .set_media_labels(path, request.labels)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "store labels request failed",
             err.to_string(),
         ),
     }
@@ -4216,16 +4280,26 @@ mod tests {
     use super::{
         DIAGNOSTIC_CONTEXT_HEADER, EMBEDDED_WEB_UI_SESSION_COOKIE, EMBEDDED_WEB_UI_SESSION_HEADER,
         EmbeddedWebUiSessionAuthorization, ErrorResponseBody, WebUiConfig, client_cache_scope,
-        error_response, is_safe_web_ui_method, normalize_store_restore_path, router,
-        trusted_loopback_origin, web_latency_probe_timeout,
+        error_response, is_safe_map_fontstack_segment, is_safe_map_glyph_range_segment,
+        is_safe_web_ui_method, normalize_store_restore_path, router, trusted_loopback_origin,
+        web_latency_probe_timeout,
     };
     use axum::body::to_bytes;
-    use axum::http::header::{HOST, ORIGIN};
+    use axum::extract::{Path, Query};
+    use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, HOST, ORIGIN};
     use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
-    use client_sdk::{ClientIdentityMaterial, IronMeshClient, LatencyProbeConfig};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use axum::{Router, middleware};
+    use client_sdk::{
+        ClientIdentityMaterial, IronMeshClient, LatencyProbeConfig,
+        ironmesh_client::RelativePathResponse,
+    };
     use common::logging::LogBuffer;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task::JoinHandle;
     use uuid::Uuid;
 
@@ -4249,6 +4323,137 @@ mod tests {
         });
 
         (format!("http://{address}"), task)
+    }
+
+    async fn start_embedded_map_asset_test_server(
+        authorization: EmbeddedWebUiSessionAuthorization,
+    ) -> (String, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have a local address");
+        let app = Router::new()
+            .route(
+                "/api/v1/maps/tiles/{z}/{x}/{y}",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [(
+                            CACHE_CONTROL.as_str(),
+                            "private, max-age=3600, stale-while-revalidate=86400",
+                        )],
+                    )
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                authorization,
+                super::require_embedded_web_ui_session,
+            ));
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), task)
+    }
+
+    const MAP_PROXY_TEST_MANIFEST_KEY: &str = "sys/maps/client-proxy.mbtiles.manifest.json";
+
+    async fn map_proxy_test_metadata(Query(query): Query<HashMap<String, String>>) -> Response {
+        match query.get("manifest_key").map(String::as_str) {
+            Some(MAP_PROXY_TEST_MANIFEST_KEY) => (
+                StatusCode::OK,
+                [(CONTENT_TYPE.as_str(), "application/json")],
+                r#"{"name":"Client proxy map","format":"png"}"#,
+            )
+                .into_response(),
+            Some("sys/maps/missing.mbtiles.manifest.json") => (
+                StatusCode::NOT_FOUND,
+                [(CONTENT_TYPE.as_str(), "application/json")],
+                r#"{"error":"map does not exist"}"#,
+            )
+                .into_response(),
+            _ => StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+
+    async fn map_proxy_test_raster(
+        Path((z, x, y)): Path<(u32, u32, u32)>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Response {
+        if (z, x, y) == (3, 4, 5)
+            && query.get("manifest_key").map(String::as_str) == Some(MAP_PROXY_TEST_MANIFEST_KEY)
+        {
+            (
+                StatusCode::OK,
+                [
+                    (CONTENT_TYPE.as_str(), "image/png"),
+                    (
+                        CACHE_CONTROL.as_str(),
+                        "public, max-age=3600, stale-while-revalidate=86400",
+                    ),
+                ],
+                b"raster-tile".as_slice(),
+            )
+                .into_response()
+        } else {
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+
+    async fn map_proxy_test_vector(
+        Path((z, x, y)): Path<(u32, u32, u32)>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Response {
+        if (z, x, y) == (3, 4, 5)
+            && query.get("manifest_key").map(String::as_str) == Some(MAP_PROXY_TEST_MANIFEST_KEY)
+        {
+            (
+                StatusCode::OK,
+                [(CONTENT_TYPE.as_str(), "application/vnd.mapbox-vector-tile")],
+                b"vector-tile".as_slice(),
+            )
+                .into_response()
+        } else {
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+
+    async fn map_proxy_test_glyph(Path((fontstack, range)): Path<(String, String)>) -> Response {
+        if fontstack == "Noto Sans Regular" && range == "0-255.pbf" {
+            (
+                StatusCode::OK,
+                [
+                    (CONTENT_TYPE.as_str(), "application/x-protobuf"),
+                    (
+                        CACHE_CONTROL.as_str(),
+                        "public, max-age=86400, stale-while-revalidate=604800",
+                    ),
+                ],
+                b"glyph-range".as_slice(),
+            )
+                .into_response()
+        } else {
+            StatusCode::BAD_REQUEST.into_response()
+        }
+    }
+
+    fn map_proxy_test_upstream_router() -> Router {
+        Router::new()
+            .route(
+                "/api/v1/maps/mbtiles-metadata",
+                get(map_proxy_test_metadata),
+            )
+            .route("/api/v1/maps/tiles/{z}/{x}/{y}", get(map_proxy_test_raster))
+            .route(
+                "/api/v1/maps/vector-tiles/{z}/{x}/{y}",
+                get(map_proxy_test_vector),
+            )
+            .route(
+                "/api/v1/maps/fonts/{fontstack}/{range}",
+                get(map_proxy_test_glyph),
+            )
     }
 
     #[test]
@@ -4396,6 +4601,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gallery_map_clusters_forward_the_capture_time_range_upstream() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream listener should have an address");
+        let upstream = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/api/v1/gallery/map/clusters",
+                axum::routing::get(|Query(query): Query<HashMap<String, String>>| async move {
+                    axum::Json(query)
+                }),
+            );
+            let _ = axum::serve(upstream_listener, app).await;
+        });
+
+        let web_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web listener should bind");
+        let web_address = web_listener
+            .local_addr()
+            .expect("web listener should have an address");
+        let app = router(WebUiConfig::from_client(
+            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}")),
+        ));
+        let web = tokio::spawn(async move {
+            let _ = axum::serve(web_listener, app).await;
+        });
+
+        let response = reqwest::get(format!(
+            "http://{web_address}/api/v1/gallery/map/clusters?depth=1&media_filter=all&captured_from_unix=20&captured_until_unix=30&south=-90&west=-180&north=90&east=180&zoom=1"
+        ))
+        .await
+        .expect("web proxy clusters request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let forwarded_query = response
+            .json::<HashMap<String, String>>()
+            .await
+            .expect("upstream query should remain JSON");
+        assert_eq!(
+            forwarded_query
+                .get("captured_from_unix")
+                .map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(
+            forwarded_query
+                .get("captured_until_unix")
+                .map(String::as_str),
+            Some("30")
+        );
+
+        web.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test]
     async fn gallery_map_proxy_falls_back_to_legacy_upstream_routes() {
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -4479,6 +4742,262 @@ mod tests {
         upstream.abort();
     }
 
+    #[tokio::test]
+    async fn client_map_routes_proxy_server_map_assets_without_local_fallback() {
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream listener should have an address");
+        let upstream = tokio::spawn(async move {
+            let app = map_proxy_test_upstream_router();
+            let _ = axum::serve(upstream_listener, app).await;
+        });
+
+        let web_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web listener should bind");
+        let web_address = web_listener
+            .local_addr()
+            .expect("web listener should have an address");
+        let upstream_sdk =
+            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}"));
+        let app = router(WebUiConfig::from_client(upstream_sdk.clone()));
+        let web = tokio::spawn(async move {
+            let _ = axum::serve(web_listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let manifest_key = MAP_PROXY_TEST_MANIFEST_KEY;
+
+        let metadata = client
+            .get(format!(
+                "http://{web_address}/api/v1/maps/mbtiles-metadata?manifest_key={manifest_key}"
+            ))
+            .send()
+            .await
+            .expect("metadata proxy request should complete");
+        assert_eq!(metadata.status(), StatusCode::OK);
+        assert_eq!(
+            metadata
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            metadata
+                .text()
+                .await
+                .expect("metadata proxy response should be readable"),
+            r#"{"name":"Client proxy map","format":"png"}"#
+        );
+
+        let raster = client
+            .get(format!(
+                "http://{web_address}/api/v1/maps/tiles/3/4/5?manifest_key={manifest_key}"
+            ))
+            .send()
+            .await
+            .expect("raster tile proxy request should complete");
+        assert_eq!(raster.status(), StatusCode::OK);
+        assert_eq!(
+            raster
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        assert_eq!(
+            raster
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=3600, stale-while-revalidate=86400, private")
+        );
+        assert_eq!(
+            raster
+                .bytes()
+                .await
+                .expect("raster tile proxy response should be readable")
+                .as_ref(),
+            b"raster-tile"
+        );
+
+        let vector = client
+            .get(format!(
+                "http://{web_address}/api/v1/maps/vector-tiles/3/4/5?manifest_key={manifest_key}"
+            ))
+            .send()
+            .await
+            .expect("vector tile proxy request should complete");
+        assert_eq!(vector.status(), StatusCode::OK);
+        assert_eq!(
+            vector
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.mapbox-vector-tile")
+        );
+        assert_eq!(
+            vector
+                .bytes()
+                .await
+                .expect("vector tile proxy response should be readable")
+                .as_ref(),
+            b"vector-tile"
+        );
+
+        let glyph = client
+            .get(format!(
+                "http://{web_address}/api/v1/maps/fonts/Noto%20Sans%20Regular/0-255.pbf"
+            ))
+            .send()
+            .await
+            .expect("glyph proxy request should complete");
+        assert_eq!(glyph.status(), StatusCode::OK);
+        assert_eq!(
+            glyph
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/x-protobuf")
+        );
+        assert_eq!(
+            glyph
+                .bytes()
+                .await
+                .expect("glyph proxy response should be readable")
+                .as_ref(),
+            b"glyph-range"
+        );
+
+        // A server-side map error is preserved rather than triggering the previous
+        // client-side MBTiles reconstruction path.
+        let missing = client
+            .get(format!(
+                "http://{web_address}/api/v1/maps/mbtiles-metadata?manifest_key=sys/maps/missing.mbtiles.manifest.json"
+            ))
+            .send()
+            .await
+            .expect("missing map metadata request should complete");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing
+                .text()
+                .await
+                .expect("missing map response should be readable"),
+            r#"{"error":"map does not exist"}"#
+        );
+        assert!(
+            upstream_sdk
+                .connection_diagnostics()
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.recent_attempts.is_empty()),
+            "map assets must not displace foreground route diagnostics"
+        );
+
+        web.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn proxied_map_response_preserves_server_content_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.mapbox-vector-tile"),
+        );
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=3600, stale-while-revalidate=86400"),
+        );
+        let response = super::proxied_map_response(RelativePathResponse {
+            status: StatusCode::OK,
+            headers,
+            body: b"compressed-vector-tile".to_vec().into(),
+        });
+
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.mapbox-vector-tile")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=3600, stale-while-revalidate=86400, private")
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("proxied map response should be readable")
+                .as_ref(),
+            b"compressed-vector-tile"
+        );
+    }
+
+    #[test]
+    fn map_asset_cache_control_keeps_private_upstream_directives() {
+        let private = HeaderValue::from_static("private, max-age=3600");
+        let sanitized = super::private_map_asset_cache_control(&private);
+
+        assert_eq!(sanitized, private);
+    }
+
+    #[tokio::test]
+    async fn map_tile_transport_failures_do_not_fill_diagnostic_logs() {
+        let buffer = Arc::new(LogBuffer::new(32));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web UI listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("web UI listener should have a local address");
+        let map_sdk = IronMeshClient::from_direct_base_url("http://127.0.0.1:9");
+        let app =
+            router(WebUiConfig::from_client(map_sdk.clone()).with_log_buffer(Arc::clone(&buffer)));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "http://{address}/api/v1/maps/tiles/3/4/5?manifest_key=sys/maps/test.mbtiles.manifest.json"
+            ))
+            .send()
+            .await
+            .expect("map tile request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            buffer.recent(32).is_empty(),
+            "high-volume map tile failures must not evict useful diagnostics"
+        );
+        let endpoint = &map_sdk.connection_diagnostics().endpoints[0];
+        assert_eq!(endpoint.total_failures, 1);
+        assert!(endpoint.recent_attempts.is_empty());
+        assert!(
+            map_sdk.connection_route_snapshot().endpoints[0]
+                .circuit_open_until_unix_ms
+                .is_some()
+        );
+
+        server.abort();
+    }
+
     #[test]
     fn normalize_store_restore_path_distinguishes_files_and_prefixes() {
         assert_eq!(
@@ -4494,6 +5013,78 @@ mod tests {
             "docs/archive/"
         );
         assert_eq!(normalize_store_restore_path("   ", false), "");
+    }
+
+    #[test]
+    fn map_font_proxy_rejects_dot_segments_before_url_normalization() {
+        assert!(!is_safe_map_fontstack_segment(".."));
+        assert!(!is_safe_map_fontstack_segment("."));
+        assert!(!is_safe_map_fontstack_segment("Noto/Regular"));
+        assert!(is_safe_map_fontstack_segment("Noto Sans Regular"));
+
+        assert!(!is_safe_map_glyph_range_segment(".."));
+        assert!(!is_safe_map_glyph_range_segment("0-255.pbf/.."));
+        assert!(!is_safe_map_glyph_range_segment("0-255.pbf\\.."));
+        assert!(is_safe_map_glyph_range_segment("0-255.pbf"));
+    }
+
+    #[tokio::test]
+    async fn map_font_proxy_rejects_encoded_dot_segments_without_contacting_the_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("web UI listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("web UI listener should have a local address");
+        let sdk = IronMeshClient::from_direct_base_url("http://127.0.0.1:9");
+        let app = router(WebUiConfig::from_client(sdk.clone()));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("web UI listener should accept a connection");
+        socket
+            .write_all(
+                b"GET /api/v1/maps/fonts/%2E%2E/0-255.pbf HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("raw encoded dot-segment request should be writable");
+        let mut response = Vec::new();
+        socket
+            .read_to_end(&mut response)
+            .await
+            .expect("raw encoded dot-segment response should be readable");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400"),
+            "encoded dot segment should be rejected locally: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(
+            sdk.connection_diagnostics()
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.recent_attempts.is_empty()),
+            "an invalid local font path must not make an upstream request"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn web_store_list_label_filters_preserve_escaped_label_characters() {
+        assert_eq!(
+            super::web_label_filter_values(Some(r"family\, close,travel\\journal")),
+            Ok(vec![
+                "family, close".to_string(),
+                "travel\\journal".to_string()
+            ])
+        );
+        assert_eq!(
+            super::web_label_filter_values(Some(r"invalid\q")),
+            Err("label filters may only escape commas and backslashes")
+        );
     }
 
     #[test]
@@ -4788,6 +5379,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedded_session_preserves_private_map_asset_cache_control() {
+        let authorization = EmbeddedWebUiSessionAuthorization::new();
+        let (base_url, server) = start_embedded_map_asset_test_server(authorization.clone()).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/api/v1/maps/tiles/3/4/5"))
+            .header(EMBEDDED_WEB_UI_SESSION_HEADER, authorization.token())
+            .send()
+            .await
+            .expect("authorized embedded map request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=3600, stale-while-revalidate=86400")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn diagnostic_log_export_returns_the_requested_retained_time_window() {
         let buffer = Arc::new(LogBuffer::new(8));
         let now = super::unix_ts();
@@ -4959,48 +5574,5 @@ mod tests {
 
         server.abort();
         upstream.abort();
-    }
-
-    #[test]
-    fn is_safe_fontstack_segment_rejects_traversal_and_separators() {
-        use super::is_safe_fontstack_segment;
-
-        // Legitimate fontstack names should still be accepted.
-        assert!(is_safe_fontstack_segment("Open Sans Regular"));
-        assert!(is_safe_fontstack_segment("Arial Unicode MS Regular"));
-
-        // Path traversal / separator attempts must be rejected.
-        assert!(!is_safe_fontstack_segment(".."));
-        assert!(!is_safe_fontstack_segment("."));
-        assert!(!is_safe_fontstack_segment("../../etc/passwd"));
-        assert!(!is_safe_fontstack_segment("..\\..\\windows"));
-        assert!(!is_safe_fontstack_segment("foo/../bar"));
-        assert!(!is_safe_fontstack_segment(""));
-        assert!(!is_safe_fontstack_segment("   "));
-    }
-
-    #[tokio::test]
-    async fn web_map_font_range_rejects_path_traversal_segments() {
-        use super::{is_safe_fontstack_segment, is_safe_glyph_range_segment};
-
-        // Regression coverage for the route-level guard used by
-        // `web_map_font_range`: a ".." fontstack must never be treated as a
-        // safe path component, since `Path::starts_with` alone does not
-        // resolve ".." components in a non-canonicalized joined path.
-        assert!(!is_safe_fontstack_segment(".."));
-        assert!(is_safe_glyph_range_segment("0-255.pbf"));
-
-        let glyphs_root = std::path::PathBuf::from("/tmp/ironmesh-test-glyphs-root");
-        let fontstack = "..".to_string();
-        let range = "0-255.pbf".to_string();
-        let path = glyphs_root.join(&fontstack).join(&range);
-        let escapes_root = path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-            || !path.starts_with(&glyphs_root);
-        assert!(
-            escapes_root,
-            "a '..' fontstack segment must be detected as escaping the glyphs root"
-        );
     }
 }

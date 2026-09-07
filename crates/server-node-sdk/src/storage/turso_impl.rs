@@ -5,10 +5,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use common::NodeId;
+use common::xmp::XmpGeoLocation;
 use tracing::warn;
 use turso::params_from_iter;
 
 use crate::cluster::NodeDescriptor;
+#[cfg(test)]
+use crate::operations::{OperationPriority, OperationProgress};
+use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 
 mod gallery;
 
@@ -18,17 +22,23 @@ const DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT: usize = 1;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_LABEL_BACKFILL_KEY,
-    GalleryDeltaCursorError, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage,
-    GalleryIndexQuery, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
-    GalleryMapClusterQuery, GallerySummaryCache, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, ObjectVersionMetadataRecord, ReconcileMarker,
-    RepairAttemptRecord, RepairRunRecord, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo,
-    SnapshotManifest, StorageContentKind, StorageLocationRecord, StorageLocationState,
-    StorageStatsSample, StorageStatsState, compress_snapshot_json, decompress_snapshot_json,
+    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
+    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaCursorError, GalleryDeltaPage,
+    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, GalleryMapClusterEntriesQuery,
+    GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache,
+    HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY, HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
+    HistoryHeadProjectionBackfillState, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    ManualRepairActionRunRecord, MediaGpsCoordinates, MetadataDbLogicalProgress,
+    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
+    OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
+    RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
+    RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
+    S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
+    StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
+    TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
+    decode_gallery_labels, decode_version_index, decompress_snapshot_json,
     metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    normalize_snapshot_manifest_object_ids, recoverable_history_listing_query,
 };
 
 pub(super) struct TursoMetadataStore {
@@ -176,6 +186,29 @@ impl TursoMetadataStore {
 
 #[async_trait]
 impl MetadataStore for TursoMetadataStore {
+    async fn object_id_backfill_needed(&self) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (OBJECT_ID_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(rows.next().await?.is_none())
+    }
+
+    async fn mark_object_id_backfill_complete(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (OBJECT_ID_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
         let mut rows = self
             .connection
@@ -194,6 +227,29 @@ impl MetadataStore for TursoMetadataStore {
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (GALLERY_SIDECAR_LABEL_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn gallery_sidecar_gps_backfill_needed(&self) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (GALLERY_SIDECAR_GPS_BACKFILL_KEY,),
+            )
+            .await?;
+        Ok(rows.next().await?.is_none())
+    }
+
+    async fn mark_gallery_sidecar_gps_backfill_complete(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (GALLERY_SIDECAR_GPS_BACKFILL_KEY,),
             )
             .await?;
         Ok(())
@@ -256,6 +312,92 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()> {
         self.store_gallery_object_labels(key, labels).await
+    }
+
+    async fn set_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<XmpGeoLocation>,
+    ) -> Result<()> {
+        self.store_gallery_object_sidecar_gps(key, location).await
+    }
+
+    async fn gallery_object_labels_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        const LABEL_LOOKUP_CHUNK_SIZE: usize = 500;
+        let mut labels_by_key = HashMap::new();
+        for keys in keys.chunks(LABEL_LOOKUP_CHUNK_SIZE) {
+            if keys.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=keys.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!(
+                        "SELECT key, labels_json FROM gallery_objects WHERE key IN ({placeholders})"
+                    ),
+                    params_from_iter(keys.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let key = row_string(&row, 0, "gallery_objects.key")?;
+                let labels_json = row_string(&row, 1, "gallery_objects.labels_json")?;
+                labels_by_key.insert(key, decode_gallery_labels(&labels_json)?);
+            }
+        }
+        Ok(labels_by_key)
+    }
+
+    async fn gallery_object_gps_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, MediaGpsCoordinates>> {
+        const GPS_LOOKUP_CHUNK_SIZE: usize = 500;
+        let mut gps_by_key = HashMap::new();
+        for keys in keys.chunks(GPS_LOOKUP_CHUNK_SIZE) {
+            if keys.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=keys.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    format!(
+                        "SELECT key, latitude, longitude FROM gallery_objects WHERE key IN ({placeholders})"
+                    ),
+                    params_from_iter(keys.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let key = row_string(&row, 0, "gallery_objects.key")?;
+                let latitude = gallery::row_opt_f64(&row, 1, "gallery_objects.latitude")?;
+                let longitude = gallery::row_opt_f64(&row, 2, "gallery_objects.longitude")?;
+                if let (Some(latitude), Some(longitude)) = (latitude, longitude)
+                    && latitude.is_finite()
+                    && (-90.0..=90.0).contains(&latitude)
+                    && longitude.is_finite()
+                    && (-180.0..=180.0).contains(&longitude)
+                {
+                    gps_by_key.insert(
+                        key,
+                        MediaGpsCoordinates {
+                            latitude,
+                            longitude,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(gps_by_key)
     }
 
     async fn query_gallery_index(
@@ -566,6 +708,281 @@ impl MetadataStore for TursoMetadataStore {
                 "DELETE FROM manual_repair_action_run_history\n                 WHERE finished_at_unix < ?1",
                 (i64::try_from(finished_before_unix)
                     .context("manual repair action history prune timestamp overflow")?,),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn list_operation_runs(
+        &self,
+        operation_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationRun>> {
+        let mut rows = match (operation_id, limit) {
+            (Some(operation_id), Some(limit)) => {
+                self.connection
+                    .query(
+                        "SELECT record_json FROM operation_runs WHERE operation_id = ?1
+                     ORDER BY created_at_unix DESC, run_id DESC LIMIT ?2",
+                        (
+                            operation_id,
+                            i64::try_from(limit).context("operation run limit overflow")?,
+                        ),
+                    )
+                    .await?
+            }
+            (Some(operation_id), None) => {
+                self.connection
+                    .query(
+                        "SELECT record_json FROM operation_runs WHERE operation_id = ?1
+                     ORDER BY created_at_unix DESC, run_id DESC",
+                        (operation_id,),
+                    )
+                    .await?
+            }
+            (None, Some(limit)) => {
+                self.connection
+                    .query(
+                        "SELECT record_json FROM operation_runs
+                     ORDER BY created_at_unix DESC, run_id DESC LIMIT ?1",
+                        (i64::try_from(limit).context("operation run limit overflow")?,),
+                    )
+                    .await?
+            }
+            (None, None) => {
+                self.connection
+                    .query(
+                        "SELECT record_json FROM operation_runs
+                     ORDER BY created_at_unix DESC, run_id DESC",
+                        (),
+                    )
+                    .await?
+            }
+        };
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let payload = row_blob(&row, 0, "operation_runs.record_json")?;
+            records.push(
+                serde_json::from_slice(&payload)
+                    .context("invalid operation run record in turso")?,
+            );
+        }
+        Ok(records)
+    }
+
+    async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT record_json FROM operation_runs WHERE run_id = ?1",
+                (run_id,),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let payload = row_blob(&row, 0, "operation_runs.record_json")?;
+        Ok(Some(
+            serde_json::from_slice(&payload).context("invalid operation run record in turso")?,
+        ))
+    }
+
+    async fn persist_operation_run(&self, run: &OperationRun) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        let payload = serde_json::to_vec_pretty(run)?;
+        let status = serde_json::to_value(run.status)?
+            .as_str()
+            .context("operation status did not serialize as a string")?
+            .to_string();
+        let finished_at_unix = run
+            .finished_at_unix
+            .map(i64::try_from)
+            .transpose()
+            .context("operation run timestamp overflow")?;
+        self.connection
+            .execute(
+                "INSERT INTO operation_runs (run_id, operation_id, status, created_at_unix, finished_at_unix, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                     operation_id = excluded.operation_id,
+                     status = excluded.status,
+                     created_at_unix = excluded.created_at_unix,
+                     finished_at_unix = excluded.finished_at_unix,
+                     record_json = excluded.record_json",
+                (
+                    run.run_id.as_str(),
+                    run.operation_id.as_str(),
+                    status,
+                    i64::try_from(run.created_at_unix)
+                        .context("operation run timestamp overflow")?,
+                    finished_at_unix,
+                    payload,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn prune_operation_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        let finished_before_unix = i64::try_from(finished_before_unix)
+            .context("operation run history prune timestamp overflow")?;
+        let result = async {
+            self.connection.execute_batch("BEGIN IMMEDIATE").await?;
+            // Result chunks deliberately have no foreign key: older database
+            // versions already contain this table, and the explicit delete
+            // keeps the retention path compatible with them.
+            self.connection
+                .execute(
+                    "DELETE FROM operation_result_chunks
+                     WHERE run_id IN (
+                         SELECT run_id FROM operation_runs
+                         WHERE finished_at_unix < ?1
+                           AND status NOT IN ('queued', 'running')
+                     )",
+                    (finished_before_unix,),
+                )
+                .await?;
+            self.connection
+                .execute(
+                    "DELETE FROM operation_runs
+                     WHERE finished_at_unix < ?1
+                       AND status NOT IN ('queued', 'running')",
+                    (finished_before_unix,),
+                )
+                .await?;
+            self.connection.execute_batch("COMMIT").await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.rollback().await;
+        }
+        result
+    }
+
+    async fn interrupt_unfinished_operation_runs(
+        &self,
+        finished_at_unix: u64,
+        termination_reason: &str,
+    ) -> Result<usize> {
+        let _writer = self.writer_lock.lock().await;
+        let result = async {
+            self.connection.execute_batch("BEGIN IMMEDIATE").await?;
+            let mut rows = self
+                .connection
+                .query(
+                    "SELECT run_id, record_json FROM operation_runs
+                     WHERE status IN ('queued', 'running')",
+                    (),
+                )
+                .await?;
+            let mut interrupted = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let run_id = row_string(&row, 0, "operation_runs.run_id")?;
+                let payload = row_blob(&row, 1, "operation_runs.record_json")?;
+                let mut run: OperationRun = serde_json::from_slice(&payload)
+                    .context("invalid operation run record in turso")?;
+                if !run.status.is_unfinished() {
+                    continue;
+                }
+                run.status = OperationRunStatus::Interrupted;
+                run.finished_at_unix = Some(finished_at_unix);
+                run.termination_reason = Some(termination_reason.to_string());
+                run.progress.message = Some("Interrupted after server restart.".to_string());
+                interrupted.push((run_id, serde_json::to_vec_pretty(&run)?));
+            }
+            for (run_id, payload) in &interrupted {
+                self.connection
+                    .execute(
+                        "UPDATE operation_runs
+                         SET status = 'interrupted', finished_at_unix = ?2, record_json = ?3
+                         WHERE run_id = ?1",
+                        (
+                            run_id.as_str(),
+                            i64::try_from(finished_at_unix)
+                                .context("operation run timestamp overflow")?,
+                            payload.as_slice(),
+                        ),
+                    )
+                    .await?;
+            }
+            self.connection.execute_batch("COMMIT").await?;
+            Ok(interrupted.len())
+        }
+        .await;
+        if result.is_err() {
+            self.rollback().await;
+        }
+        result
+    }
+
+    async fn list_operation_result_chunks(
+        &self,
+        run_id: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<OperationResultChunk>> {
+        let mut rows = match limit {
+            Some(limit) => {
+                self.connection
+                    .query(
+                        "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                     ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2 OFFSET ?3",
+                        (
+                            run_id,
+                            i64::try_from(limit)
+                                .context("operation result chunk limit overflow")?,
+                            i64::try_from(offset)
+                                .context("operation result chunk offset overflow")?,
+                        ),
+                    )
+                    .await?
+            }
+            None => {
+                self.connection
+                    .query(
+                        "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
+                     ORDER BY created_at_unix ASC, chunk_id ASC LIMIT -1 OFFSET ?2",
+                        (
+                            run_id,
+                            i64::try_from(offset)
+                                .context("operation result chunk offset overflow")?,
+                        ),
+                    )
+                    .await?
+            }
+        };
+        let mut chunks = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let payload = row_blob(&row, 0, "operation_result_chunks.payload_json")?;
+            chunks.push(
+                serde_json::from_slice(&payload)
+                    .context("invalid operation result chunk in turso")?,
+            );
+        }
+        Ok(chunks)
+    }
+
+    async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        let payload = serde_json::to_vec_pretty(chunk)?;
+        self.connection
+            .execute(
+                "INSERT INTO operation_result_chunks (run_id, chunk_id, result_type, created_at_unix, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id, chunk_id) DO UPDATE SET
+                     result_type = excluded.result_type,
+                     created_at_unix = excluded.created_at_unix,
+                     payload_json = excluded.payload_json",
+                (
+                    chunk.run_id.as_str(),
+                    chunk.chunk_id.as_str(),
+                    chunk.result_type.as_str(),
+                    i64::try_from(chunk.created_at_unix)
+                        .context("operation result chunk timestamp overflow")?,
+                    payload,
+                ),
             )
             .await?;
         Ok(())
@@ -992,7 +1409,8 @@ impl MetadataStore for TursoMetadataStore {
 
         let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
         let payload = decompress_snapshot_json(&payload)?;
-        let snapshot = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        let mut snapshot = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        normalize_snapshot_manifest_object_ids(&mut snapshot);
         Ok(Some(snapshot))
     }
 
@@ -1345,7 +1763,7 @@ impl MetadataStore for TursoMetadataStore {
         };
 
         let payload = row_blob(&row, 0, "version_indexes.index_json")?;
-        let index = self.decode_json::<FileVersionIndex>(payload, "version index")?;
+        let index = decode_version_index(object_id, &payload, "Turso")?;
         Ok(Some(index))
     }
 
@@ -1662,7 +2080,7 @@ impl MetadataStore for TursoMetadataStore {
         let mut rows = self
             .connection
             .query(
-                "SELECT index_json
+                "SELECT object_id, index_json
                  FROM version_indexes
                  ORDER BY object_id",
                 (),
@@ -1671,10 +2089,250 @@ impl MetadataStore for TursoMetadataStore {
 
         let mut indexes = Vec::new();
         while let Some(row) = rows.next().await? {
-            let payload = row_blob(&row, 0, "version_indexes.index_json")?;
-            indexes.push(self.decode_json::<FileVersionIndex>(payload, "version index")?);
+            let object_id = row_string(&row, 0, "version_indexes.object_id")?;
+            let payload = row_blob(&row, 1, "version_indexes.index_json")?;
+            indexes.push(decode_version_index(&object_id, &payload, "Turso")?);
         }
         Ok(indexes)
+    }
+
+    async fn load_version_indexes_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>> {
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        let mut rows = if let Some(after_object_id) = after_object_id {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     WHERE object_id > ?1
+                     ORDER BY object_id
+                     LIMIT ?2",
+                    (after_object_id, limit),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     ORDER BY object_id
+                     LIMIT ?1",
+                    (limit,),
+                )
+                .await?
+        };
+
+        let mut indexes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let object_id = row_string(&row, 0, "version_indexes.object_id")?;
+            let payload = row_blob(&row, 1, "version_indexes.index_json")?;
+            indexes.push(decode_version_index(&object_id, &payload, "Turso")?);
+        }
+        Ok(indexes)
+    }
+
+    async fn load_version_index_payloads_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
+        let mut rows = if let Some(after_object_id) = after_object_id {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     WHERE object_id > ?1
+                     ORDER BY object_id
+                     LIMIT ?2",
+                    (after_object_id, limit),
+                )
+                .await?
+        } else {
+            self.connection
+                .query(
+                    "SELECT object_id, index_json
+                     FROM version_indexes
+                     ORDER BY object_id
+                     LIMIT ?1",
+                    (limit,),
+                )
+                .await?
+        };
+
+        let mut payloads = Vec::new();
+        while let Some(row) = rows.next().await? {
+            payloads.push((
+                row_string(&row, 0, "version_indexes.object_id")?,
+                row_blob(&row, 1, "version_indexes.index_json")?,
+            ));
+        }
+        Ok(payloads)
+    }
+
+    async fn list_recoverable_history_listing(
+        &self,
+        prefix: &str,
+        depth: usize,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryListing> {
+        let prefix = prefix.trim().trim_matches('/').to_string();
+        let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+        let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
+        let depth = depth.clamp(1, 64);
+        let depth = i64::try_from(depth).context("history listing depth overflow")?;
+        let max_entries = max_entries.max(1);
+        let limit = max_entries
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(i64::MAX);
+        let query = recoverable_history_listing_query(!prefix.is_empty());
+        let mut rows = self
+            .connection
+            .query(
+                &query,
+                (
+                    TOMBSTONE_MANIFEST_HASH,
+                    prefix,
+                    path_lower_bound.unwrap_or_default(),
+                    path_upper_bound.unwrap_or_default(),
+                    depth,
+                    limit,
+                ),
+            )
+            .await?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let path = row_string(&row, 0, "recoverable_history_listing.path")?;
+            if row_u64(&row, 1, "recoverable_history_listing.is_historical")? != 0 {
+                entries.push(RecoverableHistoryListingEntry::Historical(
+                    RecoverableHistoryEntry {
+                        path,
+                        restore_source_path: row_string(
+                            &row,
+                            2,
+                            "recoverable_history_listing.restore_source_path",
+                        )?,
+                        restore_source_object_id: row_string(
+                            &row,
+                            3,
+                            "recoverable_history_listing.restore_source_object_id",
+                        )?,
+                        restore_version_id: row_string(
+                            &row,
+                            4,
+                            "recoverable_history_listing.restore_version_id",
+                        )?,
+                        removed_at_unix: row_u64(
+                            &row,
+                            5,
+                            "recoverable_history_listing.removed_at_unix",
+                        )?,
+                        moved_to_path: row_opt_string(
+                            &row,
+                            6,
+                            "recoverable_history_listing.moved_to_path",
+                        )?,
+                    },
+                ));
+            } else {
+                entries.push(RecoverableHistoryListingEntry::Prefix { path });
+            }
+        }
+        let truncated = entries.len() > max_entries;
+        entries.truncate(max_entries);
+        Ok(RecoverableHistoryListing { entries, truncated })
+    }
+
+    async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM metadata_meta WHERE key = ?1",
+                (HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,),
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(HistoryHeadProjectionBackfillState::Complete);
+        }
+        drop(rows);
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT value FROM metadata_meta WHERE key = ?1",
+                (HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,),
+            )
+            .await?;
+        let after_object_id = match rows.next().await? {
+            Some(row) => Some(row_string(
+                &row,
+                0,
+                "metadata_meta.history_head_projection_backfill_cursor",
+            )?),
+            None => None,
+        };
+        Ok(HistoryHeadProjectionBackfillState::Pending { after_object_id })
+    }
+
+    async fn persist_history_head_projection_backfill_batch(
+        &self,
+        projections: &[VersionIndexHeadProjection],
+        next_after_object_id: Option<&str>,
+        complete: bool,
+    ) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        for projection in projections {
+            insert_version_index_head_projection_if_missing(&self.connection, projection).await?;
+        }
+        if complete {
+            self.connection
+                .execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,),
+                )
+                .await?;
+            self.connection
+                .execute(
+                    "DELETE FROM metadata_meta WHERE key = ?1",
+                    (HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,),
+                )
+                .await?;
+        } else {
+            let after_object_id = next_after_object_id
+                .context("history head projection backfill has no next cursor")?;
+            self.connection
+                .execute(
+                    "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, after_object_id),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn clear_history_head_projections_for_test(&self) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute("DELETE FROM version_index_heads", ())
+            .await?;
+        self.connection
+            .execute(
+                "DELETE FROM metadata_meta WHERE key IN (?1, ?2)",
+                (
+                    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
+                    HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+                ),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
@@ -1731,7 +2389,10 @@ impl MetadataStore for TursoMetadataStore {
         while let Some(row) = rows.next().await? {
             let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
             let payload = decompress_snapshot_json(&payload)?;
-            snapshots.push(self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?);
+            let mut snapshot =
+                self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+            normalize_snapshot_manifest_object_ids(&mut snapshot);
+            snapshots.push(snapshot);
         }
         Ok(snapshots)
     }
@@ -1749,7 +2410,8 @@ impl MetadataStore for TursoMetadataStore {
         };
         let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
         let payload = decompress_snapshot_json(&payload)?;
-        let manifest = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        let mut manifest = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
+        normalize_snapshot_manifest_object_ids(&mut manifest);
         Ok(Some(manifest))
     }
 
@@ -2270,6 +2932,12 @@ impl MetadataStore for TursoMetadataStore {
                 (object_id,),
             )
             .await?;
+        self.connection
+            .execute(
+                "DELETE FROM version_index_heads WHERE object_id = ?1",
+                (object_id,),
+            )
+            .await?;
         Ok(())
     }
 
@@ -2359,6 +3027,97 @@ pub(super) async fn add_column_if_missing(
     Ok(())
 }
 
+pub(super) async fn upsert_version_index_head_projection(
+    connection: &turso::Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    connection
+        .execute(
+            "INSERT INTO version_index_heads (
+                 object_id,
+                 head_version_id,
+                 head_manifest_hash,
+                 logical_path,
+                 removed_at_unix,
+                 restore_source_path,
+                 restore_source_object_id,
+                 restore_version_id,
+                 moved_source_object_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(object_id) DO UPDATE SET
+                 head_version_id = excluded.head_version_id,
+                 head_manifest_hash = excluded.head_manifest_hash,
+                 logical_path = excluded.logical_path,
+                 removed_at_unix = excluded.removed_at_unix,
+                 restore_source_path = excluded.restore_source_path,
+                 restore_source_object_id = excluded.restore_source_object_id,
+                 restore_version_id = excluded.restore_version_id,
+                 moved_source_object_id = excluded.moved_source_object_id",
+            (
+                projection.object_id.as_str(),
+                projection.head_version_id.as_deref(),
+                projection.head_manifest_hash.as_deref(),
+                projection.logical_path.as_deref(),
+                projection
+                    .removed_at_unix
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("history head removal timestamp overflow")?,
+                projection.restore_source_path.as_deref(),
+                projection.restore_source_object_id.as_deref(),
+                projection.restore_version_id.as_deref(),
+                projection.moved_source_object_id.as_deref(),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn insert_version_index_head_projection_if_missing(
+    connection: &turso::Connection,
+    projection: &VersionIndexHeadProjection,
+) -> Result<()> {
+    // A normal write is authoritative. This migration-only insert deliberately
+    // cannot resurrect an index that was deleted while a backfill page was
+    // being decoded, nor can it overwrite a concurrent write.
+    connection
+        .execute(
+            "INSERT INTO version_index_heads (
+                 object_id,
+                 head_version_id,
+                 head_manifest_hash,
+                 logical_path,
+                 removed_at_unix,
+                 restore_source_path,
+                 restore_source_object_id,
+                 restore_version_id,
+                 moved_source_object_id
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+             WHERE EXISTS (
+                 SELECT 1 FROM version_indexes WHERE object_id = ?1
+             )
+             ON CONFLICT(object_id) DO NOTHING",
+            (
+                projection.object_id.as_str(),
+                projection.head_version_id.as_deref(),
+                projection.head_manifest_hash.as_deref(),
+                projection.logical_path.as_deref(),
+                projection
+                    .removed_at_unix
+                    .map(i64::try_from)
+                    .transpose()
+                    .context("history head removal timestamp overflow")?,
+                projection.restore_source_path.as_deref(),
+                projection.restore_source_object_id.as_deref(),
+                projection.restore_version_id.as_deref(),
+                projection.moved_source_object_id.as_deref(),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
     connection
         .execute_batch(
@@ -2377,6 +3136,18 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS version_indexes (
                 object_id TEXT PRIMARY KEY,
                 index_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS version_index_heads (
+                object_id TEXT PRIMARY KEY,
+                head_version_id TEXT,
+                head_manifest_hash TEXT,
+                logical_path TEXT,
+                removed_at_unix INTEGER,
+                restore_source_path TEXT,
+                restore_source_object_id TEXT,
+                restore_version_id TEXT,
+                moved_source_object_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -2431,6 +3202,24 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 run_id TEXT PRIMARY KEY,
                 finished_at_unix INTEGER NOT NULL,
                 record_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS operation_runs (
+                run_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                finished_at_unix INTEGER,
+                record_json BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS operation_result_chunks (
+                run_id TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                result_type TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                payload_json BLOB NOT NULL,
+                PRIMARY KEY(run_id, chunk_id)
             );
 
             CREATE TABLE IF NOT EXISTS data_scrub_run_history (
@@ -2556,16 +3345,31 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 PRIMARY KEY(source_node_id, key, source_version_id)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
-                ON current_objects(object_id);
             CREATE INDEX IF NOT EXISTS idx_snapshots_created
                 ON snapshots(created_at_unix DESC, snapshot_id DESC);
             CREATE INDEX IF NOT EXISTS idx_storage_stats_history_collected
                 ON storage_stats_history(collected_at_unix DESC);
+            CREATE INDEX IF NOT EXISTS idx_version_index_heads_history_path
+                ON version_index_heads(
+                    head_manifest_hash,
+                    logical_path,
+                    removed_at_unix DESC,
+                    restore_version_id DESC,
+                    object_id DESC
+                );
             CREATE INDEX IF NOT EXISTS idx_repair_run_history_finished
                 ON repair_run_history(finished_at_unix DESC, run_id DESC);
             CREATE INDEX IF NOT EXISTS idx_manual_repair_action_run_history_finished
                 ON manual_repair_action_run_history(finished_at_unix DESC, run_id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_operation_runs_operation_created
+                ON operation_runs(operation_id, created_at_unix DESC, run_id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_operation_runs_status
+                ON operation_runs(status, created_at_unix DESC, run_id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_operation_result_chunks_run_created
+                ON operation_result_chunks(run_id, created_at_unix ASC, chunk_id ASC);
             CREATE INDEX IF NOT EXISTS idx_data_scrub_run_history_finished
                 ON data_scrub_run_history(finished_at_unix DESC, run_id DESC);
             CREATE INDEX IF NOT EXISTS idx_admin_audit_created
@@ -2587,11 +3391,42 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
         .await?;
     add_column_if_missing(
         connection,
+        "current_objects",
+        "object_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_current_objects_object_id
+             ON current_objects(object_id)",
+            (),
+        )
+        .await?;
+    add_column_if_missing(
+        connection,
         "s3_access_keys",
         "allow_manage",
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    add_column_if_missing(connection, "operation_runs", "finished_at_unix", "INTEGER").await?;
+    connection
+        .execute(
+            "UPDATE operation_runs
+             SET finished_at_unix = created_at_unix
+             WHERE finished_at_unix IS NULL
+               AND status NOT IN ('queued', 'running')",
+            (),
+        )
+        .await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_operation_runs_status_finished
+             ON operation_runs(status, finished_at_unix DESC, run_id DESC)",
+            (),
+        )
+        .await?;
     gallery::init_gallery_projection(connection).await?;
 
     let mut rows = connection
@@ -2613,7 +3448,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             .with_context(|| format!("invalid Turso metadata schema version: {raw}"))?,
         None => METADATA_SCHEMA_VERSION_CURRENT,
     };
-    if schema_version != METADATA_SCHEMA_VERSION_CURRENT {
+    if !(1..=METADATA_SCHEMA_VERSION_CURRENT).contains(&schema_version) {
         bail!(
             "unsupported Turso metadata schema version: {} (current={})",
             schema_version,
@@ -2822,6 +3657,111 @@ mod tests {
 
         drop(connection);
         drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn terminal_operation_retention_removes_result_chunks_but_keeps_active_runs() {
+        let metadata_db_path = turso_test_db_path("turso-operation-retention");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("Turso metadata store should open");
+        let terminal = OperationRun {
+            run_id: "terminal-run".to_string(),
+            operation_id: "multimedia.geolocation.propose".to_string(),
+            status: OperationRunStatus::Completed,
+            priority: OperationPriority::Background,
+            created_at_unix: 10,
+            started_at_unix: Some(10),
+            finished_at_unix: Some(11),
+            progress: OperationProgress::default(),
+            input: serde_json::json!({}),
+            summary: None,
+            error: None,
+            termination_reason: None,
+        };
+        let active = OperationRun {
+            run_id: "active-run".to_string(),
+            status: OperationRunStatus::Running,
+            finished_at_unix: None,
+            ..terminal.clone()
+        };
+        store
+            .persist_operation_run(&terminal)
+            .await
+            .expect("terminal operation should persist");
+        store
+            .persist_operation_run(&active)
+            .await
+            .expect("active operation should persist");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: terminal.run_id.clone(),
+                chunk_id: "proposal-chunk".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 11,
+                payload: serde_json::json!({ "proposals": [] }),
+            })
+            .await
+            .expect("terminal operation result should persist");
+        store
+            .persist_operation_result_chunk(&OperationResultChunk {
+                run_id: terminal.run_id.clone(),
+                chunk_id: "proposal-chunk-second".to_string(),
+                result_type: "multimedia.geolocation.proposal_chunk".to_string(),
+                created_at_unix: 12,
+                payload: serde_json::json!({ "proposals": [] }),
+            })
+            .await
+            .expect("second terminal operation result should persist");
+        let result_page = store
+            .list_operation_result_chunks(&terminal.run_id, Some(1), 1)
+            .await
+            .expect("paged result lookup should succeed");
+        assert_eq!(result_page.len(), 1);
+        assert_eq!(result_page[0].chunk_id, "proposal-chunk-second");
+
+        store
+            .prune_operation_run_history_before(11)
+            .await
+            .expect("operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&terminal.run_id)
+                .await
+                .expect("retained run lookup should succeed")
+                .is_some(),
+            "retention must be measured from completion, not queue time"
+        );
+
+        store
+            .prune_operation_run_history_before(12)
+            .await
+            .expect("expired operation retention should succeed");
+        assert!(
+            store
+                .load_operation_run(&terminal.run_id)
+                .await
+                .expect("pruned run lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            store
+                .list_operation_result_chunks(&terminal.run_id, None, 0)
+                .await
+                .expect("pruned result lookup should succeed")
+                .is_empty()
+        );
+        assert!(
+            store
+                .load_operation_run(&active.run_id)
+                .await
+                .expect("active run lookup should succeed")
+                .is_some(),
+            "unfinished operations are never removed by retention"
+        );
+
+        drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 }

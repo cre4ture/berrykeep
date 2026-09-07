@@ -1,12 +1,61 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY: usize = 100_000;
-const METADATA_SCHEMA_VERSION_CURRENT: i64 = 1;
+const OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE: usize = 128;
+const OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL: usize = 1_024;
+const STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE: usize = 256;
+const STORE_INDEX_VERSION_LOOKUP_CONCURRENCY: usize = 32;
+const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
+const METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID + 1;
+const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION;
+pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
+pub(super) const GALLERY_SIDECAR_GPS_BACKFILL_KEY: &str = "gallery_sidecar_gps_v2";
+pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY: &str =
+    "history_head_projection_backfill_cursor_v1";
+pub(super) const HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY: &str =
+    "history_head_projection_backfill_complete_v1";
+
+fn object_id_migration_lock_path(metadata_db_path: &Path) -> PathBuf {
+    let mut file_name = metadata_db_path
+        .file_name()
+        .unwrap_or_default()
+        .to_os_string();
+    file_name.push(".object-id-migration.lock");
+    metadata_db_path.with_file_name(file_name)
+}
+
+async fn acquire_object_id_migration_lock(metadata_db_path: &Path) -> Result<std::fs::File> {
+    let lock_path = object_id_migration_lock_path(metadata_db_path);
+    tokio::task::spawn_blocking(move || {
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "failed to open object ID migration lock file {}",
+                    lock_path.display()
+                )
+            })?;
+        FileExt::lock_exclusive(&lock_file).with_context(|| {
+            format!(
+                "failed to acquire object ID migration lock {}",
+                lock_path.display()
+            )
+        })?;
+        Ok(lock_file)
+    })
+    .await
+    .context("object ID migration lock task failed")?
+}
 
 fn current_objects_cache_capacity() -> usize {
     std::env::var("IRONMESH_CURRENT_OBJECTS_CACHE_CAPACITY")
@@ -34,7 +83,12 @@ use bytes::{Bytes, BytesMut};
 use common::NodeId;
 use common::content_fingerprint::content_fingerprint_from_chunk_refs;
 use common::range_chunk_cache::RangeChunkCache;
-use common::xmp::{XmpSidecar, is_sidecar_key, media_key_for_sidecar, sidecar_key_for_media};
+use common::xmp::{
+    XmpGeoInference, XmpGeoLocation, XmpSidecar, is_sidecar_key, media_key_for_sidecar,
+    sidecar_key_for_media,
+};
+use fs2::FileExt;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -56,14 +110,17 @@ mod turso_impl;
 
 use self::gallery_summary_cache::GallerySummaryCache;
 pub(crate) use self::gallery_summary_cache::{
-    GallerySummaryCacheValue, GallerySummaryProgress, GallerySummaryRefreshStatus,
-    GallerySummaryScope,
+    GalleryCaptureSummaryBusyError, GallerySummaryCacheValue, GallerySummaryMiss,
+    GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
 };
 use self::sqlite_impl::SqliteMetadataStore;
 #[cfg(feature = "turso-metadata")]
 use self::turso_impl::TursoMetadataStore;
 use super::cluster::NodeDescriptor;
-use super::{DataScrubRunRecord, ManualRepairActionRunRecord, RepairRunRecord};
+use super::{
+    DataScrubRunRecord, ManualRepairActionRunRecord, RepairRunRecord,
+    operations::{OperationResultChunk, OperationRun},
+};
 
 pub use data_scrub::DataScrubReport;
 pub use media_cache::{
@@ -75,12 +132,12 @@ pub use media_tools::{HostDependencyReport, HostDependencyStatus};
 pub(crate) use data_scrub::DataScrubber;
 #[cfg(test)]
 pub(crate) use data_scrub::{DataScrubIssue, DataScrubIssueKind, DataScrubRunTestHook};
-pub(crate) use gallery_capture_time::effective_gallery_captured_at_unix;
 pub(super) use gallery_capture_time::version_created_at_unix_from_payload;
+pub(crate) use gallery_capture_time::{effective_gallery_captured_at_unix, filename_capture_time};
 pub(super) use gallery_labels::{
     GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GalleryLabelFilter,
-    decode_gallery_labels, encode_gallery_labels, gallery_label_filter_matches_json,
-    gallery_label_predicates,
+    decode_gallery_labels, encode_gallery_labels, gallery_label_filter_matches,
+    gallery_label_filter_matches_json, gallery_label_predicates,
 };
 use media_cache::MediaCacheBuildConfig;
 #[cfg(test)]
@@ -996,6 +1053,17 @@ struct SnapshotManifest {
     object_ids: HashMap<String, String>,
 }
 
+/// Drops identity bindings that predate stable object IDs from a historical snapshot.
+///
+/// Old snapshot manifests have no trustworthy identity for these paths. Treating an empty value
+/// as absent keeps it from being exposed by snapshot reads or persisted as copied-from metadata
+/// when a snapshot is restored.
+fn normalize_snapshot_manifest_object_ids(snapshot: &mut SnapshotManifest) {
+    snapshot.object_ids.retain(|path, object_id| {
+        snapshot.objects.contains_key(path) && !object_id.trim().is_empty()
+    });
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveSnapshotBatch {
     snapshot_id: String,
@@ -1012,10 +1080,34 @@ pub(super) struct CurrentState {
     pub(super) object_ids: HashMap<String, String>,
 }
 
+fn current_state_has_unique_object_id_bindings(current_state: &CurrentState) -> bool {
+    let mut object_ids = HashSet::with_capacity(current_state.objects.len());
+    current_state.objects.keys().all(|path| {
+        current_state
+            .object_ids
+            .get(path)
+            .filter(|object_id| !object_id.trim().is_empty())
+            .is_some_and(|object_id| object_ids.insert(object_id))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CurrentObjectEntry {
     pub(super) manifest_hash: String,
     pub(super) object_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct LegacyObjectIdCandidate {
+    object_id: String,
+    priority: u8,
+    created_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectIdMigrationAssignment {
+    object_id: String,
+    needs_version_backfill: bool,
 }
 
 /// A persisted, current-state projection used to serve the paginated gallery without
@@ -1049,6 +1141,8 @@ pub(crate) struct GalleryIndexQuery {
     pub(crate) depth: usize,
     pub(crate) media_filter: GalleryIndexMediaFilter,
     pub(crate) captured_sort: GalleryIndexCapturedSort,
+    pub(crate) captured_from_unix: Option<u64>,
+    pub(crate) captured_until_unix: Option<u64>,
     pub(crate) offset: usize,
     pub(crate) limit: usize,
     pub(crate) viewport: Option<GalleryViewportBounds>,
@@ -1072,6 +1166,33 @@ pub(crate) fn gallery_map_bounded_resolution(
     max_clusters: usize,
 ) -> u32 {
     let max_clusters = max_clusters.max(1) as f64;
+    let mut resolution = requested_resolution.max(1);
+    while gallery_map_viewport_cell_upper_bound(viewport, resolution) > max_clusters
+        && resolution > 1
+    {
+        resolution /= 2;
+    }
+    resolution
+}
+
+/// Scales a visible-viewport cluster budget to cover a prefetched query viewport. The multiplier
+/// is bounded by the 2× width and height prefetch contract, so a normal request keeps its base
+/// budget while a full 2× envelope can return at most four times as many occupied cells.
+pub(crate) fn gallery_map_prefetch_max_clusters(
+    visible_max_clusters: usize,
+    requested_resolution: u32,
+    visible_viewport: GalleryViewportBounds,
+    prefetch_viewport: GalleryViewportBounds,
+) -> usize {
+    let visible_cells =
+        gallery_map_viewport_cell_upper_bound(visible_viewport, requested_resolution).max(1.0);
+    let prefetch_cells =
+        gallery_map_viewport_cell_upper_bound(prefetch_viewport, requested_resolution);
+    let multiplier = (prefetch_cells / visible_cells).ceil().clamp(1.0, 4.0) as usize;
+    visible_max_clusters.max(1).saturating_mul(multiplier)
+}
+
+fn gallery_map_viewport_cell_upper_bound(viewport: GalleryViewportBounds, resolution: u32) -> f64 {
     let longitude_span = if viewport.west <= viewport.east {
         viewport.east - viewport.west
     } else {
@@ -1086,17 +1207,10 @@ pub(crate) fn gallery_map_bounded_resolution(
     let latitude_span = (mercator_y(viewport.north) - mercator_y(viewport.south))
         .abs()
         .clamp(0.0, 1.0);
-    let mut resolution = requested_resolution.max(1);
-    while gallery_map_viewport_cell_upper_bound(longitude_span, latitude_span, resolution)
-        > max_clusters
-        && resolution > 1
-    {
-        resolution /= 2;
-    }
-    resolution
+    gallery_map_viewport_cell_count(longitude_span, latitude_span, resolution)
 }
 
-fn gallery_map_viewport_cell_upper_bound(
+fn gallery_map_viewport_cell_count(
     longitude_span: f64,
     latitude_span: f64,
     resolution: u32,
@@ -1122,11 +1236,15 @@ pub(crate) struct GalleryIndexMediaSummary {
 #[derive(Debug, Clone)]
 pub(crate) struct GalleryIndexEntry {
     pub(crate) key: String,
+    pub(crate) object_id: String,
     pub(crate) manifest_hash: String,
     pub(crate) size_bytes: Option<u64>,
     pub(crate) modified_at_unix: Option<u64>,
     pub(crate) content_fingerprint: Option<String>,
     pub(crate) media_metadata: Option<CachedMediaMetadata>,
+    /// Path-scoped XMP GPS, retained separately so a location stays visible
+    /// while its content-addressed media cache is missing or being rebuilt.
+    pub(crate) gps_override: Option<MediaGpsCoordinates>,
     /// User labels of the object, materialized from the projection's label
     /// column. Populated by the sidecar ingest; empty until then.
     pub(crate) labels: Vec<String>,
@@ -1146,9 +1264,15 @@ pub(crate) struct GalleryMapClusterQuery {
     pub(crate) prefix: String,
     pub(crate) depth: usize,
     pub(crate) media_filter: GalleryIndexMediaFilter,
+    pub(crate) captured_from_unix: Option<u64>,
+    pub(crate) captured_until_unix: Option<u64>,
     pub(crate) viewport: GalleryViewportBounds,
     pub(crate) requested_resolution: u32,
     pub(crate) max_clusters: usize,
+    /// Labels used to limit every aggregate and representative entry in this
+    /// map query. Keeping the filter with the storage query prevents a
+    /// sensitive entry from affecting a cluster count or summary.
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone)]
@@ -1182,12 +1306,16 @@ pub(crate) struct GalleryMapClusterEntriesQuery {
     pub(crate) prefix: String,
     pub(crate) depth: usize,
     pub(crate) media_filter: GalleryIndexMediaFilter,
+    pub(crate) captured_from_unix: Option<u64>,
+    pub(crate) captured_until_unix: Option<u64>,
     pub(crate) viewport: GalleryViewportBounds,
     pub(crate) resolution: u32,
     pub(crate) cell_x: u32,
     pub(crate) cell_y: u32,
     pub(crate) offset: usize,
     pub(crate) limit: usize,
+    /// The filter captured in the query token that selected this cluster.
+    pub(crate) label_filter: GalleryLabelFilter,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1247,6 +1375,7 @@ pub enum VersionConsistencyState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct FileVersionRecord {
     pub(super) version_id: String,
+    #[serde(default)]
     pub(super) object_id: String,
     pub(super) manifest_hash: String,
     #[serde(default)]
@@ -1261,10 +1390,15 @@ pub(super) struct FileVersionRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct FileVersionIndex {
+    #[serde(default)]
     pub(super) object_id: String,
     pub(super) versions: HashMap<String, FileVersionRecord>,
     pub(super) head_version_ids: Vec<String>,
     preferred_head_version_id: Option<String>,
+    #[serde(skip)]
+    identity_was_normalized: bool,
+    #[serde(skip)]
+    persisted_object_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1404,6 +1538,15 @@ pub enum PathMutationResult {
     TargetExists,
 }
 
+/// The outcome of a historical restore batch. A finalization failure can occur
+/// after one or more paths have already been restored, so it is retained
+/// separately from the per-path mutation results.
+#[derive(Debug)]
+pub(crate) struct RestoreResolvedVersionPathsBatchResult {
+    pub(crate) results: Vec<Result<PathMutationResult>>,
+    pub(crate) finalization_error: Option<anyhow::Error>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRestoreReport {
     pub snapshot_id: String,
@@ -1423,7 +1566,139 @@ pub enum SnapshotRestoreMutationResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TombstonePathResult {
     pub path: String,
+    pub object_id: String,
     pub version_id: String,
+}
+
+/// A removed path whose most recent recoverable version can still be restored.
+///
+/// Entries are derived from live tombstone indexes. They intentionally exclude
+/// paths that currently exist, so callers can safely present them as optional
+/// historical items instead of mixing them into the current object tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoverableHistoryEntry {
+    pub path: String,
+    pub restore_source_path: String,
+    pub restore_source_object_id: String,
+    pub restore_version_id: String,
+    pub removed_at_unix: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_to_path: Option<String>,
+}
+
+/// The queryable preferred-head projection of one version index.
+///
+/// Version indexes intentionally retain their complete lineage as JSON. Explorer's
+/// recoverable-history view only needs the preferred head plus the resolved
+/// restore source, so keeping that small, relational projection avoids parsing
+/// every historical JSON payload for each directory request.
+#[derive(Debug, Clone)]
+pub(super) struct VersionIndexHeadProjection {
+    pub(super) object_id: String,
+    pub(super) head_version_id: Option<String>,
+    pub(super) head_manifest_hash: Option<String>,
+    pub(super) logical_path: Option<String>,
+    pub(super) removed_at_unix: Option<u64>,
+    pub(super) restore_source_path: Option<String>,
+    pub(super) restore_source_object_id: Option<String>,
+    pub(super) restore_version_id: Option<String>,
+    pub(super) moved_source_object_id: Option<String>,
+}
+
+impl VersionIndexHeadProjection {
+    fn empty(object_id: &str) -> Self {
+        Self {
+            object_id: object_id.to_string(),
+            head_version_id: None,
+            head_manifest_hash: None,
+            logical_path: None,
+            removed_at_unix: None,
+            restore_source_path: None,
+            restore_source_object_id: None,
+            restore_version_id: None,
+            moved_source_object_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoryHeadProjectionBackfillState {
+    Pending { after_object_id: Option<String> },
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryHeadProjectionBackfillProgress {
+    pub processed_index_count: usize,
+    pub complete: bool,
+}
+
+pub(super) fn version_index_head_projection(
+    object_id: &str,
+    index: &FileVersionIndex,
+) -> VersionIndexHeadProjection {
+    let mut projection = VersionIndexHeadProjection::empty(object_id);
+
+    let Some(head_version_id) = index
+        .preferred_head_version_id
+        .clone()
+        .or_else(|| choose_preferred_head(index))
+    else {
+        return projection;
+    };
+    let Some(head) = index.versions.get(&head_version_id) else {
+        return projection;
+    };
+
+    projection.head_version_id = Some(head_version_id);
+    projection.head_manifest_hash = Some(head.manifest_hash.clone());
+    projection.logical_path = head
+        .logical_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned);
+
+    if head.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+        return projection;
+    }
+    let Some(path) = projection.logical_path.clone() else {
+        return projection;
+    };
+
+    projection.removed_at_unix = Some(head.created_at_unix);
+    let restore_source = if let (Some(source_object_id), Some(source_version_id)) = (
+        head.copied_from_object_id.as_deref(),
+        head.copied_from_version_id.as_deref(),
+    ) {
+        Some((
+            head.copied_from_path
+                .clone()
+                .unwrap_or_else(|| path.clone()),
+            source_object_id.to_string(),
+            source_version_id.to_string(),
+            Some(source_object_id.to_string()),
+        ))
+    } else {
+        recoverable_tombstone_ancestor(index, head).map(|record| {
+            (
+                record.logical_path.unwrap_or_else(|| path.clone()),
+                object_id.to_string(),
+                record.version_id,
+                None,
+            )
+        })
+    };
+
+    if let Some((source_path, source_object_id, source_version_id, moved_source_object_id)) =
+        restore_source
+    {
+        projection.restore_source_path = Some(source_path);
+        projection.restore_source_object_id = Some(source_object_id);
+        projection.restore_version_id = Some(source_version_id);
+        projection.moved_source_object_id = moved_source_object_id;
+    }
+    projection
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1457,7 +1732,7 @@ pub struct SnapshotObjectState {
 }
 
 #[derive(Debug, Clone)]
-struct SnapshotRestoreSource {
+pub(crate) struct SnapshotRestoreSource {
     manifest_hash: String,
     object_id: Option<String>,
     version_id: Option<String>,
@@ -1874,6 +2149,22 @@ pub(crate) fn gallery_media_type_for_path(path: &str) -> Option<&'static str> {
     None
 }
 
+/// Resolves one gallery position while preserving the distinction between a
+/// user-authored XMP location and a BerryKeep inference. An inference is an
+/// overlay only while the original media lacks a measured position; a real
+/// embedded GPS fix always becomes authoritative once metadata is available.
+pub(crate) fn effective_gallery_gps<'a>(
+    embedded_gps: Option<&'a MediaGpsCoordinates>,
+    sidecar_gps: Option<&'a MediaGpsCoordinates>,
+    sidecar_inferred_by_berrykeep: bool,
+) -> Option<&'a MediaGpsCoordinates> {
+    if sidecar_inferred_by_berrykeep {
+        embedded_gps.or(sidecar_gps)
+    } else {
+        sidecar_gps.or(embedded_gps)
+    }
+}
+
 const WEB_MERCATOR_MAX_LATITUDE: f64 = 85.051_128_779_806_6;
 
 pub(super) fn gallery_web_mercator_position(latitude: f64, longitude: f64) -> Option<(f64, f64)> {
@@ -2111,6 +2402,7 @@ pub struct RepairAttemptRecord {
 
 #[derive(Debug, Clone)]
 pub struct PutResult {
+    pub object_id: String,
     pub snapshot_id: String,
     pub version_id: String,
     pub manifest_hash: String,
@@ -2118,6 +2410,27 @@ pub struct PutResult {
     pub new_chunks: usize,
     pub dedup_reused_chunks: usize,
     pub created_new_version: bool,
+}
+
+/// Explicit result of a geolocation sidecar mutation. This distinguishes a
+/// concurrent/existing GPS write or a changed media object from genuine
+/// storage or XMP failures.
+#[derive(Debug, Clone)]
+pub enum MediaGeolocationWrite {
+    Applied(PutResult),
+    AlreadyHasGps,
+    AlreadyHasCaptureTime,
+    MediaChanged,
+}
+
+/// Relevant XMP state stored in a media sidecar. GPS and capture-time presence
+/// are conservative write guards, so malformed user metadata is never
+/// shadowed by inferred properties.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MediaSidecarMetadataOverlay {
+    pub(crate) location: Option<XmpGeoLocation>,
+    pub(crate) has_geo_location_properties: bool,
+    pub(crate) has_capture_time_properties: bool,
 }
 
 #[allow(dead_code)]
@@ -2207,6 +2520,20 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["object_id", "index_json"],
     },
     MetadataDbLogicalTableSpec {
+        table: "version_index_heads",
+        tracked_columns: &[
+            "object_id",
+            "head_version_id",
+            "head_manifest_hash",
+            "logical_path",
+            "removed_at_unix",
+            "restore_source_path",
+            "restore_source_object_id",
+            "restore_version_id",
+            "moved_source_object_id",
+        ],
+    },
+    MetadataDbLogicalTableSpec {
         table: "snapshots",
         tracked_columns: &["snapshot_id", "snapshot_json"],
     },
@@ -2241,6 +2568,14 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
     MetadataDbLogicalTableSpec {
         table: "manual_repair_action_run_history",
         tracked_columns: &["run_id", "record_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "operation_runs",
+        tracked_columns: &["run_id", "operation_id", "record_json"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "operation_result_chunks",
+        tracked_columns: &["run_id", "chunk_id", "result_type", "payload_json"],
     },
     MetadataDbLogicalTableSpec {
         table: "data_scrub_run_history",
@@ -2413,6 +2748,16 @@ pub(crate) struct StoreIndexInspector {
     metadata_store: Arc<dyn MetadataStore>,
 }
 
+/// Detached access to the version-index metadata needed by Explorer's
+/// recoverable-history listing and restore-source resolution. It intentionally
+/// owns only clonable handles, so callers can release the main store lock
+/// before a potentially long metadata scan.
+#[derive(Clone)]
+pub(crate) struct StoreHistoryInspector {
+    storage_pool: StoragePool,
+    metadata_store: Arc<dyn MetadataStore>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ClusterReplicasPersister {
     metadata_store: Arc<dyn MetadataStore>,
@@ -2450,12 +2795,24 @@ struct ArchivedTombstoneIndexRecord {
 
 #[async_trait]
 trait MetadataStore: Send + Sync {
+    /// Whether legacy current rows, snapshots, and version payloads still need
+    /// their one-time stable object identity backfill.
+    async fn object_id_backfill_needed(&self) -> Result<bool>;
+    /// Marks the object identity backfill complete after every persisted
+    /// lineage has been migrated successfully.
+    async fn mark_object_id_backfill_complete(&self) -> Result<()>;
     /// Whether current XMP sidecars still need a one-time label projection
     /// backfill after this feature was introduced.
     async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool>;
     /// Marks the sidecar label projection backfill complete only after every
     /// current sidecar has been considered successfully.
     async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()>;
+    /// Whether current XMP sidecars still need a one-time GPS overlay
+    /// projection backfill after sidecar geolocation support was introduced.
+    async fn gallery_sidecar_gps_backfill_needed(&self) -> Result<bool>;
+    /// Marks the sidecar GPS projection backfill complete only after every
+    /// current sidecar has been considered successfully.
+    async fn mark_gallery_sidecar_gps_backfill_complete(&self) -> Result<()>;
     async fn load_current_state(&self) -> Result<CurrentState>;
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>>;
     async fn upsert_current_object(&self, key: &str, entry: &CurrentObjectEntry) -> Result<()>;
@@ -2464,6 +2821,28 @@ trait MetadataStore: Send + Sync {
     /// for the sidecar ingest, which resolves the labels of a media key from its
     /// XMP sidecar.
     async fn set_gallery_object_labels(&self, key: &str, labels: &[String]) -> Result<()>;
+    /// Replaces a path-scoped XMP GPS overlay on a projected media object. The
+    /// underlying media cache remains content-addressed, so duplicate byte
+    /// streams at other paths cannot inherit this location.
+    async fn set_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<XmpGeoLocation>,
+    ) -> Result<()>;
+    /// Returns the current complete label list for each requested key. Generic
+    /// store listings use this projection too, so gallery label edits never
+    /// replace labels that were omitted from a non-gallery query shape.
+    async fn gallery_object_labels_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, Vec<String>>>;
+    /// Returns the current effective GPS projection for each requested media
+    /// key. This stays path-scoped: a sidecar must not change an otherwise
+    /// identical object at another logical path.
+    async fn gallery_object_gps_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, MediaGpsCoordinates>>;
     async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -2511,6 +2890,28 @@ trait MetadataStore: Send + Sync {
         &self,
         finished_before_unix: u64,
     ) -> Result<()>;
+    async fn list_operation_runs(
+        &self,
+        operation_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationRun>>;
+    async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>>;
+    async fn persist_operation_run(&self, run: &OperationRun) -> Result<()>;
+    /// Removes terminal generic operation runs and their result chunks that
+    /// predate the retention cutoff. Unfinished work is never pruned here.
+    async fn prune_operation_run_history_before(&self, finished_before_unix: u64) -> Result<()>;
+    async fn interrupt_unfinished_operation_runs(
+        &self,
+        finished_at_unix: u64,
+        termination_reason: &str,
+    ) -> Result<usize>;
+    async fn list_operation_result_chunks(
+        &self,
+        run_id: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<OperationResultChunk>>;
+    async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()>;
     async fn list_data_scrub_run_history(
         &self,
         limit: Option<usize>,
@@ -2594,6 +2995,39 @@ trait MetadataStore: Send + Sync {
         index: &FileVersionIndex,
     ) -> Result<()>;
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>>;
+    async fn load_version_indexes_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileVersionIndex>>;
+    /// Reads a raw page for the history-head migration. The migration can
+    /// advance past one corrupt legacy payload without weakening normal
+    /// version-index reads, which must continue to report malformed metadata.
+    async fn load_version_index_payloads_after(
+        &self,
+        after_object_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>>;
+    /// Reads the indexed, depth-projected Explorer history. The result contains
+    /// at most `max_entries + 1` visible paths, rather than materializing every
+    /// historical descendant below the requested prefix.
+    async fn list_recoverable_history_listing(
+        &self,
+        prefix: &str,
+        depth: usize,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryListing>;
+    async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState>;
+    async fn persist_history_head_projection_backfill_batch(
+        &self,
+        projections: &[VersionIndexHeadProjection],
+        next_after_object_id: Option<&str>,
+        complete: bool,
+    ) -> Result<()>;
+    #[cfg(test)]
+    async fn clear_history_head_projections_for_test(&self) -> Result<()>;
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
@@ -2953,6 +3387,378 @@ impl StorageStatsCollector {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoverableHistoryListingEntry {
+    Prefix { path: String },
+    Historical(RecoverableHistoryEntry),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoverableHistoryListing {
+    pub(crate) entries: Vec<RecoverableHistoryListingEntry>,
+    pub(crate) truncated: bool,
+}
+
+/// Builds the depth-projected history query without recursive CTEs, which
+/// Turso does not support. Segment lengths determine the substring boundary,
+/// while the visible path itself remains a substring of the original path.
+/// This avoids unordered string aggregation when rolling up a folder.
+pub(super) fn recoverable_history_listing_query(restrict_to_prefix: bool) -> String {
+    let prefix_filter = if restrict_to_prefix {
+        "AND history.logical_path >= ?3\n                           AND history.logical_path < ?4"
+    } else {
+        ""
+    };
+    format!(
+        r#"WITH latest AS (
+             SELECT
+                 history.logical_path,
+                 history.restore_source_path,
+                 history.restore_source_object_id,
+                 history.restore_version_id,
+                 history.removed_at_unix,
+                 history.moved_source_object_id,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY history.logical_path
+                     ORDER BY history.removed_at_unix DESC,
+                              history.restore_version_id DESC,
+                              history.object_id DESC
+                 ) AS path_rank
+             FROM version_index_heads AS history
+             WHERE history.head_manifest_hash = ?1
+               AND history.restore_source_path IS NOT NULL
+               AND history.restore_source_object_id IS NOT NULL
+               AND history.restore_version_id IS NOT NULL
+               {prefix_filter}
+               AND NOT EXISTS (
+                   SELECT 1 FROM current_objects
+                   WHERE current_objects.key = history.logical_path
+               )
+         ),
+         scoped AS (
+             SELECT
+                 latest.logical_path,
+                 latest.restore_source_path,
+                 latest.restore_source_object_id,
+                 latest.restore_version_id,
+                 latest.removed_at_unix,
+                 latest.moved_source_object_id,
+                 CASE
+                     WHEN ?2 = '' THEN latest.logical_path
+                     ELSE substr(latest.logical_path, length(?2) + 2)
+                 END AS relative_path
+             FROM latest
+             WHERE latest.path_rank = 1
+         ),
+         visible AS (
+             SELECT
+                 scoped.*,
+                 length(relative_path) - length(replace(relative_path, '/', '')) + 1 AS segment_count,
+                 (
+                     SELECT sum(length(value)) + ?5 - 1
+                     FROM json_each(
+                         '[' || replace(json_quote(scoped.relative_path), '/', char(34) || ',' || char(34)) || ']'
+                     )
+                     WHERE key < ?5
+                 ) AS visible_path_length
+             FROM scoped
+         ),
+         projected AS (
+             SELECT
+                 CASE
+                     WHEN segment_count <= ?5 THEN logical_path
+                     WHEN ?2 = '' THEN substr(relative_path, 1, visible_path_length) || '/'
+                     ELSE ?2 || '/' || substr(relative_path, 1, visible_path_length) || '/'
+                 END AS display_path,
+                 CASE WHEN segment_count <= ?5 THEN 1 ELSE 0 END AS is_historical,
+                 restore_source_path,
+                 restore_source_object_id,
+                 restore_version_id,
+                 removed_at_unix,
+                 moved_source_object_id
+             FROM visible
+         )
+         SELECT
+             display_path,
+             is_historical,
+             CASE WHEN is_historical = 1 THEN restore_source_path END,
+             CASE WHEN is_historical = 1 THEN restore_source_object_id END,
+             CASE WHEN is_historical = 1 THEN restore_version_id END,
+             CASE WHEN is_historical = 1 THEN removed_at_unix END,
+             CASE WHEN is_historical = 1 THEN (
+                 SELECT MIN(current_objects.key)
+                 FROM current_objects
+                 WHERE current_objects.object_id = projected.moved_source_object_id
+                   AND current_objects.key != projected.display_path
+             ) END AS moved_to_path
+         FROM projected
+         GROUP BY display_path, is_historical
+         ORDER BY display_path, is_historical
+         LIMIT ?6"#
+    )
+}
+
+impl StoreHistoryInspector {
+    fn new(storage_pool: StoragePool, metadata_store: Arc<dyn MetadataStore>) -> Self {
+        Self {
+            storage_pool,
+            metadata_store,
+        }
+    }
+
+    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
+        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
+            return Ok(None);
+        }
+
+        let manifest_path = self
+            .storage_pool
+            .content_path(StorageContentKind::Manifest, manifest_hash)?;
+        if !fs::try_exists(&manifest_path).await? {
+            return Ok(None);
+        }
+
+        let payload = fs::read(&manifest_path).await?;
+        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
+            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
+        Ok(Some(manifest))
+    }
+
+    async fn resolve_key_for_version_index(
+        &self,
+        index: &FileVersionIndex,
+    ) -> Result<Option<String>> {
+        if let Some(preferred_head) = index
+            .preferred_head_version_id
+            .as_ref()
+            .and_then(|version_id| index.versions.get(version_id))
+            .and_then(|record| record.logical_path.clone())
+        {
+            return Ok(Some(preferred_head));
+        }
+
+        if let Some(any_logical_path) = index
+            .versions
+            .values()
+            .find_map(|record| record.logical_path.clone())
+        {
+            return Ok(Some(any_logical_path));
+        }
+
+        for record in index.versions.values() {
+            if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving historical restore source key; skipping record"
+                    );
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_key_for_version_record(
+        &self,
+        index: &FileVersionIndex,
+        record: &FileVersionRecord,
+    ) -> Result<Option<String>> {
+        if let Some(logical_path) = record.logical_path.clone() {
+            return Ok(Some(logical_path));
+        }
+
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            match self.load_manifest_by_hash(&record.manifest_hash).await {
+                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        manifest_hash = %record.manifest_hash,
+                        object_id = %index.object_id,
+                        version_id = %record.version_id,
+                        error = %err,
+                        "manifest unreadable or invalid while resolving historical restore source key; falling back to index lookup"
+                    );
+                }
+            }
+        }
+
+        self.resolve_key_for_version_index(index).await
+    }
+
+    async fn version_restore_source_from_indexes(
+        &self,
+        indexes: &[FileVersionIndex],
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        for index in indexes {
+            let Some(record) = index.versions.get(version_id) else {
+                continue;
+            };
+            let Some(resolved_path) = self.resolve_key_for_version_record(index, record).await?
+            else {
+                continue;
+            };
+            if resolved_path != source_path || record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                continue;
+            }
+
+            return Ok(Some(SnapshotRestoreSource {
+                manifest_hash: record.manifest_hash.clone(),
+                object_id: Some(index.object_id.clone()),
+                version_id: Some(record.version_id.clone()),
+                state: record.state.clone(),
+            }));
+        }
+
+        Ok(None)
+    }
+
+    async fn version_restore_source_from_object_id(
+        &self,
+        source_object_id: &str,
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<SnapshotRestoreSource>> {
+        let Some(index) = self
+            .metadata_store
+            .load_version_index_by_object_id(source_object_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.version_restore_source_from_indexes(&[index], source_path, version_id)
+            .await
+    }
+
+    pub(crate) async fn history_source_manifest_hash(
+        &self,
+        source_object_id: &str,
+        source_path: &str,
+        version_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .version_restore_source_from_object_id(source_object_id, source_path, version_id)
+            .await?
+            .map(|source| source.manifest_hash))
+    }
+
+    /// Resolves a historical restore batch without holding the main store lock.
+    /// The history listing supplies the immutable source object id, so each
+    /// restore resolves exactly one version index instead of scanning metadata.
+    pub(crate) async fn resolve_version_restore_sources(
+        &self,
+        restore_requests: &[(String, String, String, String)],
+    ) -> Result<Vec<Option<SnapshotRestoreSource>>> {
+        let mut sources = HashMap::<(String, String), SnapshotRestoreSource>::new();
+        for (source_path, version_id, source_object_id, _) in restore_requests {
+            let source = self
+                .version_restore_source_from_object_id(source_object_id, source_path, version_id)
+                .await?;
+            if let Some(source) = source {
+                sources.insert((source_path.clone(), version_id.clone()), source);
+            }
+        }
+
+        Ok(restore_requests
+            .iter()
+            .map(|(source_path, version_id, _, _)| {
+                sources
+                    .get(&(source_path.clone(), version_id.clone()))
+                    .cloned()
+            })
+            .collect())
+    }
+
+    pub(crate) async fn list_recoverable_history_listing(
+        &self,
+        prefix: &str,
+        depth: usize,
+        max_entries: usize,
+    ) -> Result<RecoverableHistoryListing> {
+        self.metadata_store
+            .list_recoverable_history_listing(prefix, depth, max_entries)
+            .await
+    }
+
+    pub(crate) async fn history_head_projection_backfill_state(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillState> {
+        self.metadata_store
+            .history_head_projection_backfill_state()
+            .await
+    }
+
+    /// Advances the one-time projection migration without running it on an
+    /// Explorer request. Replaying a completed page is safe: the backend only
+    /// inserts missing projection rows, while normal version-index writes
+    /// always win with their current projection.
+    pub(crate) async fn backfill_history_head_projection_batch(
+        &self,
+    ) -> Result<HistoryHeadProjectionBackfillProgress> {
+        let HistoryHeadProjectionBackfillState::Pending { after_object_id } = self
+            .metadata_store
+            .history_head_projection_backfill_state()
+            .await?
+        else {
+            return Ok(HistoryHeadProjectionBackfillProgress {
+                processed_index_count: 0,
+                complete: true,
+            });
+        };
+
+        let payloads = self
+            .metadata_store
+            .load_version_index_payloads_after(
+                after_object_id.as_deref(),
+                STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE,
+            )
+            .await?;
+        let processed_index_count = payloads.len();
+        let next_after_object_id = payloads.last().map(|(object_id, _)| object_id.clone());
+        let complete = processed_index_count < STORE_HISTORY_PROJECTION_BACKFILL_BATCH_SIZE;
+        let projections = payloads
+            .iter()
+            .map(|(object_id, payload)| {
+                match decode_version_index(object_id, payload, "history head projection backfill") {
+                    Ok(index) => version_index_head_projection(object_id, &index),
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            object_id,
+                            "skipping malformed version index during recoverable history backfill"
+                        );
+                        VersionIndexHeadProjection::empty(object_id)
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        self.metadata_store
+            .persist_history_head_projection_backfill_batch(
+                &projections,
+                next_after_object_id.as_deref(),
+                complete,
+            )
+            .await?;
+
+        Ok(HistoryHeadProjectionBackfillProgress {
+            processed_index_count,
+            complete,
+        })
+    }
+}
+
 impl StoreIndexInspector {
     fn new(
         current_state: CurrentState,
@@ -2972,6 +3778,24 @@ impl StoreIndexInspector {
 
     pub(crate) fn current_object_ids(&self) -> HashMap<String, String> {
         self.current_state.object_ids.clone()
+    }
+
+    /// Iterates the current object bindings without cloning the complete
+    /// current-state maps. Consumers that scan a bounded scope can copy only
+    /// the entries they actually need.
+    pub(crate) fn current_object_entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, Option<&str>)> {
+        self.current_state
+            .objects
+            .iter()
+            .map(|(path, manifest_hash)| {
+                (
+                    path.as_str(),
+                    manifest_hash.as_str(),
+                    self.current_state.object_ids.get(path).map(String::as_str),
+                )
+            })
     }
 
     async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
@@ -3090,46 +3914,88 @@ impl StoreIndexInspector {
         Ok((sizes, content_fingerprints))
     }
 
-    pub(crate) async fn object_modified_at_by_key(
+    /// Returns both the timestamp and concrete preferred revision for each
+    /// indexed path.  They are derived from the same version index so store
+    /// index listing does not load that per-object metadata twice.
+    pub(crate) async fn object_modified_at_and_revisions_by_key(
         &self,
         object_hashes: &HashMap<String, String>,
         object_ids: &HashMap<String, String>,
         max_created_at_unix: Option<u64>,
-    ) -> Result<HashMap<String, u64>> {
+    ) -> Result<(HashMap<String, u64>, HashMap<String, String>)> {
         let mut modified = HashMap::with_capacity(object_hashes.len());
-        for (key, manifest_hash) in object_hashes {
-            let Some(object_id) = object_ids.get(key) else {
-                continue;
-            };
-            let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+        let mut revisions = HashMap::with_capacity(object_hashes.len());
+        let requested_indexes = object_hashes
+            .iter()
+            .filter_map(|(key, manifest_hash)| {
+                object_ids
+                    .get(key)
+                    .map(|object_id| (key.clone(), manifest_hash.clone(), object_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        let loaded_indexes = stream::iter(requested_indexes)
+            .map(|(key, manifest_hash, object_id)| async move {
+                Ok::<_, anyhow::Error>((
+                    key,
+                    manifest_hash,
+                    self.load_version_index_by_object_id(&object_id).await?,
+                ))
+            })
+            .buffer_unordered(STORE_INDEX_VERSION_LOOKUP_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for (key, manifest_hash, index) in loaded_indexes {
+            let Some(index) = index else {
                 continue;
             };
 
-            let matching_created_at = index
+            let matching_versions = index
                 .versions
                 .values()
                 .filter(|record| record.manifest_hash == *manifest_hash)
+                .collect::<Vec<_>>();
+            let snapshot_matching_versions = matching_versions
+                .iter()
+                .copied()
                 .filter(|record| {
                     max_created_at_unix
                         .map(|limit| record.created_at_unix <= limit)
                         .unwrap_or(true)
                 })
+                .collect::<Vec<_>>();
+            let versions_for_snapshot =
+                if max_created_at_unix.is_some() && !snapshot_matching_versions.is_empty() {
+                    &snapshot_matching_versions
+                } else {
+                    &matching_versions
+                };
+
+            if let Some(created_at_unix) = versions_for_snapshot
+                .iter()
                 .map(|record| record.created_at_unix)
                 .max()
-                .or_else(|| {
-                    index
-                        .versions
-                        .values()
-                        .filter(|record| record.manifest_hash == *manifest_hash)
-                        .map(|record| record.created_at_unix)
-                        .max()
-                });
-
-            if let Some(created_at_unix) = matching_created_at {
+            {
                 modified.insert(key.clone(), created_at_unix);
             }
+            let revision = if max_created_at_unix.is_none() {
+                index
+                    .preferred_head_version_id
+                    .as_deref()
+                    .and_then(|version_id| index.versions.get(version_id))
+                    .filter(|record| record.manifest_hash == *manifest_hash)
+            } else {
+                versions_for_snapshot.iter().copied().max_by(|left, right| {
+                    left.created_at_unix
+                        .cmp(&right.created_at_unix)
+                        .then_with(|| left.version_id.cmp(&right.version_id))
+                })
+            };
+            if let Some(revision) = revision {
+                revisions.insert(key.clone(), revision.version_id.clone());
+            }
         }
-        Ok(modified)
+        Ok((modified, revisions))
     }
 
     pub(crate) async fn lookup_media_cache(
@@ -3164,6 +4030,7 @@ impl StoreIndexInspector {
         Ok(Some(MediaCacheLookup {
             content_fingerprint,
             metadata,
+            gps_override: None,
         }))
     }
 
@@ -3206,6 +4073,7 @@ impl StoreIndexInspector {
                 MediaCacheLookup {
                     content_fingerprint,
                     metadata,
+                    gps_override: None,
                 },
             );
         }
@@ -3546,22 +4414,463 @@ impl PersistentStore {
             #[cfg(test)]
             data_scrub_run_test_hook: None,
         };
+        let object_id_migration_started = Instant::now();
+        let object_id_migration_needed =
+            match store.metadata_store.object_id_backfill_needed().await {
+                Ok(needed) => needed,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                        "failed to check whether legacy object ID migration is needed"
+                    );
+                    return Err(error);
+                }
+            };
+        if object_id_migration_needed {
+            info!("starting legacy object ID migration");
+            let object_id_migration_lock =
+                match acquire_object_id_migration_lock(&store.metadata_db_path).await {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                            "failed to acquire legacy object ID migration lock"
+                        );
+                        return Err(error);
+                    }
+                };
+            info!(
+                elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                "acquired legacy object ID migration lock"
+            );
+            if let Err(error) = store.migrate_legacy_object_ids().await {
+                warn!(
+                    error = %error,
+                    elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                    "legacy object ID migration failed; refusing to start with inconsistent identity metadata"
+                );
+                return Err(error);
+            }
+            info!(
+                elapsed_ms = object_id_migration_started.elapsed().as_millis(),
+                "completed legacy object ID migration"
+            );
+            drop(object_id_migration_lock);
+        }
         store
-            .backfill_gallery_labels_from_current_sidecars()
+            .backfill_gallery_metadata_from_current_sidecars()
             .await?;
         Ok(store)
     }
 
-    /// Replays existing XMP sidecars into the gallery label projection once per
-    /// metadata database. New uploads are handled by the normal ingest hooks;
-    /// this covers sidecars that already existed when the label column was
-    /// introduced.
-    async fn backfill_gallery_labels_from_current_sidecars(&self) -> Result<()> {
-        if !self
+    /// Backfills the live namespace written before object identity became mandatory.
+    ///
+    /// This is a one-time foreground migration. If the live namespace already has one non-empty
+    /// identity per current object, it records completion without reading historical version
+    /// indexes. Otherwise it scans legacy version indexes before serving requests, so every current
+    /// object has a durable identity from the first post-upgrade request. The writes are idempotent;
+    /// a restart before the completion marker is recorded repeats the scan safely.
+    /// Historical snapshots are normalized when they are read or rewritten instead of
+    /// making startup walk every retained snapshot.
+    async fn migrate_legacy_object_ids(&self) -> Result<()> {
+        if !self.metadata_store.object_id_backfill_needed().await? {
+            return Ok(());
+        }
+
+        let current_state = self.metadata_store.load_current_state().await?;
+        if current_state_has_unique_object_id_bindings(&current_state) {
+            return self.metadata_store.mark_object_id_backfill_complete().await;
+        }
+        let mut current_objects = current_state.objects.iter().collect::<Vec<_>>();
+        current_objects.sort_by_key(|(path, _)| *path);
+        let current_object_count = current_objects.len();
+        info!(
+            current_object_count,
+            "resolving legacy object ID bindings for current namespace"
+        );
+        let legacy_candidates = self
+            .legacy_object_id_candidates_for_current_state(&current_state)
+            .await?;
+        let mut assignments = HashMap::with_capacity(current_objects.len());
+        let mut claimed_object_ids = HashSet::with_capacity(current_objects.len());
+        let mut fallback_object_id_assignment_count = 0;
+
+        let mut paths_by_existing_object_id = BTreeMap::<String, Vec<String>>::new();
+        for (path, _) in &current_objects {
+            let Some(object_id) = current_state
+                .object_ids
+                .get(*path)
+                .filter(|object_id| !object_id.trim().is_empty())
+            else {
+                continue;
+            };
+            paths_by_existing_object_id
+                .entry(object_id.clone())
+                .or_default()
+                .push((**path).clone());
+        }
+
+        for (object_id, mut paths) in paths_by_existing_object_id {
+            paths.sort();
+            let preferred_path = if paths.len() > 1 {
+                self.load_version_index_by_object_id(&object_id)
+                    .await?
+                    .and_then(|index| {
+                        index
+                            .preferred_head_version_id
+                            .as_ref()
+                            .and_then(|version_id| index.versions.get(version_id))
+                            .and_then(|record| record.logical_path.clone())
+                    })
+                    .filter(|path| paths.binary_search(path).is_ok())
+            } else {
+                None
+            };
+            let path = preferred_path.unwrap_or_else(|| paths[0].clone());
+            claimed_object_ids.insert(object_id.clone());
+            assignments.insert(
+                path,
+                ObjectIdMigrationAssignment {
+                    object_id,
+                    needs_version_backfill: false,
+                },
+            );
+        }
+
+        let mut candidates = legacy_candidates.into_iter().collect::<Vec<_>>();
+        candidates.sort_by(|(left_path, left), (right_path, right)| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| right.created_at_unix.cmp(&left.created_at_unix))
+                .then_with(|| left_path.cmp(right_path))
+        });
+        for (path, candidate) in candidates {
+            if assignments.contains_key(&path)
+                || !claimed_object_ids.insert(candidate.object_id.clone())
+            {
+                continue;
+            }
+            assignments.insert(
+                path,
+                ObjectIdMigrationAssignment {
+                    object_id: candidate.object_id,
+                    needs_version_backfill: true,
+                },
+            );
+        }
+
+        for (current_object_index, (path, manifest_hash)) in current_objects.into_iter().enumerate()
+        {
+            let assignment = match assignments.remove(path) {
+                Some(assignment) => assignment,
+                None => {
+                    fallback_object_id_assignment_count += 1;
+                    let object_id = generate_unclaimed_object_id(&mut claimed_object_ids);
+                    warn!(
+                        path,
+                        manifest_hash,
+                        object_id,
+                        "legacy object ID migration could not recover prior history; assigning a new object ID"
+                    );
+                    ObjectIdMigrationAssignment {
+                        object_id,
+                        needs_version_backfill: true,
+                    }
+                }
+            };
+
+            let existing_index = if assignment.needs_version_backfill {
+                None
+            } else {
+                self.load_version_index_by_object_id(&assignment.object_id)
+                    .await?
+            };
+            let needs_version_backfill = assignment.needs_version_backfill
+                || existing_index.is_none()
+                || existing_index.is_some_and(|index| index.identity_was_normalized);
+            if needs_version_backfill {
+                self.ensure_migrated_object_version(
+                    &assignment.object_id,
+                    path,
+                    manifest_hash,
+                    unix_ts(),
+                )
+                .await?;
+            }
+
+            if current_state.object_ids.get(path) != Some(&assignment.object_id) {
+                self.upsert_current_object(
+                    path,
+                    CurrentObjectEntry {
+                        manifest_hash: manifest_hash.clone(),
+                        object_id: assignment.object_id,
+                    },
+                )
+                .await?;
+            }
+
+            let current_object_count_processed = current_object_index + 1;
+            if current_object_count_processed % OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL == 0
+                || current_object_count_processed == current_object_count
+            {
+                info!(
+                    current_object_count,
+                    current_object_count_processed, "legacy object ID migration progress"
+                );
+            }
+        }
+
+        info!(
+            current_object_count,
+            fallback_object_id_assignment_count,
+            "completed legacy current-object identity migration"
+        );
+        self.metadata_store.mark_object_id_backfill_complete().await
+    }
+
+    async fn repair_normalized_version_index_identity(
+        &self,
+        index: &mut FileVersionIndex,
+    ) -> Result<()> {
+        if !index.identity_was_normalized {
+            return Ok(());
+        }
+
+        let persisted_object_id = index.persisted_object_id.clone();
+        if persisted_object_id != index.object_id
+            && self.has_version_index(&index.object_id).await?
+        {
+            let replacement_object_id = generate_object_id();
+            index.object_id = replacement_object_id.clone();
+            for record in index.versions.values_mut() {
+                record.object_id = replacement_object_id.clone();
+            }
+        }
+
+        self.persist_version_index_by_object_id(&index.object_id, index)
+            .await?;
+        if persisted_object_id != index.object_id {
+            self.delete_version_index_by_object_id(&persisted_object_id)
+                .await?;
+        }
+        index.persisted_object_id = index.object_id.clone();
+        index.identity_was_normalized = false;
+        Ok(())
+    }
+
+    async fn legacy_object_id_candidates_for_current_state(
+        &self,
+        current_state: &CurrentState,
+    ) -> Result<HashMap<String, LegacyObjectIdCandidate>> {
+        let unresolved_bindings = current_state
+            .objects
+            .iter()
+            .filter(|(path, _)| {
+                current_state
+                    .object_ids
+                    .get(*path)
+                    .is_none_or(|object_id| object_id.trim().is_empty())
+            })
+            .map(|(path, manifest_hash)| (path.clone(), manifest_hash.clone()))
+            .collect::<HashSet<_>>();
+        if unresolved_bindings.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let unresolved_manifest_hashes = unresolved_bindings
+            .iter()
+            .map(|(_, manifest_hash)| manifest_hash.clone())
+            .collect::<HashSet<_>>();
+        let mut candidates_by_binding = HashMap::new();
+        let mut manifest_paths = HashMap::<String, Option<String>>::new();
+        let mut after_object_id = None;
+        let scan_started = Instant::now();
+        let mut scanned_version_index_count = 0;
+
+        loop {
+            let indexes = self
+                .metadata_store
+                .load_version_indexes_after(
+                    after_object_id.as_deref(),
+                    OBJECT_ID_MIGRATION_VERSION_INDEX_BATCH_SIZE,
+                )
+                .await?;
+            let Some(last_object_id) = indexes
+                .last()
+                .map(|index| index.persisted_object_id.clone())
+            else {
+                break;
+            };
+            scanned_version_index_count += indexes.len();
+            if scanned_version_index_count % OBJECT_ID_MIGRATION_PROGRESS_LOG_INTERVAL
+                < indexes.len()
+            {
+                info!(
+                    elapsed_ms = scan_started.elapsed().as_millis(),
+                    scanned_version_index_count,
+                    "scanning legacy version indexes for object ID migration"
+                );
+            }
+
+            for mut index in indexes {
+                self.repair_normalized_version_index_identity(&mut index)
+                    .await?;
+                let preferred_head_is_tombstone = index
+                    .preferred_head_version_id
+                    .as_deref()
+                    .and_then(|version_id| index.versions.get(version_id))
+                    .is_some_and(|record| record.manifest_hash == TOMBSTONE_MANIFEST_HASH);
+                if preferred_head_is_tombstone {
+                    // A deleted lineage cannot establish the identity of a live current
+                    // object. Its earlier records can share a manifest with a later
+                    // recreate, but preserving that ID would make the tombstone win
+                    // the preferred-head lookup after migration.
+                    continue;
+                }
+                for record in index.versions.values() {
+                    if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
+                        continue;
+                    }
+                    let is_preferred_head = index.preferred_head_version_id.as_deref()
+                        == Some(record.version_id.as_str());
+                    let direct_priority = if is_preferred_head { 4 } else { 3 };
+                    let direct_match = record.logical_path.as_ref().is_some_and(|path| {
+                        unresolved_bindings.contains(&(path.clone(), record.manifest_hash.clone()))
+                    });
+                    if direct_match && let Some(path) = record.logical_path.as_ref() {
+                        update_legacy_object_id_candidate(
+                            &mut candidates_by_binding,
+                            path,
+                            &record.manifest_hash,
+                            &index.object_id,
+                            direct_priority,
+                            record.created_at_unix,
+                        );
+                    }
+
+                    if direct_match || !unresolved_manifest_hashes.contains(&record.manifest_hash) {
+                        continue;
+                    }
+                    let manifest_path = match manifest_paths.get(&record.manifest_hash) {
+                        Some(path) => path.clone(),
+                        None => {
+                            let path = match self.load_manifest_by_hash(&record.manifest_hash).await
+                            {
+                                Ok(manifest) => manifest.map(|manifest| manifest.key),
+                                Err(err) => {
+                                    warn!(
+                                        manifest_hash = %record.manifest_hash,
+                                        object_id = %index.object_id,
+                                        version_id = %record.version_id,
+                                        error = %err,
+                                        "manifest unreadable while resolving legacy object identity; skipping fallback"
+                                    );
+                                    None
+                                }
+                            };
+                            manifest_paths.insert(record.manifest_hash.clone(), path.clone());
+                            path
+                        }
+                    };
+                    let Some(path) = manifest_path else {
+                        continue;
+                    };
+                    if unresolved_bindings.contains(&(path.clone(), record.manifest_hash.clone())) {
+                        update_legacy_object_id_candidate(
+                            &mut candidates_by_binding,
+                            &path,
+                            &record.manifest_hash,
+                            &index.object_id,
+                            if is_preferred_head { 2 } else { 1 },
+                            record.created_at_unix,
+                        );
+                    }
+                }
+            }
+            after_object_id = Some(last_object_id);
+        }
+
+        info!(
+            elapsed_ms = scan_started.elapsed().as_millis(),
+            scanned_version_index_count,
+            "completed legacy version-index scan for object ID migration"
+        );
+
+        Ok(candidates_by_binding
+            .into_iter()
+            .map(|((path, _), candidate)| (path, candidate))
+            .collect())
+    }
+
+    async fn ensure_migrated_object_version(
+        &self,
+        object_id: &str,
+        path: &str,
+        manifest_hash: &str,
+        created_at_unix: u64,
+    ) -> Result<()> {
+        let mut index = self
+            .load_version_index_by_object_id(object_id)
+            .await?
+            .unwrap_or_else(|| empty_version_index(object_id));
+        let preferred_head_matches_current_manifest = index
+            .preferred_head_version_id
+            .as_deref()
+            .and_then(|version_id| index.versions.get(version_id))
+            .is_some_and(|record| record.manifest_hash == manifest_hash);
+        if preferred_head_matches_current_manifest {
+            // Loading an older payload normalizes omitted identity fields. Persist the
+            // normalized index while it is already part of the bounded current-object
+            // migration, so restart safety does not depend on a later write.
+            return self
+                .persist_version_index_by_object_id(object_id, &index)
+                .await;
+        }
+
+        let version_id = format!("migration-{}", Uuid::now_v7());
+        let parent_version_ids = index
+            .preferred_head_version_id
+            .clone()
+            .into_iter()
+            .collect();
+        index.versions.insert(
+            version_id.clone(),
+            FileVersionRecord {
+                version_id,
+                object_id: object_id.to_string(),
+                manifest_hash: manifest_hash.to_string(),
+                logical_path: Some(path.to_string()),
+                parent_version_ids,
+                state: VersionConsistencyState::Confirmed,
+                created_at_unix,
+                copied_from_object_id: None,
+                copied_from_version_id: None,
+                copied_from_path: None,
+            },
+        );
+        index.head_version_ids = recompute_head_version_ids(&index);
+        index.preferred_head_version_id = choose_preferred_head(&index);
+        self.persist_version_index_by_object_id(object_id, &index)
+            .await
+    }
+
+    /// Replays existing XMP sidecars into gallery projections once per metadata
+    /// database. New uploads are handled by the normal ingest hooks; separate
+    /// completion markers let a newly introduced projection backfill existing
+    /// sidecars even when an older projection was already migrated.
+    async fn backfill_gallery_metadata_from_current_sidecars(&self) -> Result<()> {
+        let labels_needed = self
             .metadata_store
             .gallery_sidecar_labels_backfill_needed()
-            .await?
-        {
+            .await?;
+        let gps_needed = self
+            .metadata_store
+            .gallery_sidecar_gps_backfill_needed()
+            .await?;
+        if !labels_needed && !gps_needed {
             return Ok(());
         }
 
@@ -3575,13 +4884,21 @@ impl PersistentStore {
             {
                 continue;
             }
-            self.apply_sidecar_labels(&media_key, sidecar_manifest_hash)
+            self.apply_sidecar_metadata(&media_key, sidecar_manifest_hash)
                 .await?;
         }
 
-        self.metadata_store
-            .mark_gallery_sidecar_labels_backfill_complete()
-            .await
+        if labels_needed {
+            self.metadata_store
+                .mark_gallery_sidecar_labels_backfill_complete()
+                .await?;
+        }
+        if gps_needed {
+            self.metadata_store
+                .mark_gallery_sidecar_gps_backfill_complete()
+                .await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn chunk_ingestor(&self) -> ChunkIngestor {
@@ -3756,6 +5073,10 @@ impl PersistentStore {
         ))
     }
 
+    pub(crate) fn store_history_inspector(&self) -> StoreHistoryInspector {
+        StoreHistoryInspector::new(self.storage_pool.clone(), self.metadata_store.clone())
+    }
+
     pub(crate) async fn query_gallery_index(
         &self,
         query: &GalleryIndexQuery,
@@ -3791,6 +5112,36 @@ impl PersistentStore {
         self.metadata_store
             .set_gallery_object_labels(key, labels)
             .await
+    }
+
+    /// Replaces the path-scoped XMP GPS overlay for `key` in the gallery
+    /// projection. This deliberately does not mutate the content-addressed
+    /// media cache because XMP sidecars belong to one logical path.
+    pub(crate) async fn set_gallery_object_sidecar_gps(
+        &self,
+        key: &str,
+        location: Option<XmpGeoLocation>,
+    ) -> Result<()> {
+        self.metadata_store
+            .set_gallery_object_sidecar_gps(key, location)
+            .await
+    }
+
+    pub(crate) async fn gallery_object_labels_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        self.metadata_store.gallery_object_labels_by_key(keys).await
+    }
+
+    /// Loads the current effective GPS projection for generic current-store
+    /// listings. Callers must not use this for snapshots or historic versions:
+    /// an XMP sidecar is mutable path metadata, not snapshot metadata.
+    pub(crate) async fn gallery_object_gps_by_key(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, MediaGpsCoordinates>> {
+        self.metadata_store.gallery_object_gps_by_key(keys).await
     }
 
     pub(crate) async fn query_gallery_delta(
@@ -3917,6 +5268,63 @@ impl PersistentStore {
     ) -> Result<()> {
         self.metadata_store
             .prune_manual_repair_action_run_history_before(finished_before_unix)
+            .await
+    }
+
+    pub(crate) async fn list_operation_runs(
+        &self,
+        operation_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OperationRun>> {
+        self.metadata_store
+            .list_operation_runs(operation_id, limit)
+            .await
+    }
+
+    pub(crate) async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>> {
+        self.metadata_store.load_operation_run(run_id).await
+    }
+
+    pub(crate) async fn persist_operation_run(&self, run: &OperationRun) -> Result<()> {
+        self.metadata_store.persist_operation_run(run).await
+    }
+
+    pub(crate) async fn prune_operation_run_history_before(
+        &self,
+        finished_before_unix: u64,
+    ) -> Result<()> {
+        self.metadata_store
+            .prune_operation_run_history_before(finished_before_unix)
+            .await
+    }
+
+    pub(crate) async fn interrupt_unfinished_operation_runs(
+        &self,
+        finished_at_unix: u64,
+        termination_reason: &str,
+    ) -> Result<usize> {
+        self.metadata_store
+            .interrupt_unfinished_operation_runs(finished_at_unix, termination_reason)
+            .await
+    }
+
+    pub(crate) async fn list_operation_result_chunks(
+        &self,
+        run_id: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<OperationResultChunk>> {
+        self.metadata_store
+            .list_operation_result_chunks(run_id, limit, offset)
+            .await
+    }
+
+    pub(crate) async fn persist_operation_result_chunk(
+        &self,
+        chunk: &OperationResultChunk,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_operation_result_chunk(chunk)
             .await
     }
 
@@ -4132,31 +5540,30 @@ impl PersistentStore {
             return Ok(None);
         };
 
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
         index.versions.remove(version_id);
-        if index.versions.is_empty() {
+        let mut changed_paths = if index.versions.is_empty() {
             self.delete_version_index_by_object_id(&object_id).await?;
-            if self.object_id_for_key(key).await?.as_deref() == Some(object_id.as_str()) {
-                self.remove_current_object(key).await?;
-            }
+            self.remove_current_state_bindings_for_object_id(&object_id)
+                .await?
         } else {
             index.head_version_ids = recompute_head_version_ids(&index);
             index.preferred_head_version_id = choose_preferred_head(&index);
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
             self.sync_current_state_for_key_from_index(key, &index)
-                .await?;
-        }
+                .await?
+        };
 
         self.delete_object_version_metadata(version_id).await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
             .await?;
 
@@ -4752,18 +6159,19 @@ impl PersistentStore {
                 );
             }
 
-            let touched_paths = BTreeSet::from([key.to_string()]);
+            let touched_paths = self
+                .current_state_touched_paths_for_object_id(&object_id, key)
+                .await?;
             let before_binding = self.current_state_binding(key).await?;
             if create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index)
+            let mut changed_paths = self
+                .sync_current_state_for_key_from_index(key, &index)
                 .await?;
-            let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                touched_paths
-            } else {
-                BTreeSet::new()
-            };
+            if self.current_state_binding(key).await? != before_binding {
+                changed_paths.extend(touched_paths);
+            }
             let snapshot_id = if let Some(snapshot_id) = self
                 .persist_current_state_with_snapshot_batch(
                     changed_paths,
@@ -4778,6 +6186,7 @@ impl PersistentStore {
             };
 
             return Ok(PutResult {
+                object_id,
                 snapshot_id,
                 version_id,
                 manifest_hash: manifest_hash.to_string(),
@@ -4804,6 +6213,7 @@ impl PersistentStore {
                 && parent_context_matches
             {
                 return Ok(PutResult {
+                    object_id,
                     snapshot_id: format!("snap-skipped-{preferred_head_id}"),
                     version_id: preferred_head_id,
                     manifest_hash: preferred_head.manifest_hash.clone(),
@@ -4827,7 +6237,9 @@ impl PersistentStore {
             copied_from_version_id: None,
             copied_from_path: None,
         };
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         if create_snapshot {
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
@@ -4847,13 +6259,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         let snapshot_id = if let Some(snapshot_id) = self
             .persist_current_state_with_snapshot_batch(changed_paths, create_snapshot, unix_ts())
             .await?
@@ -4864,6 +6275,7 @@ impl PersistentStore {
         };
 
         Ok(PutResult {
+            object_id,
             snapshot_id,
             version_id,
             manifest_hash: manifest_hash.to_string(),
@@ -4892,7 +6304,9 @@ impl PersistentStore {
             return Ok(true);
         }
 
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         version.state = VersionConsistencyState::Confirmed;
@@ -4900,13 +6314,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
             .await?;
 
@@ -4930,6 +6343,68 @@ impl PersistentStore {
         };
         self.version_graph_summary_for_object_id(key, &object_id)
             .await
+    }
+
+    pub async fn list_versions_by_object_id(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<VersionGraphSummary>> {
+        if object_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let Some(index) = self.load_version_index_by_object_id(object_id).await? else {
+            return Ok(None);
+        };
+        let key = match self.current_path_for_object_id(object_id).await? {
+            Some(path) => path,
+            None => match self.resolve_key_for_version_index(&index).await? {
+                Some(path) => path,
+                None => return Ok(None),
+            },
+        };
+        self.version_graph_summary_for_object_id(&key, object_id)
+            .await
+    }
+
+    pub async fn current_path_for_object_id(&self, object_id: &str) -> Result<Option<String>> {
+        if object_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut paths = self
+            .metadata_store
+            .list_keys_for_object_id(object_id)
+            .await?;
+        paths.sort();
+        paths.dedup();
+        match paths.as_slice() {
+            [] => Ok(None),
+            [path] => Ok(Some(path.clone())),
+            _ => {
+                let preferred_path = self
+                    .load_version_index_by_object_id(object_id)
+                    .await?
+                    .and_then(|index| {
+                        index
+                            .preferred_head_version_id
+                            .as_ref()
+                            .and_then(|version_id| {
+                                index
+                                    .versions
+                                    .get(version_id)
+                                    .and_then(|record| record.logical_path.clone())
+                            })
+                    })
+                    .filter(|path| paths.binary_search(path).is_ok());
+                let selected_path = preferred_path.unwrap_or_else(|| paths[0].clone());
+                warn!(
+                    object_id,
+                    selected_path,
+                    paths = ?paths,
+                    "object identity has duplicate current bindings; selecting a deterministic path"
+                );
+                Ok(Some(selected_path))
+            }
+        }
     }
 
     async fn version_graph_summary_for_object_id(
@@ -5920,7 +7395,9 @@ impl PersistentStore {
                 return Ok(resolved_version_id);
             }
 
-            let touched_paths = BTreeSet::from([key.to_string()]);
+            let touched_paths = self
+                .current_state_touched_paths_for_object_id(&object_id, key)
+                .await?;
             let before_binding = self.current_state_binding(key).await?;
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
@@ -5945,13 +7422,12 @@ impl PersistentStore {
 
             self.persist_version_index_by_object_id(&object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index)
+            let mut changed_paths = self
+                .sync_current_state_for_key_from_index(key, &index)
                 .await?;
-            let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                touched_paths
-            } else {
-                BTreeSet::new()
-            };
+            if self.current_state_binding(key).await? != before_binding {
+                changed_paths.extend(touched_paths);
+            }
             self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
                 .await?;
 
@@ -6027,7 +7503,9 @@ impl PersistentStore {
             return Ok(resolved_version_id);
         }
 
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
@@ -6051,13 +7529,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
             .await?;
 
@@ -6100,7 +7577,8 @@ impl PersistentStore {
         let mut current_state_changed = false;
 
         if !bundle.versions.is_empty() {
-            let object_id = bundle.object_id.clone().unwrap_or_else(generate_object_id);
+            let object_id =
+                nonempty_object_id(bundle.object_id.clone()).unwrap_or_else(generate_object_id);
             let mut index = self
                 .load_version_index_by_object_id(&object_id)
                 .await?
@@ -6169,27 +7647,26 @@ impl PersistentStore {
             );
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             let before_binding = self.current_state_binding(current_key).await?;
-            self.sync_current_state_for_key_from_index(current_key, &index)
+            let mut changed_current_paths = self
+                .sync_current_state_for_key_from_index(current_key, &index)
                 .await?;
-            let stale_keys: Vec<String> = self
-                .metadata_store
-                .list_keys_for_object_id(&object_id)
-                .await?
-                .into_iter()
-                .filter(|key| Some(key.as_str()) != preferred_logical_path)
-                .collect();
-            let removed_stale_keys = !stale_keys.is_empty();
-            for stale_key in stale_keys {
-                self.remove_current_object(&stale_key).await?;
-            }
+            changed_current_paths.extend(
+                self.remove_current_state_bindings_for_object_id_except(
+                    &object_id,
+                    preferred_logical_path,
+                )
+                .await?,
+            );
             if self.current_state_binding(current_key).await? != before_binding
-                || removed_stale_keys
+                || !changed_current_paths.is_empty()
             {
                 current_state_changed = true;
                 snapshot_changed_paths.extend(touched_paths);
+                snapshot_changed_paths.extend(changed_current_paths);
             }
         } else if let Some(manifest_hash) = bundle.current_manifest_hash.as_ref() {
-            let object_id = bundle.object_id.clone().unwrap_or_else(generate_object_id);
+            let object_id =
+                nonempty_object_id(bundle.object_id.clone()).unwrap_or_else(generate_object_id);
             let expected_entry = CurrentObjectEntry {
                 manifest_hash: manifest_hash.clone(),
                 object_id: object_id.clone(),
@@ -6314,9 +7791,13 @@ impl PersistentStore {
             copied_from_path: bundle.copied_from_path.clone(),
         };
 
-        self.prune_conflicting_replication_bundle_versions(key, &record)
+        let pruned_changed_paths = self
+            .prune_conflicting_replication_bundle_versions(key, &record)
             .await?;
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let mut touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
+        touched_paths.extend(pruned_changed_paths.iter().cloned());
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
 
@@ -6327,22 +7808,25 @@ impl PersistentStore {
                 index.preferred_head_version_id = choose_preferred_head(&index);
                 self.persist_version_index_by_object_id(&object_id, &index)
                     .await?;
-                self.sync_current_state_for_key_from_index(key, &index)
-                    .await?;
+                let mut changed_paths = pruned_changed_paths.clone();
+                changed_paths.extend(
+                    self.sync_current_state_for_key_from_index(key, &index)
+                        .await?,
+                );
                 if bundle.selected_is_preferred_head
                     && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
                 {
                     self.apply_selected_replica_tombstone_current_state(key, bundle)
                         .await?;
                 } else if bundle.selected_is_preferred_head {
-                    self.promote_current_state_for_key_from_index(key, &index)
-                        .await?;
+                    changed_paths.extend(
+                        self.promote_current_state_for_key_from_index(key, &index)
+                            .await?,
+                    );
                 }
-                let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                    touched_paths.clone()
-                } else {
-                    BTreeSet::new()
-                };
+                if self.current_state_binding(key).await? != before_binding {
+                    changed_paths.extend(touched_paths.clone());
+                }
                 self.persist_current_state_with_snapshot_batch(
                     changed_paths,
                     true,
@@ -6352,21 +7836,24 @@ impl PersistentStore {
                 return Ok(resolved_version_id);
             }
 
-            self.sync_current_state_for_key_from_index(key, &index)
-                .await?;
+            let mut changed_paths = pruned_changed_paths.clone();
+            changed_paths.extend(
+                self.sync_current_state_for_key_from_index(key, &index)
+                    .await?,
+            );
             if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH
             {
                 self.apply_selected_replica_tombstone_current_state(key, bundle)
                     .await?;
             } else if bundle.selected_is_preferred_head {
-                self.promote_current_state_for_key_from_index(key, &index)
-                    .await?;
+                changed_paths.extend(
+                    self.promote_current_state_for_key_from_index(key, &index)
+                        .await?,
+                );
             }
-            let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                touched_paths.clone()
-            } else {
-                BTreeSet::new()
-            };
+            if self.current_state_binding(key).await? != before_binding {
+                changed_paths.extend(touched_paths.clone());
+            }
             self.persist_current_state_with_snapshot_batch(changed_paths, true, created_at_unix)
                 .await?;
             return Ok(resolved_version_id);
@@ -6378,20 +7865,23 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
-            .await?;
+        let mut changed_paths = pruned_changed_paths;
+        changed_paths.extend(
+            self.sync_current_state_for_key_from_index(key, &index)
+                .await?,
+        );
         if bundle.selected_is_preferred_head && bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
             self.apply_selected_replica_tombstone_current_state(key, bundle)
                 .await?;
         } else if bundle.selected_is_preferred_head {
-            self.promote_current_state_for_key_from_index(key, &index)
-                .await?;
+            changed_paths.extend(
+                self.promote_current_state_for_key_from_index(key, &index)
+                    .await?,
+            );
         }
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, created_at_unix)
             .await?;
 
@@ -6419,7 +7909,9 @@ impl PersistentStore {
             return Ok(false);
         }
 
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         self.maybe_rotate_snapshot_batch(&touched_paths).await?;
         index.head_version_ids = recompute_head_version_ids(&index);
@@ -6427,13 +7919,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(changed_paths, true, unix_ts())
             .await?;
 
@@ -6713,6 +8204,34 @@ impl PersistentStore {
         let manifest_hash = self
             .resolve_manifest_hash_for_key(key, snapshot_id, version_id, read_mode)
             .await?;
+        let Some(manifest) = self
+            .load_manifest_by_hash(&manifest_hash)
+            .await
+            .map_err(StoreReadError::Internal)?
+        else {
+            return Err(StoreReadError::Corrupt(format!(
+                "manifest missing for hash={manifest_hash}"
+            )));
+        };
+
+        Ok(ObjectReadDescriptor {
+            manifest_hash,
+            total_size_bytes: manifest.total_size_bytes,
+        })
+    }
+
+    pub async fn describe_history_object(
+        &self,
+        source_object_id: &str,
+        source_path: &str,
+        version_id: &str,
+    ) -> std::result::Result<ObjectReadDescriptor, StoreReadError> {
+        let manifest_hash = self
+            .store_history_inspector()
+            .history_source_manifest_hash(source_object_id, source_path, version_id)
+            .await
+            .map_err(StoreReadError::Internal)?
+            .ok_or(StoreReadError::NotFound)?;
         let Some(manifest) = self
             .load_manifest_by_hash(&manifest_hash)
             .await
@@ -7106,13 +8625,10 @@ impl PersistentStore {
         let mut per_path_options = options.clone();
         per_path_options.create_snapshot = false;
         for target in targets {
-            let version_id = self
-                .tombstone_object_single(&target, per_path_options.clone())
-                .await?;
-            results.push(TombstonePathResult {
-                path: target,
-                version_id,
-            });
+            results.push(
+                self.tombstone_object_single(&target, per_path_options.clone())
+                    .await?,
+            );
         }
 
         if options.create_snapshot && !results.is_empty() {
@@ -7126,6 +8642,17 @@ impl PersistentStore {
     }
 
     pub async fn tombstone_object(&mut self, key: &str, options: PutOptions) -> Result<String> {
+        Ok(self
+            .tombstone_object_with_identity(key, options)
+            .await?
+            .version_id)
+    }
+
+    pub async fn tombstone_object_with_identity(
+        &mut self,
+        key: &str,
+        options: PutOptions,
+    ) -> Result<TombstonePathResult> {
         self.tombstone_object_single(key, options).await
     }
 
@@ -7139,11 +8666,7 @@ impl PersistentStore {
         key: &str,
         options: PutOptions,
     ) -> Result<Vec<TombstonePathResult>> {
-        let version_id = self.tombstone_object_single(key, options.clone()).await?;
-        let mut deleted = vec![TombstonePathResult {
-            path: key.to_owned(),
-            version_id,
-        }];
+        let mut deleted = vec![self.tombstone_object_single(key, options.clone()).await?];
 
         if is_sidecar_key(key) {
             return Ok(deleted);
@@ -7157,16 +8680,15 @@ impl PersistentStore {
         let mut sidecar_options = options;
         sidecar_options.parent_version_ids.clear();
         sidecar_options.explicit_version_id = None;
-        let sidecar_version_id =
-            Box::pin(self.tombstone_object_single(&sidecar_key, sidecar_options)).await?;
-        deleted.push(TombstonePathResult {
-            path: sidecar_key,
-            version_id: sidecar_version_id,
-        });
+        deleted.push(Box::pin(self.tombstone_object_single(&sidecar_key, sidecar_options)).await?);
         Ok(deleted)
     }
 
-    async fn tombstone_object_single(&mut self, key: &str, options: PutOptions) -> Result<String> {
+    async fn tombstone_object_single(
+        &mut self,
+        key: &str,
+        options: PutOptions,
+    ) -> Result<TombstonePathResult> {
         let object_id = self
             .object_id_for_key(key)
             .await?
@@ -7208,18 +8730,19 @@ impl PersistentStore {
                 );
             }
 
-            let touched_paths = BTreeSet::from([key.to_string()]);
+            let touched_paths = self
+                .current_state_touched_paths_for_object_id(&object_id, key)
+                .await?;
             let before_binding = self.current_state_binding(key).await?;
             if options.create_snapshot {
                 self.maybe_rotate_snapshot_batch(&touched_paths).await?;
             }
-            self.sync_current_state_for_key_from_index(key, &index)
+            let mut changed_paths = self
+                .sync_current_state_for_key_from_index(key, &index)
                 .await?;
-            let changed_paths = if self.current_state_binding(key).await? != before_binding {
-                touched_paths
-            } else {
-                BTreeSet::new()
-            };
+            if self.current_state_binding(key).await? != before_binding {
+                changed_paths.extend(touched_paths);
+            }
             let _snapshot_id = if self
                 .persist_current_state_with_snapshot_batch(
                     changed_paths,
@@ -7234,7 +8757,11 @@ impl PersistentStore {
                 format!("snap-skipped-{version_id}")
             };
 
-            return Ok(existing.version_id.clone());
+            return Ok(TombstonePathResult {
+                path: key.to_string(),
+                object_id,
+                version_id: existing.version_id.clone(),
+            });
         }
 
         let record = FileVersionRecord {
@@ -7249,7 +8776,9 @@ impl PersistentStore {
             copied_from_version_id: None,
             copied_from_path: None,
         };
-        let touched_paths = BTreeSet::from([key.to_string()]);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&object_id, key)
+            .await?;
         let before_binding = self.current_state_binding(key).await?;
         if options.create_snapshot {
             self.maybe_rotate_snapshot_batch(&touched_paths).await?;
@@ -7269,13 +8798,12 @@ impl PersistentStore {
 
         self.persist_version_index_by_object_id(&object_id, &index)
             .await?;
-        self.sync_current_state_for_key_from_index(key, &index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(key, &index)
             .await?;
-        let changed_paths = if self.current_state_binding(key).await? != before_binding {
-            touched_paths
-        } else {
-            BTreeSet::new()
-        };
+        if self.current_state_binding(key).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
         self.persist_current_state_with_snapshot_batch(
             changed_paths,
             options.create_snapshot,
@@ -7283,7 +8811,11 @@ impl PersistentStore {
         )
         .await?;
 
-        Ok(version_id)
+        Ok(TombstonePathResult {
+            path: key.to_string(),
+            object_id,
+            version_id,
+        })
     }
 
     pub async fn rename_object_path(
@@ -8315,7 +9847,7 @@ impl PersistentStore {
             });
         }
 
-        let (source_archive_file, record) = selected.expect("checked above");
+        let (source_archive_file, mut record) = selected.expect("checked above");
         if index_exists && !overwrite {
             return Ok(TombstoneRestoreReport {
                 object_id: object_id.to_string(),
@@ -8342,6 +9874,7 @@ impl PersistentStore {
             });
         }
 
+        normalize_version_index_identity(object_id, &mut record.index, "tombstone archive", None);
         self.persist_version_index_by_object_id(object_id, &record.index)
             .await?;
         Ok(TombstoneRestoreReport {
@@ -8432,6 +9965,19 @@ impl PersistentStore {
         Ok(fetched)
     }
 
+    /// Returns the current manifest and stable object identity for one path.
+    /// This intentionally uses the path cache/single-key metadata lookup rather
+    /// than materializing the full namespace state for a point revalidation.
+    pub(crate) async fn current_object_identity(
+        &self,
+        key: &str,
+    ) -> Result<Option<(String, String)>> {
+        Ok(self
+            .current_object_entry(key)
+            .await?
+            .map(|entry| (entry.manifest_hash, entry.object_id)))
+    }
+
     async fn upsert_current_object(&self, key: &str, entry: CurrentObjectEntry) -> Result<()> {
         self.metadata_store
             .upsert_current_object(key, &entry)
@@ -8441,7 +9987,7 @@ impl PersistentStore {
             .lock()
             .unwrap()
             .insert(key.to_string(), entry);
-        self.sync_sidecar_labels_after_upsert(key, &manifest_hash)
+        self.sync_sidecar_metadata_after_upsert(key, &manifest_hash)
             .await
     }
 
@@ -8451,7 +9997,7 @@ impl PersistentStore {
             .lock()
             .unwrap()
             .remove(&key.to_string());
-        self.sync_sidecar_labels_after_removal(key).await
+        self.sync_sidecar_metadata_after_removal(key).await
     }
 
     /// Makes the XMP sidecar of `media_key` carry exactly `labels`.
@@ -8481,6 +10027,85 @@ impl PersistentStore {
 
         let mut sidecar = stored.unwrap_or_else(XmpSidecar::new_empty);
         sidecar.set_keywords(labels);
+        self.write_media_sidecar(media_key, sidecar).await.map(Some)
+    }
+
+    /// Applies GPS and BerryKeep provenance through the same lossless XMP
+    /// read/modify/write path as label edits. Original media bytes are never
+    /// touched.
+    pub async fn set_media_geolocation(
+        &mut self,
+        media_key: &str,
+        inference: XmpGeoInference,
+    ) -> Result<MediaGeolocationWrite> {
+        if is_sidecar_key(media_key) {
+            bail!("GPS belongs to a media object, not to the sidecar {media_key}");
+        }
+        let sidecar_key = sidecar_key_for_media(media_key);
+        let mut sidecar = self
+            .load_stored_sidecar(&sidecar_key)
+            .await?
+            .unwrap_or_else(XmpSidecar::new_empty);
+        if sidecar.has_geo_location_properties() {
+            return Ok(MediaGeolocationWrite::AlreadyHasGps);
+        }
+        if inference.approved_capture_time.is_some() && sidecar.has_capture_time_properties() {
+            return Ok(MediaGeolocationWrite::AlreadyHasCaptureTime);
+        }
+        sidecar.set_geo_inference(inference)?;
+        self.write_media_sidecar(media_key, sidecar)
+            .await
+            .map(MediaGeolocationWrite::Applied)
+    }
+
+    /// Applies inferred GPS only while `media_key` still identifies the exact
+    /// media version reviewed by an operation. Callers hold the server store
+    /// write lock for this check and the following sidecar write, so a normal
+    /// object mutation cannot replace the media between revalidation and the
+    /// write.
+    pub async fn set_media_geolocation_if_current(
+        &mut self,
+        media_key: &str,
+        expected_manifest_hash: &str,
+        expected_object_id: &str,
+        inference: XmpGeoInference,
+    ) -> Result<MediaGeolocationWrite> {
+        let identity = self.current_object_identity(media_key).await?;
+        if !matches!(
+            identity,
+            Some((manifest_hash, object_id))
+                if manifest_hash == expected_manifest_hash && object_id == expected_object_id
+        ) {
+            return Ok(MediaGeolocationWrite::MediaChanged);
+        }
+        self.set_media_geolocation(media_key, inference).await
+    }
+
+    /// Reads the gallery GPS overlay and conservative mutation guards in one
+    /// sidecar load. A valid location is suitable for gallery projection;
+    /// present coordinate or capture-time properties block conflicting writes.
+    pub(crate) async fn media_sidecar_metadata_overlay(
+        &self,
+        media_key: &str,
+    ) -> Result<MediaSidecarMetadataOverlay> {
+        let sidecar_key = sidecar_key_for_media(media_key);
+        Ok(self
+            .load_stored_sidecar(&sidecar_key)
+            .await?
+            .map(|sidecar| MediaSidecarMetadataOverlay {
+                location: sidecar.geo_location(),
+                has_geo_location_properties: sidecar.has_geo_location_properties(),
+                has_capture_time_properties: sidecar.has_capture_time_properties(),
+            })
+            .unwrap_or_default())
+    }
+
+    async fn write_media_sidecar(
+        &mut self,
+        media_key: &str,
+        sidecar: XmpSidecar,
+    ) -> Result<PutResult> {
+        let sidecar_key = sidecar_key_for_media(media_key);
         let bytes = sidecar
             .to_bytes()
             .with_context(|| format!("failed to serialize the XMP sidecar {sidecar_key}"))?;
@@ -8490,10 +10115,8 @@ impl PersistentStore {
             }
             .into());
         }
-
         self.put_object_versioned(&sidecar_key, Bytes::from(bytes), PutOptions::default())
             .await
-            .map(Some)
     }
 
     /// Whether `labels` differ from what the stored sidecar already holds.
@@ -8541,25 +10164,30 @@ impl PersistentStore {
     /// the labels up from the sidecar that is already stored. Without the second
     /// direction a sidecar uploaded ahead of its image would be dropped
     /// silently, because the projection row it targets does not exist yet.
-    async fn sync_sidecar_labels_after_upsert(&self, key: &str, manifest_hash: &str) -> Result<()> {
+    async fn sync_sidecar_metadata_after_upsert(
+        &self,
+        key: &str,
+        manifest_hash: &str,
+    ) -> Result<()> {
         match media_key_for_sidecar(key) {
-            Some(media_key) => self.apply_sidecar_labels(&media_key, manifest_hash).await,
-            None => self.apply_stored_sidecar_labels(key).await,
+            Some(media_key) => self.apply_sidecar_metadata(&media_key, manifest_hash).await,
+            None => self.apply_stored_sidecar_metadata(key).await,
         }
     }
 
-    /// Clears the labels a removed sidecar contributed to its media object.
+    /// Clears the metadata a removed sidecar contributed to its media object.
     ///
     /// Removing a media object needs no counterpart: its projection row, and
     /// with it the label column, is deleted along with the object.
-    async fn sync_sidecar_labels_after_removal(&self, key: &str) -> Result<()> {
+    async fn sync_sidecar_metadata_after_removal(&self, key: &str) -> Result<()> {
         let Some(media_key) = media_key_for_sidecar(key) else {
             return Ok(());
         };
         if gallery_media_type_for_path(&media_key).is_none() {
             return Ok(());
         }
-        self.set_gallery_object_labels(&media_key, &[]).await
+        self.set_gallery_object_labels(&media_key, &[]).await?;
+        self.set_gallery_object_sidecar_gps(&media_key, None).await
     }
 
     /// Applies the labels of the sidecar already stored for `media_key`, if any.
@@ -8568,7 +10196,7 @@ impl PersistentStore {
     /// object cache does not retain misses. Gating on the media type therefore
     /// keeps the common ingest of non-media files from paying a sidecar lookup
     /// that can never resolve to a visible label.
-    async fn apply_stored_sidecar_labels(&self, media_key: &str) -> Result<()> {
+    async fn apply_stored_sidecar_metadata(&self, media_key: &str) -> Result<()> {
         if gallery_media_type_for_path(media_key).is_none() {
             return Ok(());
         }
@@ -8576,20 +10204,23 @@ impl PersistentStore {
         let Some(sidecar) = self.current_object_entry(&sidecar_key).await? else {
             return Ok(());
         };
-        self.apply_sidecar_labels(media_key, &sidecar.manifest_hash)
+        self.apply_sidecar_metadata(media_key, &sidecar.manifest_hash)
             .await
     }
 
     /// Stores the keywords of the given sidecar object on the projection row of
     /// `media_key`.
-    async fn apply_sidecar_labels(&self, media_key: &str, manifest_hash: &str) -> Result<()> {
+    async fn apply_sidecar_metadata(&self, media_key: &str, manifest_hash: &str) -> Result<()> {
         if gallery_media_type_for_path(media_key).is_none() {
             return Ok(());
         }
-        let Some(keywords) = self.read_sidecar_keywords(media_key, manifest_hash).await else {
+        let Some(sidecar) = self.read_sidecar(media_key, manifest_hash).await else {
             return Ok(());
         };
-        self.set_gallery_object_labels(media_key, &keywords).await
+        self.set_gallery_object_labels(media_key, sidecar.keywords())
+            .await?;
+        self.apply_sidecar_gps(media_key, sidecar.geo_location())
+            .await
     }
 
     /// Reads the keywords of a sidecar object, or `None` when the sidecar cannot
@@ -8599,11 +10230,7 @@ impl PersistentStore {
     /// expected input rather than a storage fault: it is reported and the
     /// projection is left untouched. Aborting here would fail the upload of a
     /// file whose own bytes are perfectly fine.
-    async fn read_sidecar_keywords(
-        &self,
-        media_key: &str,
-        manifest_hash: &str,
-    ) -> Option<Vec<String>> {
+    async fn read_sidecar(&self, media_key: &str, manifest_hash: &str) -> Option<XmpSidecar> {
         let bytes = match self.read_sidecar_bytes(manifest_hash).await {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -8618,7 +10245,7 @@ impl PersistentStore {
         };
 
         match XmpSidecar::parse(&bytes) {
-            Ok(sidecar) => Some(sidecar.keywords().to_vec()),
+            Ok(sidecar) => Some(sidecar),
             Err(err) => {
                 warn!(
                     media_key,
@@ -8629,6 +10256,18 @@ impl PersistentStore {
                 None
             }
         }
+    }
+
+    /// Applies an XMP GPS overlay to exactly one gallery projection row. Sidecars
+    /// are path-scoped while the media cache is content-addressed, so storing the
+    /// overlay in the cache would leak it to byte-identical copies elsewhere.
+    async fn apply_sidecar_gps(
+        &self,
+        media_key: &str,
+        location: Option<XmpGeoLocation>,
+    ) -> Result<()> {
+        self.set_gallery_object_sidecar_gps(media_key, location)
+            .await
     }
 
     /// Reads a whole sidecar object, refusing packets that are too large to be
@@ -8665,6 +10304,21 @@ impl PersistentStore {
         })
     }
 
+    async fn current_state_touched_paths_for_object_id(
+        &self,
+        object_id: &str,
+        key: &str,
+    ) -> Result<BTreeSet<String>> {
+        let mut paths: BTreeSet<String> = self
+            .metadata_store
+            .list_keys_for_object_id(object_id)
+            .await?
+            .into_iter()
+            .collect();
+        paths.insert(key.to_string());
+        Ok(paths)
+    }
+
     async fn changed_paths_after_bindings(
         &self,
         before: &HashMap<String, (Option<String>, Option<String>)>,
@@ -8692,6 +10346,7 @@ impl PersistentStore {
         object_id: &str,
         index: &FileVersionIndex,
     ) -> Result<()> {
+        validate_version_index_identity(object_id, index)?;
         self.metadata_store
             .persist_version_index_by_object_id(object_id, index)
             .await
@@ -8701,13 +10356,11 @@ impl PersistentStore {
         &self,
         key: &str,
         index: &FileVersionIndex,
-    ) -> Result<()> {
-        let current_object_id = self.object_id_for_key(key).await?;
+    ) -> Result<BTreeSet<String>> {
         let Some(preferred_head) = &index.preferred_head_version_id else {
-            if current_object_id.as_deref() == Some(index.object_id.as_str()) {
-                self.remove_current_object(key).await?;
-            }
-            return Ok(());
+            return self
+                .remove_current_state_bindings_for_object_id(&index.object_id)
+                .await;
         };
 
         let preferred_record = index.versions.get(preferred_head).with_context(|| {
@@ -8715,50 +10368,117 @@ impl PersistentStore {
         })?;
 
         if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            if current_object_id.as_deref() == Some(index.object_id.as_str()) {
-                self.remove_current_object(key).await?;
-            }
-            return Ok(());
+            return self
+                .remove_current_state_bindings_for_object_id(&index.object_id)
+                .await;
         }
 
+        let current_object_id = self.object_id_for_key(key).await?;
         if current_object_id.is_none()
             || current_object_id.as_deref() == Some(index.object_id.as_str())
         {
-            self.upsert_current_object(
-                key,
-                CurrentObjectEntry {
-                    manifest_hash: preferred_record.manifest_hash.clone(),
-                    object_id: index.object_id.clone(),
-                },
-            )
-            .await?;
+            return self
+                .bind_current_state_to_preferred_index_record(key, index, preferred_record)
+                .await;
         }
-        Ok(())
+        Ok(BTreeSet::new())
     }
 
     async fn promote_current_state_for_key_from_index(
         &self,
         key: &str,
         index: &FileVersionIndex,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
         let Some(preferred_head) = &index.preferred_head_version_id else {
-            return Ok(());
+            return self
+                .remove_current_state_bindings_for_object_id(&index.object_id)
+                .await;
         };
         let preferred_record = index.versions.get(preferred_head).with_context(|| {
             format!("preferred head {preferred_head} missing in index for key={key}")
         })?;
         if preferred_record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(());
+            return self
+                .remove_current_state_bindings_for_object_id(&index.object_id)
+                .await;
         }
 
-        self.upsert_current_object(
-            key,
-            CurrentObjectEntry {
-                manifest_hash: preferred_record.manifest_hash.clone(),
-                object_id: index.object_id.clone(),
-            },
-        )
-        .await
+        self.bind_current_state_to_preferred_index_record(key, index, preferred_record)
+            .await
+    }
+
+    async fn bind_current_state_to_preferred_index_record(
+        &self,
+        key: &str,
+        index: &FileVersionIndex,
+        preferred_record: &FileVersionRecord,
+    ) -> Result<BTreeSet<String>> {
+        let preferred_logical_path = preferred_record.logical_path.as_deref().unwrap_or(key);
+        let expected_entry = CurrentObjectEntry {
+            manifest_hash: preferred_record.manifest_hash.clone(),
+            object_id: index.object_id.clone(),
+        };
+        let mut changed_paths = BTreeSet::new();
+        let mut bound_paths = self
+            .metadata_store
+            .list_keys_for_object_id(&index.object_id)
+            .await?;
+        bound_paths.sort();
+        bound_paths.dedup();
+        bound_paths.retain(|path| path != key);
+
+        if !bound_paths.is_empty() {
+            if preferred_logical_path != key {
+                warn!(
+                    key,
+                    object_id = %index.object_id,
+                    preferred_logical_path,
+                    bound_paths = ?bound_paths,
+                    "skipping stale current-state binding for an already-bound object identity"
+                );
+                return Ok(changed_paths);
+            }
+
+            for bound_path in bound_paths {
+                self.remove_current_object(&bound_path).await?;
+                changed_paths.insert(bound_path);
+            }
+        }
+
+        if self.current_object_entry(key).await? != Some(expected_entry.clone()) {
+            self.upsert_current_object(key, expected_entry).await?;
+            changed_paths.insert(key.to_string());
+        }
+        Ok(changed_paths)
+    }
+
+    async fn remove_current_state_bindings_for_object_id(
+        &self,
+        object_id: &str,
+    ) -> Result<BTreeSet<String>> {
+        self.remove_current_state_bindings_for_object_id_except(object_id, None)
+            .await
+    }
+
+    async fn remove_current_state_bindings_for_object_id_except(
+        &self,
+        object_id: &str,
+        preserved_path: Option<&str>,
+    ) -> Result<BTreeSet<String>> {
+        let mut bound_paths = self
+            .metadata_store
+            .list_keys_for_object_id(object_id)
+            .await?;
+        bound_paths.sort();
+        bound_paths.dedup();
+        bound_paths.retain(|path| Some(path.as_str()) != preserved_path);
+
+        let mut changed_paths = BTreeSet::new();
+        for bound_path in bound_paths {
+            self.remove_current_object(&bound_path).await?;
+            changed_paths.insert(bound_path);
+        }
+        Ok(changed_paths)
     }
 
     async fn apply_selected_replica_tombstone_current_state(
@@ -8832,11 +10552,14 @@ impl PersistentStore {
         version_prefix: &str,
         create_snapshot: bool,
     ) -> Result<PathMutationResult> {
-        let touched_paths = BTreeSet::from([target_path.to_string()]);
         let target_object_id = self
             .object_id_for_key(target_path)
             .await?
             .unwrap_or_else(generate_object_id);
+        let touched_paths = self
+            .current_state_touched_paths_for_object_id(&target_object_id, target_path)
+            .await?;
+        let before_binding = self.current_state_binding(target_path).await?;
         let mut target_index = self
             .load_version_index_by_object_id(&target_object_id)
             .await?
@@ -8871,9 +10594,13 @@ impl PersistentStore {
         target_index.preferred_head_version_id = choose_preferred_head(&target_index);
         self.persist_version_index_by_object_id(&target_object_id, &target_index)
             .await?;
-        self.sync_current_state_for_key_from_index(target_path, &target_index)
+        let mut changed_paths = self
+            .sync_current_state_for_key_from_index(target_path, &target_index)
             .await?;
-        self.persist_current_state_with_snapshot_batch(touched_paths, create_snapshot, unix_ts())
+        if self.current_state_binding(target_path).await? != before_binding {
+            changed_paths.extend(touched_paths);
+        }
+        self.persist_current_state_with_snapshot_batch(changed_paths, create_snapshot, unix_ts())
             .await?;
 
         Ok(PathMutationResult::Applied)
@@ -9011,6 +10738,78 @@ impl PersistentStore {
             .await
     }
 
+    /// Applies an already-resolved historical restore batch. Target existence
+    /// is deliberately checked here, immediately before each mutation.
+    pub(crate) async fn restore_resolved_version_paths_batch(
+        &mut self,
+        restore_requests: &[(String, String, String, String)],
+        sources: &[Option<SnapshotRestoreSource>],
+    ) -> Result<RestoreResolvedVersionPathsBatchResult> {
+        if restore_requests.len() != sources.len() {
+            bail!(
+                "historical restore request/source count mismatch: {} requests, {} sources",
+                restore_requests.len(),
+                sources.len()
+            );
+        }
+        let touched_paths = restore_requests
+            .iter()
+            .map(|(_, _, _, target_path)| target_path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut before_bindings = HashMap::with_capacity(touched_paths.len());
+        for path in &touched_paths {
+            before_bindings.insert(path.clone(), self.current_state_binding(path).await?);
+        }
+        if !touched_paths.is_empty() {
+            self.maybe_rotate_snapshot_batch(&touched_paths).await?;
+        }
+        let mut results = Vec::with_capacity(restore_requests.len());
+
+        for ((source_path, _version_id, _source_object_id, target_path), source) in
+            restore_requests.iter().zip(sources)
+        {
+            let target_exists = match self.current_object_entry(target_path).await {
+                Ok(entry) => entry.is_some(),
+                Err(err) => {
+                    results.push(Err(err));
+                    continue;
+                }
+            };
+            if target_exists {
+                results.push(Ok(PathMutationResult::TargetExists));
+                continue;
+            }
+            let result = match source {
+                Some(source) => {
+                    self.restore_object_path_from_source(
+                        source.clone(),
+                        source_path,
+                        target_path,
+                        false,
+                        false,
+                    )
+                    .await
+                }
+                None => Ok(PathMutationResult::SourceMissing),
+            };
+            results.push(result);
+        }
+
+        let finalization_error = match self.changed_paths_after_bindings(&before_bindings).await {
+            Ok(changed_paths) if !changed_paths.is_empty() => self
+                .record_snapshot_batch(changed_paths, unix_ts())
+                .await
+                .err(),
+            Ok(_) => None,
+            Err(err) => Some(err),
+        };
+
+        Ok(RestoreResolvedVersionPathsBatchResult {
+            results,
+            finalization_error,
+        })
+    }
+
     async fn resolve_object_id_for_key_history(&self, key: &str) -> Result<Option<String>> {
         if let Some(object_id) = self.object_id_for_key(key).await? {
             return Ok(Some(object_id));
@@ -9137,7 +10936,7 @@ impl PersistentStore {
         created_at_unix: u64,
     ) -> Result<ReplicationImportLineageChoice> {
         if bundle.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            if let Some(object_id) = bundle.object_id.clone() {
+            if let Some(object_id) = nonempty_object_id(bundle.object_id.clone()) {
                 return Ok(ReplicationImportLineageChoice::existing(object_id));
             }
             if let Some(version_id) = bundle.version_id.as_deref()
@@ -9155,7 +10954,7 @@ impl PersistentStore {
             ));
         }
 
-        if let Some(source_object_id) = bundle.object_id.clone() {
+        if let Some(source_object_id) = nonempty_object_id(bundle.object_id.clone()) {
             if !bundle.selected_is_preferred_head {
                 if let Some(version_id) = bundle.version_id.as_deref()
                     && let Some(object_id) = self
@@ -9249,8 +11048,9 @@ impl PersistentStore {
         &mut self,
         key: &str,
         keep_record: &FileVersionRecord,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
         let mut indexes = self.load_all_version_indexes().await?;
+        let mut changed_paths = BTreeSet::new();
 
         for mut index in indexes.drain(..) {
             let Some(existing) = index.versions.get(&keep_record.version_id).cloned() else {
@@ -9272,19 +11072,22 @@ impl PersistentStore {
             if index.versions.is_empty() {
                 self.delete_version_index_by_object_id(&index.object_id)
                     .await?;
-                if self.object_id_for_key(key).await?.as_deref() == Some(index.object_id.as_str()) {
-                    self.remove_current_object(key).await?;
-                }
+                changed_paths.extend(
+                    self.remove_current_state_bindings_for_object_id(&index.object_id)
+                        .await?,
+                );
                 continue;
             }
 
             self.persist_version_index_by_object_id(&index.object_id, &index)
                 .await?;
-            self.sync_current_state_for_key_from_index(key, &index)
-                .await?;
+            changed_paths.extend(
+                self.sync_current_state_for_key_from_index(key, &index)
+                    .await?,
+            );
         }
 
-        Ok(())
+        Ok(changed_paths)
     }
 
     async fn replica_tombstone_supersedes_current_key(
@@ -9737,7 +11540,92 @@ fn empty_version_index(object_id: &str) -> FileVersionIndex {
         versions: HashMap::new(),
         head_version_ids: Vec::new(),
         preferred_head_version_id: None,
+        identity_was_normalized: false,
+        persisted_object_id: String::new(),
     }
+}
+
+fn decode_version_index(
+    persisted_object_id: &str,
+    payload: &[u8],
+    backend: &str,
+) -> Result<FileVersionIndex> {
+    let mut index = serde_json::from_slice::<FileVersionIndex>(payload)
+        .with_context(|| format!("invalid version index in {backend}"))?;
+    index.persisted_object_id = persisted_object_id.to_string();
+    index.identity_was_normalized =
+        normalize_version_index_identity(persisted_object_id, &mut index, backend, Some(payload));
+    Ok(index)
+}
+
+fn normalize_version_index_identity(
+    persisted_object_id: &str,
+    index: &mut FileVersionIndex,
+    source: &str,
+    payload: Option<&[u8]>,
+) -> bool {
+    let canonical_object_id = if persisted_object_id.trim().is_empty() {
+        if index.object_id.trim().is_empty() {
+            let payload_hash = payload.map(hash_hex).unwrap_or_else(generate_object_id);
+            format!("legacy-empty-index-{payload_hash}")
+        } else {
+            index.object_id.clone()
+        }
+    } else {
+        persisted_object_id.to_string()
+    };
+    let mut normalized = persisted_object_id.trim().is_empty();
+    if index.object_id != canonical_object_id {
+        warn!(
+            row_object_id = persisted_object_id,
+            payload_object_id = %index.object_id,
+            source,
+            "normalizing mismatched version index identity to the persisted row identity"
+        );
+        index.object_id = canonical_object_id;
+        normalized = true;
+    }
+    for record in index.versions.values_mut() {
+        if record.object_id.trim().is_empty() {
+            record.object_id = index.object_id.clone();
+            normalized = true;
+        } else if record.object_id != index.object_id {
+            warn!(
+                index_object_id = %index.object_id,
+                version_id = %record.version_id,
+                record_object_id = %record.object_id,
+                source,
+                "normalizing mismatched version record identity to the persisted row identity"
+            );
+            record.object_id = index.object_id.clone();
+            normalized = true;
+        }
+    }
+    normalized
+}
+
+fn validate_version_index_identity(object_id: &str, index: &FileVersionIndex) -> Result<()> {
+    if object_id.trim().is_empty() {
+        bail!("object_id must not be empty");
+    }
+    if index.object_id != object_id {
+        bail!(
+            "refusing to change object identity: expected={object_id} actual={}",
+            index.object_id
+        );
+    }
+    if let Some(record) = index
+        .versions
+        .values()
+        .find(|record| record.object_id != object_id)
+    {
+        bail!(
+            "refusing to persist version with a different object identity: object_id={object_id} version_id={} version_object_id={}",
+            record.version_id,
+            record.object_id
+        );
+    }
+    Ok(())
 }
 
 enum DeleteRecreateLoopCleanupCandidateOutcome {
@@ -9907,6 +11795,49 @@ fn generate_object_id() -> String {
     format!("obj-{}", Uuid::now_v7())
 }
 
+fn nonempty_object_id(object_id: Option<String>) -> Option<String> {
+    object_id.filter(|object_id| !object_id.trim().is_empty())
+}
+
+fn generate_unclaimed_object_id(claimed_object_ids: &mut HashSet<String>) -> String {
+    loop {
+        let object_id = generate_object_id();
+        if claimed_object_ids.insert(object_id.clone()) {
+            return object_id;
+        }
+    }
+}
+
+fn update_legacy_object_id_candidate(
+    candidates_by_binding: &mut HashMap<(String, String), LegacyObjectIdCandidate>,
+    path: &str,
+    manifest_hash: &str,
+    object_id: &str,
+    priority: u8,
+    created_at_unix: u64,
+) {
+    let key = (path.to_string(), manifest_hash.to_string());
+    let candidate = LegacyObjectIdCandidate {
+        object_id: object_id.to_string(),
+        priority,
+        created_at_unix,
+    };
+    let replace = candidates_by_binding.get(&key).is_none_or(|existing| {
+        (
+            candidate.priority,
+            candidate.created_at_unix,
+            candidate.object_id.as_str(),
+        ) > (
+            existing.priority,
+            existing.created_at_unix,
+            existing.object_id.as_str(),
+        )
+    });
+    if replace {
+        candidates_by_binding.insert(key, candidate);
+    }
+}
+
 fn recompute_head_version_ids(index: &FileVersionIndex) -> Vec<String> {
     let mut all_ids: HashSet<String> = index.versions.keys().cloned().collect();
     for record in index.versions.values() {
@@ -9918,6 +11849,29 @@ fn recompute_head_version_ids(index: &FileVersionIndex) -> Vec<String> {
     let mut heads: Vec<String> = all_ids.into_iter().collect();
     heads.sort();
     heads
+}
+
+fn recoverable_tombstone_ancestor(
+    index: &FileVersionIndex,
+    tombstone: &FileVersionRecord,
+) -> Option<FileVersionRecord> {
+    let mut pending = tombstone.parent_version_ids.clone();
+    let mut visited = HashSet::new();
+
+    while let Some(version_id) = pending.pop() {
+        if !visited.insert(version_id.clone()) {
+            continue;
+        }
+        let Some(record) = index.versions.get(&version_id) else {
+            continue;
+        };
+        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+            return Some(record.clone());
+        }
+        pending.extend(record.parent_version_ids.iter().cloned());
+    }
+
+    None
 }
 
 fn choose_preferred_head(index: &FileVersionIndex) -> Option<String> {

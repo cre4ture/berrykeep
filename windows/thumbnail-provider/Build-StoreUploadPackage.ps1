@@ -6,6 +6,10 @@ param(
     [string]$CargoTargetDir,
     [switch]$SkipSigning,
     [switch]$IncludePdbSymbols,
+    [string]$SigningCertificatePath,
+    [string]$SigningCertificatePassword,
+    [string]$SigningCertificateThumbprint,
+    [string]$TimestampUrl,
     [string]$CertificateSubject = 'CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21',
     [string]$CertificatePassword = 'ironmesh-store-upload'
 )
@@ -281,34 +285,6 @@ function New-AppxSymArchive {
     return $true
 }
 
-function New-MsixUploadArchive {
-    param(
-        [string]$PackagePath,
-        [string]$AppxSymPath,
-        [string]$DestinationPath
-    )
-
-    $stagePath = Join-Path (Split-Path -Parent $DestinationPath) 'msixupload-stage'
-    $zipPath = [System.IO.Path]::ChangeExtension($DestinationPath, '.zip')
-
-    Reset-Directory -Path $stagePath
-    Copy-Item $PackagePath $stagePath
-    if ($AppxSymPath -and (Test-Path $AppxSymPath)) {
-        Copy-Item $AppxSymPath $stagePath
-    }
-
-    if (Test-Path $zipPath) {
-        Remove-Item -Force $zipPath
-    }
-    if (Test-Path $DestinationPath) {
-        Remove-Item -Force $DestinationPath
-    }
-
-    Compress-Archive -Path (Join-Path $stagePath '*') -DestinationPath $zipPath -CompressionLevel Optimal
-    Move-Item $zipPath $DestinationPath
-    Remove-Item -Recurse -Force $stagePath
-}
-
 $repoRoot = Get-RepoRoot
 $scriptDir = Split-Path -Parent $PSCommandPath
 $manifestPath = Join-Path $scriptDir 'AppxManifest.xml'
@@ -345,14 +321,29 @@ else {
 $packagePath = Join-Path $artifactRoot ($artifactName + '.msix')
 $uploadPath = Join-Path $artifactRoot ($artifactName + '.msixupload')
 $appxSymPath = Join-Path $artifactRoot ($artifactName + '.appxsym')
-$pfxPath = Join-Path $artifactRoot ($artifactName + '.pfx')
+$developmentPfxPath = Join-Path $artifactRoot ($artifactName + '.pfx')
 $cerPath = Join-Path $artifactRoot ($artifactName + '.cer')
+
+$externalSigningValues = @(@(
+    $SigningCertificatePath,
+    $SigningCertificatePassword,
+    $SigningCertificateThumbprint
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($SkipSigning -and ($externalSigningValues.Count -gt 0 -or -not [string]::IsNullOrWhiteSpace($TimestampUrl))) {
+    throw '-SkipSigning cannot be combined with external signing certificate parameters.'
+}
+if ($externalSigningValues.Count -gt 0 -and $externalSigningValues.Count -ne 3) {
+    throw 'External signing requires -SigningCertificatePath, -SigningCertificatePassword, and -SigningCertificateThumbprint together.'
+}
+if ($externalSigningValues.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
+    throw '-TimestampUrl requires an external signing certificate.'
+}
 
 New-Item -ItemType Directory -Force -Path $artifactRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $cargoTargetDir | Out-Null
 Reset-Directory -Path $stagePath
 
-foreach ($path in @($packagePath, $uploadPath, $appxSymPath, $pfxPath, $cerPath)) {
+foreach ($path in @($packagePath, $uploadPath, $appxSymPath, $developmentPfxPath, $cerPath)) {
     if (Test-Path $path) {
         Remove-Item -Force $path
     }
@@ -371,24 +362,24 @@ if (-not $SkipSigning) {
     }
 }
 
-Write-Step 'Building windows-thumbnail-provider, cli-client, os-integration, ironmesh-folder-agent, ironmesh-background-launcher, and ironmesh-config-app (release)'
+Write-Step 'Building BerryKeep desktop-client artifacts (release)'
 $env:CARGO_TARGET_DIR = $cargoTargetDir
 Invoke-NativeChecked -FilePath 'cargo' -Arguments @('build', '-p', 'windows-thumbnail-provider', '-p', 'cli-client', '-p', 'os-integration', '-p', 'ironmesh-folder-agent', '-p', 'ironmesh-background-launcher', '-p', 'ironmesh-config-app', '--release')
 
 $releaseDir = Join-Path $cargoTargetDir 'release'
 $dllPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'windows_thumbnail_provider.dll' -FallbackPatterns @('windows_thumbnail_provider-*.dll')
-$clientCliPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh.exe' -FallbackPatterns @('ironmesh-*.exe')
-$exePath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-os-integration.exe' -FallbackPatterns @('ironmesh_os_integration-*.exe', 'ironmesh-os-integration-*.exe')
-$folderAgentPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-folder-agent.exe' -FallbackPatterns @('ironmesh_folder_agent-*.exe', 'ironmesh-folder-agent-*.exe')
-$backgroundLauncherPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-background-launcher.exe' -FallbackPatterns @('ironmesh_background_launcher-*.exe', 'ironmesh-background-launcher-*.exe')
-$configAppPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-config-app.exe' -FallbackPatterns @('ironmesh_config_app-*.exe', 'ironmesh-config-app-*.exe')
+$clientCliPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep.exe' -FallbackPatterns @('berrykeep-*.exe')
+$exePath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-os-integration.exe' -FallbackPatterns @('berrykeep_os_integration-*.exe', 'berrykeep-os-integration-*.exe')
+$folderAgentPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-folder-agent.exe' -FallbackPatterns @('berrykeep_folder_agent-*.exe', 'berrykeep-folder-agent-*.exe')
+$backgroundLauncherPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-background-launcher.exe' -FallbackPatterns @('berrykeep_background_launcher-*.exe', 'berrykeep-background-launcher-*.exe')
+$configAppPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-config-app.exe' -FallbackPatterns @('berrykeep_config_app-*.exe', 'berrykeep-config-app-*.exe')
 $pdbCandidates = @(
     Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'windows_thumbnail_provider.pdb' -FallbackPatterns @('windows_thumbnail_provider-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh.pdb' -FallbackPatterns @('ironmesh-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-os-integration.pdb' -FallbackPatterns @('ironmesh_os_integration-*.pdb', 'ironmesh-os-integration-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-folder-agent.pdb' -FallbackPatterns @('ironmesh_folder_agent-*.pdb', 'ironmesh-folder-agent-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-background-launcher.pdb' -FallbackPatterns @('ironmesh_background_launcher-*.pdb', 'ironmesh-background-launcher-*.pdb')
-    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'ironmesh-config-app.pdb' -FallbackPatterns @('ironmesh_config_app-*.pdb', 'ironmesh-config-app-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep.pdb' -FallbackPatterns @('berrykeep-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-os-integration.pdb' -FallbackPatterns @('berrykeep_os_integration-*.pdb', 'berrykeep-os-integration-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-folder-agent.pdb' -FallbackPatterns @('berrykeep_folder_agent-*.pdb', 'berrykeep-folder-agent-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-background-launcher.pdb' -FallbackPatterns @('berrykeep_background_launcher-*.pdb', 'berrykeep-background-launcher-*.pdb')
+    Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'berrykeep-config-app.pdb' -FallbackPatterns @('berrykeep_config_app-*.pdb', 'berrykeep-config-app-*.pdb')
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 
 if (-not $dllPath -or -not (Test-Path -LiteralPath $dllPath)) {
@@ -413,11 +404,11 @@ if (-not $configAppPath -or -not (Test-Path -LiteralPath $configAppPath)) {
 Write-Step 'Staging Store package contents'
 Save-StagedManifest -SourcePath $manifestPath -DestinationPath (Join-Path $stagePath 'AppxManifest.xml') -Version $resolvedVersion
 Copy-Item $dllPath (Join-Path $stagePath 'windows_thumbnail_provider.dll')
-Copy-Item $clientCliPath (Join-Path $stagePath 'ironmesh.exe')
-Copy-Item $exePath (Join-Path $stagePath 'ironmesh-os-integration.exe')
-Copy-Item $folderAgentPath (Join-Path $stagePath 'ironmesh-folder-agent.exe')
-Copy-Item $backgroundLauncherPath (Join-Path $stagePath 'ironmesh-background-launcher.exe')
-Copy-Item $configAppPath (Join-Path $stagePath 'ironmesh-config-app.exe')
+Copy-Item $clientCliPath (Join-Path $stagePath 'berrykeep.exe')
+Copy-Item $exePath (Join-Path $stagePath 'berrykeep-os-integration.exe')
+Copy-Item $folderAgentPath (Join-Path $stagePath 'berrykeep-folder-agent.exe')
+Copy-Item $backgroundLauncherPath (Join-Path $stagePath 'berrykeep-background-launcher.exe')
+Copy-Item $configAppPath (Join-Path $stagePath 'berrykeep-config-app.exe')
 Copy-Item $assetsPath (Join-Path $stagePath 'Assets') -Recurse
 
 Write-Step 'Packing MSIX with MakeAppx.exe'
@@ -427,14 +418,34 @@ if ($SkipSigning) {
     Write-Warning 'Skipping MSIX signing. The output is intended for Partner Center upload, not local installation.'
 }
 else {
-    $null = Ensure-CodeSigningCertificate `
-        -Subject $CertificateSubject `
-        -PfxPath $pfxPath `
-        -CerPath $cerPath `
-        -Password $CertificatePassword
+    if ($externalSigningValues.Count -eq 3) {
+        $certificatePathForSigning = (Resolve-Path -LiteralPath $SigningCertificatePath).Path
+        $certificatePasswordForSigning = $SigningCertificatePassword
+        $certificateThumbprintForSigning = $SigningCertificateThumbprint
+    }
+    else {
+        $certificate = Ensure-CodeSigningCertificate `
+            -Subject $CertificateSubject `
+            -PfxPath $developmentPfxPath `
+            -CerPath $cerPath `
+            -Password $CertificatePassword
+        $certificatePathForSigning = $developmentPfxPath
+        $certificatePasswordForSigning = $CertificatePassword
+        $certificateThumbprintForSigning = $certificate.Thumbprint
+    }
 
-    Write-Step 'Signing MSIX with SignTool.exe'
-    Invoke-NativeChecked -FilePath $signTool -Arguments @('sign', '/fd', 'SHA256', '/f', $pfxPath, '/p', $CertificatePassword, $packagePath)
+    Write-Step 'Signing and verifying MSIX with the selected certificate'
+    $signingArguments = @{
+        MsixPath = $packagePath
+        SigningCertificatePath = $certificatePathForSigning
+        SigningCertificatePassword = $certificatePasswordForSigning
+        SigningCertificateThumbprint = $certificateThumbprintForSigning
+        PublicCertificatePath = $cerPath
+    }
+    if ($TimestampUrl) {
+        $signingArguments.TimestampUrl = $TimestampUrl
+    }
+    & (Join-Path $scriptDir 'Sign-Msix.ps1') @signingArguments
 }
 
 $createdAppxSym = $false
@@ -450,7 +461,14 @@ if ($IncludePdbSymbols) {
 }
 
 Write-Step 'Creating .msixupload archive'
-New-MsixUploadArchive -PackagePath $packagePath -AppxSymPath $(if ($createdAppxSym) { $appxSymPath } else { $null }) -DestinationPath $uploadPath
+$uploadArguments = @{
+    MsixPath = $packagePath
+    OutputPath = $uploadPath
+}
+if ($createdAppxSym) {
+    $uploadArguments.AppxSymPath = $appxSymPath
+}
+& (Join-Path $scriptDir 'New-MsixUploadPackage.ps1') @uploadArguments
 
 Write-Host ''
 Write-Host 'Store upload package ready:' -ForegroundColor Green

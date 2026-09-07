@@ -4,15 +4,78 @@
 
 Pushing an annotated stable `vX.Y.Z` tag whose value matches
 `[workspace.package].version` starts the `Release` workflow. It builds the
-Windows Server Node MSI again from the tagged source, signs and timestamps it
-inside the protected `release-signing` environment, then publishes the MSI,
-signed stable manifest, and `SHA256SUMS` on the matching GitHub Release page.
+Windows Server Node MSI again from the tagged source without signing inputs.
+A separate protected `release-signing` job downloads that single unsigned MSI,
+signs it, optionally timestamps it, verifies the signer, creates the matching
+signed stable manifest, then publishes the MSI, manifest, signed client
+sideload assets, and `SHA256SUMS` on the matching GitHub Release page.
 
-Configure these protected-environment values before tagging:
+Configure these values before tagging:
 
-- secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64` - base64-encoded PFX;
-- secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD` - PFX password;
-- variable `BERRYKEEP_WINDOWS_TIMESTAMP_URL` - approved RFC-3161 endpoint.
+- repository variable `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT` -
+  normalized SHA-1 thumbprint of the release certificate; this is public and
+  is embedded in the MSI updater configuration before signing;
+- environment secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64` -
+  base64-encoded PFX;
+- environment secret `BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD` - PFX
+  password;
+- environment variable `BERRYKEEP_WINDOWS_TIMESTAMP_URL` - approved RFC-3161
+  endpoint, required for public releases and optional for self-signed tests.
+
+Keep the PFX and its password as *environment* secrets in `release-signing`,
+not repository secrets. Require independent environment approval, prevent
+self-approval, disallow administrator bypass, and limit the environment to
+the protected default branch. Start a protected signing run through
+`workflow_dispatch` from that branch. The signing job checks out the protected
+default branch only for the minimal signing utilities; the MSI itself is always
+built from the requested release tag. This also lets `workflow_dispatch` repair
+a failed publication of an existing immutable tag without recreating it.
+
+The unsigned release artifact has one-day retention and is never published.
+Protect `.github/workflows/release.yml` and
+`windows/server-node-installer/{Sign-Msi.ps1,New-ReleaseManifest.ps1}` with
+code-owner review. Never reuse the self-signed Store/MSIX development
+certificate for this release signing path.
+
+## Test-only self-signed Server Node releases
+
+For a controlled test, create a distinct self-signed Server Node certificate.
+It produces an untrusted-publisher warning when the MSI is installed, so do
+not use it for a public release. The updater still pins the exact certificate
+thumbprint for the signed manifest and MSI.
+
+Run this on a secure Windows machine, outside the repository:
+
+```powershell
+$certificate = New-SelfSignedCertificate `
+  -Type CodeSigningCert `
+  -Subject 'CN=BerryKeep Server Node Test Signing' `
+  -CertStoreLocation 'Cert:\CurrentUser\My' `
+  -KeyAlgorithm RSA `
+  -KeyLength 3072 `
+  -HashAlgorithm SHA256 `
+  -KeyExportPolicy Exportable `
+  -KeySpec Signature `
+  -NotAfter (Get-Date).AddYears(1) `
+  -FriendlyName 'BerryKeep Server Node Test Signing'
+
+$pfxPassword = Read-Host -AsSecureString 'Choose a PFX password'
+$pfxDirectory = 'C:\secure'
+New-Item -ItemType Directory -Path $pfxDirectory -Force | Out-Null
+$pfxPath = Join-Path $pfxDirectory 'berrykeep-server-node-test.pfx'
+Export-PfxCertificate -Cert $certificate.PSPath -FilePath $pfxPath -Password $pfxPassword | Out-Null
+$certificate.Thumbprint
+[Convert]::ToBase64String([System.IO.File]::ReadAllBytes($pfxPath)) | Set-Clipboard
+```
+
+Configure the returned thumbprint as the repository variable
+`BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT`. Base64-encode the PFX and
+store it as the `release-signing` environment secret
+`BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_B64`; store the password as
+`BERRYKEEP_WINDOWS_SIGNING_CERTIFICATE_PASSWORD`. Leave
+`BERRYKEEP_WINDOWS_TIMESTAMP_URL` unset for this test path. Do not commit the
+PFX, password, or Base64 value. The final command copies the Base64 value to
+the clipboard; paste it into GitHub immediately and clear the clipboard.
 
 The normal `Win Server MSI` CI job remains intentionally unsigned and uploads
 only a short-lived validation artifact. Never publish that artifact.
@@ -21,6 +84,52 @@ The validation job does not run on ordinary pushes or manual CI runs. Add the
 `ci:windows-server-node-msi` label to a pull request to request it, or push a
 stable `vX.Y.Z` release tag to run it automatically alongside the signed
 release workflow.
+
+## Signed Windows client sideload releases
+
+The `Release` workflow also creates a Windows client test-release artifact.
+It builds the MSIX from the requested immutable release tag with
+`Build-StoreUploadPackage.ps1 -SkipSigning`, then passes the single unsigned
+MSIX to a separate protected `windows-client-signing` job. That job checks out
+the protected default branch only for `Sign-Msix.ps1` and
+`New-MsixUploadPackage.ps1`, verifies the certificate and manifest publisher,
+signs the MSIX without contacting a timestamp server, and creates an
+`.msixupload` from the signed package.
+
+Configure these values before a client-signed release:
+
+- repository variable
+  `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_THUMBPRINT` - normalized
+  SHA-1 thumbprint of the client PFX;
+- environment secret
+  `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_B64` - base64-encoded PFX;
+- environment secret
+  `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD` - PFX password.
+
+Keep both secrets in the `windows-client-signing` environment, not
+as repository secrets. Configure independent approval, prevent
+self-approval/admin bypass, and limit the environment to the protected
+default branch. Run a protected client signing release through
+`workflow_dispatch` from that branch.
+The certificate subject must exactly match the `Publisher` in
+`windows/thumbnail-provider/AppxManifest.xml`; the signing helper refuses a
+mismatch. Protect `.github/workflows/release.yml` and
+`windows/thumbnail-provider/{Sign-Msix.ps1,New-MsixUploadPackage.ps1}` with
+code-owner review.
+
+The unsigned MSIX has one-day retention and is never published. The public
+GitHub Release includes the signed client MSIX and its public certificate for
+controlled sideload testing:
+
+- `berrykeep-client-<version>.msix` for a controlled sideload test;
+- `berrykeep-client-<version>.cer`, the public certificate to import into
+  `LocalMachine\TrustedPeople` on that test machine;
+
+The signed `release-windows-client` Actions artifact has fourteen-day
+retention and additionally contains
+`berrykeep-client-<version>.msixupload` for a later Partner Center upload.
+The Store package remains an intentional Partner Center step; the Store
+handles the final consumer-package signing.
 
 ## Android release builds on pull requests
 
@@ -171,19 +280,22 @@ is part of `Required CI`. It builds `x86_64-unknown-linux-musl`, rejects an ELF
 interpreter or `DT_NEEDED` entry, executes the binary, and uploads
 `static-server-node-linux-amd64` with checksums and build metadata.
 
-The separate `Focal A64` workflow performs the same checks natively for
-`aarch64-unknown-linux-musl` and uploads `static-server-node-linux-arm64`. Its
-Focal container receives that already verified executable through
-`build-local-debs.sh --prebuilt-server-node`; only the client and rendezvous
-components are compiled in the distribution container.
+The `Server Node Debian packages` workflow builds
+`aarch64-unknown-linux-musl` and `x86_64-unknown-linux-musl` once each with
+Zig on an x86_64 runner. It validates both static artifacts and runs the
+AArch64 `--version` smoke test under QEMU. Its `Focal A64`, `Trixie A64`,
+`Focal AMD64`, `Trixie AMD64`, and `Noble AMD64` package matrix entries each
+verify the matching artifact inside the target distribution container and use
+`build-local-debs.sh --server-node-only --static-server-node-artifact` to
+assemble only the portable `berrykeep-server-node` package. They do not compile
+or execute a target binary in the distribution container.
 
-On pull requests, add the `ci:debian-packages` label to run the full Debian
-package validation on both published architectures. It enables the native
-Focal ARM64 package build as well as the AMD64 binary-package handoff: the
-`Linux binaries` job builds the non-server bundle, and `Debian packages`
-combines it with the static Server Node. Both package workflows produce
-`ironmesh-server-node`, the optional `ironmesh-server-node-map-tools`,
-`ironmesh-client`, and `ironmesh-rendezvous-service`.
+On pull requests, add the `ci:debian-packages` label to run the Focal/Trixie
+ARM64 and Focal/Trixie/Noble AMD64 Server Node matrices, plus the existing
+AMD64 binary-package handoff. `Linux binaries` builds the AMD64 non-server
+bundle, and `Debian packages` combines it with the static Server Node to
+produce the complete AMD64 package set. The Server Node matrix produces only
+`berrykeep-server-node` for each target suite.
 
 For a local static build, install the web workspace dependencies and ELF tools,
 then run:

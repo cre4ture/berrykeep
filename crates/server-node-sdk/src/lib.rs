@@ -39,7 +39,10 @@ use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
 use common::xmp::{is_sidecar_key, sidecar_key_for_media};
-use common::{ClusterId, DeviceId, HealthStatus, NodeId, normalize_node_hostname};
+use common::{
+    ClusterId, DeviceId, HealthStatus, NodeId, normalize_node_hostname,
+    parse_comma_separated_labels,
+};
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
 };
@@ -117,6 +120,12 @@ const PROCESS_STATS_HISTORY_MAX_SAMPLES: usize = 450;
 const STORE_INDEX_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_INDEX_PAGE_CACHE_MAX_SCOPES: usize = 2;
 const STORE_INDEX_PAGE_CACHE_MAX_ENTRY_COUNT: usize = 50_000;
+const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
+const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
+const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
+const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
+const HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE: Duration = Duration::from_millis(25);
+const HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const GALLERY_MAX_DEPTH: usize = 64;
 const GALLERY_MAP_MAX_CLUSTERS: usize = 2_048;
 const GALLERY_MAP_CLUSTER_ENTRY_DEFAULT_LIMIT: usize = 100;
@@ -146,6 +155,7 @@ mod listing;
 mod map_config;
 mod map_dataset_import;
 mod natural_earth_import;
+mod operations;
 mod reliability_telemetry;
 mod rendezvous_contact_config;
 mod replication;
@@ -191,6 +201,7 @@ const DATA_SCRUB_HISTORY_RETENTION_SECS: u64 = 12 * 30 * 24 * 60 * 60;
 const MAX_DATA_SCRUB_HISTORY_LIMIT: usize = 4_096;
 const REPAIR_RUN_HISTORY_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 const STORE_INDEX_CURSOR_DEFAULT_PAGE_SIZE: usize = 1_000;
+const HISTORY_RESTORE_BATCH_MAX_ENTRIES: usize = 100;
 const MAX_REPAIR_RUN_HISTORY_LIMIT: usize = 4_096;
 const ACTIVE_REPAIR_LIVE_LOG_LIMIT: usize = 1_024;
 const UPLOAD_SESSION_PERSIST_COALESCE_SECS: u64 = 5;
@@ -266,18 +277,19 @@ use storage::{
     AdminAuditEvent, CachedMediaMetadata, ChunkIngestor, CleanupReport, ClientBootstrapClaimRecord,
     ClientCredentialRecord, ClientCredentialState, CurrentObjectsCacheStats, DataChangeAction,
     DataChangeActorKind, DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery,
-    DataChangeUploadMode, DataScrubReport, HostDependencyReport, HostDependencyStatus,
-    MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind,
-    MetadataDbLogicalDistribution, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan,
-    ObjectVersionMetadataRecord, PairingAuthorizationRecord, PathMutationResult, PersistentStore,
-    PreferredHeadReason, PutOptions, ReconcileVersionEntry, RepairAttemptRecord,
-    ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord, S3BucketRecord,
-    S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult, StoragePathStats,
-    StoragePoolConfig, StorageStatsSample, StoreReadError, TOMBSTONE_MANIFEST_HASH, UploadChunkRef,
-    VersionConsistencyState, grid_thumbnail_profile, media_cache_retry_due,
-    metadata_db_logical_table_count, promote_cached_media_metadata_to_incomplete,
-    thumbnail_profile_from_query,
+    DataChangeUploadMode, DataScrubReport, HistoryHeadProjectionBackfillState,
+    HostDependencyReport, HostDependencyStatus, MediaCacheLookup, MediaCacheStatus,
+    MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
+    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
+    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, ObjectVersionMetadataRecord,
+    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
+    PutOptions, ReconcileVersionEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
+    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
+    S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
+    StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
+    TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, grid_thumbnail_profile,
+    media_cache_retry_due, metadata_db_logical_table_count,
+    promote_cached_media_metadata_to_incomplete, thumbnail_profile_from_query,
 };
 
 tokio::task_local! {
@@ -337,6 +349,10 @@ struct ServerStorageRuntime {
     namespace_change_sequence: Arc<AtomicU64>,
     namespace_change_tx: watch::Sender<u64>,
     store_index_page_cache: Arc<StdMutex<StoreIndexPageCache>>,
+    store_history_cache: Arc<StdMutex<StoreHistoryCache>>,
+    store_history_cache_generation: Arc<AtomicU64>,
+    store_history_refresh_locks: Arc<StdMutex<StoreHistoryRefreshLocks>>,
+    store_history_refresh_permits: Arc<Semaphore>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
@@ -412,6 +428,7 @@ struct ServerMaintenanceRuntime {
     repair_state: Arc<Mutex<RepairExecutorState>>,
     repair_activity: Arc<Mutex<RepairActivityRuntime>>,
     manual_repair_activity: Arc<Mutex<ManualRepairActionActivityRuntime>>,
+    operations_activity: Arc<Mutex<operations::OperationActivityRuntime>>,
     autonomous_post_write_repair: Arc<Mutex<AutonomousPostWriteRepairRuntime>>,
     data_scrub_enabled: bool,
     data_scrub_interval_secs: u64,
@@ -891,6 +908,17 @@ struct InternalTlsRuntime {
 }
 
 pub(crate) fn publish_namespace_change(state: &ServerState) {
+    // Recoverable history is a derived namespace view. Any namespace mutation
+    // can add, remove, or move a recoverable path, so retaining a TTL entry
+    // here would make the Explorer stale immediately after a delete or rename.
+    state
+        .storage
+        .store_history_cache_generation
+        .fetch_add(1, Ordering::SeqCst);
+    match state.storage.store_history_cache.lock() {
+        Ok(mut cache) => cache.clear(),
+        Err(poisoned) => poisoned.into_inner().clear(),
+    }
     let sequence = state
         .storage
         .namespace_change_sequence
@@ -930,6 +958,10 @@ struct UploadSessionRecord {
     state: VersionConsistencyState,
     parent_version_ids: Vec<String>,
     explicit_version_id: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<String>,
     #[serde(default)]
     assembly_mode: UploadAssemblyMode,
     #[serde(default)]
@@ -1002,6 +1034,10 @@ struct UploadSessionStartRequest {
     parent: Vec<String>,
     version_id: Option<String>,
     #[serde(default)]
+    object_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<String>,
+    #[serde(default)]
     chunk_refs: Vec<UploadChunkRef>,
 }
 
@@ -1032,6 +1068,8 @@ struct UploadSessionChunkResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadSessionCompleteResponse {
+    #[serde(default)]
+    object_id: String,
     snapshot_id: String,
     version_id: String,
     manifest_hash: String,
@@ -6399,7 +6437,7 @@ impl ServerNodeConfig {
         }
 
         bail!(
-            "ironmesh-server-node refuses insecure public HTTP startup without TLS; configure IRONMESH_PUBLIC_TLS_CERT plus IRONMESH_PUBLIC_TLS_KEY, or set {ALLOW_INSECURE_PUBLIC_HTTP_ENV}=true for local development/testing only"
+            "berrykeep-server-node refuses insecure public HTTP startup without TLS; configure IRONMESH_PUBLIC_TLS_CERT plus IRONMESH_PUBLIC_TLS_KEY, or set {ALLOW_INSECURE_PUBLIC_HTTP_ENV}=true for local development/testing only"
         )
     }
 
@@ -7387,6 +7425,14 @@ async fn run_inner(
             namespace_change_sequence: Arc::new(AtomicU64::new(0)),
             namespace_change_tx: watch::channel(0).0,
             store_index_page_cache: Arc::new(StdMutex::new(StoreIndexPageCache::default())),
+            store_history_cache: Arc::new(StdMutex::new(StoreHistoryCache::default())),
+            store_history_cache_generation: Arc::new(AtomicU64::new(0)),
+            store_history_refresh_locks: Arc::new(StdMutex::new(
+                StoreHistoryRefreshLocks::default(),
+            )),
+            store_history_refresh_permits: Arc::new(Semaphore::new(
+                STORE_HISTORY_REFRESH_MAX_CONCURRENCY,
+            )),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
@@ -7468,6 +7514,9 @@ async fn run_inner(
             manual_repair_activity: Arc::new(Mutex::new(
                 ManualRepairActionActivityRuntime::default(),
             )),
+            operations_activity: Arc::new(Mutex::new(
+                operations::OperationActivityRuntime::default(),
+            )),
             autonomous_post_write_repair: Arc::new(Mutex::new(
                 AutonomousPostWriteRepairRuntime::default(),
             )),
@@ -7494,6 +7543,7 @@ async fn run_inner(
         )),
     };
     seed_process_temperature_stats_for_tests(&state);
+    operations::interrupt_runs_after_server_restart(&state).await;
 
     start_background_runtimes(&state, &config, startup_phase_anchor).await;
 
@@ -7543,6 +7593,7 @@ async fn start_background_runtimes(
     reliability_telemetry::spawn_reliability_telemetry_sender(state.clone());
     spawn_data_scrubber(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
+    spawn_history_head_projection_backfill(state.clone());
     spawn_direct_quic_multiplex_agent(state.clone());
 
     let load_repair_attempts_phase_started_at =
@@ -7617,8 +7668,18 @@ async fn start_background_runtimes(
 }
 
 fn build_server_apps(state: &ServerState) -> ServerApps {
-    let public_client_api = Router::new()
+    // The multiplexed client transport always carries a signed device identity.
+    // Its WebSocket handler needs that identity for every request it serves, so
+    // it cannot inherit the optional legacy-client policy of the other public
+    // client endpoints.
+    let public_client_transport_api = Router::new()
         .route("/transport/ws", get(client_transport_ws))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_signed_client_auth,
+        ));
+
+    let public_client_api = Router::new()
         .route("/diagnostics/latency", get(latency_diagnostic))
         .route(
             "/auth/device/renew-rendezvous-identity",
@@ -7626,6 +7687,8 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/snapshots", get(list_snapshots))
         .route("/store/index", get(list_store_index))
+        .route("/store/history", get(list_store_history))
+        .route("/store/history/restore", post(restore_history_entries))
         .route("/store/index/delta", get(get_store_index_delta))
         .route("/gallery/map/clusters", get(list_gallery_map_clusters))
         .route(
@@ -7664,6 +7727,13 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/media/cache/retry", post(retry_media_cache))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
+        .route(
+            "/objects/{object_id}",
+            get(get_object_by_id)
+                .put(put_object_by_id)
+                .delete(delete_object_by_id),
+        )
+        .route("/objects/{object_id}/rename", post(rename_object_by_id))
         .route("/store/copy", post(copy_object_path))
         .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
@@ -7718,6 +7788,23 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/admin/change-password", post(change_admin_password))
         .route("/auth/repair/activity", get(repair_activity_status))
         .route("/auth/repair/history", get(repair_history))
+        .route("/auth/operations", get(operations::list_operations))
+        .route(
+            "/auth/operations/{operation_id}/runs",
+            post(operations::start_operation_run),
+        )
+        .route(
+            "/auth/operation-runs/{run_id}",
+            get(operations::get_operation_run),
+        )
+        .route(
+            "/auth/operation-runs/{run_id}/results",
+            get(operations::get_operation_run_results),
+        )
+        .route(
+            "/auth/operation-runs/history",
+            get(operations::get_operation_run_history),
+        )
         .route("/auth/repair/actions", get(list_manual_repair_actions))
         .route(
             "/auth/repair/actions/activity",
@@ -7737,6 +7824,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/scrub/run", post(trigger_data_scrub_public))
         .route("/auth/store/snapshots", get(list_snapshots_admin))
         .route("/auth/store/index", get(list_store_index_admin))
+        .route("/auth/store/history", get(list_store_history_admin))
+        .route(
+            "/auth/store/history/restore",
+            post(restore_history_entries_admin),
+        )
         .route("/auth/store/index/delta", get(get_store_index_delta_admin))
         .route(
             "/auth/gallery/map/clusters",
@@ -7786,6 +7878,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             post(prepare_host_storage_directory),
         )
         .route("/auth/versions/{key}", get(list_versions_admin))
+        .route("/auth/objects/{object_id}", get(get_object_by_id_admin))
         .route(
             "/auth/versions/{key}/restore/{version_id}",
             post(restore_version_path),
@@ -7924,7 +8017,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .route("/maps/tiles/{z}/{x}/{y}", get(web_maps::xyz_tile))
         .route("/maps/vector-tiles/{z}/{x}/{y}", get(web_maps::vector_tile))
-        .route("/maps/fonts/{fontstack}/{range}", get(web_maps::font_range));
+        .route("/maps/fonts/{fontstack}/{range}", get(web_maps::font_range))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_or_admin_auth,
+        ));
 
     let public_api_v1 = Router::new()
         .route("/health", get(health))
@@ -7977,10 +8074,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .merge(public_admin_api.clone())
         .merge(public_cluster_info_api.clone())
         .merge(web_service_client_api.clone())
+        .merge(public_client_transport_api.clone())
         .merge(public_client_api.clone());
 
-    let legacy_public_api = Router::new()
-        .route("/health", get(health))
+    let legacy_public_maps_api = Router::new()
         .route(
             "/api/maps/mbtiles-metadata",
             get(web_maps::mbtiles_metadata),
@@ -7998,6 +8095,14 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             "/api/maps/fonts/{fontstack}/{range}",
             get(web_maps::font_range),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_or_admin_auth,
+        ));
+
+    let legacy_public_api = Router::new()
+        .route("/health", get(health))
+        .merge(legacy_public_maps_api)
         .route(
             "/auth/bootstrap-claims/redeem",
             post(redeem_client_bootstrap_claim),
@@ -8046,6 +8151,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .merge(public_admin_api)
         .merge(public_cluster_info_api)
         .merge(web_service_client_api)
+        .merge(public_client_transport_api)
         .merge(public_client_api);
 
     let public_logs_api =
@@ -8131,6 +8237,13 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/media/thumbnail", get(get_media_thumbnail))
         .route("/store/delete", post(delete_object_by_query))
         .route("/store/rename", post(rename_object_path))
+        .route(
+            "/objects/{object_id}",
+            get(get_object_by_id)
+                .put(put_object_by_id)
+                .delete(delete_object_by_id),
+        )
+        .route("/objects/{object_id}/rename", post(rename_object_by_id))
         .route("/store/copy", post(copy_object_path))
         .route("/store/labels", post(set_media_labels))
         .route("/store/restore", post(restore_snapshot_path))
@@ -13220,6 +13333,7 @@ async fn list_snapshots_response(state: &ServerState) -> Response {
 struct ObjectGetQuery {
     snapshot: Option<String>,
     version: Option<String>,
+    object_id: Option<String>,
     read_mode: Option<String>,
 }
 
@@ -13247,6 +13361,10 @@ struct StoreIndexQuery {
     limit: Option<usize>,
     sort: Option<StoreIndexSortOrder>,
     media_filter: Option<StoreIndexMediaFilter>,
+    /// Inclusive lower bound for the effective media capture timestamp.
+    captured_from_unix: Option<u64>,
+    /// Exclusive upper bound for the effective media capture timestamp.
+    captured_until_unix: Option<u64>,
     south: Option<f64>,
     west: Option<f64>,
     north: Option<f64>,
@@ -13258,32 +13376,96 @@ struct StoreIndexQuery {
     exclude_labels: Option<String>,
 }
 
-/// Splits a comma-separated label parameter into the labels it names.
-///
-/// Blank entries are dropped, so a trailing comma or an empty parameter does
-/// not become a filter on the empty label.
-fn store_index_labels(raw: Option<&String>) -> Vec<String> {
-    raw.map(|value| {
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|label| !label.is_empty())
-            .map(str::to_string)
-            .collect()
-    })
-    .unwrap_or_default()
+#[derive(Clone, Debug, Deserialize)]
+struct StoreHistoryQuery {
+    prefix: Option<String>,
+    depth: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StoreHistoryEntryResponse {
+    path: String,
+    entry_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_source_object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed_at_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_to_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StoreHistoryResponse {
+    prefix: String,
+    depth: usize,
+    entry_count: usize,
+    truncated: bool,
+    entries: Vec<StoreHistoryEntryResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HistoryRestoreEntryRequest {
+    path: String,
+    restore_source_path: String,
+    restore_source_object_id: String,
+    restore_version_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HistoryRestoreRequest {
+    entries: Vec<HistoryRestoreEntryRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryRestoreEntryResponse {
+    path: String,
+    restore_source_path: String,
+    restore_version_id: String,
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryRestoreResponse {
+    restored_count: usize,
+    failed_count: usize,
+    entries: Vec<HistoryRestoreEntryResponse>,
 }
 
 fn store_index_label_filter(
     query: &StoreIndexQuery,
 ) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
-    let required = store_index_labels(query.require_labels.as_ref());
-    let excluded = store_index_labels(query.exclude_labels.as_ref());
+    label_filter_from_query_values(
+        query.require_labels.as_deref(),
+        query.exclude_labels.as_deref(),
+    )
+}
+
+fn label_filter_from_query_values(
+    required: Option<&str>,
+    excluded: Option<&str>,
+) -> std::result::Result<storage::GalleryLabelFilter, &'static str> {
+    let required = parse_comma_separated_labels(required)?;
+    let excluded = parse_comma_separated_labels(excluded)?;
     let label_filter = storage::GalleryLabelFilter { required, excluded };
     if !gallery_label_filter_is_within_limit(&label_filter) {
         return Err("at most 64 labels may be specified across require_labels and exclude_labels");
     }
     Ok(label_filter)
+}
+
+/// Gallery-map summaries are cached over their entire scope. Limiting map filters to the
+/// privacy labels keeps their cache vocabulary finite and prevents arbitrary query strings from
+/// triggering a synchronous full-library aggregate scan on every request.
+fn gallery_map_label_filter_is_supported(label_filter: &storage::GalleryLabelFilter) -> bool {
+    label_filter
+        .required
+        .iter()
+        .chain(&label_filter.excluded)
+        .all(|label| matches!(label.as_str(), "private" | "nsfw"))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13297,16 +13479,28 @@ struct GalleryMapClustersQuery {
     prefix: Option<String>,
     depth: Option<usize>,
     media_filter: Option<StoreIndexMediaFilter>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
     south: Option<f64>,
     west: Option<f64>,
     north: Option<f64>,
     east: Option<f64>,
+    /// Optional visible camera bounds used to cap grid resolution independently from a prefetch
+    /// viewport. Older nodes ignore these additive fields.
+    resolution_south: Option<f64>,
+    resolution_west: Option<f64>,
+    resolution_north: Option<f64>,
+    resolution_east: Option<f64>,
     /// Integral legacy wire field. Keep it for nodes and SDKs that predate fractional zoom.
     zoom: Option<u8>,
     /// Optional fractional MapLibre camera zoom. Older nodes ignore this additive field.
     zoom_precise: Option<f64>,
     /// Optional desired cluster cell width in CSS pixels. Older nodes ignore this additive field.
     cluster_cell_size_px: Option<f64>,
+    /// Comma-separated labels an entry must carry to contribute to a cluster.
+    require_labels: Option<String>,
+    /// Comma-separated labels that must not contribute to a cluster.
+    exclude_labels: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -13439,6 +13633,8 @@ struct StoreIndexEntry {
     path: String,
     entry_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    object_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_hash: Option<String>,
@@ -13454,6 +13650,10 @@ struct StoreIndexEntry {
     /// none, so responses for unlabelled media stay byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     labels: Vec<String>,
+    /// Whether `labels` is an authoritative view of the sidecar. Clients must
+    /// not replace labels while this is false, because doing so could discard
+    /// labels that were unavailable during a best-effort projection lookup.
+    labels_resolved: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -13574,6 +13774,9 @@ struct StoreIndexPageCacheKey {
     view: Option<StoreIndexView>,
     sort: Option<StoreIndexSortOrder>,
     media_filter: Option<StoreIndexMediaFilter>,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
+    label_filter: storage::GalleryLabelFilter,
     thumbnail_route: String,
 }
 
@@ -13759,6 +13962,76 @@ impl StoreIndexPageCache {
     }
 }
 
+#[derive(Debug, Clone)]
+enum StoreHistoryCacheValue {
+    Entries(RecoverableHistoryListing),
+}
+
+#[derive(Debug)]
+struct StoreHistoryCacheEntry {
+    prefix: String,
+    depth: usize,
+    created_at: Instant,
+    value: Arc<StoreHistoryCacheValue>,
+}
+
+#[derive(Debug, Default)]
+struct StoreHistoryCache {
+    entries: VecDeque<StoreHistoryCacheEntry>,
+}
+
+#[derive(Default)]
+struct StoreHistoryRefreshLocks {
+    by_scope: HashMap<(String, usize), Arc<Mutex<()>>>,
+}
+
+impl StoreHistoryRefreshLocks {
+    fn lock_for_scope(&mut self, prefix: &str, depth: usize) -> Arc<Mutex<()>> {
+        let scope = (prefix.to_string(), depth);
+        if let Some(lock) = self.by_scope.get(&scope) {
+            return Arc::clone(lock);
+        }
+        if self.by_scope.len() >= STORE_HISTORY_CACHE_MAX_SCOPES {
+            // Never evict a lock that is still referenced by an in-flight
+            // refresh. Requests acquire the refresh permit before reaching
+            // this map, so the small fixed map always has an inactive entry
+            // to evict once it reaches capacity.
+            self.by_scope.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        self.by_scope.insert(scope, Arc::clone(&lock));
+        lock
+    }
+}
+
+impl StoreHistoryCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn get(&self, prefix: &str, depth: usize) -> Option<Arc<StoreHistoryCacheValue>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.prefix == prefix && entry.depth == depth)
+            .and_then(|entry| {
+                (entry.created_at.elapsed() <= STORE_HISTORY_CACHE_TTL)
+                    .then(|| Arc::clone(&entry.value))
+            })
+    }
+
+    fn insert(&mut self, prefix: &str, depth: usize, value: Arc<StoreHistoryCacheValue>) {
+        self.entries
+            .retain(|entry| entry.prefix != prefix || entry.depth != depth);
+        self.entries.push_front(StoreHistoryCacheEntry {
+            prefix: prefix.to_string(),
+            depth,
+            created_at: Instant::now(),
+            value,
+        });
+        self.entries.truncate(STORE_HISTORY_CACHE_MAX_SCOPES);
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct VersionRecordResponse {
     version_id: String,
@@ -13809,6 +14082,8 @@ struct PutObjectQuery {
     parent: Vec<String>,
     #[serde(default)]
     expected_revision: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
     version_id: Option<String>,
     #[serde(default)]
     internal_replication: bool,
@@ -13824,6 +14099,8 @@ struct DeleteObjectByQuery {
     parent: Vec<String>,
     #[serde(default)]
     expected_revision: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
     version_id: Option<String>,
     #[serde(default)]
     internal_replication: bool,
@@ -13839,6 +14116,42 @@ struct PathMutationRequest {
     overwrite: bool,
     #[serde(default)]
     expected_revision: Option<String>,
+    #[serde(default)]
+    object_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ObjectRenameRequest {
+    to_path: String,
+    #[serde(default)]
+    overwrite: bool,
+    #[serde(default)]
+    expected_revision: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ObjectIdRenameOperationFingerprint<'a> {
+    object_id: &'a str,
+    to_path: &'a str,
+    overwrite: bool,
+    expected_revision: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ObjectLookupResponse {
+    object_id: String,
+    path: String,
+    revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tombstone_predecessor_revision: Option<String>,
+    entry_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ObjectMutationResponse {
+    object_id: String,
+    path: String,
+    revision: String,
 }
 
 /// Replaces the labels of the media object at `path`.
@@ -14079,6 +14392,56 @@ fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
     });
 }
 
+fn spawn_history_head_projection_backfill(state: ServerState) {
+    tokio::spawn(async move {
+        let inspector = {
+            let store = read_store(&state, "history_head_projection_backfill.snapshot").await;
+            store.store_history_inspector()
+        };
+        let started_at = Instant::now();
+        let mut processed_index_count = 0usize;
+        let mut consecutive_failure_count = 0u32;
+
+        info!("starting recoverable history head projection backfill");
+        loop {
+            match inspector.backfill_history_head_projection_batch().await {
+                Ok(progress) => {
+                    consecutive_failure_count = 0;
+                    processed_index_count =
+                        processed_index_count.saturating_add(progress.processed_index_count);
+                    if progress.complete {
+                        info!(
+                            processed_index_count,
+                            elapsed_ms = started_at.elapsed().as_millis(),
+                            "completed recoverable history head projection backfill"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE).await;
+                }
+                Err(err) => {
+                    consecutive_failure_count = consecutive_failure_count.saturating_add(1);
+                    let retry_delay =
+                        history_head_projection_backfill_retry_delay(consecutive_failure_count);
+                    warn!(
+                        error = %err,
+                        processed_index_count,
+                        consecutive_failure_count,
+                        retry_delay_secs = retry_delay.as_secs(),
+                        "recoverable history head projection backfill failed; retrying"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                }
+            }
+        }
+    });
+}
+
+fn history_head_projection_backfill_retry_delay(consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(63);
+    Duration::from_secs(1_u64 << exponent).min(HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY)
+}
+
 async fn delete_object_by_query(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -14148,6 +14511,7 @@ async fn delete_object_by_query_response(
             state: query.state,
             parent: query.parent,
             expected_revision: query.expected_revision,
+            object_id: query.object_id,
             version_id: query.version_id,
             internal_replication: query.internal_replication,
             recursive: query.recursive,
@@ -14164,6 +14528,177 @@ async fn rename_object_path(
     Json(request): Json<PathMutationRequest>,
 ) -> Response {
     let fingerprint = client_mutation_operation_fingerprint("rename_object_path", &request);
+    rename_object_path_with_fingerprint(&state, &headers, request, fingerprint).await
+}
+
+async fn rename_object_path_with_fingerprint(
+    state: &ServerState,
+    headers: &HeaderMap,
+    request: PathMutationRequest,
+    fingerprint: String,
+) -> Response {
+    let requester_id = request_device_id(headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        state,
+        headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            rename_object_path_response(&state_for_request, request, Some(actor)).await
+        },
+    )
+    .await
+}
+
+async fn current_object_path_for_api(
+    state: &ServerState,
+    object_id: &str,
+) -> std::result::Result<String, StatusCode> {
+    let store = read_store(state, "object_identity.current_path").await;
+    match store.current_path_for_object_id(object_id).await {
+        Ok(Some(path)) => Ok(path),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(err) => {
+            tracing::error!(error = %err, object_id, "failed resolving current path by object identity");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn get_object_by_id(
+    State(state): State<ServerState>,
+    Path(object_id): Path<String>,
+) -> Response {
+    get_object_by_id_response(&state, &object_id).await
+}
+
+async fn get_object_by_id_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(object_id): Path<String>,
+) -> Response {
+    let action = "auth/objects/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "object_id": object_id.clone() }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+    get_object_by_id_response(&state, &object_id).await
+}
+
+async fn get_object_by_id_response(state: &ServerState, object_id: &str) -> Response {
+    let store = read_store(state, "object_identity.lookup").await;
+    let summary = match store.list_versions_by_object_id(object_id).await {
+        Ok(Some(summary)) => summary,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, object_id, "failed looking up object identity");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let preferred = summary
+        .preferred_head_version_id
+        .as_deref()
+        .and_then(|revision| {
+            summary
+                .versions
+                .iter()
+                .find(|version| version.version_id == revision)
+        });
+    let entry_type =
+        if preferred.is_some_and(|version| version.manifest_hash == TOMBSTONE_MANIFEST_HASH) {
+            "tombstone"
+        } else {
+            "key"
+        };
+    let tombstone_predecessor_revision = (entry_type == "tombstone")
+        .then(|| {
+            preferred.and_then(|version| {
+                (version.parent_version_ids.len() == 1)
+                    .then(|| version.parent_version_ids[0].clone())
+            })
+        })
+        .flatten();
+    (
+        StatusCode::OK,
+        Json(ObjectLookupResponse {
+            object_id: summary.object_id,
+            path: summary.key,
+            revision: summary.preferred_head_version_id,
+            tombstone_predecessor_revision,
+            entry_type: entry_type.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn put_object_by_id(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(object_id): Path<String>,
+    Query(query): Query<PutObjectQuery>,
+    payload: Bytes,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "put_object_by_id",
+        &json!({
+            "object_id": object_id.clone(),
+            "query": query.clone(),
+            "payload_hash": client_mutation_operation_payload_hash(payload.as_ref()),
+        }),
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_request = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let key = match current_object_path_for_api(&state_for_request, &object_id).await {
+                Ok(key) => key,
+                Err(status) => return status.into_response(),
+            };
+            let mut query = query;
+            query.object_id = Some(object_id);
+            put_object_response(
+                &state_for_request,
+                &headers_for_request,
+                key,
+                query,
+                payload,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn delete_object_by_id(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(object_id): Path<String>,
+    Query(query): Query<PutObjectQuery>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "delete_object_by_id",
+        &json!({
+            "object_id": object_id.clone(),
+            "query": query.clone(),
+        }),
+    );
     let requester_id = request_device_id(&headers);
     let state_for_request = state.clone();
     let headers_for_actor = headers.clone();
@@ -14173,9 +14708,65 @@ async fn rename_object_path(
         requester_id,
         fingerprint,
         move || async move {
+            let key = match current_object_path_for_api(&state_for_request, &object_id).await {
+                Ok(key) => key,
+                Err(status) => return status.into_response(),
+            };
+            let mut query = query;
+            query.object_id = Some(object_id);
             let actor =
                 data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
-            rename_object_path_response(&state_for_request, request, Some(actor)).await
+            delete_object_response(&state_for_request, key, query, Some(actor))
+                .await
+                .into_response()
+        },
+    )
+    .await
+}
+
+async fn rename_object_by_id(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(object_id): Path<String>,
+    Json(request): Json<ObjectRenameRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint(
+        "rename_object_by_id",
+        &ObjectIdRenameOperationFingerprint {
+            object_id: &object_id,
+            to_path: &request.to_path,
+            overwrite: request.overwrite,
+            expected_revision: request.expected_revision.as_deref(),
+        },
+    );
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    let headers_for_actor = headers.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move {
+            let from_path = match current_object_path_for_api(&state_for_request, &object_id).await
+            {
+                Ok(path) => path,
+                Err(status) => return status.into_response(),
+            };
+            let actor =
+                data_change_actor_from_client_headers(&state_for_request, &headers_for_actor).await;
+            rename_object_path_response(
+                &state_for_request,
+                PathMutationRequest {
+                    from_path,
+                    to_path: request.to_path,
+                    overwrite: request.overwrite,
+                    expected_revision: request.expected_revision,
+                    object_id: Some(object_id),
+                },
+                Some(actor),
+            )
+            .await
         },
     )
     .await
@@ -14209,6 +14800,61 @@ async fn rename_object_path_admin(
     rename_object_path_response(&state, request, Some(actor)).await
 }
 
+async fn validate_path_mutation_preconditions(
+    store: &mut TracedRwLockWriteGuard<'_, PersistentStore>,
+    request: &PathMutationRequest,
+    operation: &'static str,
+) -> std::result::Result<(), StatusCode> {
+    if let Some(object_id) = request.object_id.as_deref() {
+        match store.current_path_for_object_id(object_id).await {
+            Ok(Some(path)) if path == request.from_path => {}
+            Ok(Some(_)) => return Err(StatusCode::CONFLICT),
+            Ok(None) => match store.list_versions_by_object_id(object_id).await {
+                Ok(Some(_)) => return Err(StatusCode::CONFLICT),
+                Ok(None) => return Err(StatusCode::NOT_FOUND),
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        object_id,
+                        operation,
+                        "failed resolving historical object identity before path mutation"
+                    );
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            },
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    object_id,
+                    operation,
+                    "failed resolving object identity before path mutation"
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    if let Some(expected_revision) = request.expected_revision.as_deref() {
+        let current_revision = match store.list_versions(&request.from_path).await {
+            Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    path = %request.from_path,
+                    operation,
+                    "failed resolving preferred revision before path mutation"
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        if current_revision.as_deref() != Some(expected_revision) {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+
+    Ok(())
+}
+
 async fn rename_object_path_response(
     state: &ServerState,
     request: PathMutationRequest,
@@ -14228,27 +14874,52 @@ async fn rename_object_path_response(
     let mut store = lock_store(state, "store_path.rename").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_started = Instant::now();
-    if let Some(expected_revision) = request.expected_revision.as_deref() {
-        let current_revision = match store.list_versions(&request.from_path).await {
-            Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    path = %request.from_path,
-                    "failed resolving preferred revision before rename"
-                );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        if current_revision.as_deref() != Some(expected_revision) {
-            return StatusCode::CONFLICT.into_response();
-        }
+    if let Err(status) = validate_path_mutation_preconditions(&mut store, &request, "rename").await
+    {
+        return status.into_response();
     }
     match store
         .rename_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
     {
         Ok(PathMutationResult::Applied) => {
+            let object_mutation = if let Some(object_id) = request.object_id.as_deref() {
+                match store.list_versions_by_object_id(object_id).await {
+                    Ok(Some(summary)) => {
+                        let Some(revision) = summary.preferred_head_version_id else {
+                            tracing::error!(object_id, "renamed object has no preferred revision");
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        };
+                        if summary.key != request.to_path {
+                            tracing::error!(
+                                object_id,
+                                expected_path = %request.to_path,
+                                actual_path = %summary.key,
+                                "renamed object resolved to an unexpected path"
+                            );
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                        Some(ObjectMutationResponse {
+                            object_id: summary.object_id,
+                            path: summary.key,
+                            revision,
+                        })
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            object_id,
+                            "renamed object identity disappeared after mutation"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, object_id, "failed resolving renamed object revision");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            } else {
+                None
+            };
             info!(
                 from_path = %request.from_path,
                 to_path = %request.to_path,
@@ -14285,7 +14956,10 @@ async fn rename_object_path_response(
                 total_elapsed_ms = started.elapsed().as_millis(),
                 "store path rename response ready after queueing background availability refresh"
             );
-            StatusCode::NO_CONTENT.into_response()
+            match object_mutation {
+                Some(mutation) => (StatusCode::OK, Json(mutation)).into_response(),
+                None => StatusCode::NO_CONTENT.into_response(),
+            }
         }
         Ok(PathMutationResult::SourceMissing) => {
             info!(
@@ -14357,6 +15031,9 @@ async fn copy_object_path_response(
     }
 
     let mut store = lock_store(state, "store_path.copy").await;
+    if let Err(status) = validate_path_mutation_preconditions(&mut store, &request, "copy").await {
+        return status.into_response();
+    }
     match store
         .copy_object_path(&request.from_path, &request.to_path, request.overwrite)
         .await
@@ -14807,6 +15484,17 @@ async fn put_object_response(
     let total_size_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
     let mut store = lock_store(state, "store_object.put").await;
+    if let Some(object_id) = query.object_id.as_deref() {
+        match store.current_path_for_object_id(object_id).await {
+            Ok(Some(path)) if path == key => {}
+            Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!(error = %err, object_id, "failed resolving object identity before put");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
     if let Some(expected_revision) = query.expected_revision.as_deref() {
         let current_revision = match store.list_versions(&key).await {
             Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
@@ -14895,7 +15583,15 @@ async fn put_object_response(
                 dedup_reused_chunks = outcome.dedup_reused_chunks,
                 "stored object"
             );
-            StatusCode::CREATED.into_response()
+            (
+                StatusCode::CREATED,
+                Json(ObjectMutationResponse {
+                    object_id: outcome.object_id,
+                    path: key,
+                    revision: outcome.version_id,
+                }),
+            )
+                .into_response()
         }
         Err(err) => {
             tracing::error!(error = %err, key = %key, "failed to store object");
@@ -14999,6 +15695,8 @@ async fn start_upload_session_response(
         state: version_state,
         parent_version_ids: request.parent,
         explicit_version_id: request.version_id,
+        object_id: request.object_id,
+        expected_revision: request.expected_revision,
         assembly_mode: UploadAssemblyMode::FixedSequence,
         received_chunks,
         multipart_parts: BTreeMap::new(),
@@ -15299,6 +15997,21 @@ async fn complete_upload_session_route(
     .await
 }
 
+async fn reset_upload_session_finalizing(state: &ServerState, upload_id: &str) {
+    let mut sessions = write_upload_sessions(state, "upload_sessions.complete.reset").await;
+    if let Some(session) = sessions.sessions.get_mut(upload_id)
+        && !session.completed
+    {
+        session.finalizing = false;
+        session.updated_at_unix = unix_ts();
+        session.expires_at_unix = session
+            .updated_at_unix
+            .saturating_add(UPLOAD_SESSION_TTL_SECS);
+    }
+    drop(sessions);
+    persist_upload_session_store_after_mutation(state, "complete_upload_session_reset").await;
+}
+
 async fn complete_upload_session_response(
     state: &ServerState,
     headers: &HeaderMap,
@@ -15307,11 +16020,13 @@ async fn complete_upload_session_response(
     let finalize_started_at = Instant::now();
     let requester_device_id = request_device_id(headers);
     let (
-        key,
+        mut key,
         total_size_bytes,
         parent_version_ids,
         version_state,
         explicit_version_id,
+        object_id,
+        expected_revision,
         owner_device_id,
         chunk_refs,
     ) = {
@@ -15349,6 +16064,8 @@ async fn complete_upload_session_response(
             session.parent_version_ids.clone(),
             session.state.clone(),
             session.explicit_version_id.clone(),
+            session.object_id.clone(),
+            session.expected_revision.clone(),
             session.owner_device_id.clone(),
             session
                 .received_chunks
@@ -15368,6 +16085,46 @@ async fn complete_upload_session_response(
     let mut store = lock_store(state, "upload_session.complete.put_object_from_chunks").await;
     let store_lock_wait_ms = store.waited_ms();
     let store_finalize_started_at = Instant::now();
+    if let Some(object_id) = object_id.as_deref() {
+        match store.current_path_for_object_id(object_id).await {
+            Ok(Some(current_path)) => key = current_path,
+            Ok(None) => {
+                let object_history = store.list_versions_by_object_id(object_id).await;
+                drop(store);
+                reset_upload_session_finalizing(state, upload_id).await;
+                return match object_history {
+                    Ok(Some(_)) => StatusCode::CONFLICT.into_response(),
+                    Ok(None) => StatusCode::NOT_FOUND.into_response(),
+                    Err(err) => {
+                        tracing::error!(error = %err, object_id, "failed checking absent object identity before finalizing upload session");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                };
+            }
+            Err(err) => {
+                tracing::error!(error = %err, object_id, "failed resolving object identity before finalizing upload session");
+                drop(store);
+                reset_upload_session_finalizing(state, upload_id).await;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
+    if let Some(expected_revision) = expected_revision.as_deref() {
+        let current_revision = match store.list_versions(&key).await {
+            Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
+            Err(err) => {
+                tracing::error!(error = %err, key = %key, "failed resolving revision before finalizing upload session");
+                drop(store);
+                reset_upload_session_finalizing(state, upload_id).await;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        if current_revision.as_deref() != Some(expected_revision) {
+            drop(store);
+            reset_upload_session_finalizing(state, upload_id).await;
+            return StatusCode::CONFLICT.into_response();
+        }
+    }
     let outcome = match store
         .put_object_from_chunks(
             &key,
@@ -15472,6 +16229,7 @@ async fn complete_upload_session_response(
     .await;
 
     let response = UploadSessionCompleteResponse {
+        object_id: outcome.object_id.clone(),
         snapshot_id: outcome.snapshot_id.clone(),
         version_id: outcome.version_id.clone(),
         manifest_hash: outcome.manifest_hash.clone(),
@@ -15557,26 +16315,40 @@ async fn delete_object_response(
     key: String,
     query: PutObjectQuery,
     actor: Option<DataChangeActorContext>,
-) -> StatusCode {
+) -> Response {
     if key.trim().is_empty() {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
     if query.version_id.is_some() && !query.internal_replication {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if query.object_id.is_some() && key.ends_with('/') && !query.recursive {
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     let version_state = match query.state.as_deref() {
         None | Some("confirmed") => VersionConsistencyState::Confirmed,
         Some("provisional") => VersionConsistencyState::Provisional,
-        Some(_) => return StatusCode::BAD_REQUEST,
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let recursive = query.recursive
         || (key.ends_with('/') && !query.internal_replication && query.version_id.is_none());
     if recursive && (!query.parent.is_empty() || query.version_id.is_some()) {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
 
     let mut store = lock_store(state, "store_object.tombstone").await;
+    if let Some(object_id) = query.object_id.as_deref() {
+        match store.current_path_for_object_id(object_id).await {
+            Ok(Some(path)) if path == key => {}
+            Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!(error = %err, object_id, "failed resolving object identity before delete");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
     if let Some(expected_revision) = query.expected_revision.as_deref() {
         let current_revision = match store.list_versions(&key).await {
             Ok(graph) => graph.and_then(|graph| graph.preferred_head_version_id),
@@ -15586,11 +16358,11 @@ async fn delete_object_response(
                     path = %key,
                     "failed resolving preferred revision before delete"
                 );
-                return StatusCode::INTERNAL_SERVER_ERROR;
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
         if current_revision.as_deref() != Some(expected_revision) {
-            return StatusCode::CONFLICT;
+            return StatusCode::CONFLICT.into_response();
         }
     }
     let tombstone_options = PutOptions {
@@ -15607,14 +16379,14 @@ async fn delete_object_response(
             .map(|results| {
                 results
                     .into_iter()
-                    .map(|entry| (entry.path, entry.version_id))
+                    .map(|entry| (entry.path, entry.object_id, entry.version_id))
                     .collect::<Vec<_>>()
             })
     } else if query.internal_replication {
         store
-            .tombstone_object(&key, tombstone_options)
+            .tombstone_object_with_identity(&key, tombstone_options)
             .await
-            .map(|version_id| vec![(key.clone(), version_id)])
+            .map(|entry| vec![(entry.path, entry.object_id, entry.version_id)])
     } else {
         store
             .tombstone_object_with_companions(&key, tombstone_options)
@@ -15622,7 +16394,7 @@ async fn delete_object_response(
             .map(|results| {
                 results
                     .into_iter()
-                    .map(|entry| (entry.path, entry.version_id))
+                    .map(|entry| (entry.path, entry.object_id, entry.version_id))
                     .collect::<Vec<_>>()
             })
     };
@@ -15633,7 +16405,7 @@ async fn delete_object_response(
             publish_namespace_change(state);
 
             let mut cluster = state.cluster.lock().await;
-            for (deleted_path, version_id) in &deleted_paths {
+            for (deleted_path, _, version_id) in &deleted_paths {
                 cluster.note_replica(deleted_path, state.node_id);
                 cluster.note_replica(format!("{}@{}", deleted_path, version_id), state.node_id);
             }
@@ -15648,7 +16420,7 @@ async fn delete_object_response(
                 query.internal_replication,
             ) {
                 let mut repair_subjects = BTreeSet::new();
-                for (deleted_path, version_id) in &deleted_paths {
+                for (deleted_path, _, version_id) in &deleted_paths {
                     append_autonomous_post_write_replication_subjects(
                         &mut repair_subjects,
                         deleted_path,
@@ -15661,8 +16433,8 @@ async fn delete_object_response(
             if !query.internal_replication {
                 let version_id = deleted_paths
                     .iter()
-                    .find(|(deleted_path, _)| deleted_path == &key)
-                    .map(|(_, version_id)| version_id.clone());
+                    .find(|(deleted_path, _, _)| deleted_path == &key)
+                    .map(|(_, _, version_id)| version_id.clone());
                 record_data_change_event(
                     state,
                     PendingDataChangeEvent {
@@ -15688,7 +16460,21 @@ async fn delete_object_response(
                 deleted_paths = deleted_paths.len(),
                 "tombstoned object path(s)"
             );
-            StatusCode::CREATED
+            let response = deleted_paths
+                .iter()
+                .find(|(deleted_path, _, _)| deleted_path == &key)
+                .or_else(|| deleted_paths.first())
+                .map(
+                    |(deleted_path, object_id, version_id)| ObjectMutationResponse {
+                        object_id: object_id.clone(),
+                        path: deleted_path.clone(),
+                        revision: version_id.clone(),
+                    },
+                );
+            match response {
+                Some(response) => (StatusCode::CREATED, Json(response)).into_response(),
+                None => StatusCode::CREATED.into_response(),
+            }
         }
         Err(err) => {
             tracing::error!(
@@ -15697,7 +16483,7 @@ async fn delete_object_response(
                 recursive,
                 "failed to tombstone object path(s)"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
@@ -15781,6 +16567,8 @@ async fn list_store_index_admin(
             "limit": query.limit,
             "sort": query.sort,
             "media_filter": query.media_filter,
+            "captured_from_unix": query.captured_from_unix,
+            "captured_until_unix": query.captured_until_unix,
             "south": query.south,
             "west": query.west,
             "north": query.north,
@@ -15793,6 +16581,353 @@ async fn list_store_index_admin(
     }
 
     list_store_index_response(&state, query, PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE).await
+}
+
+async fn list_store_history(
+    State(state): State<ServerState>,
+    Query(query): Query<StoreHistoryQuery>,
+) -> Response {
+    list_store_history_response(&state, query).await
+}
+
+async fn list_store_history_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<StoreHistoryQuery>,
+) -> Response {
+    let action = "auth/store/history/get";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({
+            "prefix": query.prefix.clone(),
+            "depth": query.depth,
+        }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    list_store_history_response(&state, query).await
+}
+
+async fn list_store_history_response(state: &ServerState, query: StoreHistoryQuery) -> Response {
+    let prefix = query
+        .prefix
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    let depth = query.depth.unwrap_or(1).clamp(1, 64);
+    let cached = match state.storage.store_history_cache.lock() {
+        Ok(cache) => cache.get(&prefix, depth),
+        Err(poisoned) => poisoned.into_inner().get(&prefix, depth),
+    };
+    let history = match cached {
+        Some(cached) => cached,
+        None => {
+            let history_inspector = {
+                let store = read_store(state, "store_history.clone_inspector").await;
+                store.store_history_inspector()
+            };
+            match history_inspector
+                .history_head_projection_backfill_state()
+                .await
+            {
+                Ok(HistoryHeadProjectionBackfillState::Complete) => {}
+                Ok(HistoryHeadProjectionBackfillState::Pending { .. }) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "error": "recoverable history index is being built; retry shortly",
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to read recoverable history projection state");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+            // Coalesce cache misses without holding the store read guard, and
+            // admit only a small number of distinct projection reads at once.
+            // The short TTL intentionally tolerates concurrent namespace
+            // writes while retaining each recently visited prefix for navigation.
+            let _refresh_permit = match state
+                .storage
+                .store_history_refresh_permits
+                .clone()
+                .acquire_owned()
+                .await
+            {
+                Ok(permit) => permit,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let refresh_lock = match state.storage.store_history_refresh_locks.lock() {
+                Ok(mut locks) => locks.lock_for_scope(&prefix, depth),
+                Err(poisoned) => poisoned.into_inner().lock_for_scope(&prefix, depth),
+            };
+            let _refresh_guard = refresh_lock.lock().await;
+            let cached = match state.storage.store_history_cache.lock() {
+                Ok(cache) => cache.get(&prefix, depth),
+                Err(poisoned) => poisoned.into_inner().get(&prefix, depth),
+            };
+            if let Some(cached) = cached {
+                cached
+            } else {
+                // A restore increments this generation before it changes the
+                // cache. Do not let a scan started before that mutation put
+                // obsolete historical entries back into the cache.
+                let cache_generation = state
+                    .storage
+                    .store_history_cache_generation
+                    .load(Ordering::SeqCst);
+                let value = match history_inspector
+                    .list_recoverable_history_listing(
+                        &prefix,
+                        depth,
+                        STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT,
+                    )
+                    .await
+                {
+                    Ok(listing) => Arc::new(StoreHistoryCacheValue::Entries(listing)),
+                    Err(err) => {
+                        tracing::error!(error = %err, prefix = %prefix, depth, "failed to list recoverable history entries");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+                match state.storage.store_history_cache.lock() {
+                    Ok(mut cache) => {
+                        if state
+                            .storage
+                            .store_history_cache_generation
+                            .load(Ordering::SeqCst)
+                            == cache_generation
+                        {
+                            cache.insert(&prefix, depth, Arc::clone(&value));
+                        }
+                    }
+                    Err(poisoned) => {
+                        let mut cache = poisoned.into_inner();
+                        if state
+                            .storage
+                            .store_history_cache_generation
+                            .load(Ordering::SeqCst)
+                            == cache_generation
+                        {
+                            cache.insert(&prefix, depth, Arc::clone(&value));
+                        }
+                    }
+                }
+                value
+            }
+        }
+    };
+    let StoreHistoryCacheValue::Entries(listing) = history.as_ref();
+    let entries: Vec<StoreHistoryEntryResponse> = listing
+        .entries
+        .iter()
+        .map(store_history_entry_response)
+        .collect();
+    Json(StoreHistoryResponse {
+        prefix: prefix.clone(),
+        depth,
+        entry_count: entries.len(),
+        truncated: listing.truncated,
+        entries,
+    })
+    .into_response()
+}
+
+fn store_history_entry_response(
+    entry: &RecoverableHistoryListingEntry,
+) -> StoreHistoryEntryResponse {
+    match entry {
+        RecoverableHistoryListingEntry::Prefix { path } => StoreHistoryEntryResponse {
+            path: path.clone(),
+            entry_type: "prefix",
+            restore_source_path: None,
+            restore_source_object_id: None,
+            restore_version_id: None,
+            removed_at_unix: None,
+            moved_to_path: None,
+        },
+        RecoverableHistoryListingEntry::Historical(entry) => StoreHistoryEntryResponse {
+            path: entry.path.clone(),
+            entry_type: "historical",
+            restore_source_path: Some(entry.restore_source_path.clone()),
+            restore_source_object_id: Some(entry.restore_source_object_id.clone()),
+            restore_version_id: Some(entry.restore_version_id.clone()),
+            removed_at_unix: Some(entry.removed_at_unix),
+            moved_to_path: entry.moved_to_path.clone(),
+        },
+    }
+}
+
+async fn restore_history_entries(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<HistoryRestoreRequest>,
+) -> Response {
+    let fingerprint = client_mutation_operation_fingerprint("restore_history_entries", &request);
+    let requester_id = request_device_id(&headers);
+    let state_for_request = state.clone();
+    run_client_mutation_with_idempotency(
+        &state,
+        &headers,
+        requester_id,
+        fingerprint,
+        move || async move { restore_history_entries_response(&state_for_request, request).await },
+    )
+    .await
+}
+
+async fn restore_history_entries_admin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<HistoryRestoreRequest>,
+) -> Response {
+    let action = "auth/store/history/restore";
+    if let Err(status) = authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        true,
+        true,
+        json!({ "entries": request.entries.clone() }),
+    )
+    .await
+    {
+        return status.into_response();
+    }
+
+    restore_history_entries_response(&state, request).await
+}
+
+async fn restore_history_entries_response(
+    state: &ServerState,
+    request: HistoryRestoreRequest,
+) -> Response {
+    if request.entries.is_empty() || request.entries.len() > HISTORY_RESTORE_BATCH_MAX_ENTRIES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if request.entries.iter().any(|entry| {
+        entry.path.trim().is_empty()
+            || entry.restore_source_path.trim().is_empty()
+            || entry.restore_source_object_id.trim().is_empty()
+            || entry.restore_version_id.trim().is_empty()
+    }) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let restore_entries = request
+        .entries
+        .into_iter()
+        .map(|entry| HistoryRestoreEntryRequest {
+            path: entry.path.trim().to_string(),
+            restore_source_path: entry.restore_source_path.trim().to_string(),
+            restore_source_object_id: entry.restore_source_object_id.trim().to_string(),
+            restore_version_id: entry.restore_version_id.trim().to_string(),
+        })
+        .collect::<Vec<_>>();
+    let restore_requests = restore_entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.restore_source_path.clone(),
+                entry.restore_version_id.clone(),
+                entry.restore_source_object_id.clone(),
+                entry.path.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_results = {
+        let history_inspector = {
+            let store = read_store(state, "store_history.clone_restore_inspector").await;
+            store.store_history_inspector()
+        };
+        history_inspector
+            .resolve_version_restore_sources(&restore_requests)
+            .await
+    };
+    let restore_results = match source_results {
+        Ok(sources) => {
+            let mut store = lock_store(state, "store_history.restore_batch").await;
+            store
+                .restore_resolved_version_paths_batch(&restore_requests, &sources)
+                .await
+        }
+        Err(err) => Err(err),
+    };
+    let restore_results: Vec<Result<PathMutationResult>> = match restore_results {
+        Ok(batch) => {
+            if let Some(err) = batch.finalization_error {
+                tracing::error!(
+                    error = %err,
+                    entry_count = restore_requests.len(),
+                    "historical restore batch changed paths but did not finish snapshot recording"
+                );
+            }
+            batch.results
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, entry_count = restore_requests.len(), "failed resolving historical restore batch");
+            let error = err.to_string();
+            (0..restore_requests.len())
+                .map(|_| Err(anyhow!(error.clone())))
+                .collect()
+        }
+    };
+
+    let mut restored_count = 0usize;
+    let mut responses = Vec::with_capacity(restore_entries.len());
+    for (entry, restore_result) in restore_entries.into_iter().zip(restore_results) {
+        let status = match restore_result {
+            Ok(PathMutationResult::Applied) => {
+                restored_count = restored_count.saturating_add(1);
+                "restored"
+            }
+            Ok(PathMutationResult::SourceMissing) => "source_missing",
+            Ok(PathMutationResult::TargetExists) => "target_exists",
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %entry.path,
+                    restore_source_path = %entry.restore_source_path,
+                    restore_version_id = %entry.restore_version_id,
+                    "failed restoring historical entry"
+                );
+                "failed"
+            }
+        };
+        responses.push(HistoryRestoreEntryResponse {
+            path: entry.path,
+            restore_source_path: entry.restore_source_path,
+            restore_version_id: entry.restore_version_id,
+            status,
+        });
+    }
+
+    if restored_count > 0 {
+        publish_namespace_change(state);
+        request_local_availability_refresh(state);
+    }
+
+    let failed_count = responses.len().saturating_sub(restored_count);
+    (
+        StatusCode::OK,
+        Json(HistoryRestoreResponse {
+            restored_count,
+            failed_count,
+            entries: responses,
+        }),
+    )
+        .into_response()
 }
 
 async fn list_gallery_map_clusters(
@@ -15817,6 +16952,8 @@ async fn list_gallery_map_clusters_admin(
             "prefix": query.prefix.clone(),
             "depth": query.depth,
             "media_filter": query.media_filter,
+            "captured_from_unix": query.captured_from_unix,
+            "captured_until_unix": query.captured_until_unix,
             "south": query.south,
             "west": query.west,
             "north": query.north,
@@ -15868,7 +17005,36 @@ async fn gallery_map_clusters_response(
     query: GalleryMapClustersQuery,
     thumbnail_route: &str,
 ) -> Response {
+    if let Err(message) =
+        validate_capture_range(query.captured_from_unix, query.captured_until_unix)
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+    }
+    let label_filter = match label_filter_from_query_values(
+        query.require_labels.as_deref(),
+        query.exclude_labels.as_deref(),
+    ) {
+        Ok(label_filter) => label_filter,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
+    if !gallery_map_label_filter_is_supported(&label_filter) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "gallery map label filters only support private and nsfw"
+            })),
+        )
+            .into_response();
+    }
     let viewport = match gallery_map_viewport_from_query(&query) {
+        Ok(viewport) => viewport,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
+    let resolution_viewport = match gallery_map_resolution_viewport_from_query(&query, viewport) {
         Ok(viewport) => viewport,
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
@@ -15902,6 +17068,16 @@ async fn gallery_map_clusters_response(
                     .into_response();
             }
         };
+    let requested_resolution =
+        gallery_map::gallery_map_resolution_for_zoom(precise_zoom, cluster_cell_size_px);
+    let storage_viewport = gallery_map::storage_viewport(viewport);
+    let storage_resolution_viewport = gallery_map::storage_viewport(resolution_viewport);
+    let max_clusters = storage::gallery_map_prefetch_max_clusters(
+        GALLERY_MAP_MAX_CLUSTERS,
+        requested_resolution,
+        storage_resolution_viewport,
+        storage_viewport,
+    );
     let page = {
         let store = read_store(state, "gallery_map.clusters").await;
         store
@@ -15909,12 +17085,12 @@ async fn gallery_map_clusters_response(
                 prefix: prefix.clone(),
                 depth,
                 media_filter: gallery_map::storage_media_filter(media_filter),
-                viewport: gallery_map::storage_viewport(viewport),
-                requested_resolution: gallery_map::gallery_map_resolution_for_zoom(
-                    precise_zoom,
-                    cluster_cell_size_px,
-                ),
-                max_clusters: GALLERY_MAP_MAX_CLUSTERS,
+                captured_from_unix: query.captured_from_unix,
+                captured_until_unix: query.captured_until_unix,
+                viewport: storage_viewport,
+                requested_resolution,
+                max_clusters,
+                label_filter: label_filter.clone(),
             })
             .await
     };
@@ -15929,6 +17105,23 @@ async fn gallery_map_clusters_response(
             )
                 .into_response();
         }
+        Err(error)
+            if error
+                .downcast_ref::<storage::GalleryCaptureSummaryBusyError>()
+                .is_some() =>
+        {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "too many capture-filtered gallery summaries are being computed; retry shortly"
+                })),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
         Err(error) => {
             tracing::error!(error = %error, "failed to query gallery map clusters");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -15941,8 +17134,11 @@ async fn gallery_map_clusters_response(
             prefix: prefix.clone(),
             depth,
             media_filter,
+            captured_from_unix: query.captured_from_unix,
+            captured_until_unix: query.captured_until_unix,
             viewport,
             resolution: page.resolution,
+            label_filter,
         });
     Json(GalleryMapClustersResponse {
         prefix,
@@ -16027,12 +17223,15 @@ async fn gallery_map_cluster_entries_response(
                 prefix: token.prefix.clone(),
                 depth: token.depth,
                 media_filter: gallery_map::storage_media_filter(token.media_filter),
+                captured_from_unix: token.captured_from_unix,
+                captured_until_unix: token.captured_until_unix,
                 viewport: gallery_map::storage_viewport(token.viewport),
                 resolution: token.resolution,
                 cell_x,
                 cell_y,
                 offset: requested_offset,
                 limit,
+                label_filter: token.label_filter.clone(),
             })
             .await
     };
@@ -16098,6 +17297,41 @@ fn gallery_map_viewport_from_query(
     };
     if !gallery_map::gallery_map_viewport_is_valid(viewport) {
         return Err("gallery map viewport bounds are invalid");
+    }
+    Ok(viewport)
+}
+
+fn gallery_map_resolution_viewport_from_query(
+    query: &GalleryMapClustersQuery,
+    fallback: gallery_map::GalleryMapViewport,
+) -> std::result::Result<gallery_map::GalleryMapViewport, &'static str> {
+    let bounds = (
+        query.resolution_south,
+        query.resolution_west,
+        query.resolution_north,
+        query.resolution_east,
+    );
+    if bounds == (None, None, None, None) {
+        return Ok(fallback);
+    }
+    let (Some(south), Some(west), Some(north), Some(east)) = bounds else {
+        return Err(
+            "resolution_south, resolution_west, resolution_north, and resolution_east must be supplied together",
+        );
+    };
+    let viewport = gallery_map::GalleryMapViewport {
+        south,
+        west,
+        north,
+        east,
+    };
+    if !gallery_map::gallery_map_viewport_is_valid(viewport) {
+        return Err("gallery map resolution viewport bounds are invalid");
+    }
+    if !gallery_map::gallery_map_viewport_is_prefetch_envelope(fallback, viewport) {
+        return Err(
+            "gallery map resolution viewport must be contained in a query viewport no more than twice as wide or high",
+        );
     }
     Ok(viewport)
 }
@@ -16284,6 +17518,7 @@ fn build_reconciliation_object_path(key: &str, version_id: &str) -> String {
 fn store_index_page_cache_key(
     query: &StoreIndexQuery,
     thumbnail_route: &str,
+    label_filter: &storage::GalleryLabelFilter,
 ) -> Option<StoreIndexPageCacheKey> {
     if !matches!(query.view, Some(StoreIndexView::Tree))
         || query.limit.is_none()
@@ -16299,12 +17534,41 @@ fn store_index_page_cache_key(
         view: query.view,
         sort: query.sort,
         media_filter: query.media_filter,
+        captured_from_unix: query.captured_from_unix,
+        captured_until_unix: query.captured_until_unix,
+        label_filter: label_filter.clone(),
         thumbnail_route: thumbnail_route.to_string(),
     })
 }
 
 fn store_index_has_viewport(query: &StoreIndexQuery) -> bool {
     query.south.is_some() || query.west.is_some() || query.north.is_some() || query.east.is_some()
+}
+
+fn validate_capture_range(
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
+) -> std::result::Result<(), &'static str> {
+    if captured_from_unix
+        .into_iter()
+        .chain(captured_until_unix)
+        .any(|timestamp| timestamp > i64::MAX as u64)
+    {
+        return Err("capture-time bounds exceed the supported Unix timestamp range");
+    }
+    if matches!(
+        (captured_from_unix, captured_until_unix),
+        (Some(from), Some(until)) if from > until
+    ) {
+        return Err("captured_from_unix must not be later than captured_until_unix");
+    }
+    Ok(())
+}
+
+fn validate_store_index_capture_range(
+    query: &StoreIndexQuery,
+) -> std::result::Result<(), &'static str> {
+    validate_capture_range(query.captured_from_unix, query.captured_until_unix)
 }
 
 fn store_index_viewport_bounds(
@@ -16335,14 +17599,9 @@ fn store_index_viewport_bounds(
     }))
 }
 
-/// Whether `query` asks for a label filter, independent of whether the gallery
-/// fast path can actually honour it.
-///
-/// The generic listing fallback hard-codes `labels: Vec::new()` on every entry
-/// and cannot filter by label at all, so a caller that requested filtering has
-/// to be told the request could not be honoured rather than silently receiving
-/// an unfiltered `200` -- the motivating use case is keeping `private` media
-/// out of a view, so a silent fallback would leak it.
+/// Whether `query` asks for a label filter. Generic listings resolve the same
+/// current label projection as the gallery fast path, so they can honour this
+/// filter for every current, offset-paginated sort shape.
 fn store_index_label_filter_requested(label_filter: &storage::GalleryLabelFilter) -> bool {
     !label_filter.is_empty()
 }
@@ -16371,6 +17630,8 @@ fn store_index_gallery_query(
         depth,
         media_filter,
         captured_sort,
+        captured_from_unix: query.captured_from_unix,
+        captured_until_unix: query.captured_until_unix,
         offset: query.offset.unwrap_or(0),
         limit: query.limit?.max(1),
         viewport: store_index_viewport_bounds(query).ok()?,
@@ -16386,12 +17647,24 @@ fn store_index_response_from_gallery_index_page(
     depth: usize,
     thumbnail_route: &str,
 ) -> StoreIndexResponse {
-    let sync_token = encode_gallery_sync_token(&GallerySyncTokenPayload {
-        history_id: page.history_id,
-        revision: page.revision,
-        scope: gallery_sync_scope_from_query(gallery_query),
-    });
-    let consistency_token = format!("gallery:{sync_token}");
+    // The delta change log does not retain an entry's previous capture time. Avoid issuing a
+    // token whose later removals could not faithfully preserve a date-filtered result set.
+    let capture_filtered_consistency_token =
+        format!("gallery:{}:{}", page.history_id, page.revision);
+    let sync_token = (query.captured_from_unix.is_none() && query.captured_until_unix.is_none())
+        .then(|| {
+            encode_gallery_sync_token(&GallerySyncTokenPayload {
+                history_id: page.history_id,
+                revision: page.revision,
+                scope: gallery_sync_scope_from_query(gallery_query),
+            })
+        });
+    let consistency_token = Some(
+        sync_token
+            .as_ref()
+            .map(|sync_token| format!("gallery:{sync_token}"))
+            .unwrap_or(capture_filtered_consistency_token),
+    );
     let total_entry_count = page.total_entry_count;
     let offset = query.offset.unwrap_or(0).min(total_entry_count);
     let limit = query.limit.map(|value| value.max(1));
@@ -16411,8 +17684,8 @@ fn store_index_response_from_gallery_index_page(
             .map(|limit| offset.saturating_add(limit) < total_entry_count)
             .unwrap_or(false),
         next_cursor: None,
-        sync_token: Some(sync_token),
-        consistency_token: Some(consistency_token),
+        sync_token,
+        consistency_token,
         media_summary: StoreIndexMediaSummary {
             ready_count: page.media_summary.ready_count,
             pending_count: page.media_summary.pending_count,
@@ -16440,6 +17713,7 @@ fn store_index_entry_from_gallery_entry(
                 &MediaCacheLookup {
                     content_fingerprint: content_fingerprint.clone(),
                     metadata: entry.media_metadata,
+                    gps_override: entry.gps_override,
                 },
                 thumbnail_route,
             )
@@ -16447,6 +17721,7 @@ fn store_index_entry_from_gallery_entry(
     StoreIndexEntry {
         path: entry.key,
         entry_type: "key".to_string(),
+        object_id: (!entry.object_id.is_empty()).then_some(entry.object_id),
         version: None,
         content_hash: Some(entry.manifest_hash),
         size_bytes: entry.size_bytes,
@@ -16454,6 +17729,7 @@ fn store_index_entry_from_gallery_entry(
         content_fingerprint: entry.content_fingerprint,
         media,
         labels: entry.labels,
+        labels_resolved: true,
     }
 }
 
@@ -16497,7 +17773,84 @@ fn with_store_index_response_headers(
     response
 }
 
-fn cached_store_index_page_response(
+async fn store_index_media_labels_by_key(
+    state: &ServerState,
+    entries: &[StoreIndexEntry],
+    operation: &'static str,
+) -> Result<HashMap<String, Vec<String>>> {
+    let keys = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let store = read_store(state, operation).await;
+    store.gallery_object_labels_by_key(&keys).await
+}
+
+async fn store_index_media_gps_by_key(
+    state: &ServerState,
+    entries: &[StoreIndexEntry],
+    operation: &'static str,
+) -> Result<HashMap<String, MediaGpsCoordinates>> {
+    let keys = entries
+        .iter()
+        .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let store = read_store(state, operation).await;
+    store.gallery_object_gps_by_key(&keys).await
+}
+
+fn populate_store_index_entry_labels(
+    entries: &mut [StoreIndexEntry],
+    labels_by_key: &HashMap<String, Vec<String>>,
+) {
+    for entry in entries {
+        if let Some(labels) = labels_by_key.get(&entry.path) {
+            entry.labels = labels.clone();
+            entry.labels_resolved = true;
+        }
+    }
+}
+
+fn populate_store_index_entry_gps(
+    entries: &mut [StoreIndexEntry],
+    gps_by_key: &HashMap<String, MediaGpsCoordinates>,
+) {
+    for entry in entries {
+        if let (Some(gps), Some(media)) = (gps_by_key.get(&entry.path), entry.media.as_mut()) {
+            media.gps = Some(media_gps_response(gps));
+        }
+    }
+}
+
+async fn current_media_gps_override(
+    state: &ServerState,
+    key: &str,
+    operation: &'static str,
+) -> Option<MediaGpsCoordinates> {
+    let keys = vec![key.to_string()];
+    let store = read_store(state, operation).await;
+    match store.gallery_object_gps_by_key(&keys).await {
+        Ok(gps_by_key) => gps_by_key.get(key).cloned(),
+        Err(error) => {
+            tracing::warn!(
+                key,
+                error = %error,
+                "failed to load optional current XMP GPS projection"
+            );
+            None
+        }
+    }
+}
+
+async fn cached_store_index_page_response(
     state: &ServerState,
     namespace_change_sequence: u64,
     query: &StoreIndexQuery,
@@ -16511,7 +17864,33 @@ fn cached_store_index_page_response(
         .map(|value| offset.saturating_add(value).min(cached.total_entry_count))
         .unwrap_or(cached.total_entry_count);
     let has_more = end < cached.total_entry_count;
-    let (entries, materialized_entry_count) = cached.page(offset, end);
+    let (mut entries, materialized_entry_count) = cached.page(offset, end);
+    let label_lookup_ms = if query.snapshot.is_none() {
+        let label_lookup_started_at = Instant::now();
+        match store_index_media_labels_by_key(state, &entries, "store_index.cached_labels").await {
+            Ok(labels_by_key) => populate_store_index_entry_labels(&mut entries, &labels_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional labels for cached generic store index"
+            ),
+        }
+        label_lookup_started_at.elapsed().as_millis()
+    } else {
+        0
+    };
+    let gps_lookup_ms = if query.snapshot.is_none() {
+        let gps_lookup_started_at = Instant::now();
+        match store_index_media_gps_by_key(state, &entries, "store_index.cached_gps").await {
+            Ok(gps_by_key) => populate_store_index_entry_gps(&mut entries, &gps_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional GPS projection for cached generic store index"
+            ),
+        }
+        gps_lookup_started_at.elapsed().as_millis()
+    } else {
+        0
+    };
     if state
         .storage
         .namespace_change_sequence
@@ -16543,7 +17922,9 @@ fn cached_store_index_page_response(
         namespace_change_sequence,
         request_id,
         response,
-        format!("store-index-page-cache;desc=hit, total;dur={total_ms}"),
+        format!(
+            "store-index-page-cache;desc=hit, label-lookup;dur={label_lookup_ms}, gps-projection-lookup;dur={gps_lookup_ms}, total;dur={total_ms}"
+        ),
         cached.matching_key_count,
         cached.visible_file_count,
         materialized_entry_count,
@@ -16564,6 +17945,9 @@ async fn list_store_index_response_attempt(
     thumbnail_route: &str,
     allow_namespace_retry: bool,
 ) -> Response {
+    if let Err(message) = validate_store_index_capture_range(&query) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+    }
     let viewport = match store_index_viewport_bounds(&query) {
         Ok(viewport) => viewport,
         Err(message) => {
@@ -16582,14 +17966,14 @@ async fn list_store_index_response_attempt(
     let depth = query.depth.unwrap_or(1).max(1);
     let snapshot_label = query.snapshot.as_deref().unwrap_or("<current>");
     let cursor_mode = query.cursor.is_some() || query.page_size.is_some();
-    let page_cache_key = store_index_page_cache_key(&query, thumbnail_route);
     let namespace_change_sequence = state
         .storage
         .namespace_change_sequence
         .load(Ordering::SeqCst);
 
     let label_filter_requested = store_index_label_filter_requested(&label_filter);
-    let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter);
+    let page_cache_key = store_index_page_cache_key(&query, thumbnail_route, &label_filter);
+    let gallery_query = store_index_gallery_query(&query, &prefix, depth, label_filter.clone());
     if viewport.is_some() && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,
@@ -16599,11 +17983,20 @@ async fn list_store_index_response_attempt(
         )
             .into_response();
     }
-    if label_filter_requested && gallery_query.is_none() {
+    if label_filter_requested && cursor_mode && gallery_query.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "label filters require a current, paginated gallery query sorted by captured time"
+                "error": "label filters are unavailable with cursor pagination"
+            })),
+        )
+            .into_response();
+    }
+    if label_filter_requested && query.snapshot.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "label filters are unavailable for snapshot listings"
             })),
         )
             .into_response();
@@ -16667,25 +18060,7 @@ async fn list_store_index_response_attempt(
                 )
                     .into_response();
             }
-            Ok(None) if label_filter_requested => {
-                return (
-                    StatusCode::NOT_IMPLEMENTED,
-                    Json(json!({
-                        "error": "label filters require a metadata backend with gallery projection support"
-                    })),
-                )
-                    .into_response();
-            }
             Ok(None) => {}
-            Err(err) if label_filter_requested => {
-                tracing::error!(
-                    error = %err,
-                    prefix = %prefix,
-                    "gallery index fast path failed while a label filter was requested; \
-                     refusing to fall back to the unfiltered generic store index"
-                );
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
             Err(err) => {
                 warn!(
                     error = %err,
@@ -16711,7 +18086,9 @@ async fn list_store_index_response_attempt(
                 request_id,
                 request_started_at,
                 cached,
-            ) {
+            )
+            .await
+            {
                 return response;
             }
             if allow_namespace_retry {
@@ -16825,8 +18202,8 @@ async fn list_store_index_response_attempt(
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
     let modified_time_lookup_started_at = Instant::now();
-    let key_modified_times = match store_index_inspector
-        .object_modified_at_by_key(
+    let (key_modified_times, key_revisions) = match store_index_inspector
+        .object_modified_at_and_revisions_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
@@ -16839,24 +18216,27 @@ async fn list_store_index_response_attempt(
                 tracing::error!(
                     snapshot = snapshot_label,
                     error = %err,
-                    "failed to compute snapshot key modified times"
+                "failed to compute snapshot key modified times and revisions"
                 );
             } else {
-                tracing::error!(error = %err, "failed to compute current key modified times");
+                tracing::error!(error = %err, "failed to compute current key modified times and revisions");
             }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     let modified_time_lookup_ms = modified_time_lookup_started_at.elapsed().as_millis();
     let metadata_lookup_ms = content_summary_lookup_ms + modified_time_lookup_ms;
-
     let mut entries = build_store_index_entries_from_plan(
         &entry_plan,
+        Some(&visible_object_ids),
         Some(&visible_object_hashes),
         Some(&key_sizes),
         Some(&key_content_fingerprints),
         Some(&key_modified_times),
     );
+    for entry in &mut entries {
+        entry.version = key_revisions.get(&entry.path).cloned();
+    }
     let media_entry_count = entries
         .iter()
         .filter(|entry| entry.entry_type == "key" && looks_like_media_path(&entry.path))
@@ -16950,6 +18330,29 @@ async fn list_store_index_response_attempt(
     }
     let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
 
+    let mut label_lookup_ms = 0;
+    let labels_by_key = if label_filter_requested {
+        let label_lookup_started_at = Instant::now();
+        let labels_by_key =
+            match store_index_media_labels_by_key(state, &entries, "store_index.filtered_labels")
+                .await
+            {
+                Ok(labels_by_key) => labels_by_key,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "failed to load labels while a label filter was requested"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+        populate_store_index_entry_labels(&mut entries, &labels_by_key);
+        label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
+        Some(labels_by_key)
+    } else {
+        None
+    };
+
     let collapse_started_at = Instant::now();
     if matches!(query.view, Some(StoreIndexView::Tree)) {
         entries = collapse_store_index_entries_for_tree_view(entries);
@@ -16959,6 +18362,30 @@ async fn list_store_index_response_attempt(
     let filter_started_at = Instant::now();
     if let Some(media_filter) = query.media_filter {
         entries.retain(|entry| matches_store_index_media_filter(entry, media_filter));
+    }
+    if query.captured_from_unix.is_some() || query.captured_until_unix.is_some() {
+        entries.retain(|entry| {
+            matches_store_index_capture_range(
+                entry,
+                query.captured_from_unix,
+                query.captured_until_unix,
+            )
+        });
+    }
+    if label_filter_requested {
+        entries.retain(|entry| {
+            entry.entry_type != "key"
+                // The current gallery projection is the only label source
+                // available to this generic path. It only applies to media,
+                // while non-media keys remain visible in file listings.
+                || !looks_like_media_path(&entry.path)
+                || labels_by_key
+                    .as_ref()
+                    .and_then(|labels_by_key| labels_by_key.get(&entry.path))
+                    .is_some_and(|labels| {
+                        storage::gallery_label_filter_matches(labels, &label_filter)
+                    })
+        });
     }
     let filter_ms = filter_started_at.elapsed().as_millis();
 
@@ -17030,6 +18457,30 @@ async fn list_store_index_response_attempt(
         materialized_entry_count = total_entry_count;
     }
     let pagination_ms = pagination_started_at.elapsed().as_millis();
+    if !label_filter_requested && query.snapshot.is_none() {
+        let label_lookup_started_at = Instant::now();
+        match store_index_media_labels_by_key(state, &entries, "store_index.page_labels").await {
+            Ok(labels_by_key) => populate_store_index_entry_labels(&mut entries, &labels_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional labels for generic store index page"
+            ),
+        }
+        label_lookup_ms = label_lookup_started_at.elapsed().as_millis();
+    }
+    let gps_lookup_ms = if query.snapshot.is_none() {
+        let gps_lookup_started_at = Instant::now();
+        match store_index_media_gps_by_key(state, &entries, "store_index.page_gps").await {
+            Ok(gps_by_key) => populate_store_index_entry_gps(&mut entries, &gps_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional GPS projection for generic store index page"
+            ),
+        }
+        gps_lookup_started_at.elapsed().as_millis()
+    } else {
+        0
+    };
     let returned_entry_count = entries.len();
     let total_ms = request_started_at.elapsed().as_millis();
 
@@ -17039,6 +18490,7 @@ async fn list_store_index_response_attempt(
         || content_summary_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || modified_time_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || metadata_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
+        || label_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || media_lookup_waited_ms >= SLOW_STORE_LOCK_WAIT_LOG_THRESHOLD_MS
         || media_lookup_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
         || tree_collapse_ms >= SLOW_STORE_INDEX_PHASE_LOG_THRESHOLD_MS
@@ -17064,8 +18516,10 @@ async fn list_store_index_response_attempt(
             content_summary_lookup_ms,
             modified_time_lookup_ms,
             metadata_lookup_ms,
+            label_lookup_ms,
             media_lookup_lock_waited_ms = media_lookup_waited_ms,
             media_lookup_ms,
+            gps_lookup_ms,
             tree_collapse_ms,
             filter_ms,
             sort_ms,
@@ -17105,7 +18559,7 @@ async fn list_store_index_response_attempt(
         request_id,
         response,
         format!(
-            "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
+            "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur={entry_plan_ms}, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, label-lookup;dur={label_lookup_ms}, media-lookup;dur={media_lookup_ms}, gps-projection-lookup;dur={gps_lookup_ms}, tree-collapse;dur={tree_collapse_ms}, filter;dur={filter_ms}, sort;dur={sort_ms}, paginate;dur={pagination_ms}, total;dur={total_ms}"
         ),
         keys.len(),
         entry_plan.file_entries.len(),
@@ -17135,6 +18589,8 @@ async fn list_store_index_response_cursor_mode(
         || query.offset.is_some()
         || query.limit.is_some()
         || query.media_filter.is_some()
+        || query.captured_from_unix.is_some()
+        || query.captured_until_unix.is_some()
         || matches!(
             query.sort,
             Some(
@@ -17218,8 +18674,8 @@ async fn list_store_index_response_cursor_mode(
     };
     let content_summary_lookup_ms = content_summary_lookup_started_at.elapsed().as_millis();
     let modified_time_lookup_started_at = Instant::now();
-    let key_modified_times = match store_index_inspector
-        .object_modified_at_by_key(
+    let (key_modified_times, key_revisions) = match store_index_inspector
+        .object_modified_at_and_revisions_by_key(
             &visible_object_hashes,
             &visible_object_ids,
             snapshot_created_at_limit,
@@ -17232,23 +18688,23 @@ async fn list_store_index_response_cursor_mode(
                 tracing::error!(
                     snapshot = snapshot_label,
                     error = %err,
-                    "failed to compute snapshot key modified times"
+                "failed to compute snapshot key modified times and revisions"
                 );
             } else {
-                tracing::error!(error = %err, "failed to compute current key modified times");
+                tracing::error!(error = %err, "failed to compute current key modified times and revisions");
             }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     let modified_time_lookup_ms = modified_time_lookup_started_at.elapsed().as_millis();
     let metadata_lookup_ms = content_summary_lookup_ms + modified_time_lookup_ms;
-
     let mut entries = page
         .entries
         .iter()
         .map(|entry| match entry.kind {
             listing::KeyListingEntryKind::Object => build_store_index_object_entry(
                 entry.path.clone(),
+                Some(&visible_object_ids),
                 Some(&visible_object_hashes),
                 Some(&key_sizes),
                 Some(&key_content_fingerprints),
@@ -17259,6 +18715,9 @@ async fn list_store_index_response_cursor_mode(
             }
         })
         .collect::<Vec<_>>();
+    for entry in &mut entries {
+        entry.version = key_revisions.get(&entry.path).cloned();
+    }
 
     let media_entry_count = entries
         .iter()
@@ -17353,6 +18812,42 @@ async fn list_store_index_response_cursor_mode(
     }
     let media_lookup_ms = media_lookup_started_at.elapsed().as_millis();
 
+    let label_keys = entries
+        .iter()
+        .filter(|entry| {
+            query.snapshot.is_none()
+                && entry.entry_type == "key"
+                && looks_like_media_path(&entry.path)
+        })
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    let labels_by_key = {
+        let store = read_store(state, "store_index.cursor_labels").await;
+        store.gallery_object_labels_by_key(&label_keys).await
+    };
+    let labels_by_key = match labels_by_key {
+        Ok(labels_by_key) => labels_by_key,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to load optional labels for cursor store index"
+            );
+            HashMap::new()
+        }
+    };
+    populate_store_index_entry_labels(&mut entries, &labels_by_key);
+    let gps_lookup_started_at = Instant::now();
+    if query.snapshot.is_none() {
+        match store_index_media_gps_by_key(state, &entries, "store_index.cursor_gps").await {
+            Ok(gps_by_key) => populate_store_index_entry_gps(&mut entries, &gps_by_key),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to load optional GPS projection for cursor store index"
+            ),
+        }
+    }
+    let gps_lookup_ms = gps_lookup_started_at.elapsed().as_millis();
+
     let media_summary = summarize_store_index_entries(&entries);
     let returned_entry_count = entries.len();
     let total_ms = request_started_at.elapsed().as_millis();
@@ -17386,6 +18881,7 @@ async fn list_store_index_response_cursor_mode(
             metadata_lookup_ms,
             media_lookup_lock_waited_ms = media_lookup_waited_ms,
             media_lookup_ms,
+            gps_lookup_ms,
             tree_collapse_ms = 0,
             filter_ms = 0,
             sort_ms = 0,
@@ -17435,7 +18931,7 @@ async fn list_store_index_response_cursor_mode(
             .insert("x-ironmesh-store-index-request-id", header_value);
     }
     let server_timing = format!(
-        "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur=0, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, tree-collapse;dur=0, filter;dur=0, sort;dur=0, paginate;dur={pagination_ms}, total;dur={total_ms}"
+        "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur=0, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, gps-projection-lookup;dur={gps_lookup_ms}, tree-collapse;dur=0, filter;dur=0, sort;dur=0, paginate;dur={pagination_ms}, total;dur={total_ms}"
     );
     if let Ok(header_value) = HeaderValue::from_str(&server_timing) {
         response.headers_mut().insert("server-timing", header_value);
@@ -17458,26 +18954,35 @@ fn collapse_store_index_entries_for_tree_view(
 ) -> Vec<StoreIndexEntry> {
     let mut collapsed = BTreeMap::new();
 
-    for entry in entries {
+    for mut entry in entries {
         let is_directory_like = entry.entry_type == "prefix" || entry.path.ends_with('/');
         if !is_directory_like {
             collapsed.insert(entry.path.clone(), entry);
             continue;
         }
 
-        collapsed
-            .entry(entry.path.clone())
-            .or_insert_with(|| StoreIndexEntry {
-                path: entry.path,
-                entry_type: "prefix".to_string(),
-                version: None,
-                content_hash: None,
-                size_bytes: None,
-                modified_at_unix: None,
-                content_fingerprint: None,
-                media: None,
-                labels: Vec::new(),
-            });
+        if entry.entry_type == "key" && entry.path.ends_with('/') {
+            // An explicit directory marker is a first-class object. Preserve its
+            // complete identity and revision while presenting it as a tree prefix.
+            entry.entry_type = "prefix".to_string();
+            collapsed.insert(entry.path.clone(), entry);
+        } else {
+            collapsed
+                .entry(entry.path.clone())
+                .or_insert_with(|| StoreIndexEntry {
+                    path: entry.path,
+                    entry_type: "prefix".to_string(),
+                    object_id: None,
+                    version: None,
+                    content_hash: None,
+                    size_bytes: None,
+                    modified_at_unix: None,
+                    content_fingerprint: None,
+                    media: None,
+                    labels: Vec::new(),
+                    labels_resolved: false,
+                });
+        }
     }
 
     collapsed.into_values().collect()
@@ -17557,6 +19062,19 @@ fn store_index_entry_captured_at(entry: &StoreIndexEntry) -> u64 {
         media.and_then(|media| media.taken_at_unix),
         entry.modified_at_unix,
     )
+}
+
+fn matches_store_index_capture_range(
+    entry: &StoreIndexEntry,
+    captured_from_unix: Option<u64>,
+    captured_until_unix: Option<u64>,
+) -> bool {
+    if store_index_entry_type(entry) != "key" {
+        return true;
+    }
+    let captured_at = store_index_entry_captured_at(entry);
+    captured_from_unix.is_none_or(|from| captured_at >= from)
+        && captured_until_unix.is_none_or(|until| captured_at < until)
 }
 
 fn store_index_entry_type(entry: &StoreIndexEntry) -> &str {
@@ -17769,7 +19287,11 @@ fn build_media_index_response(
             total_bitrate_bps: metadata.total_bitrate_bps,
             codec_name: metadata.codec_name.clone(),
             codec_fourcc: metadata.codec_fourcc.clone(),
-            gps: metadata.gps.as_ref().map(media_gps_response),
+            gps: lookup
+                .gps_override
+                .as_ref()
+                .or(metadata.gps.as_ref())
+                .map(media_gps_response),
             photo: metadata.photo.as_ref().map(|photo| MediaPhotoResponse {
                 camera_manufacturer: photo.camera_manufacturer.clone(),
                 camera_model: photo.camera_model.clone(),
@@ -17800,7 +19322,7 @@ fn build_media_index_response(
             total_bitrate_bps: None,
             codec_name: None,
             codec_fourcc: None,
-            gps: None,
+            gps: lookup.gps_override.as_ref().map(media_gps_response),
             photo: None,
             thumbnail: Some(placeholder_thumbnail_response(thumbnail_url)),
             error: None,
@@ -17907,7 +19429,12 @@ fn media_type_for_path(path: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 fn build_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Vec<StoreIndexEntry> {
-    build_store_index_entries_with_hashes(keys, prefix, depth, None, None, None, None)
+    build_store_index_entries_with_hashes(
+        keys,
+        prefix,
+        depth,
+        StoreIndexEntryTestMetadata::default(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -17986,27 +19513,36 @@ fn filter_store_index_object_maps_for_prefix(
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct StoreIndexEntryTestMetadata<'a> {
+    object_ids_by_key: Option<&'a HashMap<String, String>>,
+    hashes_by_key: Option<&'a HashMap<String, String>>,
+    sizes_by_key: Option<&'a HashMap<String, u64>>,
+    content_fingerprints_by_key: Option<&'a HashMap<String, String>>,
+    modified_times_by_key: Option<&'a HashMap<String, u64>>,
+}
+
+#[cfg(test)]
 fn build_store_index_entries_with_hashes(
     keys: &[String],
     prefix: &str,
     depth: usize,
-    hashes_by_key: Option<&HashMap<String, String>>,
-    sizes_by_key: Option<&HashMap<String, u64>>,
-    content_fingerprints_by_key: Option<&HashMap<String, String>>,
-    modified_times_by_key: Option<&HashMap<String, u64>>,
+    metadata: StoreIndexEntryTestMetadata<'_>,
 ) -> Vec<StoreIndexEntry> {
     let plan = plan_store_index_entries(keys, prefix, depth);
     build_store_index_entries_from_plan(
         &plan,
-        hashes_by_key,
-        sizes_by_key,
-        content_fingerprints_by_key,
-        modified_times_by_key,
+        metadata.object_ids_by_key,
+        metadata.hashes_by_key,
+        metadata.sizes_by_key,
+        metadata.content_fingerprints_by_key,
+        metadata.modified_times_by_key,
     )
 }
 
 fn build_store_index_entries_from_plan(
     plan: &StoreIndexEntryPlan,
+    object_ids_by_key: Option<&HashMap<String, String>>,
     hashes_by_key: Option<&HashMap<String, String>>,
     sizes_by_key: Option<&HashMap<String, u64>>,
     content_fingerprints_by_key: Option<&HashMap<String, String>>,
@@ -18019,6 +19555,7 @@ fn build_store_index_entries_from_plan(
     for path in &plan.file_entries {
         entries.push(build_store_index_object_entry(
             path.clone(),
+            object_ids_by_key,
             hashes_by_key,
             sizes_by_key,
             content_fingerprints_by_key,
@@ -18033,6 +19570,7 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
     StoreIndexEntry {
         path,
         entry_type: "prefix".to_string(),
+        object_id: None,
         version: None,
         content_hash: None,
         size_bytes: None,
@@ -18042,16 +19580,21 @@ fn build_store_index_prefix_entry(path: String) -> StoreIndexEntry {
         // Labels are a property of the gallery projection; the generic listing
         // does not resolve them.
         labels: Vec::new(),
+        labels_resolved: false,
     }
 }
 
 fn build_store_index_object_entry(
     path: String,
+    object_ids_by_key: Option<&HashMap<String, String>>,
     hashes_by_key: Option<&HashMap<String, String>>,
     sizes_by_key: Option<&HashMap<String, u64>>,
     content_fingerprints_by_key: Option<&HashMap<String, String>>,
     modified_times_by_key: Option<&HashMap<String, u64>>,
 ) -> StoreIndexEntry {
+    let object_id = object_ids_by_key
+        .and_then(|values| values.get(path.as_str()))
+        .cloned();
     let content_hash = hashes_by_key
         .and_then(|values| values.get(path.as_str()))
         .cloned();
@@ -18067,6 +19610,7 @@ fn build_store_index_object_entry(
     StoreIndexEntry {
         path,
         entry_type: "key".to_string(),
+        object_id,
         version: None,
         content_hash,
         size_bytes,
@@ -18076,6 +19620,7 @@ fn build_store_index_object_entry(
         // Labels are a property of the gallery projection; the generic listing
         // does not resolve them.
         labels: Vec::new(),
+        labels_resolved: false,
     }
 }
 
@@ -18688,16 +20233,34 @@ async fn get_object_response(
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
 
+    let history_source_object_id = query.object_id.as_deref().map(str::trim);
+    if history_source_object_id.is_some_and(str::is_empty)
+        || (history_source_object_id.is_some() && query.snapshot.is_some())
+        || (history_source_object_id.is_some() && query.version.is_none())
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     let descriptor = {
         let store = read_store(state, "object_read.describe").await;
-        store
-            .describe_object(
-                key,
-                query.snapshot.as_deref(),
-                query.version.as_deref(),
-                read_mode,
-            )
-            .await
+        if let Some(object_id) = history_source_object_id {
+            store
+                .describe_history_object(
+                    object_id,
+                    key,
+                    query.version.as_deref().expect("checked above"),
+                )
+                .await
+        } else {
+            store
+                .describe_object(
+                    key,
+                    query.snapshot.as_deref(),
+                    query.version.as_deref(),
+                    read_mode,
+                )
+                .await
+        }
     };
 
     let descriptor = match descriptor {
@@ -19490,9 +21053,15 @@ async fn retry_media_cache_response(
         }
     };
 
+    let gps_override = if query.snapshot.is_none() && query.version.is_none() {
+        current_media_gps_override(state, &query.key, "media_cache.retry.gps").await
+    } else {
+        None
+    };
     let lookup = MediaCacheLookup {
         content_fingerprint: metadata.content_fingerprint.clone(),
         metadata: Some(metadata),
+        gps_override,
     };
 
     (
@@ -19559,6 +21128,35 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
+            let (current_manifest_hash, current_gps_override) = match store
+                .current_object_identity(key)
+                .await
+            {
+                Ok(Some((manifest_hash, _))) => {
+                    let keys = vec![key.to_string()];
+                    let gps_override = match store.gallery_object_gps_by_key(&keys).await {
+                        Ok(gps_by_key) => gps_by_key.get(key).cloned(),
+                        Err(error) => {
+                            tracing::warn!(
+                                key,
+                                error = %error,
+                                "failed to load optional current XMP GPS projection for version history"
+                            );
+                            None
+                        }
+                    };
+                    (Some(manifest_hash), gps_override)
+                }
+                Ok(None) => (None, None),
+                Err(error) => {
+                    tracing::warn!(
+                        key,
+                        error = %error,
+                        "failed to resolve current object while loading version history"
+                    );
+                    (None, None)
+                }
+            };
             let mut versions = Vec::with_capacity(summary.versions.len());
             for version in summary.versions {
                 let is_tombstone = version.manifest_hash == TOMBSTONE_MANIFEST_HASH;
@@ -19598,9 +21196,17 @@ async fn list_versions_response(state: &ServerState, key: &str, thumbnail_route:
                         .lookup_media_cache(&version.manifest_hash)
                         .await
                     {
-                        Ok(Some(lookup)) => {
+                        Ok(Some(mut lookup)) => {
                             content_fingerprint = Some(lookup.content_fingerprint.clone());
                             if looks_like_media_path(version_path) {
+                                // Sidecars are path-scoped mutable metadata. A current
+                                // location can decorate only the current manifest, never
+                                // an older version in this history.
+                                if current_manifest_hash.as_deref()
+                                    == Some(version.manifest_hash.as_str())
+                                {
+                                    lookup.gps_override = current_gps_override.clone();
+                                }
                                 media = Some(build_media_index_response(
                                     key,
                                     None,
@@ -20624,7 +22230,7 @@ async fn build_s3_control_plane_status_response(
         public_url: state.s3.public_url.clone(),
         tls_enabled: state.s3.tls_enabled,
         gateway_command_hint:
-            "ironmesh --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000"
+            "berrykeep --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000"
                 .to_string(),
         local_generation: runtime.generation,
         last_applied_at_unix: runtime.last_applied_at_unix,
@@ -27638,19 +29244,52 @@ async fn persist_manual_repair_action_run_record_with_retention(
     record: &ManualRepairActionRunRecord,
 ) {
     let store = lock_store(state, "manual_repair.persist").await;
-    if let Err(err) = store.persist_manual_repair_action_run_record(record).await {
+    // Finalize the generic adapter first. If the legacy record write fails,
+    // this replaces the running adapter persisted at start rather than leaving
+    // an unprunable, permanently in-flight operation run behind.
+    if let Err(err) = store
+        .persist_operation_run(&operation_run_from_manual_repair_record(record))
+        .await
+    {
         warn!(
             error = %err,
             run_id = %record.run_id,
             action_id = %record.action_id,
-            "failed to persist manual repair action history record"
+            "failed to persist generic operation adapter for manual repair action"
         );
-        return;
     }
+    let legacy_record_persisted = match store.persist_manual_repair_action_run_record(record).await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(
+                error = %err,
+                run_id = %record.run_id,
+                action_id = %record.action_id,
+                "failed to persist manual repair action history record"
+            );
+            false
+        }
+    };
 
     let retention_cutoff = record
         .finished_at_unix
         .saturating_sub(state.maintenance.repair_run_history_retention_secs);
+    if let Err(err) = store
+        .prune_operation_run_history_before(retention_cutoff)
+        .await
+    {
+        warn!(
+            error = %err,
+            retention_cutoff,
+            run_id = %record.run_id,
+            action_id = %record.action_id,
+            "failed to prune generic operation history for manual repair actions"
+        );
+    }
+    if !legacy_record_persisted {
+        return;
+    }
     if let Err(err) = store
         .prune_manual_repair_action_run_history_before(retention_cutoff)
         .await
@@ -27661,6 +29300,68 @@ async fn persist_manual_repair_action_run_record_with_retention(
             run_id = %record.run_id,
             action_id = %record.action_id,
             "failed to prune manual repair action history"
+        );
+    }
+}
+
+fn operation_run_from_manual_repair_record(
+    record: &ManualRepairActionRunRecord,
+) -> operations::OperationRun {
+    operations::OperationRun {
+        run_id: record.run_id.clone(),
+        operation_id: format!("repair.{}", record.action_id),
+        status: match record.status {
+            ManualRepairActionRunStatus::Completed => operations::OperationRunStatus::Completed,
+            ManualRepairActionRunStatus::Failed => operations::OperationRunStatus::Failed,
+        },
+        priority: operations::OperationPriority::Repair,
+        created_at_unix: record.started_at_unix,
+        started_at_unix: Some(record.started_at_unix),
+        finished_at_unix: Some(record.finished_at_unix),
+        progress: operations::OperationProgress {
+            phase: Some("completed".to_string()),
+            message: Some(record.summary.clone()),
+            ..operations::OperationProgress::default()
+        },
+        input: json!({ "dry_run": record.dry_run }),
+        summary: Some(json!({
+            "changed": record.changed,
+            "report": record.report,
+        })),
+        error: record.last_error.clone(),
+        termination_reason: None,
+    }
+}
+
+async fn persist_manual_repair_action_operation_started(
+    state: &ServerState,
+    active_run: &ManualRepairActionActiveRun,
+) {
+    let run = operations::OperationRun {
+        run_id: active_run.run_id.clone(),
+        operation_id: format!("repair.{}", active_run.action_id),
+        status: operations::OperationRunStatus::Running,
+        priority: operations::OperationPriority::Repair,
+        created_at_unix: active_run.started_at_unix,
+        started_at_unix: Some(active_run.started_at_unix),
+        finished_at_unix: None,
+        progress: operations::OperationProgress {
+            phase: Some("running".to_string()),
+            message: Some("Manual repair action is running.".to_string()),
+            ..operations::OperationProgress::default()
+        },
+        input: json!({ "dry_run": active_run.dry_run }),
+        summary: None,
+        error: None,
+        termination_reason: None,
+    };
+    let store = lock_store(state, "manual_repair.persist_started_operation").await;
+    if let Err(error) = store.persist_operation_run(&run).await {
+        warn!(
+            error = %error,
+            run_id = %run.run_id,
+            action_id = %run.operation_id,
+            "failed to persist started generic operation adapter for manual repair action"
         );
     }
 }
@@ -27913,6 +29614,7 @@ async fn start_local_manual_repair_action(
     };
 
     let (active_run, tracker) = active_or_new;
+    persist_manual_repair_action_operation_started(state, &active_run).await;
     let state_clone = state.clone();
     tokio::spawn(async move {
         execute_manual_repair_action_run(state_clone, tracker).await;

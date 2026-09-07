@@ -17,6 +17,9 @@ import type {
   AdminMediaCacheClearResponse,
   AdminStoreGetResponse,
   AdminSnapshotSummary,
+  AdminStoreHistoryRestoreEntry,
+  AdminStoreHistoryRestoreResponse,
+  AdminStoreHistoryResponse,
   AdminStoreListResponse,
   AdminVersionGraphResponse,
   AdminSessionStatus,
@@ -61,6 +64,12 @@ import type {
   NodeConnectionPriorityView,
   NodeDescriptor,
   NodeEnrollmentPackage,
+  OperationCatalogResponse,
+  OperationRun,
+  OperationRunHistoryResponse,
+  OperationRunResultsResponse,
+  OperationRunStartRequest,
+  OperationRunStartResponse,
   NaturalEarthImportJobView,
   NaturalEarthImportProfile,
   NaturalEarthImportStatusResponse,
@@ -172,6 +181,95 @@ export async function getAdminSessionStatus(
   return fetchAdminJson<AdminSessionStatus>(apiV1("/auth/admin/session"), { adminTokenOverride });
 }
 
+export async function getOperations(
+  adminTokenOverride?: string
+): Promise<OperationCatalogResponse> {
+  return fetchAdminJson<OperationCatalogResponse>(apiV1("/auth/operations"), {
+    adminTokenOverride
+  });
+}
+
+export async function startOperationRun(
+  operationId: string,
+  request: OperationRunStartRequest,
+  adminTokenOverride?: string
+): Promise<OperationRunStartResponse> {
+  return fetchAdminJson<OperationRunStartResponse>(
+    apiV1(`/auth/operations/${encodeURIComponent(operationId)}/runs`),
+    {
+      method: "POST",
+      body: request,
+      adminTokenOverride
+    }
+  );
+}
+
+export async function getOperationRun(
+  runId: string,
+  adminTokenOverride?: string
+): Promise<OperationRun> {
+  return fetchAdminJson<OperationRun>(
+    apiV1(`/auth/operation-runs/${encodeURIComponent(runId)}`),
+    { adminTokenOverride }
+  );
+}
+
+export async function getOperationRunResults(
+  runId: string,
+  options?: { limit?: number; offset?: number },
+  adminTokenOverride?: string
+): Promise<OperationRunResultsResponse> {
+  const query = new URLSearchParams();
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    query.set("limit", String(Math.max(1, Math.min(20, Math.trunc(options.limit)))));
+  }
+  if (typeof options?.offset === "number" && Number.isFinite(options.offset)) {
+    query.set("offset", String(Math.max(0, Math.trunc(options.offset))));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return fetchAdminJson<OperationRunResultsResponse>(
+    `${apiV1(`/auth/operation-runs/${encodeURIComponent(runId)}/results`)}${suffix}`,
+    { adminTokenOverride }
+  );
+}
+
+/** Fetches a protected media thumbnail for display through an object URL. */
+export async function getAdminMediaThumbnail(
+  key: string,
+  adminTokenOverride?: string,
+  signal?: AbortSignal
+): Promise<Blob> {
+  const query = new URLSearchParams({ key });
+  const response = await fetch(`${apiV1("/auth/media/thumbnail")}?${query.toString()}`, {
+    credentials: "same-origin",
+    cache: "no-store",
+    signal,
+    headers: buildAdminHeaders(adminTokenOverride)
+  });
+  if (!response.ok) {
+    throw new Error(`thumbnail request failed (${response.status})`);
+  }
+  return response.blob();
+}
+
+export async function getOperationRunHistory(
+  options?: { operationId?: string; limit?: number },
+  adminTokenOverride?: string
+): Promise<OperationRunHistoryResponse> {
+  const query = new URLSearchParams();
+  if (options?.operationId?.trim()) {
+    query.set("operation_id", options.operationId.trim());
+  }
+  if (typeof options?.limit === "number" && Number.isFinite(options.limit)) {
+    query.set("limit", String(Math.max(1, Math.min(200, Math.trunc(options.limit)))));
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return fetchAdminJson<OperationRunHistoryResponse>(
+    `${apiV1("/auth/operation-runs/history")}${suffix}`,
+    { adminTokenOverride }
+  );
+}
+
 export async function listAdminWebServices(
   adminTokenOverride?: string
 ): Promise<AdminWebService[]> {
@@ -278,13 +376,64 @@ export async function listAdminStoreEntries(
   if (options.mediaFilter) {
     query.set("media_filter", options.mediaFilter);
   }
+  if (options.capturedFromUnix !== undefined) {
+    query.set("captured_from_unix", String(options.capturedFromUnix));
+  }
+  if (options.capturedUntilUnix !== undefined) {
+    query.set("captured_until_unix", String(options.capturedUntilUnix));
+  }
   if (options.viewport) {
     query.set("south", String(options.viewport.south));
     query.set("west", String(options.viewport.west));
     query.set("north", String(options.viewport.north));
     query.set("east", String(options.viewport.east));
   }
+  appendLabelFilter(query, "require_labels", options.requireLabels);
+  appendLabelFilter(query, "exclude_labels", options.excludeLabels);
   return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
+    adminTokenOverride
+  });
+}
+
+export async function listAdminStoreHistoryEntries(
+  prefix?: string,
+  depth = 1,
+  adminTokenOverride?: string
+): Promise<AdminStoreHistoryResponse> {
+  const query = new URLSearchParams({
+    depth: String(Math.max(1, Math.floor(depth)))
+  });
+  if (prefix?.trim()) {
+    query.set("prefix", prefix.trim());
+  }
+  return fetchAdminJson<AdminStoreHistoryResponse>(
+    `${apiV1("/auth/store/history")}?${query.toString()}`,
+    { adminTokenOverride }
+  );
+}
+
+export async function restoreAdminStoreHistoryEntries(
+  entries: AdminStoreHistoryRestoreEntry[],
+  adminTokenOverride?: string
+): Promise<AdminStoreHistoryRestoreResponse> {
+  return fetchAdminJson<AdminStoreHistoryRestoreResponse>(
+    apiV1("/auth/store/history/restore"),
+    {
+      method: "POST",
+      body: { entries },
+      adminTokenOverride
+    }
+  );
+}
+
+export async function setAdminStoreMediaLabels(
+  path: string,
+  labels: string[],
+  adminTokenOverride?: string
+): Promise<void> {
+  await fetchAdminJson<unknown>(apiV1("/auth/store/labels"), {
+    method: "POST",
+    body: { path, labels },
     adminTokenOverride
   });
 }
@@ -308,14 +457,43 @@ export async function getAdminGalleryMapClusters(
   if (request.prefix?.trim()) {
     query.set("prefix", request.prefix.trim());
   }
+  if (request.resolutionViewport) {
+    query.set("resolution_south", String(request.resolutionViewport.south));
+    query.set("resolution_west", String(request.resolutionViewport.west));
+    query.set("resolution_north", String(request.resolutionViewport.north));
+    query.set("resolution_east", String(request.resolutionViewport.east));
+  }
   if (cellSizePx !== null) {
     query.set("cluster_cell_size_px", String(cellSizePx));
   }
+  if (request.capturedFromUnix !== undefined) {
+    query.set("captured_from_unix", String(request.capturedFromUnix));
+  }
+  if (request.capturedUntilUnix !== undefined) {
+    query.set("captured_until_unix", String(request.capturedUntilUnix));
+  }
+  appendLabelFilter(query, "require_labels", request.requireLabels);
+  appendLabelFilter(query, "exclude_labels", request.excludeLabels);
   return fetchAdminGalleryMapJson<GalleryMapClustersResponse>(
     "clusters",
     query,
     adminTokenOverride
   );
+}
+
+function appendLabelFilter(
+  query: URLSearchParams,
+  parameter: "require_labels" | "exclude_labels",
+  labels: string[] | undefined
+): void {
+  const value = (labels ?? [])
+    .map((label) => label.trim())
+    .filter(Boolean)
+    .map((label) => label.replaceAll("\\", "\\\\").replaceAll(",", "\\,"))
+    .join(",");
+  if (value) {
+    query.set(parameter, value);
+  }
 }
 
 export async function getAdminGalleryMapClusterEntries(
@@ -374,7 +552,8 @@ export async function getAdminStoreValue(
   snapshot?: string | null,
   version?: string | null,
   previewBytes?: number | null,
-  adminTokenOverride?: string
+  adminTokenOverride?: string,
+  sourceObjectId?: string | null
 ): Promise<AdminStoreGetResponse> {
   const headers = new Headers(buildAdminHeaders(adminTokenOverride));
   const previewLimit =
@@ -385,7 +564,11 @@ export async function getAdminStoreValue(
     headers.set("range", `bytes=0-${previewLimit - 1}`);
   }
 
-  const response = await fetch(getAdminStoreDownloadUrl(key, snapshot, version), {
+  const downloadUrl = getAdminStoreDownloadUrl(key, snapshot, version);
+  const sourceObjectQuery = sourceObjectId?.trim()
+    ? `${downloadUrl.includes("?") ? "&" : "?"}object_id=${encodeURIComponent(sourceObjectId.trim())}`
+    : "";
+  const response = await fetch(`${downloadUrl}${sourceObjectQuery}`, {
     credentials: "same-origin",
     cache: "no-store",
     headers

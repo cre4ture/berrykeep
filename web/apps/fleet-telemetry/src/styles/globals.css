@@ -1,0 +1,66 @@
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+:root[data-mantine-color-scheme="light"] {
+  --fleet-background:
+    radial-gradient(circle at 8% -10%, rgba(20, 184, 166, 0.18), transparent 32%),
+    linear-gradient(180deg, #f7faf9 0%, #edf6f2 100%);
+  --fleet-header: rgba(248, 252, 250, 0.88);
+  --fleet-border: rgba(24, 39, 34, 0.1);
+}
+
+:root[data-mantine-color-scheme="dark"] {
+  --fleet-background:
+    radial-gradient(circle at 8% -10%, rgba(20, 184, 166, 0.2), transparent 30%),
+    linear-gradient(180deg, #07110f 0%, #0b1814 100%);
+  --fleet-header: rgba(7, 17, 15, 0.88);
+  --fleet-border: rgba(113, 218, 202, 0.14);
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: var(--fleet-background);
+  color: var(--mantine-color-text);
+}
+
+.fleet-page {
+  min-height: 100dvh;
+}
+
+.fleet-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  border-bottom: 1px solid var(--fleet-border);
+  background: var(--fleet-header);
+  backdrop-filter: blur(14px);
+}
+
+.fleet-header-inner {
+  display: flex;
+  min-height: 4.5rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.fleet-content {
+  padding-top: clamp(1.5rem, 4vw, 3rem);
+  padding-bottom: clamp(2rem, 5vw, 4rem);
+}
+
+@media (max-width: 36em) {
+  .fleet-header-inner {
+    min-height: 4rem;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
+
+  .fleet-header .mantine-Badge-root {
+    display: none;
+  }
+}

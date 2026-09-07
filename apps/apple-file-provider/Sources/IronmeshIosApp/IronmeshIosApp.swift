@@ -20,13 +20,17 @@ struct IronmeshIosApp: App {
                 if IronmeshUiTestWebUiSession.embeddedSurface == .galleryMap {
                     IronmeshGalleryMapContent(
                         session: session,
+                        accentColorHex: AppleAccentColor.defaultHex,
                         isStarting: false,
                         statusMessage: "",
                         onStart: {},
                         onClose: {}
                     )
                 } else {
-                    IronmeshHostedWebView(session: session)
+                    IronmeshHostedWebView(
+                        session: session,
+                        accentColorHex: AppleAccentColor.defaultHex
+                    )
                 }
             } else {
                 IronmeshIosRootView()
@@ -34,6 +38,7 @@ struct IronmeshIosApp: App {
                     .task {
                         model.activate()
                     }
+                    .tint(Color(ironmeshAccentColorHex: model.themeAccentColorHex))
             }
         }
     }
@@ -105,7 +110,10 @@ private struct IronmeshIosRootView: View {
                 }
             )
         ) { presentation in
-            IronmeshHostedWebView(session: presentation.session)
+            IronmeshHostedWebView(
+                session: presentation.session,
+                accentColorHex: model.themeAccentColorHex
+            )
         }
         .onChange(of: scenePhase) { phase in
             if phase == .active {
@@ -174,6 +182,7 @@ private struct IronmeshGalleryMapView: View {
     var body: some View {
         IronmeshGalleryMapContent(
             session: model.galleryMapPresentation?.session,
+            accentColorHex: model.themeAccentColorHex,
             isStarting: model.isBusy,
             statusMessage: model.statusText,
             onStart: model.openGalleryMap,
@@ -184,6 +193,7 @@ private struct IronmeshGalleryMapView: View {
 
 private struct IronmeshGalleryMapContent: View {
     let session: AppleWebUiSession?
+    let accentColorHex: String
     let isStarting: Bool
     let statusMessage: String
     let onStart: () -> Void
@@ -191,8 +201,11 @@ private struct IronmeshGalleryMapContent: View {
 
     var body: some View {
         if let session, let galleryMapSession = galleryMapWebUiSession(from: session) {
-            IronmeshHostedWebView(session: galleryMapSession)
-                .onDisappear(perform: onClose)
+            IronmeshHostedWebView(
+                session: galleryMapSession,
+                accentColorHex: accentColorHex
+            )
+            .onDisappear(perform: onClose)
         } else {
             galleryMapStartCard
         }
@@ -234,13 +247,9 @@ private func galleryMapWebUiSession(from session: AppleWebUiSession) -> AppleWeb
         return nil
     }
     var queryItems = components.queryItems ?? []
-    queryItems.removeAll {
-        $0.name == "embedded" || $0.name == "embedded_client" || $0.name == "page" || $0.name == "gallery_view"
-    }
+    queryItems.removeAll { $0.name == "embedded" || $0.name == "embedded_client" }
     queryItems.append(URLQueryItem(name: "embedded", value: IronmeshEmbeddedSurface.galleryMap.rawValue))
     queryItems.append(URLQueryItem(name: "embedded_client", value: "ios"))
-    queryItems.append(URLQueryItem(name: "page", value: "gallery"))
-    queryItems.append(URLQueryItem(name: "gallery_view", value: "map"))
     components.queryItems = queryItems
 
     guard let url = components.url,
@@ -1162,6 +1171,47 @@ private struct IronmeshSettingsView: View {
                     }
                 }
 
+                Section("Appearance") {
+                    ColorPicker(
+                        "Accent color",
+                        selection: accentColorBinding,
+                        supportsOpacity: false
+                    )
+
+                    HStack(spacing: 12) {
+                        ForEach(AppleAccentColor.swatches, id: \.self) { swatch in
+                            Button {
+                                model.updateThemeAccentColor(swatch)
+                            } label: {
+                                Circle()
+                                    .fill(Color(ironmeshAccentColorHex: swatch))
+                                    .frame(width: 26, height: 26)
+                                    .overlay {
+                                        if model.themeAccentColorHex == swatch {
+                                            Circle()
+                                                .stroke(.primary, lineWidth: 2)
+                                        }
+                                    }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Use accent color \(swatch)")
+                        }
+                    }
+
+                    Text(model.themeAccentColorHex)
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(.secondary)
+
+                    Button("Reset accent color") {
+                        model.updateThemeAccentColor(AppleAccentColor.defaultHex)
+                    }
+                    .disabled(model.themeAccentColorHex == AppleAccentColor.defaultHex)
+
+                    Text("The embedded web interface uses this color as well.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Bootstrap") {
                     IronmeshMultilineEditor(
                         title: "Bootstrap bundle",
@@ -1192,6 +1242,15 @@ private struct IronmeshSettingsView: View {
                             }
                         }
                     }
+                }
+
+                Section("Cached data") {
+                    Button("Clear cached data", role: .destructive) {
+                        model.clearCachedData()
+                    }
+                    Text("Removes local map, Web UI, and temporary cached data. Enrollment, settings, and files stay intact.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Advanced") {
@@ -1304,6 +1363,18 @@ private struct IronmeshSettingsView: View {
         Binding(
             get: { model.draft[keyPath: keyPath] },
             set: { model.draft[keyPath: keyPath] = $0 }
+        )
+    }
+
+    private var accentColorBinding: Binding<Color> {
+        Binding(
+            get: { Color(ironmeshAccentColorHex: model.themeAccentColorHex) },
+            set: { color in
+                guard let hex = ironmeshAccentColorHex(from: color) else {
+                    return
+                }
+                model.updateThemeAccentColor(hex)
+            }
         )
     }
 }
@@ -1498,6 +1569,42 @@ struct IronmeshBrowserRow: View {
     }
 }
 
+private extension Color {
+    init(ironmeshAccentColorHex: String) {
+        let normalized = AppleAccentColor.normalizedHex(ironmeshAccentColorHex)
+            ?? AppleAccentColor.defaultHex
+        let value = UInt64(normalized.dropFirst(), radix: 16) ?? 0x14B8A6
+        self.init(
+            .sRGB,
+            red: Double((value >> 16) & 0xFF) / 255,
+            green: Double((value >> 8) & 0xFF) / 255,
+            blue: Double(value & 0xFF) / 255,
+            opacity: 1
+        )
+    }
+}
+
+private func ironmeshAccentColorHex(from color: Color) -> String? {
+    var red: CGFloat = 0
+    var green: CGFloat = 0
+    var blue: CGFloat = 0
+    var alpha: CGFloat = 0
+    guard UIColor(color).getRed(&red, green: &green, blue: &blue, alpha: &alpha) else {
+        return nil
+    }
+
+    func colorChannel(_ value: CGFloat) -> Int {
+        Int((min(max(value, 0), 1) * 255).rounded())
+    }
+
+    return String(
+        format: "#%02X%02X%02X",
+        colorChannel(red),
+        colorChannel(green),
+        colorChannel(blue)
+    )
+}
+
 struct IronmeshKeyValueRow: View {
     let label: String
     let value: String
@@ -1607,9 +1714,10 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
     private static let originalShareHandlerName = "IronmeshIosShare"
 
     let session: AppleWebUiSession
+    let accentColorHex: String
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(origin: ironmeshIosEmbeddedWebURL(session.url))
+        Coordinator(origin: ironmeshIosEmbeddedWebURL(session.url, accentColorHex: accentColorHex))
     }
 
     func makeUIViewController(context: Context) -> UIViewController {
@@ -1628,7 +1736,9 @@ private struct IronmeshHostedWebView: UIViewControllerRepresentable {
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView
 
-        var request = URLRequest(url: ironmeshIosEmbeddedWebURL(session.url))
+        var request = URLRequest(
+            url: ironmeshIosEmbeddedWebURL(session.url, accentColorHex: accentColorHex)
+        )
         request.setValue(session.authorization, forHTTPHeaderField: "X-IronMesh-Web-Ui-Session")
         webView.load(request)
 

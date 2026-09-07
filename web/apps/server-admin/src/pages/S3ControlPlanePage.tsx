@@ -390,7 +390,7 @@ export function S3ControlPlanePage() {
                   label="Gateway command"
                   value={
                     status?.gateway_command_hint ??
-                    "ironmesh --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000"
+                    "berrykeep --bootstrap-file <bootstrap.json> --client-identity-file <identity.json> serve-s3 --bind 127.0.0.1:9000"
                   }
                   readOnly
                   autosize
