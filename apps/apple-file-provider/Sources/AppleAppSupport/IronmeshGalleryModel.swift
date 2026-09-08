@@ -309,7 +309,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
         let thumbnailSessions = thumbnailSessions
         let data = try await thumbnailSessionPool.perform(priority: priority) { sessionIndex in
             let thumbnailSession = thumbnailSessions[sessionIndex]
-            try await Task.detached(priority: priority) {
+            return try await Task.detached(priority: priority) {
                 try thumbnailSession.fetchRelativeBytes(
                     path: relativePath,
                     configuration: configuration
