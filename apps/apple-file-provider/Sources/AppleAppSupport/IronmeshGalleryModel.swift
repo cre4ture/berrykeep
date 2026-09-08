@@ -419,7 +419,7 @@ private actor IronmeshGalleryThumbnailSessionPool {
         }
 
         let waiterID = UUID()
-        try await withTaskCancellationHandler {
+        return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
                 if Task.isCancelled {
                     continuation.resume(throwing: CancellationError())
