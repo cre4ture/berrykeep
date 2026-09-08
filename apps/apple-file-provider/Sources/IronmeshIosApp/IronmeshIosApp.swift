@@ -1122,8 +1122,8 @@ private struct IronmeshSettingsView: View {
                     )
                 }
 
-                Section("Device") {
-                    if let enrolledDeviceID = model.draft.enrolledDeviceID.nilIfBlank {
+                if let enrolledDeviceID = model.draft.enrolledDeviceID.nilIfBlank {
+                    Section("Device") {
                         IronmeshInlineNote(text: "Enrolled device: \(enrolledDeviceID)")
                     }
                 }
