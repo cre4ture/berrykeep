@@ -1274,8 +1274,6 @@ private struct IronmeshSettingsView: View {
                         }
                     }
 
-                    TextField("Domain display name", text: draftBinding(\.domainDisplayName))
-                    TextField("Domain identifier", text: draftBinding(\.domainIdentifier))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
 
