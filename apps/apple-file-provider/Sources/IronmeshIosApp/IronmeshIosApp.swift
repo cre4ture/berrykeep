@@ -1122,54 +1122,23 @@ private func diagnosticLogFilename(now: Date = Date()) -> String {
 
 private struct IronmeshSettingsView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
-    @State private var showsScanner = false
     @State private var showsExperimentalNodePriorities = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Connection") {
-                    if let normalizedConnectionInput = model.draft.normalizedConnectionInput {
-                        IronmeshInlineNote(text: normalizedConnectionInput)
-                    } else {
-                        IronmeshInlineNote(text: "Import a connection bootstrap bundle below.")
-                    }
-
-                    if model.draft.requiresEnrollment {
-                        IronmeshInlineNote(
-                            text: "This bootstrap bundle requires device enrollment before the app can reconnect."
-                        )
-                    }
-
-                    Button(model.draft.requiresEnrollment ? "Go to enrollment" : "Apply and reconnect") {
-                        model.applyConnectionSettings()
-                    }
+                    IronmeshInlineNote(
+                        text: "Connection setup is fixed for the current app session."
+                    )
                 }
 
-                Section("Identity") {
+                Section("Device") {
                     TextField("Device label (optional)", text: draftBinding(\.deviceLabel))
                         .textInputAutocapitalization(.words)
 
                     if let enrolledDeviceID = model.draft.enrolledDeviceID.nilIfBlank {
                         IronmeshInlineNote(text: "Enrolled device: \(enrolledDeviceID)")
-                    }
-
-                    IronmeshMultilineEditor(
-                        title: "Client identity JSON",
-                        text: draftBinding(\.clientIdentityJSON),
-                        prompt: "Optional JSON identity material."
-                    )
-
-                    IronmeshMultilineEditor(
-                        title: "Server CA PEM",
-                        text: draftBinding(\.serverCAPem),
-                        prompt: "Optional CA override for bootstrap-advertised HTTPS routes."
-                    )
-
-                    if model.draft.hasClientIdentity || model.draft.serverCAPem.nilIfBlank != nil {
-                        Button("Clear identity material", role: .destructive) {
-                            model.clearIdentity()
-                        }
                     }
                 }
 
@@ -1239,38 +1208,6 @@ private struct IronmeshSettingsView: View {
                     Text("The embedded web interface uses this color as well.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                }
-
-                Section("Bootstrap") {
-                    IronmeshMultilineEditor(
-                        title: "Bootstrap bundle",
-                        text: draftBinding(\.bootstrapInput),
-                        prompt: "Paste bootstrap JSON here or import it from a QR code."
-                    )
-
-                    if model.draft.requiresEnrollment {
-                        IronmeshInlineNote(
-                            text: "Enrollment will mint client identity material for this bootstrap bundle."
-                        )
-                    }
-
-                    HStack {
-                        Button("Scan QR") {
-                            showsScanner = true
-                        }
-                        .buttonStyle(.bordered)
-
-                        if model.draft.hasBootstrapPayload {
-                            Button(model.draft.requiresEnrollment ? "Enroll device" : "Re-enroll device") {
-                                model.enrollDevice()
-                            }
-                            .buttonStyle(.borderedProminent)
-
-                            Button("Clear bootstrap", role: .destructive) {
-                                model.draft.bootstrapInput = ""
-                            }
-                        }
-                    }
                 }
 
                 Section("Cached data") {
@@ -1360,13 +1297,6 @@ private struct IronmeshSettingsView: View {
                         model.openWebUI()
                     }
 
-                    Button("Restore bundled defaults") {
-                        model.resetToBundleDefaults()
-                    }
-
-                    Button("Clear app setup", role: .destructive) {
-                        model.clearAppSetup()
-                    }
                 }
 
                 Section("Provider note") {
@@ -1379,11 +1309,6 @@ private struct IronmeshSettingsView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     IronmeshTitleLatencyToolbarItem()
                 }
-            }
-        }
-        .sheet(isPresented: $showsScanner) {
-            IronmeshScannerSheet { payload in
-                model.applyScannedCode(payload)
             }
         }
     }
