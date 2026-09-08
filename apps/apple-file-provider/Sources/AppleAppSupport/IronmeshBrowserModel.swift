@@ -1217,7 +1217,9 @@ final class IronmeshBrowserModel: ObservableObject {
     func closeWebUI() {
         webUIStartToken = nil
         guard webUIPresentation != nil else {
-            pendingWebUIStart = nil
+            if pendingWebUIStart == .webUI {
+                pendingWebUIStart = nil
+            }
             return
         }
         webUIPresentation = nil
@@ -1293,7 +1295,9 @@ final class IronmeshBrowserModel: ObservableObject {
     func closeGalleryMap() {
         galleryMapStartToken = nil
         guard galleryMapPresentation != nil else {
-            pendingWebUIStart = nil
+            if pendingWebUIStart == .galleryMap {
+                pendingWebUIStart = nil
+            }
             return
         }
         galleryMapPresentation = nil
