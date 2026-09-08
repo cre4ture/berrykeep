@@ -1625,9 +1625,8 @@ private func appleDiagnosticPlatformName() -> String {
 final class IronmeshRemoteSession: @unchecked Sendable {
     private let bridge: AppleCFacadeBridge
     private let lock = NSLock()
-    private let connectLock = NSLock()
+    private let operationLock = NSLock()
     private var configurationKey: String?
-    private var pendingConnectionChanges = 0
 
     init(ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter(connectionName: "ios app shell")) {
         bridge = AppleCFacadeBridge(ffi: ffi)
@@ -1697,8 +1696,10 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     }
 
     func disableTitleLatencyMonitor() throws {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         lock.lock()
-        let hasConnection = configurationKey != nil && pendingConnectionChanges == 0
+        let hasConnection = configurationKey != nil
         lock.unlock()
         guard hasConnection else {
             return
@@ -1709,10 +1710,14 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     }
 
     func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
-        try bridge.startWebUI(configuration: configuration)
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        return try bridge.startWebUI(configuration: configuration)
     }
 
     func stopWebUI() throws {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         try bridge.stopWebUI()
     }
 
@@ -1720,6 +1725,8 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         _ configuration: AppleConnectionConfiguration,
         operation: (AppleCFacadeBridge) throws -> T
     ) throws -> T {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         try connectIfNeeded(configuration)
         return try operation(bridge)
     }
@@ -1732,27 +1739,7 @@ final class IronmeshRemoteSession: @unchecked Sendable {
             lock.unlock()
             return
         }
-        pendingConnectionChanges += 1
-        lock.unlock()
-
-        connectLock.lock()
-        defer { connectLock.unlock() }
-        defer {
-            lock.lock()
-            pendingConnectionChanges -= 1
-            lock.unlock()
-        }
-
-        lock.lock()
-        if configurationKey == nextKey {
-            lock.unlock()
-            return
-        }
-        lock.unlock()
-
         _ = try bridge.connect(configuration)
-
-        lock.lock()
         configurationKey = nextKey
         lock.unlock()
     }
