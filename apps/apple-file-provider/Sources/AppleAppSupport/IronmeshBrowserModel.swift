@@ -1758,13 +1758,12 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         let nextKey = configuration.cacheKey
 
         lock.lock()
+        defer { lock.unlock() }
         if configurationKey == nextKey {
-            lock.unlock()
             return
         }
         _ = try bridge.connect(configuration)
         configurationKey = nextKey
-        lock.unlock()
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from json: String) throws -> T {
