@@ -1193,6 +1193,9 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func openWebUI() {
+        guard !isBusy else {
+            return
+        }
         if galleryMapPresentation != nil {
             closeGalleryMap()
         }
@@ -1216,11 +1219,9 @@ final class IronmeshBrowserModel: ObservableObject {
                     try remoteSession.startWebUI(configuration: configuration)
                 }.value
                 guard webUIStartToken == startToken else {
-                    if galleryMapStartToken == nil && webUIStartToken == nil {
-                        try? await Task.detached(priority: .userInitiated) {
-                            try remoteSession.stopWebUI()
-                        }.value
-                    }
+                    try? await Task.detached(priority: .userInitiated) {
+                        try remoteSession.stopWebUI()
+                    }.value
                     return
                 }
                 webUIPresentation = IronmeshWebUIPresentation(session: session)
@@ -1252,6 +1253,9 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func openGalleryMap() {
+        guard !isBusy else {
+            return
+        }
         guard galleryMapPresentation == nil else {
             return
         }
@@ -1278,11 +1282,9 @@ final class IronmeshBrowserModel: ObservableObject {
                     try remoteSession.startWebUI(configuration: configuration)
                 }.value
                 guard galleryMapStartToken == startToken else {
-                    if galleryMapStartToken == nil && webUIStartToken == nil {
-                        try? await Task.detached(priority: .userInitiated) {
-                            try remoteSession.stopWebUI()
-                        }.value
-                    }
+                    try? await Task.detached(priority: .userInitiated) {
+                        try remoteSession.stopWebUI()
+                    }.value
                     return
                 }
                 galleryMapPresentation = IronmeshWebUIPresentation(session: session)
