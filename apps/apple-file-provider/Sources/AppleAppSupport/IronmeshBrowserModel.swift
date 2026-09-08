@@ -1200,6 +1200,9 @@ final class IronmeshBrowserModel: ObservableObject {
         if galleryMapPresentation != nil {
             closeGalleryMap()
         }
+        guard webUIPresentation == nil else {
+            return
+        }
         guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
             statusText = isWebUICacheClearInProgress
                 ? "Clearing cached Web UI data."
