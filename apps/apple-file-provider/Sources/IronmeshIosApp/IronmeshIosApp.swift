@@ -198,8 +198,10 @@ private struct IronmeshGalleryMapContent: View {
     let statusMessage: String
     let onStart: () -> Void
     let onClose: () -> Void
+    @State private var isVisible = false
 
     var body: some View {
+        Group {
         if let session, let galleryMapSession = galleryMapWebUiSession(from: session) {
             IronmeshHostedWebView(
                 session: galleryMapSession,
@@ -214,6 +216,19 @@ private struct IronmeshGalleryMapContent: View {
                         onClose()
                     }
                 }
+        }
+        }
+        .onAppear {
+            isVisible = true
+        }
+        .onDisappear {
+            isVisible = false
+        }
+        .task(id: session?.url.absoluteString) {
+            guard !isVisible, session != nil else {
+                return
+            }
+            onClose()
         }
     }
 
