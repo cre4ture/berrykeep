@@ -1039,7 +1039,9 @@ final class IronmeshBrowserModel: ObservableObject {
                 invalidateConnectionRouteState()
 
                 if let configuration = draft.connectionConfiguration {
-                    connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                    connectionDiagnostics = try? await Task.detached(priority: .utility) {
+                        try remoteSession.connectionDiagnostics(configuration: configuration)
+                    }.value
                 }
 
                 lastErrorMessage = nil
@@ -1574,7 +1576,9 @@ final class IronmeshBrowserModel: ObservableObject {
                     return
                 }
 
-                let diagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                let diagnostics = try? await Task.detached(priority: .utility) {
+                    try remoteSession.connectionDiagnostics(configuration: configuration)
+                }.value
                 guard directoryLoadCoordinator.acceptsSharedState(request) else {
                     return
                 }
@@ -1590,7 +1594,9 @@ final class IronmeshBrowserModel: ObservableObject {
                 guard directoryLoadCoordinator.acceptsSharedState(request) else {
                     return
                 }
-                connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                connectionDiagnostics = try? await Task.detached(priority: .utility) {
+                    try remoteSession.connectionDiagnostics(configuration: configuration)
+                }.value
                 guard directoryLoadCoordinator.acceptsSharedState(request) else {
                     return
                 }
