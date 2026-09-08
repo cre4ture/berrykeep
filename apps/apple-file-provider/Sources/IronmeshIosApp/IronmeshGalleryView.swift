@@ -316,34 +316,38 @@ private struct IronmeshGalleryThumbnailCell: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color(uiColor: .secondarySystemGroupedBackground))
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color(uiColor: .secondarySystemGroupedBackground))
 
-                if let image {
-                    Button(action: onOpen) {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
-                    .buttonStyle(.plain)
-                } else if errorMessage != nil {
-                    Button {
-                        retryGeneration += 1
-                    } label: {
-                        VStack(spacing: 6) {
-                            Image(systemName: "arrow.clockwise")
-                            Text("Retry")
-                                .font(.caption)
+                        if let image {
+                            Button(action: onOpen) {
+                                Image(uiImage: image)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                    .clipped()
+                            }
+                            .buttonStyle(.plain)
+                        } else if errorMessage != nil {
+                            Button {
+                                retryGeneration += 1
+                            } label: {
+                                VStack(spacing: 6) {
+                                    Image(systemName: "arrow.clockwise")
+                                    Text("Retry")
+                                        .font(.caption)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        } else {
+                            ProgressView()
                         }
                     }
-                    .buttonStyle(.bordered)
-                } else {
-                    ProgressView()
                 }
-            }
-            .aspectRatio(1, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             Text(galleryDisplayName(entry.path))
@@ -620,18 +624,29 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
 
         context.coordinator.imageView.contentMode = .scaleAspectFit
         context.coordinator.imageView.clipsToBounds = true
+        context.coordinator.imageView.translatesAutoresizingMaskIntoConstraints = true
         scrollView.addSubview(context.coordinator.imageView)
         return scrollView
     }
 
     func updateUIView(_ scrollView: UIScrollView, context: Context) {
         let isFirstImage = context.coordinator.imageView.image == nil
+        let layoutSize = scrollView.bounds.size
+        let needsLayout = context.coordinator.layoutSize != layoutSize
         context.coordinator.onZoomStarted = onZoomStarted
         context.coordinator.imageView.image = image
-        context.coordinator.imageView.frame = scrollView.bounds
-        scrollView.contentSize = scrollView.bounds.size
         if isFirstImage {
+            context.coordinator.imageView.frame = CGRect(origin: .zero, size: layoutSize)
+            scrollView.contentSize = scrollView.bounds.size
+            context.coordinator.layoutSize = layoutSize
             scrollView.setZoomScale(1, animated: false)
+        } else if needsLayout {
+            let zoomScale = scrollView.zoomScale
+            scrollView.setZoomScale(1, animated: false)
+            context.coordinator.imageView.frame = CGRect(origin: .zero, size: layoutSize)
+            scrollView.contentSize = scrollView.bounds.size
+            context.coordinator.layoutSize = layoutSize
+            scrollView.setZoomScale(zoomScale, animated: false)
         }
     }
 
@@ -639,6 +654,7 @@ private struct IronmeshZoomableImageView: UIViewRepresentable {
         let imageView = UIImageView()
         var onZoomStarted: () -> Void
         private var didRequestFullResolution = false
+        fileprivate var layoutSize: CGSize?
 
         init(onZoomStarted: @escaping () -> Void) {
             self.onZoomStarted = onZoomStarted

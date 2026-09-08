@@ -80,25 +80,37 @@ int ironmesh_ios_facade_connection_route_snapshot_json(void *handle,
                                                        char **out_json,
                                                        char **out_error);
 
+/**
+ * Gives a suspended iOS client an opportunistic shared-route refresh when the
+ * app returns to the foreground. It does not create a permanent background task.
+ */
 int ironmesh_ios_facade_notify_foregrounded(void *handle, char **out_error);
 
+/**
+ * Returns a renewed serialized identity once for the Swift/App Group owner to
+ * persist. An empty string means that no renewal has occurred since the previous
+ * call; the in-memory managed client remains usable either way.
+ */
 int ironmesh_ios_facade_take_client_identity_update_json(void *handle,
-                                                          char **out_json,
-                                                          char **out_error);
+                                                         char **out_json,
+                                                         char **out_error);
 
+/**
+ * Returns a serialized bootstrap update once for the Swift/App Group owner to
+ * persist. It only contains a list returned by the authenticated cluster API;
+ * an empty string means that no new version has been learned.
+ */
 int ironmesh_ios_facade_take_connection_bootstrap_update_json(void *handle,
-                                                               char **out_json,
-                                                               char **out_error);
-
-int ironmesh_ios_facade_configure_title_latency_monitor_json(void *handle,
-                                                              int enabled,
-                                                              uint64_t period_seconds,
                                                               char **out_json,
                                                               char **out_error);
 
-int ironmesh_ios_facade_title_latency_status_json(void *handle,
-                                                   char **out_json,
-                                                   char **out_error);
+int ironmesh_ios_facade_configure_title_latency_monitor_json(void *handle,
+                                                             int enabled,
+                                                             uint64_t period_seconds,
+                                                             char **out_json,
+                                                             char **out_error);
+
+int ironmesh_ios_facade_title_latency_status_json(void *handle, char **out_json, char **out_error);
 
 int ironmesh_ios_facade_fetch_bytes(void *handle,
                                     const char *key,

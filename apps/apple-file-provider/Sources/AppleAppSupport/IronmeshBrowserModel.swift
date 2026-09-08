@@ -200,11 +200,22 @@ final class IronmeshBrowserModel: ObservableObject {
     private let diagnosticActionLimit = 10_000
 
     private var didActivate = false
+    private var galleryMapStartToken: UUID?
+    private var webUIStartToken: UUID?
+    private var isWebUIStartInFlight = false
+    private var isWebUIStopInFlight = false
+    private var isWebUICacheClearInProgress = false
+    private var pendingWebUIStart: PendingWebUIStart?
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
     private var titleLatencyStatusTask: Task<Void, Never>?
     private var diagnosticActions: [IronmeshRecentAction] = []
+
+    private enum PendingWebUIStart {
+        case webUI
+        case galleryMap
+    }
 
     var isSyncProfileMutationInProgress: Bool {
         syncProfileOperationState.isMutationInProgress
@@ -913,61 +924,6 @@ final class IronmeshBrowserModel: ObservableObject {
         }
     }
 
-    func clearAppSetup() {
-        closeWebUI()
-        do {
-            try settingsStore.clear()
-        } catch {
-            lastErrorMessage = error.localizedDescription
-            statusText = error.localizedDescription
-            addAction("Clear setup failed", detail: error.localizedDescription)
-            return
-        }
-        draft = IronmeshConnectionDraft(
-            deviceLabel: draft.deviceLabel,
-            domainIdentifier: bundleDefaults.domainIdentifier,
-            domainDisplayName: bundleDefaults.domainDisplayName
-        )
-        hasCompletedOnboarding = false
-        clearDirectoryAfterConnectionContextChange()
-        lastSuccessfulConnectionAt = nil
-        lastErrorMessage = nil
-        connectionDiagnostics = nil
-        invalidateConnectionRouteState()
-        webUIPresentation = nil
-        statusText = "Setup cleared. Finish onboarding to reconnect."
-        addAction("Cleared setup", detail: "App connection and identity fields were reset.")
-        configureTitleLatencyMonitor()
-    }
-
-    func clearIdentity() {
-        closeWebUI()
-        var clearedDraft = draft
-        clearedDraft.clientIdentityJSON = ""
-        clearedDraft.serverCAPem = ""
-        clearedDraft.enrolledDeviceID = ""
-        do {
-            try settingsStore.save(
-                clearedDraft.appliedConnectionState(
-                    defaultBootstrapInput: bundleDefaults.bootstrapInput
-                )
-            )
-        } catch {
-            lastErrorMessage = error.localizedDescription
-            statusText = error.localizedDescription
-            addAction("Clear identity failed", detail: error.localizedDescription)
-            return
-        }
-        draft = clearedDraft
-        if clearedDraft.requiresEnrollment {
-            hasCompletedOnboarding = false
-        }
-        invalidateConnectionRouteState()
-        clearDirectoryAfterConnectionContextChange()
-        addAction("Cleared identity material", detail: "Removed client identity JSON and custom CA.")
-        configureTitleLatencyMonitor()
-    }
-
     func applyScannedCode(_ scannedValue: String) {
         if draft.applyScannedCode(scannedValue) {
             lastErrorMessage = nil
@@ -1035,7 +991,9 @@ final class IronmeshBrowserModel: ObservableObject {
                 invalidateConnectionRouteState()
 
                 if let configuration = draft.connectionConfiguration {
-                    connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                    connectionDiagnostics = try? await Task.detached(priority: .utility) {
+                        try remoteSession.connectionDiagnostics(configuration: configuration)
+                    }.value
                 }
 
                 lastErrorMessage = nil
@@ -1192,7 +1150,25 @@ final class IronmeshBrowserModel: ObservableObject {
 
     func openWebUI() {
         if galleryMapPresentation != nil {
+            pendingWebUIStart = .webUI
             closeGalleryMap()
+            return
+        }
+        guard webUIPresentation == nil else {
+            return
+        }
+        guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
+            if isWebUICacheClearInProgress {
+                statusText = "Clearing cached Web UI data."
+            } else {
+                statusText = "An embedded view is already opening."
+            }
+            return
+        }
+        if isWebUIStopInFlight {
+            pendingWebUIStart = .webUI
+            statusText = "Closing embedded view."
+            return
         }
         guard let configuration = draft.connectionConfiguration else {
             let message = "A connection bootstrap bundle is required."
@@ -1201,20 +1177,36 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
 
+        let startToken = UUID()
+        galleryMapStartToken = nil
+        webUIStartToken = startToken
+        isWebUIStartInFlight = true
         let remoteSession = remoteSession
         beginOperation()
         Task {
-            defer { endOperation() }
+            defer {
+                isWebUIStartInFlight = false
+                endOperation()
+            }
 
             do {
                 let session = try await Task.detached(priority: .userInitiated) {
                     try remoteSession.startWebUI(configuration: configuration)
                 }.value
+                guard webUIStartToken == startToken else {
+                    try? await Task.detached(priority: .userInitiated) {
+                        try remoteSession.stopWebUI()
+                    }.value
+                    return
+                }
                 webUIPresentation = IronmeshWebUIPresentation(session: session)
                 lastErrorMessage = nil
                 statusText = "Opened embedded web UI."
                 addAction("Opened web UI", detail: "Started isolated loopback session.")
             } catch {
+                guard webUIStartToken == startToken else {
+                    return
+                }
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Web UI failed", detail: error.localizedDescription)
@@ -1223,15 +1215,15 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func closeWebUI() {
+        webUIStartToken = nil
         guard webUIPresentation != nil else {
+            if pendingWebUIStart == .webUI {
+                pendingWebUIStart = nil
+            }
             return
         }
         webUIPresentation = nil
-        do {
-            try remoteSession.stopWebUI()
-        } catch {
-            lastErrorMessage = error.localizedDescription
-        }
+        stopWebUIAsync()
     }
 
     func openGalleryMap() {
@@ -1239,7 +1231,22 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
         if webUIPresentation != nil {
+            pendingWebUIStart = .galleryMap
             closeWebUI()
+            return
+        }
+        guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
+            if isWebUICacheClearInProgress {
+                statusText = "Clearing cached Web UI data."
+            } else {
+                statusText = "An embedded view is already opening."
+            }
+            return
+        }
+        if isWebUIStopInFlight {
+            pendingWebUIStart = .galleryMap
+            statusText = "Closing embedded view."
+            return
         }
         guard let configuration = draft.connectionConfiguration else {
             let message = "A connection bootstrap bundle is required."
@@ -1248,20 +1255,36 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
 
+        let startToken = UUID()
+        webUIStartToken = nil
+        galleryMapStartToken = startToken
+        isWebUIStartInFlight = true
         let remoteSession = remoteSession
         beginOperation()
         Task {
-            defer { endOperation() }
+            defer {
+                isWebUIStartInFlight = false
+                endOperation()
+            }
 
             do {
                 let session = try await Task.detached(priority: .userInitiated) {
                     try remoteSession.startWebUI(configuration: configuration)
                 }.value
+                guard galleryMapStartToken == startToken else {
+                    try? await Task.detached(priority: .userInitiated) {
+                        try remoteSession.stopWebUI()
+                    }.value
+                    return
+                }
                 galleryMapPresentation = IronmeshWebUIPresentation(session: session)
                 lastErrorMessage = nil
                 statusText = "Opened embedded gallery map."
                 addAction("Opened gallery map", detail: "Started isolated loopback session.")
             } catch {
+                guard galleryMapStartToken == startToken else {
+                    return
+                }
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Gallery map failed", detail: error.localizedDescription)
@@ -1270,32 +1293,80 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func closeGalleryMap() {
+        galleryMapStartToken = nil
         guard galleryMapPresentation != nil else {
+            if pendingWebUIStart == .galleryMap {
+                pendingWebUIStart = nil
+            }
             return
         }
         galleryMapPresentation = nil
-        do {
-            try remoteSession.stopWebUI()
-        } catch {
-            lastErrorMessage = error.localizedDescription
+        stopWebUIAsync()
+    }
+
+    private func stopWebUIAsync() {
+        guard !isWebUIStopInFlight else {
+            return
+        }
+        isWebUIStopInFlight = true
+        let remoteSession = remoteSession
+        Task {
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try remoteSession.stopWebUI()
+                }.value
+                let pendingStart = pendingWebUIStart
+                pendingWebUIStart = nil
+                isWebUIStopInFlight = false
+                switch pendingStart {
+                case .webUI:
+                    openWebUI()
+                case .galleryMap:
+                    openGalleryMap()
+                case nil:
+                    break
+                }
+            } catch {
+                pendingWebUIStart = nil
+                isWebUIStopInFlight = false
+                lastErrorMessage = error.localizedDescription
+            }
         }
     }
 
     /// Removes discardable local data without touching enrollment, connection settings, or files.
     /// A running embedded Web UI is stopped first so no open SQLite VFS handle can retain chunks.
     func clearCachedData() {
+        guard !isWebUIStartInFlight else {
+            statusText = "Wait for the embedded view to finish opening before clearing cached data."
+            return
+        }
+        guard !isWebUIStopInFlight else {
+            statusText = "Wait for the embedded view to finish closing before clearing cached data."
+            return
+        }
+        guard !isWebUICacheClearInProgress else {
+            return
+        }
+        isWebUICacheClearInProgress = true
+        pendingWebUIStart = nil
+        webUIStartToken = nil
+        galleryMapStartToken = nil
+        webUIPresentation = nil
+        galleryMapPresentation = nil
         let remoteSession = remoteSession
         beginOperation()
         Task {
-            defer { endOperation() }
+            defer {
+                isWebUICacheClearInProgress = false
+                endOperation()
+            }
             do {
                 try await Task.detached(priority: .userInitiated) {
                     try remoteSession.stopWebUI()
                     clearIronmeshCachedFiles()
                 }.value
                 URLCache.shared.removeAllCachedResponses()
-                webUIPresentation = nil
-                galleryMapPresentation = nil
                 lastErrorMessage = nil
                 statusText = "Cached data cleared. Reopen the Web UI to fetch fresh map data."
                 addAction("Cleared cached data", detail: "Removed local map and Web UI cache data.")
@@ -1515,7 +1586,9 @@ final class IronmeshBrowserModel: ObservableObject {
                     return
                 }
 
-                let diagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                let diagnostics = try? await Task.detached(priority: .utility) {
+                    try remoteSession.connectionDiagnostics(configuration: configuration)
+                }.value
                 guard directoryLoadCoordinator.acceptsSharedState(request) else {
                     return
                 }
@@ -1531,10 +1604,13 @@ final class IronmeshBrowserModel: ObservableObject {
                 guard directoryLoadCoordinator.acceptsSharedState(request) else {
                     return
                 }
-                connectionDiagnostics = try? remoteSession.connectionDiagnostics(configuration: configuration)
+                let diagnostics = try? await Task.detached(priority: .utility) {
+                    try remoteSession.connectionDiagnostics(configuration: configuration)
+                }.value
                 guard directoryLoadCoordinator.acceptsSharedState(request) else {
                     return
                 }
+                connectionDiagnostics = diagnostics
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Browse failed", detail: error.localizedDescription)
@@ -1607,6 +1683,7 @@ private func appleDiagnosticPlatformName() -> String {
 final class IronmeshRemoteSession: @unchecked Sendable {
     private let bridge: AppleCFacadeBridge
     private let lock = NSLock()
+    private let operationLock = NSLock()
     private var configurationKey: String?
 
     init(ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter(connectionName: "ios app shell")) {
@@ -1614,8 +1691,9 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     }
 
     func list(path: String, configuration: AppleConnectionConfiguration) throws -> [AppleBridgeItem] {
-        try connectIfNeeded(configuration)
-        return sortedItems(try bridge.list(path: path, depth: 1))
+        try withBridge(configuration) { bridge in
+            sortedItems(try bridge.list(path: path, depth: 1))
+        }
     }
 
     func download(
@@ -1623,15 +1701,17 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         revisionHint: String?,
         configuration: AppleConnectionConfiguration
     ) throws -> Data {
-        try connectIfNeeded(configuration)
-        return try bridge.download(path: path, revisionHint: revisionHint)
+        try withBridge(configuration) { bridge in
+            try bridge.download(path: path, revisionHint: revisionHint)
+        }
     }
 
     func connectionDiagnostics(
         configuration: AppleConnectionConfiguration
     ) throws -> IronmeshConnectionDiagnosticsSnapshot {
-        try connectIfNeeded(configuration)
-        let json = try bridge.connectionDiagnosticsJSON()
+        let json = try withBridge(configuration) { bridge in
+            try bridge.connectionDiagnosticsJSON()
+        }
         return try decode(IronmeshConnectionDiagnosticsSnapshot.self, from: json)
     }
 
@@ -1639,37 +1719,43 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         configuration: AppleConnectionConfiguration,
         refresh: Bool
     ) throws -> AppleConnectionRouteSnapshot {
-        try connectIfNeeded(configuration)
-        let json = try bridge.connectionRouteSnapshotJSON(refresh: refresh)
+        let json = try withBridge(configuration) { bridge in
+            try bridge.connectionRouteSnapshotJSON(refresh: refresh)
+        }
         return try decode(AppleConnectionRouteSnapshot.self, from: json)
     }
 
     func notifyForegrounded(
         configuration: AppleConnectionConfiguration
     ) throws -> String? {
-        try connectIfNeeded(configuration)
-        try bridge.notifyForegrounded()
-        return try bridge.takeClientIdentityUpdateJSON().nilIfBlank
+        try withBridge(configuration) { bridge in
+            try bridge.notifyForegrounded()
+            return try bridge.takeClientIdentityUpdateJSON().nilIfBlank
+        }
     }
 
     func configureTitleLatencyMonitor(
         configuration: AppleConnectionConfiguration,
         settings: AppleTitleLatencyMonitorSettings
     ) throws -> AppleTitleLatencyStatus {
-        try connectIfNeeded(configuration)
-        let json = try bridge.configureTitleLatencyMonitorJSON(settings: settings)
+        let json = try withBridge(configuration) { bridge in
+            try bridge.configureTitleLatencyMonitorJSON(settings: settings)
+        }
         return try decode(AppleTitleLatencyStatus.self, from: json)
     }
 
     func titleLatencyStatus(
         configuration: AppleConnectionConfiguration
     ) throws -> AppleTitleLatencyStatus {
-        try connectIfNeeded(configuration)
-        let json = try bridge.titleLatencyStatusJSON()
+        let json = try withBridge(configuration) { bridge in
+            try bridge.titleLatencyStatusJSON()
+        }
         return try decode(AppleTitleLatencyStatus.self, from: json)
     }
 
     func disableTitleLatencyMonitor() throws {
+        operationLock.lock()
+        defer { operationLock.unlock() }
         lock.lock()
         let hasConnection = configurationKey != nil
         lock.unlock()
@@ -1682,29 +1768,33 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     }
 
     func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
-        try bridge.startWebUI(configuration: configuration)
+        return try bridge.startWebUI(configuration: configuration)
     }
 
     func stopWebUI() throws {
         try bridge.stopWebUI()
     }
 
+    private func withBridge<T>(
+        _ configuration: AppleConnectionConfiguration,
+        operation: (AppleCFacadeBridge) throws -> T
+    ) throws -> T {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        try connectIfNeeded(configuration)
+        return try operation(bridge)
+    }
+
     private func connectIfNeeded(_ configuration: AppleConnectionConfiguration) throws {
         let nextKey = configuration.cacheKey
 
         lock.lock()
-        let currentKey = configurationKey
-        lock.unlock()
-
-        guard currentKey != nextKey else {
+        defer { lock.unlock() }
+        if configurationKey == nextKey {
             return
         }
-
         _ = try bridge.connect(configuration)
-
-        lock.lock()
         configurationKey = nextKey
-        lock.unlock()
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from json: String) throws -> T {

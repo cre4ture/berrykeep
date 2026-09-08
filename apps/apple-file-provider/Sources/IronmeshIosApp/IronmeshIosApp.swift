@@ -23,7 +23,8 @@ struct IronmeshIosApp: App {
                         accentColorHex: AppleAccentColor.defaultHex,
                         isStarting: false,
                         statusMessage: "",
-                        onStart: {}
+                        onStart: {},
+                        onClose: {}
                     )
                 } else {
                     IronmeshHostedWebView(
@@ -125,33 +126,54 @@ private struct IronmeshIosRootView: View {
     }
 }
 
+private enum IronmeshMainShellTab: Hashable {
+    case home
+    case library
+    case galleryMap
+    case files
+    case settings
+}
+
 private struct IronmeshMainShellView: View {
+    @EnvironmentObject private var model: IronmeshBrowserModel
+    @State private var selectedTab: IronmeshMainShellTab = .home
+
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             IronmeshHomeView()
                 .tabItem {
                     Label("Home", systemImage: "house")
                 }
+                .tag(IronmeshMainShellTab.home)
 
             IronmeshLibraryView()
                 .tabItem {
                     Label("Library", systemImage: "books.vertical")
                 }
+                .tag(IronmeshMainShellTab.library)
 
             IronmeshGalleryMapView()
                 .tabItem {
                     Label("Gallery Map", systemImage: "map")
                 }
+                .tag(IronmeshMainShellTab.galleryMap)
 
             IronmeshFilesView()
                 .tabItem {
                     Label("Files", systemImage: "folder.badge.gearshape")
                 }
+                .tag(IronmeshMainShellTab.files)
 
             IronmeshSettingsView()
                 .tabItem {
                     Label("Settings", systemImage: "gearshape")
                 }
+                .tag(IronmeshMainShellTab.settings)
+        }
+        .onChange(of: selectedTab) { tab in
+            if tab != .galleryMap {
+                model.closeGalleryMap()
+            }
         }
     }
 }
@@ -169,11 +191,9 @@ private struct IronmeshGalleryMapView: View {
             accentColorHex: model.themeAccentColorHex,
             isStarting: model.isBusy,
             statusMessage: model.statusText,
-            onStart: model.openGalleryMap
+            onStart: model.openGalleryMap,
+            onClose: model.closeGalleryMap
         )
-        .onDisappear {
-            model.closeGalleryMap()
-        }
     }
 }
 
@@ -183,6 +203,7 @@ private struct IronmeshGalleryMapContent: View {
     let isStarting: Bool
     let statusMessage: String
     let onStart: () -> Void
+    let onClose: () -> Void
 
     var body: some View {
         if let session, let galleryMapSession = galleryMapWebUiSession(from: session) {
@@ -190,10 +211,22 @@ private struct IronmeshGalleryMapContent: View {
                 session: galleryMapSession,
                 accentColorHex: accentColorHex
             )
-                .ignoresSafeArea()
+            .ignoresSafeArea()
         } else {
             galleryMapStartCard
+                .task(id: hasInvalidSession) {
+                    if hasInvalidSession {
+                        onClose()
+                    }
+                }
         }
+    }
+
+    private var hasInvalidSession: Bool {
+        guard let session else {
+            return false
+        }
+        return galleryMapWebUiSession(from: session) == nil
     }
 
     private var galleryMapStartCard: some View {
@@ -1078,54 +1111,20 @@ private func diagnosticLogFilename(now: Date = Date()) -> String {
 
 private struct IronmeshSettingsView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
-    @State private var showsScanner = false
     @State private var showsExperimentalNodePriorities = false
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Connection") {
-                    if let normalizedConnectionInput = model.draft.normalizedConnectionInput {
-                        IronmeshInlineNote(text: normalizedConnectionInput)
-                    } else {
-                        IronmeshInlineNote(text: "Import a connection bootstrap bundle below.")
-                    }
-
-                    if model.draft.requiresEnrollment {
-                        IronmeshInlineNote(
-                            text: "This bootstrap bundle requires device enrollment before the app can reconnect."
-                        )
-                    }
-
-                    Button(model.draft.requiresEnrollment ? "Go to enrollment" : "Apply and reconnect") {
-                        model.applyConnectionSettings()
-                    }
+                    IronmeshInlineNote(
+                        text: "Connection setup cannot be changed from Settings."
+                    )
                 }
 
-                Section("Identity") {
-                    TextField("Device label (optional)", text: draftBinding(\.deviceLabel))
-                        .textInputAutocapitalization(.words)
-
-                    if let enrolledDeviceID = model.draft.enrolledDeviceID.nilIfBlank {
+                if let enrolledDeviceID = model.draft.enrolledDeviceID.nilIfBlank {
+                    Section("Device") {
                         IronmeshInlineNote(text: "Enrolled device: \(enrolledDeviceID)")
-                    }
-
-                    IronmeshMultilineEditor(
-                        title: "Client identity JSON",
-                        text: draftBinding(\.clientIdentityJSON),
-                        prompt: "Optional JSON identity material."
-                    )
-
-                    IronmeshMultilineEditor(
-                        title: "Server CA PEM",
-                        text: draftBinding(\.serverCAPem),
-                        prompt: "Optional CA override for bootstrap-advertised HTTPS routes."
-                    )
-
-                    if model.draft.hasClientIdentity || model.draft.serverCAPem.nilIfBlank != nil {
-                        Button("Clear identity material", role: .destructive) {
-                            model.clearIdentity()
-                        }
                     }
                 }
 
@@ -1195,38 +1194,6 @@ private struct IronmeshSettingsView: View {
                     Text("The embedded web interface uses this color as well.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                }
-
-                Section("Bootstrap") {
-                    IronmeshMultilineEditor(
-                        title: "Bootstrap bundle",
-                        text: draftBinding(\.bootstrapInput),
-                        prompt: "Paste bootstrap JSON here or import it from a QR code."
-                    )
-
-                    if model.draft.requiresEnrollment {
-                        IronmeshInlineNote(
-                            text: "Enrollment will mint client identity material for this bootstrap bundle."
-                        )
-                    }
-
-                    HStack {
-                        Button("Scan QR") {
-                            showsScanner = true
-                        }
-                        .buttonStyle(.bordered)
-
-                        if model.draft.hasBootstrapPayload {
-                            Button(model.draft.requiresEnrollment ? "Enroll device" : "Re-enroll device") {
-                                model.enrollDevice()
-                            }
-                            .buttonStyle(.borderedProminent)
-
-                            Button("Clear bootstrap", role: .destructive) {
-                                model.draft.bootstrapInput = ""
-                            }
-                        }
-                    }
                 }
 
                 Section("Cached data") {
@@ -1307,8 +1274,6 @@ private struct IronmeshSettingsView: View {
                         }
                     }
 
-                    TextField("Domain display name", text: draftBinding(\.domainDisplayName))
-                    TextField("Domain identifier", text: draftBinding(\.domainIdentifier))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
 
@@ -1316,13 +1281,6 @@ private struct IronmeshSettingsView: View {
                         model.openWebUI()
                     }
 
-                    Button("Restore bundled defaults") {
-                        model.resetToBundleDefaults()
-                    }
-
-                    Button("Clear app setup", role: .destructive) {
-                        model.clearAppSetup()
-                    }
                 }
 
                 Section("Provider note") {
@@ -1335,11 +1293,6 @@ private struct IronmeshSettingsView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     IronmeshTitleLatencyToolbarItem()
                 }
-            }
-        }
-        .sheet(isPresented: $showsScanner) {
-            IronmeshScannerSheet { payload in
-                model.applyScannedCode(payload)
             }
         }
     }
