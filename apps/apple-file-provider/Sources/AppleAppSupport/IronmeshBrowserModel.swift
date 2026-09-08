@@ -1625,7 +1625,9 @@ private func appleDiagnosticPlatformName() -> String {
 final class IronmeshRemoteSession: @unchecked Sendable {
     private let bridge: AppleCFacadeBridge
     private let lock = NSLock()
+    private let connectLock = NSLock()
     private var configurationKey: String?
+    private var pendingConnectionChanges = 0
 
     init(ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter(connectionName: "ios app shell")) {
         bridge = AppleCFacadeBridge(ffi: ffi)
@@ -1696,7 +1698,7 @@ final class IronmeshRemoteSession: @unchecked Sendable {
 
     func disableTitleLatencyMonitor() throws {
         lock.lock()
-        let hasConnection = configurationKey != nil
+        let hasConnection = configurationKey != nil && pendingConnectionChanges == 0
         lock.unlock()
         guard hasConnection else {
             return
@@ -1726,11 +1728,33 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         let nextKey = configuration.cacheKey
 
         lock.lock()
-        defer { lock.unlock() }
-        if configurationKey != nextKey {
-            _ = try bridge.connect(configuration)
-            configurationKey = nextKey
+        if configurationKey == nextKey {
+            lock.unlock()
+            return
         }
+        pendingConnectionChanges += 1
+        lock.unlock()
+
+        connectLock.lock()
+        defer { connectLock.unlock() }
+        defer {
+            lock.lock()
+            pendingConnectionChanges -= 1
+            lock.unlock()
+        }
+
+        lock.lock()
+        if configurationKey == nextKey {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        _ = try bridge.connect(configuration)
+
+        lock.lock()
+        configurationKey = nextKey
+        lock.unlock()
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from json: String) throws -> T {
