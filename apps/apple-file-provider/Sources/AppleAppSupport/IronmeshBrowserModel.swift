@@ -1710,8 +1710,9 @@ final class IronmeshRemoteSession: @unchecked Sendable {
 
     func disableTitleLatencyMonitor() throws {
         lock.lock()
-        defer { lock.unlock() }
-        guard configurationKey != nil else {
+        let hasConnection = configurationKey != nil
+        lock.unlock()
+        guard hasConnection else {
             return
         }
         _ = try bridge.configureTitleLatencyMonitorJSON(
@@ -1731,6 +1732,11 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         _ configuration: AppleConnectionConfiguration,
         operation: (AppleCFacadeBridge) throws -> T
     ) throws -> T {
+        try connectIfNeeded(configuration)
+        return try operation(bridge)
+    }
+
+    private func connectIfNeeded(_ configuration: AppleConnectionConfiguration) throws {
         let nextKey = configuration.cacheKey
 
         lock.lock()
@@ -1739,7 +1745,6 @@ final class IronmeshRemoteSession: @unchecked Sendable {
             _ = try bridge.connect(configuration)
             configurationKey = nextKey
         }
-        return try operation(bridge)
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from json: String) throws -> T {

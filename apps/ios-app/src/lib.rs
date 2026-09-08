@@ -1633,7 +1633,7 @@ pub extern "C" fn ironmesh_ios_facade_stop_web_ui(out_error: *mut *mut c_char) -
 }
 
 fn build_runtime() -> Result<Runtime> {
-    let runtime = Builder::new_current_thread()
+    let runtime = Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create iOS facade runtime")?;
