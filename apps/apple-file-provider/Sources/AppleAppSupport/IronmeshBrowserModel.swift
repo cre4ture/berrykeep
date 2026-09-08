@@ -917,61 +917,6 @@ final class IronmeshBrowserModel: ObservableObject {
         }
     }
 
-    func clearAppSetup() {
-        closeWebUI()
-        do {
-            try settingsStore.clear()
-        } catch {
-            lastErrorMessage = error.localizedDescription
-            statusText = error.localizedDescription
-            addAction("Clear setup failed", detail: error.localizedDescription)
-            return
-        }
-        draft = IronmeshConnectionDraft(
-            deviceLabel: draft.deviceLabel,
-            domainIdentifier: bundleDefaults.domainIdentifier,
-            domainDisplayName: bundleDefaults.domainDisplayName
-        )
-        hasCompletedOnboarding = false
-        clearDirectoryAfterConnectionContextChange()
-        lastSuccessfulConnectionAt = nil
-        lastErrorMessage = nil
-        connectionDiagnostics = nil
-        invalidateConnectionRouteState()
-        webUIPresentation = nil
-        statusText = "Setup cleared. Finish onboarding to reconnect."
-        addAction("Cleared setup", detail: "App connection and identity fields were reset.")
-        configureTitleLatencyMonitor()
-    }
-
-    func clearIdentity() {
-        closeWebUI()
-        var clearedDraft = draft
-        clearedDraft.clientIdentityJSON = ""
-        clearedDraft.serverCAPem = ""
-        clearedDraft.enrolledDeviceID = ""
-        do {
-            try settingsStore.save(
-                clearedDraft.appliedConnectionState(
-                    defaultBootstrapInput: bundleDefaults.bootstrapInput
-                )
-            )
-        } catch {
-            lastErrorMessage = error.localizedDescription
-            statusText = error.localizedDescription
-            addAction("Clear identity failed", detail: error.localizedDescription)
-            return
-        }
-        draft = clearedDraft
-        if clearedDraft.requiresEnrollment {
-            hasCompletedOnboarding = false
-        }
-        invalidateConnectionRouteState()
-        clearDirectoryAfterConnectionContextChange()
-        addAction("Cleared identity material", detail: "Removed client identity JSON and custom CA.")
-        configureTitleLatencyMonitor()
-    }
-
     func applyScannedCode(_ scannedValue: String) {
         if draft.applyScannedCode(scannedValue) {
             lastErrorMessage = nil
