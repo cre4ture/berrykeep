@@ -392,9 +392,14 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
 }
 
 private actor IronmeshGalleryRequestLimiter {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
     private let maximumConcurrentRequests: Int
     private var activeRequests = 0
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [Waiter] = []
 
     init(maximumConcurrentRequests: Int) {
         self.maximumConcurrentRequests = maximumConcurrentRequests
@@ -404,29 +409,49 @@ private actor IronmeshGalleryRequestLimiter {
         _ operation: @Sendable () async throws -> T
     ) async throws -> T {
         try Task.checkCancellation()
-        await acquire()
+        try await acquire()
         defer { release() }
         try Task.checkCancellation()
         return try await operation()
     }
 
-    private func acquire() async {
+    private func acquire() async throws {
         if activeRequests < maximumConcurrentRequests {
             activeRequests += 1
             return
         }
-        await withCheckedContinuation { waiter in
-            waiters.append(waiter)
+
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                waiters.append(Waiter(id: waiterID, continuation: continuation))
+            }
+        } onCancel: {
+            Task {
+                await self.cancelWaiter(id: waiterID)
+            }
         }
     }
 
     private func release() {
         if let waiter = waiters.first {
             waiters.removeFirst()
-            waiter.resume()
+            waiter.continuation.resume()
         } else {
             activeRequests -= 1
         }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
     }
 }
 
