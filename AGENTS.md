@@ -2,6 +2,8 @@
 
 Official project language: English.
 
+Automatically create and update a PR.
+
 Prefer one worktree per PR.
 
 Assume concurrent development across hosts. Refresh remote state before integrating or pushing.
