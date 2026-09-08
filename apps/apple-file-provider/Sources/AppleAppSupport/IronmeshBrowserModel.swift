@@ -1634,6 +1634,16 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         }
     }
 
+    func download(
+        path: String,
+        revisionHint: String?,
+        configuration: AppleConnectionConfiguration
+    ) throws -> Data {
+        try withBridge(configuration) { bridge in
+            try bridge.download(path: path, revisionHint: revisionHint)
+        }
+    }
+
     func connectionDiagnostics(
         configuration: AppleConnectionConfiguration
     ) throws -> IronmeshConnectionDiagnosticsSnapshot {
