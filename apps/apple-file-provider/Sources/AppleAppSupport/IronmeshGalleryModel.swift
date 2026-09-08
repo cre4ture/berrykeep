@@ -71,7 +71,6 @@ final class IronmeshGalleryModel: ObservableObject {
         entries = []
         totalCount = 0
         errorMessage = nil
-        remoteSession.activate(configuration: configuration)
         imageRepository.prepare(for: configuration)
         loadPage(context: context, generation: generation, offset: 0)
     }
@@ -250,8 +249,6 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
     }
 
     func prepare(for configuration: AppleConnectionConfiguration) {
-        thumbnailSessions.forEach { $0.activate(configuration: configuration) }
-        fullImageSession.activate(configuration: configuration)
         cacheContextLock.lock()
         defer { cacheContextLock.unlock() }
         let preparation = cacheContextGate.prepare(for: configuration)
@@ -478,16 +475,9 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
     private let bridge: AppleCFacadeBridge
     private let lock = NSLock()
     private var configuration: AppleConnectionConfiguration?
-    private var activeConfiguration: AppleConnectionConfiguration?
 
     init(ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter(connectionName: "ios gallery")) {
         bridge = AppleCFacadeBridge(ffi: ffi)
-    }
-
-    func activate(configuration: AppleConnectionConfiguration) {
-        lock.lock()
-        activeConfiguration = configuration
-        lock.unlock()
     }
 
     func storeIndex(
@@ -534,21 +524,10 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        guard activeConfiguration == nil || activeConfiguration == nextConfiguration else {
-            throw IronmeshGalleryRemoteSessionError.staleConfiguration
-        }
         if configuration != nextConfiguration {
             _ = try bridge.connect(nextConfiguration)
             configuration = nextConfiguration
         }
         return try operation(bridge)
-    }
-}
-
-private enum IronmeshGalleryRemoteSessionError: LocalizedError {
-    case staleConfiguration
-
-    var errorDescription: String? {
-        "The gallery connection changed before the request finished."
     }
 }
