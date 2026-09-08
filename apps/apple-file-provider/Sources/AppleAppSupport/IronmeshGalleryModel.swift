@@ -226,7 +226,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
     private let fullImageSession: IronmeshGalleryRemoteSession
     private let cacheContextLock = NSLock()
     private var cacheContextGate = AppleGalleryCacheContextGate()
-    private let thumbnailRequestLimiter: IronmeshGalleryRequestLimiter
+    private let thumbnailSessionPool: IronmeshGalleryThumbnailSessionPool
 
     init(
         thumbnailSessions: [IronmeshGalleryRemoteSession]? = nil,
@@ -237,8 +237,8 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
             : (0..<4).map { _ in IronmeshGalleryRemoteSession() }
         self.thumbnailSessions = resolvedThumbnailSessions
         self.fullImageSession = fullImageSession
-        thumbnailRequestLimiter = IronmeshGalleryRequestLimiter(
-            maximumConcurrentRequests: resolvedThumbnailSessions.count
+        thumbnailSessionPool = IronmeshGalleryThumbnailSessionPool(
+            sessionCount: resolvedThumbnailSessions.count
         )
         thumbnailCache.countLimit = 160
         thumbnailCache.totalCostLimit = 48 * 1_024 * 1_024
@@ -306,8 +306,9 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
         }
 
         let relativePath = AppleGalleryThumbnailPath.relativePath(for: entry, profile: profile)
-        let thumbnailSession = thumbnailSession(for: entry.path)
-        let data = try await thumbnailRequestLimiter.perform(priority: priority) {
+        let thumbnailSessions = thumbnailSessions
+        let data = try await thumbnailSessionPool.perform(priority: priority) { sessionIndex in
+            let thumbnailSession = thumbnailSessions[sessionIndex]
             try await Task.detached(priority: priority) {
                 try thumbnailSession.fetchRelativeBytes(
                     path: relativePath,
@@ -384,57 +385,49 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
         cache.setObject(data as NSData, forKey: key as NSString, cost: data.count)
     }
 
-    private func thumbnailSession(for path: String) -> IronmeshGalleryRemoteSession {
-        var hash: UInt64 = 5381
-        for byte in path.utf8 {
-            hash = ((hash << 5) &+ hash) &+ UInt64(byte)
-        }
-        return thumbnailSessions[Int(hash % UInt64(thumbnailSessions.count))]
-    }
 }
 
-private actor IronmeshGalleryRequestLimiter {
+private actor IronmeshGalleryThumbnailSessionPool {
     private struct Waiter {
         let id: UUID
         let priority: TaskPriority
-        let continuation: CheckedContinuation<Void, Error>
+        let continuation: CheckedContinuation<Int, Error>
     }
 
-    private let maximumConcurrentRequests: Int
-    private var activeRequests = 0
+    private var availableSessionIndices: [Int]
     private var waiters: [Waiter] = []
 
-    init(maximumConcurrentRequests: Int) {
-        self.maximumConcurrentRequests = maximumConcurrentRequests
+    init(sessionCount: Int) {
+        precondition(sessionCount > 0)
+        availableSessionIndices = Array(0..<sessionCount)
     }
 
     func perform<T: Sendable>(
         priority: TaskPriority,
-        _ operation: @Sendable () async throws -> T
+        _ operation: @Sendable (Int) async throws -> T
     ) async throws -> T {
         try Task.checkCancellation()
-        try await acquire()
-        defer { release() }
+        let sessionIndex = try await acquire(priority: priority)
+        defer { release(sessionIndex) }
         try Task.checkCancellation()
-        return try await operation()
+        return try await operation(sessionIndex)
     }
 
-    private func acquire() async throws {
-        if activeRequests < maximumConcurrentRequests {
-            activeRequests += 1
-            return
+    private func acquire(priority: TaskPriority) async throws -> Int {
+        if let sessionIndex = availableSessionIndices.popLast() {
+            return sessionIndex
         }
 
         let waiterID = UUID()
         try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
                 if Task.isCancelled {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
-                    waiters.append(
-                        Waiter(id: waiterID, priority: priority, continuation: continuation)
-                    )
+                waiters.append(
+                    Waiter(id: waiterID, priority: priority, continuation: continuation)
+                )
             }
         } onCancel: {
             Task {
@@ -443,14 +436,14 @@ private actor IronmeshGalleryRequestLimiter {
         }
     }
 
-    private func release() {
+    private func release(_ sessionIndex: Int) {
         if let index = waiters.indices.max(by: {
             waiters[$0].priority.rawValue < waiters[$1].priority.rawValue
         }) {
             let waiter = waiters.remove(at: index)
-            waiter.continuation.resume()
+            waiter.continuation.resume(returning: sessionIndex)
         } else {
-            activeRequests -= 1
+            availableSessionIndices.append(sessionIndex)
         }
     }
 
