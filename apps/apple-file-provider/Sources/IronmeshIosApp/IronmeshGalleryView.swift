@@ -14,14 +14,16 @@ struct IronmeshGalleryView: View {
     @State private var showSensitiveContent = false
     @State private var selection: IronmeshGallerySelection?
 
-    init(remoteSession _: IronmeshRemoteSession) {
+    init() {
         _galleryModel = StateObject(wrappedValue: {
             let gallerySession = IronmeshGalleryRemoteSession()
+            let thumbnailSessions = (0..<4).map { _ in IronmeshGalleryRemoteSession() }
+            let fullImageSession = IronmeshGalleryRemoteSession()
             return IronmeshGalleryModel(
                 remoteSession: gallerySession,
                 imageRepository: IronmeshGalleryImageRepository(
-                    thumbnailSessions: [gallerySession],
-                    fullImageSession: gallerySession
+                    thumbnailSessions: thumbnailSessions,
+                    fullImageSession: fullImageSession
                 )
             )
         }())

@@ -185,10 +185,6 @@ final class IronmeshBrowserModel: ObservableObject {
 
     let bundleDefaults: IronmeshConnectionDraft
 
-    var galleryRemoteSession: IronmeshRemoteSession {
-        remoteSession
-    }
-
     private let remoteSession: IronmeshRemoteSession
     private let settingsStore: AppleConnectionSettingsStore
     private let enroller: AppleBootstrapEnroller
@@ -1635,44 +1631,6 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     func list(path: String, configuration: AppleConnectionConfiguration) throws -> [AppleBridgeItem] {
         try withBridge(configuration) { bridge in
             sortedItems(try bridge.list(path: path, depth: 1))
-        }
-    }
-
-    func storeIndex(
-        _ request: AppleStoreIndexRequest,
-        configuration: AppleConnectionConfiguration
-    ) throws -> AppleStoreIndexResponse {
-        try withBridge(configuration) { bridge in
-            try bridge.storeIndex(request)
-        }
-    }
-
-    func fetchRelativeBytes(
-        path: String,
-        configuration: AppleConnectionConfiguration
-    ) throws -> Data {
-        try withBridge(configuration) { bridge in
-            try bridge.fetchRelativeBytes(path: path)
-        }
-    }
-
-    func download(
-        path: String,
-        revisionHint: String?,
-        configuration: AppleConnectionConfiguration
-    ) throws -> Data {
-        try withBridge(configuration) { bridge in
-            try bridge.download(path: path, revisionHint: revisionHint)
-        }
-    }
-
-    func setMediaLabels(
-        path: String,
-        labels: [String],
-        configuration: AppleConnectionConfiguration
-    ) throws {
-        try withBridge(configuration) { bridge in
-            try bridge.setMediaLabels(path: path, labels: labels)
         }
     }
 
