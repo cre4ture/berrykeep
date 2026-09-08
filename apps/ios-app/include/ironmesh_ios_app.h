@@ -66,6 +66,16 @@ int ironmesh_ios_facade_store_index_with_options_json(void *handle,
                                                       char **out_json,
                                                       char **out_error);
 
+/**
+ * Replaces the XMP-sidecar labels for one media path.
+ *
+ * # Safety
+ *
+ * `handle` must be a live handle returned by this facade. `key` and
+ * `labels_json` must each point to valid, NUL-terminated UTF-8 strings for
+ * the duration of the call. When non-null, `out_error` must point to writable
+ * storage for a C string pointer owned by this facade.
+ */
 int ironmesh_ios_facade_set_media_labels_json(void *handle,
                                               const char *key,
                                               const char *labels_json,
