@@ -202,6 +202,7 @@ final class IronmeshBrowserModel: ObservableObject {
     private var didActivate = false
     private var galleryMapStartToken: UUID?
     private var webUIStartToken: UUID?
+    private var isWebUIStartInFlight = false
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
@@ -1193,11 +1194,11 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func openWebUI() {
-        guard !isBusy else {
-            return
-        }
         if galleryMapPresentation != nil {
             closeGalleryMap()
+        }
+        guard !isWebUIStartInFlight else {
+            return
         }
         guard let configuration = draft.connectionConfiguration else {
             let message = "A connection bootstrap bundle is required."
@@ -1209,10 +1210,14 @@ final class IronmeshBrowserModel: ObservableObject {
         let startToken = UUID()
         galleryMapStartToken = nil
         webUIStartToken = startToken
+        isWebUIStartInFlight = true
         let remoteSession = remoteSession
         beginOperation()
         Task {
-            defer { endOperation() }
+            defer {
+                isWebUIStartInFlight = false
+                endOperation()
+            }
 
             do {
                 let session = try await Task.detached(priority: .userInitiated) {
@@ -1253,14 +1258,14 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func openGalleryMap() {
-        guard !isBusy else {
-            return
-        }
         guard galleryMapPresentation == nil else {
             return
         }
         if webUIPresentation != nil {
             closeWebUI()
+        }
+        guard !isWebUIStartInFlight else {
+            return
         }
         guard let configuration = draft.connectionConfiguration else {
             let message = "A connection bootstrap bundle is required."
@@ -1272,10 +1277,14 @@ final class IronmeshBrowserModel: ObservableObject {
         let startToken = UUID()
         webUIStartToken = nil
         galleryMapStartToken = startToken
+        isWebUIStartInFlight = true
         let remoteSession = remoteSession
         beginOperation()
         Task {
-            defer { endOperation() }
+            defer {
+                isWebUIStartInFlight = false
+                endOperation()
+            }
 
             do {
                 let session = try await Task.detached(priority: .userInitiated) {
