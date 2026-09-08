@@ -39,6 +39,13 @@ impl ClientNode {
         }
     }
 
+    /// Returns a differently named client view while retaining this node's
+    /// in-process content cache.
+    pub fn with_connection_name(mut self, connection_name: impl Into<String>) -> Self {
+        self.client = self.client.with_connection_name(connection_name);
+        self
+    }
+
     pub async fn put(&self, key: impl Into<String>, data: Bytes) -> Result<StorageObjectMeta> {
         self.put_with_expected_revision(key, data, None).await
     }
@@ -334,5 +341,26 @@ impl ClientNode {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn named_client_view_retains_shared_content_cache() {
+        let node = ClientNode::from_direct_base_url("http://127.0.0.1:1");
+        node.cache
+            .write()
+            .await
+            .insert("cached.txt".to_string(), Bytes::from_static(b"cached"));
+
+        let named = node.clone().with_connection_name("mobile test");
+
+        assert_eq!(
+            named.cache.read().await.get("cached.txt").cloned(),
+            Some(Bytes::from_static(b"cached"))
+        );
     }
 }

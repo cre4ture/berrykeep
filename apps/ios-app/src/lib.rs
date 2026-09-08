@@ -281,12 +281,11 @@ impl IosStorageApp {
     ) -> Result<Self> {
         init_ios_tracing();
         let connection_name = normalize_optional_string(connection_name);
-        let configuration = MobileClientConfiguration::new(
+        let mobile_session = ios_mobile_client()?.connect_input(
             connection_input.into(),
             server_ca_pem,
             client_identity_json,
         )?;
-        let mobile_session = ios_mobile_client()?.connect(configuration)?;
         let mut sdk = mobile_session.base_client();
 
         if let Some(name) = connection_name.as_ref() {
@@ -324,7 +323,11 @@ impl IosStorageApp {
         managed_client: Option<ManagedIronMeshClient>,
         mobile_session: Option<MobileClientSession>,
     ) -> Result<Self> {
-        let client = ClientNode::with_client(sdk.clone());
+        let client = match (mobile_session.as_ref(), connection_name.as_ref()) {
+            (Some(session), Some(connection_name)) => session.client_node(connection_name.clone()),
+            (Some(session), None) => session.base_client_node(),
+            (None, _) => ClientNode::with_client(sdk.clone()),
+        };
         let fallback_title_latency_monitor = mobile_session
             .is_none()
             .then(|| Mutex::new(TitleLatencyMonitor::disabled()));

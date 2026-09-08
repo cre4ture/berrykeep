@@ -511,18 +511,20 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_ini
     }
 }
 
-fn runtime() -> Result<&'static tokio::runtime::Runtime> {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
+    static RUNTIME: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
     if let Some(rt) = RUNTIME.get() {
-        return Ok(rt);
+        return Ok(Arc::clone(rt));
     }
 
     init_android_tracing();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to initialize android rust runtime")?;
+    let rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("failed to initialize android rust runtime")?,
+    );
 
     if RUNTIME.set(rt).is_ok() {
         tracing::info!(
@@ -535,6 +537,7 @@ fn runtime() -> Result<&'static tokio::runtime::Runtime> {
     }
     RUNTIME
         .get()
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("runtime initialization race"))
 }
 
@@ -1892,7 +1895,9 @@ fn android_mobile_client() -> Result<&'static MobileClient> {
                     persist_android_connection_bootstrap,
                 ));
             options.web_ui_log_buffer = Some(android_web_log_buffer());
-            MobileClient::new(options).map_err(|error| format!("{error:#}"))
+            runtime()
+                .map(|runtime| MobileClient::with_runtime(runtime, options))
+                .map_err(|error| format!("{error:#}"))
         })
         .as_ref()
         .map_err(|message| anyhow::anyhow!(message.clone()))
@@ -1911,11 +1916,11 @@ fn cached_configured_sdk_build(
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
 ) -> Result<MobileClientSession> {
-    android_mobile_client()?.connect(mobile_client_configuration(
-        connection_input,
+    android_mobile_client()?.connect_input(
+        connection_input.into(),
         server_ca_pem,
         client_identity_json,
-    )?)
+    )
 }
 
 fn cached_configured_sdk(

@@ -12,7 +12,7 @@ use client_sdk::{
 use common::logging::LogBuffer;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -26,6 +26,27 @@ use web_ui_backend::{EmbeddedWebUiSessionAuthorization, WebUiBootstrapPersistenc
 pub struct MobileConnectionAffinity {
     connection_identity: String,
     client_identity: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct MobileClientInput {
+    connection_input: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+}
+
+impl MobileClientInput {
+    fn new(
+        connection_input: impl AsRef<str>,
+        server_ca_pem: Option<impl AsRef<str>>,
+        client_identity_json: Option<impl AsRef<str>>,
+    ) -> Self {
+        Self {
+            connection_input: connection_input.as_ref().trim().to_string(),
+            server_ca_pem: normalize_optional(server_ca_pem),
+            client_identity_json: normalize_optional(client_identity_json),
+        }
+    }
 }
 
 /// Parsed and normalized configuration shared by both mobile adapters.
@@ -43,7 +64,12 @@ impl MobileClientConfiguration {
         server_ca_pem: Option<impl AsRef<str>>,
         client_identity_json: Option<impl AsRef<str>>,
     ) -> Result<Self> {
-        let connection_input = connection_input.as_ref().trim();
+        let input = MobileClientInput::new(connection_input, server_ca_pem, client_identity_json);
+        Self::from_input(&input)
+    }
+
+    fn from_input(input: &MobileClientInput) -> Result<Self> {
+        let connection_input = input.connection_input.as_str();
         anyhow::ensure!(
             !connection_input.is_empty(),
             "mobile client requires a non-empty connection bootstrap"
@@ -54,11 +80,12 @@ impl MobileClientConfiguration {
         let normalized_connection_input = bootstrap
             .to_json_pretty()
             .context("failed to normalize mobile connection bootstrap JSON")?;
-        if let Some(server_ca_pem) = normalize_optional(server_ca_pem) {
-            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem);
+        if let Some(server_ca_pem) = input.server_ca_pem.as_ref() {
+            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
 
-        let client_identity = normalize_optional(client_identity_json)
+        let client_identity = input
+            .client_identity_json
             .as_deref()
             .map(ClientIdentityMaterial::from_json_str)
             .transpose()
@@ -187,6 +214,7 @@ struct MobileClientSessionInner {
     runtime: Arc<Runtime>,
     configuration: MobileClientConfiguration,
     client: IronMeshClient,
+    client_node: ClientNode,
     managed_client: Option<ManagedIronMeshClient>,
     client_identity: Option<ClientIdentityMaterial>,
 }
@@ -233,7 +261,14 @@ impl MobileClientSession {
     }
 
     pub fn client_node(&self, connection_name: impl Into<String>) -> ClientNode {
-        ClientNode::with_client(self.client(connection_name))
+        self.inner
+            .client_node
+            .clone()
+            .with_connection_name(connection_name)
+    }
+
+    pub fn base_client_node(&self) -> ClientNode {
+        self.inner.client_node.clone()
     }
 
     pub fn managed_client(&self) -> Option<ManagedIronMeshClient> {
@@ -261,6 +296,7 @@ impl MobileClientSession {
 
 struct ActiveConnection {
     affinity: MobileConnectionAffinity,
+    source_input: Option<MobileClientInput>,
     session: MobileClientSession,
 }
 
@@ -462,7 +498,7 @@ impl WebUiLifecycle {
 pub struct MobileClient {
     runtime: Arc<Runtime>,
     options: MobileClientOptions,
-    connection: Mutex<Option<ActiveConnection>>,
+    connection: RwLock<Option<ActiveConnection>>,
     title_latency_operation: Mutex<()>,
     title_latency_monitor: Mutex<TitleLatencyMonitor>,
     web_ui_operation: Mutex<()>,
@@ -483,7 +519,7 @@ impl MobileClient {
         Self {
             runtime,
             options,
-            connection: Mutex::new(None),
+            connection: RwLock::new(None),
             title_latency_operation: Mutex::new(()),
             title_latency_monitor: Mutex::new(TitleLatencyMonitor::disabled()),
             web_ui_operation: Mutex::new(()),
@@ -494,19 +530,56 @@ impl MobileClient {
     /// Returns the existing configuration-affine session or atomically replaces
     /// it. Existing leases continue to own their previous client without a lock.
     pub fn connect(&self, configuration: MobileClientConfiguration) -> Result<MobileClientSession> {
+        self.connect_prepared(configuration, None)
+    }
+
+    /// Resolves repeated FFI input through the active affine session without
+    /// reparsing bootstrap and identity JSON for every native operation.
+    pub fn connect_input(
+        &self,
+        connection_input: impl AsRef<str>,
+        server_ca_pem: Option<impl AsRef<str>>,
+        client_identity_json: Option<impl AsRef<str>>,
+    ) -> Result<MobileClientSession> {
+        let input = MobileClientInput::new(connection_input, server_ca_pem, client_identity_json);
+        {
+            let active = self
+                .connection
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(active) = active.as_ref()
+                && active.source_input.as_ref() == Some(&input)
+            {
+                return Ok(active.session.clone());
+            }
+        }
+
+        let configuration = MobileClientConfiguration::from_input(&input)?;
+        self.connect_prepared(configuration, Some(input))
+    }
+
+    fn connect_prepared(
+        &self,
+        configuration: MobileClientConfiguration,
+        source_input: Option<MobileClientInput>,
+    ) -> Result<MobileClientSession> {
         let mut active = self
             .connection
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(active) = active.as_ref()
+        if let Some(active) = active.as_mut()
             && active.affinity == *configuration.affinity()
         {
+            if source_input.is_some() {
+                active.source_input = source_input;
+            }
             return Ok(active.session.clone());
         }
 
         let session = self.build_session(configuration)?;
         *active = Some(ActiveConnection {
             affinity: session.affinity().clone(),
+            source_input,
             session: session.clone(),
         });
         Ok(session)
@@ -545,12 +618,14 @@ impl MobileClient {
                 None => (bootstrap.build_client()?, None, None),
             };
 
+        let client_node = ClientNode::with_client(client.clone());
         Ok(MobileClientSession {
             inner: Arc::new(MobileClientSessionInner {
                 id: Uuid::now_v7(),
                 runtime: self.runtime.clone(),
                 configuration,
                 client,
+                client_node,
                 managed_client,
                 client_identity,
             }),
@@ -750,7 +825,7 @@ impl MobileClient {
     /// Stops only the requested surface. Closing a stale native presentation
     /// cannot tear down a newer surface that already replaced it.
     pub fn stop_web_ui(&self, surface: MobileWebUiSurface) -> MobileWebUiCommandResult {
-        let (request_id, should_run) = {
+        let request_id = {
             let mut lifecycle = self
                 .web_ui
                 .lock()
@@ -785,9 +860,8 @@ impl MobileClient {
             });
             lifecycle.failure = None;
             lifecycle.changed();
-            (request_id, true)
+            request_id
         };
-        debug_assert!(should_run);
 
         let _operation = self
             .web_ui_operation
@@ -1000,6 +1074,19 @@ mod tests {
 
         assert_eq!(first.id(), second.id());
         assert_eq!(first.affinity(), second.affinity());
+    }
+
+    #[test]
+    fn repeated_ffi_input_reuses_one_affine_session() {
+        let client = client();
+        let first = client
+            .connect_input(test_bootstrap(18_080), None::<&str>, None::<&str>)
+            .expect("first input should connect");
+        let second = client
+            .connect_input(test_bootstrap(18_080), None::<&str>, None::<&str>)
+            .expect("matching input should connect");
+
+        assert_eq!(first.id(), second.id());
     }
 
     #[test]
