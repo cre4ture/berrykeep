@@ -203,6 +203,7 @@ final class IronmeshBrowserModel: ObservableObject {
     private var galleryMapStartToken: UUID?
     private var webUIStartToken: UUID?
     private var isWebUIStartInFlight = false
+    private var isWebUICacheClearInProgress = false
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
@@ -1197,7 +1198,7 @@ final class IronmeshBrowserModel: ObservableObject {
         if galleryMapPresentation != nil {
             closeGalleryMap()
         }
-        guard !isWebUIStartInFlight else {
+        guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
             return
         }
         guard let configuration = draft.connectionConfiguration else {
@@ -1264,7 +1265,7 @@ final class IronmeshBrowserModel: ObservableObject {
         if webUIPresentation != nil {
             closeWebUI()
         }
-        guard !isWebUIStartInFlight else {
+        guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
             return
         }
         guard let configuration = draft.connectionConfiguration else {
@@ -1327,18 +1328,27 @@ final class IronmeshBrowserModel: ObservableObject {
     /// Removes discardable local data without touching enrollment, connection settings, or files.
     /// A running embedded Web UI is stopped first so no open SQLite VFS handle can retain chunks.
     func clearCachedData() {
+        guard !isWebUICacheClearInProgress else {
+            return
+        }
+        isWebUICacheClearInProgress = true
+        webUIStartToken = nil
+        galleryMapStartToken = nil
+        webUIPresentation = nil
+        galleryMapPresentation = nil
         let remoteSession = remoteSession
         beginOperation()
         Task {
-            defer { endOperation() }
+            defer {
+                isWebUICacheClearInProgress = false
+                endOperation()
+            }
             do {
                 try await Task.detached(priority: .userInitiated) {
                     try remoteSession.stopWebUI()
                     clearIronmeshCachedFiles()
                 }.value
                 URLCache.shared.removeAllCachedResponses()
-                webUIPresentation = nil
-                galleryMapPresentation = nil
                 lastErrorMessage = nil
                 statusText = "Cached data cleared. Reopen the Web UI to fetch fresh map data."
                 addAction("Cleared cached data", detail: "Removed local map and Web UI cache data.")
