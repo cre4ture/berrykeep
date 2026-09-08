@@ -209,12 +209,19 @@ private struct IronmeshGalleryMapContent: View {
             .onDisappear(perform: onClose)
         } else {
             galleryMapStartCard
-                .onAppear {
-                    if session != nil {
+                .task(id: hasInvalidSession) {
+                    if hasInvalidSession {
                         onClose()
                     }
                 }
         }
+    }
+
+    private var hasInvalidSession: Bool {
+        guard let session else {
+            return false
+        }
+        return galleryMapWebUiSession(from: session) == nil
     }
 
     private var galleryMapStartCard: some View {
