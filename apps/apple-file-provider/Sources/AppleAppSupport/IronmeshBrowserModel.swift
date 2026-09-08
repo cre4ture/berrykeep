@@ -1157,14 +1157,17 @@ final class IronmeshBrowserModel: ObservableObject {
         guard webUIPresentation == nil else {
             return
         }
-        guard !isWebUIStartInFlight, !isWebUIStopInFlight, !isWebUICacheClearInProgress else {
+        guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
             if isWebUICacheClearInProgress {
                 statusText = "Clearing cached Web UI data."
-            } else if isWebUIStopInFlight {
-                statusText = "Closing embedded view."
             } else {
                 statusText = "An embedded view is already opening."
             }
+            return
+        }
+        if isWebUIStopInFlight {
+            pendingWebUIStart = .galleryMap
+            statusText = "Closing embedded view."
             return
         }
         guard let configuration = draft.connectionConfiguration else {
