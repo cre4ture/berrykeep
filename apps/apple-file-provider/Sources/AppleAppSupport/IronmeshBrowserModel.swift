@@ -1336,6 +1336,10 @@ final class IronmeshBrowserModel: ObservableObject {
     /// Removes discardable local data without touching enrollment, connection settings, or files.
     /// A running embedded Web UI is stopped first so no open SQLite VFS handle can retain chunks.
     func clearCachedData() {
+        guard !isWebUIStartInFlight else {
+            statusText = "Wait for the embedded view to finish opening before clearing cached data."
+            return
+        }
         guard !isWebUICacheClearInProgress else {
             return
         }
