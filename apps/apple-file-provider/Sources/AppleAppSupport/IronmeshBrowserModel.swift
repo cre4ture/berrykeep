@@ -1546,12 +1546,13 @@ final class IronmeshBrowserModel: ObservableObject {
                 guard directoryLoadCoordinator.acceptsSharedState(request) else {
                     return
                 }
-                connectionDiagnostics = try? await Task.detached(priority: .utility) {
+                let diagnostics = try? await Task.detached(priority: .utility) {
                     try remoteSession.connectionDiagnostics(configuration: configuration)
                 }.value
                 guard directoryLoadCoordinator.acceptsSharedState(request) else {
                     return
                 }
+                connectionDiagnostics = diagnostics
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Browse failed", detail: error.localizedDescription)
