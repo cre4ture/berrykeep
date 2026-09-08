@@ -203,6 +203,7 @@ final class IronmeshBrowserModel: ObservableObject {
     private var galleryMapStartToken: UUID?
     private var webUIStartToken: UUID?
     private var isWebUIStartInFlight = false
+    private var isWebUIStopInFlight = false
     private var isWebUICacheClearInProgress = false
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
@@ -1148,10 +1149,14 @@ final class IronmeshBrowserModel: ObservableObject {
         guard webUIPresentation == nil else {
             return
         }
-        guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
-            statusText = isWebUICacheClearInProgress
-                ? "Clearing cached Web UI data."
-                : "An embedded view is already opening."
+        guard !isWebUIStartInFlight, !isWebUIStopInFlight, !isWebUICacheClearInProgress else {
+            if isWebUICacheClearInProgress {
+                statusText = "Clearing cached Web UI data."
+            } else if isWebUIStopInFlight {
+                statusText = "Closing embedded view."
+            } else {
+                statusText = "An embedded view is already opening."
+            }
             return
         }
         guard let configuration = draft.connectionConfiguration else {
@@ -1204,11 +1209,7 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
         webUIPresentation = nil
-        do {
-            try remoteSession.stopWebUI()
-        } catch {
-            lastErrorMessage = error.localizedDescription
-        }
+        stopWebUIAsync()
     }
 
     func openGalleryMap() {
@@ -1218,10 +1219,14 @@ final class IronmeshBrowserModel: ObservableObject {
         if webUIPresentation != nil {
             closeWebUI()
         }
-        guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
-            statusText = isWebUICacheClearInProgress
-                ? "Clearing cached Web UI data."
-                : "An embedded view is already opening."
+        guard !isWebUIStartInFlight, !isWebUIStopInFlight, !isWebUICacheClearInProgress else {
+            if isWebUICacheClearInProgress {
+                statusText = "Clearing cached Web UI data."
+            } else if isWebUIStopInFlight {
+                statusText = "Closing embedded view."
+            } else {
+                statusText = "An embedded view is already opening."
+            }
             return
         }
         guard let configuration = draft.connectionConfiguration else {
@@ -1274,10 +1279,24 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
         galleryMapPresentation = nil
-        do {
-            try remoteSession.stopWebUI()
-        } catch {
-            lastErrorMessage = error.localizedDescription
+        stopWebUIAsync()
+    }
+
+    private func stopWebUIAsync() {
+        guard !isWebUIStopInFlight else {
+            return
+        }
+        isWebUIStopInFlight = true
+        let remoteSession = remoteSession
+        Task {
+            defer { isWebUIStopInFlight = false }
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try remoteSession.stopWebUI()
+                }.value
+            } catch {
+                lastErrorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -1286,6 +1305,10 @@ final class IronmeshBrowserModel: ObservableObject {
     func clearCachedData() {
         guard !isWebUIStartInFlight else {
             statusText = "Wait for the embedded view to finish opening before clearing cached data."
+            return
+        }
+        guard !isWebUIStopInFlight else {
+            statusText = "Wait for the embedded view to finish closing before clearing cached data."
             return
         }
         guard !isWebUICacheClearInProgress else {
