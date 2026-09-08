@@ -3,7 +3,6 @@ mod android_context;
 mod android_saf_backend;
 #[cfg(debug_assertions)]
 mod android_test_bridge;
-mod single_flight_registry;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -11,13 +10,6 @@ use bytes::Bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
-
-    static ANDROID_CLIENT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn clear_android_client_cache_for_test() {
-        android_client_cache().clear();
-    }
 
     #[test]
     fn embedded_web_ui_diagnostic_is_normalized_before_native_log_export() {
@@ -449,103 +441,6 @@ mod tests {
     }
 
     #[test]
-    fn android_client_configuration_cache_reuses_matching_configuration() {
-        let _guard = ANDROID_CLIENT_CACHE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        clear_android_client_cache_for_test();
-
-        let build_count = AtomicUsize::new(0);
-        let bootstrap_a = test_connection_bootstrap("http://127.0.0.1:18080");
-        let bootstrap_b = test_connection_bootstrap("http://127.0.0.1:18081");
-        let key = android_client_cache_key(bootstrap_a.clone(), None, None)
-            .expect("test cache key should be valid");
-
-        let first = cached_configured_sdk_build_for_key(key.clone(), |_| {
-            build_count.fetch_add(1, Ordering::SeqCst);
-            Ok(ConfiguredAndroidSdk {
-                client: ConnectionBootstrap::from_json_str(&bootstrap_a)?.build_client()?,
-                client_identity: None,
-                managed_client: None,
-            })
-        })
-        .expect("first client configuration should be cached");
-        let second = cached_configured_sdk_build_for_key(key.clone(), |_| {
-            build_count.fetch_add(1, Ordering::SeqCst);
-            Ok(ConfiguredAndroidSdk {
-                client: ConnectionBootstrap::from_json_str(&bootstrap_b)?.build_client()?,
-                client_identity: None,
-                managed_client: None,
-            })
-        })
-        .expect("matching client configuration should use the cache");
-
-        assert_eq!(build_count.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            first.client.connection_route_snapshot().endpoints[0].locator,
-            second.client.connection_route_snapshot().endpoints[0].locator,
-        );
-
-        let changed_key = android_client_cache_key(bootstrap_b.clone(), None, None)
-            .expect("changed test cache key should be valid");
-        let changed = cached_configured_sdk_build_for_key(changed_key, |_| {
-            build_count.fetch_add(1, Ordering::SeqCst);
-            Ok(ConfiguredAndroidSdk {
-                client: ConnectionBootstrap::from_json_str(&bootstrap_b)?.build_client()?,
-                client_identity: None,
-                managed_client: None,
-            })
-        })
-        .expect("changed client configuration should rebuild the client");
-
-        assert_eq!(build_count.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            changed.client.connection_route_snapshot().endpoints[0].locator,
-            "http://127.0.0.1:18081",
-        );
-
-        clear_android_client_cache_for_test();
-    }
-
-    #[test]
-    fn android_client_cache_identity_survives_credential_metadata_renewal() {
-        let cluster_id = "019d04a8-3099-75bc-8ff5-f5bd9a78bb83"
-            .parse()
-            .expect("cluster id should parse");
-        let identity =
-            ClientIdentityMaterial::generate(cluster_id, None, Some("Pixel".to_string()))
-                .expect("identity should generate");
-        let mut renewed = identity.clone();
-        renewed.label = Some("Renamed Pixel".to_string());
-        renewed.issued_at_unix = Some(10);
-        renewed.expires_at_unix = Some(20);
-        let bootstrap = test_connection_bootstrap("http://127.0.0.1:18080");
-
-        let original_key = android_client_cache_key(
-            bootstrap.clone(),
-            None,
-            Some(
-                identity
-                    .to_json_pretty()
-                    .expect("identity should serialize"),
-            ),
-        )
-        .expect("original key should build");
-        let renewed_key = android_client_cache_key(
-            bootstrap,
-            None,
-            Some(
-                renewed
-                    .to_json_pretty()
-                    .expect("renewed identity should serialize"),
-            ),
-        )
-        .expect("renewed key should build");
-
-        assert!(original_key == renewed_key);
-    }
-
-    #[test]
     fn android_client_rejects_legacy_direct_server_url() {
         let error = normalized_bootstrap_json("https://storage.example.test")
             .expect_err("a direct server URL must not be accepted as app configuration");
@@ -553,27 +448,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("failed to parse android connection bootstrap JSON")
+                .contains("failed to parse mobile connection bootstrap JSON")
         );
-    }
-
-    fn test_connection_bootstrap(server_url: &str) -> String {
-        format!(
-            r#"{{
-                "version": 1,
-                "cluster_id": "019d04a8-3099-75bc-8ff5-f5bd9a78bb83",
-                "rendezvous_urls": [],
-                "direct_endpoints": [
-                    {{
-                        "url": "{server_url}",
-                        "usage": "public_api",
-                        "node_id": "019d04a8-3099-75bc-8ff5-f5bd9a78bb84"
-                    }}
-                ],
-                "relay_mode": "disabled",
-                "trust_roots": {{}}
-            }}"#
-        )
     }
 }
 use client_sdk::ironmesh_client::DownloadRangeRequest;
@@ -581,16 +457,19 @@ use client_sdk::{
     ClientConnectionDiagnosticImpact, ClientConnectionDiagnostics,
     ClientConnectionDiagnosticsEvent, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
     EnrolledClientConnection, IronMeshClient, ManagedBootstrapPersistence, ManagedClientOptions,
-    ManagedIronMeshClient, RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions,
-    StoreIndexSortOrder, StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig,
+    RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
+    StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig,
     enroll_client_connection_blocking, set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyte, jbyteArray, jint, jlong, jstring};
+use mobile_client_core::{
+    MobileClient, MobileClientConfiguration, MobileClientOptions, MobileClientSession,
+    MobileIdentityPersistence, MobileWebUiPhase, MobileWebUiSession, MobileWebUiSurface,
+};
 use serde::Serialize;
-use single_flight_registry::SingleFlightRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -603,7 +482,6 @@ use sync_agent_core::{
     ModificationLogStore, ModificationOperation, PathScope, describe_connection_target,
     run_folder_agent, run_folder_agent_with_control,
 };
-use tokio::task::JoinHandle;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -712,22 +590,6 @@ fn normalize_embedded_web_ui_diagnostic(message: &str) -> Option<String> {
         truncated.push(character);
     }
     Some(truncated)
-}
-
-struct WebUiServer {
-    task: JoinHandle<()>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EmbeddedWebUiLaunch {
-    url: String,
-    authorization: String,
-}
-
-fn web_ui_server_state() -> &'static Mutex<Option<WebUiServer>> {
-    static STATE: OnceLock<Mutex<Option<WebUiServer>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(None))
 }
 
 struct AndroidPreferencesBridgeState {
@@ -1258,7 +1120,7 @@ fn android_no_backup_files_dir() -> Result<PathBuf> {
 }
 
 fn clear_android_cached_data() -> Result<()> {
-    stop_embedded_web_ui()?;
+    let _ = android_mobile_client()?.abort_web_ui();
     with_android_preferences_env(|env, class| {
         env.call_static_method(&class, "clearCacheDirectory", "()V", &[])
             .context("failed to clear Android cache directory")?;
@@ -1775,75 +1637,27 @@ fn start_embedded_web_ui(
     bootstrap_json: String,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
-) -> Result<EmbeddedWebUiLaunch> {
-    let rt = runtime()?;
-    let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
-    let server_ca_pem = normalize_optional_string(server_ca_pem);
-    let client_identity_json = normalize_optional_string(client_identity_json);
-    let mut state = web_ui_server_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("web ui state lock poisoned"))?;
-
-    if let Some(previous) = state.take() {
-        previous.task.abort();
+) -> Result<MobileWebUiSession> {
+    let configuration =
+        mobile_client_configuration(bootstrap_json, server_ca_pem, client_identity_json)?;
+    let result = android_mobile_client()?.start_web_ui(configuration, MobileWebUiSurface::WebUi);
+    if result.state.phase == MobileWebUiPhase::Failed {
+        let message = result
+            .state
+            .failure
+            .as_ref()
+            .map(|failure| failure.message.as_str())
+            .unwrap_or("embedded Web UI start failed");
+        anyhow::bail!("{message}");
     }
-
-    let listener = rt
-        .block_on(async { tokio::net::TcpListener::bind(("127.0.0.1", 0)).await })
-        .context("failed to bind embedded web ui listener")?;
-    let address = listener
-        .local_addr()
-        .context("failed to read embedded web ui listener address")?;
-    let local_url = format!("http://127.0.0.1:{}/", address.port());
-    let configured = cached_configured_sdk_build(
-        bootstrap_json.clone(),
-        server_ca_pem.clone(),
-        client_identity_json.clone(),
-    )?;
-    let client = configured.client.with_connection_name("android web ui");
-    let mut web_ui_config =
-        web_ui_backend::WebUiConfig::from_client(client).with_service_name("ironmesh-android");
-    let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
-        .context("failed to parse android bootstrap for embedded web ui")?;
-    if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-        bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-    }
-    web_ui_config = web_ui_config
-        .with_connection_bootstrap(bootstrap)
-        .with_connection_bootstrap_persistence(web_ui_backend::WebUiBootstrapPersistence::new(
-            "android_preferences",
-            persist_android_connection_bootstrap,
-        ));
-    if let Some(identity) = configured.client_identity {
-        web_ui_config = web_ui_config.with_client_identity(identity);
-    }
-    let authorization = web_ui_backend::EmbeddedWebUiSessionAuthorization::new();
-    let launch = EmbeddedWebUiLaunch {
-        url: local_url,
-        authorization: authorization.token().to_string(),
-    };
-    let app = web_ui_backend::router(
-        web_ui_config
-            .with_log_buffer(android_web_log_buffer())
-            .with_embedded_session_authorization(authorization),
-    );
-
-    let task = rt.spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    *state = Some(WebUiServer { task });
-
-    Ok(launch)
+    result
+        .state
+        .session
+        .ok_or_else(|| anyhow::anyhow!("embedded Web UI start was superseded or cancelled"))
 }
 
 fn stop_embedded_web_ui() -> Result<()> {
-    let mut state = web_ui_server_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("web ui state lock poisoned"))?;
-    if let Some(server) = state.take() {
-        server.task.abort();
-    }
+    let _ = android_mobile_client()?.stop_web_ui(MobileWebUiSurface::WebUi);
     Ok(())
 }
 
@@ -2051,206 +1865,57 @@ fn now_unix_ms() -> u64 {
 }
 
 fn normalized_bootstrap_json(bootstrap_json: impl Into<String>) -> Result<String> {
-    let bootstrap_json = bootstrap_json.into();
-    let trimmed = bootstrap_json.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("android client requires a non-empty connection bootstrap");
-    }
-
-    ConnectionBootstrap::from_json_str(trimmed)
-        .context("failed to parse android connection bootstrap JSON")?
-        .to_json_pretty()
-        .context("failed to normalize android connection bootstrap JSON")
+    Ok(
+        MobileClientConfiguration::new(bootstrap_json.into(), None::<String>, None::<String>)?
+            .normalized_connection_input()
+            .to_string(),
+    )
 }
 
-#[derive(Clone)]
-struct ConfiguredAndroidSdk {
-    client: IronMeshClient,
-    client_identity: Option<ClientIdentityMaterial>,
-    managed_client: Option<ManagedIronMeshClient>,
-}
-
-impl ConfiguredAndroidSdk {
-    fn folder_agent_shared_client(&self) -> FolderAgentSharedClient {
-        match self.managed_client.as_ref() {
-            Some(managed_client) => {
-                FolderAgentSharedClient::from_managed_client(managed_client.clone())
-            }
-            None => FolderAgentSharedClient::from_client(self.client.clone()),
-        }
-    }
-}
-
-fn configured_sdk_build(
-    bootstrap_json: impl Into<String>,
-    server_ca_pem: Option<String>,
-    client_identity_json: Option<String>,
-) -> Result<ConfiguredAndroidSdk> {
-    let server_ca_pem = normalize_optional_string(server_ca_pem);
-    let client_identity_json = normalize_optional_string(client_identity_json);
-    let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
-    let parsed_identity = client_identity_json
-        .as_deref()
-        .map(|raw| {
-            ClientIdentityMaterial::from_json_str(raw)
-                .context("failed to parse android client identity JSON")
-        })
-        .transpose()?;
-
-    let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
-        .context("failed to parse android connection bootstrap JSON")?;
-    if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-        bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-    }
-
-    match parsed_identity {
-        Some(identity) => {
-            let original_identity = identity.clone();
-            // Android owns one process-wide managed client. Use the conservative mobile
-            // maintenance cadence for that shared controller; foreground and connectivity
-            // callbacks still trigger immediate refreshes explicitly.
-            let options = ManagedClientOptions {
-                connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
+fn android_mobile_client() -> Result<&'static MobileClient> {
+    static CLIENT: OnceLock<std::result::Result<MobileClient, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let mut options = MobileClientOptions::new("android");
+            options.managed_client.connection_bootstrap_persistence =
+                Some(ManagedBootstrapPersistence::new(
                     "android_preferences",
                     persist_android_connection_bootstrap,
-                )),
-                ..ManagedClientOptions::mobile_background()
-            };
-            let managed_client = runtime()?
-                .block_on(bootstrap.build_managed_client_with_identity(identity, options))?;
-            let client_identity = managed_client
-                .take_identity_update()
-                .unwrap_or(original_identity.clone());
-            if client_identity != original_identity
-                && let Err(err) = persist_android_client_identity(&client_identity)
-            {
-                tracing::warn!(
-                    error = %err,
-                    "failed to persist renewed android client identity"
-                );
-            }
-            Ok(ConfiguredAndroidSdk {
-                client: managed_client.client(),
-                client_identity: Some(client_identity),
-                managed_client: Some(managed_client),
-            })
-        }
-        None => Ok(ConfiguredAndroidSdk {
-            client: bootstrap.build_client()?,
-            client_identity: None,
-            managed_client: None,
-        }),
-    }
+                ));
+            options.identity_persistence = Some(MobileIdentityPersistence::new(
+                "android_preferences",
+                persist_android_client_identity,
+            ));
+            options.web_ui_bootstrap_persistence =
+                Some(web_ui_backend::WebUiBootstrapPersistence::new(
+                    "android_preferences",
+                    persist_android_connection_bootstrap,
+                ));
+            options.web_ui_log_buffer = Some(android_web_log_buffer());
+            MobileClient::new(options).map_err(|error| format!("{error:#}"))
+        })
+        .as_ref()
+        .map_err(|message| anyhow::anyhow!(message.clone()))
 }
 
-#[derive(Clone)]
-struct AndroidClientCacheKey {
-    connection_input: String,
-    server_ca_pem: Option<String>,
-    client_identity_json: Option<String>,
-    connection_identity: String,
-    client_identity: Option<String>,
-}
-
-impl PartialEq for AndroidClientCacheKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.connection_identity == other.connection_identity
-            && self.server_ca_pem == other.server_ca_pem
-            && self.client_identity == other.client_identity
-    }
-}
-
-impl Eq for AndroidClientCacheKey {}
-
-fn android_client_cache_key(
+fn mobile_client_configuration(
     connection_input: impl Into<String>,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
-) -> Result<AndroidClientCacheKey> {
-    let mut bootstrap = ConnectionBootstrap::from_json_str(connection_input.into().trim())
-        .context("failed to parse android connection bootstrap JSON")?;
-    let connection_input = bootstrap
-        .to_json_pretty()
-        .context("failed to normalize android connection bootstrap JSON")?;
-    // The managed controller already applies and persists authenticated contact-list updates in
-    // place. A newly persisted list must therefore not make the same process construct another
-    // client while the existing controller is still active.
-    bootstrap.rendezvous_contact_list = None;
-    let connection_identity = bootstrap
-        .to_json_pretty()
-        .context("failed to normalize android client cache identity")?;
-    let server_ca_pem = normalize_optional_string(server_ca_pem);
-    let client_identity_json = normalize_optional_string(client_identity_json);
-    let parsed_identity = client_identity_json
-        .as_deref()
-        .map(ClientIdentityMaterial::from_json_str)
-        .transpose()
-        .context("failed to parse android client identity JSON")?;
-    let client_identity = parsed_identity
-        .as_ref()
-        .map(android_client_identity_cache_fingerprint);
-    let client_identity_json = parsed_identity
-        .as_ref()
-        .map(ClientIdentityMaterial::to_json_pretty)
-        .transpose()
-        .context("failed to normalize android client identity JSON")?;
-
-    Ok(AndroidClientCacheKey {
-        connection_input,
-        server_ca_pem,
-        client_identity_json,
-        connection_identity,
-        client_identity,
-    })
-}
-
-fn android_client_identity_cache_fingerprint(identity: &ClientIdentityMaterial) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for value in [
-        identity.cluster_id.to_string(),
-        identity.device_id.to_string(),
-        identity.private_key_pem.clone(),
-        identity.public_key_pem.clone(),
-    ] {
-        hasher.update(value.as_bytes());
-        hasher.update(&[0]);
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
-/// Building an `IronMeshClient` from scratch runs a network connection-quality
-/// probe (see `order_clients_by_startup_probe` in client-sdk), so every JNI
-/// call, including the embedded Web UI, shares one cached configuration per
-/// distinct connection identity instead of rebuilding it - and re-probing
-/// targets - on every call.
-fn android_client_cache()
--> &'static SingleFlightRegistry<AndroidClientCacheKey, ConfiguredAndroidSdk> {
-    static CACHE: OnceLock<SingleFlightRegistry<AndroidClientCacheKey, ConfiguredAndroidSdk>> =
-        OnceLock::new();
-    CACHE.get_or_init(SingleFlightRegistry::default)
+) -> Result<MobileClientConfiguration> {
+    MobileClientConfiguration::new(connection_input.into(), server_ca_pem, client_identity_json)
 }
 
 fn cached_configured_sdk_build(
     connection_input: impl Into<String>,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
-) -> Result<ConfiguredAndroidSdk> {
-    let key = android_client_cache_key(connection_input, server_ca_pem, client_identity_json)?;
-
-    cached_configured_sdk_build_for_key(key, |key| {
-        configured_sdk_build(
-            key.connection_input.clone(),
-            key.server_ca_pem.clone(),
-            key.client_identity_json.clone(),
-        )
-    })
-}
-
-fn cached_configured_sdk_build_for_key(
-    key: AndroidClientCacheKey,
-    build: impl FnOnce(&AndroidClientCacheKey) -> Result<ConfiguredAndroidSdk>,
-) -> Result<ConfiguredAndroidSdk> {
-    android_client_cache().get_or_try_init(key, build)
+) -> Result<MobileClientSession> {
+    android_mobile_client()?.connect(mobile_client_configuration(
+        connection_input,
+        server_ca_pem,
+        client_identity_json,
+    )?)
 }
 
 fn cached_configured_sdk(
@@ -2260,8 +1925,7 @@ fn cached_configured_sdk(
 ) -> Result<IronMeshClient> {
     Ok(
         cached_configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?
-            .client
-            .with_connection_name("android foreground"),
+            .client("android foreground"),
     )
 }
 
@@ -2270,11 +1934,17 @@ fn cached_configured_client_node(
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
 ) -> Result<ClientNode> {
-    Ok(ClientNode::with_client(cached_configured_sdk(
-        connection_input,
-        server_ca_pem,
-        client_identity_json,
-    )?))
+    Ok(
+        cached_configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?
+            .client_node("android foreground"),
+    )
+}
+
+fn folder_agent_shared_client(session: &MobileClientSession) -> FolderAgentSharedClient {
+    match session.managed_client() {
+        Some(managed_client) => FolderAgentSharedClient::from_managed_client(managed_client),
+        None => FolderAgentSharedClient::from_client(session.client("android folder sync")),
+    }
 }
 
 fn android_title_latency_monitor() -> &'static Mutex<TitleLatencyMonitor> {
@@ -2639,7 +2309,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_not
         initialize_android_preferences_bridge(&mut env)?;
         let configured =
             cached_configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?;
-        let Some(managed_client) = configured.managed_client else {
+        let Some(managed_client) = configured.managed_client() else {
             return Ok(());
         };
         runtime()?.spawn(async move {
@@ -2679,7 +2349,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_not
         initialize_android_preferences_bridge(&mut env)?;
         let configured =
             cached_configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?;
-        let Some(managed_client) = configured.managed_client else {
+        let Some(managed_client) = configured.managed_client() else {
             return Ok(());
         };
         runtime()?.spawn(async move {
@@ -3425,12 +3095,12 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
             android_saf_backend::initialize_backend_bridge(&mut env)?;
         }
 
-        let shared_client = cached_configured_sdk_build(
+        let session = cached_configured_sdk_build(
             bootstrap_json.clone(),
             server_ca_pem.clone(),
             client_identity_json.clone(),
-        )?
-        .folder_agent_shared_client();
+        )?;
+        let shared_client = folder_agent_shared_client(&session);
 
         let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),
@@ -3507,12 +3177,12 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
             android_saf_backend::initialize_backend_bridge(&mut env)?;
         }
 
-        let shared_client = cached_configured_sdk_build(
+        let session = cached_configured_sdk_build(
             bootstrap_json.clone(),
             server_ca_pem.clone(),
             client_identity_json.clone(),
-        )?
-        .folder_agent_shared_client();
+        )?;
+        let shared_client = folder_agent_shared_client(&session);
 
         let options = FolderAgentRuntimeOptions {
             root_dir: PathBuf::from(local_folder),

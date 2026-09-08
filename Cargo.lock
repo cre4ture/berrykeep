@@ -164,6 +164,7 @@ dependencies = [
  "futures-util",
  "hickory-resolver",
  "jni 0.21.1",
+ "mobile-client-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
