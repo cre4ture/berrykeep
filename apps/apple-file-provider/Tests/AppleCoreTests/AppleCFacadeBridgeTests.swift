@@ -422,6 +422,7 @@ private func assertRemoteUnavailable(_ error: Error) {
 }
 
 private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
+    private let stateLock = NSLock()
     var createdConnectionInput: String?
     var createHandleError: Error?
     var createHandleCallCount = 0
@@ -477,6 +478,8 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         serverCAPem: String?,
         clientIdentityJSON: String?
     ) throws -> AppleRustHandle {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         _ = serverCAPem
         _ = clientIdentityJSON
         createdConnectionInput = connectionInput
@@ -506,6 +509,8 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     func stopWebUi() throws {}
 
     func listJSON(handle: AppleRustHandle, prefix: String?, depth: Int, snapshot: String?) throws -> String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         _ = handle
         _ = snapshot
         lastListPrefix = prefix

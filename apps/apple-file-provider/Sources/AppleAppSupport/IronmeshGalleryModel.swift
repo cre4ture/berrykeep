@@ -305,7 +305,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
 
         let relativePath = AppleGalleryThumbnailPath.relativePath(for: entry, profile: profile)
         let thumbnailSession = thumbnailSession(for: entry.path)
-        let data = try await thumbnailRequestLimiter.perform {
+        let data = try await thumbnailRequestLimiter.perform(priority: priority) {
             try await Task.detached(priority: priority) {
                 try thumbnailSession.fetchRelativeBytes(
                     path: relativePath,
@@ -394,6 +394,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
 private actor IronmeshGalleryRequestLimiter {
     private struct Waiter {
         let id: UUID
+        let priority: TaskPriority
         let continuation: CheckedContinuation<Void, Error>
     }
 
@@ -406,6 +407,7 @@ private actor IronmeshGalleryRequestLimiter {
     }
 
     func perform<T: Sendable>(
+        priority: TaskPriority,
         _ operation: @Sendable () async throws -> T
     ) async throws -> T {
         try Task.checkCancellation()
@@ -428,7 +430,9 @@ private actor IronmeshGalleryRequestLimiter {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
-                waiters.append(Waiter(id: waiterID, continuation: continuation))
+                    waiters.append(
+                        Waiter(id: waiterID, priority: priority, continuation: continuation)
+                    )
             }
         } onCancel: {
             Task {
@@ -438,8 +442,10 @@ private actor IronmeshGalleryRequestLimiter {
     }
 
     private func release() {
-        if let waiter = waiters.first {
-            waiters.removeFirst()
+        if let index = waiters.indices.max(by: {
+            waiters[$0].priority.rawValue < waiters[$1].priority.rawValue
+        }) {
+            let waiter = waiters.remove(at: index)
             waiter.continuation.resume()
         } else {
             activeRequests -= 1

@@ -135,6 +135,7 @@ private enum IronmeshMainShellTab: Hashable {
 }
 
 private struct IronmeshMainShellView: View {
+    @EnvironmentObject private var model: IronmeshBrowserModel
     @State private var selectedTab: IronmeshMainShellTab = .home
 
     var body: some View {
@@ -151,7 +152,7 @@ private struct IronmeshMainShellView: View {
                 }
                 .tag(IronmeshMainShellTab.library)
 
-            IronmeshGalleryMapView()
+            IronmeshGalleryMapView(isSelected: selectedTab == .galleryMap)
                 .tabItem {
                     Label("Gallery Map", systemImage: "map")
                 }
@@ -169,6 +170,11 @@ private struct IronmeshMainShellView: View {
                 }
                 .tag(IronmeshMainShellTab.settings)
         }
+        .onChange(of: selectedTab) { tab in
+            if tab != .galleryMap {
+                model.closeGalleryMap()
+            }
+        }
     }
 }
 
@@ -178,10 +184,12 @@ private enum IronmeshEmbeddedSurface: String {
 
 private struct IronmeshGalleryMapView: View {
     @EnvironmentObject private var model: IronmeshBrowserModel
+    let isSelected: Bool
 
     var body: some View {
         IronmeshGalleryMapContent(
             session: model.galleryMapPresentation?.session,
+            isSelected: isSelected,
             accentColorHex: model.themeAccentColorHex,
             isStarting: model.isBusy,
             statusMessage: model.statusText,
@@ -193,39 +201,32 @@ private struct IronmeshGalleryMapView: View {
 
 private struct IronmeshGalleryMapContent: View {
     let session: AppleWebUiSession?
+    let isSelected: Bool
     let accentColorHex: String
     let isStarting: Bool
     let statusMessage: String
     let onStart: () -> Void
     let onClose: () -> Void
-    @State private var shouldCloseStartedSession = false
 
     var body: some View {
-        Group {
-        if let session, let galleryMapSession = galleryMapWebUiSession(from: session) {
-            IronmeshHostedWebView(
-                session: galleryMapSession,
-                accentColorHex: accentColorHex
-            )
-            .ignoresSafeArea()
-            .onDisappear(perform: onClose)
-        } else {
-            galleryMapStartCard
-                .task(id: hasInvalidSession) {
-                    if hasInvalidSession {
-                        onClose()
+        ZStack {
+            if let session, let galleryMapSession = galleryMapWebUiSession(from: session) {
+                IronmeshHostedWebView(
+                    session: galleryMapSession,
+                    accentColorHex: accentColorHex
+                )
+                .ignoresSafeArea()
+            } else {
+                galleryMapStartCard
+                    .task(id: hasInvalidSession) {
+                        if hasInvalidSession {
+                            onClose()
+                        }
                     }
-                }
-        }
-        }
-        .onAppear {
-            shouldCloseStartedSession = false
-        }
-        .onDisappear {
-            shouldCloseStartedSession = session == nil
+            }
         }
         .task(id: session?.url.absoluteString) {
-            guard shouldCloseStartedSession, session != nil else {
+            guard !isSelected, session != nil else {
                 return
             }
             onClose()
