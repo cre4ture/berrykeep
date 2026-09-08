@@ -1203,7 +1203,7 @@ final class IronmeshBrowserModel: ObservableObject {
         guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
             statusText = isWebUICacheClearInProgress
                 ? "Clearing cached Web UI data."
-                : "Opening embedded Web UI."
+                : "An embedded view is already opening."
             return
         }
         guard let configuration = draft.connectionConfiguration else {
@@ -1273,7 +1273,7 @@ final class IronmeshBrowserModel: ObservableObject {
         guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
             statusText = isWebUICacheClearInProgress
                 ? "Clearing cached Web UI data."
-                : "Opening embedded gallery map."
+                : "An embedded view is already opening."
             return
         }
         guard let configuration = draft.connectionConfiguration else {
