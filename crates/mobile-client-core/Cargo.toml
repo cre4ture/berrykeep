@@ -1,0 +1,21 @@
+[package]
+name = "mobile-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+blake3.workspace = true
+client-sdk = { path = "../client-sdk" }
+common = { path = "../common" }
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+web-ui-backend = { path = "../web-ui-backend" }
+
+[lints]
+workspace = true

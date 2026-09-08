@@ -3651,6 +3651,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mobile-client-core"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "blake3",
+ "client-sdk",
+ "common",
+ "serde",
+ "tokio",
+ "tracing",
+ "uuid",
+ "web-ui-backend",
+]
+
+[[package]]
 name = "moka"
 version = "0.12.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
