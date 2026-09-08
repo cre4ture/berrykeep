@@ -227,7 +227,7 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
     private let fullImageSession: IronmeshGalleryRemoteSession
     private let cacheContextLock = NSLock()
     private var cacheContextGate = AppleGalleryCacheContextGate()
-    private let thumbnailRequestLimiter = IronmeshGalleryRequestLimiter(maximumConcurrentRequests: 4)
+    private let thumbnailRequestLimiter = IronmeshGalleryRequestLimiter(maximumConcurrentRequests: 1)
 
     init(
         thumbnailSessions: [IronmeshGalleryRemoteSession]? = nil,
