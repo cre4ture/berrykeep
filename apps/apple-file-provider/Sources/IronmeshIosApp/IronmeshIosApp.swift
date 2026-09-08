@@ -1118,14 +1118,11 @@ private struct IronmeshSettingsView: View {
             Form {
                 Section("Connection") {
                     IronmeshInlineNote(
-                        text: "Connection setup is fixed for the current app session."
+                        text: "Connection setup cannot be changed from Settings."
                     )
                 }
 
                 Section("Device") {
-                    TextField("Device label (optional)", text: draftBinding(\.deviceLabel))
-                        .textInputAutocapitalization(.words)
-
                     if let enrolledDeviceID = model.draft.enrolledDeviceID.nilIfBlank {
                         IronmeshInlineNote(text: "Enrolled device: \(enrolledDeviceID)")
                     }

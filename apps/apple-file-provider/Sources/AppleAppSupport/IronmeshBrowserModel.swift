@@ -201,6 +201,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     private var didActivate = false
     private var galleryMapStartToken: UUID?
+    private var webUIStartToken: UUID?
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
@@ -1203,7 +1204,8 @@ final class IronmeshBrowserModel: ObservableObject {
         }
 
         let startToken = UUID()
-        galleryMapStartToken = startToken
+        galleryMapStartToken = nil
+        webUIStartToken = startToken
         let remoteSession = remoteSession
         beginOperation()
         Task {
@@ -1213,11 +1215,22 @@ final class IronmeshBrowserModel: ObservableObject {
                 let session = try await Task.detached(priority: .userInitiated) {
                     try remoteSession.startWebUI(configuration: configuration)
                 }.value
+                guard webUIStartToken == startToken else {
+                    if galleryMapStartToken == nil && webUIStartToken == nil {
+                        try? await Task.detached(priority: .userInitiated) {
+                            try remoteSession.stopWebUI()
+                        }.value
+                    }
+                    return
+                }
                 webUIPresentation = IronmeshWebUIPresentation(session: session)
                 lastErrorMessage = nil
                 statusText = "Opened embedded web UI."
                 addAction("Opened web UI", detail: "Started isolated loopback session.")
             } catch {
+                guard webUIStartToken == startToken else {
+                    return
+                }
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Web UI failed", detail: error.localizedDescription)
@@ -1226,6 +1239,7 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func closeWebUI() {
+        webUIStartToken = nil
         guard webUIPresentation != nil else {
             return
         }
@@ -1252,6 +1266,7 @@ final class IronmeshBrowserModel: ObservableObject {
         }
 
         let startToken = UUID()
+        webUIStartToken = nil
         galleryMapStartToken = startToken
         let remoteSession = remoteSession
         beginOperation()
@@ -1263,9 +1278,11 @@ final class IronmeshBrowserModel: ObservableObject {
                     try remoteSession.startWebUI(configuration: configuration)
                 }.value
                 guard galleryMapStartToken == startToken else {
-                    try? await Task.detached(priority: .userInitiated) {
-                        try remoteSession.stopWebUI()
-                    }.value
+                    if galleryMapStartToken == nil && webUIStartToken == nil {
+                        try? await Task.detached(priority: .userInitiated) {
+                            try remoteSession.stopWebUI()
+                        }.value
+                    }
                     return
                 }
                 galleryMapPresentation = IronmeshWebUIPresentation(session: session)
