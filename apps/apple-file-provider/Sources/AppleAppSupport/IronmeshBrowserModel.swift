@@ -205,11 +205,17 @@ final class IronmeshBrowserModel: ObservableObject {
     private var isWebUIStartInFlight = false
     private var isWebUIStopInFlight = false
     private var isWebUICacheClearInProgress = false
+    private var pendingWebUIStart: PendingWebUIStart?
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
     private var titleLatencyStatusTask: Task<Void, Never>?
     private var diagnosticActions: [IronmeshRecentAction] = []
+
+    private enum PendingWebUIStart {
+        case webUI
+        case galleryMap
+    }
 
     var isSyncProfileMutationInProgress: Bool {
         syncProfileOperationState.isMutationInProgress
@@ -1144,7 +1150,9 @@ final class IronmeshBrowserModel: ObservableObject {
 
     func openWebUI() {
         if galleryMapPresentation != nil {
+            pendingWebUIStart = .webUI
             closeGalleryMap()
+            return
         }
         guard webUIPresentation == nil else {
             return
@@ -1217,7 +1225,9 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
         if webUIPresentation != nil {
+            pendingWebUIStart = .galleryMap
             closeWebUI()
+            return
         }
         guard !isWebUIStartInFlight, !isWebUIStopInFlight, !isWebUICacheClearInProgress else {
             if isWebUICacheClearInProgress {
@@ -1289,12 +1299,24 @@ final class IronmeshBrowserModel: ObservableObject {
         isWebUIStopInFlight = true
         let remoteSession = remoteSession
         Task {
-            defer { isWebUIStopInFlight = false }
             do {
                 try await Task.detached(priority: .userInitiated) {
                     try remoteSession.stopWebUI()
                 }.value
+                let pendingStart = pendingWebUIStart
+                pendingWebUIStart = nil
+                isWebUIStopInFlight = false
+                switch pendingStart {
+                case .webUI:
+                    openWebUI()
+                case .galleryMap:
+                    openGalleryMap()
+                case nil:
+                    break
+                }
             } catch {
+                pendingWebUIStart = nil
+                isWebUIStopInFlight = false
                 lastErrorMessage = error.localizedDescription
             }
         }
@@ -1315,6 +1337,7 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
         isWebUICacheClearInProgress = true
+        pendingWebUIStart = nil
         webUIStartToken = nil
         galleryMapStartToken = nil
         webUIPresentation = nil
