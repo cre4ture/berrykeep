@@ -645,7 +645,7 @@ impl MobileClient {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        {
+        let previous_active = {
             let mut lifecycle = self
                 .web_ui
                 .lock()
@@ -671,10 +671,14 @@ impl MobileClient {
                     state: lifecycle.snapshot(),
                 };
             }
-            if let Some(active) = lifecycle.active.take() {
-                active.task.abort();
+            let active = lifecycle.active.take();
+            if active.is_some() {
                 lifecycle.changed();
             }
+            active
+        };
+        if let Some(active) = previous_active {
+            self.abort_web_ui_task(active);
         }
 
         let result = self
@@ -692,11 +696,13 @@ impl MobileClient {
                         && intent.surface == surface
                         && intent.affinity == affinity
                 }) {
-                    active.task.abort();
-                    return MobileWebUiCommandResult {
+                    let result = MobileWebUiCommandResult {
                         disposition: MobileWebUiCommandDisposition::Superseded,
                         state: lifecycle.snapshot(),
                     };
+                    drop(lifecycle);
+                    self.abort_web_ui_task(active);
+                    return result;
                 }
                 lifecycle.active = Some(active);
                 lifecycle.transition = None;
@@ -787,25 +793,33 @@ impl MobileClient {
             .web_ui_operation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active = {
+            let mut lifecycle = self
+                .web_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active = lifecycle
+                .active
+                .as_ref()
+                .is_some_and(|active| active.session.surface == surface)
+                .then(|| lifecycle.active.take())
+                .flatten();
+            if lifecycle
+                .transition
+                .is_some_and(|transition| transition.request_id() == request_id)
+            {
+                lifecycle.transition = None;
+            }
+            lifecycle.changed();
+            active
+        };
+        if let Some(active) = active {
+            self.abort_web_ui_task(active);
+        }
         let mut lifecycle = self
             .web_ui
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if lifecycle
-            .active
-            .as_ref()
-            .is_some_and(|active| active.session.surface == surface)
-            && let Some(active) = lifecycle.active.take()
-        {
-            active.task.abort();
-        }
-        if lifecycle
-            .transition
-            .is_some_and(|transition| transition.request_id() == request_id)
-        {
-            lifecycle.transition = None;
-        }
-        lifecycle.changed();
         MobileWebUiCommandResult {
             disposition: MobileWebUiCommandDisposition::Applied,
             state: lifecycle.snapshot(),
@@ -835,21 +849,29 @@ impl MobileClient {
             .web_ui_operation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active = {
+            let mut lifecycle = self
+                .web_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active = lifecycle.active.take();
+            if lifecycle
+                .transition
+                .is_some_and(|transition| transition.request_id() == request_id)
+            {
+                lifecycle.transition = None;
+            }
+            lifecycle.failure = None;
+            lifecycle.changed();
+            active
+        };
+        if let Some(active) = active {
+            self.abort_web_ui_task(active);
+        }
         let mut lifecycle = self
             .web_ui
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(active) = lifecycle.active.take() {
-            active.task.abort();
-        }
-        if lifecycle
-            .transition
-            .is_some_and(|transition| transition.request_id() == request_id)
-        {
-            lifecycle.transition = None;
-        }
-        lifecycle.failure = None;
-        lifecycle.changed();
         MobileWebUiCommandResult {
             disposition: MobileWebUiCommandDisposition::Applied,
             state: lifecycle.snapshot(),
@@ -911,6 +933,11 @@ impl MobileClient {
             task,
             completion,
         })
+    }
+
+    fn abort_web_ui_task(&self, active: ActiveWebUi) {
+        active.task.abort();
+        let _ = self.runtime.block_on(active.task);
     }
 }
 
