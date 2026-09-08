@@ -188,9 +188,11 @@ pipeline. Each suite container verifies its matching artifact metadata and
 uploads the resulting server-only package. Pull requests receive no deployment
 credentials and must opt in with the `ci:debian-packages` label.
 
-To enable the manual `publish` workflow-dispatch input, create a protected
-GitHub environment named `apt-repository` and configure its required review
-policy. In that environment, add these secrets:
+To enable publishing, create a protected GitHub environment named
+`apt-repository` and configure its required review policy. Its deployment
+policy must permit `main` for manual repair runs and final release tags
+(`vX.Y.Z`) for automatic stable releases. In that environment, add these
+secrets:
 
 - `BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64`: base64-encoded exported private
   archive signing key.
@@ -218,9 +220,11 @@ The publish job imports the private key into a fresh temporary keyring,
 confirms its fingerprint, imports the primary archive, and deploys identical
 signed metadata to the primary and compatibility locations. Seed the primary
 archive from the legacy repository once with the migration commands above
-before enabling CI publishing. The job is restricted to a manual run from
-`main` and the protected environment; it never exposes signing or SSH secrets
-to a pull request.
+before enabling CI publishing. A final annotated `vX.Y.Z` tag whose version
+matches the workspace version automatically builds, signs, and deploys the
+matrix through the protected environment. The manual `publish` input remains
+restricted to `main` as a repair path. The job never exposes signing or SSH
+secrets to a pull request.
 
 ## Verify the published repository
 

@@ -102,6 +102,8 @@ Build-Profiles: <!server-node-only>
 Depends:
  ${misc:Depends},
  berrykeep-client (>= ${source:Upstream-Version})
+Breaks: berrykeep-client (<< ${binary:Version})
+Replaces: berrykeep-client (<< ${binary:Version})
 Description: Transitional package for BerryKeep client applications
  This package keeps existing Ironmesh client installations upgrading to the
  renamed BerryKeep package during the compatibility window.

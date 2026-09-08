@@ -2304,7 +2304,7 @@ async fn large_identity_upload_completion_conflict_is_reported_as_object_mutatio
             .route(
                 "/api/v1/store/uploads/{upload_id}/chunk/{index}",
                 put(
-                    |AxumPath((_, index)): AxumPath<(String, usize)>| async move {
+                    |AxumPath((_, index)): AxumPath<(String, usize)>, _payload: Bytes| async move {
                         (
                             StatusCode::OK,
                             Json(UploadSessionChunkResponse {
