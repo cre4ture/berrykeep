@@ -1166,7 +1166,7 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
         if isWebUIStopInFlight {
-            pendingWebUIStart = .galleryMap
+            pendingWebUIStart = .webUI
             statusText = "Closing embedded view."
             return
         }
@@ -1241,7 +1241,7 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
         if isWebUIStopInFlight {
-            pendingWebUIStart = .webUI
+            pendingWebUIStart = .galleryMap
             statusText = "Closing embedded view."
             return
         }
