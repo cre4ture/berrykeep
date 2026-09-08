@@ -474,7 +474,7 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
     private let sharedSession: IronmeshRemoteSession?
     private let lock = NSLock()
     private var configuration: AppleConnectionConfiguration?
-    private var activeSharedConfiguration: AppleConnectionConfiguration?
+    private var activeConfiguration: AppleConnectionConfiguration?
 
     init(ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter(connectionName: "ios gallery")) {
         bridge = AppleCFacadeBridge(ffi: ffi)
@@ -487,11 +487,8 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
     }
 
     func activate(configuration: AppleConnectionConfiguration) {
-        guard sharedSession != nil else {
-            return
-        }
         lock.lock()
-        activeSharedConfiguration = configuration
+        activeConfiguration = configuration
         lock.unlock()
     }
 
@@ -499,8 +496,8 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
         _ request: AppleStoreIndexRequest,
         configuration: AppleConnectionConfiguration
     ) throws -> AppleStoreIndexResponse {
+        try requireActiveConfiguration(configuration)
         if let sharedSession {
-            try requireActiveSharedConfiguration(configuration)
             return try sharedSession.storeIndex(request, configuration: configuration)
         }
         return try withBridge(configuration: configuration) { bridge in
@@ -512,8 +509,8 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
         path: String,
         configuration: AppleConnectionConfiguration
     ) throws -> Data {
+        try requireActiveConfiguration(configuration)
         if let sharedSession {
-            try requireActiveSharedConfiguration(configuration)
             return try sharedSession.fetchRelativeBytes(path: path, configuration: configuration)
         }
         return try withBridge(configuration: configuration) { bridge in
@@ -525,8 +522,8 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
         path: String,
         configuration: AppleConnectionConfiguration
     ) throws -> Data {
+        try requireActiveConfiguration(configuration)
         if let sharedSession {
-            try requireActiveSharedConfiguration(configuration)
             return try sharedSession.download(path: path, revisionHint: nil, configuration: configuration)
         }
         return try withBridge(configuration: configuration) { bridge in
@@ -539,8 +536,8 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
         labels: [String],
         configuration: AppleConnectionConfiguration
     ) throws {
+        try requireActiveConfiguration(configuration)
         if let sharedSession {
-            try requireActiveSharedConfiguration(configuration)
             try sharedSession.setMediaLabels(
                 path: path,
                 labels: labels,
@@ -553,12 +550,15 @@ final class IronmeshGalleryRemoteSession: @unchecked Sendable {
         }
     }
 
-    private func requireActiveSharedConfiguration(
+    private func requireActiveConfiguration(
         _ requestedConfiguration: AppleConnectionConfiguration
     ) throws {
         lock.lock()
         defer { lock.unlock() }
-        guard activeSharedConfiguration == requestedConfiguration else {
+        guard let activeConfiguration else {
+            return
+        }
+        guard activeConfiguration == requestedConfiguration else {
             throw IronmeshGalleryRemoteSessionError.staleConfiguration
         }
     }

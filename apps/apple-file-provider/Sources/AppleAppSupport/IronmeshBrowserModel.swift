@@ -204,6 +204,7 @@ final class IronmeshBrowserModel: ObservableObject {
     private let diagnosticActionLimit = 10_000
 
     private var didActivate = false
+    private var galleryMapStartToken: UUID?
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
@@ -1205,6 +1206,8 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
 
+        let startToken = UUID()
+        galleryMapStartToken = startToken
         let remoteSession = remoteSession
         beginOperation()
         Task {
@@ -1252,6 +1255,8 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
 
+        let startToken = UUID()
+        galleryMapStartToken = startToken
         let remoteSession = remoteSession
         beginOperation()
         Task {
@@ -1261,11 +1266,20 @@ final class IronmeshBrowserModel: ObservableObject {
                 let session = try await Task.detached(priority: .userInitiated) {
                     try remoteSession.startWebUI(configuration: configuration)
                 }.value
+                guard galleryMapStartToken == startToken else {
+                    try? await Task.detached(priority: .userInitiated) {
+                        try remoteSession.stopWebUI()
+                    }.value
+                    return
+                }
                 galleryMapPresentation = IronmeshWebUIPresentation(session: session)
                 lastErrorMessage = nil
                 statusText = "Opened embedded gallery map."
                 addAction("Opened gallery map", detail: "Started isolated loopback session.")
             } catch {
+                guard galleryMapStartToken == startToken else {
+                    return
+                }
                 lastErrorMessage = error.localizedDescription
                 statusText = error.localizedDescription
                 addAction("Gallery map failed", detail: error.localizedDescription)
@@ -1274,6 +1288,7 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func closeGalleryMap() {
+        galleryMapStartToken = nil
         guard galleryMapPresentation != nil else {
             return
         }

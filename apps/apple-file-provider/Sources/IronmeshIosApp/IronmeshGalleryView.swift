@@ -14,9 +14,9 @@ struct IronmeshGalleryView: View {
     @State private var showSensitiveContent = false
     @State private var selection: IronmeshGallerySelection?
 
-    init(remoteSession: IronmeshRemoteSession) {
+    init(remoteSession _: IronmeshRemoteSession) {
         _galleryModel = StateObject(wrappedValue: {
-            let gallerySession = IronmeshGalleryRemoteSession(sharedSession: remoteSession)
+            let gallerySession = IronmeshGalleryRemoteSession()
             return IronmeshGalleryModel(
                 remoteSession: gallerySession,
                 imageRepository: IronmeshGalleryImageRepository(
