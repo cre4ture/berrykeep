@@ -4,7 +4,7 @@ import UIKit
 
 struct IronmeshGalleryView: View {
     @EnvironmentObject private var browserModel: IronmeshBrowserModel
-    @StateObject private var galleryModel = IronmeshGalleryModel()
+    @StateObject private var galleryModel: IronmeshGalleryModel
     @State private var mode: AppleGalleryMode = .allImages
     @State private var sort: AppleGallerySort = .newest
     @State private var captureDateRange = AppleGalleryCaptureDateRange()
@@ -13,6 +13,15 @@ struct IronmeshGalleryView: View {
     // must start private and NSFW media hidden until the user explicitly opts in again.
     @State private var showSensitiveContent = false
     @State private var selection: IronmeshGallerySelection?
+
+    init(remoteSession: IronmeshRemoteSession) {
+        _galleryModel = StateObject(
+            wrappedValue: IronmeshGalleryModel(
+                remoteSession: remoteSession,
+                imageRepository: IronmeshGalleryImageRepository(remoteSession: remoteSession)
+            )
+        )
+    }
 
     private var loadID: IronmeshGalleryLoadID {
         IronmeshGalleryLoadID(

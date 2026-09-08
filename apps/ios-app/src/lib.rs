@@ -1,25 +1,29 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-#[cfg(test)]
-use client_sdk::EnrolledClientConnection;
 use client_sdk::ironmesh_client::DownloadRangeRequest;
 use client_sdk::{
     ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionRouteSnapshot,
-    ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ManagedClientOptions, ManagedIronMeshClient, ObjectHeadInfo, RequestedRange, StoreIndexEntry,
-    StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder,
-    StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig, TitleLatencyProbeStatus,
-    VersionGraphSummary, enroll_client_connection_blocking,
+    ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ManagedIronMeshClient,
+    ObjectHeadInfo, RequestedRange, StoreIndexEntry, StoreIndexMediaFilter,
+    StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder, StoreIndexView,
+    TitleLatencyMonitor, TitleLatencyProbeConfig, TitleLatencyProbeStatus, VersionGraphSummary,
+    enroll_client_connection_blocking,
 };
+#[cfg(test)]
+use client_sdk::{ConnectionBootstrap, EnrolledClientConnection};
 use common::StorageObjectMeta;
+use mobile_client_core::{
+    MobileClient, MobileClientConfiguration, MobileClientOptions, MobileClientSession,
+    MobileWebUiPhase, MobileWebUiSession, MobileWebUiState, MobileWebUiSurface,
+};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
+use std::future::Future;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::{Builder, Runtime};
-use tokio::task::JoinHandle;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -51,13 +55,13 @@ fn init_ios_tracing() {
 }
 
 pub struct IosStorageApp {
-    runtime: Runtime,
+    runtime: Option<Runtime>,
+    _mobile_session: Option<MobileClientSession>,
     sdk: client_sdk::IronMeshClient,
     managed_client: Option<ManagedIronMeshClient>,
     client: ClientNode,
-    client_identity: Option<ClientIdentityMaterial>,
     connection_name: Option<String>,
-    title_latency_monitor: Mutex<TitleLatencyMonitor>,
+    fallback_title_latency_monitor: Option<Mutex<TitleLatencyMonitor>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,17 +187,6 @@ pub struct AppleConnectionDiagnosticsResponse {
     pub last_success_unix_ms: Option<u64>,
 }
 
-struct WebUiServer {
-    task: JoinHandle<()>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EmbeddedWebUiLaunch {
-    url: String,
-    authorization: String,
-}
-
 impl AppleConnectionAttempt {
     fn from_client_attempt(
         endpoint_locator: &str,
@@ -287,49 +280,25 @@ impl IosStorageApp {
         connection_name: Option<String>,
     ) -> Result<Self> {
         init_ios_tracing();
-        let bootstrap_json = normalized_bootstrap_json(connection_input)?;
-        let server_ca_pem = normalize_optional_string(server_ca_pem);
-        let client_identity_json = normalize_optional_string(client_identity_json);
         let connection_name = normalize_optional_string(connection_name);
-        let client_identity = client_identity_json
-            .as_deref()
-            .map(ClientIdentityMaterial::from_json_str)
-            .transpose()
-            .context("failed to parse iOS client identity JSON")?;
-
-        let runtime = build_runtime()?;
-        let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
-            .context("failed to parse iOS connection bootstrap JSON")?;
-        if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-            bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-        }
-        let (mut sdk, client_identity, managed_client) = match client_identity {
-            Some(identity) => {
-                let managed_client =
-                    runtime.block_on(bootstrap.build_managed_client_with_identity(
-                        identity.clone(),
-                        ManagedClientOptions::default(),
-                    ))?;
-                let updated_identity = managed_client.latest_identity_update().unwrap_or(identity);
-                (
-                    managed_client.client(),
-                    Some(updated_identity),
-                    Some(managed_client),
-                )
-            }
-            None => (bootstrap.build_client()?, None, None),
-        };
+        let configuration = MobileClientConfiguration::new(
+            connection_input.into(),
+            server_ca_pem,
+            client_identity_json,
+        )?;
+        let mobile_session = ios_mobile_client()?.connect(configuration)?;
+        let mut sdk = mobile_session.base_client();
 
         if let Some(name) = connection_name.as_ref() {
             sdk = sdk.with_connection_name(name.clone());
         }
 
         Self::with_configured_sdk(
-            runtime,
+            None,
             sdk,
-            client_identity,
             connection_name,
-            managed_client,
+            mobile_session.managed_client(),
+            Some(mobile_session),
         )
     }
 
@@ -342,35 +311,46 @@ impl IosStorageApp {
 
     pub fn with_sdk(
         sdk: client_sdk::IronMeshClient,
-        client_identity: Option<ClientIdentityMaterial>,
+        _client_identity: Option<ClientIdentityMaterial>,
         connection_name: Option<String>,
     ) -> Result<Self> {
-        Self::with_configured_sdk(
-            build_runtime()?,
-            sdk,
-            client_identity,
-            connection_name,
-            None,
-        )
+        Self::with_configured_sdk(Some(build_runtime()?), sdk, connection_name, None, None)
     }
 
     fn with_configured_sdk(
-        runtime: Runtime,
+        runtime: Option<Runtime>,
         sdk: client_sdk::IronMeshClient,
-        client_identity: Option<ClientIdentityMaterial>,
         connection_name: Option<String>,
         managed_client: Option<ManagedIronMeshClient>,
+        mobile_session: Option<MobileClientSession>,
     ) -> Result<Self> {
         let client = ClientNode::with_client(sdk.clone());
+        let fallback_title_latency_monitor = mobile_session
+            .is_none()
+            .then(|| Mutex::new(TitleLatencyMonitor::disabled()));
         Ok(Self {
             runtime,
+            _mobile_session: mobile_session,
             sdk,
             managed_client,
             client,
-            client_identity,
             connection_name,
-            title_latency_monitor: Mutex::new(TitleLatencyMonitor::disabled()),
+            fallback_title_latency_monitor,
         })
+    }
+
+    fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        match self._mobile_session.as_ref() {
+            Some(session) => session.block_on(future),
+            None => self
+                .runtime
+                .as_ref()
+                .expect("an injected iOS SDK owns a runtime")
+                .block_on(future),
+        }
     }
 
     pub fn put(&self, key: impl Into<String>, data: Vec<u8>) -> Result<ApplePutResponse> {
@@ -384,13 +364,12 @@ impl IosStorageApp {
         expected_revision: Option<&str>,
     ) -> Result<ApplePutResponse> {
         let key = key.into();
-        self.runtime
-            .block_on(self.put_async(key, data, expected_revision))
+        self.block_on(self.put_async(key, data, expected_revision))
     }
 
     pub fn fetch(&self, key: impl AsRef<str>) -> Result<Vec<u8>> {
         let key = key.as_ref().to_string();
-        self.runtime.block_on(self.fetch_async(key))
+        self.block_on(self.fetch_async(key))
     }
 
     pub fn object_size(
@@ -399,8 +378,7 @@ impl IosStorageApp {
         snapshot: Option<&str>,
         version: Option<&str>,
     ) -> Result<u64> {
-        self.runtime
-            .block_on(self.sdk.get_object_size(key.as_ref(), snapshot, version))
+        self.block_on(self.sdk.get_object_size(key.as_ref(), snapshot, version))
     }
 
     pub fn fetch_range(
@@ -418,22 +396,20 @@ impl IosStorageApp {
         let mut bytes = Vec::with_capacity(length);
         let mut on_progress = |_progress| {};
         let should_cancel = || false;
-        let report = self
-            .runtime
-            .block_on(self.sdk.download_range_to_writer_with_progress(
-                DownloadRangeRequest {
-                    key: key.as_ref(),
-                    snapshot,
-                    version,
-                    range: RequestedRange {
-                        offset,
-                        length: length as u64,
-                    },
+        let report = self.block_on(self.sdk.download_range_to_writer_with_progress(
+            DownloadRangeRequest {
+                key: key.as_ref(),
+                snapshot,
+                version,
+                range: RequestedRange {
+                    offset,
+                    length: length as u64,
                 },
-                &mut bytes,
-                &mut on_progress,
-                &should_cancel,
-            ))?;
+            },
+            &mut bytes,
+            &mut on_progress,
+            &should_cancel,
+        ))?;
         anyhow::ensure!(
             report.bytes_downloaded == length as u64 && bytes.len() == length,
             "range response size mismatch: requested={length} reported={} actual={}",
@@ -445,7 +421,7 @@ impl IosStorageApp {
 
     pub fn fetch_relative_path(&self, path: impl AsRef<str>) -> Result<Vec<u8>> {
         let path = path.as_ref().to_string();
-        self.runtime.block_on(async {
+        self.block_on(async {
             let response = self.sdk.get_relative_path(&path).await?;
             if !response.status.is_success() {
                 bail!("{path} returned non-success status: {}", response.status);
@@ -460,18 +436,17 @@ impl IosStorageApp {
         depth: usize,
         snapshot: Option<&str>,
     ) -> Result<AppleListResponse> {
-        self.runtime
-            .block_on(self.list_async(prefix, depth, snapshot))
+        self.block_on(self.list_async(prefix, depth, snapshot))
     }
 
     pub fn metadata(&self, key: impl AsRef<str>) -> Result<AppleMetadataResponse> {
         let key = key.as_ref().to_string();
-        self.runtime.block_on(self.metadata_async(key))
+        self.block_on(self.metadata_async(key))
     }
 
     pub fn delete_path(&self, key: impl AsRef<str>) -> Result<()> {
         let key = key.as_ref().to_string();
-        self.runtime.block_on(self.client.delete_path(key))
+        self.block_on(self.client.delete_path(key))
     }
 
     pub fn move_path(
@@ -492,13 +467,12 @@ impl IosStorageApp {
     ) -> Result<()> {
         let from_path = from_path.into();
         let to_path = to_path.into();
-        self.runtime
-            .block_on(self.client.rename_path_with_expected_revision(
-                from_path,
-                to_path,
-                overwrite,
-                expected_revision,
-            ))
+        self.block_on(self.client.rename_path_with_expected_revision(
+            from_path,
+            to_path,
+            overwrite,
+            expected_revision,
+        ))
     }
 
     pub fn web_gui_html(&self) -> String {
@@ -515,13 +489,12 @@ impl IosStorageApp {
     pub fn connection_route_snapshot(&self, refresh: bool) -> ClientConnectionRouteSnapshot {
         if refresh {
             if let Some(managed_client) = self.managed_client.as_ref() {
-                let _ = self.runtime.block_on(
+                let _ = self.block_on(
                     managed_client
                         .refresh_routes(client_sdk::RouteRefreshReason::ExplicitDiagnosticRequest),
                 );
             }
-            self.runtime
-                .block_on(self.sdk.refresh_connection_route_snapshot())
+            self.block_on(self.sdk.refresh_connection_route_snapshot())
         } else {
             self.sdk.connection_route_snapshot()
         }
@@ -537,7 +510,7 @@ impl IosStorageApp {
             "foreground_runtime_started"
         );
         if let Some(managed_client) = self.managed_client.as_ref() {
-            let _ = self.runtime.block_on(managed_client.notify_foregrounded());
+            let _ = self.block_on(managed_client.notify_foregrounded());
         }
     }
 
@@ -564,17 +537,32 @@ impl IosStorageApp {
         &self,
         config: TitleLatencyProbeConfig,
     ) -> Result<TitleLatencyProbeStatus> {
+        if let Some(session) = self._mobile_session.as_ref() {
+            return ios_mobile_client()?
+                .configure_title_latency_monitor(session.configuration().clone(), config);
+        }
+
         let next_monitor = TitleLatencyMonitor::start(self.sdk.clone(), config)?;
         let status = next_monitor.status();
         *self
-            .title_latency_monitor
+            .fallback_title_latency_monitor
+            .as_ref()
+            .expect("an injected iOS SDK owns a latency monitor")
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_monitor;
         Ok(status)
     }
 
     pub fn title_latency_status(&self) -> TitleLatencyProbeStatus {
-        self.title_latency_monitor
+        if self._mobile_session.is_some() {
+            return ios_mobile_client()
+                .expect("a configured iOS session has an initialized mobile client")
+                .title_latency_status();
+        }
+
+        self.fallback_title_latency_monitor
+            .as_ref()
+            .expect("an injected iOS SDK owns a latency monitor")
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .status()
@@ -587,7 +575,7 @@ impl IosStorageApp {
         snapshot: Option<&str>,
         options: StoreIndexRequestOptions,
     ) -> Result<StoreIndexResponse> {
-        self.runtime.block_on(
+        self.block_on(
             self.sdk
                 .store_index_with_options(prefix, depth, snapshot, options),
         )
@@ -695,23 +683,16 @@ impl IosStorageApp {
     }
 }
 
-fn web_ui_runtime() -> Result<&'static Runtime> {
-    static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
-    let runtime = RUNTIME.get_or_init(|| {
-        Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| format!("failed to create iOS web ui runtime: {error:#}"))
-    });
-    match runtime {
-        Ok(runtime) => Ok(runtime),
-        Err(message) => bail!("{message}"),
-    }
-}
-
-fn web_ui_server_state() -> &'static Mutex<Option<WebUiServer>> {
-    static STATE: OnceLock<Mutex<Option<WebUiServer>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(None))
+fn ios_mobile_client() -> Result<&'static MobileClient> {
+    static CLIENT: OnceLock<std::result::Result<MobileClient, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let mut options = MobileClientOptions::new("ios");
+            options.web_ui_log_buffer = Some(ios_diagnostic_log_buffer());
+            MobileClient::new(options).map_err(|error| format!("{error:#}"))
+        })
+        .as_ref()
+        .map_err(|message| anyhow!(message.clone()))
 }
 
 fn start_embedded_web_ui(
@@ -719,69 +700,52 @@ fn start_embedded_web_ui(
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
     _cache_root: PathBuf,
-) -> Result<EmbeddedWebUiLaunch> {
+    surface: MobileWebUiSurface,
+) -> Result<MobileWebUiSession> {
     init_ios_tracing();
-    let runtime = web_ui_runtime()?;
-    let bootstrap_json = normalized_bootstrap_json(bootstrap_json)?;
-    let server_ca_pem = normalize_optional_string(server_ca_pem);
-    let client_identity_json = normalize_optional_string(client_identity_json);
-
-    let mut state = web_ui_server_state()
-        .lock()
-        .map_err(|_| anyhow!("web ui state lock poisoned"))?;
-    if let Some(previous) = state.take() {
-        previous.task.abort();
+    let configuration =
+        MobileClientConfiguration::new(bootstrap_json, server_ca_pem, client_identity_json)?;
+    let result = ios_mobile_client()?.start_web_ui(configuration, surface);
+    if result.state.phase == MobileWebUiPhase::Failed {
+        let message = result
+            .state
+            .failure
+            .as_ref()
+            .map(|failure| failure.message.as_str())
+            .unwrap_or("embedded Web UI start failed");
+        bail!("{message}");
     }
-
-    let listener = runtime
-        .block_on(async { tokio::net::TcpListener::bind(("127.0.0.1", 0)).await })
-        .context("failed to bind iOS embedded web ui listener")?;
-    let address = listener
-        .local_addr()
-        .context("failed to inspect iOS embedded web ui listener address")?;
-    let local_url = format!("http://127.0.0.1:{}/", address.port());
-
-    let configured = IosStorageApp::configured(
-        bootstrap_json.clone(),
-        server_ca_pem.clone(),
-        client_identity_json.clone(),
-        Some("ios-web-ui".to_string()),
-    )?;
-    let mut web_ui_config = web_ui_backend::WebUiConfig::from_client(configured.sdk.clone())
-        .with_service_name("ironmesh-ios");
-    let mut bootstrap = ConnectionBootstrap::from_json_str(&bootstrap_json)
-        .context("failed to parse iOS bootstrap for embedded web ui")?;
-    if let Some(server_ca_pem) = server_ca_pem.as_ref() {
-        bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
-    }
-    web_ui_config = web_ui_config.with_connection_bootstrap(bootstrap);
-    if let Some(identity) = configured.client_identity.clone() {
-        web_ui_config = web_ui_config.with_client_identity(identity);
-    }
-    let authorization = web_ui_backend::EmbeddedWebUiSessionAuthorization::new();
-    let launch = EmbeddedWebUiLaunch {
-        url: local_url,
-        authorization: authorization.token().to_string(),
-    };
-    let app =
-        web_ui_backend::router(web_ui_config.with_embedded_session_authorization(authorization));
-    let task = runtime.spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    *state = Some(WebUiServer { task });
-
-    Ok(launch)
+    result
+        .state
+        .session
+        .ok_or_else(|| anyhow!("embedded Web UI start was superseded or cancelled"))
 }
 
 fn stop_embedded_web_ui() -> Result<()> {
-    let mut state = web_ui_server_state()
-        .lock()
-        .map_err(|_| anyhow!("web ui state lock poisoned"))?;
-    if let Some(server) = state.take() {
-        server.task.abort();
-    }
+    let _ = ios_mobile_client()?.stop_web_ui(MobileWebUiSurface::WebUi);
     Ok(())
+}
+
+fn stop_embedded_web_ui_surface(surface: MobileWebUiSurface) -> Result<()> {
+    let _ = ios_mobile_client()?.stop_web_ui(surface);
+    Ok(())
+}
+
+fn parse_web_ui_surface(value: &str) -> Result<MobileWebUiSurface> {
+    match value.trim() {
+        "web_ui" => Ok(MobileWebUiSurface::WebUi),
+        "gallery_map" => Ok(MobileWebUiSurface::GalleryMap),
+        other => bail!("unsupported embedded Web UI surface: {other}"),
+    }
+}
+
+fn abort_embedded_web_ui() -> Result<()> {
+    let _ = ios_mobile_client()?.abort_web_ui();
+    Ok(())
+}
+
+fn embedded_web_ui_state() -> Result<MobileWebUiState> {
+    Ok(ios_mobile_client()?.web_ui_state())
 }
 
 pub fn create_handle(
@@ -936,7 +900,7 @@ fn delete_with_expected_revision_json(
 ) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
     let key = key.into();
-    app.runtime.block_on(async {
+    app.block_on(async {
         app.client
             .delete_path_with_expected_revision(key.clone(), expected_revision)
             .await?;
@@ -1022,6 +986,11 @@ fn title_latency_status_json(handle: *mut c_void) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
     serde_json::to_string(&app.title_latency_status())
         .context("failed to serialize Apple title latency status")
+}
+
+fn stop_title_latency_monitor() -> Result<()> {
+    let _ = ios_mobile_client()?.stop_title_latency_monitor();
+    Ok(())
 }
 
 pub fn enroll_connection_input_json(
@@ -1373,6 +1342,15 @@ pub extern "C" fn ironmesh_ios_facade_title_latency_status_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_stop_title_latency_monitor(
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_error(out_error);
+    run_ffi_unit_result(out_error, stop_title_latency_monitor)
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_fetch_bytes(
     handle: *mut c_void,
     key: *const c_char,
@@ -1620,8 +1598,35 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui(
             optional_c_string(server_ca_pem)?,
             optional_c_string(client_identity_json)?,
             PathBuf::from(required_c_string(cache_root, "cache_root")?),
+            MobileWebUiSurface::WebUi,
         )?)
         .context("failed to serialize embedded web ui launch")
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_start_web_ui_for_surface(
+    connection_input: *const c_char,
+    server_ca_pem: *const c_char,
+    client_identity_json: *const c_char,
+    cache_root: *const c_char,
+    surface: *const c_char,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        let surface = required_c_string(surface, "surface")?;
+        serde_json::to_string(&start_embedded_web_ui(
+            required_c_string(connection_input, "connection_input")?,
+            optional_c_string(server_ca_pem)?,
+            optional_c_string(client_identity_json)?,
+            PathBuf::from(required_c_string(cache_root, "cache_root")?),
+            parse_web_ui_surface(&surface)?,
+        )?)
+        .context("failed to serialize embedded Web UI session")
     })
 }
 
@@ -1630,6 +1635,40 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui(
 pub extern "C" fn ironmesh_ios_facade_stop_web_ui(out_error: *mut *mut c_char) -> c_int {
     clear_error(out_error);
     run_ffi_unit_result(out_error, stop_embedded_web_ui)
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_stop_web_ui_surface(
+    surface: *const c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_error(out_error);
+    run_ffi_unit_result(out_error, || {
+        let surface = required_c_string(surface, "surface")?;
+        stop_embedded_web_ui_surface(parse_web_ui_surface(&surface)?)
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_abort_web_ui(out_error: *mut *mut c_char) -> c_int {
+    clear_error(out_error);
+    run_ffi_unit_result(out_error, abort_embedded_web_ui)
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_web_ui_state_json(
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        serde_json::to_string(&embedded_web_ui_state()?)
+            .context("failed to serialize embedded Web UI state")
+    })
 }
 
 fn build_runtime() -> Result<Runtime> {
@@ -1710,6 +1749,7 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 fn normalized_bootstrap_json(bootstrap_json: impl Into<String>) -> Result<String> {
     let bootstrap_json = bootstrap_json.into();
     let trimmed = bootstrap_json.trim();

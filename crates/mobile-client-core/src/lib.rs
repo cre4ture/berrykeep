@@ -7,10 +7,11 @@
 use anyhow::{Context, Result};
 use client_sdk::{
     ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient, ManagedClientOptions,
-    ManagedIronMeshClient,
+    ManagedIronMeshClient, TitleLatencyMonitor, TitleLatencyProbeConfig, TitleLatencyProbeStatus,
 };
 use common::logging::LogBuffer;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
@@ -183,6 +184,7 @@ impl MobileClientOptions {
 
 struct MobileClientSessionInner {
     id: Uuid,
+    runtime: Arc<Runtime>,
     configuration: MobileClientConfiguration,
     client: IronMeshClient,
     managed_client: Option<ManagedIronMeshClient>,
@@ -217,6 +219,17 @@ impl MobileClientSession {
             .client
             .clone()
             .with_connection_name(connection_name.into())
+    }
+
+    pub fn base_client(&self) -> IronMeshClient {
+        self.inner.client.clone()
+    }
+
+    pub fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        self.inner.runtime.block_on(future)
     }
 
     pub fn client_node(&self, connection_name: impl Into<String>) -> ClientNode {
@@ -450,6 +463,8 @@ pub struct MobileClient {
     runtime: Arc<Runtime>,
     options: MobileClientOptions,
     connection: Mutex<Option<ActiveConnection>>,
+    title_latency_operation: Mutex<()>,
+    title_latency_monitor: Mutex<TitleLatencyMonitor>,
     web_ui_operation: Mutex<()>,
     web_ui: Mutex<WebUiLifecycle>,
 }
@@ -469,6 +484,8 @@ impl MobileClient {
             runtime,
             options,
             connection: Mutex::new(None),
+            title_latency_operation: Mutex::new(()),
+            title_latency_monitor: Mutex::new(TitleLatencyMonitor::disabled()),
             web_ui_operation: Mutex::new(()),
             web_ui: Mutex::new(WebUiLifecycle::default()),
         }
@@ -531,6 +548,7 @@ impl MobileClient {
         Ok(MobileClientSession {
             inner: Arc::new(MobileClientSessionInner {
                 id: Uuid::now_v7(),
+                runtime: self.runtime.clone(),
                 configuration,
                 client,
                 managed_client,
@@ -544,6 +562,53 @@ impl MobileClient {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot()
+    }
+
+    /// Configures the process-wide latency monitor against a session with the
+    /// same affinity rules as every other mobile operation.
+    pub fn configure_title_latency_monitor(
+        &self,
+        configuration: MobileClientConfiguration,
+        config: TitleLatencyProbeConfig,
+    ) -> Result<TitleLatencyProbeStatus> {
+        config.validate()?;
+        let _operation = self
+            .title_latency_operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next_monitor = if config.enabled {
+            let session = self.connect(configuration)?;
+            TitleLatencyMonitor::start(session.base_client(), config)?
+        } else {
+            TitleLatencyMonitor::disabled()
+        };
+        let status = next_monitor.status();
+        *self
+            .title_latency_monitor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_monitor;
+        Ok(status)
+    }
+
+    pub fn title_latency_status(&self) -> TitleLatencyProbeStatus {
+        self.title_latency_monitor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .status()
+    }
+
+    pub fn stop_title_latency_monitor(&self) -> TitleLatencyProbeStatus {
+        let _operation = self
+            .title_latency_operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let monitor = TitleLatencyMonitor::disabled();
+        let status = monitor.status();
+        *self
+            .title_latency_monitor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = monitor;
+        status
     }
 
     /// Starts or switches the single loopback server. Concurrent requests are
@@ -963,6 +1028,23 @@ mod tests {
         .expect("renewed configuration should parse");
 
         assert_eq!(original.affinity(), renewed.affinity());
+    }
+
+    #[test]
+    fn title_latency_monitor_lifecycle_is_owned_by_mobile_client() {
+        let client = client();
+        let configured = client
+            .configure_title_latency_monitor(
+                configuration(18_080),
+                TitleLatencyProbeConfig {
+                    enabled: false,
+                    period_seconds: 60,
+                },
+            )
+            .expect("disabled monitor configuration should succeed");
+
+        assert_eq!(configured, client.title_latency_status());
+        assert_eq!(configured, client.stop_title_latency_monitor());
     }
 
     #[test]

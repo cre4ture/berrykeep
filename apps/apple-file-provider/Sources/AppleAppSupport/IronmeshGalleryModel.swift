@@ -16,7 +16,7 @@ final class IronmeshGalleryModel: ObservableObject {
 
     let imageRepository: IronmeshGalleryImageRepository
 
-    private let remoteSession: IronmeshGalleryRemoteSession
+    private let remoteSession: IronmeshRemoteSession
     private var activeContext: IronmeshGalleryLoadContext?
     private var activeGeneration: UInt64?
     private var pagination = AppleGalleryPagination()
@@ -24,8 +24,8 @@ final class IronmeshGalleryModel: ObservableObject {
     private var pageTask: Task<Void, Never>?
 
     init(
-        remoteSession: IronmeshGalleryRemoteSession = IronmeshGalleryRemoteSession(),
-        imageRepository: IronmeshGalleryImageRepository = IronmeshGalleryImageRepository()
+        remoteSession: IronmeshRemoteSession,
+        imageRepository: IronmeshGalleryImageRepository
     ) {
         self.remoteSession = remoteSession
         self.imageRepository = imageRepository
@@ -222,24 +222,13 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
     private let thumbnailCache = NSCache<NSString, NSData>()
     private let viewerPreviewCache = NSCache<NSString, NSData>()
     private let fullImageCache = NSCache<NSString, NSData>()
-    private let thumbnailSessions: [IronmeshGalleryRemoteSession]
-    private let fullImageSession: IronmeshGalleryRemoteSession
+    private let remoteSession: IronmeshRemoteSession
     private let cacheContextLock = NSLock()
     private var cacheContextGate = AppleGalleryCacheContextGate()
-    private let thumbnailSessionPool: IronmeshGalleryThumbnailSessionPool
+    private let requestLimiter = IronmeshGalleryRequestLimiter(limit: 4)
 
-    init(
-        thumbnailSessions: [IronmeshGalleryRemoteSession]? = nil,
-        fullImageSession: IronmeshGalleryRemoteSession = IronmeshGalleryRemoteSession()
-    ) {
-        let resolvedThumbnailSessions = thumbnailSessions?.isEmpty == false
-            ? thumbnailSessions!
-            : (0..<4).map { _ in IronmeshGalleryRemoteSession() }
-        self.thumbnailSessions = resolvedThumbnailSessions
-        self.fullImageSession = fullImageSession
-        thumbnailSessionPool = IronmeshGalleryThumbnailSessionPool(
-            sessionCount: resolvedThumbnailSessions.count
-        )
+    init(remoteSession: IronmeshRemoteSession) {
+        self.remoteSession = remoteSession
         thumbnailCache.countLimit = 160
         thumbnailCache.totalCostLimit = 48 * 1_024 * 1_024
         viewerPreviewCache.countLimit = 8
@@ -306,11 +295,10 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
         }
 
         let relativePath = AppleGalleryThumbnailPath.relativePath(for: entry, profile: profile)
-        let thumbnailSessions = thumbnailSessions
-        let data = try await thumbnailSessionPool.perform(priority: priority) { sessionIndex in
-            let thumbnailSession = thumbnailSessions[sessionIndex]
+        let remoteSession = remoteSession
+        let data = try await requestLimiter.perform(priority: priority) {
             return try await Task.detached(priority: priority) {
-                try thumbnailSession.fetchRelativeBytes(
+                try remoteSession.fetchRelativeBytes(
                     path: relativePath,
                     configuration: configuration
                 )
@@ -341,9 +329,13 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
             return data
         }
 
-        let fullImageSession = fullImageSession
+        let remoteSession = remoteSession
         let data = try await Task.detached(priority: .userInitiated) {
-            try fullImageSession.download(path: entry.path, configuration: configuration)
+            try remoteSession.download(
+                path: entry.path,
+                revisionHint: nil,
+                configuration: configuration
+            )
         }.value
 
         try storeCacheResult(
@@ -384,43 +376,43 @@ final class IronmeshGalleryImageRepository: @unchecked Sendable {
         }
         cache.setObject(data as NSData, forKey: key as NSString, cost: data.count)
     }
-
 }
 
-private actor IronmeshGalleryThumbnailSessionPool {
+private actor IronmeshGalleryRequestLimiter {
     private struct Waiter {
         let id: UUID
         let priority: TaskPriority
-        let continuation: CheckedContinuation<Int, Error>
+        let continuation: CheckedContinuation<Void, Error>
     }
 
-    private var availableSessionIndices: [Int]
+    private var availablePermits: Int
     private var waiters: [Waiter] = []
 
-    init(sessionCount: Int) {
-        precondition(sessionCount > 0)
-        availableSessionIndices = Array(0..<sessionCount)
+    init(limit: Int) {
+        precondition(limit > 0)
+        availablePermits = limit
     }
 
     func perform<T: Sendable>(
         priority: TaskPriority,
-        _ operation: @Sendable (Int) async throws -> T
+        _ operation: @Sendable () async throws -> T
     ) async throws -> T {
         try Task.checkCancellation()
-        let sessionIndex = try await acquire(priority: priority)
-        defer { release(sessionIndex) }
+        try await acquire(priority: priority)
+        defer { release() }
         try Task.checkCancellation()
-        return try await operation(sessionIndex)
+        return try await operation()
     }
 
-    private func acquire(priority: TaskPriority) async throws -> Int {
-        if let sessionIndex = availableSessionIndices.popLast() {
-            return sessionIndex
+    private func acquire(priority: TaskPriority) async throws {
+        if availablePermits > 0 {
+            availablePermits -= 1
+            return
         }
 
         let waiterID = UUID()
-        return try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 if Task.isCancelled {
                     continuation.resume(throwing: CancellationError())
                     return
@@ -436,14 +428,14 @@ private actor IronmeshGalleryThumbnailSessionPool {
         }
     }
 
-    private func release(_ sessionIndex: Int) {
+    private func release() {
         if let index = waiters.indices.max(by: {
             waiters[$0].priority.rawValue < waiters[$1].priority.rawValue
         }) {
             let waiter = waiters.remove(at: index)
-            waiter.continuation.resume(returning: sessionIndex)
+            waiter.continuation.resume()
         } else {
-            availableSessionIndices.append(sessionIndex)
+            availablePermits += 1
         }
     }
 
@@ -461,66 +453,5 @@ private enum IronmeshGalleryImageRepositoryError: LocalizedError {
 
     var errorDescription: String? {
         "The gallery connection changed before the image finished loading."
-    }
-}
-
-final class IronmeshGalleryRemoteSession: @unchecked Sendable {
-    private let bridge: AppleCFacadeBridge
-    private let lock = NSLock()
-    private var configuration: AppleConnectionConfiguration?
-
-    init(ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter(connectionName: "ios gallery")) {
-        bridge = AppleCFacadeBridge(ffi: ffi)
-    }
-
-    func storeIndex(
-        _ request: AppleStoreIndexRequest,
-        configuration: AppleConnectionConfiguration
-    ) throws -> AppleStoreIndexResponse {
-        return try withBridge(configuration: configuration) { bridge in
-            try bridge.storeIndex(request)
-        }
-    }
-
-    func fetchRelativeBytes(
-        path: String,
-        configuration: AppleConnectionConfiguration
-    ) throws -> Data {
-        return try withBridge(configuration: configuration) { bridge in
-            try bridge.fetchRelativeBytes(path: path)
-        }
-    }
-
-    func download(
-        path: String,
-        configuration: AppleConnectionConfiguration
-    ) throws -> Data {
-        return try withBridge(configuration: configuration) { bridge in
-            try bridge.download(path: path, revisionHint: nil)
-        }
-    }
-
-    func setMediaLabels(
-        path: String,
-        labels: [String],
-        configuration: AppleConnectionConfiguration
-    ) throws {
-        try withBridge(configuration: configuration) { bridge in
-            try bridge.setMediaLabels(path: path, labels: labels)
-        }
-    }
-
-    private func withBridge<T>(
-        configuration nextConfiguration: AppleConnectionConfiguration,
-        operation: (AppleCFacadeBridge) throws -> T
-    ) throws -> T {
-        lock.lock()
-        defer { lock.unlock() }
-
-        if configuration != nextConfiguration {
-            _ = try bridge.connect(nextConfiguration)
-            configuration = nextConfiguration
-        }
-        return try operation(bridge)
     }
 }

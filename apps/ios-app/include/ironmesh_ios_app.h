@@ -66,6 +66,16 @@ int ironmesh_ios_facade_store_index_with_options_json(void *handle,
                                                       char **out_json,
                                                       char **out_error);
 
+/**
+ * Replaces the XMP-sidecar labels for one media path.
+ *
+ * # Safety
+ *
+ * `handle` must be a live handle returned by this facade. `key` and
+ * `labels_json` must each point to valid, NUL-terminated UTF-8 strings for
+ * the duration of the call. When non-null, `out_error` must point to writable
+ * storage for a C string pointer owned by this facade.
+ */
 int ironmesh_ios_facade_set_media_labels_json(void *handle,
                                               const char *key,
                                               const char *labels_json,
@@ -111,6 +121,8 @@ int ironmesh_ios_facade_configure_title_latency_monitor_json(void *handle,
                                                              char **out_error);
 
 int ironmesh_ios_facade_title_latency_status_json(void *handle, char **out_json, char **out_error);
+
+int ironmesh_ios_facade_stop_title_latency_monitor(char **out_error);
 
 int ironmesh_ios_facade_fetch_bytes(void *handle,
                                     const char *key,
@@ -187,6 +199,20 @@ int ironmesh_ios_facade_start_web_ui(const char *connection_input,
                                      char **out_url,
                                      char **out_error);
 
+int ironmesh_ios_facade_start_web_ui_for_surface(const char *connection_input,
+                                                 const char *server_ca_pem,
+                                                 const char *client_identity_json,
+                                                 const char *cache_root,
+                                                 const char *surface,
+                                                 char **out_json,
+                                                 char **out_error);
+
 int ironmesh_ios_facade_stop_web_ui(char **out_error);
+
+int ironmesh_ios_facade_stop_web_ui_surface(const char *surface, char **out_error);
+
+int ironmesh_ios_facade_abort_web_ui(char **out_error);
+
+int ironmesh_ios_facade_web_ui_state_json(char **out_json, char **out_error);
 
 #endif  /* IRONMESH_IOS_APP_H */

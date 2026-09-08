@@ -458,8 +458,8 @@ use client_sdk::{
     ClientConnectionDiagnosticsEvent, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
     EnrolledClientConnection, IronMeshClient, ManagedBootstrapPersistence, ManagedClientOptions,
     RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
-    StoreIndexView, TitleLatencyMonitor, TitleLatencyProbeConfig,
-    enroll_client_connection_blocking, set_connection_diagnostics_observer,
+    StoreIndexView, TitleLatencyProbeConfig, enroll_client_connection_blocking,
+    set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
 use jni::JavaVM;
@@ -1947,16 +1947,6 @@ fn folder_agent_shared_client(session: &MobileClientSession) -> FolderAgentShare
     }
 }
 
-fn android_title_latency_monitor() -> &'static Mutex<TitleLatencyMonitor> {
-    static MONITOR: OnceLock<Mutex<TitleLatencyMonitor>> = OnceLock::new();
-    MONITOR.get_or_init(|| Mutex::new(TitleLatencyMonitor::disabled()))
-}
-
-fn android_title_latency_configuration_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 fn configure_android_title_latency_monitor(
     connection_input: String,
     server_ca_pem: Option<String>,
@@ -1964,44 +1954,26 @@ fn configure_android_title_latency_monitor(
     enabled: bool,
     period_seconds: u64,
 ) -> Result<String> {
-    let _configuration_guard = android_title_latency_configuration_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let config = TitleLatencyProbeConfig {
         enabled,
         period_seconds,
     };
-    config.validate()?;
-
-    let next_monitor = if config.enabled {
-        let client = cached_configured_sdk(connection_input, server_ca_pem, client_identity_json)?;
-        TitleLatencyMonitor::start(client, config)?
-    } else {
-        TitleLatencyMonitor::disabled()
-    };
-    let status = next_monitor.status();
-    *android_title_latency_monitor()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_monitor;
+    let configuration =
+        mobile_client_configuration(connection_input, server_ca_pem, client_identity_json)?;
+    let status = android_mobile_client()?.configure_title_latency_monitor(configuration, config)?;
 
     serde_json::to_string(&status).context("failed to serialize Android title latency status")
 }
 
 fn android_title_latency_status_json() -> Result<String> {
-    let status = android_title_latency_monitor()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .status();
+    let status = android_mobile_client()?.title_latency_status();
     serde_json::to_string(&status).context("failed to serialize Android title latency status")
 }
 
 fn stop_android_title_latency_monitor() {
-    let _configuration_guard = android_title_latency_configuration_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *android_title_latency_monitor()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = TitleLatencyMonitor::disabled();
+    if let Ok(client) = android_mobile_client() {
+        let _ = client.stop_title_latency_monitor();
+    }
 }
 
 fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>> {

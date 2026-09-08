@@ -2895,6 +2895,7 @@ dependencies = [
  "bytes",
  "client-sdk",
  "common",
+ "mobile-client-core",
  "serde",
  "serde_json",
  "tokio",

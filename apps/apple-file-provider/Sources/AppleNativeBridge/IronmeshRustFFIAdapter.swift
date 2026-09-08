@@ -531,10 +531,30 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return consumeString(jsonPointer)
     }
 
+    func stopTitleLatencyMonitor() throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_stop_title_latency_monitor(&errorPointer)
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+    }
+
     func startWebUI(
         connectionInput: String,
         serverCAPem: String?,
         clientIdentityJSON: String?
+    ) throws -> String {
+        try startWebUI(
+            connectionInput: connectionInput,
+            serverCAPem: serverCAPem,
+            clientIdentityJSON: clientIdentityJSON,
+            surface: .webUI
+        )
+    }
+
+    func startWebUI(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?,
+        surface: AppleWebUiSurface
     ) throws -> String {
         var urlPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
@@ -543,14 +563,17 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
             withOptionalCString(serverCAPem) { serverPointer in
                 withOptionalCString(clientIdentityJSON) { identityPointer in
                     cacheDirectory.withCString { cacheDirectoryPointer in
-                        ironmesh_ios_facade_start_web_ui(
-                            connectionPointer,
-                            serverPointer,
-                            identityPointer,
-                            cacheDirectoryPointer,
-                            &urlPointer,
-                            &errorPointer
-                        )
+                        surface.rawValue.withCString { surfacePointer in
+                            ironmesh_ios_facade_start_web_ui_for_surface(
+                                connectionPointer,
+                                serverPointer,
+                                identityPointer,
+                                cacheDirectoryPointer,
+                                surfacePointer,
+                                &urlPointer,
+                                &errorPointer
+                            )
+                        }
                     }
                 }
             }
@@ -564,7 +587,32 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
     }
 
     func stopWebUI() throws {
-        try stopWebUi()
+        try stopWebUI(surface: .webUI)
+    }
+
+    func stopWebUI(surface: AppleWebUiSurface) throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = surface.rawValue.withCString { surfacePointer in
+            ironmesh_ios_facade_stop_web_ui_surface(surfacePointer, &errorPointer)
+        }
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+    }
+
+    func abortWebUI() throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_abort_web_ui(&errorPointer)
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+    }
+
+    func webUIStateJSON() throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let status = ironmesh_ios_facade_web_ui_state_json(&jsonPointer, &errorPointer)
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no Web UI state.")
+        }
+        return consumeString(jsonPointer)
     }
 
     func enrollConnectionInput(

@@ -28,6 +28,28 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         }
     }
 
+    func testBridgeUsesSharedWebUILifecycleContract() throws {
+        let ffi = MockFFI()
+        ffi.webUIURL = #"{"sessionId":"session-1","surface":"gallery_map","url":"http://127.0.0.1:4100/","authorization":"test-session"}"#
+        ffi.webUIStateResponseJSON = #"{"revision":7,"phase":"running","surface":"gallery_map","session":{"sessionId":"session-1","surface":"gallery_map","url":"http://127.0.0.1:4100/","authorization":"test-session"}}"#
+        let bridge = AppleCFacadeBridge(ffi: ffi)
+        let configuration = AppleConnectionConfiguration(connectionInput: #"{"version":1}"#)
+
+        let session = try bridge.startWebUI(configuration: configuration, surface: .galleryMap)
+        let state = try bridge.webUIState()
+        try bridge.stopWebUI(surface: .galleryMap)
+        try bridge.abortWebUI()
+
+        XCTAssertEqual(session.sessionID, "session-1")
+        XCTAssertEqual(session.surface, .galleryMap)
+        XCTAssertEqual(state.revision, 7)
+        XCTAssertEqual(state.phase, .running)
+        XCTAssertEqual(state.session, session)
+        XCTAssertEqual(ffi.lastStartedWebUISurface, .galleryMap)
+        XCTAssertEqual(ffi.lastStoppedWebUISurface, .galleryMap)
+        XCTAssertEqual(ffi.webUIAbortCount, 1)
+    }
+
     func testBridgeMapsRustListResponseIntoBridgeItems() throws {
         let ffi = MockFFI()
         ffi.listResponseJSON = """
@@ -468,6 +490,10 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var routeSnapshotResponseJSON = #"{"ranked_indices":[],"endpoints":[]}"#
     var clientIdentityUpdateJSON = ""
     var webUIURL = #"{"url":"http://127.0.0.1:4100/","authorization":"test-session"}"#
+    var webUIStateResponseJSON = #"{"revision":0,"phase":"idle"}"#
+    var lastStartedWebUISurface: AppleWebUiSurface?
+    var lastStoppedWebUISurface: AppleWebUiSurface?
+    var webUIAbortCount = 0
     var lastRouteSnapshotRefresh: Bool?
     var foregroundNotificationCount = 0
     var lastTitleLatencyEnabled: Bool?
@@ -740,5 +766,30 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         return webUIURL
     }
 
+    func startWebUI(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?,
+        surface: AppleWebUiSurface
+    ) throws -> String {
+        _ = connectionInput
+        _ = serverCAPem
+        _ = clientIdentityJSON
+        lastStartedWebUISurface = surface
+        return webUIURL
+    }
+
     func stopWebUI() throws {}
+
+    func stopWebUI(surface: AppleWebUiSurface) throws {
+        lastStoppedWebUISurface = surface
+    }
+
+    func abortWebUI() throws {
+        webUIAbortCount += 1
+    }
+
+    func webUIStateJSON() throws -> String {
+        webUIStateResponseJSON
+    }
 }
