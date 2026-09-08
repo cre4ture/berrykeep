@@ -198,7 +198,7 @@ private struct IronmeshGalleryMapContent: View {
     let statusMessage: String
     let onStart: () -> Void
     let onClose: () -> Void
-    @State private var isVisible = false
+    @State private var shouldCloseStartedSession = false
 
     var body: some View {
         Group {
@@ -219,13 +219,13 @@ private struct IronmeshGalleryMapContent: View {
         }
         }
         .onAppear {
-            isVisible = true
+            shouldCloseStartedSession = false
         }
         .onDisappear {
-            isVisible = false
+            shouldCloseStartedSession = session == nil
         }
         .task(id: session?.url.absoluteString) {
-            guard !isVisible, session != nil else {
+            guard shouldCloseStartedSession, session != nil else {
                 return
             }
             onClose()
