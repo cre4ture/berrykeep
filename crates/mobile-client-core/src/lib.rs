@@ -825,53 +825,74 @@ impl MobileClient {
     /// Stops only the requested surface. Closing a stale native presentation
     /// cannot tear down a newer surface that already replaced it.
     pub fn stop_web_ui(&self, surface: MobileWebUiSurface) -> MobileWebUiCommandResult {
-        let request_id = {
-            let mut lifecycle = self
-                .web_ui
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            lifecycle.refresh_server_exit();
-            let desired_matches = lifecycle
-                .desired
-                .as_ref()
-                .is_some_and(|intent| intent.surface == surface);
-            let active_matches = lifecycle
-                .active
-                .as_ref()
-                .is_some_and(|active| active.session.surface == surface);
-            let failure_matches = lifecycle
-                .failure
-                .as_ref()
-                .is_some_and(|failure| failure.surface == Some(surface));
-            if !desired_matches && !active_matches && !failure_matches {
-                return MobileWebUiCommandResult {
-                    disposition: MobileWebUiCommandDisposition::Noop,
-                    state: lifecycle.snapshot(),
-                };
-            }
-
-            let request_id = lifecycle.next_request_id();
-            if desired_matches {
-                lifecycle.desired = None;
-            }
-            lifecycle.transition = Some(WebUiTransition::Stopping {
-                request_id,
-                surface: Some(surface),
-            });
-            lifecycle.failure = None;
-            lifecycle.changed();
-            request_id
+        let Some(request_id) = self.begin_web_ui_stop(surface) else {
+            return MobileWebUiCommandResult {
+                disposition: MobileWebUiCommandDisposition::Noop,
+                state: self.web_ui_state(),
+            };
         };
 
         let _operation = self
             .web_ui_operation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.finish_web_ui_stop(request_id, surface)
+    }
+
+    fn begin_web_ui_stop(&self, surface: MobileWebUiSurface) -> Option<u64> {
+        let mut lifecycle = self
+            .web_ui
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lifecycle.refresh_server_exit();
+        let desired_matches = lifecycle
+            .desired
+            .as_ref()
+            .is_some_and(|intent| intent.surface == surface);
+        let active_matches = lifecycle
+            .active
+            .as_ref()
+            .is_some_and(|active| active.session.surface == surface);
+        let failure_matches = lifecycle
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.surface == Some(surface));
+        if !desired_matches && !active_matches && !failure_matches {
+            return None;
+        }
+
+        let request_id = lifecycle.next_request_id();
+        if desired_matches {
+            lifecycle.desired = None;
+        }
+        lifecycle.transition = Some(WebUiTransition::Stopping {
+            request_id,
+            surface: Some(surface),
+        });
+        lifecycle.failure = None;
+        lifecycle.changed();
+        Some(request_id)
+    }
+
+    fn finish_web_ui_stop(
+        &self,
+        request_id: u64,
+        surface: MobileWebUiSurface,
+    ) -> MobileWebUiCommandResult {
         let active = {
             let mut lifecycle = self
                 .web_ui
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lifecycle.refresh_server_exit();
+            // The operation mutex is not FIFO: a newer command may complete
+            // before this waiter acquires it, and the latest request must win.
+            if lifecycle.next_request_id != request_id {
+                return MobileWebUiCommandResult {
+                    disposition: MobileWebUiCommandDisposition::Superseded,
+                    state: lifecycle.snapshot(),
+                };
+            }
             let active = lifecycle
                 .active
                 .as_ref()
@@ -1207,6 +1228,45 @@ mod tests {
         assert_eq!(
             stale_stop.state.session.map(|session| session.session_id),
             Some(active_session_id)
+        );
+    }
+
+    #[test]
+    fn delayed_stop_does_not_close_newer_start() {
+        let client = client();
+        let initial = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
+        let initial_session_id = initial
+            .state
+            .session
+            .expect("initial Web UI should be running")
+            .session_id;
+        let delayed_stop_request = client
+            .begin_web_ui_stop(MobileWebUiSurface::WebUi)
+            .expect("running Web UI should begin stopping");
+
+        let restarted = client.start_web_ui(configuration(18_081), MobileWebUiSurface::WebUi);
+        let restarted_session_id = restarted
+            .state
+            .session
+            .as_ref()
+            .expect("newer Web UI should be running")
+            .session_id;
+        let delayed_stop =
+            client.finish_web_ui_stop(delayed_stop_request, MobileWebUiSurface::WebUi);
+
+        assert_eq!(
+            restarted.disposition,
+            MobileWebUiCommandDisposition::Applied
+        );
+        assert_ne!(restarted_session_id, initial_session_id);
+        assert_eq!(
+            delayed_stop.disposition,
+            MobileWebUiCommandDisposition::Superseded
+        );
+        assert_eq!(delayed_stop.state.phase, MobileWebUiPhase::Running);
+        assert_eq!(
+            delayed_stop.state.session.map(|session| session.session_id),
+            Some(restarted_session_id)
         );
     }
 
