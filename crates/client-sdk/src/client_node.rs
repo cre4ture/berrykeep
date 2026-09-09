@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -11,10 +11,94 @@ use crate::ironmesh_client::{
     UploadResult, VersionGraphSummary,
 };
 
+pub const DEFAULT_CLIENT_NODE_CACHE_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_CLIENT_NODE_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_CLIENT_NODE_CACHE_CAPACITY_ENTRIES: usize = 256;
+
+struct ClientContentCache {
+    entries: HashMap<String, Bytes>,
+    recency: VecDeque<String>,
+    size_bytes: usize,
+    capacity_bytes: usize,
+    max_entry_bytes: usize,
+    capacity_entries: usize,
+}
+
+impl ClientContentCache {
+    fn new(capacity_bytes: usize, max_entry_bytes: usize, capacity_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            recency: VecDeque::new(),
+            size_bytes: 0,
+            capacity_bytes,
+            max_entry_bytes: max_entry_bytes.min(capacity_bytes),
+            capacity_entries,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Bytes> {
+        let payload = self.entries.get(key)?.clone();
+        self.recency.retain(|cached_key| cached_key != key);
+        self.recency.push_back(key.to_string());
+        Some(payload)
+    }
+
+    fn insert(&mut self, key: String, payload: Bytes) {
+        self.remove(&key);
+        if self.capacity_entries == 0 || payload.len() > self.max_entry_bytes {
+            return;
+        }
+
+        while self.entries.len() >= self.capacity_entries
+            || self.size_bytes.saturating_add(payload.len()) > self.capacity_bytes
+        {
+            let Some(evicted_key) = self.recency.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&evicted_key) {
+                self.size_bytes = self.size_bytes.saturating_sub(evicted.len());
+            }
+        }
+
+        self.size_bytes = self.size_bytes.saturating_add(payload.len());
+        self.recency.push_back(key.clone());
+        self.entries.insert(key, payload);
+    }
+
+    fn remove(&mut self, key: &str) -> Option<Bytes> {
+        let removed = self.entries.remove(key)?;
+        self.size_bytes = self.size_bytes.saturating_sub(removed.len());
+        self.recency.retain(|cached_key| cached_key != key);
+        Some(removed)
+    }
+
+    fn remove_where(&mut self, mut predicate: impl FnMut(&str) -> bool) {
+        let keys = self
+            .entries
+            .keys()
+            .filter(|key| predicate(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    fn cache_entries(&self) -> Vec<CacheEntry> {
+        self.entries
+            .iter()
+            .map(|(key, value)| CacheEntry {
+                key: key.clone(),
+                size_bytes: value.len(),
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct ClientNode {
     client: IronMeshClient,
-    cache: Arc<RwLock<HashMap<String, Bytes>>>,
+    cache: Arc<RwLock<ClientContentCache>>,
 }
 
 impl ClientNode {
@@ -33,9 +117,29 @@ impl ClientNode {
     }
 
     pub fn with_client(client: IronMeshClient) -> Self {
+        Self::with_client_cache_limits(
+            client,
+            DEFAULT_CLIENT_NODE_CACHE_CAPACITY_BYTES,
+            DEFAULT_CLIENT_NODE_CACHE_MAX_ENTRY_BYTES,
+            DEFAULT_CLIENT_NODE_CACHE_CAPACITY_ENTRIES,
+        )
+    }
+
+    /// Creates a client node with a byte-weighted LRU content cache. Payloads
+    /// larger than `max_entry_bytes` are served but never retained.
+    pub fn with_client_cache_limits(
+        client: IronMeshClient,
+        capacity_bytes: usize,
+        max_entry_bytes: usize,
+        capacity_entries: usize,
+    ) -> Self {
         Self {
             client,
-            cache: Arc::new(RwLock::new(HashMap::new())),
+            cache: Arc::new(RwLock::new(ClientContentCache::new(
+                capacity_bytes,
+                max_entry_bytes,
+                capacity_entries,
+            ))),
         }
     }
 
@@ -95,7 +199,7 @@ impl ClientNode {
     pub async fn get_cached_or_fetch(&self, key: impl AsRef<str>) -> Result<Bytes> {
         let key = key.as_ref();
 
-        if let Some(entry) = self.cache.read().await.get(key).cloned() {
+        if let Some(entry) = self.cache.write().await.get(key) {
             return Ok(entry);
         }
 
@@ -182,8 +286,9 @@ impl ClientNode {
             .copy_path(from_path.clone(), to_path.clone(), overwrite)
             .await?;
 
-        if let Some(payload) = self.cache.read().await.get(&from_path).cloned() {
-            self.cache.write().await.insert(to_path, payload);
+        let mut cache = self.cache.write().await;
+        if let Some(payload) = cache.get(&from_path) {
+            cache.insert(to_path, payload);
         }
         Ok(())
     }
@@ -212,7 +317,7 @@ impl ClientNode {
 
         let mut cache = self.cache.write().await;
         if recursive {
-            cache.retain(|key, _| key != &to_path && !key.starts_with(&to_path));
+            cache.remove_where(|key| key == to_path || key.starts_with(&to_path));
         } else {
             cache.remove(&to_path);
         }
@@ -321,15 +426,7 @@ impl ClientNode {
     }
 
     pub async fn cache_entries(&self) -> Vec<CacheEntry> {
-        self.cache
-            .read()
-            .await
-            .iter()
-            .map(|(key, value)| CacheEntry {
-                key: key.clone(),
-                size_bytes: value.len(),
-            })
-            .collect()
+        self.cache.read().await.cache_entries()
     }
 
     pub async fn remove_cached(&self, key: impl AsRef<str>) -> Result<()> {
@@ -359,8 +456,32 @@ mod tests {
         let named = node.clone().with_connection_name("mobile test");
 
         assert_eq!(
-            named.cache.read().await.get("cached.txt").cloned(),
+            named.cache.write().await.get("cached.txt"),
             Some(Bytes::from_static(b"cached"))
         );
+    }
+
+    #[tokio::test]
+    async fn content_cache_evicts_by_recency_and_rejects_oversized_entries() {
+        let node = ClientNode::with_client_cache_limits(
+            IronMeshClient::from_direct_base_url("http://127.0.0.1:1"),
+            6,
+            4,
+            2,
+        );
+        let mut cache = node.cache.write().await;
+        cache.insert("a".to_string(), Bytes::from_static(b"aaa"));
+        cache.insert("b".to_string(), Bytes::from_static(b"bbb"));
+        assert_eq!(cache.get("a"), Some(Bytes::from_static(b"aaa")));
+
+        cache.insert("c".to_string(), Bytes::from_static(b"ccc"));
+        cache.insert("large".to_string(), Bytes::from_static(b"12345"));
+
+        assert_eq!(cache.size_bytes, 6);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(!cache.entries.contains_key("b"));
+        assert!(!cache.entries.contains_key("large"));
+        assert!(cache.entries.contains_key("a"));
+        assert!(cache.entries.contains_key("c"));
     }
 }
