@@ -504,6 +504,7 @@ pub struct MobileClient {
     runtime: Arc<Runtime>,
     options: MobileClientOptions,
     connection: RwLock<Option<ActiveConnection>>,
+    connection_build: Mutex<()>,
     title_latency_operation: Mutex<()>,
     title_latency_monitor: Mutex<TitleLatencyMonitor>,
     web_ui_operation: Mutex<()>,
@@ -525,6 +526,7 @@ impl MobileClient {
             runtime,
             options,
             connection: RwLock::new(None),
+            connection_build: Mutex::new(()),
             title_latency_operation: Mutex::new(()),
             title_latency_monitor: Mutex::new(TitleLatencyMonitor::disabled()),
             web_ui_operation: Mutex::new(()),
@@ -568,26 +570,61 @@ impl MobileClient {
         configuration: MobileClientConfiguration,
         source_input: Option<MobileClientInput>,
     ) -> Result<MobileClientSession> {
+        if let Some(session) = self.reuse_connection(configuration.affinity(), &source_input) {
+            return Ok(session);
+        }
+
+        let _build = self
+            .connection_build
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = self.reuse_connection(configuration.affinity(), &source_input) {
+            return Ok(session);
+        }
+
+        // Session construction may perform bounded discovery and connection
+        // probes. Keep it outside the ready-session lock so matching callers
+        // can continue cloning the current immutable lease while this runs.
+        let session = self.build_session(configuration)?;
         let mut active = self
             .connection
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(active) = active.as_mut()
-            && active.affinity == *configuration.affinity()
-        {
-            if source_input.is_some() {
-                active.source_input = source_input;
-            }
-            return Ok(active.session.clone());
-        }
-
-        let session = self.build_session(configuration)?;
         *active = Some(ActiveConnection {
             affinity: session.affinity().clone(),
             source_input,
             session: session.clone(),
         });
         Ok(session)
+    }
+
+    fn reuse_connection(
+        &self,
+        affinity: &MobileConnectionAffinity,
+        source_input: &Option<MobileClientInput>,
+    ) -> Option<MobileClientSession> {
+        let Some(source_input) = source_input else {
+            let active = self
+                .connection
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            return active
+                .as_ref()
+                .filter(|active| active.affinity == *affinity)
+                .map(|active| active.session.clone());
+        };
+
+        let mut active = self
+            .connection
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active = active
+            .as_mut()
+            .filter(|active| active.affinity == *affinity)?;
+        if active.source_input.as_ref() != Some(source_input) {
+            active.source_input = Some(source_input.clone());
+        }
+        Some(active.session.clone())
     }
 
     fn build_session(
@@ -1051,8 +1088,9 @@ impl MobileClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
+    use std::sync::{Barrier, mpsc};
     use std::thread;
+    use std::time::Duration;
 
     fn test_bootstrap(port: u16) -> String {
         format!(
@@ -1120,6 +1158,43 @@ mod tests {
             .expect("matching input should connect");
 
         assert_eq!(first.id(), second.id());
+    }
+
+    #[test]
+    fn ready_connection_bypasses_session_build_lock() {
+        let client = client();
+        let ready = client
+            .connect(configuration(18_080))
+            .expect("initial session should connect");
+        let build_guard = client
+            .connection_build
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (completed, observed) = mpsc::channel();
+        let caller = {
+            let client = client.clone();
+            thread::spawn(move || {
+                let result = client
+                    .connect(configuration(18_080))
+                    .map(|session| session.id());
+                completed
+                    .send(result)
+                    .expect("test receiver should remain available");
+            })
+        };
+
+        let observed = observed.recv_timeout(Duration::from_secs(5));
+        drop(build_guard);
+        caller
+            .join()
+            .expect("ready-session caller should not panic");
+
+        assert_eq!(
+            observed
+                .expect("ready session should not wait for an unrelated build")
+                .expect("ready session should connect"),
+            ready.id()
+        );
     }
 
     #[test]
