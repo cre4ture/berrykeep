@@ -467,7 +467,7 @@ use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyte, jbyteArray, jint, jlong, jstring};
 use mobile_client_core::{
     MobileClient, MobileClientConfiguration, MobileClientOptions, MobileClientSession,
-    MobileIdentityPersistence, MobileWebUiPhase, MobileWebUiSession, MobileWebUiSurface,
+    MobileIdentityPersistence, MobileWebUiSession, MobileWebUiSurface,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -1643,20 +1643,9 @@ fn start_embedded_web_ui(
 ) -> Result<MobileWebUiSession> {
     let configuration =
         mobile_client_configuration(bootstrap_json, server_ca_pem, client_identity_json)?;
-    let result = android_mobile_client()?.start_web_ui(configuration, MobileWebUiSurface::WebUi);
-    if result.state.phase == MobileWebUiPhase::Failed {
-        let message = result
-            .state
-            .failure
-            .as_ref()
-            .map(|failure| failure.message.as_str())
-            .unwrap_or("embedded Web UI start failed");
-        anyhow::bail!("{message}");
-    }
-    result
-        .state
-        .session
-        .ok_or_else(|| anyhow::anyhow!("embedded Web UI start was superseded or cancelled"))
+    android_mobile_client()?
+        .start_web_ui(configuration, MobileWebUiSurface::WebUi)
+        .into_started_session(MobileWebUiSurface::WebUi)
 }
 
 fn stop_embedded_web_ui() -> Result<()> {

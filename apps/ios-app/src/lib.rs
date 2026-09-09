@@ -14,7 +14,7 @@ use client_sdk::{ConnectionBootstrap, EnrolledClientConnection};
 use common::StorageObjectMeta;
 use mobile_client_core::{
     MobileClient, MobileClientConfiguration, MobileClientOptions, MobileClientSession,
-    MobileWebUiPhase, MobileWebUiSession, MobileWebUiState, MobileWebUiSurface,
+    MobileWebUiSession, MobileWebUiState, MobileWebUiSurface,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
@@ -708,20 +708,9 @@ fn start_embedded_web_ui(
     init_ios_tracing();
     let configuration =
         MobileClientConfiguration::new(bootstrap_json, server_ca_pem, client_identity_json)?;
-    let result = ios_mobile_client()?.start_web_ui(configuration, surface);
-    if result.state.phase == MobileWebUiPhase::Failed {
-        let message = result
-            .state
-            .failure
-            .as_ref()
-            .map(|failure| failure.message.as_str())
-            .unwrap_or("embedded Web UI start failed");
-        bail!("{message}");
-    }
-    result
-        .state
-        .session
-        .ok_or_else(|| anyhow!("embedded Web UI start was superseded or cancelled"))
+    ios_mobile_client()?
+        .start_web_ui(configuration, surface)
+        .into_started_session(surface)
 }
 
 fn stop_embedded_web_ui() -> Result<()> {

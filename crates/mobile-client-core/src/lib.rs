@@ -380,6 +380,46 @@ pub struct MobileWebUiCommandResult {
     pub state: MobileWebUiState,
 }
 
+impl MobileWebUiCommandResult {
+    /// Converts a successful start command into the session owned by that
+    /// request. A superseded command must never expose another request's
+    /// currently active authorization token through a platform adapter.
+    pub fn into_started_session(
+        self,
+        expected_surface: MobileWebUiSurface,
+    ) -> Result<MobileWebUiSession> {
+        if self.state.phase == MobileWebUiPhase::Failed {
+            let message = self
+                .state
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.as_str())
+                .unwrap_or("embedded Web UI start failed");
+            anyhow::bail!(message.to_string());
+        }
+        anyhow::ensure!(
+            matches!(
+                self.disposition,
+                MobileWebUiCommandDisposition::Applied | MobileWebUiCommandDisposition::Reused
+            ),
+            "embedded Web UI start was superseded or cancelled"
+        );
+        anyhow::ensure!(
+            self.state.phase == MobileWebUiPhase::Running,
+            "embedded Web UI start did not enter the running state"
+        );
+        let session = self
+            .state
+            .session
+            .context("embedded Web UI start did not publish a session")?;
+        anyhow::ensure!(
+            session.surface == expected_surface,
+            "embedded Web UI start returned a session for another surface"
+        );
+        Ok(session)
+    }
+}
+
 #[derive(Clone)]
 struct WebUiIntent {
     request_id: u64,
@@ -1354,6 +1394,35 @@ mod tests {
         assert_eq!(
             delayed_stop.state.session.map(|session| session.session_id),
             Some(restarted_session_id)
+        );
+    }
+
+    #[test]
+    fn superseded_start_result_does_not_expose_active_session() {
+        let client = client();
+        let running = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
+        let active_session_id = running
+            .state
+            .session
+            .as_ref()
+            .expect("Web UI should be running")
+            .session_id;
+        let superseded = MobileWebUiCommandResult {
+            disposition: MobileWebUiCommandDisposition::Superseded,
+            state: running.state,
+        };
+
+        let error = superseded
+            .into_started_session(MobileWebUiSurface::WebUi)
+            .expect_err("superseded start must not expose the active session");
+
+        assert!(error.to_string().contains("superseded or cancelled"));
+        assert_eq!(
+            client
+                .web_ui_state()
+                .session
+                .map(|session| session.session_id),
+            Some(active_session_id)
         );
     }
 
