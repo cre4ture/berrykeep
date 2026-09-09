@@ -550,7 +550,9 @@ impl WebUiLifecycle {
             revision: self.revision,
             phase,
             surface,
-            session: self.active.as_ref().map(|active| active.session.clone()),
+            session: (phase == MobileWebUiPhase::Running)
+                .then(|| self.active.as_ref().map(|active| active.session.clone()))
+                .flatten(),
             failure: self.failure.as_ref().map(|failure| failure.failure.clone()),
         }
     }
@@ -1594,6 +1596,35 @@ mod tests {
                 .transition
                 .is_some_and(|transition| transition.request_id() == replacement_request_id)
         );
+    }
+
+    #[test]
+    fn transition_snapshot_does_not_expose_active_session() {
+        let client = client();
+        let _ = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
+        let observed = {
+            let mut lifecycle = client
+                .web_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let gallery_start_request = lifecycle.next_request_id();
+            lifecycle.desired = Some(WebUiIntent {
+                request_id: gallery_start_request,
+                surface: MobileWebUiSurface::GalleryMap,
+                affinity: configuration(18_081).affinity().clone(),
+            });
+            lifecycle.transition = Some(WebUiTransition::Starting {
+                request_id: gallery_start_request,
+                surface: MobileWebUiSurface::GalleryMap,
+            });
+            lifecycle.changed();
+            lifecycle.snapshot()
+        };
+
+        assert_eq!(observed.phase, MobileWebUiPhase::Starting);
+        assert_eq!(observed.surface, Some(MobileWebUiSurface::GalleryMap));
+        assert!(observed.session.is_none());
+        let _ = client.abort_web_ui();
     }
 
     #[test]
