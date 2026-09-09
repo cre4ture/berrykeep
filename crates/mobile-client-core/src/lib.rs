@@ -1057,38 +1057,42 @@ impl MobileClient {
     /// Infallible recovery boundary used by cache clearing and process
     /// lifecycle teardown. It cancels pending starts and force-aborts any task.
     pub fn abort_web_ui(&self) -> MobileWebUiCommandResult {
-        let request_id = {
-            let mut lifecycle = self
-                .web_ui
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let request_id = lifecycle.next_request_id();
-            lifecycle.desired = None;
-            lifecycle.transition = Some(WebUiTransition::Stopping {
-                request_id,
-                surface: None,
-            });
-            lifecycle.failure = None;
-            lifecycle.changed();
-            request_id
-        };
+        self.begin_web_ui_abort();
 
         let _operation = self
             .web_ui_operation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.finish_web_ui_abort()
+    }
+
+    fn begin_web_ui_abort(&self) {
+        let mut lifecycle = self
+            .web_ui
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let request_id = lifecycle.next_request_id();
+        lifecycle.desired = None;
+        lifecycle.transition = Some(WebUiTransition::Stopping {
+            request_id,
+            surface: None,
+        });
+        lifecycle.failure = None;
+        lifecycle.changed();
+    }
+
+    fn finish_web_ui_abort(&self) -> MobileWebUiCommandResult {
         let active = {
             let mut lifecycle = self
                 .web_ui
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let active = lifecycle.active.take();
-            if lifecycle
-                .transition
-                .is_some_and(|transition| transition.request_id() == request_id)
-            {
-                lifecycle.transition = None;
-            }
+            // Abort is an unconditional recovery boundary: if it reaches this
+            // phase after a newer command, it owns the final reset and must not
+            // leave that command's lifecycle ownership behind.
+            lifecycle.desired = None;
+            lifecycle.transition = None;
             lifecycle.failure = None;
             lifecycle.changed();
             active
@@ -1625,6 +1629,32 @@ mod tests {
         assert_eq!(observed.surface, Some(MobileWebUiSurface::GalleryMap));
         assert!(observed.session.is_none());
         let _ = client.abort_web_ui();
+    }
+
+    #[test]
+    fn delayed_abort_force_resets_newer_start() {
+        let client = client();
+        let _ = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
+        client.begin_web_ui_abort();
+
+        let newer = client.start_web_ui(configuration(18_081), MobileWebUiSurface::GalleryMap);
+        assert_eq!(newer.state.phase, MobileWebUiPhase::Running);
+        assert_eq!(newer.state.surface, Some(MobileWebUiSurface::GalleryMap));
+        assert!(newer.state.session.is_some());
+
+        let aborted = client.finish_web_ui_abort();
+
+        assert_eq!(aborted.disposition, MobileWebUiCommandDisposition::Applied);
+        assert_eq!(aborted.state.phase, MobileWebUiPhase::Idle);
+        assert!(aborted.state.session.is_none());
+        assert!(aborted.state.failure.is_none());
+        let lifecycle = client
+            .web_ui
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(lifecycle.desired.is_none());
+        assert!(lifecycle.transition.is_none());
+        assert!(lifecycle.active.is_none());
     }
 
     #[test]
