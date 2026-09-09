@@ -489,7 +489,24 @@ impl WebUiLifecycle {
         }
 
         let active = self.active.take().expect("active Web UI was just observed");
-        if self.next_request_id > active.request_id {
+        let newer_start_will_replace_active = self
+            .desired
+            .as_ref()
+            .is_some_and(|intent| intent.request_id > active.request_id);
+        let newer_transition_owns_active = self.transition.is_some_and(|transition| {
+            if transition.request_id() <= active.request_id {
+                return false;
+            }
+            match transition {
+                WebUiTransition::Starting { .. } => true,
+                WebUiTransition::Stopping { surface: None, .. } => true,
+                WebUiTransition::Stopping {
+                    surface: Some(surface),
+                    ..
+                } => surface == active.session.surface,
+            }
+        });
+        if newer_start_will_replace_active || newer_transition_owns_active {
             self.changed();
             return;
         }
@@ -972,9 +989,36 @@ impl MobileClient {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             lifecycle.refresh_server_exit();
-            // The operation mutex is not FIFO: a newer command may complete
-            // before this waiter acquires it, and the latest request must win.
-            if lifecycle.next_request_id != request_id {
+            // The operation mutex is not FIFO. Only a newer command that owns
+            // this surface may supersede its pending stop; unrelated commands
+            // must not leave the target listener running indefinitely.
+            let newer_intent_targets_surface = lifecycle
+                .desired
+                .as_ref()
+                .is_some_and(|intent| intent.request_id > request_id && intent.surface == surface);
+            let newer_active_owns_surface = lifecycle.active.as_ref().is_some_and(|active| {
+                active.request_id > request_id && active.session.surface == surface
+            });
+            let newer_transition_targets_surface = lifecycle.transition.is_some_and(|transition| {
+                if transition.request_id() <= request_id {
+                    return false;
+                }
+                match transition {
+                    WebUiTransition::Starting {
+                        surface: transition_surface,
+                        ..
+                    }
+                    | WebUiTransition::Stopping {
+                        surface: Some(transition_surface),
+                        ..
+                    } => transition_surface == surface,
+                    WebUiTransition::Stopping { surface: None, .. } => true,
+                }
+            });
+            if newer_intent_targets_surface
+                || newer_active_owns_surface
+                || newer_transition_targets_surface
+            {
                 return MobileWebUiCommandResult {
                     disposition: MobileWebUiCommandDisposition::Superseded,
                     state: lifecycle.snapshot(),
@@ -1410,6 +1454,58 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_newer_stop_does_not_cancel_pending_active_stop() {
+        let client = client();
+        let _ = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
+        let web_ui_stop_request = client
+            .begin_web_ui_stop(MobileWebUiSurface::WebUi)
+            .expect("running Web UI should begin stopping");
+        {
+            let mut lifecycle = client
+                .web_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let gallery_start_request = lifecycle.next_request_id();
+            lifecycle.desired = Some(WebUiIntent {
+                request_id: gallery_start_request,
+                surface: MobileWebUiSurface::GalleryMap,
+                affinity: configuration(18_081).affinity().clone(),
+            });
+            lifecycle.transition = Some(WebUiTransition::Starting {
+                request_id: gallery_start_request,
+                surface: MobileWebUiSurface::GalleryMap,
+            });
+            lifecycle.changed();
+        }
+        let gallery_stop_request = client
+            .begin_web_ui_stop(MobileWebUiSurface::GalleryMap)
+            .expect("pending gallery start should begin stopping");
+
+        let gallery_stop =
+            client.finish_web_ui_stop(gallery_stop_request, MobileWebUiSurface::GalleryMap);
+        let web_ui_stop = client.finish_web_ui_stop(web_ui_stop_request, MobileWebUiSurface::WebUi);
+
+        assert_eq!(
+            gallery_stop.disposition,
+            MobileWebUiCommandDisposition::Applied
+        );
+        assert_eq!(
+            web_ui_stop.disposition,
+            MobileWebUiCommandDisposition::Applied
+        );
+        assert_eq!(web_ui_stop.state.phase, MobileWebUiPhase::Idle);
+        assert!(web_ui_stop.state.session.is_none());
+        assert!(
+            client
+                .web_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active
+                .is_none()
+        );
+    }
+
+    #[test]
     fn superseded_start_result_does_not_expose_active_session() {
         let client = client();
         let running = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
@@ -1497,6 +1593,52 @@ mod tests {
             lifecycle
                 .transition
                 .is_some_and(|transition| transition.request_id() == replacement_request_id)
+        );
+    }
+
+    #[test]
+    fn server_exit_reports_failure_without_newer_state_owner() {
+        let client = client();
+        let _ = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
+        let finished_task = client.runtime.spawn(async {});
+        while !finished_task.is_finished() {
+            thread::yield_now();
+        }
+
+        let (old_task, observed) = {
+            let mut lifecycle = client
+                .web_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active = lifecycle
+                .active
+                .as_mut()
+                .expect("initial Web UI should be active");
+            let old_task = std::mem::replace(&mut active.task, finished_task);
+            *active
+                .completion
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some("current Web UI crashed".to_string());
+            lifecycle.next_request_id();
+            lifecycle.desired = None;
+            lifecycle.transition = None;
+            lifecycle.changed();
+            let observed = lifecycle.snapshot();
+            (old_task, observed)
+        };
+        old_task.abort();
+        let _ = client.runtime.block_on(old_task);
+
+        assert_eq!(observed.phase, MobileWebUiPhase::Failed);
+        assert_eq!(observed.surface, Some(MobileWebUiSurface::WebUi));
+        assert_eq!(
+            observed.failure.as_ref().map(|failure| failure.stage),
+            Some(MobileWebUiFailureStage::Server)
+        );
+        assert_eq!(
+            observed.failure.map(|failure| failure.recovery),
+            Some(MobileWebUiRecovery::Abort)
         );
     }
 
