@@ -1869,6 +1869,7 @@ fn android_mobile_client() -> Result<&'static MobileClient> {
     CLIENT
         .get_or_init(|| {
             let mut options = MobileClientOptions::new("android");
+            options.managed_client = ManagedClientOptions::mobile_background();
             options.managed_client.connection_bootstrap_persistence =
                 Some(ManagedBootstrapPersistence::new(
                     "android_preferences",

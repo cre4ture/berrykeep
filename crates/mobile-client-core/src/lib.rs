@@ -199,7 +199,7 @@ impl MobileClientOptions {
             platform
         };
         Self {
-            managed_client: ManagedClientOptions::mobile_background(),
+            managed_client: ManagedClientOptions::default(),
             identity_persistence: None,
             web_ui_service_name: format!("ironmesh-{platform}"),
             web_ui_connection_name: format!("{platform} web ui"),
@@ -1307,6 +1307,18 @@ mod tests {
 
         assert_eq!(configured, client.title_latency_status());
         assert_eq!(configured, client.stop_title_latency_monitor());
+    }
+
+    #[test]
+    fn mobile_client_options_default_to_interactive_route_maintenance() {
+        let options = MobileClientOptions::new("test");
+        let expected = ManagedClientOptions::default();
+
+        assert_eq!(options.managed_client.discovery_ttl, expected.discovery_ttl);
+        assert_eq!(
+            options.managed_client.route_retirement_grace,
+            expected.route_retirement_grace
+        );
     }
 
     #[test]
