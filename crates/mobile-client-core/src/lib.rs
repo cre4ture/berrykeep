@@ -343,13 +343,25 @@ pub struct MobileWebUiFailure {
     pub recovery: MobileWebUiRecovery,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MobileWebUiSession {
     pub session_id: Uuid,
     pub surface: MobileWebUiSurface,
     pub url: String,
     pub authorization: String,
+}
+
+impl std::fmt::Debug for MobileWebUiSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MobileWebUiSession")
+            .field("session_id", &self.session_id)
+            .field("surface", &self.surface)
+            .field("url", &self.url)
+            .field("authorization", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1378,6 +1390,30 @@ mod tests {
             options.managed_client.route_retirement_grace,
             expected.route_retirement_grace
         );
+    }
+
+    #[test]
+    fn web_ui_debug_output_redacts_authorization() {
+        let authorization = "secret-loopback-bearer-token";
+        let result = MobileWebUiCommandResult {
+            disposition: MobileWebUiCommandDisposition::Applied,
+            state: MobileWebUiState {
+                revision: 1,
+                phase: MobileWebUiPhase::Running,
+                surface: Some(MobileWebUiSurface::WebUi),
+                session: Some(MobileWebUiSession {
+                    session_id: Uuid::nil(),
+                    surface: MobileWebUiSurface::WebUi,
+                    url: "http://127.0.0.1:18080".to_string(),
+                    authorization: authorization.to_string(),
+                }),
+                failure: None,
+            },
+        };
+
+        let debug = format!("{result:?}");
+        assert!(!debug.contains(authorization));
+        assert!(debug.contains("authorization: \"<redacted>\""));
     }
 
     #[test]
