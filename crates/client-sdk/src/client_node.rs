@@ -11,46 +11,63 @@ use crate::ironmesh_client::{
     UploadResult, VersionGraphSummary,
 };
 
-pub const DEFAULT_CLIENT_NODE_CACHE_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
-pub const DEFAULT_CLIENT_NODE_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
-pub const DEFAULT_CLIENT_NODE_CACHE_CAPACITY_ENTRIES: usize = 256;
-
-struct ClientContentCache {
-    entries: HashMap<String, Bytes>,
-    recency: VecDeque<String>,
-    size_bytes: usize,
+#[derive(Clone, Copy)]
+struct ClientContentCacheLimits {
     capacity_bytes: usize,
     max_entry_bytes: usize,
     capacity_entries: usize,
 }
 
+struct ClientContentCache {
+    entries: HashMap<String, Bytes>,
+    recency: VecDeque<String>,
+    size_bytes: usize,
+    limits: Option<ClientContentCacheLimits>,
+}
+
 impl ClientContentCache {
-    fn new(capacity_bytes: usize, max_entry_bytes: usize, capacity_entries: usize) -> Self {
+    fn unbounded() -> Self {
         Self {
             entries: HashMap::new(),
             recency: VecDeque::new(),
             size_bytes: 0,
-            capacity_bytes,
-            max_entry_bytes: max_entry_bytes.min(capacity_bytes),
-            capacity_entries,
+            limits: None,
+        }
+    }
+
+    fn bounded(capacity_bytes: usize, max_entry_bytes: usize, capacity_entries: usize) -> Self {
+        Self {
+            limits: Some(ClientContentCacheLimits {
+                capacity_bytes,
+                max_entry_bytes: max_entry_bytes.min(capacity_bytes),
+                capacity_entries,
+            }),
+            ..Self::unbounded()
         }
     }
 
     fn get(&mut self, key: &str) -> Option<Bytes> {
         let payload = self.entries.get(key)?.clone();
-        self.recency.retain(|cached_key| cached_key != key);
-        self.recency.push_back(key.to_string());
+        if self.limits.is_some() {
+            self.recency.retain(|cached_key| cached_key != key);
+            self.recency.push_back(key.to_string());
+        }
         Some(payload)
     }
 
     fn insert(&mut self, key: String, payload: Bytes) {
         self.remove(&key);
-        if self.capacity_entries == 0 || payload.len() > self.max_entry_bytes {
+        let Some(limits) = self.limits else {
+            self.size_bytes = self.size_bytes.saturating_add(payload.len());
+            self.entries.insert(key, payload);
+            return;
+        };
+        if limits.capacity_entries == 0 || payload.len() > limits.max_entry_bytes {
             return;
         }
 
-        while self.entries.len() >= self.capacity_entries
-            || self.size_bytes.saturating_add(payload.len()) > self.capacity_bytes
+        while self.entries.len() >= limits.capacity_entries
+            || self.size_bytes.saturating_add(payload.len()) > limits.capacity_bytes
         {
             let Some(evicted_key) = self.recency.pop_front() else {
                 break;
@@ -117,12 +134,10 @@ impl ClientNode {
     }
 
     pub fn with_client(client: IronMeshClient) -> Self {
-        Self::with_client_cache_limits(
+        Self {
             client,
-            DEFAULT_CLIENT_NODE_CACHE_CAPACITY_BYTES,
-            DEFAULT_CLIENT_NODE_CACHE_MAX_ENTRY_BYTES,
-            DEFAULT_CLIENT_NODE_CACHE_CAPACITY_ENTRIES,
-        )
+            cache: Arc::new(RwLock::new(ClientContentCache::unbounded())),
+        }
     }
 
     /// Creates a client node with a byte-weighted LRU content cache. Payloads
@@ -135,7 +150,7 @@ impl ClientNode {
     ) -> Self {
         Self {
             client,
-            cache: Arc::new(RwLock::new(ClientContentCache::new(
+            cache: Arc::new(RwLock::new(ClientContentCache::bounded(
                 capacity_bytes,
                 max_entry_bytes,
                 capacity_entries,
@@ -459,6 +474,19 @@ mod tests {
             named.cache.write().await.get("cached.txt"),
             Some(Bytes::from_static(b"cached"))
         );
+    }
+
+    #[tokio::test]
+    async fn default_content_cache_preserves_unbounded_large_entries() {
+        let node = ClientNode::from_direct_base_url("http://127.0.0.1:1");
+        let payload = Bytes::from(vec![7; 9 * 1024 * 1024]);
+        let mut cache = node.cache.write().await;
+
+        cache.insert("large.bin".to_string(), payload.clone());
+
+        assert_eq!(cache.get("large.bin"), Some(payload));
+        assert!(cache.limits.is_none());
+        assert!(cache.recency.is_empty());
     }
 
     #[tokio::test]

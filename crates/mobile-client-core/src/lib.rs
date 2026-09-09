@@ -18,6 +18,10 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 use web_ui_backend::{EmbeddedWebUiSessionAuthorization, WebUiBootstrapPersistence, WebUiConfig};
 
+const MOBILE_CLIENT_NODE_CACHE_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
+const MOBILE_CLIENT_NODE_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+const MOBILE_CLIENT_NODE_CACHE_CAPACITY_ENTRIES: usize = 256;
+
 /// Stable identity of the transport configuration used by one mobile session.
 ///
 /// Authenticated contact-list updates and renewable certificate metadata do not
@@ -719,7 +723,12 @@ impl MobileClient {
                 None => (bootstrap.build_client()?, None, None),
             };
 
-        let client_node = ClientNode::with_client(client.clone());
+        let client_node = ClientNode::with_client_cache_limits(
+            client.clone(),
+            MOBILE_CLIENT_NODE_CACHE_CAPACITY_BYTES,
+            MOBILE_CLIENT_NODE_CACHE_MAX_ENTRY_BYTES,
+            MOBILE_CLIENT_NODE_CACHE_CAPACITY_ENTRIES,
+        );
         Ok(MobileClientSession {
             inner: Arc::new(MobileClientSessionInner {
                 id: Uuid::now_v7(),
