@@ -388,6 +388,7 @@ struct WebUiIntent {
 }
 
 struct ActiveWebUi {
+    request_id: u64,
     affinity: MobileConnectionAffinity,
     session: MobileWebUiSession,
     task: JoinHandle<()>,
@@ -448,6 +449,10 @@ impl WebUiLifecycle {
         }
 
         let active = self.active.take().expect("active Web UI was just observed");
+        if self.next_request_id > active.request_id {
+            self.changed();
+            return;
+        }
         let message = active
             .completion
             .lock()
@@ -739,6 +744,11 @@ impl MobileClient {
             if lifecycle.active.as_ref().is_some_and(|active| {
                 active.affinity == affinity && active.session.surface == surface
             }) {
+                lifecycle
+                    .active
+                    .as_mut()
+                    .expect("matching active Web UI was just observed")
+                    .request_id = request_id;
                 lifecycle.transition = None;
                 lifecycle.changed();
                 return MobileWebUiCommandResult {
@@ -758,7 +768,7 @@ impl MobileClient {
 
         let result = self
             .connect(configuration)
-            .and_then(|session| self.build_web_ui(surface, &session));
+            .and_then(|session| self.build_web_ui(request_id, surface, &session));
 
         match result {
             Ok(active) => {
@@ -975,6 +985,7 @@ impl MobileClient {
 
     fn build_web_ui(
         &self,
+        request_id: u64,
         surface: MobileWebUiSurface,
         client_session: &MobileClientSession,
     ) -> Result<ActiveWebUi> {
@@ -1023,6 +1034,7 @@ impl MobileClient {
         });
 
         Ok(ActiveWebUi {
+            request_id,
             affinity: client_session.affinity().clone(),
             session,
             task,
@@ -1267,6 +1279,68 @@ mod tests {
         assert_eq!(
             delayed_stop.state.session.map(|session| session.session_id),
             Some(restarted_session_id)
+        );
+    }
+
+    #[test]
+    fn server_exit_does_not_clear_newer_start_intent() {
+        let client = client();
+        let _ = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
+        let replacement_configuration = configuration(18_081);
+        let finished_task = client.runtime.spawn(async {});
+        while !finished_task.is_finished() {
+            thread::yield_now();
+        }
+
+        let (old_task, replacement_request_id, observed) = {
+            let mut lifecycle = client
+                .web_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active = lifecycle
+                .active
+                .as_mut()
+                .expect("initial Web UI should be active");
+            let old_task = std::mem::replace(&mut active.task, finished_task);
+            *active
+                .completion
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some("old Web UI exited".to_string());
+
+            let replacement_request_id = lifecycle.next_request_id();
+            lifecycle.desired = Some(WebUiIntent {
+                request_id: replacement_request_id,
+                surface: MobileWebUiSurface::GalleryMap,
+                affinity: replacement_configuration.affinity().clone(),
+            });
+            lifecycle.transition = Some(WebUiTransition::Starting {
+                request_id: replacement_request_id,
+                surface: MobileWebUiSurface::GalleryMap,
+            });
+            lifecycle.changed();
+            let observed = lifecycle.snapshot();
+            (old_task, replacement_request_id, observed)
+        };
+        old_task.abort();
+        let _ = client.runtime.block_on(old_task);
+
+        assert_eq!(observed.phase, MobileWebUiPhase::Starting);
+        assert_eq!(observed.surface, Some(MobileWebUiSurface::GalleryMap));
+        assert!(observed.session.is_none());
+        assert!(observed.failure.is_none());
+        let lifecycle = client
+            .web_ui
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            lifecycle.desired.as_ref().map(|intent| intent.request_id),
+            Some(replacement_request_id)
+        );
+        assert!(
+            lifecycle
+                .transition
+                .is_some_and(|transition| transition.request_id() == replacement_request_id)
         );
     }
 
