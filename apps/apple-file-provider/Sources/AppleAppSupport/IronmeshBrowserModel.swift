@@ -1185,8 +1185,20 @@ final class IronmeshBrowserModel: ObservableObject {
                 let state = try await Task.detached(priority: .userInitiated) {
                     try remoteSession.webUIState()
                 }.value
-                guard applyWebUIState(state),
-                      state.phase == .running,
+                guard applyWebUIState(state) else {
+                    return
+                }
+                if state.phase == .failed {
+                    reportWebUIFailure(
+                        state,
+                        fallback: AppleManualCBridgeError.invalidResponse(
+                            "embedded Web UI exited before presentation"
+                        ),
+                        requestedSurface: surface
+                    )
+                    return
+                }
+                guard state.phase == .running,
                       state.surface == surface,
                       state.session?.sessionID == session.sessionID
                 else {
@@ -1276,17 +1288,25 @@ final class IronmeshBrowserModel: ObservableObject {
             if state.phase != .failed {
                 return
             }
-            let message = webUIFailureMessage(state.failure, fallback: error)
-            lastErrorMessage = message
-            statusText = message
-            addAction(
-                requestedSurface == .webUI ? "Web UI failed" : "Gallery map failed",
-                detail: message
-            )
+            reportWebUIFailure(state, fallback: error, requestedSurface: requestedSurface)
             return
         }
 
         let message = error.localizedDescription
+        lastErrorMessage = message
+        statusText = message
+        addAction(
+            requestedSurface == .webUI ? "Web UI failed" : "Gallery map failed",
+            detail: message
+        )
+    }
+
+    private func reportWebUIFailure(
+        _ state: AppleWebUiState,
+        fallback: Error,
+        requestedSurface: AppleWebUiSurface
+    ) {
+        let message = webUIFailureMessage(state.failure, fallback: fallback)
         lastErrorMessage = message
         statusText = message
         addAction(
