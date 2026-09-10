@@ -1283,16 +1283,19 @@ final class IronmeshBrowserModel: ObservableObject {
         if let state = try? await Task.detached(priority: .userInitiated, operation: {
             try remoteSession.webUIState()
         }).value {
-            guard applyWebUIState(state) else {
+            if applyWebUIState(state), state.phase == .failed {
+                reportWebUIFailure(state, fallback: error, requestedSurface: requestedSurface)
                 return
             }
-            if state.phase != .failed {
-                return
-            }
-            reportWebUIFailure(state, fallback: error, requestedSurface: requestedSurface)
-            return
         }
 
+        reportWebUIOperationError(error, requestedSurface: requestedSurface)
+    }
+
+    private func reportWebUIOperationError(
+        _ error: Error,
+        requestedSurface: AppleWebUiSurface
+    ) {
         let message = error.localizedDescription
         lastErrorMessage = message
         statusText = message
