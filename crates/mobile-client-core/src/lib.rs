@@ -58,6 +58,7 @@ impl MobileClientInput {
 pub struct MobileClientConfiguration {
     normalized_connection_input: String,
     effective_bootstrap: ConnectionBootstrap,
+    effective_bootstrap_identity: String,
     client_identity: Option<ClientIdentityMaterial>,
     affinity: MobileConnectionAffinity,
 }
@@ -87,6 +88,9 @@ impl MobileClientConfiguration {
         if let Some(server_ca_pem) = input.server_ca_pem.as_ref() {
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
+        let effective_bootstrap_identity = bootstrap
+            .to_json_pretty()
+            .context("failed to normalize effective mobile connection bootstrap JSON")?;
 
         let client_identity = input
             .client_identity_json
@@ -110,6 +114,7 @@ impl MobileClientConfiguration {
         Ok(Self {
             normalized_connection_input,
             effective_bootstrap: bootstrap,
+            effective_bootstrap_identity,
             affinity: MobileConnectionAffinity {
                 connection_identity,
                 client_identity: client_identity
@@ -126,6 +131,10 @@ impl MobileClientConfiguration {
 
     pub fn effective_bootstrap(&self) -> &ConnectionBootstrap {
         &self.effective_bootstrap
+    }
+
+    fn effective_bootstrap_identity(&self) -> &str {
+        &self.effective_bootstrap_identity
     }
 
     pub fn client_identity(&self) -> Option<&ClientIdentityMaterial> {
@@ -446,6 +455,7 @@ struct WebUiIntent {
 struct ActiveWebUi {
     request_id: u64,
     affinity: MobileConnectionAffinity,
+    bootstrap_identity: String,
     session: MobileWebUiSession,
     task: JoinHandle<()>,
     completion: Arc<Mutex<Option<String>>>,
@@ -816,6 +826,7 @@ impl MobileClient {
         surface: MobileWebUiSurface,
     ) -> MobileWebUiCommandResult {
         let affinity = configuration.affinity().clone();
+        let bootstrap_identity = configuration.effective_bootstrap_identity().to_string();
         let request_id = {
             let mut lifecycle = self
                 .web_ui
@@ -859,7 +870,9 @@ impl MobileClient {
                 };
             }
             if lifecycle.active.as_ref().is_some_and(|active| {
-                active.affinity == affinity && active.session.surface == surface
+                active.affinity == affinity
+                    && active.bootstrap_identity == bootstrap_identity
+                    && active.session.surface == surface
             }) {
                 lifecycle
                     .active
@@ -883,9 +896,10 @@ impl MobileClient {
             self.abort_web_ui_task(active);
         }
 
-        let result = self
-            .connect(configuration)
-            .and_then(|session| self.build_web_ui(request_id, surface, &session));
+        let web_ui_configuration = configuration.clone();
+        let result = self.connect(configuration).and_then(|session| {
+            self.build_web_ui(request_id, surface, &session, &web_ui_configuration)
+        });
 
         match result {
             Ok(active) => {
@@ -1136,6 +1150,7 @@ impl MobileClient {
         request_id: u64,
         surface: MobileWebUiSurface,
         client_session: &MobileClientSession,
+        configuration: &MobileClientConfiguration,
     ) -> Result<ActiveWebUi> {
         let listener = self
             .runtime
@@ -1156,7 +1171,7 @@ impl MobileClient {
             client_session.client(self.options.web_ui_connection_name.clone()),
         )
         .with_service_name(self.options.web_ui_service_name.clone())
-        .with_connection_bootstrap(client_session.configuration().effective_bootstrap().clone())
+        .with_connection_bootstrap(configuration.effective_bootstrap().clone())
         .with_embedded_session_authorization(authorization);
         if let Some(identity) = client_session.client_identity() {
             web_ui_config = web_ui_config.with_client_identity(identity);
@@ -1184,6 +1199,7 @@ impl MobileClient {
         Ok(ActiveWebUi {
             request_id,
             affinity: client_session.affinity().clone(),
+            bootstrap_identity: configuration.effective_bootstrap_identity().to_string(),
             session,
             task,
             completion,
@@ -1235,6 +1251,24 @@ mod tests {
     fn configuration(port: u16) -> MobileClientConfiguration {
         MobileClientConfiguration::new(test_bootstrap(port), None::<&str>, None::<&str>)
             .expect("test configuration should parse")
+    }
+
+    fn configuration_with_contact_list(port: u16, version_id: &str) -> MobileClientConfiguration {
+        let mut bootstrap = ConnectionBootstrap::from_json_str(&test_bootstrap(port))
+            .expect("test bootstrap should parse");
+        bootstrap.rendezvous_contact_list = Some(client_sdk::PersistedRendezvousContactList {
+            schema_version: 1,
+            version_id: version_id.to_string(),
+            rendezvous_urls: vec![format!("https://{version_id}.example.test")],
+        });
+        MobileClientConfiguration::new(
+            bootstrap
+                .to_json_pretty()
+                .expect("test bootstrap should serialize"),
+            None::<&str>,
+            None::<&str>,
+        )
+        .expect("test configuration should parse")
     }
 
     fn client() -> Arc<MobileClient> {
@@ -1440,6 +1474,70 @@ mod tests {
                 .iter()
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn updated_contact_list_rebuilds_web_ui_on_reused_connection() {
+        let client = client();
+        let original = configuration_with_contact_list(18_080, "contacts-v1");
+        let updated = configuration_with_contact_list(18_080, "contacts-v2");
+        assert_eq!(original.affinity(), updated.affinity());
+        assert_ne!(
+            original.effective_bootstrap_identity(),
+            updated.effective_bootstrap_identity()
+        );
+
+        let first = client.start_web_ui(original, MobileWebUiSurface::WebUi);
+        let first_web_ui_id = first
+            .state
+            .session
+            .expect("first Web UI should be running")
+            .session_id;
+        let connection_id = client
+            .connection
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .expect("connection should be active")
+            .session
+            .id();
+
+        let restarted = client.start_web_ui(updated.clone(), MobileWebUiSurface::WebUi);
+
+        assert_eq!(
+            restarted.disposition,
+            MobileWebUiCommandDisposition::Applied
+        );
+        assert_ne!(
+            restarted
+                .state
+                .session
+                .expect("updated Web UI should be running")
+                .session_id,
+            first_web_ui_id
+        );
+        assert_eq!(
+            client
+                .connection
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .expect("connection should remain active")
+                .session
+                .id(),
+            connection_id
+        );
+        let lifecycle = client
+            .web_ui
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            lifecycle
+                .active
+                .as_ref()
+                .map(|active| active.bootstrap_identity.as_str()),
+            Some(updated.effective_bootstrap_identity())
         );
     }
 
