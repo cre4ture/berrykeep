@@ -6,6 +6,7 @@ members = [
     "crates/rendezvous-server",
     "crates/stats-collector-server",
     "crates/client-sdk",
+    "crates/mobile-client-core",
     "crates/server-node-sdk",
     "crates/web-ui-backend",
     "crates/desktop-client-config",

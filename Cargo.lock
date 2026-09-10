@@ -164,6 +164,7 @@ dependencies = [
  "futures-util",
  "hickory-resolver",
  "jni 0.21.1",
+ "mobile-client-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2894,6 +2895,7 @@ dependencies = [
  "bytes",
  "client-sdk",
  "common",
+ "mobile-client-core",
  "serde",
  "serde_json",
  "tokio",
@@ -3648,6 +3650,22 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mobile-client-core"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "blake3",
+ "client-sdk",
+ "common",
+ "serde",
+ "tokio",
+ "tracing",
+ "uuid",
+ "web-ui-backend",
 ]
 
 [[package]]

@@ -185,7 +185,7 @@ final class IronmeshBrowserModel: ObservableObject {
 
     let bundleDefaults: IronmeshConnectionDraft
 
-    private let remoteSession: IronmeshRemoteSession
+    let remoteSession: IronmeshRemoteSession
     private let settingsStore: AppleConnectionSettingsStore
     private let enroller: AppleBootstrapEnroller
     private let fileProviderDomains: AppleFileProviderDomainCoordinator
@@ -200,22 +200,13 @@ final class IronmeshBrowserModel: ObservableObject {
     private let diagnosticActionLimit = 10_000
 
     private var didActivate = false
-    private var galleryMapStartToken: UUID?
-    private var webUIStartToken: UUID?
-    private var isWebUIStartInFlight = false
-    private var isWebUIStopInFlight = false
     private var isWebUICacheClearInProgress = false
-    private var pendingWebUIStart: PendingWebUIStart?
+    private var webUIStateRevision: UInt64 = 0
     private var pendingOperations = 0
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
     private var titleLatencyStatusTask: Task<Void, Never>?
     private var diagnosticActions: [IronmeshRecentAction] = []
-
-    private enum PendingWebUIStart {
-        case webUI
-        case galleryMap
-    }
 
     var isSyncProfileMutationInProgress: Bool {
         syncProfileOperationState.isMutationInProgress
@@ -1149,103 +1140,26 @@ final class IronmeshBrowserModel: ObservableObject {
     }
 
     func openWebUI() {
-        if galleryMapPresentation != nil {
-            pendingWebUIStart = .webUI
-            closeGalleryMap()
-            return
-        }
-        guard webUIPresentation == nil else {
-            return
-        }
-        guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
-            if isWebUICacheClearInProgress {
-                statusText = "Clearing cached Web UI data."
-            } else {
-                statusText = "An embedded view is already opening."
-            }
-            return
-        }
-        if isWebUIStopInFlight {
-            pendingWebUIStart = .webUI
-            statusText = "Closing embedded view."
-            return
-        }
-        guard let configuration = draft.connectionConfiguration else {
-            let message = "A connection bootstrap bundle is required."
-            lastErrorMessage = message
-            statusText = message
-            return
-        }
-
-        let startToken = UUID()
-        galleryMapStartToken = nil
-        webUIStartToken = startToken
-        isWebUIStartInFlight = true
-        let remoteSession = remoteSession
-        beginOperation()
-        Task {
-            defer {
-                isWebUIStartInFlight = false
-                endOperation()
-            }
-
-            do {
-                let session = try await Task.detached(priority: .userInitiated) {
-                    try remoteSession.startWebUI(configuration: configuration)
-                }.value
-                guard webUIStartToken == startToken else {
-                    try? await Task.detached(priority: .userInitiated) {
-                        try remoteSession.stopWebUI()
-                    }.value
-                    return
-                }
-                webUIPresentation = IronmeshWebUIPresentation(session: session)
-                lastErrorMessage = nil
-                statusText = "Opened embedded web UI."
-                addAction("Opened web UI", detail: "Started isolated loopback session.")
-            } catch {
-                guard webUIStartToken == startToken else {
-                    return
-                }
-                lastErrorMessage = error.localizedDescription
-                statusText = error.localizedDescription
-                addAction("Web UI failed", detail: error.localizedDescription)
-            }
-        }
+        openEmbeddedWebUI(surface: .webUI)
     }
 
     func closeWebUI() {
-        webUIStartToken = nil
-        guard webUIPresentation != nil else {
-            if pendingWebUIStart == .webUI {
-                pendingWebUIStart = nil
-            }
-            return
-        }
         webUIPresentation = nil
-        stopWebUIAsync()
+        stopWebUIAsync(surface: .webUI)
     }
 
     func openGalleryMap() {
-        guard galleryMapPresentation == nil else {
-            return
-        }
-        if webUIPresentation != nil {
-            pendingWebUIStart = .galleryMap
-            closeWebUI()
-            return
-        }
-        guard !isWebUIStartInFlight, !isWebUICacheClearInProgress else {
-            if isWebUICacheClearInProgress {
-                statusText = "Clearing cached Web UI data."
-            } else {
-                statusText = "An embedded view is already opening."
-            }
-            return
-        }
-        if isWebUIStopInFlight {
-            pendingWebUIStart = .galleryMap
-            statusText = "Closing embedded view."
+        openEmbeddedWebUI(surface: .galleryMap)
+    }
+
+    func closeGalleryMap() {
+        galleryMapPresentation = nil
+        stopWebUIAsync(surface: .galleryMap)
+    }
+
+    private func openEmbeddedWebUI(surface: AppleWebUiSurface) {
+        guard !isWebUICacheClearInProgress else {
+            statusText = "Clearing cached Web UI data."
             return
         }
         guard let configuration = draft.connectionConfiguration else {
@@ -1255,103 +1169,176 @@ final class IronmeshBrowserModel: ObservableObject {
             return
         }
 
-        let startToken = UUID()
-        webUIStartToken = nil
-        galleryMapStartToken = startToken
-        isWebUIStartInFlight = true
+        webUIPresentation = nil
+        galleryMapPresentation = nil
+        statusText = surface == .webUI
+            ? "Opening embedded web UI."
+            : "Opening embedded gallery map."
         let remoteSession = remoteSession
         beginOperation()
         Task {
-            defer {
-                isWebUIStartInFlight = false
-                endOperation()
-            }
-
+            defer { endOperation() }
             do {
-                let session = try await Task.detached(priority: .userInitiated) {
-                    try remoteSession.startWebUI(configuration: configuration)
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try remoteSession.startWebUI(configuration: configuration, surface: surface)
                 }.value
-                guard galleryMapStartToken == startToken else {
-                    try? await Task.detached(priority: .userInitiated) {
-                        try remoteSession.stopWebUI()
-                    }.value
+                let state = result.state
+                guard applyWebUIState(state) else {
                     return
                 }
-                galleryMapPresentation = IronmeshWebUIPresentation(session: session)
+                if state.phase == .failed {
+                    reportWebUIFailure(
+                        state,
+                        fallback: AppleManualCBridgeError.invalidResponse(
+                            "embedded Web UI exited before presentation"
+                        ),
+                        requestedSurface: surface
+                    )
+                    return
+                }
+                guard result.disposition == .applied || result.disposition == .reused,
+                      state.phase == .running,
+                      state.surface == surface,
+                      let session = state.session
+                else {
+                    return
+                }
+
                 lastErrorMessage = nil
-                statusText = "Opened embedded gallery map."
-                addAction("Opened gallery map", detail: "Started isolated loopback session.")
+                statusText = surface == .webUI
+                    ? "Opened embedded web UI."
+                    : "Opened embedded gallery map."
+                addAction(
+                    surface == .webUI ? "Opened web UI" : "Opened gallery map",
+                    detail: "Started shared loopback session \(session.sessionID)."
+                )
             } catch {
-                guard galleryMapStartToken == startToken else {
+                await reconcileWebUIFailure(error, requestedSurface: surface)
+            }
+        }
+    }
+
+    private func stopWebUIAsync(surface: AppleWebUiSurface) {
+        let remoteSession = remoteSession
+        beginOperation()
+        Task {
+            defer { endOperation() }
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try remoteSession.stopWebUI(surface: surface)
+                }.value
+                guard result.disposition != .noop else {
                     return
                 }
-                lastErrorMessage = error.localizedDescription
-                statusText = error.localizedDescription
-                addAction("Gallery map failed", detail: error.localizedDescription)
-            }
-        }
-    }
-
-    func closeGalleryMap() {
-        galleryMapStartToken = nil
-        guard galleryMapPresentation != nil else {
-            if pendingWebUIStart == .galleryMap {
-                pendingWebUIStart = nil
-            }
-            return
-        }
-        galleryMapPresentation = nil
-        stopWebUIAsync()
-    }
-
-    private func stopWebUIAsync() {
-        guard !isWebUIStopInFlight else {
-            return
-        }
-        isWebUIStopInFlight = true
-        let remoteSession = remoteSession
-        Task {
-            do {
-                try await Task.detached(priority: .userInitiated) {
-                    try remoteSession.stopWebUI()
-                }.value
-                let pendingStart = pendingWebUIStart
-                pendingWebUIStart = nil
-                isWebUIStopInFlight = false
-                switch pendingStart {
-                case .webUI:
-                    openWebUI()
-                case .galleryMap:
-                    openGalleryMap()
-                case nil:
-                    break
-                }
+                _ = applyWebUIState(result.state)
             } catch {
-                pendingWebUIStart = nil
-                isWebUIStopInFlight = false
-                lastErrorMessage = error.localizedDescription
+                let stopMessage = error.localizedDescription
+                do {
+                    let result = try await Task.detached(priority: .userInitiated) {
+                        try remoteSession.stopWebUI(surface: surface)
+                    }.value
+                    if result.disposition != .noop {
+                        _ = applyWebUIState(result.state)
+                    }
+                    let message = "The embedded view stop was retried successfully. You can open it again."
+                    lastErrorMessage = nil
+                    statusText = message
+                    addAction("Recovered embedded view", detail: stopMessage)
+                } catch {
+                    let message = "The embedded view could not be stopped. Try closing it again, or clear cached data to reset embedded views. \(error.localizedDescription)"
+                    lastErrorMessage = message
+                    statusText = message
+                    addAction("Embedded view stop failed", detail: message)
+                }
             }
         }
+    }
+
+    @discardableResult
+    private func applyWebUIState(_ state: AppleWebUiState) -> Bool {
+        guard state.revision >= webUIStateRevision else {
+            return false
+        }
+        webUIStateRevision = state.revision
+
+        switch (state.phase, state.surface, state.session) {
+        case (.running, .webUI, let session?):
+            webUIPresentation = IronmeshWebUIPresentation(session: session)
+            galleryMapPresentation = nil
+        case (.running, .galleryMap, let session?):
+            webUIPresentation = nil
+            galleryMapPresentation = IronmeshWebUIPresentation(session: session)
+        default:
+            webUIPresentation = nil
+            galleryMapPresentation = nil
+        }
+        return true
+    }
+
+    private func reconcileWebUIFailure(
+        _ error: Error,
+        requestedSurface: AppleWebUiSurface
+    ) async {
+        let remoteSession = remoteSession
+        if let state = try? await Task.detached(priority: .userInitiated, operation: {
+            try remoteSession.webUIState()
+        }).value {
+            if applyWebUIState(state), state.phase == .failed {
+                reportWebUIFailure(state, fallback: error, requestedSurface: requestedSurface)
+                return
+            }
+        }
+
+        reportWebUIOperationError(error, requestedSurface: requestedSurface)
+    }
+
+    private func reportWebUIOperationError(
+        _ error: Error,
+        requestedSurface: AppleWebUiSurface
+    ) {
+        let message = error.localizedDescription
+        lastErrorMessage = message
+        statusText = message
+        addAction(
+            requestedSurface == .webUI ? "Web UI failed" : "Gallery map failed",
+            detail: message
+        )
+    }
+
+    private func reportWebUIFailure(
+        _ state: AppleWebUiState,
+        fallback: Error,
+        requestedSurface: AppleWebUiSurface
+    ) {
+        let message = webUIFailureMessage(state.failure, fallback: fallback)
+        lastErrorMessage = message
+        statusText = message
+        addAction(
+            requestedSurface == .webUI ? "Web UI failed" : "Gallery map failed",
+            detail: message
+        )
+    }
+
+    private func webUIFailureMessage(
+        _ failure: AppleWebUiFailure?,
+        fallback: Error
+    ) -> String {
+        guard let failure else {
+            return fallback.localizedDescription
+        }
+        let recovery = failure.recovery == "retry_start_or_abort"
+            ? "Try opening it again, or clear cached data to force recovery."
+            : "Close the view or clear cached data before trying again."
+        return "Embedded view failed: \(failure.message) \(recovery)"
     }
 
     /// Removes discardable local data without touching enrollment, connection settings, or files.
     /// A running embedded Web UI is stopped first so no open SQLite VFS handle can retain chunks.
     func clearCachedData() {
-        guard !isWebUIStartInFlight else {
-            statusText = "Wait for the embedded view to finish opening before clearing cached data."
-            return
-        }
-        guard !isWebUIStopInFlight else {
-            statusText = "Wait for the embedded view to finish closing before clearing cached data."
-            return
-        }
         guard !isWebUICacheClearInProgress else {
             return
         }
         isWebUICacheClearInProgress = true
-        pendingWebUIStart = nil
-        webUIStartToken = nil
-        galleryMapStartToken = nil
         webUIPresentation = nil
         galleryMapPresentation = nil
         let remoteSession = remoteSession
@@ -1362,10 +1349,12 @@ final class IronmeshBrowserModel: ObservableObject {
                 endOperation()
             }
             do {
-                try await Task.detached(priority: .userInitiated) {
-                    try remoteSession.stopWebUI()
+                let result = try await Task.detached(priority: .userInitiated) {
+                    let result = try remoteSession.abortWebUI()
                     clearIronmeshCachedFiles()
+                    return result
                 }.value
+                _ = applyWebUIState(result.state)
                 URLCache.shared.removeAllCachedResponses()
                 lastErrorMessage = nil
                 statusText = "Cached data cleared. Reopen the Web UI to fetch fresh map data."
@@ -1682,9 +1671,6 @@ private func appleDiagnosticPlatformName() -> String {
 
 final class IronmeshRemoteSession: @unchecked Sendable {
     private let bridge: AppleCFacadeBridge
-    private let lock = NSLock()
-    private let operationLock = NSLock()
-    private var configurationKey: String?
 
     init(ffi: AppleManualCBridgeFFI = IronmeshRustFFIAdapter(connectionName: "ios app shell")) {
         bridge = AppleCFacadeBridge(ffi: ffi)
@@ -1703,6 +1689,34 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     ) throws -> Data {
         try withBridge(configuration) { bridge in
             try bridge.download(path: path, revisionHint: revisionHint)
+        }
+    }
+
+    func storeIndex(
+        _ request: AppleStoreIndexRequest,
+        configuration: AppleConnectionConfiguration
+    ) throws -> AppleStoreIndexResponse {
+        try withBridge(configuration) { bridge in
+            try bridge.storeIndex(request)
+        }
+    }
+
+    func fetchRelativeBytes(
+        path: String,
+        configuration: AppleConnectionConfiguration
+    ) throws -> Data {
+        try withBridge(configuration) { bridge in
+            try bridge.fetchRelativeBytes(path: path)
+        }
+    }
+
+    func setMediaLabels(
+        path: String,
+        labels: [String],
+        configuration: AppleConnectionConfiguration
+    ) throws {
+        try withBridge(configuration) { bridge in
+            try bridge.setMediaLabels(path: path, labels: labels)
         }
     }
 
@@ -1754,47 +1768,33 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     }
 
     func disableTitleLatencyMonitor() throws {
-        operationLock.lock()
-        defer { operationLock.unlock() }
-        lock.lock()
-        let hasConnection = configurationKey != nil
-        lock.unlock()
-        guard hasConnection else {
-            return
-        }
-        _ = try bridge.configureTitleLatencyMonitorJSON(
-            settings: AppleTitleLatencyMonitorSettings()
-        )
+        try bridge.stopTitleLatencyMonitor()
     }
 
-    func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
-        return try bridge.startWebUI(configuration: configuration)
+    func startWebUI(
+        configuration: AppleConnectionConfiguration,
+        surface: AppleWebUiSurface
+    ) throws -> AppleWebUiCommandResult {
+        try bridge.startWebUICommand(configuration: configuration, surface: surface)
     }
 
-    func stopWebUI() throws {
-        try bridge.stopWebUI()
+    func stopWebUI(surface: AppleWebUiSurface) throws -> AppleWebUiCommandResult {
+        try bridge.stopWebUI(surface: surface)
+    }
+
+    func abortWebUI() throws -> AppleWebUiCommandResult {
+        try bridge.abortWebUI()
+    }
+
+    func webUIState() throws -> AppleWebUiState {
+        try bridge.webUIState()
     }
 
     private func withBridge<T>(
         _ configuration: AppleConnectionConfiguration,
         operation: (AppleCFacadeBridge) throws -> T
     ) throws -> T {
-        operationLock.lock()
-        defer { operationLock.unlock() }
-        try connectIfNeeded(configuration)
-        return try operation(bridge)
-    }
-
-    private func connectIfNeeded(_ configuration: AppleConnectionConfiguration) throws {
-        let nextKey = configuration.cacheKey
-
-        lock.lock()
-        defer { lock.unlock() }
-        if configurationKey == nextKey {
-            return
-        }
-        _ = try bridge.connect(configuration)
-        configurationKey = nextKey
+        try bridge.withConnectedSession(configuration, operation: operation)
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from json: String) throws -> T {
@@ -1850,14 +1850,4 @@ private func previewLooksLikeImage(path: String, data: Data) -> Bool {
     return data.starts(with: [0x89, 0x50, 0x4E, 0x47])
         || data.starts(with: [0xFF, 0xD8, 0xFF])
         || data.starts(with: [0x47, 0x49, 0x46, 0x38])
-}
-
-private extension AppleConnectionConfiguration {
-    var cacheKey: String {
-        [
-            normalizedConnectionInput,
-            serverCAPem ?? "",
-            clientIdentityJSON ?? "",
-        ].joined(separator: "\n---\n")
-    }
 }
