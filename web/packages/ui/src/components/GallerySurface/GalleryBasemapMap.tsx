@@ -2082,12 +2082,23 @@ function absolutizeStyleUrl(urlValue: string): string {
     return urlValue;
   }
 
-  const tokenMatches = [...urlValue.matchAll(/\{[^}]+\}/g)];
+  const tokens: string[] = [];
+  let tokenStart = urlValue.indexOf("{");
+  while (tokenStart >= 0) {
+    const tokenEnd = urlValue.indexOf("}", tokenStart + 1);
+    if (tokenEnd < 0) {
+      break;
+    }
+    if (tokenEnd > tokenStart + 1) {
+      tokens.push(urlValue.slice(tokenStart, tokenEnd + 1));
+    }
+    tokenStart = urlValue.indexOf("{", tokenEnd + 1);
+  }
+
   let normalizedUrl = urlValue;
   const placeholderMap = new Map<string, string>();
 
-  for (const [index, match] of tokenMatches.entries()) {
-    const token = match[0];
+  for (const [index, token] of tokens.entries()) {
     const placeholder = `__ironmesh_style_token_${index}__`;
     normalizedUrl = normalizedUrl.replace(token, placeholder);
     placeholderMap.set(placeholder, token);
