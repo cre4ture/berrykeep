@@ -113,6 +113,12 @@ public protocol AppleManualCBridgeFFI: Sendable {
         clientIdentityJSON: String?,
         surface: AppleWebUiSurface
     ) throws -> String
+    func startWebUICommandJSON(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?,
+        surface: AppleWebUiSurface
+    ) throws -> String
     func stopWebUI(surface: AppleWebUiSurface) throws -> String
     func abortWebUI() throws -> String
     func webUIStateJSON() throws -> String
@@ -648,6 +654,19 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
     ) throws -> AppleWebUiSession {
         let bootstrapJSON = try validatedBootstrapJSON(configuration)
         return try AppleWebUiSession(responseJSON: ffi.startWebUI(
+            connectionInput: bootstrapJSON,
+            serverCAPem: configuration.serverCAPem,
+            clientIdentityJSON: configuration.clientIdentityJSON,
+            surface: surface
+        ))
+    }
+
+    public func startWebUICommand(
+        configuration: AppleConnectionConfiguration,
+        surface: AppleWebUiSurface = .webUI
+    ) throws -> AppleWebUiCommandResult {
+        let bootstrapJSON = try validatedBootstrapJSON(configuration)
+        return try AppleWebUiCommandResult(responseJSON: ffi.startWebUICommandJSON(
             connectionInput: bootstrapJSON,
             serverCAPem: configuration.serverCAPem,
             clientIdentityJSON: configuration.clientIdentityJSON,

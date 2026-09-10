@@ -705,12 +705,20 @@ fn start_embedded_web_ui(
     _cache_root: PathBuf,
     surface: MobileWebUiSurface,
 ) -> Result<MobileWebUiSession> {
+    start_embedded_web_ui_command(bootstrap_json, server_ca_pem, client_identity_json, surface)?
+        .into_started_session(surface)
+}
+
+fn start_embedded_web_ui_command(
+    bootstrap_json: String,
+    server_ca_pem: Option<String>,
+    client_identity_json: Option<String>,
+    surface: MobileWebUiSurface,
+) -> Result<MobileWebUiCommandResult> {
     init_ios_tracing();
     let configuration =
         MobileClientConfiguration::new(bootstrap_json, server_ca_pem, client_identity_json)?;
-    ios_mobile_client()?
-        .start_web_ui(configuration, surface)
-        .into_started_session(surface)
+    Ok(ios_mobile_client()?.start_web_ui(configuration, surface))
 }
 
 fn stop_embedded_web_ui() -> Result<MobileWebUiCommandResult> {
@@ -1616,6 +1624,32 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui_for_surface(
             parse_web_ui_surface(&surface)?,
         )?)
         .context("failed to serialize embedded Web UI session")
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_start_web_ui_for_surface_result_json(
+    connection_input: *const c_char,
+    server_ca_pem: *const c_char,
+    client_identity_json: *const c_char,
+    cache_root: *const c_char,
+    surface: *const c_char,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        let surface = required_c_string(surface, "surface")?;
+        let _cache_root = PathBuf::from(required_c_string(cache_root, "cache_root")?);
+        serde_json::to_string(&start_embedded_web_ui_command(
+            required_c_string(connection_input, "connection_input")?,
+            optional_c_string(server_ca_pem)?,
+            optional_c_string(client_identity_json)?,
+            parse_web_ui_surface(&surface)?,
+        )?)
+        .context("failed to serialize embedded Web UI start result")
     })
 }
 

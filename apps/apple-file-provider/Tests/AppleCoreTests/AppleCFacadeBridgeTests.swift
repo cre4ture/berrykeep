@@ -31,6 +31,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
     func testBridgeUsesSharedWebUILifecycleContract() throws {
         let ffi = MockFFI()
         ffi.webUIURL = #"{"sessionId":"session-1","surface":"gallery_map","url":"http://127.0.0.1:4100/","authorization":"test-session"}"#
+        ffi.webUIStartCommandResponseJSON = #"{"disposition":"applied","state":{"revision":7,"phase":"running","surface":"gallery_map","session":{"sessionId":"session-1","surface":"gallery_map","url":"http://127.0.0.1:4100/","authorization":"test-session"}}}"#
         ffi.webUIStateResponseJSON = #"{"revision":7,"phase":"running","surface":"gallery_map","session":{"sessionId":"session-1","surface":"gallery_map","url":"http://127.0.0.1:4100/","authorization":"test-session"}}"#
         ffi.webUIStopResponseJSON = #"{"disposition":"noop","state":{"revision":7,"phase":"running","surface":"gallery_map","session":{"sessionId":"session-1","surface":"gallery_map","url":"http://127.0.0.1:4100/","authorization":"test-session"}}}"#
         ffi.webUIAbortResponseJSON = #"{"disposition":"applied","state":{"revision":8,"phase":"idle"}}"#
@@ -38,12 +39,18 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         let configuration = AppleConnectionConfiguration(connectionInput: #"{"version":1}"#)
 
         let session = try bridge.startWebUI(configuration: configuration, surface: .galleryMap)
+        let start = try bridge.startWebUICommand(
+            configuration: configuration,
+            surface: .galleryMap
+        )
         let state = try bridge.webUIState()
         let stop = try bridge.stopWebUI(surface: .galleryMap)
         let abort = try bridge.abortWebUI()
 
         XCTAssertEqual(session.sessionID, "session-1")
         XCTAssertEqual(session.surface, .galleryMap)
+        XCTAssertEqual(start.disposition, .applied)
+        XCTAssertEqual(start.state, state)
         XCTAssertEqual(state.revision, 7)
         XCTAssertEqual(state.phase, .running)
         XCTAssertEqual(state.session, session)
@@ -497,6 +504,7 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var routeSnapshotResponseJSON = #"{"ranked_indices":[],"endpoints":[]}"#
     var clientIdentityUpdateJSON = ""
     var webUIURL = #"{"url":"http://127.0.0.1:4100/","authorization":"test-session"}"#
+    var webUIStartCommandResponseJSON = #"{"disposition":"applied","state":{"revision":1,"phase":"running","surface":"web_ui","session":{"sessionId":"session-1","surface":"web_ui","url":"http://127.0.0.1:4100/","authorization":"test-session"}}}"#
     var webUIStateResponseJSON = #"{"revision":0,"phase":"idle"}"#
     var webUIStopResponseJSON = #"{"disposition":"noop","state":{"revision":0,"phase":"idle"}}"#
     var webUIAbortResponseJSON = #"{"disposition":"applied","state":{"revision":1,"phase":"idle"}}"#
@@ -773,6 +781,19 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         _ = serverCAPem
         _ = clientIdentityJSON
         return webUIURL
+    }
+
+    func startWebUICommandJSON(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?,
+        surface: AppleWebUiSurface
+    ) throws -> String {
+        _ = connectionInput
+        _ = serverCAPem
+        _ = clientIdentityJSON
+        lastStartedWebUISurface = surface
+        return webUIStartCommandResponseJSON
     }
 
     func startWebUI(

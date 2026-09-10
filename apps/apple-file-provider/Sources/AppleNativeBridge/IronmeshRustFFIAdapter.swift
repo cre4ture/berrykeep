@@ -586,6 +586,42 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return consumeString(urlPointer)
     }
 
+    func startWebUICommandJSON(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?,
+        surface: AppleWebUiSurface
+    ) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let cacheDirectory = ironmeshCachesDirectory().path
+        let status = withOptionalCString(connectionInput) { connectionPointer in
+            withOptionalCString(serverCAPem) { serverPointer in
+                withOptionalCString(clientIdentityJSON) { identityPointer in
+                    cacheDirectory.withCString { cacheDirectoryPointer in
+                        surface.rawValue.withCString { surfacePointer in
+                            ironmesh_ios_facade_start_web_ui_for_surface_result_json(
+                                connectionPointer,
+                                serverPointer,
+                                identityPointer,
+                                cacheDirectoryPointer,
+                                surfacePointer,
+                                &jsonPointer,
+                                &errorPointer
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no Web UI start result.")
+        }
+        return consumeString(jsonPointer)
+    }
+
     func stopWebUI() throws -> String {
         try stopWebUI(surface: .webUI)
     }

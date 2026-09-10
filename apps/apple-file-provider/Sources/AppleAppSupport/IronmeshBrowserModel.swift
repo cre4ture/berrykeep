@@ -1179,12 +1179,10 @@ final class IronmeshBrowserModel: ObservableObject {
         Task {
             defer { endOperation() }
             do {
-                let session = try await Task.detached(priority: .userInitiated) {
+                let result = try await Task.detached(priority: .userInitiated) {
                     try remoteSession.startWebUI(configuration: configuration, surface: surface)
                 }.value
-                let state = try await Task.detached(priority: .userInitiated) {
-                    try remoteSession.webUIState()
-                }.value
+                let state = result.state
                 guard applyWebUIState(state) else {
                     return
                 }
@@ -1198,9 +1196,10 @@ final class IronmeshBrowserModel: ObservableObject {
                     )
                     return
                 }
-                guard state.phase == .running,
+                guard result.disposition == .applied || result.disposition == .reused,
+                      state.phase == .running,
                       state.surface == surface,
-                      state.session?.sessionID == session.sessionID
+                      let session = state.session
                 else {
                     return
                 }
@@ -1236,18 +1235,20 @@ final class IronmeshBrowserModel: ObservableObject {
                 let stopMessage = error.localizedDescription
                 do {
                     let result = try await Task.detached(priority: .userInitiated) {
-                        try remoteSession.abortWebUI()
+                        try remoteSession.stopWebUI(surface: surface)
                     }.value
-                    _ = applyWebUIState(result.state)
-                    let message = "The embedded view did not stop cleanly and was force-closed. You can open it again."
+                    if result.disposition != .noop {
+                        _ = applyWebUIState(result.state)
+                    }
+                    let message = "The embedded view stop was retried successfully. You can open it again."
                     lastErrorMessage = message
                     statusText = message
                     addAction("Recovered embedded view", detail: stopMessage)
                 } catch {
-                    let message = "The embedded view could not be stopped or recovered. Restart the app before opening it again. \(error.localizedDescription)"
+                    let message = "The embedded view could not be stopped. Try closing it again, or clear cached data to reset embedded views. \(error.localizedDescription)"
                     lastErrorMessage = message
                     statusText = message
-                    addAction("Embedded view recovery failed", detail: message)
+                    addAction("Embedded view stop failed", detail: message)
                 }
             }
         }
@@ -1770,8 +1771,8 @@ final class IronmeshRemoteSession: @unchecked Sendable {
     func startWebUI(
         configuration: AppleConnectionConfiguration,
         surface: AppleWebUiSurface
-    ) throws -> AppleWebUiSession {
-        try bridge.startWebUI(configuration: configuration, surface: surface)
+    ) throws -> AppleWebUiCommandResult {
+        try bridge.startWebUICommand(configuration: configuration, surface: surface)
     }
 
     func stopWebUI(surface: AppleWebUiSurface) throws -> AppleWebUiCommandResult {
