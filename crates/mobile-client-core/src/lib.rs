@@ -22,7 +22,7 @@ const MOBILE_CLIENT_NODE_CACHE_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
 const MOBILE_CLIENT_NODE_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const MOBILE_CLIENT_NODE_CACHE_CAPACITY_ENTRIES: usize = 256;
 const MOBILE_WEB_UI_AUTHORIZATION_REUSE_MIN_TTL: std::time::Duration =
-    std::time::Duration::from_secs(30);
+    std::time::Duration::from_secs(5 * 60);
 
 /// Stable identity of the transport configuration used by one mobile session.
 ///
@@ -1649,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn expiring_authorization_rebuilds_web_ui_instead_of_reusing_it() {
+    fn short_lived_authorization_rebuilds_web_ui_instead_of_reusing_it() {
         let client = client();
         let first = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
         let first_session_id = first
@@ -1666,7 +1666,8 @@ mod tests {
                 .active
                 .as_mut()
                 .expect("Web UI should be active")
-                .authorization = EmbeddedWebUiSessionAuthorization::with_ttl(Duration::ZERO);
+                .authorization =
+                EmbeddedWebUiSessionAuthorization::with_ttl(Duration::from_secs(4 * 60));
         }
 
         let restarted = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
