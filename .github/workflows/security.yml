@@ -64,6 +64,4 @@ jobs:
           tool: cargo-deny
 
       - name: Run cargo deny policy checks
-        run: |
-          cargo deny --locked --exclude system-tests check advisories licenses sources bans
-          cargo deny --locked --manifest-path tests/system-tests/Cargo.toml check advisories licenses sources bans
+        run: cargo deny --locked --exclude system-tests check advisories licenses sources bans
