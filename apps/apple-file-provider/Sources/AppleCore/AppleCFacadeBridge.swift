@@ -100,15 +100,62 @@ public protocol AppleManualCBridgeFFI: Sendable {
         periodSeconds: UInt64
     ) throws -> String
     func titleLatencyStatusJSON(handle: AppleRustHandle) throws -> String
+    func stopTitleLatencyMonitor() throws
     func startWebUI(
         connectionInput: String,
         serverCAPem: String?,
         clientIdentityJSON: String?
     ) throws -> String
-    func stopWebUI() throws
+    func stopWebUI() throws -> String
+    func startWebUI(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?,
+        surface: AppleWebUiSurface
+    ) throws -> String
+    func startWebUICommandJSON(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?,
+        surface: AppleWebUiSurface
+    ) throws -> String
+    func stopWebUI(surface: AppleWebUiSurface) throws -> String
+    func abortWebUI() throws -> String
+    func webUIStateJSON() throws -> String
 }
 
 public extension AppleManualCBridgeFFI {
+    func stopTitleLatencyMonitor() throws {
+        throw AppleManualCBridgeError.invalidResponse("Title latency monitor stop is unavailable")
+    }
+
+    func startWebUI(
+        connectionInput: String,
+        serverCAPem: String?,
+        clientIdentityJSON: String?,
+        surface: AppleWebUiSurface
+    ) throws -> String {
+        _ = surface
+        return try startWebUI(
+            connectionInput: connectionInput,
+            serverCAPem: serverCAPem,
+            clientIdentityJSON: clientIdentityJSON
+        )
+    }
+
+    func stopWebUI(surface: AppleWebUiSurface) throws -> String {
+        _ = surface
+        return try stopWebUI()
+    }
+
+    func abortWebUI() throws -> String {
+        try stopWebUI()
+    }
+
+    func webUIStateJSON() throws -> String {
+        throw AppleManualCBridgeError.invalidResponse("Web UI state reads are unavailable")
+    }
+
     func setMediaLabels(handle: AppleRustHandle, key: String, labelsJSON: String) throws {
         _ = handle
         _ = key
@@ -197,38 +244,113 @@ public struct AppleTitleLatencyStatus: Codable, Equatable, Sendable {
     }
 }
 
-private struct AppleWebUiLaunchResponse: Decodable {
-    let url: String
-    let authorization: String
+public enum AppleWebUiSurface: String, Codable, Equatable, Sendable {
+    case webUI = "web_ui"
+    case galleryMap = "gallery_map"
 }
 
-public struct AppleWebUiSession: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+public enum AppleWebUiPhase: String, Codable, Equatable, Sendable {
+    case idle
+    case starting
+    case running
+    case stopping
+    case failed
+}
+
+public struct AppleWebUiFailure: Codable, Equatable, Sendable {
+    public let stage: String
+    public let message: String
+    public let recovery: String
+}
+
+public struct AppleWebUiState: Codable, Equatable, Sendable {
+    public let revision: UInt64
+    public let phase: AppleWebUiPhase
+    public let surface: AppleWebUiSurface?
+    public let session: AppleWebUiSession?
+    public let failure: AppleWebUiFailure?
+}
+
+public enum AppleWebUiCommandDisposition: String, Codable, Equatable, Sendable {
+    case applied
+    case reused
+    case superseded
+    case noop
+}
+
+public struct AppleWebUiCommandResult: Codable, Equatable, Sendable {
+    public let disposition: AppleWebUiCommandDisposition
+    public let state: AppleWebUiState
+
+    public init(responseJSON: String) throws {
+        do {
+            self = try JSONDecoder().decode(
+                AppleWebUiCommandResult.self,
+                from: Data(responseJSON.utf8)
+            )
+        } catch {
+            throw AppleManualCBridgeError.invalidResponse(
+                "invalid embedded Web UI command response"
+            )
+        }
+    }
+}
+
+public struct AppleWebUiSession: Codable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let sessionID: String
+    public let surface: AppleWebUiSurface
     public let url: URL
     public let authorization: String
 
     public init(responseJSON: String) throws {
-        let response: AppleWebUiLaunchResponse
         do {
-            response = try JSONDecoder().decode(
-                AppleWebUiLaunchResponse.self,
+            self = try JSONDecoder().decode(
+                AppleWebUiSession.self,
                 from: Data(responseJSON.utf8)
             )
         } catch {
             throw AppleManualCBridgeError.invalidResponse("invalid embedded web UI launch response")
         }
-        guard let url = URL(string: response.url), !response.authorization.isEmpty else {
-            throw AppleManualCBridgeError.invalidResponse("invalid embedded web UI launch response")
-        }
-        self.url = url
-        self.authorization = response.authorization
     }
 
     public var description: String {
-        "AppleWebUiSession(url: \(url.absoluteString), authorization: <redacted>)"
+        "AppleWebUiSession(sessionID: \(sessionID), surface: \(surface.rawValue), url: \(url.absoluteString), authorization: <redacted>)"
     }
 
     public var debugDescription: String {
         description
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case surface
+        case url
+        case authorization
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        url = try container.decode(URL.self, forKey: .url)
+        authorization = try container.decode(String.self, forKey: .authorization)
+        sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
+            ?? url.absoluteString
+        surface = try container.decodeIfPresent(AppleWebUiSurface.self, forKey: .surface)
+            ?? .webUI
+        guard !authorization.isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .authorization,
+                in: container,
+                debugDescription: "embedded Web UI authorization is empty"
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(sessionID, forKey: .sessionID)
+        try container.encode(surface, forKey: .surface)
+        try container.encode(url, forKey: .url)
+        try container.encode(authorization, forKey: .authorization)
     }
 }
 
@@ -286,6 +408,18 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
             domainIdentifier: bootstrapJSON,
             rootPath: "/"
         )
+    }
+
+    /// Borrows one immutable, configuration-affine Rust session for an entire
+    /// operation. Rust reuses the shared session; Swift does not cache or swap
+    /// transport handles when settings change concurrently.
+    public func withConnectedSession<T>(
+        _ configuration: AppleConnectionConfiguration,
+        operation: (AppleCFacadeBridge) throws -> T
+    ) throws -> T {
+        let connectedBridge = AppleCFacadeBridge(ffi: ffi)
+        _ = try connectedBridge.connect(configuration)
+        return try operation(connectedBridge)
     }
 
     public func list(path: String, depth: Int) throws -> [AppleBridgeItem] {
@@ -510,17 +644,53 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
         }
     }
 
-    public func startWebUI(configuration: AppleConnectionConfiguration) throws -> AppleWebUiSession {
+    public func stopTitleLatencyMonitor() throws {
+        try ffi.stopTitleLatencyMonitor()
+    }
+
+    public func startWebUI(
+        configuration: AppleConnectionConfiguration,
+        surface: AppleWebUiSurface = .webUI
+    ) throws -> AppleWebUiSession {
         let bootstrapJSON = try validatedBootstrapJSON(configuration)
         return try AppleWebUiSession(responseJSON: ffi.startWebUI(
             connectionInput: bootstrapJSON,
             serverCAPem: configuration.serverCAPem,
-            clientIdentityJSON: configuration.clientIdentityJSON
+            clientIdentityJSON: configuration.clientIdentityJSON,
+            surface: surface
         ))
     }
 
-    public func stopWebUI() throws {
-        try ffi.stopWebUI()
+    public func startWebUICommand(
+        configuration: AppleConnectionConfiguration,
+        surface: AppleWebUiSurface = .webUI
+    ) throws -> AppleWebUiCommandResult {
+        let bootstrapJSON = try validatedBootstrapJSON(configuration)
+        return try AppleWebUiCommandResult(responseJSON: ffi.startWebUICommandJSON(
+            connectionInput: bootstrapJSON,
+            serverCAPem: configuration.serverCAPem,
+            clientIdentityJSON: configuration.clientIdentityJSON,
+            surface: surface
+        ))
+    }
+
+    public func stopWebUI(
+        surface: AppleWebUiSurface = .webUI
+    ) throws -> AppleWebUiCommandResult {
+        try AppleWebUiCommandResult(responseJSON: ffi.stopWebUI(surface: surface))
+    }
+
+    public func abortWebUI() throws -> AppleWebUiCommandResult {
+        try AppleWebUiCommandResult(responseJSON: ffi.abortWebUI())
+    }
+
+    public func webUIState() throws -> AppleWebUiState {
+        let json = try ffi.webUIStateJSON()
+        do {
+            return try JSONDecoder().decode(AppleWebUiState.self, from: Data(json.utf8))
+        } catch {
+            throw AppleManualCBridgeError.invalidResponse("invalid embedded Web UI state response")
+        }
     }
 
     private func disconnectIfNeeded() {

@@ -604,7 +604,7 @@ private struct IronmeshLibraryView: View {
                         }
                     }
                 } else {
-                    IronmeshGalleryView()
+                    IronmeshGalleryView(remoteSession: model.remoteSession)
                 }
             }
             .background(Color(uiColor: .systemGroupedBackground))
@@ -1273,10 +1273,6 @@ private struct IronmeshSettingsView: View {
                             model.refreshConnectionPaths()
                         }
                     }
-
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-
                     Button("Open web UI") {
                         model.openWebUI()
                     }
@@ -1295,13 +1291,6 @@ private struct IronmeshSettingsView: View {
                 }
             }
         }
-    }
-
-    private func draftBinding(_ keyPath: WritableKeyPath<IronmeshConnectionDraft, String>) -> Binding<String> {
-        Binding(
-            get: { model.draft[keyPath: keyPath] },
-            set: { model.draft[keyPath: keyPath] = $0 }
-        )
     }
 
     private var accentColorBinding: Binding<Color> {

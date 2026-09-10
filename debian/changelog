@@ -1,3 +1,15 @@
+berrykeep (1.2.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Add persistent multimedia operations, geolocation workflows, and expanded
+    gallery discovery across desktop and mobile clients.
+  * Publish signed Windows client MSIX sideload assets and portable Server Node
+    packages for AMD64 and ARM64.
+  * Complete the BerryKeep package transition while retaining safe Ironmesh
+    compatibility paths for deployed systems.
+  * Roll the workspace release to 1.2.0.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 10 Sep 2026 00:30:00 +0200
+
 berrykeep (1.1.0-3~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Preserve legacy desktop integration during the Ironmesh-to-BerryKeep

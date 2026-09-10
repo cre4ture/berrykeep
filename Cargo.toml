@@ -6,6 +6,7 @@ members = [
     "crates/rendezvous-server",
     "crates/stats-collector-server",
     "crates/client-sdk",
+    "crates/mobile-client-core",
     "crates/server-node-sdk",
     "crates/web-ui-backend",
     "crates/desktop-client-config",
@@ -30,7 +31,7 @@ exclude = ["tests/system-tests"]
 resolver = "2"
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 license = "MIT"
 authors = ["ironmesh contributors"]

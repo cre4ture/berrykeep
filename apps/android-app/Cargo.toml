@@ -17,6 +17,7 @@ client-sdk = { path = "../../crates/client-sdk" }
 common = { path = "../../crates/common" }
 futures-util = "0.3"
 jni = "0.21"
+mobile-client-core = { path = "../../crates/mobile-client-core" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
