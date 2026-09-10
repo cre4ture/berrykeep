@@ -46,12 +46,20 @@ impl ClientContentCache {
         }
     }
 
-    fn get(&mut self, key: &str) -> Option<Bytes> {
-        let payload = self.entries.get(key)?.clone();
-        if self.limits.is_some() {
+    fn peek(&self, key: &str) -> Option<Bytes> {
+        self.entries.get(key).cloned()
+    }
+
+    fn touch(&mut self, key: &str) {
+        if self.limits.is_some() && self.entries.contains_key(key) {
             self.recency.retain(|cached_key| cached_key != key);
             self.recency.push_back(key.to_string());
         }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Bytes> {
+        let payload = self.entries.get(key)?.clone();
+        self.touch(key);
         Some(payload)
     }
 
@@ -214,7 +222,17 @@ impl ClientNode {
     pub async fn get_cached_or_fetch(&self, key: impl AsRef<str>) -> Result<Bytes> {
         let key = key.as_ref();
 
-        if let Some(entry) = self.cache.write().await.get(key) {
+        let cached = {
+            let cache = self.cache.read().await;
+            cache.peek(key).map(|entry| (entry, cache.limits.is_some()))
+        };
+        if let Some((entry, bounded)) = cached {
+            // Cache hits must remain parallel across session clones. Recency is
+            // advisory under contention; eviction stays strictly bounded even
+            // when this best-effort touch cannot acquire the writer immediately.
+            if bounded && let Ok(mut cache) = self.cache.try_write() {
+                cache.touch(key);
+            }
             return Ok(entry);
         }
 
@@ -511,5 +529,31 @@ mod tests {
         assert!(!cache.entries.contains_key("large"));
         assert!(cache.entries.contains_key("a"));
         assert!(cache.entries.contains_key("c"));
+    }
+
+    #[tokio::test]
+    async fn cached_hit_does_not_wait_for_exclusive_lru_access() {
+        let node = ClientNode::with_client_cache_limits(
+            IronMeshClient::from_direct_base_url("http://127.0.0.1:1"),
+            16,
+            16,
+            2,
+        );
+        node.cache
+            .write()
+            .await
+            .insert("cached.txt".to_string(), Bytes::from_static(b"cached"));
+        let concurrent_reader = node.cache.read().await;
+
+        let payload = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            node.get_cached_or_fetch("cached.txt"),
+        )
+        .await
+        .expect("cache hit should not wait for the concurrent reader")
+        .expect("cache hit should succeed");
+
+        assert_eq!(payload, Bytes::from_static(b"cached"));
+        drop(concurrent_reader);
     }
 }
