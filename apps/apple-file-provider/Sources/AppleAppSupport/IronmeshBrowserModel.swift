@@ -1213,23 +1213,20 @@ final class IronmeshBrowserModel: ObservableObject {
         Task {
             defer { endOperation() }
             do {
-                try await Task.detached(priority: .userInitiated) {
+                let result = try await Task.detached(priority: .userInitiated) {
                     try remoteSession.stopWebUI(surface: surface)
                 }.value
-                let state = try await Task.detached(priority: .userInitiated) {
-                    try remoteSession.webUIState()
-                }.value
-                _ = applyWebUIState(state)
+                guard result.disposition != .noop else {
+                    return
+                }
+                _ = applyWebUIState(result.state)
             } catch {
                 let stopMessage = error.localizedDescription
                 do {
-                    try await Task.detached(priority: .userInitiated) {
+                    let result = try await Task.detached(priority: .userInitiated) {
                         try remoteSession.abortWebUI()
                     }.value
-                    let state = try await Task.detached(priority: .userInitiated) {
-                        try remoteSession.webUIState()
-                    }.value
-                    _ = applyWebUIState(state)
+                    _ = applyWebUIState(result.state)
                     let message = "The embedded view did not stop cleanly and was force-closed. You can open it again."
                     lastErrorMessage = message
                     statusText = message
@@ -1328,10 +1325,12 @@ final class IronmeshBrowserModel: ObservableObject {
                 endOperation()
             }
             do {
-                try await Task.detached(priority: .userInitiated) {
-                    try remoteSession.abortWebUI()
+                let result = try await Task.detached(priority: .userInitiated) {
+                    let result = try remoteSession.abortWebUI()
                     clearIronmeshCachedFiles()
+                    return result
                 }.value
+                _ = applyWebUIState(result.state)
                 URLCache.shared.removeAllCachedResponses()
                 lastErrorMessage = nil
                 statusText = "Cached data cleared. Reopen the Web UI to fetch fresh map data."
@@ -1755,11 +1754,11 @@ final class IronmeshRemoteSession: @unchecked Sendable {
         try bridge.startWebUI(configuration: configuration, surface: surface)
     }
 
-    func stopWebUI(surface: AppleWebUiSurface) throws {
+    func stopWebUI(surface: AppleWebUiSurface) throws -> AppleWebUiCommandResult {
         try bridge.stopWebUI(surface: surface)
     }
 
-    func abortWebUI() throws {
+    func abortWebUI() throws -> AppleWebUiCommandResult {
         try bridge.abortWebUI()
     }
 

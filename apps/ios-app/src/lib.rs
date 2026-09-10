@@ -14,7 +14,7 @@ use client_sdk::{ConnectionBootstrap, EnrolledClientConnection};
 use common::StorageObjectMeta;
 use mobile_client_core::{
     MobileClient, MobileClientConfiguration, MobileClientOptions, MobileClientSession,
-    MobileWebUiSession, MobileWebUiState, MobileWebUiSurface,
+    MobileWebUiCommandResult, MobileWebUiSession, MobileWebUiState, MobileWebUiSurface,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
@@ -713,14 +713,12 @@ fn start_embedded_web_ui(
         .into_started_session(surface)
 }
 
-fn stop_embedded_web_ui() -> Result<()> {
-    let _ = ios_mobile_client()?.stop_web_ui(MobileWebUiSurface::WebUi);
-    Ok(())
+fn stop_embedded_web_ui() -> Result<MobileWebUiCommandResult> {
+    Ok(ios_mobile_client()?.stop_web_ui(MobileWebUiSurface::WebUi))
 }
 
-fn stop_embedded_web_ui_surface(surface: MobileWebUiSurface) -> Result<()> {
-    let _ = ios_mobile_client()?.stop_web_ui(surface);
-    Ok(())
+fn stop_embedded_web_ui_surface(surface: MobileWebUiSurface) -> Result<MobileWebUiCommandResult> {
+    Ok(ios_mobile_client()?.stop_web_ui(surface))
 }
 
 fn parse_web_ui_surface(value: &str) -> Result<MobileWebUiSurface> {
@@ -731,9 +729,8 @@ fn parse_web_ui_surface(value: &str) -> Result<MobileWebUiSurface> {
     }
 }
 
-fn abort_embedded_web_ui() -> Result<()> {
-    let _ = ios_mobile_client()?.abort_web_ui();
-    Ok(())
+fn abort_embedded_web_ui() -> Result<MobileWebUiCommandResult> {
+    Ok(ios_mobile_client()?.abort_web_ui())
 }
 
 fn embedded_web_ui_state() -> Result<MobileWebUiState> {
@@ -1626,7 +1623,7 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui_for_surface(
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_stop_web_ui(out_error: *mut *mut c_char) -> c_int {
     clear_error(out_error);
-    run_ffi_unit_result(out_error, stop_embedded_web_ui)
+    run_ffi_unit_result(out_error, || stop_embedded_web_ui().map(drop))
 }
 
 #[allow(unsafe_code)]
@@ -1638,7 +1635,25 @@ pub extern "C" fn ironmesh_ios_facade_stop_web_ui_surface(
     clear_error(out_error);
     run_ffi_unit_result(out_error, || {
         let surface = required_c_string(surface, "surface")?;
-        stop_embedded_web_ui_surface(parse_web_ui_surface(&surface)?)
+        stop_embedded_web_ui_surface(parse_web_ui_surface(&surface)?).map(drop)
+    })
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_stop_web_ui_surface_result_json(
+    surface: *const c_char,
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        let surface = required_c_string(surface, "surface")?;
+        serde_json::to_string(&stop_embedded_web_ui_surface(parse_web_ui_surface(
+            &surface,
+        )?)?)
+        .context("failed to serialize embedded Web UI stop result")
     })
 }
 
@@ -1646,7 +1661,21 @@ pub extern "C" fn ironmesh_ios_facade_stop_web_ui_surface(
 #[unsafe(no_mangle)]
 pub extern "C" fn ironmesh_ios_facade_abort_web_ui(out_error: *mut *mut c_char) -> c_int {
     clear_error(out_error);
-    run_ffi_unit_result(out_error, abort_embedded_web_ui)
+    run_ffi_unit_result(out_error, || abort_embedded_web_ui().map(drop))
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn ironmesh_ios_facade_abort_web_ui_result_json(
+    out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
+) -> c_int {
+    clear_string_out(out_json);
+    clear_error(out_error);
+    run_ffi_string_result(out_json, out_error, || {
+        serde_json::to_string(&abort_embedded_web_ui()?)
+            .context("failed to serialize embedded Web UI abort result")
+    })
 }
 
 #[allow(unsafe_code)]

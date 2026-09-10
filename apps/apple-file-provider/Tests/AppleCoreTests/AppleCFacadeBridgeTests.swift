@@ -32,19 +32,26 @@ final class AppleCFacadeBridgeTests: XCTestCase {
         let ffi = MockFFI()
         ffi.webUIURL = #"{"sessionId":"session-1","surface":"gallery_map","url":"http://127.0.0.1:4100/","authorization":"test-session"}"#
         ffi.webUIStateResponseJSON = #"{"revision":7,"phase":"running","surface":"gallery_map","session":{"sessionId":"session-1","surface":"gallery_map","url":"http://127.0.0.1:4100/","authorization":"test-session"}}"#
+        ffi.webUIStopResponseJSON = #"{"disposition":"noop","state":{"revision":7,"phase":"running","surface":"gallery_map","session":{"sessionId":"session-1","surface":"gallery_map","url":"http://127.0.0.1:4100/","authorization":"test-session"}}}"#
+        ffi.webUIAbortResponseJSON = #"{"disposition":"applied","state":{"revision":8,"phase":"idle"}}"#
         let bridge = AppleCFacadeBridge(ffi: ffi)
         let configuration = AppleConnectionConfiguration(connectionInput: #"{"version":1}"#)
 
         let session = try bridge.startWebUI(configuration: configuration, surface: .galleryMap)
         let state = try bridge.webUIState()
-        try bridge.stopWebUI(surface: .galleryMap)
-        try bridge.abortWebUI()
+        let stop = try bridge.stopWebUI(surface: .galleryMap)
+        let abort = try bridge.abortWebUI()
 
         XCTAssertEqual(session.sessionID, "session-1")
         XCTAssertEqual(session.surface, .galleryMap)
         XCTAssertEqual(state.revision, 7)
         XCTAssertEqual(state.phase, .running)
         XCTAssertEqual(state.session, session)
+        XCTAssertEqual(stop.disposition, .noop)
+        XCTAssertEqual(stop.state, state)
+        XCTAssertEqual(abort.disposition, .applied)
+        XCTAssertEqual(abort.state.phase, .idle)
+        XCTAssertEqual(abort.state.revision, 8)
         XCTAssertEqual(ffi.lastStartedWebUISurface, .galleryMap)
         XCTAssertEqual(ffi.lastStoppedWebUISurface, .galleryMap)
         XCTAssertEqual(ffi.webUIAbortCount, 1)
@@ -491,6 +498,8 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
     var clientIdentityUpdateJSON = ""
     var webUIURL = #"{"url":"http://127.0.0.1:4100/","authorization":"test-session"}"#
     var webUIStateResponseJSON = #"{"revision":0,"phase":"idle"}"#
+    var webUIStopResponseJSON = #"{"disposition":"noop","state":{"revision":0,"phase":"idle"}}"#
+    var webUIAbortResponseJSON = #"{"disposition":"applied","state":{"revision":1,"phase":"idle"}}"#
     var lastStartedWebUISurface: AppleWebUiSurface?
     var lastStoppedWebUISurface: AppleWebUiSurface?
     var webUIAbortCount = 0
@@ -779,14 +788,18 @@ private final class MockFFI: AppleManualCBridgeFFI, @unchecked Sendable {
         return webUIURL
     }
 
-    func stopWebUI() throws {}
-
-    func stopWebUI(surface: AppleWebUiSurface) throws {
-        lastStoppedWebUISurface = surface
+    func stopWebUI() throws -> String {
+        webUIStopResponseJSON
     }
 
-    func abortWebUI() throws {
+    func stopWebUI(surface: AppleWebUiSurface) throws -> String {
+        lastStoppedWebUISurface = surface
+        return webUIStopResponseJSON
+    }
+
+    func abortWebUI() throws -> String {
         webUIAbortCount += 1
+        return webUIAbortResponseJSON
     }
 
     func webUIStateJSON() throws -> String {

@@ -586,22 +586,36 @@ final class IronmeshRustFFIAdapter: AppleManualCBridgeFFI, AppleBootstrapEnrolle
         return consumeString(urlPointer)
     }
 
-    func stopWebUI() throws {
+    func stopWebUI() throws -> String {
         try stopWebUI(surface: .webUI)
     }
 
-    func stopWebUI(surface: AppleWebUiSurface) throws {
+    func stopWebUI(surface: AppleWebUiSurface) throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
         let status = surface.rawValue.withCString { surfacePointer in
-            ironmesh_ios_facade_stop_web_ui_surface(surfacePointer, &errorPointer)
+            ironmesh_ios_facade_stop_web_ui_surface_result_json(
+                surfacePointer,
+                &jsonPointer,
+                &errorPointer
+            )
         }
         try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no Web UI stop result.")
+        }
+        return consumeString(jsonPointer)
     }
 
-    func abortWebUI() throws {
+    func abortWebUI() throws -> String {
+        var jsonPointer: UnsafeMutablePointer<CChar>?
         var errorPointer: UnsafeMutablePointer<CChar>?
-        let status = ironmesh_ios_facade_abort_web_ui(&errorPointer)
+        let status = ironmesh_ios_facade_abort_web_ui_result_json(&jsonPointer, &errorPointer)
         try throwIfNeeded(status: status, errorPointer: errorPointer)
+        guard let jsonPointer else {
+            throw IronmeshRustFFIError(message: "Rust bridge returned no Web UI abort result.")
+        }
+        return consumeString(jsonPointer)
     }
 
     func webUIStateJSON() throws -> String {

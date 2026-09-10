@@ -106,15 +106,15 @@ public protocol AppleManualCBridgeFFI: Sendable {
         serverCAPem: String?,
         clientIdentityJSON: String?
     ) throws -> String
-    func stopWebUI() throws
+    func stopWebUI() throws -> String
     func startWebUI(
         connectionInput: String,
         serverCAPem: String?,
         clientIdentityJSON: String?,
         surface: AppleWebUiSurface
     ) throws -> String
-    func stopWebUI(surface: AppleWebUiSurface) throws
-    func abortWebUI() throws
+    func stopWebUI(surface: AppleWebUiSurface) throws -> String
+    func abortWebUI() throws -> String
     func webUIStateJSON() throws -> String
 }
 
@@ -137,12 +137,12 @@ public extension AppleManualCBridgeFFI {
         )
     }
 
-    func stopWebUI(surface: AppleWebUiSurface) throws {
+    func stopWebUI(surface: AppleWebUiSurface) throws -> String {
         _ = surface
-        try stopWebUI()
+        return try stopWebUI()
     }
 
-    func abortWebUI() throws {
+    func abortWebUI() throws -> String {
         try stopWebUI()
     }
 
@@ -263,6 +263,31 @@ public struct AppleWebUiState: Codable, Equatable, Sendable {
     public let surface: AppleWebUiSurface?
     public let session: AppleWebUiSession?
     public let failure: AppleWebUiFailure?
+}
+
+public enum AppleWebUiCommandDisposition: String, Codable, Equatable, Sendable {
+    case applied
+    case reused
+    case superseded
+    case noop
+}
+
+public struct AppleWebUiCommandResult: Codable, Equatable, Sendable {
+    public let disposition: AppleWebUiCommandDisposition
+    public let state: AppleWebUiState
+
+    public init(responseJSON: String) throws {
+        do {
+            self = try JSONDecoder().decode(
+                AppleWebUiCommandResult.self,
+                from: Data(responseJSON.utf8)
+            )
+        } catch {
+            throw AppleManualCBridgeError.invalidResponse(
+                "invalid embedded Web UI command response"
+            )
+        }
+    }
 }
 
 public struct AppleWebUiSession: Codable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
@@ -630,12 +655,14 @@ public final class AppleCFacadeBridge: AppleManualCBridge, @unchecked Sendable {
         ))
     }
 
-    public func stopWebUI(surface: AppleWebUiSurface = .webUI) throws {
-        try ffi.stopWebUI(surface: surface)
+    public func stopWebUI(
+        surface: AppleWebUiSurface = .webUI
+    ) throws -> AppleWebUiCommandResult {
+        try AppleWebUiCommandResult(responseJSON: ffi.stopWebUI(surface: surface))
     }
 
-    public func abortWebUI() throws {
-        try ffi.abortWebUI()
+    public func abortWebUI() throws -> AppleWebUiCommandResult {
+        try AppleWebUiCommandResult(responseJSON: ffi.abortWebUI())
     }
 
     public func webUIState() throws -> AppleWebUiState {

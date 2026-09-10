@@ -211,7 +211,13 @@ int ironmesh_ios_facade_stop_web_ui(char **out_error);
 
 int ironmesh_ios_facade_stop_web_ui_surface(const char *surface, char **out_error);
 
+int ironmesh_ios_facade_stop_web_ui_surface_result_json(const char *surface,
+                                                        char **out_json,
+                                                        char **out_error);
+
 int ironmesh_ios_facade_abort_web_ui(char **out_error);
+
+int ironmesh_ios_facade_abort_web_ui_result_json(char **out_json, char **out_error);
 
 int ironmesh_ios_facade_web_ui_state_json(char **out_json, char **out_error);
 
