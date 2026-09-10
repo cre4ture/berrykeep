@@ -1241,7 +1241,7 @@ final class IronmeshBrowserModel: ObservableObject {
                         _ = applyWebUIState(result.state)
                     }
                     let message = "The embedded view stop was retried successfully. You can open it again."
-                    lastErrorMessage = message
+                    lastErrorMessage = nil
                     statusText = message
                     addAction("Recovered embedded view", detail: stopMessage)
                 } catch {
