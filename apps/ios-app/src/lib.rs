@@ -1804,20 +1804,6 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
-#[cfg(test)]
-fn normalized_bootstrap_json(bootstrap_json: impl Into<String>) -> Result<String> {
-    let bootstrap_json = bootstrap_json.into();
-    let trimmed = bootstrap_json.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("iOS client requires a non-empty connection bootstrap");
-    }
-
-    ConnectionBootstrap::from_json_str(trimmed)
-        .context("failed to parse iOS connection bootstrap JSON")?
-        .to_json_pretty()
-        .context("failed to normalize iOS connection bootstrap JSON")
-}
-
 fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some("raw") => Ok(Some(StoreIndexView::Raw)),
@@ -2475,13 +2461,20 @@ mod tests {
 
     #[test]
     fn ios_client_rejects_legacy_direct_server_url() {
-        let error = normalized_bootstrap_json("https://storage.example.test")
-            .expect_err("a direct server URL must not be accepted as app configuration");
+        let error = match IosStorageApp::configured(
+            "https://storage.example.test",
+            None,
+            None,
+            Some("test".to_string()),
+        ) {
+            Ok(_) => panic!("a direct server URL must not be accepted as app configuration"),
+            Err(error) => error,
+        };
 
         assert!(
             error
                 .to_string()
-                .contains("failed to parse iOS connection bootstrap JSON")
+                .contains("failed to parse mobile connection bootstrap JSON")
         );
     }
 
