@@ -149,12 +149,16 @@ impl EmbeddedWebUiSessionAuthorization {
         &self.token
     }
 
-    fn accepts(&self, candidate: Option<&str>) -> bool {
-        !self.is_expired() && candidate.is_some_and(|candidate| candidate == self.token.as_ref())
+    /// Returns whether this one-time bootstrap authorization will expire within
+    /// `window`. Embedded hosts use this to replace a listener before handing a
+    /// caller a token that may expire while its WebView is starting.
+    pub fn expires_within(&self, window: Duration) -> bool {
+        self.expires_at.saturating_duration_since(Instant::now()) <= window
     }
 
-    fn is_expired(&self) -> bool {
-        Instant::now() >= self.expires_at
+    fn accepts(&self, candidate: Option<&str>) -> bool {
+        !self.expires_within(Duration::ZERO)
+            && candidate.is_some_and(|candidate| candidate == self.token.as_ref())
     }
 
     fn cookie(&self) -> Option<HeaderValue> {

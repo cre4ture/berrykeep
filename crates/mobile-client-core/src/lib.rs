@@ -21,6 +21,8 @@ use web_ui_backend::{EmbeddedWebUiSessionAuthorization, WebUiBootstrapPersistenc
 const MOBILE_CLIENT_NODE_CACHE_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
 const MOBILE_CLIENT_NODE_CACHE_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const MOBILE_CLIENT_NODE_CACHE_CAPACITY_ENTRIES: usize = 256;
+const MOBILE_WEB_UI_AUTHORIZATION_REUSE_MIN_TTL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Stable identity of the transport configuration used by one mobile session.
 ///
@@ -456,6 +458,8 @@ struct ActiveWebUi {
     request_id: u64,
     affinity: MobileConnectionAffinity,
     bootstrap_identity: String,
+    client_identity: Option<ClientIdentityMaterial>,
+    authorization: EmbeddedWebUiSessionAuthorization,
     session: MobileWebUiSession,
     task: JoinHandle<()>,
     completion: Arc<Mutex<Option<String>>>,
@@ -872,6 +876,10 @@ impl MobileClient {
             if lifecycle.active.as_ref().is_some_and(|active| {
                 active.affinity == affinity
                     && active.bootstrap_identity == bootstrap_identity
+                    && active.client_identity.as_ref() == configuration.client_identity()
+                    && !active
+                        .authorization
+                        .expires_within(MOBILE_WEB_UI_AUTHORIZATION_REUSE_MIN_TTL)
                     && active.session.surface == surface
             }) {
                 lifecycle
@@ -1167,13 +1175,18 @@ impl MobileClient {
             authorization: authorization.token().to_string(),
         };
 
-        let mut web_ui_config = WebUiConfig::from_client(
-            client_session.client(self.options.web_ui_connection_name.clone()),
-        )
-        .with_service_name(self.options.web_ui_service_name.clone())
-        .with_connection_bootstrap(configuration.effective_bootstrap().clone())
-        .with_embedded_session_authorization(authorization);
-        if let Some(identity) = client_session.client_identity() {
+        let client_identity = configuration.client_identity().cloned();
+        let mut web_ui_client = client_session.client(self.options.web_ui_connection_name.clone());
+        if let Some(identity) = client_identity.clone() {
+            // The affine transport router can stay shared, but request signing
+            // must use the caller's latest renewable credential material.
+            web_ui_client = web_ui_client.with_client_identity(identity);
+        }
+        let mut web_ui_config = WebUiConfig::from_client(web_ui_client)
+            .with_service_name(self.options.web_ui_service_name.clone())
+            .with_connection_bootstrap(configuration.effective_bootstrap().clone())
+            .with_embedded_session_authorization(authorization.clone());
+        if let Some(identity) = client_identity {
             web_ui_config = web_ui_config.with_client_identity(identity);
         }
         if let Some(persistence) = self.options.web_ui_bootstrap_persistence.clone() {
@@ -1200,6 +1213,8 @@ impl MobileClient {
             request_id,
             affinity: client_session.affinity().clone(),
             bootstrap_identity: configuration.effective_bootstrap_identity().to_string(),
+            client_identity: configuration.client_identity().cloned(),
+            authorization,
             session,
             task,
             completion,
@@ -1269,6 +1284,22 @@ mod tests {
             None::<&str>,
         )
         .expect("test configuration should parse")
+    }
+
+    fn configuration_with_identity(
+        port: u16,
+        identity: &ClientIdentityMaterial,
+    ) -> MobileClientConfiguration {
+        MobileClientConfiguration::new(
+            test_bootstrap(port),
+            None::<&str>,
+            Some(
+                identity
+                    .to_json_pretty()
+                    .expect("test identity should serialize"),
+            ),
+        )
+        .expect("identity configuration should parse")
     }
 
     fn client() -> Arc<MobileClient> {
@@ -1538,6 +1569,119 @@ mod tests {
                 .as_ref()
                 .map(|active| active.bootstrap_identity.as_str()),
             Some(updated.effective_bootstrap_identity())
+        );
+    }
+
+    #[test]
+    fn renewed_credentials_rebuild_web_ui_on_reused_connection() {
+        let cluster_id = "019d04a8-3099-75bc-8ff5-f5bd9a78bb83"
+            .parse()
+            .expect("cluster id should parse");
+        let mut original_identity =
+            ClientIdentityMaterial::generate(cluster_id, None, Some("Mobile device".to_string()))
+                .expect("identity should generate");
+        original_identity.credential_pem = Some("credential-v1".to_string());
+        original_identity.issued_at_unix = Some(10);
+        original_identity.expires_at_unix = Some(20);
+        let mut renewed_identity = original_identity.clone();
+        renewed_identity.credential_pem = Some("credential-v2".to_string());
+        renewed_identity.issued_at_unix = Some(30);
+        renewed_identity.expires_at_unix = Some(40);
+
+        let original = configuration_with_identity(18_080, &original_identity);
+        let renewed = configuration_with_identity(18_080, &renewed_identity);
+        assert_eq!(original.affinity(), renewed.affinity());
+
+        let client = client();
+        let first = client.start_web_ui(original, MobileWebUiSurface::WebUi);
+        let first_web_ui_id = first
+            .state
+            .session
+            .expect("first Web UI should be running")
+            .session_id;
+        let connection_id = client
+            .connection
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .expect("connection should be active")
+            .session
+            .id();
+
+        let restarted = client.start_web_ui(renewed, MobileWebUiSurface::WebUi);
+
+        assert_eq!(
+            restarted.disposition,
+            MobileWebUiCommandDisposition::Applied
+        );
+        assert_ne!(
+            restarted
+                .state
+                .session
+                .expect("renewed Web UI should be running")
+                .session_id,
+            first_web_ui_id
+        );
+        let connection = client
+            .connection
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            connection
+                .as_ref()
+                .expect("connection should remain active")
+                .session
+                .id(),
+            connection_id
+        );
+        let lifecycle = client
+            .web_ui
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            lifecycle
+                .active
+                .as_ref()
+                .and_then(|active| active.client_identity.as_ref())
+                .and_then(|identity| identity.credential_pem.as_deref()),
+            Some("credential-v2")
+        );
+    }
+
+    #[test]
+    fn expiring_authorization_rebuilds_web_ui_instead_of_reusing_it() {
+        let client = client();
+        let first = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
+        let first_session_id = first
+            .state
+            .session
+            .expect("first Web UI should be running")
+            .session_id;
+        {
+            let mut lifecycle = client
+                .web_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lifecycle
+                .active
+                .as_mut()
+                .expect("Web UI should be active")
+                .authorization = EmbeddedWebUiSessionAuthorization::with_ttl(Duration::ZERO);
+        }
+
+        let restarted = client.start_web_ui(configuration(18_080), MobileWebUiSurface::WebUi);
+
+        assert_eq!(
+            restarted.disposition,
+            MobileWebUiCommandDisposition::Applied
+        );
+        assert_ne!(
+            restarted
+                .state
+                .session
+                .expect("replacement Web UI should be running")
+                .session_id,
+            first_session_id
         );
     }
 
