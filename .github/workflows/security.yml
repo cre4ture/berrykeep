@@ -37,8 +37,11 @@ jobs:
         with:
           tool: cargo-audit
 
-      - name: Run cargo audit
+      - name: Run cargo audit (workspace)
         run: cargo audit --file Cargo.lock
+
+      - name: Run cargo audit (system tests)
+        run: cargo audit --file tests/system-tests/Cargo.lock
 
   cargo-deny:
     name: Deny

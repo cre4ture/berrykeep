@@ -10,7 +10,13 @@ authors = ["ironmesh contributors"]
 [dependencies]
 anyhow = "1"
 aws-credential-types = "1"
-aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "http-1x",
+    "rt-tokio",
+    "sigv4a",
+] }
 aws-types = "1"
 axum = "0.8"
 blake3 = "1"
