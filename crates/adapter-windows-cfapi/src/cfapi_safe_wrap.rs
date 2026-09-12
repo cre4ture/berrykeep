@@ -501,6 +501,18 @@ where
     callback(protected_handle.raw())
 }
 
+fn try_metadata_update_accesses<T, E>(
+    mut open: impl FnMut(u32) -> std::result::Result<T, E>,
+) -> std::result::Result<T, (E, E)> {
+    match open(FILE_WRITE_DATA) {
+        Ok(value) => Ok(value),
+        Err(write_data_error) => match open(WRITE_DAC) {
+            Ok(value) => Ok(value),
+            Err(write_dac_error) => Err((write_data_error, write_dac_error)),
+        },
+    }
+}
+
 pub(crate) fn with_cf_metadata_update_handle<T, F>(path: &Path, callback: F) -> Result<T>
 where
     F: FnOnce(HANDLE) -> Result<T>,
@@ -531,15 +543,12 @@ where
         }
     };
 
-    let file = match open(FILE_WRITE_DATA) {
-        Ok(file) => file,
-        Err(write_data_error) => open(WRITE_DAC).with_context(|| {
-            format!(
-                "CreateFileW failed to open metadata update handle for {} with FILE_WRITE_DATA ({write_data_error}) or WRITE_DAC",
-                path.display()
-            )
-        })?,
-    };
+    let file = try_metadata_update_accesses(open).map_err(|(write_data_error, write_dac_error)| {
+        anyhow::Error::new(write_dac_error).context(format!(
+            "CreateFileW failed to open metadata update handle for {} with FILE_WRITE_DATA ({write_data_error}) or WRITE_DAC",
+            path.display()
+        ))
+    })?;
     callback(file.as_raw_handle() as HANDLE)
 }
 
@@ -1260,6 +1269,24 @@ unsafe extern "system" fn callback_file_close_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_update_access_falls_back_without_requesting_read_access() {
+        let mut attempts = Vec::new();
+        let opened = try_metadata_update_accesses(|access| {
+            attempts.push(access);
+            if access == FILE_WRITE_DATA {
+                Err("modify permission denied")
+            } else {
+                Ok("opened with owner permission")
+            }
+        })
+        .expect("WRITE_DAC fallback should succeed");
+
+        assert_eq!(opened, "opened with owner permission");
+        assert_eq!(attempts, [FILE_WRITE_DATA, WRITE_DAC]);
+        assert!(attempts.iter().all(|access| access & FILE_READ_DATA == 0));
+    }
 
     #[test]
     fn fetch_worker_pool_shutdown_is_idempotent_and_closes_ingress() {

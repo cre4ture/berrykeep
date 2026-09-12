@@ -272,9 +272,20 @@ fn should_schedule_placeholder_hydration(
 
 fn placeholder_has_uploadable_local_content(state: PlaceholderSnapshot) -> bool {
     state.modified_data_size != 0
-        || (state.on_disk_data_size > 0
-            && !state.is_partial
-            && state.in_sync_state != CF_IN_SYNC_STATE_IN_SYNC)
+        || (!state.is_partial && state.in_sync_state != CF_IN_SYNC_STATE_IN_SYNC)
+}
+
+fn update_placeholder_probe_failure_state(
+    failures: &mut HashSet<String>,
+    path: &str,
+    failed: bool,
+) -> bool {
+    if failed {
+        failures.insert(path.to_string())
+    } else {
+        failures.remove(path);
+        false
+    }
 }
 
 pub struct SyncRootMonitor {
@@ -877,7 +888,11 @@ impl SyncRootMonitor {
         };
         let previous_path = self.prior_paths.get(&rel_path).cloned();
         if !entry.is_dir && entry.is_placeholder && entry.placeholder_state.is_none() {
-            if self.unavailable_placeholder_probes.insert(rel_path.clone()) {
+            if update_placeholder_probe_failure_state(
+                &mut self.unavailable_placeholder_probes,
+                &rel_path,
+                true,
+            ) {
                 tracing::info!(
                     "{}: deferring placeholder processing for {} because its current CFAPI state is unavailable error={}",
                     self.name,
@@ -890,7 +905,11 @@ impl SyncRootMonitor {
             }
             return;
         }
-        self.unavailable_placeholder_probes.remove(&rel_path);
+        update_placeholder_probe_failure_state(
+            &mut self.unavailable_placeholder_probes,
+            &rel_path,
+            false,
+        );
         self.maybe_schedule_placeholder_hydrate(path, &rel_path, &entry);
         self.maybe_schedule_placeholder_dehydrate(path, &rel_path, &entry);
 
@@ -1962,6 +1981,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn placeholder_probe_failure_diagnostics_rearm_after_recovery() {
+        let mut failures = HashSet::new();
+        assert!(update_placeholder_probe_failure_state(
+            &mut failures,
+            "docs/report.txt",
+            true
+        ));
+        assert!(!update_placeholder_probe_failure_state(
+            &mut failures,
+            "docs/report.txt",
+            true
+        ));
+        assert!(!update_placeholder_probe_failure_state(
+            &mut failures,
+            "docs/report.txt",
+            false
+        ));
+        assert!(update_placeholder_probe_failure_state(
+            &mut failures,
+            "docs/report.txt",
+            true
+        ));
+    }
+
     fn registered_monitor_test_sync_root(
         test_name: &str,
     ) -> (RegisteredMonitorTestSyncRoot, uuid::Uuid) {
@@ -2868,11 +2912,22 @@ mod tests {
 
         let cold_not_in_sync = PlaceholderSnapshot {
             on_disk_data_size: 0,
+            is_partial: true,
             ..not_in_sync
         };
         assert!(
             !placeholder_has_uploadable_local_content(cold_not_in_sync),
             "the monitor must not read a placeholder that has no local data"
+        );
+
+        let empty_not_in_sync = PlaceholderSnapshot {
+            on_disk_data_size: 0,
+            is_partial: false,
+            ..not_in_sync
+        };
+        assert!(
+            placeholder_has_uploadable_local_content(empty_not_in_sync),
+            "a locally truncated empty placeholder must remain uploadable"
         );
 
         let partial_not_in_sync = PlaceholderSnapshot {
