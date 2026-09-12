@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use crate::helpers::{hresult_nonneg, utf16_path};
+use crate::helpers::{hresult_nonneg, utf16_verbatim_path};
 use crate::runtime::{
     CallbackContext, handle_callback_cancel_fetch_data, handle_callback_fetch_data,
     handle_callback_file_close_completion, handle_callback_file_open,
@@ -493,7 +493,7 @@ pub(crate) fn with_cf_oplock_handle<T, F>(
 where
     F: FnOnce(HANDLE) -> Result<T>,
 {
-    let wide_path = utf16_path(path);
+    let wide_path = utf16_verbatim_path(path);
     let mut protected_handle = INVALID_HANDLE_VALUE;
     let hr = unsafe { CfOpenFileWithOplock(wide_path.as_ptr(), flags, &mut protected_handle) };
     hresult_nonneg(hr, "CfOpenFileWithOplock")?;
@@ -517,7 +517,7 @@ pub(crate) fn with_cf_metadata_update_handle<T, F>(path: &Path, callback: F) -> 
 where
     F: FnOnce(HANDLE) -> Result<T>,
 {
-    let wide_path = utf16_path(path);
+    let wide_path = utf16_verbatim_path(path);
     // CfUpdatePlaceholder accepts FILE_WRITE_DATA or WRITE_DAC. Prefer the
     // ordinary Modify permission and retain WRITE_DAC as an owner-compatible
     // fallback for ACLs that do not grant FILE_WRITE_DATA.
@@ -607,7 +607,7 @@ pub(crate) fn read_placeholder_standard_info(
 }
 
 pub(crate) fn path_placeholder_state_from_find(path: &Path) -> Result<CF_PLACEHOLDER_STATE> {
-    let wide_path = utf16_path(path);
+    let wide_path = utf16_verbatim_path(path);
     let mut find_data = WIN32_FIND_DATAW::default();
     let handle = unsafe { FindFirstFileW(wide_path.as_ptr(), &mut find_data) };
     if handle == INVALID_HANDLE_VALUE {
@@ -625,7 +625,7 @@ pub(crate) fn path_placeholder_state_from_find(path: &Path) -> Result<CF_PLACEHO
 }
 
 pub(crate) fn open_read_attributes_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let wide_path = utf16_path(path);
+    let wide_path = utf16_verbatim_path(path);
     let handle = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
@@ -1286,6 +1286,27 @@ mod tests {
         assert_eq!(opened, "opened with owner permission");
         assert_eq!(attempts, [FILE_WRITE_DATA, WRITE_DAC]);
         assert!(attempts.iter().all(|access| access & FILE_READ_DATA == 0));
+    }
+
+    #[test]
+    fn placeholder_state_query_supports_long_verbatim_paths() {
+        let root =
+            std::env::temp_dir().join(format!("ironmesh-cfapi-long-path-{}", uuid::Uuid::new_v4()));
+        let mut directory = root.clone();
+        let mut segment_index = 0;
+        while directory.to_string_lossy().encode_utf16().count() <= 280 {
+            directory.push(format!("segment-{segment_index:03}-abcdefghijklmnop"));
+            segment_index += 1;
+        }
+        std::fs::create_dir_all(&directory).expect("failed to create long-path test directory");
+        let path = directory.join("local-file.txt");
+        std::fs::write(&path, b"local content").expect("failed to create long-path test file");
+        assert!(path.to_string_lossy().encode_utf16().count() > 260);
+
+        let state = path_placeholder_state_from_find(&path);
+        let _ = std::fs::remove_dir_all(&root);
+
+        state.expect("FindFirstFileW must classify paths longer than MAX_PATH");
     }
 
     #[test]
