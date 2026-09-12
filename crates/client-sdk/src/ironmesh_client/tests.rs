@@ -86,6 +86,11 @@ fn object_url_builder_escapes_segments() {
 }
 
 #[test]
+fn store_index_children_view_uses_its_wire_value() {
+    assert_eq!(StoreIndexView::Children.as_query_value(), "children");
+}
+
+#[test]
 fn gallery_map_zoom_request_validation_preserves_fractional_zoom() {
     assert_eq!(gallery_map_zoom_for_request(3.75).unwrap(), 3.75);
     assert_eq!(gallery_map_zoom_for_request(-2.0).unwrap(), 0.0);

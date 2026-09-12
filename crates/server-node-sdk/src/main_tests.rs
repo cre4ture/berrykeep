@@ -13739,6 +13739,20 @@ fn store_index_entry_plan_limits_visible_files_to_requested_depth() {
 }
 
 #[test]
+fn store_index_children_plan_excludes_the_queried_directory_marker() {
+    let keys = vec![
+        "docs/".to_string(),
+        "docs/readme.md".to_string(),
+        "docs/guide/intro.md".to_string(),
+    ];
+
+    let plan = super::plan_store_index_children(&keys, "docs/", 1);
+
+    assert_eq!(plan.file_entries, vec!["docs/readme.md"]);
+    assert_eq!(plan.prefix_entries, vec!["docs/guide/"]);
+}
+
+#[test]
 fn store_index_object_map_filter_respects_prefix_boundaries() {
     let (hashes, object_ids) = super::filter_store_index_object_maps_for_prefix(
         HashMap::from([

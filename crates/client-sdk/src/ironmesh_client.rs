@@ -3632,6 +3632,8 @@ pub struct VersionGraphSummary {
 pub enum StoreIndexView {
     Raw,
     Tree,
+    /// Prefix-scoped tree entries without the marker for the queried prefix.
+    Children,
 }
 
 impl StoreIndexView {
@@ -3639,6 +3641,7 @@ impl StoreIndexView {
         match self {
             Self::Raw => "raw",
             Self::Tree => "tree",
+            Self::Children => "children",
         }
     }
 }

@@ -616,7 +616,10 @@ impl IosStorageApp {
         depth: usize,
         snapshot: Option<&str>,
     ) -> Result<AppleListResponse> {
-        let response = self.client.store_index(prefix, depth, snapshot).await?;
+        let response = self
+            .sdk
+            .store_index_with_view(prefix, depth, snapshot, Some(StoreIndexView::Children))
+            .await?;
         let mut entries = Vec::with_capacity(response.entries.len());
 
         for entry in response.entries {
@@ -1808,6 +1811,7 @@ fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>>
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some("raw") => Ok(Some(StoreIndexView::Raw)),
         Some("tree") => Ok(Some(StoreIndexView::Tree)),
+        Some("children") => Ok(Some(StoreIndexView::Children)),
         Some(other) => bail!("unsupported store index view: {other}"),
         None => Ok(None),
     }
@@ -2344,9 +2348,24 @@ mod tests {
             });
         }
 
+        let is_children_view = uri
+            .query()
+            .is_some_and(|query| query.split('&').any(|pair| pair == "view=children"));
+        let response_prefix = uri
+            .query()
+            .filter(|query| {
+                query
+                    .split('&')
+                    .any(|pair| matches!(pair, "prefix=docs" | "prefix=docs%2F"))
+            })
+            .map(|_| "docs".to_string())
+            .unwrap_or_default();
+        if is_children_view {
+            entries.retain(|entry| entry.path.trim_matches('/') != "docs");
+        }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let response = StoreIndexResponse {
-            prefix: String::new(),
+            prefix: response_prefix,
             depth: 1,
             entry_count: entries.len(),
             total_entry_count: entries.len(),
@@ -2743,7 +2762,8 @@ mod tests {
 
     #[test]
     fn blocking_facade_round_trips_list_metadata_fetch_put_move_and_delete() {
-        let addr = spawn_test_server();
+        let state = TestServerState::default();
+        let (addr, state) = spawn_test_server_with_state(state);
         let handle = create_handle_for_server(addr);
 
         let payload = b"hello apple facade";
@@ -2782,17 +2802,26 @@ mod tests {
         assert!(list_error.is_null());
         let list_response: AppleListResponse =
             serde_json::from_str(&read_string(list_json)).expect("list response should parse");
-        assert_eq!(list_response.entries.len(), 2);
+        assert_eq!(list_response.entries.len(), 1);
         assert!(
-            list_response.entries.iter().any(
-                |entry| entry.path == "docs/" && matches!(entry.kind, AppleItemKind::Directory)
-            )
+            list_response
+                .entries
+                .iter()
+                .all(|entry| entry.path != "docs/")
         );
         assert!(
             list_response
                 .entries
                 .iter()
                 .any(|entry| entry.path == "docs/readme.txt")
+        );
+        assert!(
+            state
+                .last_store_index_query
+                .lock()
+                .expect("lock poisoned")
+                .as_deref()
+                .is_some_and(|query| query.contains("view=children"))
         );
 
         let mut metadata_json = ptr::null_mut();

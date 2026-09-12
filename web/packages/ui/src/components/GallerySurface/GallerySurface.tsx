@@ -236,7 +236,7 @@ type GalleryNavigationItem = {
 };
 
 export type GalleryLoadEntriesOptions = {
-  view?: "raw" | "tree";
+  view?: "raw" | "tree" | "children";
   offset?: number;
   limit?: number;
   sort?: GallerySortOrder;
@@ -1265,7 +1265,7 @@ export function GallerySurface({
 
     try {
       const navigationPromise = loadEntries(targetScope.prefix, 1, targetScope.snapshotId, {
-        view: "tree"
+        view: "children"
       });
 
       if (targetViewMode === "map" && !targetScope.snapshotId) {

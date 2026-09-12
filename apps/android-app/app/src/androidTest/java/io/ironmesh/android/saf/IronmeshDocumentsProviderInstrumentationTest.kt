@@ -166,11 +166,11 @@ class IronmeshDocumentsProviderInstrumentationTest {
     }
 
     @Test
-    fun queryChildDocuments_treeViewFolderMarkersAreNamedWithoutDuplicates() {
+    fun queryChildDocuments_childrenViewFolderMarkersAreNamedWithoutDuplicates() {
         // The mock server collapses trailing-slash/"prefix" duplicates into a single
-        // canonical "prefix" entry per directory when view=tree is requested, matching the
-        // production server contract (see collapse_store_index_entries_for_tree_view). The
-        // provider trusts that contract rather than re-deriving directory-ness itself.
+        // canonical "prefix" entry per directory when view=children is requested, matching
+        // the production server contract. The provider trusts that contract rather than
+        // re-deriving child membership or directory-ness itself.
         configureProviderDownloadScenario()
         val childrenUri = DocumentsContract.buildChildDocumentsUri(
             "${appContext.packageName}.documents",
@@ -211,9 +211,9 @@ class IronmeshDocumentsProviderInstrumentationTest {
             rows.all { (_, displayName) -> displayName.isNotBlank() },
         )
         assertTrue(
-            "SAF directory listing should request the deduplicated tree view",
+            "SAF directory listing should request the central children projection",
             jsonArrayStrings(RustClientTestBridge.getCapturedRequestPaths()).any { path ->
-                path.startsWith("/api/v1/store/index?") && path.contains("view=tree")
+                path.startsWith("/api/v1/store/index?") && path.contains("view=children")
             },
         )
     }

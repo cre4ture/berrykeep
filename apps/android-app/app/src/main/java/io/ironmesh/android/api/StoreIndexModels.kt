@@ -16,6 +16,7 @@ enum class StoreIndexView(
 ) {
     RAW("raw"),
     TREE("tree"),
+    CHILDREN("children"),
 }
 
 enum class StoreIndexSortOrder(
