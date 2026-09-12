@@ -29,6 +29,6 @@ Apply these rules to non-trivial changes.
 
 ## Before each commit
 
-- Review the diff for unrelated churn, duplicated logic, unclear names, hidden side effects, and missing error handling.
+- Self-review the diff for unrelated churn, duplicated logic, unclear names, hidden side effects, and missing error handling.
 - Update tests and documentation when behavior or interfaces change.
 - Keep the commit single-purpose and reviewable.
