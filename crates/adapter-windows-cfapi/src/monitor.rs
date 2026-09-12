@@ -290,7 +290,9 @@ fn should_schedule_placeholder_hydration(
 
 fn placeholder_has_uploadable_local_content(state: PlaceholderSnapshot) -> bool {
     state.modified_data_size != 0
-        || (state.on_disk_data_size > 0 && state.in_sync_state != CF_IN_SYNC_STATE_IN_SYNC)
+        || (state.on_disk_data_size > 0
+            && !state.is_partial
+            && state.in_sync_state != CF_IN_SYNC_STATE_IN_SYNC)
 }
 
 pub struct SyncRootMonitor {
@@ -2803,6 +2805,15 @@ mod tests {
         assert!(
             !placeholder_has_uploadable_local_content(cold_not_in_sync),
             "the monitor must not read a placeholder that has no local data"
+        );
+
+        let partial_not_in_sync = PlaceholderSnapshot {
+            is_partial: true,
+            ..not_in_sync
+        };
+        assert!(
+            !placeholder_has_uploadable_local_content(partial_not_in_sync),
+            "the monitor must not hydrate missing ranges to upload an unmodified partial placeholder"
         );
     }
 }

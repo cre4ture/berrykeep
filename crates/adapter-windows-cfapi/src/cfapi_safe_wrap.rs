@@ -506,31 +506,40 @@ where
     F: FnOnce(HANDLE) -> Result<T>,
 {
     let wide_path = utf16_path(path);
-    // CfUpdatePlaceholder accepts WRITE_DAC as an alternative to WRITE_DATA.
+    // CfUpdatePlaceholder accepts FILE_WRITE_DATA or WRITE_DAC. Prefer the
+    // ordinary Modify permission and retain WRITE_DAC as an owner-compatible
+    // fallback for ACLs that do not grant FILE_WRITE_DATA.
     // Avoid CfOpenFileWithOplock(CF_OPEN_FILE_FLAG_WRITE_ACCESS) here because
     // that flag also requests FILE_READ_DATA and can hydrate a cold placeholder
     // before a metadata-only update.
-    let handle = unsafe {
-        CreateFileW(
-            wide_path.as_ptr(),
-            WRITE_DAC,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            null_mut(),
-        )
+    let open = |desired_access| {
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                desired_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
+        }
     };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
+
+    let file = match open(FILE_WRITE_DATA) {
+        Ok(file) => file,
+        Err(write_data_error) => open(WRITE_DAC).with_context(|| {
             format!(
-                "CreateFileW failed to open metadata update handle for {}",
+                "CreateFileW failed to open metadata update handle for {} with FILE_WRITE_DATA ({write_data_error}) or WRITE_DAC",
                 path.display()
             )
-        });
-    }
-
-    let file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        })?,
+    };
     callback(file.as_raw_handle() as HANDLE)
 }
 
