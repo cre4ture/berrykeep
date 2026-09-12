@@ -116,10 +116,16 @@ impl PriorPath {
         }
     }
 
-    fn advance(entry: &ObservedEntry, previous: Option<&Self>) -> Self {
+    fn advance(
+        entry: &ObservedEntry,
+        previous: Option<&Self>,
+        retain_materialized_upload_identity: bool,
+    ) -> Self {
         let mut next = Self::from_observed(entry);
         if next.object_id.is_none()
             && next.revision.is_none()
+            && (entry.placeholder_inspection_error.is_some()
+                || (retain_materialized_upload_identity && !entry.is_placeholder))
             && let Some(previous) = previous.filter(|previous| previous.is_dir == entry.is_dir)
         {
             next.object_id.clone_from(&previous.object_id);
@@ -532,7 +538,11 @@ impl SyncRootMonitor {
             .map(|(path, entry)| {
                 (
                     path.clone(),
-                    PriorPath::advance(entry, self.prior_paths.get(path)),
+                    PriorPath::advance(
+                        entry,
+                        self.prior_paths.get(path),
+                        self.pending_uploads.contains(path),
+                    ),
                 )
             })
             .collect();
@@ -610,7 +620,11 @@ impl SyncRootMonitor {
             .map(|(path, entry)| {
                 (
                     path.clone(),
-                    PriorPath::advance(entry, self.prior_paths.get(path)),
+                    PriorPath::advance(
+                        entry,
+                        self.prior_paths.get(path),
+                        self.pending_uploads.contains(path),
+                    ),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -1543,6 +1557,9 @@ fn upload_identity(
             entry.placeholder_revision.clone(),
         );
     }
+    if entry.is_placeholder {
+        return (None, None);
+    }
     previous
         .filter(|previous| previous.is_dir == entry.is_dir)
         .map(|previous| (previous.object_id.clone(), previous.revision.clone()))
@@ -2065,6 +2082,9 @@ mod tests {
                 revision: Some("revision-report".to_string()),
             },
         );
+        monitor
+            .pending_uploads
+            .insert("docs/report.txt".to_string());
 
         let replacement = observed_entry(false);
         let current = HashMap::from([("docs/report.txt".to_string(), replacement.clone())]);
@@ -2096,6 +2116,35 @@ mod tests {
                 revision: None,
             }),
             "a kind change must not inherit the replaced object's CAS identity"
+        );
+    }
+
+    #[test]
+    fn detached_placeholder_identity_does_not_resurrect_prior_cas() {
+        let previous = PriorPath {
+            is_dir: false,
+            object_id: Some("tombstoned-object".to_string()),
+            revision: Some("tombstoned-revision".to_string()),
+        };
+        let mut detached = observed_entry(false);
+        detached.is_placeholder = true;
+        detached.placeholder_state = Some(PlaceholderSnapshot {
+            on_disk_data_size: 16,
+            modified_data_size: 16,
+            in_sync_state: 0,
+            pin_state: 0,
+            is_partial: false,
+        });
+
+        assert_eq!(
+            upload_identity(&detached, Some(&previous)),
+            (None, None),
+            "an intentionally detached placeholder must upload its dirty bytes as a new object"
+        );
+        assert_eq!(
+            PriorPath::advance(&detached, Some(&previous), true),
+            PriorPath::from_observed(&detached),
+            "advancing the topology baseline must not restore a detached placeholder identity"
         );
     }
 
