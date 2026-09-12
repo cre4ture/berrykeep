@@ -1007,6 +1007,7 @@ impl SyncRootMonitor {
                     self.name,
                     rel_path
                 );
+                self.mark_upload_for_retry(&rel_path);
                 return;
             }
             match self.uploader.upload_reader_for_object(
@@ -1084,7 +1085,10 @@ impl SyncRootMonitor {
 
             let metadata = match std::fs::metadata(path) {
                 Ok(m) => m,
-                Err(_) => return,
+                Err(_) => {
+                    self.mark_upload_for_retry(&rel_path);
+                    return;
+                }
             };
             if path.exists() {
                 let upload_snapshot = (metadata.len(), metadata.modified().ok());
@@ -1116,6 +1120,7 @@ impl SyncRootMonitor {
                         self.name,
                         rel_path
                     );
+                    self.mark_upload_for_retry(&rel_path);
                     return;
                 }
                 match self.uploader.upload_reader_for_object(
@@ -1898,7 +1903,7 @@ mod tests {
         SyncRootRegistration, apply_action_plan, register_sync_root, unregister_sync_root,
     };
     use std::io::Read;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use sync_core::{NamespaceEntry, SyncSnapshot};
     use windows_sys::Win32::Storage::CloudFilters::{
@@ -2122,6 +2127,128 @@ mod tests {
                 revision: None,
             }),
             "a kind change must not inherit the replaced object's CAS identity"
+        );
+    }
+
+    #[test]
+    fn vanished_materialized_replacement_marks_retry_before_advancing_cas_baseline() {
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-monitor-vanished-replacement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = "docs/report.txt";
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            Arc::new(MockUploader::default()),
+        );
+        monitor.prior_paths.insert(
+            path.to_string(),
+            PriorPath {
+                is_dir: false,
+                object_id: Some("obj-report".to_string()),
+                revision: Some("revision-report".to_string()),
+            },
+        );
+        let mut replacement = observed_entry(false);
+        replacement.materialized_file = Some(MaterializedFileSnapshot {
+            local_file_identity: None,
+            len: 12,
+            last_write_time: 34,
+        });
+        let mut current = HashMap::from([(path.to_string(), replacement.clone())]);
+
+        // Model a save-via-rename replacement captured by snapshot_entries(),
+        // followed by the editor's next rename before handle_entry() re-stats it.
+        monitor.handle_entry(
+            &sync_root.join("docs\\report.txt"),
+            path.to_string(),
+            &mut current,
+        );
+
+        assert!(
+            monitor.pending_uploads.contains(path),
+            "a vanished replacement must remain pending for the next scan"
+        );
+        monitor.replace_observation_baseline(&current);
+        assert_eq!(
+            upload_identity(&replacement, monitor.prior_paths.get(path)),
+            (
+                Some("obj-report".to_string()),
+                Some("revision-report".to_string())
+            ),
+            "the retry must retain the replaced placeholder's CAS identity"
+        );
+    }
+
+    #[test]
+    fn ambiguous_materialized_upload_marks_retry_instead_of_dropping_cas_intent() {
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-monitor-ambiguous-file-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create sync root");
+        std::fs::write(sync_root.join("docs\\report.txt"), b"replacement")
+            .expect("failed to create replacement");
+        let path = "docs/report.txt";
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            Arc::new(MockUploader::default()),
+        );
+        monitor.prior_paths.insert(
+            path.to_string(),
+            PriorPath {
+                is_dir: false,
+                object_id: Some("obj-report".to_string()),
+                revision: None,
+            },
+        );
+        let mut replacement = observed_entry(false);
+        replacement.materialized_file = Some(MaterializedFileSnapshot {
+            local_file_identity: None,
+            len: 11,
+            last_write_time: 34,
+        });
+        let mut current = HashMap::from([(path.to_string(), replacement)]);
+
+        monitor.handle_entry(
+            &sync_root.join("docs\\report.txt"),
+            path.to_string(),
+            &mut current,
+        );
+
+        assert!(
+            monitor.pending_uploads.contains(path),
+            "an incomplete CAS pair must remain pending instead of falling back to an unguarded create"
+        );
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn ambiguous_directory_upload_marks_retry() {
+        let sync_root = std::env::temp_dir().join(format!(
+            "ironmesh-monitor-ambiguous-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = "docs";
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root,
+            uuid::Uuid::nil(),
+            Arc::new(MockUploader::default()),
+        );
+        let mut directory = observed_entry(true);
+        directory.placeholder_object_id = Some("obj-docs".to_string());
+        let mut current = HashMap::from([(path.to_string(), directory)]);
+
+        monitor.handle_entry(Path::new(path), path.to_string(), &mut current);
+
+        assert!(
+            monitor.pending_uploads.contains(path),
+            "an incomplete directory CAS pair must remain pending"
         );
     }
 
