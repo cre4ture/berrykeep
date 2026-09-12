@@ -388,7 +388,8 @@ async fn run_import(state: &ServerState, job: &NaturalEarthImportJobView) -> Res
     update_phase(state, "Checking GDAL and unzip dependencies").await;
     ensure_import_commands_available(state, job.profile).await?;
     let staging_dir = state
-        .data_dir
+        .managed_paths
+        .data_dir()
         .join("state")
         .join("natural-earth-imports")
         .join(&job.id);

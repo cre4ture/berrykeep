@@ -1236,7 +1236,8 @@ async fn install_direct_quic_runtime(
     state: &mut ServerState,
 ) -> transport_sdk::ConnectionCandidate {
     let secret_key_path = state
-        .data_dir
+        .managed_paths
+        .data_dir()
         .join("state")
         .join(format!("test-direct-quic-{}.txt", state.node_id));
     let secret_key = transport_sdk::load_or_create_secret_key(&secret_key_path)
@@ -10225,12 +10226,14 @@ async fn import_managed_signer_backup_persists_signer_material_and_requires_rest
     assert!(payload.restart_required);
 
     let signer_cert_path = importer
-        .data_dir
+        .managed_paths
+        .data_dir()
         .join("managed")
         .join("signer")
         .join("cluster-ca.pem");
     let signer_key_path = importer
-        .data_dir
+        .managed_paths
+        .data_dir()
         .join("managed")
         .join("signer")
         .join("cluster-ca.key");
@@ -12210,9 +12213,10 @@ async fn persisted_web_service_is_visible_through_signed_client_and_web_ui_node_
         })
         .await
         .unwrap();
-    state.web_services = super::web_service_proxy::WebServiceRegistry::load(&state.data_dir)
-        .await
-        .expect("persisted web service configuration should reload");
+    state.web_services =
+        super::web_service_proxy::WebServiceRegistry::load(state.managed_paths.data_dir())
+            .await
+            .expect("persisted web service configuration should reload");
 
     let server_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_address = server_listener.local_addr().unwrap();
@@ -19329,7 +19333,8 @@ async fn clear_media_cache_admin_requires_auth_and_clears_cached_media_impl(
     };
 
     let orphan_dir = state
-        .data_dir
+        .managed_paths
+        .data_dir()
         .join("state")
         .join("media_cache")
         .join("thumbnails")
@@ -19649,7 +19654,7 @@ async fn build_test_state(
 
     let (namespace_change_tx, _) = tokio::sync::watch::channel(0);
     let state = ServerState {
-        data_dir: root.clone(),
+        managed_paths: super::ManagedPaths::from_data_dir(root.clone()),
         cluster_id: uuid::Uuid::now_v7(),
         node_id: local_node_id,
         node_hostname: None,
@@ -19921,9 +19926,15 @@ async fn upload_session_chunk_ingest_does_not_wait_on_store_lock() {
     assert_eq!(chunk.size_bytes, payload.len());
     drop(sessions);
 
-    let persisted_payload = fs::read(state.data_dir.join("state").join("upload_sessions.json"))
-        .await
-        .expect("upload session state should be persisted");
+    let persisted_payload = fs::read(
+        state
+            .managed_paths
+            .data_dir()
+            .join("state")
+            .join("upload_sessions.json"),
+    )
+    .await
+    .expect("upload session state should be persisted");
     let persisted = serde_json::from_slice::<super::UploadSessionFile>(&persisted_payload)
         .expect("persisted upload session state should parse");
     let persisted_session = persisted
@@ -22665,7 +22676,7 @@ fn install_relay_tls_for_test_state(state: &mut ServerState) {
         default_tls_issue_policy(),
     )
     .expect("test source internal TLS material should issue");
-    let tls_dir = state.data_dir.join("relay-test-tls");
+    let tls_dir = state.managed_paths.data_dir().join("relay-test-tls");
     std::fs::create_dir_all(&tls_dir).expect("test relay TLS directory should create");
     let ca_cert_path = tls_dir.join("cluster-ca.pem");
     let cert_path = tls_dir.join("source.pem");
