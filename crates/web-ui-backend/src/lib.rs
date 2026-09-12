@@ -3006,6 +3006,7 @@ async fn web_store_list(
         None => None,
         Some("tree") => Some(StoreIndexView::Tree),
         Some("raw") => Some(StoreIndexView::Raw),
+        Some("children") => Some(StoreIndexView::Children),
         Some(other) => {
             return error_response(
                 StatusCode::BAD_REQUEST,

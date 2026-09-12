@@ -6,12 +6,9 @@ import org.junit.Test
 
 class GalleryDirectoriesTest {
     @Test
-    fun currentDirectoryOmitsAncestorAndCurrentFolderMarkers() {
+    fun childrenProjectionProducesDirectoryItems() {
         val entries = listOf(
-            prefix("devices/"),
-            prefix("devices/Oppo-uli/"),
             prefix("devices/Oppo-uli/Fotos/"),
-            prefix("devices/Oppo-uli/Fotos/2026/"),
             key("devices/Oppo-uli/image.jpg"),
         )
 
@@ -23,21 +20,20 @@ class GalleryDirectoriesTest {
                     pathLabel = "devices/Oppo-uli/Fotos/",
                 ),
             ),
-            galleryDirectoryItemsForParent(entries, "devices/Oppo-uli/"),
+            galleryDirectoryItems(entries),
         )
     }
 
     @Test
-    fun rootDirectoryIncludesOnlyTopLevelFolders() {
+    fun rootChildrenProjectionIncludesTopLevelFolders() {
         val entries = listOf(
             prefix("devices/"),
-            prefix("devices/Oppo-uli/"),
             prefix("archive/"),
         )
 
         assertEquals(
             listOf("devices", "archive"),
-            galleryDirectoryItemsForParent(entries, "/").map(GalleryDirectoryItem::displayName),
+            galleryDirectoryItems(entries).map(GalleryDirectoryItem::displayName),
         )
     }
 
