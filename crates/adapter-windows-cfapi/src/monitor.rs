@@ -7,16 +7,16 @@ use std::time::Duration;
 use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
-    cf_dehydrate_placeholder_with_oplock, cf_get_placeholder_standard_info,
-    cf_get_placeholder_standard_info_with_identity, cf_hydrate_placeholder, cf_set_in_sync,
-    cf_set_in_sync_with_usn, cf_set_not_in_sync, describe_path_state, open_sync_path,
-    path_is_placeholder, path_placeholder_state, try_convert_materialized_file,
+    cf_dehydrate_placeholder_with_oplock, cf_get_placeholder_standard_info_with_identity,
+    cf_hydrate_placeholder, cf_set_in_sync, cf_set_in_sync_with_usn, cf_set_not_in_sync,
+    describe_path_state, open_sync_path, path_is_placeholder, path_placeholder_state,
+    try_convert_materialized_file,
 };
 use crate::cfapi_safe_wrap::local_file_identity_for_path;
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::helpers::{
-    PlaceholderFileIdentity, decode_placeholder_file_identity, error_chain_has_win32_hresult,
-    normalize_path, path_to_relative,
+    decode_placeholder_file_identity, error_chain_has_win32_hresult, normalize_path,
+    path_to_relative,
 };
 use crate::hydration_control::is_active_hydration_marked;
 use crate::placeholder_metadata::{
@@ -30,7 +30,7 @@ use crate::snapshot_cache::is_internal_remote_snapshot_relative_path;
 use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Storage::CloudFilters::{
     CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED,
-    CF_PLACEHOLDER_STATE_NO_STATES, CF_PLACEHOLDER_STATE_PARTIAL,
+    CF_PLACEHOLDER_STATE_NO_STATES, CF_PLACEHOLDER_STATE_PARTIAL, CF_PLACEHOLDER_STATE_PLACEHOLDER,
 };
 
 const DEHYDRATE_SHARING_VIOLATION_MAX_RETRIES: usize = 8;
@@ -60,6 +60,7 @@ struct ObservedEntry {
     placeholder_object_id: Option<String>,
     placeholder_revision: Option<String>,
     placeholder_state: Option<PlaceholderSnapshot>,
+    placeholder_probe_error: Option<String>,
     provider_hydration_active: bool,
     materialized_file: Option<MaterializedFileSnapshot>,
 }
@@ -76,18 +77,20 @@ impl ObservedEntry {
             .unwrap_or_else(|| String::from("none"));
         let placeholder_object_id = self.placeholder_object_id.as_deref().unwrap_or("none");
         let placeholder_revision = self.placeholder_revision.as_deref().unwrap_or("none");
+        let placeholder_probe_error = self.placeholder_probe_error.as_deref().unwrap_or("none");
         let materialized_file = self
             .materialized_file
             .map(|snapshot| snapshot.to_log_string())
             .unwrap_or_else(|| String::from("none"));
         format!(
-            "dir={} placeholder={} placeholder_path={} object_id={} revision={} placeholder_probe={} hydration_active={} materialized={}",
+            "dir={} placeholder={} placeholder_path={} object_id={} revision={} placeholder_probe={} placeholder_probe_error={} hydration_active={} materialized={}",
             self.is_dir,
             self.is_placeholder,
             placeholder_identity_path,
             placeholder_object_id,
             placeholder_revision,
             placeholder_state,
+            placeholder_probe_error,
             self.provider_hydration_active,
             materialized_file,
         )
@@ -211,16 +214,17 @@ struct PlaceholderSnapshot {
 }
 
 impl PlaceholderSnapshot {
-    fn from_path(path: &std::path::Path, placeholder_state_bits: u32) -> Option<Self> {
-        let file = open_sync_path(path, false).ok()?;
-        let info = cf_get_placeholder_standard_info(&file).ok()?;
-        Some(Self {
+    fn from_info(
+        info: &windows_sys::Win32::Storage::CloudFilters::CF_PLACEHOLDER_STANDARD_INFO,
+        placeholder_state_bits: u32,
+    ) -> Self {
+        Self {
             on_disk_data_size: info.OnDiskDataSize,
             modified_data_size: info.ModifiedDataSize,
             in_sync_state: info.InSyncState,
             pin_state: info.PinState,
             is_partial: (placeholder_state_bits & CF_PLACEHOLDER_STATE_PARTIAL) != 0,
-        })
+        }
     }
 
     fn should_dehydrate(self) -> bool {
@@ -875,10 +879,13 @@ impl SyncRootMonitor {
         if !entry.is_dir && entry.is_placeholder && entry.placeholder_state.is_none() {
             if self.unavailable_placeholder_probes.insert(rel_path.clone()) {
                 tracing::info!(
-                    "{}: deferring placeholder processing for {} because its current CFAPI state is unavailable raw_state={}",
+                    "{}: deferring placeholder processing for {} because its current CFAPI state is unavailable error={}",
                     self.name,
                     rel_path,
-                    describe_path_state(path)
+                    entry
+                        .placeholder_probe_error
+                        .as_deref()
+                        .unwrap_or("unknown")
                 );
             }
             return;
@@ -1504,24 +1511,6 @@ fn record_remote_applied_directory(path: &str, directories: &mut HashSet<String>
     }
 }
 
-fn placeholder_identity_for_entry(
-    path: &std::path::Path,
-    is_placeholder: bool,
-) -> Option<PlaceholderFileIdentity> {
-    if !is_placeholder {
-        return None;
-    }
-
-    let file = open_sync_path(path, false).ok()?;
-    let info = cf_get_placeholder_standard_info_with_identity(&file).ok()?;
-    let file_identity = info.file_identity();
-    if file_identity.is_empty() {
-        return None;
-    }
-
-    decode_placeholder_file_identity(file_identity)
-}
-
 fn repair_locally_renamed_object(
     sync_root: &std::path::Path,
     path: &std::path::Path,
@@ -1687,9 +1676,30 @@ fn snapshot_entry(
     is_dir: bool,
 ) -> ObservedEntry {
     let metadata = std::fs::metadata(path).ok();
-    let is_placeholder = path_is_placeholder(path);
-    let placeholder_identity = placeholder_identity_for_entry(path, is_placeholder);
-    let should_probe = !is_dir && is_placeholder;
+    let placeholder_state_bits =
+        path_placeholder_state(path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
+    let is_placeholder = (placeholder_state_bits & CF_PLACEHOLDER_STATE_PLACEHOLDER) != 0;
+    let placeholder_probe = is_placeholder.then(|| {
+        open_sync_path(path, false)
+            .map_err(anyhow::Error::from)
+            .and_then(|file| cf_get_placeholder_standard_info_with_identity(&file))
+    });
+    let (placeholder_identity, placeholder_state, placeholder_probe_error) = match placeholder_probe
+    {
+        Some(Ok(info)) => {
+            let file_identity = info.file_identity();
+            let identity = if file_identity.is_empty() {
+                None
+            } else {
+                decode_placeholder_file_identity(file_identity)
+            };
+            let state = (!is_dir)
+                .then(|| PlaceholderSnapshot::from_info(info.info(), placeholder_state_bits));
+            (identity, state, None)
+        }
+        Some(Err(err)) => (None, None, Some(format!("{err:#}"))),
+        None => (None, None, None),
+    };
     ObservedEntry {
         is_dir,
         is_placeholder,
@@ -1702,14 +1712,11 @@ fn snapshot_entry(
         placeholder_revision: placeholder_identity
             .as_ref()
             .and_then(|identity| identity.remote_version.clone()),
-        placeholder_state: if !should_probe {
-            None
-        } else {
-            let placeholder_state_bits =
-                path_placeholder_state(path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
-            PlaceholderSnapshot::from_path(path, placeholder_state_bits)
-        },
-        provider_hydration_active: should_probe && is_active_hydration_marked(sync_root, rel_path),
+        placeholder_state,
+        placeholder_probe_error,
+        provider_hydration_active: !is_dir
+            && is_placeholder
+            && is_active_hydration_marked(sync_root, rel_path),
         materialized_file: (!is_dir && !is_placeholder)
             .then(|| {
                 metadata.as_ref().map(|metadata| MaterializedFileSnapshot {
@@ -1921,6 +1928,7 @@ mod tests {
             placeholder_object_id: None,
             placeholder_revision: None,
             placeholder_state: None,
+            placeholder_probe_error: None,
             provider_hydration_active: false,
             materialized_file: None,
         }
