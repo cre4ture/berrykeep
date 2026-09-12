@@ -1491,6 +1491,7 @@ fn upload_identity(
         );
     }
     previous
+        .filter(|previous| previous.is_dir == entry.is_dir)
         .map(|previous| (previous.object_id.clone(), previous.revision.clone()))
         .unwrap_or_default()
 }
@@ -1940,6 +1941,34 @@ mod tests {
             provider_hydration_active: false,
             materialized_file: None,
         }
+    }
+
+    #[test]
+    fn upload_identity_reuses_prior_cas_only_for_the_same_object_kind() {
+        let entry = observed_entry(false);
+        let prior_file = PriorPath {
+            is_dir: false,
+            object_id: Some("obj-file".to_string()),
+            revision: Some("revision-file".to_string()),
+        };
+        assert_eq!(
+            upload_identity(&entry, Some(&prior_file)),
+            (
+                Some("obj-file".to_string()),
+                Some("revision-file".to_string())
+            )
+        );
+
+        let prior_directory = PriorPath {
+            is_dir: true,
+            object_id: Some("obj-directory".to_string()),
+            revision: Some("revision-directory".to_string()),
+        };
+        assert_eq!(
+            upload_identity(&entry, Some(&prior_directory)),
+            (None, None),
+            "a file replacing a directory must create a new object instead of CAS-writing the directory marker"
+        );
     }
 
     fn registered_monitor_test_sync_root(
