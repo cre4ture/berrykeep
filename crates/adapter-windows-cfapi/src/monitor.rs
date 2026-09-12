@@ -32,7 +32,6 @@ use windows_sys::Win32::Storage::CloudFilters::{
     CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED,
     CF_PLACEHOLDER_STATE_NO_STATES, CF_PLACEHOLDER_STATE_PARTIAL,
 };
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_PINNED, FILE_ATTRIBUTE_UNPINNED};
 
 const DEHYDRATE_SHARING_VIOLATION_MAX_RETRIES: usize = 8;
 const DEHYDRATE_SHARING_VIOLATION_RETRY_DELAY_MS: u64 = 250;
@@ -53,32 +52,83 @@ impl LocalFileIdentity {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SeenEntry {
+#[derive(Clone, Debug)]
+struct ObservedEntry {
     is_dir: bool,
-    file_attributes: u32,
-    local_file_identity: Option<LocalFileIdentity>,
+    is_placeholder: bool,
     placeholder_identity_path: Option<String>,
     placeholder_object_id: Option<String>,
     placeholder_revision: Option<String>,
     placeholder_state: Option<PlaceholderSnapshot>,
     provider_hydration_active: bool,
+    materialized_file: Option<MaterializedFileSnapshot>,
 }
 
-impl SeenEntry {
-    fn has_pinned_attribute(&self) -> bool {
-        (self.file_attributes & FILE_ATTRIBUTE_PINNED) != 0
-    }
-
-    fn has_unpinned_attribute(&self) -> bool {
-        (self.file_attributes & FILE_ATTRIBUTE_UNPINNED) != 0
-    }
-
+impl ObservedEntry {
     fn to_log_string(&self) -> String {
         let placeholder_state = self
             .placeholder_state
             .map(|state| state.to_log_string())
             .unwrap_or_else(|| String::from("none"));
+        let placeholder_identity_path = self
+            .placeholder_identity_path
+            .clone()
+            .unwrap_or_else(|| String::from("none"));
+        let placeholder_object_id = self.placeholder_object_id.as_deref().unwrap_or("none");
+        let placeholder_revision = self.placeholder_revision.as_deref().unwrap_or("none");
+        let materialized_file = self
+            .materialized_file
+            .map(|snapshot| snapshot.to_log_string())
+            .unwrap_or_else(|| String::from("none"));
+        format!(
+            "dir={} placeholder={} placeholder_path={} object_id={} revision={} placeholder_probe={} hydration_active={} materialized={}",
+            self.is_dir,
+            self.is_placeholder,
+            placeholder_identity_path,
+            placeholder_object_id,
+            placeholder_revision,
+            placeholder_state,
+            self.provider_hydration_active,
+            materialized_file,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PriorPath {
+    is_dir: bool,
+    object_id: Option<String>,
+    revision: Option<String>,
+}
+
+impl PriorPath {
+    fn from_observed(entry: &ObservedEntry) -> Self {
+        Self {
+            is_dir: entry.is_dir,
+            object_id: entry.placeholder_object_id.clone(),
+            revision: entry.placeholder_revision.clone(),
+        }
+    }
+
+    fn to_log_string(&self) -> String {
+        format!(
+            "dir={} object_id={} revision={}",
+            self.is_dir,
+            self.object_id.as_deref().unwrap_or("none"),
+            self.revision.as_deref().unwrap_or("none"),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MaterializedFileSnapshot {
+    local_file_identity: Option<LocalFileIdentity>,
+    len: u64,
+    last_write_time: u64,
+}
+
+impl MaterializedFileSnapshot {
+    fn to_log_string(self) -> String {
         let local_file_identity = self
             .local_file_identity
             .map(|identity| {
@@ -88,25 +138,59 @@ impl SeenEntry {
                 )
             })
             .unwrap_or_else(|| String::from("none"));
-        let placeholder_identity_path = self
-            .placeholder_identity_path
-            .clone()
-            .unwrap_or_else(|| String::from("none"));
-        let placeholder_object_id = self.placeholder_object_id.as_deref().unwrap_or("none");
-        let placeholder_revision = self.placeholder_revision.as_deref().unwrap_or("none");
         format!(
-            "dir={} attrs=0x{:08x} pinned_attr={} unpinned_attr={} file_id={} placeholder_path={} object_id={} revision={} placeholder_probe={} hydration_active={}",
-            self.is_dir,
-            self.file_attributes,
-            self.has_pinned_attribute(),
-            self.has_unpinned_attribute(),
-            local_file_identity,
-            placeholder_identity_path,
-            placeholder_object_id,
-            placeholder_revision,
-            placeholder_state,
-            self.provider_hydration_active,
+            "file_id={} len={} last_write={}",
+            local_file_identity, self.len, self.last_write_time
         )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UploadObservation {
+    Placeholder {
+        object_id: Option<String>,
+        revision: Option<String>,
+        on_disk_data_size: i64,
+        modified_data_size: i64,
+        in_sync_state: i32,
+    },
+    Materialized(MaterializedFileSnapshot),
+}
+
+impl UploadObservation {
+    fn from_observed(entry: &ObservedEntry) -> Option<Self> {
+        if entry.is_dir {
+            return None;
+        }
+        if !entry.is_placeholder {
+            return entry.materialized_file.map(Self::Materialized);
+        }
+        let state = entry.placeholder_state?;
+        Some(Self::Placeholder {
+            object_id: entry.placeholder_object_id.clone(),
+            revision: entry.placeholder_revision.clone(),
+            on_disk_data_size: state.on_disk_data_size,
+            modified_data_size: state.modified_data_size,
+            in_sync_state: state.in_sync_state,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HydrationObservation {
+    eligible: bool,
+    provider_hydration_active: bool,
+    on_disk_data_size: i64,
+}
+
+impl HydrationObservation {
+    fn from_observed(entry: &ObservedEntry) -> Option<Self> {
+        let state = entry.placeholder_state?;
+        Some(Self {
+            eligible: state.should_hydrate(),
+            provider_hydration_active: entry.provider_hydration_active,
+            on_disk_data_size: state.on_disk_data_size,
+        })
     }
 }
 
@@ -175,20 +259,6 @@ impl PlaceholderSnapshot {
             && self.is_partial
     }
 
-    fn block_reason(self) -> &'static str {
-        if self.pin_state != CF_PIN_STATE_UNPINNED {
-            "pin-state-not-unpinned"
-        } else if self.in_sync_state != CF_IN_SYNC_STATE_IN_SYNC {
-            "not-in-sync"
-        } else if self.modified_data_size != 0 {
-            "modified-data-present"
-        } else if self.on_disk_data_size <= 0 {
-            "already-dehydrated"
-        } else {
-            "eligible"
-        }
-    }
-
     fn to_log_string(self) -> String {
         format!(
             "on_disk={} modified={} in_sync={} pin={} partial={}",
@@ -202,54 +272,25 @@ impl PlaceholderSnapshot {
 }
 
 fn should_schedule_placeholder_hydration(
-    previous_entry: Option<&SeenEntry>,
-    entry: &SeenEntry,
-    placeholder_state: PlaceholderSnapshot,
+    previous: Option<HydrationObservation>,
+    current: HydrationObservation,
 ) -> bool {
-    if !entry.has_pinned_attribute()
-        || !placeholder_state.should_hydrate()
-        || entry.provider_hydration_active
-    {
+    if !current.eligible || current.provider_hydration_active {
         return false;
     }
 
-    let Some(previous_entry) = previous_entry else {
+    let Some(previous) = previous else {
         return true;
     };
 
-    if previous_entry == entry {
-        return false;
-    }
-
-    let previous_was_hydrate_eligible = previous_entry.has_pinned_attribute()
-        && previous_entry
-            .placeholder_state
-            .is_some_and(PlaceholderSnapshot::should_hydrate);
-
-    !previous_was_hydrate_eligible
-        || previous_entry.provider_hydration_active
-        || previous_entry
-            .placeholder_state
-            .filter(|previous| previous.should_hydrate())
-            .is_some_and(|previous| previous != placeholder_state)
+    !previous.eligible
+        || previous.provider_hydration_active
+        || previous.on_disk_data_size != current.on_disk_data_size
 }
 
-fn should_skip_clean_placeholder_content_upload(
-    previous_entry: Option<&SeenEntry>,
-    entry: &SeenEntry,
-) -> bool {
-    let Some(previous_entry) = previous_entry else {
-        return false;
-    };
-    let Some(placeholder_state) = entry.placeholder_state else {
-        return false;
-    };
-    if placeholder_state.modified_data_size != 0 {
-        return false;
-    }
-
-    previous_entry.placeholder_state.is_some()
-        || previous_entry.local_file_identity == entry.local_file_identity
+fn placeholder_has_uploadable_local_content(state: PlaceholderSnapshot) -> bool {
+    state.modified_data_size != 0
+        || (state.on_disk_data_size > 0 && state.in_sync_state != CF_IN_SYNC_STATE_IN_SYNC)
 }
 
 pub struct SyncRootMonitor {
@@ -257,7 +298,19 @@ pub struct SyncRootMonitor {
     sync_root: PathBuf,
     provider_instance_id: uuid::Uuid,
     uploader: Arc<dyn Uploader>,
-    seen: HashMap<String, SeenEntry>,
+    // Historical path/object identity is retained only for create, rename, and
+    // delete detection. Current CFAPI state is never inferred from this map.
+    prior_paths: HashMap<String, PriorPath>,
+    // Upload observations debounce already-handled local changes. Whether a
+    // placeholder may be read is decided exclusively from its current CFAPI
+    // state before this history is consulted.
+    upload_observations: HashMap<String, UploadObservation>,
+    // Explicit hydration needs edge/progress detection so a seeded pinned
+    // placeholder is not hydrated merely because the provider restarted.
+    hydration_observations: HashMap<String, HydrationObservation>,
+    // Transient transport failures are workflow state, not fake filesystem
+    // history. Keep their retry intent separate from observation baselines.
+    pending_uploads: HashSet<String>,
     pending_object_renames: Vec<LocalRenamePair>,
     dehydrations_in_flight: Arc<Mutex<HashSet<String>>>,
     hydrations_in_flight: Arc<Mutex<HashSet<String>>>,
@@ -268,8 +321,8 @@ pub struct SyncRootMonitor {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DehydrateScanSummary {
     total_entries: usize,
-    pinned_attribute_count: usize,
-    unpinned_attribute_count: usize,
+    pinned_count: usize,
+    unpinned_count: usize,
     probed_placeholder_count: usize,
     hydrate_eligible_count: usize,
     eligible_count: usize,
@@ -277,7 +330,7 @@ struct DehydrateScanSummary {
 
 #[derive(Debug, Default)]
 struct SnapshotEntries {
-    entries: HashMap<String, SeenEntry>,
+    entries: HashMap<String, ObservedEntry>,
     walk_error_count: usize,
     walk_error_samples: Vec<String>,
 }
@@ -366,7 +419,10 @@ impl SyncRootMonitor {
             sync_root,
             provider_instance_id,
             uploader,
-            seen: HashMap::new(),
+            prior_paths: HashMap::new(),
+            upload_observations: HashMap::new(),
+            hydration_observations: HashMap::new(),
+            pending_uploads: HashSet::new(),
             pending_object_renames: Vec::new(),
             dehydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
             hydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -400,7 +456,7 @@ impl SyncRootMonitor {
                 snapshot.walk_error_samples
             );
         }
-        self.seen = snapshot.entries;
+        self.replace_observation_baseline(&snapshot.entries);
     }
 
     pub fn seed_remote_entries(&mut self, plan: &CfapiActionPlan) {
@@ -434,7 +490,28 @@ impl SyncRootMonitor {
                 self.seed_existing_entry(&mut seeded, &parent, true);
             }
         }
-        self.seen = seeded;
+        self.replace_observation_baseline(&seeded);
+    }
+
+    fn replace_observation_baseline(&mut self, entries: &HashMap<String, ObservedEntry>) {
+        self.prior_paths = entries
+            .iter()
+            .map(|(path, entry)| (path.clone(), PriorPath::from_observed(entry)))
+            .collect();
+        self.upload_observations = entries
+            .iter()
+            .filter_map(|(path, entry)| {
+                UploadObservation::from_observed(entry)
+                    .map(|observation| (path.clone(), observation))
+            })
+            .collect();
+        self.hydration_observations = entries
+            .iter()
+            .filter_map(|(path, entry)| {
+                HydrationObservation::from_observed(entry)
+                    .map(|observation| (path.clone(), observation))
+            })
+            .collect();
     }
 
     pub fn walk(&mut self) {
@@ -464,9 +541,12 @@ impl SyncRootMonitor {
         self.log_dehydrate_scan_summary(dehydrate_summary);
         if walk_error_count == 0 {
             self.handle_deleted_entries(&current, &handled_renames);
+            self.pending_uploads
+                .retain(|path| current.contains_key(path));
+            self.replace_observation_baseline(&current);
         } else {
-            let preserved_count = self
-                .preserve_missing_entries_after_incomplete_snapshot(&mut current, &handled_renames);
+            let preserved_count =
+                self.update_partial_observation_baseline(&current, &handled_renames);
             tracing::info!(
                 "{}: snapshot scan encountered {} walk errors; suppressing delete detection for this pass and preserving {} prior entries sample={:?}",
                 self.name,
@@ -475,14 +555,58 @@ impl SyncRootMonitor {
                 walk_error_samples
             );
         }
-        self.seen = current;
+    }
+
+    fn update_partial_observation_baseline(
+        &mut self,
+        current: &HashMap<String, ObservedEntry>,
+        handled_renames: &HashSet<String>,
+    ) -> usize {
+        let mut prior_paths = current
+            .iter()
+            .map(|(path, entry)| (path.clone(), PriorPath::from_observed(entry)))
+            .collect::<HashMap<_, _>>();
+        let mut upload_observations = current
+            .iter()
+            .filter_map(|(path, entry)| {
+                UploadObservation::from_observed(entry)
+                    .map(|observation| (path.clone(), observation))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut hydration_observations = current
+            .iter()
+            .filter_map(|(path, entry)| {
+                HydrationObservation::from_observed(entry)
+                    .map(|observation| (path.clone(), observation))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut preserved_count = 0;
+        for (path, prior) in &self.prior_paths {
+            if prior_paths.contains_key(path) || handled_renames.contains(path) {
+                continue;
+            }
+            prior_paths.insert(path.clone(), prior.clone());
+            if let Some(observation) = self.upload_observations.get(path) {
+                upload_observations.insert(path.clone(), observation.clone());
+            }
+            if let Some(observation) = self.hydration_observations.get(path) {
+                hydration_observations.insert(path.clone(), *observation);
+            }
+            preserved_count += 1;
+        }
+
+        self.prior_paths = prior_paths;
+        self.upload_observations = upload_observations;
+        self.hydration_observations = hydration_observations;
+        preserved_count
     }
 
     fn handle_local_object_renames(
         &mut self,
-        current: &mut HashMap<String, SeenEntry>,
+        current: &mut HashMap<String, ObservedEntry>,
     ) -> std::collections::HashSet<String> {
-        let mut rename_pairs = detect_local_object_renames(&self.seen, current);
+        let mut rename_pairs = detect_local_object_renames(&self.prior_paths, current);
         let detected_pairs = rename_pairs
             .iter()
             .map(|rename| (rename.from_path.clone(), rename.to_path.clone()))
@@ -518,9 +642,9 @@ impl SyncRootMonitor {
                 rename.from_path,
                 rename.to_path,
                 rename.detection,
-                self.seen
+                self.prior_paths
                     .get(&rename.from_path)
-                    .map(|entry| entry.to_log_string())
+                    .map(PriorPath::to_log_string)
                     .unwrap_or_else(|| String::from("<missing>")),
                 current
                     .get(&rename.to_path)
@@ -633,8 +757,8 @@ impl SyncRootMonitor {
             .lock()
             .expect("dehydrations_in_flight lock poisoned")
             .len();
-        if summary.pinned_attribute_count == 0
-            && summary.unpinned_attribute_count == 0
+        if summary.pinned_count == 0
+            && summary.unpinned_count == 0
             && summary.probed_placeholder_count == 0
             && summary.hydrate_eligible_count == 0
             && summary.eligible_count == 0
@@ -645,11 +769,11 @@ impl SyncRootMonitor {
         }
 
         tracing::info!(
-            "{}: dehydrate-scan total_entries={} pinned_attr={} unpinned_attr={} probed_placeholders={} hydrate_eligible={} eligible={} hydrate_in_flight={} in_flight={}",
+            "{}: dehydrate-scan total_entries={} pinned={} unpinned={} probed_placeholders={} hydrate_eligible={} eligible={} hydrate_in_flight={} in_flight={}",
             self.name,
             summary.total_entries,
-            summary.pinned_attribute_count,
-            summary.unpinned_attribute_count,
+            summary.pinned_count,
+            summary.unpinned_count,
             summary.probed_placeholder_count,
             summary.hydrate_eligible_count,
             summary.eligible_count,
@@ -706,25 +830,9 @@ impl SyncRootMonitor {
         snapshot
     }
 
-    fn preserve_missing_entries_after_incomplete_snapshot(
-        &self,
-        current: &mut HashMap<String, SeenEntry>,
-        handled_renames: &HashSet<String>,
-    ) -> usize {
-        let mut preserved_count = 0;
-        for (path, entry) in &self.seen {
-            if current.contains_key(path) || handled_renames.contains(path) {
-                continue;
-            }
-            current.insert(path.clone(), entry.clone());
-            preserved_count += 1;
-        }
-        preserved_count
-    }
-
     fn seed_existing_entry(
         &self,
-        seeded: &mut HashMap<String, SeenEntry>,
+        seeded: &mut HashMap<String, ObservedEntry>,
         rel_path: &str,
         is_dir_hint: bool,
     ) {
@@ -759,7 +867,7 @@ impl SyncRootMonitor {
         &mut self,
         path: &std::path::Path,
         rel_path: String,
-        current: &mut HashMap<String, SeenEntry>,
+        current: &mut HashMap<String, ObservedEntry>,
     ) {
         if rel_path.is_empty() {
             return;
@@ -770,39 +878,13 @@ impl SyncRootMonitor {
         {
             return;
         }
-        let entry = match current.get(&rel_path) {
+        let entry = match current.get(&rel_path).cloned() {
             Some(entry) => entry,
             None => return,
         };
-        let previous_entry = self.seen.get(&rel_path);
-        let entry_unchanged = previous_entry == Some(entry);
-
-        if !entry_unchanged
-            && (entry.has_unpinned_attribute()
-                || previous_entry.is_some_and(SeenEntry::has_unpinned_attribute)
-                || entry.placeholder_state.is_some()
-                || previous_entry
-                    .and_then(|value| value.placeholder_state)
-                    .is_some())
-        {
-            tracing::info!(
-                "{}: path-state changed path={} previous={} current={} raw_state={}",
-                self.name,
-                rel_path,
-                previous_entry
-                    .map(|value| value.to_log_string())
-                    .unwrap_or_else(|| String::from("<new>")),
-                entry.to_log_string(),
-                describe_path_state(path)
-            );
-        }
-
-        self.maybe_schedule_placeholder_hydrate(path, &rel_path, previous_entry, entry);
-        self.maybe_schedule_placeholder_dehydrate(path, &rel_path, previous_entry, entry);
-
-        if entry_unchanged {
-            return;
-        }
+        let previous_path = self.prior_paths.get(&rel_path).cloned();
+        self.maybe_schedule_placeholder_hydrate(path, &rel_path, &entry);
+        self.maybe_schedule_placeholder_dehydrate(path, &rel_path, &entry);
 
         if self
             .remote_applied_tracker
@@ -813,10 +895,14 @@ impl SyncRootMonitor {
                 self.name,
                 rel_path
             );
+            self.pending_uploads.remove(&rel_path);
             return;
         }
 
         if entry.is_dir {
+            if previous_path.is_some() && !self.pending_uploads.contains(&rel_path) {
+                return;
+            }
             if self
                 .remote_applied_tracker
                 .take_directory_suppression(&rel_path)
@@ -826,12 +912,14 @@ impl SyncRootMonitor {
                     self.name,
                     rel_path
                 );
+                self.pending_uploads.remove(&rel_path);
                 return;
             }
             tracing::info!("{}: detected new directory {}", self.name, rel_path);
             let mut cursor = std::io::Cursor::new(b"<DIR>".to_vec());
             let remote_path = directory_marker_path(&rel_path);
-            if entry.placeholder_object_id.is_some() != entry.placeholder_revision.is_some() {
+            let (object_id, revision) = upload_identity(&entry, previous_path.as_ref());
+            if object_id.is_some() != revision.is_some() {
                 tracing::warn!(
                     "{}: refusing ambiguous directory upload for {}; object_id and expected_revision are incomplete",
                     self.name,
@@ -841,8 +929,8 @@ impl SyncRootMonitor {
             }
             match self.uploader.upload_reader_for_object(
                 &remote_path,
-                entry.placeholder_object_id.as_deref(),
-                entry.placeholder_revision.as_deref(),
+                object_id.as_deref(),
+                revision.as_deref(),
                 &mut cursor,
                 b"<DIR>".len() as u64,
             ) {
@@ -857,7 +945,7 @@ impl SyncRootMonitor {
                             self.name,
                             rel_path
                         );
-                        self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                        self.mark_upload_for_retry(&rel_path);
                         return;
                     };
                     if let Err(err) = record_uploaded_object_state(
@@ -874,12 +962,9 @@ impl SyncRootMonitor {
                             rel_path,
                             err
                         );
-                        self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                        self.mark_upload_for_retry(&rel_path);
                     } else {
-                        // The upload receipt advances the placeholder's
-                        // revision. Refresh this walk's snapshot so that
-                        // revision becomes the next monitor baseline instead
-                        // of looking like a new local change on every scan.
+                        self.pending_uploads.remove(&rel_path);
                         self.seed_existing_entry(current, &rel_path, true);
                     }
                 }
@@ -890,32 +975,49 @@ impl SyncRootMonitor {
                         rel_path,
                         err
                     );
-                    self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                    self.mark_upload_for_retry(&rel_path);
                 }
             }
         } else {
+            let current_upload_observation = UploadObservation::from_observed(&entry);
+            if entry.is_placeholder {
+                let Some(placeholder_state) = entry.placeholder_state else {
+                    tracing::info!(
+                        "{}: deferring content decision for placeholder {} because its CFAPI state is unavailable raw_state={}",
+                        self.name,
+                        rel_path,
+                        describe_path_state(path)
+                    );
+                    return;
+                };
+                if !placeholder_has_uploadable_local_content(placeholder_state) {
+                    self.pending_uploads.remove(&rel_path);
+                    return;
+                }
+            }
+
+            let upload_observation_changed =
+                current_upload_observation
+                    .as_ref()
+                    .is_some_and(|current_observation| {
+                        self.upload_observations.get(&rel_path) != Some(current_observation)
+                    });
+            if !upload_observation_changed && !self.pending_uploads.contains(&rel_path) {
+                return;
+            }
+
             let metadata = match std::fs::metadata(path) {
                 Ok(m) => m,
                 Err(_) => return,
             };
             if path.exists() {
                 let upload_snapshot = (metadata.len(), metadata.modified().ok());
-                let was_placeholder = path_is_placeholder(path);
-                if was_placeholder {
-                    if should_skip_clean_placeholder_content_upload(previous_entry, entry) {
-                        tracing::info!(
-                            "{}: skipping upload for clean placeholder {} after metadata-only change snapshot={} raw_state={}",
-                            self.name,
-                            rel_path,
-                            entry.to_log_string(),
-                            describe_path_state(path)
-                        );
-                        return;
-                    }
+                if entry.is_placeholder {
                     tracing::info!(
-                        "{}: uploading placeholder-backed file {} after local change detection",
+                        "{}: uploading dirty placeholder-backed file {} snapshot={}",
                         self.name,
-                        rel_path
+                        rel_path,
+                        entry.to_log_string()
                     );
                 }
                 let mut file = match std::fs::File::open(path) {
@@ -927,11 +1029,12 @@ impl SyncRootMonitor {
                             rel_path,
                             err
                         );
-                        self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                        self.mark_upload_for_retry(&rel_path);
                         return;
                     }
                 };
-                if entry.placeholder_object_id.is_some() != entry.placeholder_revision.is_some() {
+                let (object_id, revision) = upload_identity(&entry, previous_path.as_ref());
+                if object_id.is_some() != revision.is_some() {
                     tracing::warn!(
                         "{}: refusing ambiguous upload for {}; object_id and expected_revision are incomplete",
                         self.name,
@@ -941,8 +1044,8 @@ impl SyncRootMonitor {
                 }
                 match self.uploader.upload_reader_for_object(
                     &rel_path,
-                    entry.placeholder_object_id.as_deref(),
-                    entry.placeholder_revision.as_deref(),
+                    object_id.as_deref(),
+                    revision.as_deref(),
                     &mut file,
                     metadata.len(),
                 ) {
@@ -950,7 +1053,7 @@ impl SyncRootMonitor {
                         let content_unchanged = std::fs::metadata(path)
                             .map(|after| (after.len(), after.modified().ok()) == upload_snapshot)
                             .unwrap_or(false);
-                        if !was_placeholder {
+                        if !entry.is_placeholder {
                             try_convert_materialized_file(path, &rel_path, &metadata);
                         }
                         let uploaded_identity = receipt
@@ -963,7 +1066,7 @@ impl SyncRootMonitor {
                                 self.name,
                                 rel_path
                             );
-                            self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                            self.mark_upload_for_retry(&rel_path);
                             return;
                         };
                         if let Err(err) = record_uploaded_object_state(
@@ -980,7 +1083,7 @@ impl SyncRootMonitor {
                                 rel_path,
                                 err
                             );
-                            self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                            self.mark_upload_for_retry(&rel_path);
                             return;
                         }
                         if !content_unchanged {
@@ -991,7 +1094,7 @@ impl SyncRootMonitor {
                                 object_id,
                                 revision
                             );
-                            self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                            self.mark_upload_for_retry(&rel_path);
                             return;
                         }
                         match open_sync_path(path, true).and_then(|file| {
@@ -1017,11 +1120,12 @@ impl SyncRootMonitor {
                                     rel_path,
                                     err
                                 );
-                                self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                                self.mark_upload_for_retry(&rel_path);
                                 return;
                             }
                         }
                         self.seed_existing_entry(current, &rel_path, false);
+                        self.pending_uploads.remove(&rel_path);
                         tracing::info!("{}: uploaded file {}", self.name, rel_path);
                     }
                     Err(err) => {
@@ -1032,13 +1136,14 @@ impl SyncRootMonitor {
                             err
                         );
                         if is_remote_mutation_conflict(&err) {
+                            self.pending_uploads.remove(&rel_path);
                             tracing::warn!(
                                 "{}: preserving unsynchronized local change for {} after object mutation conflict",
                                 self.name,
                                 rel_path
                             );
                         } else {
-                            self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                            self.mark_upload_for_retry(&rel_path);
                         }
                     }
                 }
@@ -1054,72 +1159,41 @@ impl SyncRootMonitor {
                         rel_path,
                         e
                     );
-                    self.mark_entry_for_retry(current, &rel_path, previous_entry);
+                    self.mark_upload_for_retry(&rel_path);
                 } else {
+                    self.pending_uploads.remove(&rel_path);
                     tracing::info!("{}: created placeholder for {}", self.name, rel_path);
                 }
             }
         }
     }
 
-    fn mark_entry_for_retry(
-        &self,
-        current: &mut HashMap<String, SeenEntry>,
-        rel_path: &str,
-        previous_entry: Option<&SeenEntry>,
-    ) {
-        if let Some(previous_entry) = previous_entry {
-            current.insert(rel_path.to_string(), previous_entry.clone());
-        } else {
-            current.remove(rel_path);
-        }
+    fn mark_upload_for_retry(&mut self, rel_path: &str) {
+        self.pending_uploads.insert(rel_path.to_string());
     }
 
     fn maybe_schedule_placeholder_dehydrate(
         &self,
         path: &std::path::Path,
         rel_path: &str,
-        previous_entry: Option<&SeenEntry>,
-        entry: &SeenEntry,
+        entry: &ObservedEntry,
     ) {
-        if !entry.has_unpinned_attribute() {
+        if entry.is_dir || !entry.is_placeholder {
             return;
         }
 
         let Some(placeholder_state) = entry.placeholder_state else {
-            if previous_entry != Some(entry) {
-                tracing::info!(
-                    "{}: dehydrate candidate missing placeholder probe path={} entry={} raw_state={}",
-                    self.name,
-                    rel_path,
-                    entry.to_log_string(),
-                    describe_path_state(path)
-                );
-            }
+            tracing::info!(
+                "{}: dehydrate candidate missing placeholder probe path={} entry={} raw_state={}",
+                self.name,
+                rel_path,
+                entry.to_log_string(),
+                describe_path_state(path)
+            );
             return;
         };
         if !placeholder_state.should_dehydrate() {
-            if previous_entry != Some(entry) {
-                tracing::info!(
-                    "{}: dehydrate candidate rejected path={} snapshot={} reason={} raw_state={}",
-                    self.name,
-                    rel_path,
-                    placeholder_state.to_log_string(),
-                    placeholder_state.block_reason(),
-                    describe_path_state(path)
-                );
-            }
             return;
-        }
-
-        if previous_entry != Some(entry) {
-            tracing::info!(
-                "{}: dehydrate candidate accepted path={} snapshot={} raw_state={} action=request-provider-dehydrate",
-                self.name,
-                rel_path,
-                placeholder_state.to_log_string(),
-                describe_path_state(path),
-            );
         }
 
         {
@@ -1128,18 +1202,17 @@ impl SyncRootMonitor {
                 .lock()
                 .expect("dehydrations_in_flight lock poisoned");
             if !in_flight.insert(rel_path.to_string()) {
-                if previous_entry != Some(entry) {
-                    tracing::info!(
-                        "{}: dehydrate already in flight for {} snapshot={} raw_state={}",
-                        self.name,
-                        rel_path,
-                        placeholder_state.to_log_string(),
-                        describe_path_state(path)
-                    );
-                }
                 return;
             }
         }
+
+        tracing::info!(
+            "{}: dehydrate candidate accepted path={} snapshot={} raw_state={} action=request-provider-dehydrate",
+            self.name,
+            rel_path,
+            placeholder_state.to_log_string(),
+            describe_path_state(path),
+        );
 
         let rel_path = rel_path.to_string();
         let full_path = path.to_path_buf();
@@ -1215,75 +1288,38 @@ impl SyncRootMonitor {
         &self,
         path: &std::path::Path,
         rel_path: &str,
-        previous_entry: Option<&SeenEntry>,
-        entry: &SeenEntry,
+        entry: &ObservedEntry,
     ) {
-        if !entry.has_pinned_attribute() {
+        if entry.is_dir || !entry.is_placeholder {
             return;
         }
 
         let Some(placeholder_state) = entry.placeholder_state else {
-            if previous_entry != Some(entry) {
-                tracing::info!(
-                    "{}: hydrate candidate missing placeholder probe path={} entry={} raw_state={}",
-                    self.name,
-                    rel_path,
-                    entry.to_log_string(),
-                    describe_path_state(path)
-                );
-            }
+            tracing::info!(
+                "{}: hydrate candidate missing placeholder probe path={} entry={} raw_state={}",
+                self.name,
+                rel_path,
+                entry.to_log_string(),
+                describe_path_state(path)
+            );
             return;
         };
         if !placeholder_state.should_hydrate() {
-            if previous_entry != Some(entry) {
-                let reason = if placeholder_state.pin_state != CF_PIN_STATE_PINNED {
-                    "pin-state-not-pinned"
-                } else if placeholder_state.in_sync_state != CF_IN_SYNC_STATE_IN_SYNC {
-                    "not-in-sync"
-                } else if placeholder_state.modified_data_size != 0 {
-                    "modified-data-present"
-                } else if !placeholder_state.is_partial {
-                    "already-fully-hydrated"
-                } else {
-                    "not-eligible"
-                };
-                tracing::info!(
-                    "{}: hydrate candidate rejected path={} snapshot={} reason={} raw_state={}",
-                    self.name,
-                    rel_path,
-                    placeholder_state.to_log_string(),
-                    reason,
-                    describe_path_state(path)
-                );
-            }
             return;
         }
 
         if entry.provider_hydration_active {
-            if previous_entry != Some(entry) {
-                tracing::info!(
-                    "{}: hydrate candidate deferred path={} snapshot={} reason=provider-hydration-active raw_state={}",
-                    self.name,
-                    rel_path,
-                    placeholder_state.to_log_string(),
-                    describe_path_state(path)
-                );
-            }
             return;
         }
 
-        if !should_schedule_placeholder_hydration(previous_entry, entry, placeholder_state) {
+        let Some(current_observation) = HydrationObservation::from_observed(entry) else {
             return;
-        }
-
-        if previous_entry != Some(entry) {
-            tracing::info!(
-                "{}: hydrate candidate accepted path={} snapshot={} raw_state={} action=request-provider-hydrate",
-                self.name,
-                rel_path,
-                placeholder_state.to_log_string(),
-                describe_path_state(path),
-            );
+        };
+        if !should_schedule_placeholder_hydration(
+            self.hydration_observations.get(rel_path).copied(),
+            current_observation,
+        ) {
+            return;
         }
 
         {
@@ -1292,18 +1328,17 @@ impl SyncRootMonitor {
                 .lock()
                 .expect("hydrations_in_flight lock poisoned");
             if !in_flight.insert(rel_path.to_string()) {
-                if previous_entry != Some(entry) {
-                    tracing::info!(
-                        "{}: hydrate already in flight for {} snapshot={} raw_state={}",
-                        self.name,
-                        rel_path,
-                        placeholder_state.to_log_string(),
-                        describe_path_state(path)
-                    );
-                }
                 return;
             }
         }
+
+        tracing::info!(
+            "{}: hydrate candidate accepted path={} snapshot={} raw_state={} action=request-provider-hydrate",
+            self.name,
+            rel_path,
+            placeholder_state.to_log_string(),
+            describe_path_state(path),
+        );
 
         let rel_path = rel_path.to_string();
         let full_path = path.to_path_buf();
@@ -1368,11 +1403,11 @@ impl SyncRootMonitor {
 
     fn handle_deleted_entries(
         &self,
-        current: &HashMap<String, SeenEntry>,
+        current: &HashMap<String, ObservedEntry>,
         handled_renames: &std::collections::HashSet<String>,
     ) {
         let mut deleted_paths = self
-            .seen
+            .prior_paths
             .iter()
             .filter_map(|(path, entry)| {
                 if current.contains_key(path) {
@@ -1410,10 +1445,9 @@ impl SyncRootMonitor {
                 );
                 continue;
             }
-            let (Some(object_id), Some(expected_revision)) = (
-                entry.placeholder_object_id.as_deref(),
-                entry.placeholder_revision.as_deref(),
-            ) else {
+            let (Some(object_id), Some(expected_revision)) =
+                (entry.object_id.as_deref(), entry.revision.as_deref())
+            else {
                 tracing::warn!(
                     "{}: refusing path-only remote delete for {}; placeholder identity is incomplete",
                     self.name,
@@ -1442,6 +1476,21 @@ impl SyncRootMonitor {
             }
         }
     }
+}
+
+fn upload_identity(
+    entry: &ObservedEntry,
+    previous: Option<&PriorPath>,
+) -> (Option<String>, Option<String>) {
+    if entry.placeholder_object_id.is_some() || entry.placeholder_revision.is_some() {
+        return (
+            entry.placeholder_object_id.clone(),
+            entry.placeholder_revision.clone(),
+        );
+    }
+    previous
+        .map(|previous| (previous.object_id.clone(), previous.revision.clone()))
+        .unwrap_or_default()
 }
 
 fn normalize_monitor_relative_path(path: &str) -> String {
@@ -1587,8 +1636,8 @@ fn mark_local_rename_conflict(path: &std::path::Path) {
 }
 
 fn detect_local_object_renames(
-    previous: &HashMap<String, SeenEntry>,
-    current: &HashMap<String, SeenEntry>,
+    previous: &HashMap<String, PriorPath>,
+    current: &HashMap<String, ObservedEntry>,
 ) -> Vec<LocalRenamePair> {
     let mut pairs = Vec::new();
     let mut matched_sources = std::collections::HashSet::new();
@@ -1615,8 +1664,7 @@ fn detect_local_object_renames(
             continue;
         }
         if previous.get(from_path).is_some_and(|candidate| {
-            candidate.is_dir == entry.is_dir
-                && candidate.placeholder_object_id.as_deref() == Some(object_id)
+            candidate.is_dir == entry.is_dir && candidate.object_id.as_deref() == Some(object_id)
         }) {
             matched_sources.insert(from_path.to_string());
             matched_destinations.insert(to_path.clone());
@@ -1651,23 +1699,14 @@ fn snapshot_entry(
     rel_path: &str,
     path: &std::path::Path,
     is_dir: bool,
-) -> SeenEntry {
+) -> ObservedEntry {
     let metadata = std::fs::metadata(path).ok();
-    let file_attributes = metadata
-        .as_ref()
-        .map(|metadata| metadata.file_attributes())
-        .unwrap_or_default();
     let is_placeholder = path_is_placeholder(path);
     let placeholder_identity = placeholder_identity_for_entry(path, is_placeholder);
-    let should_probe = !is_dir
-        && ((file_attributes & FILE_ATTRIBUTE_UNPINNED) != 0
-            || (file_attributes & FILE_ATTRIBUTE_PINNED) != 0);
-    SeenEntry {
+    let should_probe = !is_dir && is_placeholder;
+    ObservedEntry {
         is_dir,
-        file_attributes,
-        local_file_identity: (!is_dir)
-            .then(|| LocalFileIdentity::from_path(path))
-            .flatten(),
+        is_placeholder,
         placeholder_identity_path: placeholder_identity
             .as_ref()
             .map(|identity| identity.path.clone()),
@@ -1685,20 +1724,35 @@ fn snapshot_entry(
             PlaceholderSnapshot::from_path(path, placeholder_state_bits)
         },
         provider_hydration_active: should_probe && is_active_hydration_marked(sync_root, rel_path),
+        materialized_file: (!is_dir && !is_placeholder)
+            .then(|| {
+                metadata.as_ref().map(|metadata| MaterializedFileSnapshot {
+                    local_file_identity: LocalFileIdentity::from_path(path),
+                    len: metadata.len(),
+                    last_write_time: metadata.last_write_time(),
+                })
+            })
+            .flatten(),
     }
 }
 
-fn summarize_dehydrate_scan(entries: &HashMap<String, SeenEntry>) -> DehydrateScanSummary {
+fn summarize_dehydrate_scan(entries: &HashMap<String, ObservedEntry>) -> DehydrateScanSummary {
     let mut summary = DehydrateScanSummary {
         total_entries: entries.len(),
         ..Default::default()
     };
     for entry in entries.values() {
-        if entry.has_pinned_attribute() {
-            summary.pinned_attribute_count += 1;
+        if entry
+            .placeholder_state
+            .is_some_and(|state| state.pin_state == CF_PIN_STATE_PINNED)
+        {
+            summary.pinned_count += 1;
         }
-        if entry.has_unpinned_attribute() {
-            summary.unpinned_attribute_count += 1;
+        if entry
+            .placeholder_state
+            .is_some_and(|state| state.pin_state == CF_PIN_STATE_UNPINNED)
+        {
+            summary.unpinned_count += 1;
         }
         if entry.placeholder_state.is_some() {
             summary.probed_placeholder_count += 1;
@@ -1873,16 +1927,16 @@ mod tests {
         }
     }
 
-    fn seen_entry(is_dir: bool) -> SeenEntry {
-        SeenEntry {
+    fn observed_entry(is_dir: bool) -> ObservedEntry {
+        ObservedEntry {
             is_dir,
-            file_attributes: 0,
-            local_file_identity: None,
+            is_placeholder: false,
             placeholder_identity_path: None,
             placeholder_object_id: None,
             placeholder_revision: None,
             placeholder_state: None,
             provider_hydration_active: false,
+            materialized_file: None,
         }
     }
 
@@ -2141,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_directory_upload_refreshes_the_seen_revision() {
+    fn successful_directory_upload_refreshes_the_topology_revision() {
         let (sync_root, provider_instance_id) =
             registered_monitor_test_sync_root("directory-upload-seen-revision");
         let uploader = Arc::new(MockUploader::default());
@@ -2230,25 +2284,27 @@ mod tests {
             uuid::Uuid::nil(),
             uploader.clone(),
         );
-        monitor
-            .seen
-            .insert(String::from("docs/keep.txt"), seen_entry(false));
-        monitor
-            .seen
-            .insert(String::from("docs/old-name.txt"), seen_entry(false));
+        monitor.prior_paths.insert(
+            String::from("docs/keep.txt"),
+            PriorPath::from_observed(&observed_entry(false)),
+        );
+        monitor.prior_paths.insert(
+            String::from("docs/old-name.txt"),
+            PriorPath::from_observed(&observed_entry(false)),
+        );
 
-        let mut current = HashMap::from([(String::from("docs/new-name.txt"), seen_entry(false))]);
+        let current = HashMap::from([(String::from("docs/new-name.txt"), observed_entry(false))]);
         let handled_renames = HashSet::from([
             String::from("docs/old-name.txt"),
             String::from("docs/new-name.txt"),
         ]);
 
-        let preserved_count = monitor
-            .preserve_missing_entries_after_incomplete_snapshot(&mut current, &handled_renames);
+        let preserved_count =
+            monitor.update_partial_observation_baseline(&current, &handled_renames);
 
         assert_eq!(preserved_count, 1);
-        assert!(current.contains_key("docs/keep.txt"));
-        assert!(!current.contains_key("docs/old-name.txt"));
+        assert!(monitor.prior_paths.contains_key("docs/keep.txt"));
+        assert!(!monitor.prior_paths.contains_key("docs/old-name.txt"));
 
         monitor.handle_deleted_entries(&current, &handled_renames);
 
@@ -2281,10 +2337,10 @@ mod tests {
         monitor.seed_seen();
         assert!(
             monitor
-                .seen
+                .prior_paths
                 .get(path)
-                .and_then(|entry| entry.placeholder_identity_path.as_deref())
-                .is_some_and(|identity_path| identity_path == path),
+                .and_then(|entry| entry.object_id.as_deref())
+                .is_some_and(|object_id| object_id == "test-object"),
             "the monitor has observed the real provider placeholder before reconciliation"
         );
 
@@ -2336,7 +2392,7 @@ mod tests {
                 .expect("deletes lock poisoned")
                 .as_slice(),
             ["test-object"],
-            "a user file deletion is emitted exactly once after the monitor advances its seen set"
+            "a user file deletion is emitted exactly once after the monitor advances its topology baseline"
         );
     }
 
@@ -2352,10 +2408,14 @@ mod tests {
             uuid::Uuid::nil(),
             uploader.clone(),
         );
-        let mut directory = seen_entry(true);
-        directory.placeholder_object_id = Some("directory-marker-object".to_string());
-        directory.placeholder_revision = Some("directory-marker-revision".to_string());
-        monitor.seen.insert("documents".to_string(), directory);
+        let directory = PriorPath {
+            is_dir: true,
+            object_id: Some("directory-marker-object".to_string()),
+            revision: Some("directory-marker-revision".to_string()),
+        };
+        monitor
+            .prior_paths
+            .insert("documents".to_string(), directory);
 
         monitor.handle_deleted_entries(&HashMap::new(), &HashSet::new());
 
@@ -2381,14 +2441,17 @@ mod tests {
 
     #[test]
     fn local_rename_detection_requires_same_placeholder_object_id() {
-        let mut previous_entry = seen_entry(false);
+        let mut previous_entry = observed_entry(false);
         previous_entry.placeholder_identity_path = Some("docs/old.txt".to_string());
         previous_entry.placeholder_object_id = Some("obj-document".to_string());
         previous_entry.placeholder_revision = Some("revision-3".to_string());
         let current_entry = previous_entry.clone();
 
         let pairs = detect_local_object_renames(
-            &HashMap::from([("docs/old.txt".to_string(), previous_entry)]),
+            &HashMap::from([(
+                "docs/old.txt".to_string(),
+                PriorPath::from_observed(&previous_entry),
+            )]),
             &HashMap::from([("archive/new.txt".to_string(), current_entry)]),
         );
 
@@ -2400,14 +2463,17 @@ mod tests {
 
     #[test]
     fn local_directory_rename_detection_requires_same_placeholder_object_id() {
-        let mut previous_entry = seen_entry(true);
+        let mut previous_entry = observed_entry(true);
         previous_entry.placeholder_identity_path = Some("docs".to_string());
         previous_entry.placeholder_object_id = Some("obj-directory".to_string());
         previous_entry.placeholder_revision = Some("revision-3".to_string());
         let current_entry = previous_entry.clone();
 
         let pairs = detect_local_object_renames(
-            &HashMap::from([("docs".to_string(), previous_entry)]),
+            &HashMap::from([(
+                "docs".to_string(),
+                PriorPath::from_observed(&previous_entry),
+            )]),
             &HashMap::from([("archive".to_string(), current_entry)]),
         );
 
@@ -2417,7 +2483,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_object_id_rename_failure_is_retried_after_seen_advances() {
+    fn transient_object_id_rename_failure_is_retried_after_topology_baseline_advances() {
         let unique = uuid::Uuid::new_v4();
         let sync_root =
             std::env::temp_dir().join(format!("ironmesh-monitor-rename-retry-{unique}"));
@@ -2429,12 +2495,15 @@ mod tests {
             uploader.clone(),
         );
 
-        let mut old_entry = seen_entry(false);
+        let mut old_entry = observed_entry(false);
         old_entry.placeholder_identity_path = Some("docs/old.txt".to_string());
         old_entry.placeholder_object_id = Some("obj-document".to_string());
         old_entry.placeholder_revision = Some("revision-3".to_string());
         let current_entry = old_entry.clone();
-        monitor.seen.insert("docs/old.txt".to_string(), old_entry);
+        monitor.prior_paths.insert(
+            "docs/old.txt".to_string(),
+            PriorPath::from_observed(&old_entry),
+        );
         let mut current = HashMap::from([("archive/new.txt".to_string(), current_entry)]);
 
         let first_handled = monitor.handle_local_object_renames(&mut current);
@@ -2444,7 +2513,10 @@ mod tests {
 
         // This models the end of a scan: only the destination remains in the
         // baseline, so a retry cannot rely on the removed source path.
-        monitor.seen = current.clone();
+        monitor.prior_paths = current
+            .iter()
+            .map(|(path, entry)| (path.clone(), PriorPath::from_observed(entry)))
+            .collect();
         let second_handled = monitor.handle_local_object_renames(&mut current);
 
         assert!(second_handled.contains("docs/old.txt"));
@@ -2472,7 +2544,7 @@ mod tests {
 
     #[test]
     fn local_rename_detection_rejects_path_history_with_different_object_id() {
-        let mut previous_entry = seen_entry(false);
+        let mut previous_entry = observed_entry(false);
         previous_entry.placeholder_identity_path = Some("docs/old.txt".to_string());
         previous_entry.placeholder_object_id = Some("obj-old".to_string());
         previous_entry.placeholder_revision = Some("revision-3".to_string());
@@ -2480,7 +2552,10 @@ mod tests {
         current_entry.placeholder_object_id = Some("obj-new".to_string());
 
         let pairs = detect_local_object_renames(
-            &HashMap::from([("docs/old.txt".to_string(), previous_entry)]),
+            &HashMap::from([(
+                "docs/old.txt".to_string(),
+                PriorPath::from_observed(&previous_entry),
+            )]),
             &HashMap::from([("archive/new.txt".to_string(), current_entry)]),
         );
 
@@ -2602,266 +2677,132 @@ mod tests {
 
     #[test]
     fn startup_seed_does_not_schedule_hydration_for_unchanged_pinned_placeholder() {
-        let pinned_partial = PlaceholderSnapshot {
-            on_disk_data_size: 0,
-            modified_data_size: 0,
-            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
-            pin_state: CF_PIN_STATE_PINNED,
-            is_partial: true,
-        };
-        let entry = SeenEntry {
-            is_dir: false,
-            file_attributes: FILE_ATTRIBUTE_PINNED,
-            local_file_identity: None,
-            placeholder_identity_path: Some("movies/example.mp4".to_string()),
-            placeholder_object_id: Some("obj-example".to_string()),
-            placeholder_revision: Some("revision-example".to_string()),
-            placeholder_state: Some(pinned_partial),
+        let observation = HydrationObservation {
+            eligible: true,
             provider_hydration_active: false,
+            on_disk_data_size: 0,
         };
 
         assert!(
-            !should_schedule_placeholder_hydration(Some(&entry), &entry, pinned_partial),
+            !should_schedule_placeholder_hydration(Some(observation), observation),
             "seeded startup snapshot should not auto-hydrate an unchanged pinned placeholder",
         );
     }
 
     #[test]
     fn monitor_only_schedules_hydration_when_entry_newly_becomes_eligible() {
-        let pinned_partial = PlaceholderSnapshot {
+        let previous = HydrationObservation {
+            eligible: false,
+            provider_hydration_active: false,
             on_disk_data_size: 0,
-            modified_data_size: 0,
-            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
-            pin_state: CF_PIN_STATE_PINNED,
-            is_partial: true,
         };
-        let previous = SeenEntry {
-            is_dir: false,
-            file_attributes: 0,
-            local_file_identity: None,
-            placeholder_identity_path: Some("movies/example.mp4".to_string()),
-            placeholder_object_id: Some("obj-example".to_string()),
-            placeholder_revision: Some("revision-example".to_string()),
-            placeholder_state: None,
+        let current = HydrationObservation {
+            eligible: true,
             provider_hydration_active: false,
-        };
-        let current = SeenEntry {
-            is_dir: false,
-            file_attributes: FILE_ATTRIBUTE_PINNED,
-            local_file_identity: None,
-            placeholder_identity_path: Some("movies/example.mp4".to_string()),
-            placeholder_object_id: Some("obj-example".to_string()),
-            placeholder_revision: Some("revision-example".to_string()),
-            placeholder_state: Some(pinned_partial),
-            provider_hydration_active: false,
+            on_disk_data_size: 0,
         };
 
         assert!(
-            should_schedule_placeholder_hydration(Some(&previous), &current, pinned_partial),
+            should_schedule_placeholder_hydration(Some(previous), current),
             "a placeholder that newly becomes pinned and partially hydrated should be eligible",
         );
         assert!(
-            !should_schedule_placeholder_hydration(Some(&current), &current, pinned_partial),
+            !should_schedule_placeholder_hydration(Some(current), current),
             "already-eligible placeholders should not reschedule hydration on every walk",
         );
     }
 
     #[test]
     fn monitor_defers_hydration_while_provider_hydration_is_active() {
-        let pinned_partial = PlaceholderSnapshot {
-            on_disk_data_size: 0,
-            modified_data_size: 0,
-            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
-            pin_state: CF_PIN_STATE_PINNED,
-            is_partial: true,
-        };
-        let entry = SeenEntry {
-            is_dir: false,
-            file_attributes: FILE_ATTRIBUTE_PINNED,
-            local_file_identity: None,
-            placeholder_identity_path: Some("movies/example.mp4".to_string()),
-            placeholder_object_id: Some("obj-example".to_string()),
-            placeholder_revision: Some("revision-example".to_string()),
-            placeholder_state: Some(pinned_partial),
+        let observation = HydrationObservation {
+            eligible: true,
             provider_hydration_active: true,
+            on_disk_data_size: 0,
         };
 
         assert!(
-            !should_schedule_placeholder_hydration(None, &entry, pinned_partial),
+            !should_schedule_placeholder_hydration(None, observation),
             "provider-owned hydration should suppress overlapping explicit hydrates",
         );
     }
 
     #[test]
     fn monitor_retries_hydration_after_provider_hydration_clears() {
-        let pinned_partial = PlaceholderSnapshot {
-            on_disk_data_size: 0,
-            modified_data_size: 0,
-            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
-            pin_state: CF_PIN_STATE_PINNED,
-            is_partial: true,
-        };
-        let previous = SeenEntry {
-            is_dir: false,
-            file_attributes: FILE_ATTRIBUTE_PINNED,
-            local_file_identity: None,
-            placeholder_identity_path: Some("movies/example.mp4".to_string()),
-            placeholder_object_id: Some("obj-example".to_string()),
-            placeholder_revision: Some("revision-example".to_string()),
-            placeholder_state: Some(pinned_partial),
+        let previous = HydrationObservation {
+            eligible: true,
             provider_hydration_active: true,
+            on_disk_data_size: 0,
         };
-        let current = SeenEntry {
+        let current = HydrationObservation {
             provider_hydration_active: false,
-            ..previous.clone()
+            ..previous
         };
 
         assert!(
-            should_schedule_placeholder_hydration(Some(&previous), &current, pinned_partial),
+            should_schedule_placeholder_hydration(Some(previous), current),
             "a stuck partial placeholder should retry once provider-owned hydration clears",
         );
     }
 
     #[test]
     fn monitor_retries_hydration_after_partial_progress_changes() {
-        let previous_partial = PlaceholderSnapshot {
-            on_disk_data_size: 0,
-            modified_data_size: 0,
-            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
-            pin_state: CF_PIN_STATE_PINNED,
-            is_partial: true,
-        };
-        let current_partial = PlaceholderSnapshot {
-            on_disk_data_size: 3_883_008,
-            ..previous_partial
-        };
-        let previous = SeenEntry {
-            is_dir: false,
-            file_attributes: FILE_ATTRIBUTE_PINNED,
-            local_file_identity: None,
-            placeholder_identity_path: Some("movies/example.mp4".to_string()),
-            placeholder_object_id: Some("obj-example".to_string()),
-            placeholder_revision: Some("revision-example".to_string()),
-            placeholder_state: Some(previous_partial),
+        let previous = HydrationObservation {
+            eligible: true,
             provider_hydration_active: false,
+            on_disk_data_size: 0,
         };
-        let current = SeenEntry {
-            placeholder_state: Some(current_partial),
-            ..previous.clone()
+        let current = HydrationObservation {
+            on_disk_data_size: 3_883_008,
+            ..previous
         };
 
         assert!(
-            should_schedule_placeholder_hydration(Some(&previous), &current, current_partial),
+            should_schedule_placeholder_hydration(Some(previous), current),
             "partial hydration progress should allow one more explicit hydrate pass",
         );
     }
 
     #[test]
-    fn monitor_skips_upload_for_existing_clean_placeholder_state_changes() {
-        let previous = SeenEntry {
-            is_dir: false,
-            file_attributes: FILE_ATTRIBUTE_UNPINNED,
-            local_file_identity: Some(LocalFileIdentity {
-                volume_serial_number: 7,
-                file_index: 11,
-            }),
-            placeholder_identity_path: Some("movies/example.mp4".to_string()),
-            placeholder_object_id: Some("obj-example".to_string()),
-            placeholder_revision: Some("revision-example".to_string()),
-            placeholder_state: Some(PlaceholderSnapshot {
-                on_disk_data_size: 4096,
-                modified_data_size: 0,
-                in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
-                pin_state: CF_PIN_STATE_UNPINNED,
-                is_partial: false,
-            }),
-            provider_hydration_active: false,
-        };
-        let current = SeenEntry {
-            placeholder_state: Some(PlaceholderSnapshot {
-                on_disk_data_size: 0,
-                ..previous.placeholder_state.expect("placeholder snapshot")
-            }),
-            ..previous.clone()
+    fn clean_placeholder_state_never_requests_a_content_upload() {
+        let clean = PlaceholderSnapshot {
+            on_disk_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+            pin_state: CF_PIN_STATE_UNPINNED,
+            is_partial: true,
         };
 
         assert!(
-            should_skip_clean_placeholder_content_upload(Some(&previous), &current),
-            "clean placeholder state transitions should not trigger a content upload",
+            !placeholder_has_uploadable_local_content(clean),
+            "a clean cold placeholder has no local content to upload",
         );
     }
 
     #[test]
-    fn monitor_keeps_dirty_placeholder_uploads_enabled() {
-        let previous = SeenEntry {
-            is_dir: false,
-            file_attributes: FILE_ATTRIBUTE_UNPINNED,
-            local_file_identity: Some(LocalFileIdentity {
-                volume_serial_number: 7,
-                file_index: 11,
-            }),
-            placeholder_identity_path: Some("movies/example.mp4".to_string()),
-            placeholder_object_id: Some("obj-example".to_string()),
-            placeholder_revision: Some("revision-example".to_string()),
-            placeholder_state: Some(PlaceholderSnapshot {
-                on_disk_data_size: 4096,
-                modified_data_size: 0,
-                in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
-                pin_state: CF_PIN_STATE_UNPINNED,
-                is_partial: false,
-            }),
-            provider_hydration_active: false,
+    fn dirty_placeholder_state_requests_a_content_upload() {
+        let modified = PlaceholderSnapshot {
+            on_disk_data_size: 4096,
+            modified_data_size: 512,
+            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+            pin_state: CF_PIN_STATE_UNPINNED,
+            is_partial: false,
         };
-        let current = SeenEntry {
-            placeholder_state: Some(PlaceholderSnapshot {
-                modified_data_size: 512,
-                ..previous.placeholder_state.expect("placeholder snapshot")
-            }),
-            ..previous.clone()
+        let not_in_sync = PlaceholderSnapshot {
+            modified_data_size: 0,
+            in_sync_state: CF_IN_SYNC_STATE_NOT_IN_SYNC,
+            ..modified
         };
 
+        assert!(placeholder_has_uploadable_local_content(modified));
+        assert!(placeholder_has_uploadable_local_content(not_in_sync));
+
+        let cold_not_in_sync = PlaceholderSnapshot {
+            on_disk_data_size: 0,
+            ..not_in_sync
+        };
         assert!(
-            !should_skip_clean_placeholder_content_upload(Some(&previous), &current),
-            "dirty placeholders must still be eligible for upload",
-        );
-    }
-
-    #[test]
-    fn monitor_skips_upload_after_materialized_file_converts_to_clean_placeholder() {
-        let file_identity = Some(LocalFileIdentity {
-            volume_serial_number: 7,
-            file_index: 11,
-        });
-        let previous = SeenEntry {
-            is_dir: false,
-            file_attributes: 0,
-            local_file_identity: file_identity,
-            placeholder_identity_path: None,
-            placeholder_object_id: None,
-            placeholder_revision: None,
-            placeholder_state: None,
-            provider_hydration_active: false,
-        };
-        let current = SeenEntry {
-            is_dir: false,
-            file_attributes: FILE_ATTRIBUTE_UNPINNED,
-            local_file_identity: file_identity,
-            placeholder_identity_path: Some("movies/example.mp4".to_string()),
-            placeholder_object_id: Some("obj-example".to_string()),
-            placeholder_revision: Some("revision-example".to_string()),
-            placeholder_state: Some(PlaceholderSnapshot {
-                on_disk_data_size: 0,
-                modified_data_size: 0,
-                in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
-                pin_state: CF_PIN_STATE_UNPINNED,
-                is_partial: false,
-            }),
-            provider_hydration_active: false,
-        };
-
-        assert!(
-            should_skip_clean_placeholder_content_upload(Some(&previous), &current),
-            "post-upload placeholder conversion should not cause a second upload",
+            !placeholder_has_uploadable_local_content(cold_not_in_sync),
+            "the monitor must not read a placeholder that has no local data"
         );
     }
 }

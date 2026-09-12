@@ -501,6 +501,39 @@ where
     callback(protected_handle.raw())
 }
 
+pub(crate) fn with_cf_metadata_update_handle<T, F>(path: &Path, callback: F) -> Result<T>
+where
+    F: FnOnce(HANDLE) -> Result<T>,
+{
+    let wide_path = utf16_path(path);
+    // CfUpdatePlaceholder accepts WRITE_DAC as an alternative to WRITE_DATA.
+    // Avoid CfOpenFileWithOplock(CF_OPEN_FILE_FLAG_WRITE_ACCESS) here because
+    // that flag also requests FILE_READ_DATA and can hydrate a cold placeholder
+    // before a metadata-only update.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "CreateFileW failed to open metadata update handle for {}",
+                path.display()
+            )
+        });
+    }
+
+    let file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+    callback(file.as_raw_handle() as HANDLE)
+}
+
 pub(crate) fn report_provider_progress2(
     connection_key: CF_CONNECTION_KEY,
     transfer_key: i64,

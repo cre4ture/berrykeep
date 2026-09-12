@@ -3,9 +3,9 @@
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info_with_identity, cf_set_in_sync,
-    cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_with_oplock,
+    cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_metadata_only,
     cf_update_placeholder_metadata_and_identity,
-    cf_update_placeholder_metadata_and_identity_with_oplock, open_sync_path, path_is_placeholder,
+    cf_update_placeholder_metadata_and_identity_metadata_only, open_sync_path, path_is_placeholder,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::content_fingerprint::file_content_fingerprint;
@@ -1560,19 +1560,19 @@ fn mutate_placeholder_identity_for_path(
     }
     let encoded = identity.encoded();
 
-    let oplock_result = match fs_metadata.as_ref() {
-        Some(metadata) => {
-            cf_update_placeholder_metadata_and_identity_with_oplock(&full_path, metadata, &encoded)
-        }
-        None => cf_update_placeholder_file_identity_with_oplock(&full_path, &encoded),
+    let metadata_update_result = match fs_metadata.as_ref() {
+        Some(metadata) => cf_update_placeholder_metadata_and_identity_metadata_only(
+            &full_path, metadata, &encoded,
+        ),
+        None => cf_update_placeholder_file_identity_metadata_only(&full_path, &encoded),
     };
-    match oplock_result {
+    match metadata_update_result {
         Ok(()) => Ok(()),
-        Err(oplock_err) => {
+        Err(metadata_update_err) => {
             if path_is_placeholder(&full_path) {
-                return Err(oplock_err).with_context(|| {
+                return Err(metadata_update_err).with_context(|| {
                     format!(
-                        "refusing to reopen existing placeholder {} with generic write access after oplock metadata update failed",
+                        "refusing to reopen existing placeholder {} with generic write access after metadata-only update failed",
                         full_path.display()
                     )
                 });
@@ -1988,6 +1988,12 @@ mod tests {
             .expect("modified identity should decode");
         assert_eq!(identity.object_id.as_deref(), Some(object_id));
         assert_eq!(identity.remote_version.as_deref(), Some("revision-2"));
+        assert_eq!(
+            info.info().OnDiskDataSize,
+            0,
+            "a remote metadata refresh must leave a cold placeholder dehydrated"
+        );
+        assert_eq!(info.info().ModifiedDataSize, 0);
     }
 
     #[test]
