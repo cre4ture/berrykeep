@@ -1997,6 +1997,54 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_metadata_update_rejects_a_local_dirty_change_after_its_probe() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("metadata-update-dirty-race");
+        let path = "docs/raced.txt";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-1",
+            "raced-hash",
+            1_725_100_000,
+        );
+        let full_path = sync_root.root_path.join("docs\\raced.txt");
+        let writer = open_sync_path(&full_path, true).expect("placeholder should open for writing");
+
+        let update_result = mutate_placeholder_identity_for_path(
+            &sync_root.root_path,
+            path,
+            Some(CF_FS_METADATA {
+                BasicInfo: FILE_BASIC_INFO {
+                    LastWriteTime: unix_seconds_to_windows_file_time(1_725_100_001)
+                        .expect("test timestamp should convert"),
+                    ..Default::default()
+                },
+                FileSize: 1_024,
+            }),
+            false,
+            |identity| {
+                identity.remote_version = Some("revision-2".to_string());
+                crate::cfapi::cf_set_not_in_sync(&writer)
+                    .expect("concurrent local change should advance the placeholder USN");
+            },
+        );
+
+        assert!(
+            update_result.is_err(),
+            "the placeholder update must reject a local change made after its state probe"
+        );
+        let file = open_sync_path(&full_path, false).expect("placeholder should remain readable");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("placeholder identity should remain readable");
+        let identity = decode_placeholder_file_identity(info.file_identity())
+            .expect("placeholder identity should remain decodable");
+        assert_eq!(identity.remote_version.as_deref(), Some("revision-1"));
+        assert_ne!(info.info().InSyncState, CF_IN_SYNC_STATE_IN_SYNC);
+    }
+
+    #[test]
     fn remote_rename_moves_existing_placeholder_by_object_id() {
         let (sync_root, provider_instance_id) = registered_test_sync_root("remote-rename");
         let old_path = "docs/old-name.txt";

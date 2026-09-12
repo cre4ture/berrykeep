@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_CLOUD_FILE_UNSUCCESSFUL,
+    ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
+    STATUS_CLOUD_FILE_UNSUCCESSFUL,
 };
 use windows_sys::Win32::Storage::CloudFilters::*;
 use windows_sys::Win32::Storage::FileSystem::*;
@@ -527,20 +528,21 @@ fn open_cf_metadata_update_file(path: &Path) -> Result<std::fs::File> {
     let wide_path = utf16_verbatim_path(path);
     // CfUpdatePlaceholder accepts FILE_WRITE_DATA or WRITE_DAC. Prefer the
     // ordinary Modify permission and retain WRITE_DAC as an owner-compatible
-    // fallback for ACLs that do not grant FILE_WRITE_DATA.
+    // fallback for ACLs that do not grant FILE_WRITE_DATA or applications that
+    // temporarily deny shared data writes.
     // Avoid CfOpenFileWithOplock(CF_OPEN_FILE_FLAG_WRITE_ACCESS) here because
     // that flag also requests FILE_READ_DATA and can hydrate a cold placeholder
     // before a metadata-only update.
-    // Excluding FILE_SHARE_WRITE also makes the preceding dirty-state probe and
-    // metadata update safe against a local writer: an existing writer prevents
-    // this open, and this handle prevents a writer until CfUpdatePlaceholder
-    // returns.
+    // Retain full sharing so metadata-only refreshes can coexist with user
+    // applications. Updates that mark a placeholder in sync use
+    // CF_UPDATE_FLAG_VERIFY_IN_SYNC, while identity-only conflict bookkeeping
+    // never clears the local dirty state.
     let open = |desired_access| {
         let handle = unsafe {
             CreateFileW(
                 wide_path.as_ptr(),
                 desired_access,
-                FILE_SHARE_READ | FILE_SHARE_DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 null(),
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -555,7 +557,11 @@ fn open_cf_metadata_update_file(path: &Path) -> Result<std::fs::File> {
     };
 
     try_metadata_update_accesses(open, |error| {
-        error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+        matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_SHARING_VIOLATION as i32
+        )
     })
     .map_err(|(write_data_error, write_dac_error)| match write_dac_error {
         Some(write_dac_error) => anyhow::Error::new(write_dac_error).context(format!(
@@ -1310,12 +1316,12 @@ mod tests {
     }
 
     #[test]
-    fn metadata_update_access_does_not_fallback_after_a_non_acl_error() {
+    fn metadata_update_access_does_not_fallback_after_an_unrelated_error() {
         let mut attempts = Vec::new();
         let result = try_metadata_update_accesses(
             |access| {
                 attempts.push(access);
-                Err::<(), _>("sharing violation")
+                Err::<(), _>("file not found")
             },
             |_| false,
         );
@@ -1325,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_update_handle_rejects_a_concurrent_writer() {
+    fn metadata_update_handle_allows_a_concurrent_writer() {
         let root = std::env::temp_dir().join(format!(
             "ironmesh-cfapi-metadata-writer-{}",
             uuid::Uuid::new_v4()
@@ -1342,13 +1348,41 @@ mod tests {
 
         let metadata_open = open_cf_metadata_update_file(&path);
         drop(writer);
-        let writer_was_rejected = metadata_open.is_err();
+        let metadata_open_succeeded = metadata_open.is_ok();
         drop(metadata_open);
         let _ = std::fs::remove_dir_all(root);
 
         assert!(
-            writer_was_rejected,
-            "metadata update must not race a local writer between the dirty-state probe and CfUpdatePlaceholder"
+            metadata_open_succeeded,
+            "metadata-only refreshes must coexist with applications that already have the file open for writing"
+        );
+    }
+
+    #[test]
+    fn metadata_update_handle_coexists_with_a_writer_that_denies_data_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "ironmesh-cfapi-metadata-deny-write-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("failed to create metadata handle test root");
+        let path = root.join("placeholder.bin");
+        std::fs::write(&path, b"local content")
+            .expect("failed to create metadata handle test file");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(&path)
+            .expect("failed to hold a deny-write handle");
+
+        let metadata_open = open_cf_metadata_update_file(&path);
+        drop(writer);
+        let metadata_open_succeeded = metadata_open.is_ok();
+        drop(metadata_open);
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            metadata_open_succeeded,
+            "metadata-only refreshes must fall back to non-data WRITE_DAC access when an application denies shared data writes"
         );
     }
 
