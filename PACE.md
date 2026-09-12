@@ -18,12 +18,14 @@ Apply these rules to non-trivial changes.
 
 ## Engineering guardrails
 
+- Follow SOLID and clean code principles.
+- Apply Test Driven Development always. Features, fixes and PR findings (especially corner cases).
 - Apply SRP and prefer high cohesion / low coupling.
 - Apply DRY to significant duplication in the touched scope.
 - Prefer a functional core / imperative shell where it keeps side effects and I/O isolated.
 - Use explicit, descriptive names and explicit, informative error handling.
 - Split functions, modules, or crates when size or branching materially harms readability, testability, or ownership clarity.
-- Apply the Boy Scout Rule only within the touched scope; do not expand the task into unrelated cleanup.
+- Apply the Boy Scout Rule within the touched scope; do expand scope when cleanup doesn't increase the PR complexity significantly.
 
 ## Before each commit
 
