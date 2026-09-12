@@ -819,14 +819,7 @@ impl SyncRootMonitor {
             .lock()
             .expect("dehydrations_in_flight lock poisoned")
             .len();
-        if summary.pinned_count == 0
-            && summary.unpinned_count == 0
-            && summary.probed_placeholder_count == 0
-            && summary.hydrate_eligible_count == 0
-            && summary.eligible_count == 0
-            && hydrate_in_flight_count == 0
-            && in_flight_count == 0
-        {
+        if !should_log_dehydrate_scan_summary(summary, hydrate_in_flight_count, in_flight_count) {
             return;
         }
 
@@ -1545,6 +1538,19 @@ impl SyncRootMonitor {
             }
         }
     }
+}
+
+fn should_log_dehydrate_scan_summary(
+    summary: DehydrateScanSummary,
+    hydrate_in_flight_count: usize,
+    dehydrate_in_flight_count: usize,
+) -> bool {
+    summary.pinned_count != 0
+        || summary.unpinned_count != 0
+        || summary.hydrate_eligible_count != 0
+        || summary.eligible_count != 0
+        || hydrate_in_flight_count != 0
+        || dehydrate_in_flight_count != 0
 }
 
 fn upload_identity(
@@ -2269,6 +2275,20 @@ mod tests {
             "docs/report.txt",
             true
         ));
+    }
+
+    #[test]
+    fn idle_unspecified_placeholder_does_not_enable_scan_summary_logging() {
+        let summary = DehydrateScanSummary {
+            total_entries: 1,
+            probed_placeholder_count: 1,
+            ..Default::default()
+        };
+
+        assert!(
+            !should_log_dehydrate_scan_summary(summary, 0, 0),
+            "an idle placeholder without a pin state or eligible action must keep the periodic scan quiet"
+        );
     }
 
     fn registered_monitor_test_sync_root(
