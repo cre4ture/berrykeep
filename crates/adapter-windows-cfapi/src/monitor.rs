@@ -212,30 +212,8 @@ struct PlaceholderSnapshot {
 
 impl PlaceholderSnapshot {
     fn from_path(path: &std::path::Path, placeholder_state_bits: u32) -> Option<Self> {
-        let file = match open_sync_path(path, false) {
-            Ok(file) => file,
-            Err(err) => {
-                tracing::info!(
-                    "monitor: dehydrate probe open failed path={} error={} state={}",
-                    path.display(),
-                    err,
-                    describe_path_state(path)
-                );
-                return None;
-            }
-        };
-        let info = match cf_get_placeholder_standard_info(&file) {
-            Ok(info) => info,
-            Err(err) => {
-                tracing::info!(
-                    "monitor: dehydrate probe placeholder-info failed path={} error={} state={}",
-                    path.display(),
-                    err,
-                    describe_path_state(path)
-                );
-                return None;
-            }
-        };
+        let file = open_sync_path(path, false).ok()?;
+        let info = cf_get_placeholder_standard_info(&file).ok()?;
         Some(Self {
             on_disk_data_size: info.OnDiskDataSize,
             modified_data_size: info.ModifiedDataSize,
@@ -313,6 +291,9 @@ pub struct SyncRootMonitor {
     // Transient transport failures are workflow state, not fake filesystem
     // history. Keep their retry intent separate from observation baselines.
     pending_uploads: HashSet<String>,
+    // Diagnostics for an unavailable current CFAPI probe are emitted only on
+    // the failure edge, not on every monitor walk.
+    unavailable_placeholder_probes: HashSet<String>,
     pending_object_renames: Vec<LocalRenamePair>,
     dehydrations_in_flight: Arc<Mutex<HashSet<String>>>,
     hydrations_in_flight: Arc<Mutex<HashSet<String>>>,
@@ -425,6 +406,7 @@ impl SyncRootMonitor {
             upload_observations: HashMap::new(),
             hydration_observations: HashMap::new(),
             pending_uploads: HashSet::new(),
+            unavailable_placeholder_probes: HashSet::new(),
             pending_object_renames: Vec::new(),
             dehydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
             hydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -545,6 +527,11 @@ impl SyncRootMonitor {
             self.handle_deleted_entries(&current, &handled_renames);
             self.pending_uploads
                 .retain(|path| current.contains_key(path));
+            self.unavailable_placeholder_probes.retain(|path| {
+                current.get(path).is_some_and(|entry| {
+                    !entry.is_dir && entry.is_placeholder && entry.placeholder_state.is_none()
+                })
+            });
             self.replace_observation_baseline(&current);
         } else {
             let preserved_count =
@@ -885,6 +872,18 @@ impl SyncRootMonitor {
             None => return,
         };
         let previous_path = self.prior_paths.get(&rel_path).cloned();
+        if !entry.is_dir && entry.is_placeholder && entry.placeholder_state.is_none() {
+            if self.unavailable_placeholder_probes.insert(rel_path.clone()) {
+                tracing::info!(
+                    "{}: deferring placeholder processing for {} because its current CFAPI state is unavailable raw_state={}",
+                    self.name,
+                    rel_path,
+                    describe_path_state(path)
+                );
+            }
+            return;
+        }
+        self.unavailable_placeholder_probes.remove(&rel_path);
         self.maybe_schedule_placeholder_hydrate(path, &rel_path, &entry);
         self.maybe_schedule_placeholder_dehydrate(path, &rel_path, &entry);
 
@@ -905,7 +904,11 @@ impl SyncRootMonitor {
             let remote_applied = self
                 .remote_applied_tracker
                 .take_directory_suppression(&rel_path);
-            if previous_path.is_some() && !self.pending_uploads.contains(&rel_path) {
+            if previous_path
+                .as_ref()
+                .is_some_and(|previous| previous.is_dir)
+                && !self.pending_uploads.contains(&rel_path)
+            {
                 return;
             }
             if remote_applied {
@@ -983,15 +986,9 @@ impl SyncRootMonitor {
         } else {
             let current_upload_observation = UploadObservation::from_observed(&entry);
             if entry.is_placeholder {
-                let Some(placeholder_state) = entry.placeholder_state else {
-                    tracing::info!(
-                        "{}: deferring content decision for placeholder {} because its CFAPI state is unavailable raw_state={}",
-                        self.name,
-                        rel_path,
-                        describe_path_state(path)
-                    );
-                    return;
-                };
+                let placeholder_state = entry
+                    .placeholder_state
+                    .expect("unavailable placeholder probes return before content handling");
                 if !placeholder_has_uploadable_local_content(placeholder_state) {
                     self.pending_uploads.remove(&rel_path);
                     return;
@@ -1185,13 +1182,6 @@ impl SyncRootMonitor {
         }
 
         let Some(placeholder_state) = entry.placeholder_state else {
-            tracing::info!(
-                "{}: dehydrate candidate missing placeholder probe path={} entry={} raw_state={}",
-                self.name,
-                rel_path,
-                entry.to_log_string(),
-                describe_path_state(path)
-            );
             return;
         };
         if !placeholder_state.should_dehydrate() {
@@ -1297,13 +1287,6 @@ impl SyncRootMonitor {
         }
 
         let Some(placeholder_state) = entry.placeholder_state else {
-            tracing::info!(
-                "{}: hydrate candidate missing placeholder probe path={} entry={} raw_state={}",
-                self.name,
-                rel_path,
-                entry.to_log_string(),
-                describe_path_state(path)
-            );
             return;
         };
         if !placeholder_state.should_hydrate() {
@@ -2233,6 +2216,41 @@ mod tests {
         assert!(
             uploads.iter().any(|path| path == "local/"),
             "later local directory should still upload normally, uploads={uploads:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn directory_replacing_file_is_uploaded_as_a_new_marker() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("ironmesh-monitor-file-to-directory-{unique}"));
+        std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create sync root");
+        let replaced_path = sync_root.join("docs").join("entry");
+        std::fs::write(&replaced_path, b"old file").expect("failed to create original file");
+
+        let uploader = Arc::new(MockUploader::default());
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            sync_root.clone(),
+            uuid::Uuid::nil(),
+            uploader.clone(),
+        );
+        monitor.seed_seen();
+
+        std::fs::remove_file(&replaced_path).expect("failed to remove original file");
+        std::fs::create_dir(&replaced_path).expect("failed to replace file with directory");
+        monitor.walk();
+
+        assert_eq!(
+            uploader
+                .uploads
+                .lock()
+                .expect("uploads lock poisoned")
+                .as_slice(),
+            ["docs/entry/"],
+            "a directory replacing a file must not be hidden by the prior file topology"
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
