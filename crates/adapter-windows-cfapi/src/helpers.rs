@@ -285,6 +285,52 @@ pub fn utf16_path(path: &Path) -> Vec<u16> {
         .collect()
 }
 
+pub fn utf16_verbatim_path(path: &Path) -> Vec<u16> {
+    const BACKSLASH: u16 = b'\\' as u16;
+    const FORWARD_SLASH: u16 = b'/' as u16;
+    const VERBATIM_PREFIX: &[u16] = &[BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
+    const DEVICE_PREFIX: &[u16] = &[BACKSLASH, BACKSLASH, b'.' as u16, BACKSLASH];
+    const UNC_PREFIX: &[u16] = &[
+        BACKSLASH,
+        BACKSLASH,
+        b'?' as u16,
+        BACKSLASH,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        BACKSLASH,
+    ];
+
+    let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if !path.is_absolute()
+        || encoded.starts_with(VERBATIM_PREFIX)
+        || encoded.starts_with(DEVICE_PREFIX)
+    {
+        encoded.push(0);
+        return encoded;
+    }
+
+    for unit in &mut encoded {
+        if *unit == FORWARD_SLASH {
+            *unit = BACKSLASH;
+        }
+    }
+
+    let mut verbatim = if encoded.starts_with(&[BACKSLASH, BACKSLASH]) {
+        let mut value = Vec::with_capacity(UNC_PREFIX.len() + encoded.len() - 2 + 1);
+        value.extend_from_slice(UNC_PREFIX);
+        value.extend_from_slice(&encoded[2..]);
+        value
+    } else {
+        let mut value = Vec::with_capacity(VERBATIM_PREFIX.len() + encoded.len() + 1);
+        value.extend_from_slice(VERBATIM_PREFIX);
+        value.extend_from_slice(&encoded);
+        value
+    };
+    verbatim.push(0);
+    verbatim
+}
+
 pub fn path_to_relative(sync_root: &Path, normalized_path: &str) -> String {
     let root = expand_path_if_possible(sync_root);
     let root_string = pathbuf_to_windows_string(&root);
@@ -390,13 +436,35 @@ mod tests {
     use super::{
         PlaceholderFileIdentity, decode_path_from_file_identity, decode_placeholder_file_identity,
         encode_placeholder_file_identity, error_chain_has_win32_hresult, hresult_from_win32,
-        hresult_nonneg, path_to_relative,
+        hresult_nonneg, path_to_relative, utf16_verbatim_path,
     };
     use anyhow::Context;
     use std::path::Path;
     use sync_core::{NamespaceMediaMetadata, NamespacePhotoMetadata};
     use uuid::Uuid;
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+    fn decode_nul_terminated_path(path: Vec<u16>) -> String {
+        String::from_utf16(&path[..path.len() - 1]).expect("path should remain valid UTF-16")
+    }
+
+    #[test]
+    fn verbatim_path_encoding_handles_drive_unc_and_relative_paths() {
+        assert_eq!(
+            decode_nul_terminated_path(utf16_verbatim_path(Path::new(r"C:\deep\file.txt"))),
+            r"\\?\C:\deep\file.txt"
+        );
+        assert_eq!(
+            decode_nul_terminated_path(utf16_verbatim_path(Path::new(
+                r"\\server\share\deep\file.txt"
+            ))),
+            r"\\?\UNC\server\share\deep\file.txt"
+        );
+        assert_eq!(
+            decode_nul_terminated_path(utf16_verbatim_path(Path::new(r"deep\file.txt"))),
+            r"deep\file.txt"
+        );
+    }
 
     #[test]
     fn path_to_relative_strips_full_root_prefix_with_drive() {

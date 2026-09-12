@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use crate::helpers::{hresult_nonneg, utf16_path};
+use crate::helpers::{hresult_nonneg, utf16_verbatim_path};
 use crate::runtime::{
     CallbackContext, handle_callback_cancel_fetch_data, handle_callback_fetch_data,
     handle_callback_file_close_completion, handle_callback_file_open,
@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
-    HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_CLOUD_FILE_UNSUCCESSFUL,
+    ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
+    STATUS_CLOUD_FILE_UNSUCCESSFUL,
 };
 use windows_sys::Win32::Storage::CloudFilters::*;
 use windows_sys::Win32::Storage::FileSystem::*;
@@ -493,12 +494,85 @@ pub(crate) fn with_cf_oplock_handle<T, F>(
 where
     F: FnOnce(HANDLE) -> Result<T>,
 {
-    let wide_path = utf16_path(path);
+    let wide_path = utf16_verbatim_path(path);
     let mut protected_handle = INVALID_HANDLE_VALUE;
     let hr = unsafe { CfOpenFileWithOplock(wide_path.as_ptr(), flags, &mut protected_handle) };
     hresult_nonneg(hr, "CfOpenFileWithOplock")?;
     let protected_handle = ProtectedCfHandle(protected_handle);
     callback(protected_handle.raw())
+}
+
+fn try_metadata_update_accesses<T, E>(
+    mut open: impl FnMut(u32) -> std::result::Result<T, E>,
+    should_fallback: impl Fn(&E) -> bool,
+) -> std::result::Result<T, (E, Option<E>)> {
+    match open(FILE_WRITE_DATA) {
+        Ok(value) => Ok(value),
+        Err(write_data_error) if should_fallback(&write_data_error) => match open(WRITE_DAC) {
+            Ok(value) => Ok(value),
+            Err(write_dac_error) => Err((write_data_error, Some(write_dac_error))),
+        },
+        Err(write_data_error) => Err((write_data_error, None)),
+    }
+}
+
+pub(crate) fn with_cf_metadata_update_handle<T, F>(path: &Path, callback: F) -> Result<T>
+where
+    F: FnOnce(HANDLE) -> Result<T>,
+{
+    let file = open_cf_metadata_update_file(path)?;
+    callback(file.as_raw_handle() as HANDLE)
+}
+
+fn open_cf_metadata_update_file(path: &Path) -> Result<std::fs::File> {
+    let wide_path = utf16_verbatim_path(path);
+    // CfUpdatePlaceholder accepts FILE_WRITE_DATA or WRITE_DAC. Prefer the
+    // ordinary Modify permission and retain WRITE_DAC as an owner-compatible
+    // fallback for ACLs that do not grant FILE_WRITE_DATA or applications that
+    // temporarily deny shared data writes.
+    // Avoid CfOpenFileWithOplock(CF_OPEN_FILE_FLAG_WRITE_ACCESS) here because
+    // that flag also requests FILE_READ_DATA and can hydrate a cold placeholder
+    // before a metadata-only update.
+    // Retain full sharing so metadata-only refreshes can coexist with user
+    // applications. Updates that mark a placeholder in sync use
+    // CF_UPDATE_FLAG_VERIFY_IN_SYNC, while identity-only conflict bookkeeping
+    // never clears the local dirty state.
+    let open = |desired_access| {
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                desired_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
+        }
+    };
+
+    try_metadata_update_accesses(open, |error| {
+        matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_SHARING_VIOLATION as i32
+        )
+    })
+    .map_err(|(write_data_error, write_dac_error)| match write_dac_error {
+        Some(write_dac_error) => anyhow::Error::new(write_dac_error).context(format!(
+            "CreateFileW failed to open metadata update handle for {} with FILE_WRITE_DATA ({write_data_error}) or WRITE_DAC",
+            path.display()
+        )),
+        None => anyhow::Error::new(write_data_error).context(format!(
+            "CreateFileW failed to open metadata update handle for {}",
+            path.display()
+        )),
+    })
 }
 
 pub(crate) fn report_provider_progress2(
@@ -556,7 +630,7 @@ pub(crate) fn read_placeholder_standard_info(
 }
 
 pub(crate) fn path_placeholder_state_from_find(path: &Path) -> Result<CF_PLACEHOLDER_STATE> {
-    let wide_path = utf16_path(path);
+    let wide_path = utf16_verbatim_path(path);
     let mut find_data = WIN32_FIND_DATAW::default();
     let handle = unsafe { FindFirstFileW(wide_path.as_ptr(), &mut find_data) };
     if handle == INVALID_HANDLE_VALUE {
@@ -574,7 +648,7 @@ pub(crate) fn path_placeholder_state_from_find(path: &Path) -> Result<CF_PLACEHO
 }
 
 pub(crate) fn open_read_attributes_file(path: &Path) -> std::io::Result<std::fs::File> {
-    let wide_path = utf16_path(path);
+    let wide_path = utf16_verbatim_path(path);
     let handle = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
@@ -1218,6 +1292,120 @@ unsafe extern "system" fn callback_file_close_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn metadata_update_access_falls_back_without_requesting_read_access() {
+        let mut attempts = Vec::new();
+        let opened = try_metadata_update_accesses(
+            |access| {
+                attempts.push(access);
+                if access == FILE_WRITE_DATA {
+                    Err("modify permission denied")
+                } else {
+                    Ok("opened with owner permission")
+                }
+            },
+            |error| *error == "modify permission denied",
+        )
+        .expect("WRITE_DAC fallback should succeed");
+
+        assert_eq!(opened, "opened with owner permission");
+        assert_eq!(attempts, [FILE_WRITE_DATA, WRITE_DAC]);
+        assert!(attempts.iter().all(|access| access & FILE_READ_DATA == 0));
+    }
+
+    #[test]
+    fn metadata_update_access_does_not_fallback_after_an_unrelated_error() {
+        let mut attempts = Vec::new();
+        let result = try_metadata_update_accesses(
+            |access| {
+                attempts.push(access);
+                Err::<(), _>("file not found")
+            },
+            |_| false,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(attempts, [FILE_WRITE_DATA]);
+    }
+
+    #[test]
+    fn metadata_update_handle_allows_a_concurrent_writer() {
+        let root = std::env::temp_dir().join(format!(
+            "ironmesh-cfapi-metadata-writer-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("failed to create metadata handle test root");
+        let path = root.join("placeholder.bin");
+        std::fs::write(&path, b"local content")
+            .expect("failed to create metadata handle test file");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .expect("failed to hold a concurrent writer");
+
+        let metadata_open = open_cf_metadata_update_file(&path);
+        drop(writer);
+        let metadata_open_succeeded = metadata_open.is_ok();
+        drop(metadata_open);
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            metadata_open_succeeded,
+            "metadata-only refreshes must coexist with applications that already have the file open for writing"
+        );
+    }
+
+    #[test]
+    fn metadata_update_handle_coexists_with_a_writer_that_denies_data_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "ironmesh-cfapi-metadata-deny-write-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("failed to create metadata handle test root");
+        let path = root.join("placeholder.bin");
+        std::fs::write(&path, b"local content")
+            .expect("failed to create metadata handle test file");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(&path)
+            .expect("failed to hold a deny-write handle");
+
+        let metadata_open = open_cf_metadata_update_file(&path);
+        drop(writer);
+        let metadata_open_succeeded = metadata_open.is_ok();
+        drop(metadata_open);
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            metadata_open_succeeded,
+            "metadata-only refreshes must fall back to non-data WRITE_DAC access when an application denies shared data writes"
+        );
+    }
+
+    #[test]
+    fn placeholder_state_query_supports_long_verbatim_paths() {
+        let root =
+            std::env::temp_dir().join(format!("ironmesh-cfapi-long-path-{}", uuid::Uuid::new_v4()));
+        let mut directory = root.clone();
+        let mut segment_index = 0;
+        while directory.to_string_lossy().encode_utf16().count() <= 280 {
+            directory.push(format!("segment-{segment_index:03}-abcdefghijklmnop"));
+            segment_index += 1;
+        }
+        std::fs::create_dir_all(&directory).expect("failed to create long-path test directory");
+        let path = directory.join("local-file.txt");
+        std::fs::write(&path, b"local content").expect("failed to create long-path test file");
+        assert!(path.to_string_lossy().encode_utf16().count() > 260);
+
+        let state = path_placeholder_state_from_find(&path);
+        let _ = std::fs::remove_dir_all(&root);
+
+        state.expect("FindFirstFileW must classify paths longer than MAX_PATH");
+    }
 
     #[test]
     fn fetch_worker_pool_shutdown_is_idempotent_and_closes_ingress() {
