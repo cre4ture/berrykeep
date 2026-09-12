@@ -113,6 +113,18 @@ impl PriorPath {
         }
     }
 
+    fn advance(entry: &ObservedEntry, previous: Option<&Self>) -> Self {
+        let mut next = Self::from_observed(entry);
+        if next.object_id.is_none()
+            && next.revision.is_none()
+            && let Some(previous) = previous.filter(|previous| previous.is_dir == entry.is_dir)
+        {
+            next.object_id.clone_from(&previous.object_id);
+            next.revision.clone_from(&previous.revision);
+        }
+        next
+    }
+
     fn to_log_string(&self) -> String {
         format!(
             "dir={} object_id={} revision={}",
@@ -495,7 +507,12 @@ impl SyncRootMonitor {
     fn replace_observation_baseline(&mut self, entries: &HashMap<String, ObservedEntry>) {
         self.prior_paths = entries
             .iter()
-            .map(|(path, entry)| (path.clone(), PriorPath::from_observed(entry)))
+            .map(|(path, entry)| {
+                (
+                    path.clone(),
+                    PriorPath::advance(entry, self.prior_paths.get(path)),
+                )
+            })
             .collect();
         self.upload_observations = entries
             .iter()
@@ -568,7 +585,12 @@ impl SyncRootMonitor {
     ) -> usize {
         let mut prior_paths = current
             .iter()
-            .map(|(path, entry)| (path.clone(), PriorPath::from_observed(entry)))
+            .map(|(path, entry)| {
+                (
+                    path.clone(),
+                    PriorPath::advance(entry, self.prior_paths.get(path)),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let mut upload_observations = current
             .iter()
@@ -1978,6 +2000,59 @@ mod tests {
             upload_identity(&entry, Some(&prior_directory)),
             (None, None),
             "a file replacing a directory must create a new object instead of CAS-writing the directory marker"
+        );
+    }
+
+    #[test]
+    fn identityless_retry_baseline_preserves_same_kind_cas_identity() {
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            std::env::temp_dir().join(format!(
+                "ironmesh-monitor-upload-identity-retry-{}",
+                uuid::Uuid::new_v4()
+            )),
+            uuid::Uuid::nil(),
+            Arc::new(MockUploader::default()),
+        );
+        monitor.prior_paths.insert(
+            "docs/report.txt".to_string(),
+            PriorPath {
+                is_dir: false,
+                object_id: Some("obj-report".to_string()),
+                revision: Some("revision-report".to_string()),
+            },
+        );
+
+        let replacement = observed_entry(false);
+        let current = HashMap::from([("docs/report.txt".to_string(), replacement.clone())]);
+
+        // Model the end of a failed upload walk followed by another retry walk.
+        // The replacement is materialized and therefore cannot provide CFAPI identity itself.
+        monitor.replace_observation_baseline(&current);
+        monitor.replace_observation_baseline(&current);
+
+        assert_eq!(
+            upload_identity(&replacement, monitor.prior_paths.get("docs/report.txt")),
+            (
+                Some("obj-report".to_string()),
+                Some("revision-report".to_string())
+            ),
+            "an identityless same-kind replacement must retain the remote CAS identity across retry scans"
+        );
+
+        let replacement_directory = observed_entry(true);
+        monitor.replace_observation_baseline(&HashMap::from([(
+            "docs/report.txt".to_string(),
+            replacement_directory,
+        )]));
+        assert_eq!(
+            monitor.prior_paths.get("docs/report.txt"),
+            Some(&PriorPath {
+                is_dir: true,
+                object_id: None,
+                revision: None,
+            }),
+            "a kind change must not inherit the replaced object's CAS identity"
         );
     }
 
