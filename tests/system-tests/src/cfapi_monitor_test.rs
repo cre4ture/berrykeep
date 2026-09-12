@@ -2042,41 +2042,51 @@ mod tests {
         )
         .await;
 
-        let observed_file = local_file.clone();
-        let cold_guard = tokio::spawn(async move {
-            assert_placeholder_stays_dehydrated(
-                &observed_file,
-                Duration::from_secs(15),
-                Duration::from_millis(25),
-            )
-            .await;
-        });
-        fixture
-            .sdk
-            .restore_version_path(key, &older_version, key, false)
-            .await
-            .expect("failed to restore the older version at its original path");
-        wait_for_remote_payload(&fixture.sdk, key, restored_payload.as_bytes(), 220).await;
+        let restore = async {
+            fixture
+                .sdk
+                .restore_version_path(key, &older_version, key, false)
+                .await
+                .expect("failed to restore the older version at its original path");
+            wait_for_remote_payload(&fixture.sdk, key, restored_payload.as_bytes(), 220).await;
+        };
+        let observe_placeholder = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+            let mut metadata_applied_at = None;
+            loop {
+                let info = placeholder_standard_info(&local_file).unwrap_or_else(|err| {
+                    panic!(
+                        "failed to inspect placeholder during remote restore at {}: {err:#}",
+                        local_file.display()
+                    )
+                });
+                assert_eq!(
+                    (info.OnDiskDataSize, info.ModifiedDataSize),
+                    (0, 0),
+                    "never-hydrated placeholder gained local data during remote restore at {}: {}",
+                    local_file.display(),
+                    sync_item_state_summary(&local_file)
+                );
 
-        for _ in 0..220 {
-            if std::fs::metadata(&local_file)
-                .map(|metadata| metadata.len() == restored_payload.len() as u64)
-                .unwrap_or(false)
-            {
-                break;
+                if std::fs::metadata(&local_file)
+                    .map(|metadata| metadata.len() == restored_payload.len() as u64)
+                    .unwrap_or(false)
+                {
+                    let applied_at =
+                        metadata_applied_at.get_or_insert_with(tokio::time::Instant::now);
+                    if applied_at.elapsed() >= Duration::from_secs(3) {
+                        return;
+                    }
+                }
+
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the running adapter did not apply the restored remote metadata"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        assert_eq!(
-            std::fs::metadata(&local_file)
-                .expect("restored placeholder should remain present")
-                .len(),
-            restored_payload.len() as u64,
-            "the running adapter did not apply the restored remote metadata"
-        );
-        cold_guard
-            .await
-            .expect("cold-placeholder guard failed during remote restore");
+        };
+        tokio::join!(restore, observe_placeholder);
 
         stop_server(&mut adapter).await;
         stop_server(&mut fixture.server).await;
