@@ -312,7 +312,7 @@ struct MetadataBundleImportObserver {
 
 #[derive(Clone)]
 struct ServerState {
-    data_dir: PathBuf,
+    managed_paths: ManagedPaths,
     cluster_id: ClusterId,
     node_id: NodeId,
     node_hostname: Option<String>,
@@ -905,6 +905,31 @@ struct InternalTlsRuntime {
     cert_path: PathBuf,
     key_path: PathBuf,
     metadata_path: Option<PathBuf>,
+}
+
+/// Filesystem locations fixed when the node process starts.
+///
+/// This deliberately has no mutation API. Runtime state holds clients, locks, and caches, while
+/// handlers use these paths only as startup-managed configuration.
+#[derive(Clone)]
+struct ManagedPaths(Arc<ManagedPathsInner>);
+
+struct ManagedPathsInner {
+    data_dir: PathBuf,
+}
+
+impl ManagedPaths {
+    fn from_config(config: &ServerNodeConfig) -> Self {
+        Self::from_data_dir(config.data_dir.clone())
+    }
+
+    fn from_data_dir(data_dir: PathBuf) -> Self {
+        Self(Arc::new(ManagedPathsInner { data_dir }))
+    }
+
+    fn data_dir(&self) -> &FsPath {
+        &self.0.data_dir
+    }
 }
 
 pub(crate) fn publish_namespace_change(state: &ServerState) {
@@ -7401,8 +7426,9 @@ async fn run_inner(
         }
     };
 
+    let managed_paths = ManagedPaths::from_config(&config);
     let state = ServerState {
-        data_dir: config.data_dir.clone(),
+        managed_paths,
         cluster_id: config.cluster_id,
         node_id: config.node_id,
         node_hostname,
@@ -8545,7 +8571,7 @@ async fn refresh_local_node_storage(state: &ServerState) {
         Ok(stats) => stats,
         Err(err) => {
             warn!(
-                path = %state.data_dir.display(),
+                path = %state.managed_paths.data_dir().display(),
                 error = %err,
                 "failed to refresh local storage pool capacity"
             );
@@ -24612,7 +24638,7 @@ async fn import_managed_signer_backup_handler(
     }
 
     if let Err(err) = import_managed_signer_backup(
-        &state.data_dir,
+        state.managed_paths.data_dir(),
         &request.backup,
         &request.passphrase,
         Some(state.cluster_id),
@@ -24658,7 +24684,7 @@ async fn import_managed_signer_backup_handler(
             cluster_id: state.cluster_id,
             source_node_id: request.backup.source_node_id,
             restart_required: true,
-            signer_ca_cert_path: managed_signer_ca_cert_path(&state.data_dir)
+            signer_ca_cert_path: managed_signer_ca_cert_path(state.managed_paths.data_dir())
                 .display()
                 .to_string(),
         }),
@@ -25010,7 +25036,7 @@ async fn import_managed_rendezvous_failover_handler(
     };
 
     if let Err(err) = import_managed_rendezvous_failover_package(
-        &state.data_dir,
+        state.managed_paths.data_dir(),
         &request.package,
         &request.passphrase,
         bind_addr,
@@ -25061,10 +25087,10 @@ async fn import_managed_rendezvous_failover_handler(
             target_node_id,
             public_url: request.package.public_url,
             restart_required: true,
-            cert_path: managed_rendezvous_cert_path(&state.data_dir)
+            cert_path: managed_rendezvous_cert_path(state.managed_paths.data_dir())
                 .display()
                 .to_string(),
-            key_path: managed_rendezvous_key_path(&state.data_dir)
+            key_path: managed_rendezvous_key_path(state.managed_paths.data_dir())
                 .display()
                 .to_string(),
         }),
@@ -25419,7 +25445,7 @@ async fn import_managed_control_plane_promotion_handler(
     };
 
     if let Err(err) = import_managed_signer_backup(
-        &state.data_dir,
+        state.managed_paths.data_dir(),
         &request.package.signer_backup,
         &request.passphrase,
         Some(state.cluster_id),
@@ -25443,7 +25469,7 @@ async fn import_managed_control_plane_promotion_handler(
     }
 
     if let Err(err) = import_managed_rendezvous_failover_package(
-        &state.data_dir,
+        state.managed_paths.data_dir(),
         &request.package.rendezvous_failover,
         &request.passphrase,
         bind_addr,
@@ -25494,13 +25520,13 @@ async fn import_managed_control_plane_promotion_handler(
             target_node_id,
             public_url: request.package.rendezvous_failover.public_url.clone(),
             restart_required: true,
-            signer_ca_cert_path: managed_signer_ca_cert_path(&state.data_dir)
+            signer_ca_cert_path: managed_signer_ca_cert_path(state.managed_paths.data_dir())
                 .display()
                 .to_string(),
-            rendezvous_cert_path: managed_rendezvous_cert_path(&state.data_dir)
+            rendezvous_cert_path: managed_rendezvous_cert_path(state.managed_paths.data_dir())
                 .display()
                 .to_string(),
-            rendezvous_key_path: managed_rendezvous_key_path(&state.data_dir)
+            rendezvous_key_path: managed_rendezvous_key_path(state.managed_paths.data_dir())
                 .display()
                 .to_string(),
         }),
@@ -30973,7 +30999,7 @@ async fn upgrade_password_hash_if_legacy(state: &ServerState, password: &str) {
         .admin_password_hash
         .lock()
         .expect("admin_password_hash mutex poisoned") = Some(new_hash.clone());
-    let state_path = setup::managed_setup_state_path(&state.data_dir);
+    let state_path = setup::managed_setup_state_path(state.managed_paths.data_dir());
     if let Ok(Some(mut managed)) = setup::read_managed_setup_state(&state_path) {
         managed.admin_password_hash = Some(new_hash);
         if let Err(err) = setup::write_managed_setup_state(&state_path, &managed) {
@@ -31341,7 +31367,7 @@ pub(crate) async fn change_admin_password(
             .await
             .expect("hash_admin_password task panicked");
 
-    let state_path = setup::managed_setup_state_path(&state.data_dir);
+    let state_path = setup::managed_setup_state_path(state.managed_paths.data_dir());
     match setup::read_managed_setup_state(&state_path) {
         Ok(Some(mut managed)) => {
             managed.admin_password_hash = Some(new_hash.clone());
