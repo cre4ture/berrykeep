@@ -185,9 +185,67 @@ impl Default for ManagedSetupState {
 
 #[derive(Clone)]
 struct SetupServerState {
-    config: SetupBootstrapConfig,
+    paths: ManagedSetupPaths,
+    bind_addr: SocketAddr,
+    runtime: SetupRuntimeState,
+}
+
+/// Setup paths are derived and validated before the Axum router is constructed.
+///
+/// The setup handlers can observe these locations but have no API for changing them. Mutable
+/// lifecycle data lives separately in `SetupRuntimeState`.
+#[derive(Clone)]
+struct ManagedSetupPaths(Arc<ManagedSetupPathsInner>);
+
+struct ManagedSetupPathsInner {
+    data_dir: PathBuf,
+    state_path: PathBuf,
+    bootstrap_cert_path: PathBuf,
+}
+
+impl ManagedSetupPaths {
+    fn from_config(config: &SetupBootstrapConfig) -> Self {
+        Self(Arc::new(ManagedSetupPathsInner {
+            data_dir: config.data_dir.clone(),
+            state_path: config.state_path.clone(),
+            bootstrap_cert_path: config.bootstrap_cert_path.clone(),
+        }))
+    }
+
+    fn data_dir(&self) -> &std::path::Path {
+        &self.0.data_dir
+    }
+
+    fn state_path(&self) -> &std::path::Path {
+        &self.0.state_path
+    }
+
+    fn bootstrap_cert_path(&self) -> &std::path::Path {
+        &self.0.bootstrap_cert_path
+    }
+}
+
+#[derive(Clone)]
+struct SetupRuntimeState {
     managed_state: Arc<Mutex<ManagedSetupState>>,
     completion_tx: mpsc::Sender<SetupCompletion>,
+}
+
+#[cfg(test)]
+impl SetupServerState {
+    fn for_test(
+        config: SetupBootstrapConfig,
+        completion_tx: mpsc::Sender<SetupCompletion>,
+    ) -> Self {
+        Self {
+            paths: ManagedSetupPaths::from_config(&config),
+            bind_addr: config.bind_addr,
+            runtime: SetupRuntimeState {
+                managed_state: Arc::new(Mutex::new(ManagedSetupState::default())),
+                completion_tx,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -661,9 +719,12 @@ pub(crate) async fn run_setup_mode(
     let tls_config = ensure_bootstrap_tls_config(&config).await?;
     let (completion_tx, mut completion_rx) = mpsc::channel::<SetupCompletion>(1);
     let app_state = SetupServerState {
-        config: config.clone(),
-        managed_state: Arc::new(Mutex::new(initial_state)),
-        completion_tx,
+        paths: ManagedSetupPaths::from_config(&config),
+        bind_addr: config.bind_addr,
+        runtime: SetupRuntimeState {
+            managed_state: Arc::new(Mutex::new(initial_state)),
+            completion_tx,
+        },
     };
 
     let app = Router::new()
@@ -726,13 +787,13 @@ pub(crate) async fn run_setup_mode(
 }
 
 async fn setup_health(State(state): State<SetupServerState>) -> impl IntoResponse {
-    let managed = state.managed_state.lock().await;
+    let managed = state.runtime.managed_state.lock().await;
     (
         StatusCode::OK,
         Json(json!({
             "mode": "bootstrap_setup",
             "state": managed.state,
-            "data_dir": state.config.data_dir.display().to_string(),
+            "data_dir": state.paths.data_dir().display().to_string(),
             "version": env!("CARGO_PKG_VERSION"),
             "revision": git_version::git_version!(fallback = "unknown", args = ["--tags", "--always", "--dirty=-dirty", "--abbrev=12"]),
         })),
@@ -740,17 +801,17 @@ async fn setup_health(State(state): State<SetupServerState>) -> impl IntoRespons
 }
 
 async fn get_setup_status(State(state): State<SetupServerState>) -> impl IntoResponse {
-    let managed = state.managed_state.lock().await.clone();
-    let fingerprint = parse_certificate_details_from_path(&state.config.bootstrap_cert_path)
+    let managed = state.runtime.managed_state.lock().await.clone();
+    let fingerprint = parse_certificate_details_from_path(state.paths.bootstrap_cert_path())
         .ok()
         .map(|parsed| parsed.certificate_fingerprint);
     (
         StatusCode::OK,
         Json(SetupStatusResponse {
             state: managed.state,
-            data_dir: state.config.data_dir.display().to_string(),
-            bind_addr: state.config.bind_addr.to_string(),
-            bootstrap_tls_cert_path: state.config.bootstrap_cert_path.display().to_string(),
+            data_dir: state.paths.data_dir().display().to_string(),
+            bind_addr: state.bind_addr.to_string(),
+            bootstrap_tls_cert_path: state.paths.bootstrap_cert_path().display().to_string(),
             bootstrap_tls_fingerprint: fingerprint,
             cluster_id: managed.cluster_id,
             node_id: managed.node_id,
@@ -786,7 +847,7 @@ async fn start_new_cluster(
     };
 
     {
-        let managed = state.managed_state.lock().await;
+        let managed = state.runtime.managed_state.lock().await;
         if managed.state == SetupLifecycleState::Online {
             return (
                 StatusCode::CONFLICT,
@@ -816,11 +877,11 @@ async fn start_new_cluster(
         }
     };
 
-    let runtime_enrollment_path = runtime_node_enrollment_path(&state.config.data_dir);
+    let runtime_enrollment_path = runtime_node_enrollment_path(state.paths.data_dir());
     let cluster_id = Uuid::now_v7();
     let node_id = NodeId::new_v4();
     let labels = default_setup_labels();
-    let bind_addr = state.config.bind_addr;
+    let bind_addr = state.bind_addr;
     let internal_bind_addr = default_internal_bind_addr(bind_addr);
     let managed_rendezvous_bind_addr = default_managed_rendezvous_bind_addr(bind_addr);
     let public_url = origin_to_string(&public_origin);
@@ -851,7 +912,7 @@ async fn start_new_cluster(
         cluster_id,
         node_id,
         mode: NodeBootstrapMode::Cluster,
-        data_dir: state.config.data_dir.display().to_string(),
+        data_dir: state.paths.data_dir().display().to_string(),
         bind_addr: bind_addr.to_string(),
         public_url: Some(public_url.clone()),
         labels: labels.clone(),
@@ -905,7 +966,7 @@ async fn start_new_cluster(
             .into_response();
     }
     if let Err(err) = write_managed_signer_material(
-        &state.config.data_dir,
+        state.paths.data_dir(),
         &artifacts.ca_cert_pem,
         &artifacts.ca_key_pem,
     ) {
@@ -932,7 +993,7 @@ async fn start_new_cluster(
             }
         };
     if let Err(err) = write_managed_rendezvous_material(
-        &state.config.data_dir,
+        state.paths.data_dir(),
         Some(&artifacts.ca_cert_pem),
         &managed_rendezvous_cert_pem,
         &managed_rendezvous_key_pem,
@@ -944,7 +1005,7 @@ async fn start_new_cluster(
             .into_response();
     }
     if let Err(err) =
-        apply_setup_telemetry_choice(&state.config.data_dir, request.telemetry_enabled).await
+        apply_setup_telemetry_choice(state.paths.data_dir(), request.telemetry_enabled).await
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -953,20 +1014,20 @@ async fn start_new_cluster(
             .into_response();
     }
 
-    let mut managed = state.managed_state.lock().await;
+    let mut managed = state.runtime.managed_state.lock().await;
     managed.state = SetupLifecycleState::Online;
     managed.updated_at_unix = unix_ts();
     managed.cluster_id = Some(cluster_id);
     managed.node_id = Some(node_id);
     managed.runtime_node_enrollment_path = None;
-    managed.runtime_data_dir = Some(state.config.data_dir.display().to_string());
+    managed.runtime_data_dir = Some(state.paths.data_dir().display().to_string());
     managed.recovery_reason = None;
     managed.metadata_backend = Some(metadata_backend);
     managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = Some(managed_rendezvous_bind_addr.to_string());
     managed.managed_rendezvous_public_url = Some(managed_rendezvous_public_url.clone());
     managed.pending_join_request = None;
-    if let Err(err) = write_managed_setup_state(&state.config.state_path, &managed) {
+    if let Err(err) = write_managed_setup_state(state.paths.state_path(), &managed) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": err.to_string() })),
@@ -989,10 +1050,10 @@ async fn start_new_cluster(
                 .into_response();
         }
     };
-    apply_managed_signer_paths(&state.config.data_dir, &mut config);
-    apply_managed_rendezvous_config(&state.config.data_dir, &managed_snapshot, &mut config);
+    apply_managed_signer_paths(state.paths.data_dir(), &mut config);
+    apply_managed_rendezvous_config(state.paths.data_dir(), &managed_snapshot, &mut config);
     config.admin_password_hash = Some(hash_admin_password(&request.admin_password));
-    let completion_permit = match state.completion_tx.clone().reserve_owned().await {
+    let completion_permit = match state.runtime.completion_tx.clone().reserve_owned().await {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -1033,7 +1094,7 @@ async fn generate_join_request(
         }
     };
 
-    let mut managed = state.managed_state.lock().await;
+    let mut managed = state.runtime.managed_state.lock().await;
     if managed.state == SetupLifecycleState::Online {
         return (
             StatusCode::CONFLICT,
@@ -1042,7 +1103,7 @@ async fn generate_join_request(
             .into_response();
     }
     let node_id = managed.node_id.unwrap_or_else(NodeId::new_v4);
-    let internal_bind_addr = default_internal_bind_addr(state.config.bind_addr);
+    let internal_bind_addr = default_internal_bind_addr(state.bind_addr);
     let join_request = NodeJoinRequest {
         version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
         node_id,
@@ -1050,7 +1111,7 @@ async fn generate_join_request(
         // Transport v1 still requires this compatibility field. Managed import replaces it with
         // the receiving node's local runtime data root, so no issuer-side host path is exported.
         data_dir: ".".to_string(),
-        bind_addr: state.config.bind_addr.to_string(),
+        bind_addr: state.bind_addr.to_string(),
         public_url: Some(origin_to_string(&public_origin)),
         labels: default_setup_labels(),
         public_tls: Some(managed_public_tls_files()),
@@ -1074,10 +1135,10 @@ async fn generate_join_request(
     managed.state = SetupLifecycleState::PendingJoin;
     managed.updated_at_unix = unix_ts();
     managed.node_id = Some(node_id);
-    managed.runtime_data_dir = Some(state.config.data_dir.display().to_string());
+    managed.runtime_data_dir = Some(state.paths.data_dir().display().to_string());
     managed.recovery_reason = None;
     managed.pending_join_request = Some(join_request.clone());
-    if let Err(err) = write_managed_setup_state(&state.config.state_path, &managed) {
+    if let Err(err) = write_managed_setup_state(state.paths.state_path(), &managed) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": err.to_string() })),
@@ -1106,7 +1167,7 @@ async fn import_node_enrollment_package(
                 .into_response();
         }
     };
-    let package = match canonical_managed_node_enrollment(package, &state.config.data_dir) {
+    let package = match canonical_managed_node_enrollment(package, state.paths.data_dir()) {
         Ok(package) => package,
         Err(err) => {
             return (
@@ -1117,7 +1178,7 @@ async fn import_node_enrollment_package(
         }
     };
 
-    let mut managed = state.managed_state.lock().await;
+    let mut managed = state.runtime.managed_state.lock().await;
     let metadata_backend = match resolve_setup_metadata_backend(request.metadata_backend, &managed)
     {
         Ok(backend) => backend,
@@ -1173,7 +1234,7 @@ async fn import_node_enrollment_package(
             .into_response();
     }
 
-    let runtime_enrollment_path = runtime_node_enrollment_path(&state.config.data_dir);
+    let runtime_enrollment_path = runtime_node_enrollment_path(state.paths.data_dir());
     if let Err(err) = package.write_to_path(&runtime_enrollment_path) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1182,7 +1243,7 @@ async fn import_node_enrollment_package(
             .into_response();
     }
     if let Err(err) =
-        apply_setup_telemetry_choice(&state.config.data_dir, request.telemetry_enabled).await
+        apply_setup_telemetry_choice(state.paths.data_dir(), request.telemetry_enabled).await
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1196,14 +1257,14 @@ async fn import_node_enrollment_package(
     managed.cluster_id = Some(package.bootstrap.cluster_id);
     managed.node_id = Some(package.bootstrap.node_id);
     managed.runtime_node_enrollment_path = None;
-    managed.runtime_data_dir = Some(state.config.data_dir.display().to_string());
+    managed.runtime_data_dir = Some(state.paths.data_dir().display().to_string());
     managed.recovery_reason = None;
     managed.metadata_backend = Some(metadata_backend);
     managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
     managed.managed_rendezvous_bind_addr = None;
     managed.managed_rendezvous_public_url = None;
     managed.pending_join_request = None;
-    if let Err(err) = write_managed_setup_state(&state.config.state_path, &managed) {
+    if let Err(err) = write_managed_setup_state(state.paths.state_path(), &managed) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": err.to_string() })),
@@ -1226,10 +1287,10 @@ async fn import_node_enrollment_package(
                 .into_response();
         }
     };
-    apply_managed_signer_paths(&state.config.data_dir, &mut config);
-    apply_managed_rendezvous_config(&state.config.data_dir, &managed_snapshot, &mut config);
+    apply_managed_signer_paths(state.paths.data_dir(), &mut config);
+    apply_managed_rendezvous_config(state.paths.data_dir(), &managed_snapshot, &mut config);
     config.admin_password_hash = Some(hash_admin_password(&request.admin_password));
-    let completion_permit = match state.completion_tx.clone().reserve_owned().await {
+    let completion_permit = match state.runtime.completion_tx.clone().reserve_owned().await {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -3029,11 +3090,7 @@ mod tests {
         let bind_addr = "127.0.0.1:18443".parse::<SocketAddr>().unwrap();
         let config = managed_startup_bootstrap_config(data_dir.clone(), bind_addr).unwrap();
         let (completion_tx, mut completion_rx) = mpsc::channel(1);
-        let state = SetupServerState {
-            config,
-            managed_state: Arc::new(Mutex::new(ManagedSetupState::default())),
-            completion_tx,
-        };
+        let state = SetupServerState::for_test(config, completion_tx);
         let package = test_node_enrollment_package(&data_dir, bind_addr);
         // Generated rather than literals so static analysis doesn't mistake these test-only
         // values for hard-coded credentials (CodeQL rust/hard-coded-cryptographic-value).
@@ -3054,7 +3111,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let managed = state.managed_state.lock().await.clone();
+        let managed = state.runtime.managed_state.lock().await.clone();
         let managed_hash = managed
             .admin_password_hash
             .as_deref()
@@ -3127,11 +3184,7 @@ mod tests {
         let bind_addr = "127.0.0.1:18443".parse::<SocketAddr>().unwrap();
         let config = managed_startup_bootstrap_config(data_dir.clone(), bind_addr).unwrap();
         let (completion_tx, mut completion_rx) = mpsc::channel(1);
-        let state = SetupServerState {
-            config,
-            managed_state: Arc::new(Mutex::new(ManagedSetupState::default())),
-            completion_tx,
-        };
+        let state = SetupServerState::for_test(config, completion_tx);
 
         // Generated rather than a literal so static analysis doesn't mistake this test-only
         // value for a hard-coded credential (CodeQL rust/hard-coded-cryptographic-value).
@@ -3158,7 +3211,7 @@ mod tests {
             default_setup_metadata_backend()
         );
         assert_eq!(
-            state.managed_state.lock().await.metadata_backend,
+            state.runtime.managed_state.lock().await.metadata_backend,
             Some(default_setup_metadata_backend())
         );
 
@@ -3177,11 +3230,7 @@ mod tests {
         let bind_addr = "127.0.0.1:18443".parse::<SocketAddr>().unwrap();
         let config = managed_startup_bootstrap_config(data_dir.clone(), bind_addr).unwrap();
         let (completion_tx, mut completion_rx) = mpsc::channel(1);
-        let state = SetupServerState {
-            config,
-            managed_state: Arc::new(Mutex::new(ManagedSetupState::default())),
-            completion_tx,
-        };
+        let state = SetupServerState::for_test(config, completion_tx);
         let package = test_node_enrollment_package(&data_dir, bind_addr);
 
         // Generated rather than a literal so static analysis doesn't mistake this test-only

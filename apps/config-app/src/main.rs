@@ -114,9 +114,51 @@ struct WaitAndRelaunchBackgroundArgs {
 
 #[derive(Clone)]
 struct AppState {
+    paths: ManagedPaths,
+    runtime: ConfigAppRuntime,
+}
+
+/// Filesystem locations resolved once before the local configuration router is built.
+///
+/// The wrapper deliberately exposes only immutable references so request handlers cannot alter
+/// where the application reads configuration, writes launch reports, or resolves packaged tools.
+#[derive(Clone)]
+struct ManagedPaths(Arc<ManagedPathsInner>);
+
+struct ManagedPathsInner {
     instance_store_path: PathBuf,
     launch_report_path: PathBuf,
     package_root: PathBuf,
+}
+
+impl ManagedPaths {
+    fn new(
+        instance_store_path: PathBuf,
+        launch_report_path: PathBuf,
+        package_root: PathBuf,
+    ) -> Self {
+        Self(Arc::new(ManagedPathsInner {
+            instance_store_path,
+            launch_report_path,
+            package_root,
+        }))
+    }
+
+    fn instance_store_path(&self) -> &Path {
+        &self.0.instance_store_path
+    }
+
+    fn launch_report_path(&self) -> &Path {
+        &self.0.launch_report_path
+    }
+
+    fn package_root(&self) -> &Path {
+        &self.0.package_root
+    }
+}
+
+#[derive(Clone)]
+struct ConfigAppRuntime {
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
@@ -559,14 +601,18 @@ async fn main() -> Result<()> {
     migrate_legacy_state_paths()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let state = AppState {
-        instance_store_path: default_instance_store_path(),
-        launch_report_path: default_launch_report_path(),
-        package_root,
-        shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+        paths: ManagedPaths::new(
+            default_instance_store_path(),
+            default_launch_report_path(),
+            package_root,
+        ),
+        runtime: ConfigAppRuntime {
+            shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+        },
     };
 
     if (cli.background || cli.launch_enabled_on_start) && !cli.skip_initial_service_launch {
-        let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+        let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
             .context("failed loading managed instances before launch")?;
         reconcile_managed_identities_for_selection(
             &state,
@@ -574,8 +620,8 @@ async fn main() -> Result<()> {
             ManagedIdentitySelection::EnabledLaunch,
         )
         .await;
-        let report = launch_enabled_instances(&store, &state.package_root);
-        save_launch_report(&state.launch_report_path, &report)
+        let report = launch_enabled_instances(&store, state.paths.package_root());
+        save_launch_report(state.paths.launch_report_path(), &report)
             .context("failed saving launch report before config app startup")?;
     }
 
@@ -838,8 +884,8 @@ fn publish_config_app_desktop_status(
     web_ui_url: &str,
     status_file: &Path,
 ) -> Result<()> {
-    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)?;
-    let last_launch_report = load_last_launch_report(&state.launch_report_path)?;
+    let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())?;
+    let last_launch_report = load_last_launch_report(state.paths.launch_report_path())?;
     let runtime_statuses = service_runtime_statuses(&store, last_launch_report.as_ref());
     let service_documents = load_service_status_documents(&runtime_statuses);
     let services = merged_service_statuses(&store, &runtime_statuses, service_documents.as_slice());
@@ -868,7 +914,7 @@ fn publish_config_app_desktop_status(
     };
     let mut document = build_status_document(
         "BerryKeep",
-        &state.instance_store_path,
+        state.paths.instance_store_path(),
         web_ui_url.to_string(),
         &snapshot,
     );
@@ -1267,7 +1313,7 @@ async fn upsert_client_identity(
     State(state): State<AppState>,
     Json(request): Json<UpsertClientIdentityRequest>,
 ) -> Result<Json<UpsertClientIdentityResponse>, ApiError> {
-    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let existing = request
         .id
@@ -1276,7 +1322,7 @@ async fn upsert_client_identity(
         .filter(|id| !id.is_empty())
         .and_then(|id| store.client_identity(id));
     let (mut identity, bootstrap_content, enroll) =
-        request.into_identity(existing, &state.instance_store_path)?;
+        request.into_identity(existing, state.paths.instance_store_path())?;
     if let Some(bootstrap_content) = bootstrap_content.as_deref() {
         write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
     }
@@ -1293,7 +1339,7 @@ async fn upsert_client_identity(
     let managed_identity_id = identity.id.clone();
     store.upsert_client_identity(identity);
     store
-        .save(&state.instance_store_path)
+        .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     reconcile_managed_identities_for_selection(
         &state,
@@ -1313,12 +1359,12 @@ async fn upsert_client_cli_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertClientCliInstanceRequest>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let instance = request.into_instance(&store)?;
     store.upsert_client_cli(instance);
     store
-        .save(&state.instance_store_path)
+        .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
         load_config_response(&state).map_err(ApiError::internal)?,
@@ -1329,7 +1375,7 @@ async fn upsert_os_integration_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertOsIntegrationInstanceRequest>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let existing = request
         .id
@@ -1345,7 +1391,7 @@ async fn upsert_os_integration_instance(
     let instance = request.into_instance(existing, &store)?;
     store.upsert_os_integration(instance);
     store
-        .save(&state.instance_store_path)
+        .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
         load_config_response(&state).map_err(ApiError::internal)?,
@@ -1356,7 +1402,7 @@ async fn upsert_folder_agent_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertFolderAgentInstanceRequest>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let existing = request
         .id
@@ -1372,7 +1418,7 @@ async fn upsert_folder_agent_instance(
     let instance = request.into_instance(existing, &store)?;
     store.upsert_folder_agent(instance);
     store
-        .save(&state.instance_store_path)
+        .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
         load_config_response(&state).map_err(ApiError::internal)?,
@@ -1383,7 +1429,7 @@ async fn delete_os_integration_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_os_integration(&id) {
         return Err(ApiError::bad_request(format!(
@@ -1392,7 +1438,7 @@ async fn delete_os_integration_instance(
         )));
     }
     store
-        .save(&state.instance_store_path)
+        .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
         load_config_response(&state).map_err(ApiError::internal)?,
@@ -1403,7 +1449,7 @@ async fn delete_client_cli_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_client_cli(&id) {
         return Err(ApiError::bad_request(format!(
@@ -1412,7 +1458,7 @@ async fn delete_client_cli_instance(
         )));
     }
     store
-        .save(&state.instance_store_path)
+        .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
         load_config_response(&state).map_err(ApiError::internal)?,
@@ -1423,7 +1469,7 @@ async fn delete_folder_agent_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_folder_agent(&id) {
         return Err(ApiError::bad_request(format!(
@@ -1432,7 +1478,7 @@ async fn delete_folder_agent_instance(
         )));
     }
     store
-        .save(&state.instance_store_path)
+        .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
         load_config_response(&state).map_err(ApiError::internal)?,
@@ -1443,7 +1489,7 @@ async fn delete_client_identity(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_client_identity(&id) {
         return Err(ApiError::bad_request(format!(
@@ -1452,7 +1498,7 @@ async fn delete_client_identity(
         )));
     }
     store
-        .save(&state.instance_store_path)
+        .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
         load_config_response(&state).map_err(ApiError::internal)?,
@@ -1464,11 +1510,11 @@ async fn start_service_instance(
     State(state): State<AppState>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
     let kind = normalize_service_kind(&kind)?;
-    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     ensure_service_instance_exists(&store, kind, &id)?;
     let existing_report =
-        load_last_launch_report(&state.launch_report_path).map_err(ApiError::internal)?;
+        load_last_launch_report(state.paths.launch_report_path()).map_err(ApiError::internal)?;
     let already_running = service_runtime_statuses(&store, existing_report.as_ref())
         .iter()
         .any(|status| status.instance_kind == kind && status.id == id && status.running);
@@ -1486,10 +1532,14 @@ async fn start_service_instance(
         ManagedIdentitySelection::ServiceInstance { kind, id: &id },
     )
     .await;
-    let launch = launch_configured_service(&store, kind, &id, &state.package_root)?;
-    let updated_report =
-        launch_report_with_updated_outcome(existing_report, &state.package_root, launch.clone());
-    save_launch_report(&state.launch_report_path, &updated_report).map_err(ApiError::internal)?;
+    let launch = launch_configured_service(&store, kind, &id, state.paths.package_root())?;
+    let updated_report = launch_report_with_updated_outcome(
+        existing_report,
+        state.paths.package_root(),
+        launch.clone(),
+    );
+    save_launch_report(state.paths.launch_report_path(), &updated_report)
+        .map_err(ApiError::internal)?;
 
     Ok(Json(ServiceActionResponse {
         config: load_config_response(&state).map_err(ApiError::internal)?,
@@ -1503,10 +1553,11 @@ async fn stop_service_instance(
     State(state): State<AppState>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
     let kind = normalize_service_kind(&kind)?;
-    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     ensure_service_instance_exists(&store, kind, &id)?;
-    let report = load_last_launch_report(&state.launch_report_path).map_err(ApiError::internal)?;
+    let report =
+        load_last_launch_report(state.paths.launch_report_path()).map_err(ApiError::internal)?;
     let stop = stop_service_from_report(report.as_ref(), kind, &id);
 
     Ok(Json(ServiceActionResponse {
@@ -1521,11 +1572,11 @@ async fn restart_service_instance(
     State(state): State<AppState>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
     let kind = normalize_service_kind(&kind)?;
-    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     ensure_service_instance_exists(&store, kind, &id)?;
     let existing_report =
-        load_last_launch_report(&state.launch_report_path).map_err(ApiError::internal)?;
+        load_last_launch_report(state.paths.launch_report_path()).map_err(ApiError::internal)?;
     let stop = stop_service_from_report(existing_report.as_ref(), kind, &id);
     let launch = if stop.was_running && !stop.stopped {
         None
@@ -1536,13 +1587,13 @@ async fn restart_service_instance(
             ManagedIdentitySelection::ServiceInstance { kind, id: &id },
         )
         .await;
-        let launch = launch_configured_service(&store, kind, &id, &state.package_root)?;
+        let launch = launch_configured_service(&store, kind, &id, state.paths.package_root())?;
         let updated_report = launch_report_with_updated_outcome(
             existing_report,
-            &state.package_root,
+            state.paths.package_root(),
             launch.clone(),
         );
-        save_launch_report(&state.launch_report_path, &updated_report)
+        save_launch_report(state.paths.launch_report_path(), &updated_report)
             .map_err(ApiError::internal)?;
         Some(launch)
     };
@@ -1555,7 +1606,7 @@ async fn restart_service_instance(
 }
 
 async fn launch_enabled_now(State(state): State<AppState>) -> Result<Json<LaunchReport>, ApiError> {
-    let store = ManagedInstanceStore::load_or_default(&state.instance_store_path)
+    let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     reconcile_managed_identities_for_selection(
         &state,
@@ -1563,8 +1614,8 @@ async fn launch_enabled_now(State(state): State<AppState>) -> Result<Json<Launch
         ManagedIdentitySelection::EnabledLaunch,
     )
     .await;
-    let report = launch_enabled_instances(&store, &state.package_root);
-    save_launch_report(&state.launch_report_path, &report).map_err(ApiError::internal)?;
+    let report = launch_enabled_instances(&store, state.paths.package_root());
+    save_launch_report(state.paths.launch_report_path(), &report).map_err(ApiError::internal)?;
     Ok(Json(report))
 }
 
@@ -1575,7 +1626,7 @@ async fn shutdown_app(State(state): State<AppState>) -> Result<Json<serde_json::
 }
 
 async fn request_shutdown(state: &AppState) {
-    let mut shutdown_tx = state.shutdown_tx.lock().await;
+    let mut shutdown_tx = state.runtime.shutdown_tx.lock().await;
     if let Some(sender) = shutdown_tx.take() {
         let _ = sender.send(());
     }
@@ -1583,7 +1634,7 @@ async fn request_shutdown(state: &AppState) {
 
 #[cfg(target_os = "linux")]
 fn spawn_linux_package_handoff_task(state: AppState, restart_config: BackgroundRestartConfig) {
-    let config_app_path = state.package_root.join(CONFIG_APP_EXE);
+    let config_app_path = state.paths.package_root().join(CONFIG_APP_EXE);
     let self_pid = std::process::id();
 
     tokio::spawn(async move {
@@ -1726,19 +1777,19 @@ fn spawn_background_child_reaper(mut child: Child, process_label: String) {
 }
 
 fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
-    let mut store = ManagedInstanceStore::load_or_default(&state.instance_store_path)?;
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())?;
     refresh_store_client_identity_metadata(&mut store);
-    let last_launch_report = load_last_launch_report(&state.launch_report_path)?;
+    let last_launch_report = load_last_launch_report(state.paths.launch_report_path())?;
     let service_statuses = service_runtime_statuses(&store, last_launch_report.as_ref());
     Ok(ConfigResponse {
         platform: PLATFORM_KIND,
         desktop_config_version: DESKTOP_CLIENT_CONFIG_VERSION,
         desktop_config_revision: DESKTOP_CLIENT_CONFIG_REVISION,
         supports_os_integration: OS_INTEGRATION_MANAGEMENT_SUPPORTED,
-        config_path: state.instance_store_path.display().to_string(),
-        launch_report_path: state.launch_report_path.display().to_string(),
+        config_path: state.paths.instance_store_path().display().to_string(),
+        launch_report_path: state.paths.launch_report_path().display().to_string(),
         service_log_dir: default_service_log_dir().display().to_string(),
-        package_root: state.package_root.display().to_string(),
+        package_root: state.paths.package_root().display().to_string(),
         startup_integration_label: STARTUP_INTEGRATION_LABEL,
         startup_integration_value: STARTUP_INTEGRATION_VALUE,
         startup_integration_note: STARTUP_INTEGRATION_NOTE,
@@ -1835,8 +1886,8 @@ async fn reconcile_managed_identities_for_selection(
         return;
     }
 
-    let launch_report_path = state.launch_report_path.clone();
-    let package_root = state.package_root.clone();
+    let launch_report_path = state.paths.launch_report_path().to_path_buf();
+    let package_root = state.paths.package_root().to_path_buf();
     let store = store.clone();
     let excluded_service = match selection {
         ManagedIdentitySelection::ServiceInstance { kind, id } => Some(ManagedServiceRef {
