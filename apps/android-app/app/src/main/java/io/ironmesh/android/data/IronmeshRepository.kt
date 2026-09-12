@@ -291,15 +291,14 @@ class IronmeshRepository {
     suspend fun storeIndexDirectoryListing(
         connectionInput: String,
         prefix: String? = null,
-        depth: Int = 1,
         serverCaPem: String? = null,
         clientIdentityJson: String? = null,
     ): StoreIndexResponse {
         return storeIndexResponse(
             connectionInput = connectionInput,
             prefix = prefix,
-            depth = depth.coerceAtLeast(1),
-            options = StoreIndexRequestOptions(view = StoreIndexView.TREE),
+            depth = 1,
+            options = StoreIndexRequestOptions(view = StoreIndexView.CHILDREN),
             serverCaPem = serverCaPem,
             clientIdentityJson = clientIdentityJson,
         )

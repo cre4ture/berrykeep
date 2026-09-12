@@ -189,7 +189,7 @@ let currentExplorer = null;
     }
 
     async function listStoreEntries(prefix, snapshot) {
-      const query = new URLSearchParams({ depth: '1' });
+      const query = new URLSearchParams({ depth: '1', view: 'children' });
       const normalizedPrefix = normalizePath(prefix);
       if (normalizedPrefix) query.set('prefix', folderMarkerKey(normalizedPrefix));
       if (snapshot) query.set('snapshot', snapshot);
@@ -204,9 +204,7 @@ let currentExplorer = null;
       return entries
         .filter(entry => {
           const target = String(entry.path || '');
-          if (!target) return false;
-          if (!basePrefix) return true;
-          return target.startsWith(basePrefix) && target !== basePrefix;
+          return target.length > 0;
         })
         .map(entry => {
           const rawPath = String(entry.path || '');

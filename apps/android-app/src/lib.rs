@@ -1975,6 +1975,7 @@ fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>>
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some("raw") => Ok(Some(StoreIndexView::Raw)),
         Some("tree") => Ok(Some(StoreIndexView::Tree)),
+        Some("children") => Ok(Some(StoreIndexView::Children)),
         Some(other) => anyhow::bail!("unsupported store index view: {other}"),
         None => Ok(None),
     }

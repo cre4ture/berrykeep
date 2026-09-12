@@ -1800,8 +1800,8 @@ test("client-ui gallery reuses an evicted virtual page without requesting it aga
   expect(pageOffsets.filter((offset) => offset === "0")).toHaveLength(initialPageRequestCount);
 });
 
-test("client-ui explorer fetches result pages instead of the complete index", async ({ page }) => {
-  const requestPages: Array<{ offset: string | null; limit: string | null }> = [];
+test("client-ui explorer requests paged children instead of the complete index", async ({ page }) => {
+  const requestPages: Array<{ offset: string | null; limit: string | null; view: string | null }> = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
     if (url.pathname !== apiV1("/store/list") || !url.searchParams.has("limit")) {
@@ -1809,7 +1809,8 @@ test("client-ui explorer fetches result pages instead of the complete index", as
     }
     requestPages.push({
       offset: url.searchParams.get("offset"),
-      limit: url.searchParams.get("limit")
+      limit: url.searchParams.get("limit"),
+      view: url.searchParams.get("view")
     });
   });
 
@@ -1827,6 +1828,7 @@ test("client-ui explorer fetches result pages instead of the complete index", as
     .toBe(true);
   await expect(pagination).toContainText("Showing 101–200 of");
   expect(requestPages.every((request) => request.limit === "100")).toBe(true);
+  expect(requestPages.every((request) => request.view === "children")).toBe(true);
 });
 
 test("client-ui explorer refreshes history while paging current entries", async ({ page }) => {
@@ -2853,7 +2855,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     }
 
     if (pathname === apiV1("/store/list") && method === "GET") {
-      expect(searchParams.get("view")).toBe("tree");
+      expect(["tree", "children"]).toContain(searchParams.get("view"));
       galleryStoreListRequestCount += 1;
       if (galleryOffline) {
         await route.fulfill({

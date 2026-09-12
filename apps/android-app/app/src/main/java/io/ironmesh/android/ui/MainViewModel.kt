@@ -1849,7 +1849,6 @@ class MainViewModel(
         val listing = repository.storeIndexDirectoryListing(
             connectionInput = connectionInput,
             prefix = prefix,
-            depth = 1,
             serverCaPem = serverCaPem,
             clientIdentityJson = clientIdentityJson,
         )
@@ -1866,10 +1865,7 @@ class MainViewModel(
             serverCaPem = serverCaPem,
             clientIdentityJson = clientIdentityJson,
         )
-        val directories = galleryDirectoryItemsForParent(
-            entries = listing.entries,
-            parentPath = request.currentDirectoryPath,
-        )
+        val directories = galleryDirectoryItems(listing.entries)
         val items = firstPage.entries.mapNotNull(::galleryImageItemFromEntry)
         val totalItemCount = firstPage.total_entry_count.coerceAtLeast(items.size)
 
