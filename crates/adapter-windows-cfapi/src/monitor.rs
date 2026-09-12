@@ -60,7 +60,7 @@ struct ObservedEntry {
     placeholder_object_id: Option<String>,
     placeholder_revision: Option<String>,
     placeholder_state: Option<PlaceholderSnapshot>,
-    placeholder_probe_error: Option<String>,
+    placeholder_inspection_error: Option<String>,
     provider_hydration_active: bool,
     materialized_file: Option<MaterializedFileSnapshot>,
 }
@@ -77,20 +77,23 @@ impl ObservedEntry {
             .unwrap_or_else(|| String::from("none"));
         let placeholder_object_id = self.placeholder_object_id.as_deref().unwrap_or("none");
         let placeholder_revision = self.placeholder_revision.as_deref().unwrap_or("none");
-        let placeholder_probe_error = self.placeholder_probe_error.as_deref().unwrap_or("none");
+        let placeholder_inspection_error = self
+            .placeholder_inspection_error
+            .as_deref()
+            .unwrap_or("none");
         let materialized_file = self
             .materialized_file
             .map(|snapshot| snapshot.to_log_string())
             .unwrap_or_else(|| String::from("none"));
         format!(
-            "dir={} placeholder={} placeholder_path={} object_id={} revision={} placeholder_probe={} placeholder_probe_error={} hydration_active={} materialized={}",
+            "dir={} placeholder={} placeholder_path={} object_id={} revision={} placeholder_probe={} placeholder_inspection_error={} hydration_active={} materialized={}",
             self.is_dir,
             self.is_placeholder,
             placeholder_identity_path,
             placeholder_object_id,
             placeholder_revision,
             placeholder_state,
-            placeholder_probe_error,
+            placeholder_inspection_error,
             self.provider_hydration_active,
             materialized_file,
         )
@@ -174,6 +177,9 @@ enum UploadObservation {
 
 impl UploadObservation {
     fn from_observed(entry: &ObservedEntry) -> Option<Self> {
+        if entry.placeholder_inspection_error.is_some() {
+            return None;
+        }
         if entry.is_dir {
             return None;
         }
@@ -188,6 +194,14 @@ impl UploadObservation {
             modified_data_size: state.modified_data_size,
             in_sync_state: state.in_sync_state,
         })
+    }
+
+    fn advance(entry: &ObservedEntry, previous: Option<&Self>) -> Option<Self> {
+        if entry.placeholder_inspection_error.is_some() {
+            previous.cloned()
+        } else {
+            Self::from_observed(entry)
+        }
     }
 }
 
@@ -206,6 +220,14 @@ impl HydrationObservation {
             provider_hydration_active: entry.provider_hydration_active,
             on_disk_data_size: state.on_disk_data_size,
         })
+    }
+
+    fn advance(entry: &ObservedEntry, previous: Option<Self>) -> Option<Self> {
+        if entry.placeholder_inspection_error.is_some() {
+            previous
+        } else {
+            Self::from_observed(entry)
+        }
     }
 }
 
@@ -287,7 +309,7 @@ fn placeholder_has_uploadable_local_content(state: PlaceholderSnapshot) -> bool 
         || (!state.is_partial && state.in_sync_state != CF_IN_SYNC_STATE_IN_SYNC)
 }
 
-fn update_placeholder_probe_failure_state(
+fn update_cfapi_inspection_failure_state(
     failures: &mut HashSet<String>,
     path: &str,
     failed: bool,
@@ -318,9 +340,9 @@ pub struct SyncRootMonitor {
     // Transient transport failures are workflow state, not fake filesystem
     // history. Keep their retry intent separate from observation baselines.
     pending_uploads: HashSet<String>,
-    // Diagnostics for an unavailable current CFAPI probe are emitted only on
-    // the failure edge, not on every monitor walk.
-    unavailable_placeholder_probes: HashSet<String>,
+    // Diagnostics for an unavailable current CFAPI inspection are emitted
+    // only on the failure edge, not on every monitor walk.
+    unavailable_cfapi_inspections: HashSet<String>,
     pending_object_renames: Vec<LocalRenamePair>,
     dehydrations_in_flight: Arc<Mutex<HashSet<String>>>,
     hydrations_in_flight: Arc<Mutex<HashSet<String>>>,
@@ -433,7 +455,7 @@ impl SyncRootMonitor {
             upload_observations: HashMap::new(),
             hydration_observations: HashMap::new(),
             pending_uploads: HashSet::new(),
-            unavailable_placeholder_probes: HashSet::new(),
+            unavailable_cfapi_inspections: HashSet::new(),
             pending_object_renames: Vec::new(),
             dehydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
             hydrations_in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -517,14 +539,14 @@ impl SyncRootMonitor {
         self.upload_observations = entries
             .iter()
             .filter_map(|(path, entry)| {
-                UploadObservation::from_observed(entry)
+                UploadObservation::advance(entry, self.upload_observations.get(path))
                     .map(|observation| (path.clone(), observation))
             })
             .collect();
         self.hydration_observations = entries
             .iter()
             .filter_map(|(path, entry)| {
-                HydrationObservation::from_observed(entry)
+                HydrationObservation::advance(entry, self.hydration_observations.get(path).copied())
                     .map(|observation| (path.clone(), observation))
             })
             .collect();
@@ -559,10 +581,10 @@ impl SyncRootMonitor {
             self.handle_deleted_entries(&current, &handled_renames);
             self.pending_uploads
                 .retain(|path| current.contains_key(path));
-            self.unavailable_placeholder_probes.retain(|path| {
-                current.get(path).is_some_and(|entry| {
-                    !entry.is_dir && entry.is_placeholder && entry.placeholder_state.is_none()
-                })
+            self.unavailable_cfapi_inspections.retain(|path| {
+                current
+                    .get(path)
+                    .is_some_and(|entry| entry.placeholder_inspection_error.is_some())
             });
             self.replace_observation_baseline(&current);
         } else {
@@ -595,14 +617,14 @@ impl SyncRootMonitor {
         let mut upload_observations = current
             .iter()
             .filter_map(|(path, entry)| {
-                UploadObservation::from_observed(entry)
+                UploadObservation::advance(entry, self.upload_observations.get(path))
                     .map(|observation| (path.clone(), observation))
             })
             .collect::<HashMap<_, _>>();
         let mut hydration_observations = current
             .iter()
             .filter_map(|(path, entry)| {
-                HydrationObservation::from_observed(entry)
+                HydrationObservation::advance(entry, self.hydration_observations.get(path).copied())
                     .map(|observation| (path.clone(), observation))
             })
             .collect::<HashMap<_, _>>();
@@ -909,9 +931,9 @@ impl SyncRootMonitor {
             None => return,
         };
         let previous_path = self.prior_paths.get(&rel_path).cloned();
-        if !entry.is_dir && entry.is_placeholder && entry.placeholder_state.is_none() {
-            if update_placeholder_probe_failure_state(
-                &mut self.unavailable_placeholder_probes,
+        if entry.placeholder_inspection_error.is_some() {
+            if update_cfapi_inspection_failure_state(
+                &mut self.unavailable_cfapi_inspections,
                 &rel_path,
                 true,
             ) {
@@ -920,15 +942,15 @@ impl SyncRootMonitor {
                     self.name,
                     rel_path,
                     entry
-                        .placeholder_probe_error
+                        .placeholder_inspection_error
                         .as_deref()
                         .unwrap_or("unknown")
                 );
             }
             return;
         }
-        update_placeholder_probe_failure_state(
-            &mut self.unavailable_placeholder_probes,
+        update_cfapi_inspection_failure_state(
+            &mut self.unavailable_cfapi_inspections,
             &rel_path,
             false,
         );
@@ -1036,7 +1058,7 @@ impl SyncRootMonitor {
             if entry.is_placeholder {
                 let placeholder_state = entry
                     .placeholder_state
-                    .expect("unavailable placeholder probes return before content handling");
+                    .expect("unavailable CFAPI inspections return before content handling");
                 if !placeholder_has_uploadable_local_content(placeholder_state) {
                     self.pending_uploads.remove(&rel_path);
                     return;
@@ -1716,17 +1738,37 @@ fn snapshot_entry(
     path: &std::path::Path,
     is_dir: bool,
 ) -> ObservedEntry {
+    snapshot_entry_with_placeholder_state(
+        sync_root,
+        rel_path,
+        path,
+        is_dir,
+        path_placeholder_state(path),
+    )
+}
+
+fn snapshot_entry_with_placeholder_state(
+    sync_root: &std::path::Path,
+    rel_path: &str,
+    path: &std::path::Path,
+    is_dir: bool,
+    placeholder_state: anyhow::Result<u32>,
+) -> ObservedEntry {
     let metadata = std::fs::metadata(path).ok();
-    let placeholder_state_bits =
-        path_placeholder_state(path).unwrap_or(CF_PLACEHOLDER_STATE_NO_STATES);
+    let (placeholder_state_bits, classification_error) = match placeholder_state {
+        Ok(state) => (state, None),
+        Err(err) => (
+            CF_PLACEHOLDER_STATE_NO_STATES,
+            Some(format!("failed to classify placeholder state: {err:#}")),
+        ),
+    };
     let is_placeholder = (placeholder_state_bits & CF_PLACEHOLDER_STATE_PLACEHOLDER) != 0;
     let placeholder_probe = is_placeholder.then(|| {
         open_sync_path(path, false)
             .map_err(anyhow::Error::from)
             .and_then(|file| cf_get_placeholder_standard_info_with_identity(&file))
     });
-    let (placeholder_identity, placeholder_state, placeholder_probe_error) = match placeholder_probe
-    {
+    let (placeholder_identity, placeholder_state, probe_error) = match placeholder_probe {
         Some(Ok(info)) => {
             let file_identity = info.file_identity();
             let identity = if file_identity.is_empty() {
@@ -1741,6 +1783,7 @@ fn snapshot_entry(
         Some(Err(err)) => (None, None, Some(format!("{err:#}"))),
         None => (None, None, None),
     };
+    let placeholder_inspection_error = classification_error.or(probe_error);
     ObservedEntry {
         is_dir,
         is_placeholder,
@@ -1754,11 +1797,11 @@ fn snapshot_entry(
             .as_ref()
             .and_then(|identity| identity.remote_version.clone()),
         placeholder_state,
-        placeholder_probe_error,
+        placeholder_inspection_error: placeholder_inspection_error.clone(),
         provider_hydration_active: !is_dir
             && is_placeholder
             && is_active_hydration_marked(sync_root, rel_path),
-        materialized_file: (!is_dir && !is_placeholder)
+        materialized_file: (!is_dir && !is_placeholder && placeholder_inspection_error.is_none())
             .then(|| {
                 metadata.as_ref().map(|metadata| MaterializedFileSnapshot {
                     local_file_identity: LocalFileIdentity::from_path(path),
@@ -1969,7 +2012,7 @@ mod tests {
             placeholder_object_id: None,
             placeholder_revision: None,
             placeholder_state: None,
-            placeholder_probe_error: None,
+            placeholder_inspection_error: None,
             provider_hydration_active: false,
             materialized_file: None,
         }
@@ -2057,24 +2100,122 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_probe_failure_diagnostics_rearm_after_recovery() {
+    fn placeholder_classification_failure_never_becomes_a_materialized_upload() {
+        let root = std::env::temp_dir().join(format!(
+            "ironmesh-monitor-placeholder-classification-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("failed to create test root");
+        let path = root.join("cold-placeholder.bin");
+        std::fs::write(&path, b"metadata-only test file").expect("failed to create test file");
+
+        let entry = snapshot_entry_with_placeholder_state(
+            &root,
+            "cold-placeholder.bin",
+            &path,
+            false,
+            Err(anyhow::anyhow!(
+                "injected placeholder classification failure"
+            )),
+        );
+
+        assert!(
+            entry.placeholder_inspection_error.is_some(),
+            "a failed placeholder classification must remain visible as unavailable CFAPI state"
+        );
+        assert!(
+            entry.materialized_file.is_none(),
+            "unknown CFAPI state must never produce a materialized-file upload observation"
+        );
+        assert!(
+            UploadObservation::from_observed(&entry).is_none(),
+            "unknown CFAPI state must never enter the content upload path"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_placeholder_inspection_preserves_all_observation_baselines() {
+        let mut monitor = SyncRootMonitor::new(
+            "monitor-test",
+            std::env::temp_dir().join(format!(
+                "ironmesh-monitor-placeholder-inspection-baseline-{}",
+                uuid::Uuid::new_v4()
+            )),
+            uuid::Uuid::nil(),
+            Arc::new(MockUploader::default()),
+        );
+        let mut available = observed_entry(false);
+        available.is_placeholder = true;
+        available.placeholder_identity_path = Some("docs/report.txt".to_string());
+        available.placeholder_object_id = Some("obj-report".to_string());
+        available.placeholder_revision = Some("revision-report".to_string());
+        available.placeholder_state = Some(PlaceholderSnapshot {
+            on_disk_data_size: 0,
+            modified_data_size: 0,
+            in_sync_state: CF_IN_SYNC_STATE_IN_SYNC,
+            pin_state: 0,
+            is_partial: true,
+        });
+        monitor.replace_observation_baseline(&HashMap::from([(
+            "docs/report.txt".to_string(),
+            available.clone(),
+        )]));
+        let prior_path = monitor.prior_paths["docs/report.txt"].clone();
+        let upload_observation = monitor.upload_observations["docs/report.txt"].clone();
+        let hydration_observation = monitor.hydration_observations["docs/report.txt"];
+
+        let mut unavailable = available;
+        unavailable.placeholder_object_id = None;
+        unavailable.placeholder_revision = None;
+        unavailable.placeholder_state = None;
+        unavailable.placeholder_inspection_error = Some("injected CFAPI probe failure".to_string());
+        let unavailable_snapshot = HashMap::from([("docs/report.txt".to_string(), unavailable)]);
+
+        monitor.update_partial_observation_baseline(&unavailable_snapshot, &HashSet::new());
+        assert_eq!(monitor.prior_paths["docs/report.txt"], prior_path);
+        assert_eq!(
+            monitor.upload_observations["docs/report.txt"], upload_observation,
+            "a partial deferred scan must preserve the last successful upload observation"
+        );
+        assert_eq!(
+            monitor.hydration_observations["docs/report.txt"], hydration_observation,
+            "a partial deferred scan must preserve the last successful hydration observation"
+        );
+
+        monitor.replace_observation_baseline(&unavailable_snapshot);
+
+        assert_eq!(monitor.prior_paths["docs/report.txt"], prior_path);
+        assert_eq!(
+            monitor.upload_observations["docs/report.txt"], upload_observation,
+            "a deferred scan must not erase the last successful upload observation"
+        );
+        assert_eq!(
+            monitor.hydration_observations["docs/report.txt"], hydration_observation,
+            "a deferred scan must not erase the last successful hydration observation"
+        );
+    }
+
+    #[test]
+    fn cfapi_inspection_failure_diagnostics_rearm_after_recovery() {
         let mut failures = HashSet::new();
-        assert!(update_placeholder_probe_failure_state(
+        assert!(update_cfapi_inspection_failure_state(
             &mut failures,
             "docs/report.txt",
             true
         ));
-        assert!(!update_placeholder_probe_failure_state(
+        assert!(!update_cfapi_inspection_failure_state(
             &mut failures,
             "docs/report.txt",
             true
         ));
-        assert!(!update_placeholder_probe_failure_state(
+        assert!(!update_cfapi_inspection_failure_state(
             &mut failures,
             "docs/report.txt",
             false
         ));
-        assert!(update_placeholder_probe_failure_state(
+        assert!(update_cfapi_inspection_failure_state(
             &mut failures,
             "docs/report.txt",
             true
