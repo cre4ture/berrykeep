@@ -902,13 +902,13 @@ impl SyncRootMonitor {
         }
 
         if entry.is_dir {
+            let remote_applied = self
+                .remote_applied_tracker
+                .take_directory_suppression(&rel_path);
             if previous_path.is_some() && !self.pending_uploads.contains(&rel_path) {
                 return;
             }
-            if self
-                .remote_applied_tracker
-                .take_directory_suppression(&rel_path)
-            {
+            if remote_applied {
                 tracing::info!(
                     "{}: suppressing local upload for remote-applied directory {}",
                     self.name,
@@ -2176,6 +2176,19 @@ mod tests {
             "remote-applied directory should not be echoed back as local upload"
         );
 
+        remote_applied.record_plan(&CfapiActionPlan {
+            actions: vec![CfapiAction::EnsureDirectory {
+                object_id: None,
+                path: "docs".to_string(),
+                remote_version: None,
+            }],
+        });
+        monitor.walk();
+        std::fs::remove_dir(sync_root.join("docs")).expect("failed to remove remote directory");
+        monitor.walk();
+        std::fs::create_dir(sync_root.join("docs")).expect("failed to recreate directory locally");
+        monitor.walk();
+
         std::fs::create_dir_all(sync_root.join("local")).expect("failed to create local directory");
         monitor.walk();
 
@@ -2185,12 +2198,12 @@ mod tests {
             .expect("uploads lock poisoned")
             .clone();
         assert!(
-            uploads.iter().any(|path| path == "local/"),
-            "later local directory should still upload normally, uploads={uploads:?}"
+            uploads.iter().any(|path| path == "docs/"),
+            "a later local recreation must not consume a stale remote suppression, uploads={uploads:?}"
         );
         assert!(
-            uploads.iter().all(|path| path != "docs/"),
-            "remote-applied directory should remain suppressed, uploads={uploads:?}"
+            uploads.iter().any(|path| path == "local/"),
+            "later local directory should still upload normally, uploads={uploads:?}"
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
