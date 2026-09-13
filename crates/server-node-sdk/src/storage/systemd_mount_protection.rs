@@ -890,7 +890,12 @@ fn checks_for_inspection(
         } => targets
             .iter()
             .map(|target| {
-                let protecting_mount = (!target.path_resolution_failed)
+                let expected_host_mount = expected_host_mount_point(target, &host_mount_points);
+                let target_is_on_expected_host_mount = expected_host_mount
+                    .map(|mount_point| target.mount_point.as_deref() == Some(mount_point.as_path()))
+                    .unwrap_or(true);
+                let protecting_mount = (!target.path_resolution_failed
+                    && target_is_on_expected_host_mount)
                     .then(|| protecting_mount_dependency(target, &mounts))
                     .flatten();
                 match protecting_mount {
@@ -931,7 +936,7 @@ fn checks_for_inspection(
                             target.path.display()
                         )),
                     },
-                    None if target.mount_point.as_deref() == Some(Path::new("/")) && expected_host_mount_point(target, &host_mount_points).is_none() => HostDependencyCheck {
+                    None if target.mount_point.as_deref() == Some(Path::new("/")) && expected_host_mount.is_none() => HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
                         status: HostDependencyStatus::NotApplicable,
@@ -1490,6 +1495,30 @@ mod tests {
             dependencies(vec![systemd_mount("srv-pool.mount", "/srv/pool")]),
         );
         assert_eq!(checks[0].status, HostDependencyStatus::Ready);
+    }
+
+    #[test]
+    fn expected_deeper_mount_cannot_use_an_ancestor_dependency() {
+        let target = MountProtectionTarget {
+            id: "systemd-mount-data-dir".to_string(),
+            feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+            path: PathBuf::from("/srv/berrykeep"),
+            mount_point: Some(PathBuf::from("/srv")),
+            mount_point_is_bind: false,
+            backing_mount_points: Vec::new(),
+            path_resolution_failed: false,
+            missing_severity: HostDependencySeverity::Critical,
+        };
+        let checks = checks_for_inspection(
+            &[target],
+            dependencies_with_host_mount_points(
+                vec![systemd_mount("srv.mount", "/srv")],
+                &["/srv", "/srv/berrykeep"],
+            ),
+        );
+
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Critical);
     }
 
     #[test]
