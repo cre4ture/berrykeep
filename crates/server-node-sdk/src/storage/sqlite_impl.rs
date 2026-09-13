@@ -2527,6 +2527,18 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn content_repair_pending(&self, manifest_hash: &str) -> Result<bool> {
+        let hash = manifest_hash.to_string();
+        self.read(move |db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_repair_tasks WHERE manifest_hash=?1)",
+                params![hash],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
     async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
         self.read(|db| {
             let mut statement =

@@ -83,6 +83,51 @@ pub(crate) fn validate_manifest(hash: &str, payload: &[u8]) -> Result<Replicatio
     })
 }
 
+async fn read_valid_manifest(
+    storage_pool: &StoragePool,
+    hash: &str,
+) -> Result<Option<(Vec<u8>, ReplicationManifestPayload)>> {
+    let path = storage_pool.content_path(StorageContentKind::Manifest, hash)?;
+    let bytes = match fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let manifest = validate_manifest(hash, &bytes)?;
+    Ok(Some((bytes, manifest)))
+}
+
+/// Cheap presence contract shared by availability and ordinary replication.
+/// Full chunk hashing belongs to scrub, actual transfers and repair completion.
+pub(super) async fn manifest_is_fully_local(
+    storage_pool: &StoragePool,
+    hash: &str,
+) -> Result<bool> {
+    if hash == TOMBSTONE_MANIFEST_HASH {
+        return Ok(true);
+    }
+    let manifest = match read_valid_manifest(storage_pool, hash).await {
+        Ok(Some((_, manifest))) => manifest,
+        Ok(None) => return Ok(false),
+        Err(error) => {
+            warn!(manifest_hash = hash, error = %error, "invalid manifest is not locally available");
+            return Ok(false);
+        }
+    };
+    for chunk in &manifest.chunks {
+        let path = storage_pool.content_path(StorageContentKind::Chunk, &chunk.hash)?;
+        let metadata = match fs::metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.len() != chunk.size_bytes as u64 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl PersistentStore {
     pub(crate) async fn content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
         self.metadata_store.load_content_repair_tasks().await
@@ -101,16 +146,9 @@ impl PersistentStore {
     }
 
     pub(crate) async fn read_recovery_manifest(&self, hash: &str) -> Result<Option<Vec<u8>>> {
-        let path = self
-            .storage_pool
-            .content_path(StorageContentKind::Manifest, hash)?;
-        let bytes = match fs::read(path).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        validate_manifest(hash, &bytes)?;
-        Ok(Some(bytes))
+        Ok(read_valid_manifest(&self.storage_pool, hash)
+            .await?
+            .map(|(bytes, _)| bytes))
     }
 
     pub(crate) async fn install_recovery_manifest(&self, hash: &str, payload: &[u8]) -> Result<()> {
@@ -160,24 +198,19 @@ impl PersistentStore {
         Ok(())
     }
 
-    pub(crate) async fn verify_replication_source(&self, hash: &str, claim: bool) -> Result<()> {
+    pub(crate) async fn check_owned_replica_presence(&self, hash: &str) -> Result<()> {
         if hash == TOMBSTONE_MANIFEST_HASH {
             return Ok(());
         }
         let _guard = self.content_gc_gate.read().await;
-        let task = ContentRepairTask::new(
-            RetainedReference {
-                key: None,
-                object_id: None,
-                version_id: None,
-                manifest_hash: hash.to_string(),
-                snapshot_only: true,
-            },
-            true,
-        );
-        self.verify_recovered_content(&task).await?;
-        if claim {
-            self.mark_manifest_locally_owned(hash).await?;
+        if !self.manifest_is_owned(hash).await? {
+            bail!("manifest is not an owned replica: {hash}");
+        }
+        if self.metadata_store.content_repair_pending(hash).await? {
+            bail!("manifest has pending integrity findings: {hash}");
+        }
+        if !manifest_is_fully_local(&self.storage_pool, hash).await? {
+            bail!("owned replica content is incomplete: {hash}");
         }
         Ok(())
     }

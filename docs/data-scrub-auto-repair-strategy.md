@@ -27,6 +27,9 @@ These are different facts:
 - Scrub verifies hashes as well as sizes. Pending repairs suppress availability until final
   verification succeeds. Ordinary availability refresh checks manifest integrity and chunk
   existence/size; it does not rehash the entire data set on every refresh.
+  Routine replication source checks reuse this cheap contract, require existing
+  ownership, and reject pending repairs. Only the repair/transfer path hashes content
+  before promoting a new replica; a presence check never promotes cache ownership.
 
 Missing cache entries on an unassigned, metadata-only node are normal. Scrub records their count
 as `chunks_not_required_locally`, without creating corruption findings or filling that node.

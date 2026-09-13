@@ -2817,6 +2817,7 @@ trait MetadataStore: Send + Sync {
     async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>>;
     async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()>;
     async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()>;
+    async fn content_repair_pending(&self, manifest_hash: &str) -> Result<bool>;
     /// Whether legacy current rows, snapshots, and version payloads still need
     /// their one-time stable object identity backfill.
     async fn object_id_backfill_needed(&self) -> Result<bool>;
@@ -4177,7 +4178,8 @@ impl ReplicationSubjectInspector {
                 continue;
             }
             if hash == TOMBSTONE_MANIFEST_HASH
-                || (owned.contains(&hash) && self.manifest_is_fully_local(&hash).await?)
+                || (owned.contains(&hash)
+                    && content_recovery::manifest_is_fully_local(&self.storage_pool, &hash).await?)
             {
                 subjects.extend(
                     references
@@ -4193,64 +4195,6 @@ impl ReplicationSubjectInspector {
         let mut keys: Vec<String> = self.current_state.objects.keys().cloned().collect();
         keys.sort();
         keys
-    }
-
-    async fn manifest_is_fully_local(&self, manifest_hash: &str) -> Result<bool> {
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(true);
-        }
-
-        let manifest = match self.load_manifest_by_hash(manifest_hash).await {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => return Ok(false),
-            Err(err) => {
-                // A single corrupt/unreadable manifest must not abort availability
-                // checks for every other object on this node: treat it as not
-                // locally available (so it gets queued for repair) and keep going
-                // rather than propagating the error out of the whole scan.
-                warn!(
-                    manifest_hash = %manifest_hash,
-                    error = %err,
-                    "manifest unreadable or invalid; treating as not locally available"
-                );
-                return Ok(false);
-            }
-        };
-
-        for chunk in &manifest.chunks {
-            let chunk_path = self
-                .storage_pool
-                .content_path(StorageContentKind::Chunk, &chunk.hash)?;
-            let metadata = match fs::metadata(&chunk_path).await {
-                Ok(metadata) => metadata,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(err) => return Err(err.into()),
-            };
-            if metadata.len() != chunk.size_bytes as u64 {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
-    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(None);
-        }
-
-        let manifest_path = self
-            .storage_pool
-            .content_path(StorageContentKind::Manifest, manifest_hash)?;
-        if !fs::try_exists(&manifest_path).await? {
-            return Ok(None);
-        }
-
-        let payload = fs::read(&manifest_path).await?;
-        content_recovery::validate_manifest(manifest_hash, &payload)?;
-        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
-            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
-        Ok(Some(manifest))
     }
 }
 
