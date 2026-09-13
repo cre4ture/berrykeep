@@ -12218,6 +12218,10 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
         Ok(retained) => subjects.extend(retained.subjects()),
         Err(error) => warn!(error = %error, "failed to enumerate retained replication obligations"),
     }
+    // Hash-only references have no object-key export. Their placement audit and
+    // durable worker live in content_recovery, not the legacy bundle planner.
+    subjects
+        .retain(|subject| !subject.starts_with(storage::retained_content::MANIFEST_SUBJECT_PREFIX));
     subjects.into_iter().collect()
 }
 
