@@ -24,6 +24,7 @@ use crate::rendezvous::IrohRelayTicket;
 
 const DIRECT_QUIC_ENDPOINT_SCHEME: &str = "iroh";
 pub const DEFAULT_DIRECT_QUIC_ALPN: &str = "berrykeep/transport/1";
+const LEGACY_DIRECT_QUIC_ALPN: &str = "ironmesh/transport/1";
 
 #[derive(Clone)]
 pub struct DirectQuicEndpointConfig {
@@ -325,7 +326,7 @@ impl DirectQuicEndpoint {
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)
             .secret_key(config.secret_key)
             .relay_mode(relay_mode)
-            .alpns(vec![config.alpn.as_bytes().to_vec()]);
+            .alpns(accepted_alpns(&config.alpn));
         if let Some(relay_ca_pem) = config.relay_ca_pem.as_deref() {
             endpoint_builder = endpoint_builder.ca_tls_config(relay_ca_config(relay_ca_pem)?);
         }
@@ -531,6 +532,14 @@ impl DirectQuicEndpoint {
     pub async fn close(&self) {
         self.endpoint.close().await;
     }
+}
+
+fn accepted_alpns(configured_alpn: &str) -> Vec<Vec<u8>> {
+    let mut alpns = vec![configured_alpn.as_bytes().to_vec()];
+    if configured_alpn == DEFAULT_DIRECT_QUIC_ALPN {
+        alpns.push(LEGACY_DIRECT_QUIC_ALPN.as_bytes().to_vec());
+    }
+    alpns
 }
 
 impl DirectQuicEndpointSnapshot {
@@ -860,6 +869,22 @@ fn write_error_to_io_error(error: iroh::endpoint::WriteError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_endpoint_accepts_the_legacy_quic_alpn() {
+        assert_eq!(
+            accepted_alpns(DEFAULT_DIRECT_QUIC_ALPN),
+            vec![
+                DEFAULT_DIRECT_QUIC_ALPN.as_bytes().to_vec(),
+                LEGACY_DIRECT_QUIC_ALPN.as_bytes().to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_quic_alpn_does_not_add_the_legacy_protocol() {
+        assert_eq!(accepted_alpns("custom/1"), vec![b"custom/1".to_vec()]);
+    }
 
     #[test]
     fn rejects_candidate_with_mismatched_authenticated_transport_id() {
