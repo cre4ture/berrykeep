@@ -17,8 +17,8 @@ import {
   type ChildProcessStat,
   type TemperatureComponentStat,
   type MemoryAttributionSample
-} from "@ironmesh/api";
-import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
+} from "@berrykeep/api";
+import { berrykeepUiRevision, berrykeepUiVersion } from "@berrykeep/config";
 import {
   ActionIcon,
   Alert,
@@ -38,11 +38,11 @@ import {
   Tooltip as MantineTooltip
 } from "@mantine/core";
 import {
-  ironmeshPrimaryColor,
+  berrykeepPrimaryColor,
   StatCard,
   ZoomableTimeSeriesChart,
   formatTimeSeriesChartTimestamp
-} from "@ironmesh/ui";
+} from "@berrykeep/ui";
 import { useDisclosure } from "@mantine/hooks";
 import { useMemo, useState } from "react";
 import {
@@ -108,7 +108,7 @@ const STORAGE_CHART_SERIES: Array<{
     key: "latestSnapshotUniqueChunkBytes",
     label: "Latest snapshot unique",
     color: "#34d399",
-    badgeColor: ironmeshPrimaryColor
+    badgeColor: berrykeepPrimaryColor
   }
 ];
 
@@ -283,7 +283,7 @@ export function DashboardPage() {
     : null;
   const connectedRendezvousEndpoints =
     rendezvousConfig?.endpoint_registrations.filter((endpoint) => endpoint.status === "connected") ?? [];
-  const versionMismatch = Boolean(backendHealth?.version) && backendHealth?.version !== ironmeshUiVersion;
+  const versionMismatch = Boolean(backendHealth?.version) && backendHealth?.version !== berrykeepUiVersion;
   const latestStorageSample = storageStats?.sample ?? null;
   const metadataFootprintBytes = latestStorageSample
     ? latestStorageSample.metadata_db_bytes +
@@ -408,7 +408,7 @@ export function DashboardPage() {
                   {clusterSummary?.local_node_id ?? (clusterSummaryLoading ? "loading" : "unknown")}
                 </Badge>
                 <Badge
-                  color={localNode?.reachability.relay_required ? ironmeshPrimaryColor : "blue"}
+                  color={localNode?.reachability.relay_required ? berrykeepPrimaryColor : "blue"}
                   variant="light"
                 >
                   {localNode?.reachability.relay_required ? "relay-required" : "direct-capable"}
@@ -431,7 +431,7 @@ export function DashboardPage() {
             <Stack gap="sm">
               <Text fw={700}>Version info</Text>
               <Text size="sm">
-                UI build: <Code>{formatFullVersion(ironmeshUiVersion, ironmeshUiRevision)}</Code>
+                UI build: <Code>{formatFullVersion(berrykeepUiVersion, berrykeepUiRevision)}</Code>
               </Text>
               <Text size="sm">
                 Backend build: <Code>{formatFullVersion(backendHealth?.version, backendHealth?.revision)}</Code>
@@ -484,7 +484,7 @@ export function DashboardPage() {
               <Text fw={700}>Rendezvous participation</Text>
               <Group gap="sm">
                 <Badge
-                  color={rendezvousConfig?.registration_enabled ? ironmeshPrimaryColor : "gray"}
+                  color={rendezvousConfig?.registration_enabled ? berrykeepPrimaryColor : "gray"}
                   variant="light"
                 >
                   {rendezvousConfig?.registration_enabled ? "registration enabled" : "registration disabled"}
@@ -638,7 +638,7 @@ export function DashboardPage() {
                 <Stack gap={4}>
                   <Text fw={700}>Process resource usage</Text>
                   <Text size="sm" c="dimmed" maw={760}>
-                    CPU, memory, disk I/O, and temperature sensors for the ironmesh server host.
+                    CPU, memory, disk I/O, and temperature sensors for the berrykeep server host.
                     Live process charts refresh every few seconds; summary values refresh every 30 seconds. Child
                     processes (e.g. ffmpeg during video thumbnail generation) are tracked separately.
                   </Text>
@@ -980,7 +980,7 @@ export function DashboardPage() {
                         <Table.Tr key={node.node_id}>
                           <Table.Td>{node.node_id}</Table.Td>
                           <Table.Td>
-                            <Badge color={node.status === "online" ? ironmeshPrimaryColor : "gray"} variant="light">
+                            <Badge color={node.status === "online" ? berrykeepPrimaryColor : "gray"} variant="light">
                               {node.status}
                             </Badge>
                           </Table.Td>
@@ -1064,7 +1064,7 @@ export function DashboardPage() {
                   </Button>
                 </Group>
                 {mediaCacheClearResult ? (
-                  <Alert color={ironmeshPrimaryColor} variant="light" title="Media cache cleared">
+                  <Alert color={berrykeepPrimaryColor} variant="light" title="Media cache cleared">
                     Cleared {mediaCacheClearResult.deleted_metadata_records} metadata records and{" "}
                     {mediaCacheClearResult.deleted_thumbnail_files} generated thumbnails (
                     {formatBytes(mediaCacheClearResult.deleted_thumbnail_bytes)}) at{" "}
@@ -1195,7 +1195,7 @@ function startupStatusColor(status: string | undefined): string {
     case "running":
       return "orange";
     case "completed":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "skipped_no_gaps":
       return "blue";
     case "scheduled":

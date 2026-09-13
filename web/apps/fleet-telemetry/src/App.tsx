@@ -18,10 +18,10 @@ import {
 import { IconRefresh, IconShieldCheck } from "@tabler/icons-react";
 import {
   ColorSchemeControl,
-  IronmeshBrand,
+  BerryKeepBrand,
   PageHeader,
   StatCard
-} from "@ironmesh/ui/fleet-telemetry";
+} from "@berrykeep/ui/fleet-telemetry";
 import {
   Bar,
   BarChart,
@@ -48,7 +48,7 @@ export function App() {
     <Box className="fleet-page">
       <Box component="header" className="fleet-header">
         <Container size="lg" className="fleet-header-inner">
-          <IronmeshBrand surfaceLabel="Fleet reliability" />
+          <BerryKeepBrand surfaceLabel="Fleet reliability" />
           <Group gap="xs">
             <Badge color="brand" variant="light" leftSection={<IconShieldCheck size={14} />}>
               Public aggregates

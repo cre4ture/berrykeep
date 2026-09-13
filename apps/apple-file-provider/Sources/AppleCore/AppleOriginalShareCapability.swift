@@ -121,10 +121,12 @@ public struct AppleOriginalShareCapability: Codable, Equatable, Sendable {
 }
 
 public final class AppleOriginalShareCapabilityStore: @unchecked Sendable {
-    public static let directoryName = "IronmeshOriginalShareCapabilities"
+    public static let directoryName = "BerryKeepOriginalShareCapabilities"
+    public static let legacyDirectoryName = "IronmeshOriginalShareCapabilities"
 
     private static let processLock = NSLock()
     private let directoryURL: URL
+    private let legacyDirectoryURL: URL?
     private let clock: () -> Date
     private let tokenFactory: () -> String
 
@@ -135,7 +137,13 @@ public final class AppleOriginalShareCapabilityStore: @unchecked Sendable {
         ) else {
             throw AppleOriginalShareError.storageUnavailable
         }
-        self.init(directoryURL: containerURL.appendingPathComponent(Self.directoryName, isDirectory: true))
+        self.init(
+            directoryURL: containerURL.appendingPathComponent(Self.directoryName, isDirectory: true),
+            legacyDirectoryURL: containerURL.appendingPathComponent(
+                Self.legacyDirectoryName,
+                isDirectory: true
+            )
+        )
         #else
         _ = appGroupIdentifier
         throw AppleOriginalShareError.storageUnavailable
@@ -144,10 +152,12 @@ public final class AppleOriginalShareCapabilityStore: @unchecked Sendable {
 
     public init(
         directoryURL: URL,
+        legacyDirectoryURL: URL? = nil,
         clock: @escaping () -> Date = Date.init,
         tokenFactory: @escaping () -> String = { UUID().uuidString.lowercased() }
     ) {
         self.directoryURL = directoryURL
+        self.legacyDirectoryURL = legacyDirectoryURL
         self.clock = clock
         self.tokenFactory = tokenFactory
     }
@@ -248,6 +258,7 @@ public final class AppleOriginalShareCapabilityStore: @unchecked Sendable {
         defer { Self.processLock.unlock() }
 
         try ensureDirectoryExists()
+        try migrateLegacyCapabilitiesLocked()
         let lockFileURL = directoryURL.appendingPathComponent(".store.lock", isDirectory: false)
         _ = FileManager.default.createFile(atPath: lockFileURL.path, contents: Data())
         let lockFile: FileHandle
@@ -284,6 +295,28 @@ public final class AppleOriginalShareCapabilityStore: @unchecked Sendable {
             try mutableDirectoryURL.setResourceValues(values)
         } catch {
             throw AppleOriginalShareError.storageUnavailable
+        }
+    }
+
+    private func migrateLegacyCapabilitiesLocked() throws {
+        guard let legacyDirectoryURL,
+              legacyDirectoryURL != directoryURL,
+              FileManager.default.fileExists(atPath: legacyDirectoryURL.path)
+        else {
+            return
+        }
+
+        let legacyFiles = try FileManager.default.contentsOfDirectory(
+            at: legacyDirectoryURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        for legacyFile in legacyFiles where legacyFile.pathExtension == "json" {
+            let canonicalFile = directoryURL.appendingPathComponent(legacyFile.lastPathComponent)
+            guard !FileManager.default.fileExists(atPath: canonicalFile.path) else {
+                continue
+            }
+            try? FileManager.default.moveItem(at: legacyFile, to: canonicalFile)
         }
     }
 

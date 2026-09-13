@@ -3,11 +3,11 @@
 
     <application>
         <activity
-            android:name="io.ironmesh.android.GalleryMapWebUiTestActivity"
+            android:name="io.berrykeep.android.GalleryMapWebUiTestActivity"
             android:exported="false" />
         <provider
-            android:name="io.ironmesh.android.data.TestTreeDocumentsProvider"
-            android:authorities="io.ironmesh.android.test.documents"
+            android:name="io.berrykeep.android.data.TestTreeDocumentsProvider"
+            android:authorities="io.berrykeep.android.test.documents"
             android:exported="true"
             android:grantUriPermissions="true"
             android:permission="android.permission.MANAGE_DOCUMENTS">

@@ -32,7 +32,7 @@ Requirements:
 - use the existing shared web gallery surface,
 - only place images that actually have GPS metadata,
 - show thumbnails on the map,
-- keep the basemap self-hostable on Ironmesh-operated infrastructure,
+- keep the basemap self-hostable on BerryKeep-operated infrastructure,
 - keep the normal grid view available as the default fallback.
 
 ## Existing Foundation
@@ -70,7 +70,7 @@ Why:
 The current preference remains:
 
 - self-hosted `PMTiles` when a simple static basemap is sufficient,
-- `Martin` only if Ironmesh later needs a more standard or more dynamic tile-service setup.
+- `Martin` only if BerryKeep later needs a more standard or more dynamic tile-service setup.
 
 This note assumes the storage layer can already serve large basemap assets through the general
 read-through path when needed.
@@ -194,7 +194,7 @@ The first vector slice should stay intentionally small:
 
 - serve vector tiles from the split OpenMapTiles MBTiles via server-side tile endpoints,
 - serve glyph PBFs from a configured font directory,
-- use an Ironmesh-owned minimal MapLibre style,
+- use an BerryKeep-owned minimal MapLibre style,
 - avoid sprite/icon dependencies in the first pass,
 - expose `Satellite` and `Street` as separate basemap choices in the gallery.
 
@@ -217,13 +217,13 @@ The local `maptiler-server-map-styles-and-samples-3.15` bundle is useful as a re
 - sprite layout,
 - expected OpenMapTiles layer names.
 
-However, the sample bundle should not be treated as a drop-in Ironmesh deployment artifact.
+However, the sample bundle should not be treated as a drop-in BerryKeep deployment artifact.
 It contains MapTiler-Server-specific placeholders and may carry license restrictions that differ
-from Ironmesh deployment needs.
+from BerryKeep deployment needs.
 
 The first implementation should therefore:
 
-- own the actual style JSON in Ironmesh,
+- own the actual style JSON in BerryKeep,
 - treat sprite usage as optional and deferred,
 - treat the font directory as an external/configured asset root.
 
@@ -258,7 +258,7 @@ The frontend side should:
 - render raster and vector basemaps through the same shared gallery map surface,
 - keep marker overlay behavior identical across basemap modes.
 
-The first vector style should live in Ironmesh frontend code rather than depend on an external
+The first vector style should live in BerryKeep frontend code rather than depend on an external
 style JSON server.
 
 ## Remaining Map-Specific Decisions

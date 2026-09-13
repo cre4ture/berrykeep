@@ -109,7 +109,7 @@ log_file_for_node() {
 }
 
 session_name_for_node() {
-  printf 'ironmesh-%s' "$1"
+  printf 'berrykeep-%s' "$1"
 }
 
 screen_session_exists() {
@@ -183,7 +183,7 @@ start_node() {
   fi
 
   printf -v start_command \
-    'ulimit -n 1024 && cd %q && export IRONMESH_DATA_DIR=%q IRONMESH_SERVER_BIND=%q && %s' \
+    'ulimit -n 1024 && cd %q && export BERRYKEEP_DATA_DIR=%q BERRYKEEP_SERVER_BIND=%q && %s' \
     "$REPO_ROOT" "$data_dir" "$bind_addr" "$run_command"
 
   screen -L -Logfile "$log_file" -DdmS "$session_name" bash -lc "$start_command"

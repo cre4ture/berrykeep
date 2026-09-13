@@ -40,7 +40,7 @@ pub const CLIENT_CLI_EXE: &str = if cfg!(windows) {
 } else {
     "berrykeep"
 };
-pub const STARTUP_TASK_ID: &str = "IronmeshBackgroundLauncher";
+pub const STARTUP_TASK_ID: &str = "BerryKeepBackgroundLauncher";
 pub const PLATFORM_KIND: &str = env::consts::OS;
 pub const STARTUP_INTEGRATION_LABEL: &str = if cfg!(windows) {
     "Startup Task"
@@ -59,7 +59,7 @@ pub const STARTUP_INTEGRATION_NOTE: &str = if cfg!(windows) {
 };
 pub const OS_INTEGRATION_MANAGEMENT_SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 
-const LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
+const LOCAL_STATE_ROOT_DIR: &str = "BerryKeep";
 const CONFIG_SUBDIR: &str = "desktop-client-config";
 #[cfg(windows)]
 const LEGACY_WINDOWS_CONFIG_SUBDIR: &str = "windows-client-config";
@@ -1510,7 +1510,7 @@ fn is_windows_apps_package_root(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn windows_app_execution_alias_path(executable_name: &str) -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
+    common::legacy_compatibility::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|path| {
@@ -1566,7 +1566,7 @@ fn write_launch_log_header(
     command_line: &[String],
 ) -> Result<()> {
     writeln!(file)?;
-    writeln!(file, "=== IronMesh service launch ===")?;
+    writeln!(file, "=== BerryKeep service launch ===")?;
     writeln!(file, "launched_at_unix_ms={launched_at_unix_ms}")?;
     writeln!(file, "instance_kind={instance_kind}")?;
     writeln!(file, "id={id}")?;
@@ -1617,7 +1617,7 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn local_appdata_root() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
+    common::legacy_compatibility::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -1683,11 +1683,13 @@ fn state_home_root() -> PathBuf {
 
 #[cfg(not(windows))]
 fn xdg_dir(env_var: &str, home_suffix: &[&str]) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
+    if let Some(path) =
+        common::legacy_compatibility::var_os(env_var).filter(|value| !value.is_empty())
+    {
         return Some(PathBuf::from(path));
     }
 
-    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
+    let home = common::legacy_compatibility::var_os("HOME").filter(|value| !value.is_empty())?;
     let mut path = PathBuf::from(home);
     for segment in home_suffix {
         path.push(segment);
@@ -1850,7 +1852,7 @@ mod tests {
         let report = LaunchReport {
             version: LAUNCH_REPORT_VERSION,
             launched_at_unix_ms: 1,
-            package_root: "/opt/ironmesh".to_string(),
+            package_root: "/opt/berrykeep".to_string(),
             total_enabled: 1,
             outcomes: vec![LaunchOutcome {
                 instance_kind: "folder-agent".to_string(),
@@ -1858,7 +1860,7 @@ mod tests {
                 label: "Folder".to_string(),
                 executable: "/opt/berrykeep/berrykeep-folder-agent".to_string(),
                 command_line: vec!["--root-dir".to_string(), "/tmp/folder".to_string()],
-                log_file: Some("/tmp/ironmesh/folder-agent-folder-1.log".to_string()),
+                log_file: Some("/tmp/berrykeep/folder-agent-folder-1.log".to_string()),
                 pid: Some(42),
                 error: None,
             }],
@@ -1907,7 +1909,7 @@ mod tests {
         let report = LaunchReport {
             version: LAUNCH_REPORT_VERSION,
             launched_at_unix_ms: 1,
-            package_root: "/opt/ironmesh".to_string(),
+            package_root: "/opt/berrykeep".to_string(),
             total_enabled: 1,
             outcomes: vec![LaunchOutcome {
                 instance_kind: "folder-agent".to_string(),
@@ -2038,7 +2040,7 @@ mod tests {
             "unexpected log file path: {log_file}"
         );
         let log = std::fs::read_to_string(&log_file).expect("log file should be readable");
-        assert!(log.contains("=== IronMesh service launch ==="));
+        assert!(log.contains("=== BerryKeep service launch ==="));
         assert!(log.contains("instance_kind=folder-agent"));
         assert!(log.contains("id=folder/one"));
         assert!(log.contains("spawn attempt failed executable="));
@@ -2050,11 +2052,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_apps_package_root_prefers_app_execution_alias() {
-        let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") else {
+        let Some(local_appdata) = common::legacy_compatibility::var_os("LOCALAPPDATA") else {
             return;
         };
         let package_root = PathBuf::from(
-            r"C:\Program Files\WindowsApps\UlrichHornung.IronMesh_1.0.2.1_neutral__bnh81bg69mtt8",
+            r"C:\Program Files\WindowsApps\UlrichHornung.BerryKeep_1.0.2.1_neutral__bnh81bg69mtt8",
         );
 
         let candidates = service_executable_candidates(&package_root, OS_INTEGRATION_EXE);
@@ -2078,7 +2080,7 @@ mod tests {
             &path,
             r#"{
   "launched_at_unix_ms": 1,
-  "package_root": "/opt/ironmesh",
+  "package_root": "/opt/berrykeep",
   "total_enabled": 0,
   "outcomes": []
 }"#,
@@ -2103,7 +2105,7 @@ mod tests {
             r#"{
   "version": 99,
   "launched_at_unix_ms": 1,
-  "package_root": "/opt/ironmesh",
+  "package_root": "/opt/berrykeep",
   "total_enabled": 0,
   "outcomes": []
 }"#,

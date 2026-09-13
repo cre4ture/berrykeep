@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/ironmesh-favicon.svg" alt="BerryKeep logo" width="144" />
+  <img src="docs/assets/berrykeep-favicon.svg" alt="BerryKeep logo" width="144" />
 </p>
 
 # BerryKeep
@@ -54,25 +54,13 @@ Example for the web-ui (apps have similar):
 
 <img width="1647" height="1386" alt="image" src="https://github.com/user-attachments/assets/382bdf31-189b-4e7f-867f-a5e7ec534ed0" />
 
-## Renaming from IronMesh
+## Name and compatibility
 
-This project is being renamed from **IronMesh** to **BerryKeep** because the
-former name is already used by another project. The repository and
-user-facing product surfaces are now moving to the BerryKeep name and the new
-grape-and-leaf icon.
-
-The rename is deliberately incremental. To preserve compatibility with
-existing installs, data, automation, and package upgrades, many technical
-identifiers still use the legacy `ironmesh` name. These include Cargo package
-and crate names, binary and command names, environment variables, systemd
-service and user names, data directories, package-transition names,
-application identities, and some asset and source-file names.
-
-Existing APT clients can continue using the legacy `/apt/ironmesh` URL; it is
-a signed compatibility mirror of the new BerryKeep repository. A future
-compatibility-aware migration will update the remaining identifiers; until
-then, an `ironmesh` reference in a command, path, package name, or
-configuration key is expected and does not identify a separate product.
+BerryKeep is the canonical product and project name. New commands, packages,
+configuration, application identities, API contracts, paths, and
+documentation use that name. Existing deployments can follow the documented
+[legacy compatibility inventory](docs/legacy-compatibility.md) for
+their temporary migration contracts.
 
 ## Project Status
 
@@ -108,13 +96,13 @@ As a software engineer, I want the same relationship with my computer and my dat
 
 BerryKeep is also a test of what is now possible for an individual builder. AI coding agents have expanded the practical reach of small teams and solo engineers by an order of magnitude, and part of this project is to explore that shift seriously. Proving that this kind of ambitious, deeply owned software can be built in a new way is not separate from the project's purpose; it is one of its central goals.
 
-## At A Glance (Legacy Diagram)
+## At a glance
 
 <p align="center">
-  <a href="docs/assets/ironmesh-at-a-glance.png">
+  <a href="docs/assets/berrykeep-at-a-glance.png">
     <img
-      src="docs/assets/ironmesh-at-a-glance.png"
-      alt="IronMesh at a glance overview diagram (legacy branding)"
+      src="docs/assets/berrykeep-at-a-glance.png"
+      alt="BerryKeep at a glance overview diagram"
       width="1200"
     />
   </a>
@@ -150,9 +138,6 @@ BerryKeep Ubuntu packages are published from the signed APT repository at:
 https://creax.de/apt/berrykeep
 ```
 
-`https://creax.de/apt/ironmesh` remains available as a signed compatibility
-mirror for existing apt source entries.
-
 These packages follow the experimental status above and are intended for
 evaluation and controlled self-hosted testing.
 
@@ -182,8 +167,7 @@ curl -fsSL https://creax.de/apt/berrykeep/berrykeep-archive-keyring.asc \
 ```
 
 Add exactly one apt source, matching the Ubuntu release and architecture of the
-host. New installations use `berrykeep.list`; existing clients can retain an
-`ironmesh.list` source because the legacy URL is a compatibility mirror:
+host. New installations use `berrykeep.list`:
 
 ```bash
 # Ubuntu 20.04 ARM64
@@ -221,11 +205,9 @@ sudo apt install berrykeep-server-node-map-tools
 The `berrykeep-server-node` package installs a systemd service, but it does not
 start it automatically. Configure the service first:
 
-These instructions are for a new installation. An upgraded
-`ironmesh-server-node` continues using its legacy service, configuration, and
-state path. Before enabling the BerryKeep unit on that host, deliberately
-migrate its configuration and state; starting `berrykeep-server-node.service`
-stops the legacy unit. See [the Debian package-name transition guide](docs/debian-package-name-transition.md).
+These instructions are for a new installation. Before enabling the BerryKeep
+unit on an upgraded host, follow the
+[Debian package transition guide](docs/debian-package-name-transition.md).
 
 ```bash
 sudoedit /etc/berrykeep/server-node.env
@@ -234,8 +216,8 @@ sudoedit /etc/berrykeep/server-node.env
 For a first node in a new cluster, this minimal configuration is enough:
 
 ```bash
-IRONMESH_DATA_DIR=/var/lib/berrykeep-server-node
-IRONMESH_SERVER_BIND=0.0.0.0:8443
+BERRYKEEP_DATA_DIR=/var/lib/berrykeep-server-node
+BERRYKEEP_SERVER_BIND=0.0.0.0:8443
 ```
 
 Then enable the service for boot and start it immediately:
@@ -264,18 +246,9 @@ The package creates a dedicated `berrykeep-server-node` system user. The service
 runs as that user, and systemd creates `/var/lib/berrykeep-server-node` as its
 state directory.
 
-If you upgrade from an earlier Ironmesh beta package that ran the service as
-`root`, fix its retained legacy service data ownership once:
-
-```bash
-sudo chown -R ironmesh-server-node:ironmesh-server-node /var/lib/ironmesh-server-node
-sudo systemctl restart ironmesh-server-node.service
-```
-
-Existing `ironmesh-*` installations upgrade through transitional packages that
-keep their current services, configuration files, state directories, and
-legacy command aliases. See [the Debian package transition guide](docs/debian-package-name-transition.md)
-for the operator-facing details.
+If you upgrade from an earlier beta package that ran the service as `root`,
+follow the ownership and transition steps in the
+[Debian package transition guide](docs/debian-package-name-transition.md).
 
 ## Install On macOS
 

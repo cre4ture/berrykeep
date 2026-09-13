@@ -26,7 +26,7 @@ pub const FOLDER_AGENT_EXE: &str = if cfg!(windows) {
 } else {
     "berrykeep-folder-agent"
 };
-pub const STARTUP_TASK_ID: &str = "IronmeshBackgroundLauncher";
+pub const STARTUP_TASK_ID: &str = "BerryKeepBackgroundLauncher";
 pub const PLATFORM_KIND: &str = env::consts::OS;
 pub const STARTUP_INTEGRATION_LABEL: &str = if cfg!(windows) {
     "Startup Task"
@@ -45,7 +45,7 @@ pub const STARTUP_INTEGRATION_NOTE: &str = if cfg!(windows) {
 };
 pub const OS_INTEGRATION_MANAGEMENT_SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 
-const LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
+const LOCAL_STATE_ROOT_DIR: &str = "BerryKeep";
 #[cfg(windows)]
 const CONFIG_SUBDIR: &str = "windows-client-config";
 #[cfg(not(windows))]
@@ -837,7 +837,7 @@ mod tests {
         let report = LaunchReport {
             version: LAUNCH_REPORT_VERSION,
             launched_at_unix_ms: 1,
-            package_root: "C:/Ironmesh".to_string(),
+            package_root: "C:/BerryKeep".to_string(),
             total_enabled: 1,
             outcomes: vec![LaunchOutcome {
                 instance_kind: "folder-agent".to_string(),
@@ -868,7 +868,7 @@ mod tests {
             &path,
             r#"{
   "launched_at_unix_ms": 1,
-  "package_root": "C:/Ironmesh",
+  "package_root": "C:/BerryKeep",
   "total_enabled": 0,
   "outcomes": []
 }"#,
@@ -893,7 +893,7 @@ mod tests {
             r#"{
   "version": 99,
   "launched_at_unix_ms": 1,
-  "package_root": "C:/Ironmesh",
+  "package_root": "C:/BerryKeep",
   "total_enabled": 0,
   "outcomes": []
 }"#,

@@ -1,4 +1,4 @@
-import type { GalleryMapConfiguration } from "@ironmesh/api";
+import type { GalleryMapConfiguration } from "@berrykeep/api";
 import { expect, test, type Page } from "@playwright/test";
 
 export type GalleryMapContractSetup = {

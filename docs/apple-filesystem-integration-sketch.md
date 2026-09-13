@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document is the implementation sketch for bringing IronMesh to Apple platforms, with:
+This document is the implementation sketch for bringing BerryKeep to Apple platforms, with:
 
 1. `File Provider` on both macOS and iOS/iPadOS as the shared primary track.
 2. `folder-agent + Finder Sync` as the lowest-priority fallback/MVP track only if File Provider is blocked.
@@ -65,7 +65,7 @@ This priority explicitly covers both macOS and iOS/iPadOS together. It is not in
 Why this is first:
 
 - It is the Apple-supported cloud-files integration model for both macOS and iOS/iPadOS.
-- It is the closest Apple equivalent to IronMesh's existing Android `DocumentsProvider` and Windows CFAPI work.
+- It is the closest Apple equivalent to BerryKeep's existing Android `DocumentsProvider` and Windows CFAPI work.
 - It supports the right UX class:
   - Finder / Files visibility
   - on-demand hydration
@@ -77,7 +77,7 @@ What this should become:
 
 - A native Apple host app for account/bootstrap setup.
 - A File Provider extension using the modern replicated model.
-- A thin native-to-Rust bridge so the extension can call shared IronMesh transport and sync logic.
+- A thin native-to-Rust bridge so the extension can call shared BerryKeep transport and sync logic.
 
 Practical architecture:
 
@@ -85,7 +85,7 @@ Practical architecture:
    - Swift/SwiftUI host app.
    - Collect server/bootstrap config, trust roots, and client identity material.
    - Persist those settings in an app-group container shared with the extension.
-   - Register one `NSFileProviderDomain` per configured IronMesh account/root.
+   - Register one `NSFileProviderDomain` per configured BerryKeep account/root.
 
 2. File Provider extension
    - Use `NSFileProviderReplicatedExtension`.
@@ -243,7 +243,7 @@ Apple-facing metadata/list responses should carry the fields that the extension 
   - conflict reason codes such as modify/modify or modify/delete
   - preferred revision/head information
   - optional alternate/conflicting revision identifiers
-  - optional conflict-copy/reference path if IronMesh materializes one
+  - optional conflict-copy/reference path if BerryKeep materializes one
 
 ## Key design rules
 
@@ -277,10 +277,10 @@ Suggested shape:
 
 Suggested native targets:
 
-- `IronmeshMacApp`
-- `IronmeshMacFileProviderExtension`
-- `IronmeshIosApp`
-- `IronmeshIosFileProviderExtension`
+- `BerryKeepMacApp`
+- `BerryKeepMacFileProviderExtension`
+- `BerryKeepIosApp`
+- `BerryKeepIosFileProviderExtension`
 
 Suggested shared native modules:
 

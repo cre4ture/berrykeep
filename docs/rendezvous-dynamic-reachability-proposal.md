@@ -157,8 +157,8 @@ Client-side consumption is new; see 4.3.
 
 **Config.** Add `peer_rendezvous_urls: Vec<String>` to
 `RendezvousServiceConfig` (`apps/rendezvous-service/src/config.rs`), parsed
-from a new `IRONMESH_RENDEZVOUS_PEER_URLS` env var using the same
-comma-split pattern already used for `IRONMESH_RELAY_PUBLIC_URLS`
+from a new `BERRYKEEP_RENDEZVOUS_PEER_URLS` env var using the same
+comma-split pattern already used for `BERRYKEEP_RELAY_PUBLIC_URLS`
 (`config.rs:147-157`).
 
 **Probing.** Reuse, don't reinvent: `RendezvousControlClient` in
@@ -203,7 +203,7 @@ it is meant for device clients, which should not need node operational
 metadata.
 
 **Client-sdk integration.** `crates/client-sdk` already builds a
-`RendezvousControlClient` in `connection.rs` / `ironmesh_client.rs` /
+`RendezvousControlClient` in `connection.rs` / `berrykeep_client.rs` /
 `session_pool.rs` for relay use. Add
 `RendezvousControlClient::fetch_discovery(node_id)` (mirrors the existing
 `list_presence`/`issue_relay_ticket` methods, same multi-URL fallback loop).
@@ -256,9 +256,9 @@ tests already sensitive to target-shape changes). Concretely:
 3. `crates/transport-sdk/src/rendezvous_runtime.rs`: `PresenceRegistry::register` takes observed addr; add `fetch_discovery` to `RendezvousControlClient`.
 4. `crates/rendezvous-server/src/auth.rs`: add `require_any_authenticated_peer`; capture peer `SocketAddr` in `MtlsAuthenticatedPeerAcceptor` and the plain-HTTP `axum::serve` path.
 5. `crates/rendezvous-server/src/lib.rs`: `RendezvousAppState` gains a mesh-probing `RendezvousControlClient` + background task; new `/control/mesh` and `/control/discovery` routes; candidate synthesis in `register_presence`/`list_presence`.
-6. `apps/rendezvous-service/src/config.rs`: `peer_rendezvous_urls` from `IRONMESH_RENDEZVOUS_PEER_URLS`.
+6. `apps/rendezvous-service/src/config.rs`: `peer_rendezvous_urls` from `BERRYKEEP_RENDEZVOUS_PEER_URLS`.
 7. `crates/client-sdk/src/bootstrap.rs`: `refresh_dynamic_targets_blocking`.
-8. Debian/deploy artifacts (`debian/ironmesh-rendezvous-service.env`, `scripts/deploy-rendezvous-service.sh`): document the new env var.
+8. Debian/deploy artifacts (`debian/berrykeep-rendezvous-service.env`, `scripts/deploy-rendezvous-service.sh`): document the new env var.
 9. System tests: extend `tests/system-tests/src/cluster_test.rs` (mesh probing between rendezvous instances, reflexive-candidate propagation) and add a client-facing discovery test alongside the existing `cli_managed_rendezvous_latency_test.rs` / `cli_latency_test.rs` added on this branch's parent.
 
 ## 7. Suggested implementation phases

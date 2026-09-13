@@ -19,7 +19,7 @@ fn main() {
         .join("apps")
         .join("server-admin")
         .join("dist");
-    let prebuilt_web_dir = env::var_os("IRONMESH_PREBUILT_WEB_DIR").map(PathBuf::from);
+    let prebuilt_web_dir = env::var_os("BERRYKEEP_PREBUILT_WEB_DIR").map(PathBuf::from);
 
     println!("cargo:rerun-if-changed=build.rs");
     println!(
@@ -165,11 +165,11 @@ fn main() {
             .join("..")
             .join("docs")
             .join("assets")
-            .join("ironmesh-favicon.svg")
+            .join("berrykeep-favicon.svg")
             .display()
     );
     println!("cargo:rerun-if-env-changed=PATH");
-    println!("cargo:rerun-if-env-changed=IRONMESH_PREBUILT_WEB_DIR");
+    println!("cargo:rerun-if-env-changed=BERRYKEEP_PREBUILT_WEB_DIR");
     if let Some(prebuilt_web_dir) = prebuilt_web_dir.as_deref() {
         println!(
             "cargo:rerun-if-changed={}",
@@ -412,7 +412,7 @@ fn resolve_prebuilt_dist_dir(prebuilt_web_dir: &Path, app_name: &str) -> PathBuf
     }
 
     panic!(
-        "prebuilt web assets requested via IRONMESH_PREBUILT_WEB_DIR={}, but {} is missing index.html",
+        "prebuilt web assets requested via BERRYKEEP_PREBUILT_WEB_DIR={}, but {} is missing index.html",
         prebuilt_web_dir.display(),
         candidate.display()
     );
@@ -424,7 +424,7 @@ struct FrontendBuildLock {
 
 impl FrontendBuildLock {
     fn acquire(web_workspace_dir: &Path) -> Self {
-        let lock_path = web_workspace_dir.join(".ironmesh-build.lock");
+        let lock_path = web_workspace_dir.join(".berrykeep-build.lock");
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)

@@ -42,7 +42,7 @@ final class AppleItemVersionFingerprintTests: XCTestCase {
             XCTAssertEqual(error.domain, NSFileProviderErrorDomain)
             XCTAssertEqual(error.code, NSFileProviderError.Code.cannotSynchronize.rawValue)
             XCTAssertEqual(
-                error.userInfo["IronmeshConflictReason"] as? String,
+                error.userInfo["BerryKeepConflictReason"] as? String,
                 "missing_post_move_revision"
             )
         }
@@ -59,7 +59,7 @@ final class AppleItemVersionFingerprintTests: XCTestCase {
     }
 
     func testDeleteConflictUsesDeletionRejectedDisposition() {
-        let error = ironmeshDeletionRejectedError(
+        let error = berrykeepDeletionRejectedError(
             path: "documents/report.txt",
             expectedRevision: "v1",
             currentRevision: "v2"
@@ -67,8 +67,8 @@ final class AppleItemVersionFingerprintTests: XCTestCase {
 
         XCTAssertEqual(error.domain, NSFileProviderErrorDomain)
         XCTAssertEqual(error.code, NSFileProviderError.Code.deletionRejected.rawValue)
-        XCTAssertEqual(error.userInfo["IronmeshExpectedRevision"] as? String, "v1")
-        XCTAssertEqual(error.userInfo["IronmeshCurrentRevision"] as? String, "v2")
+        XCTAssertEqual(error.userInfo["BerryKeepExpectedRevision"] as? String, "v1")
+        XCTAssertEqual(error.userInfo["BerryKeepCurrentRevision"] as? String, "v2")
     }
 
     func testDirectoryDeleteIsAdvertisedAndUsesRecursiveRemotePath() {
@@ -94,13 +94,13 @@ final class AppleItemVersionFingerprintTests: XCTestCase {
     }
 
     func testConflictCopyErrorRequestsWorkingSetSignal() {
-        let conflictError = ironmeshConflictError(
+        let conflictError = berrykeepConflictError(
             originalPath: "documents/report.txt",
-            conflictCopyPath: "documents/report (IronMesh conflict abc).txt",
+            conflictCopyPath: "documents/report (BerryKeep conflict abc).txt",
             expectedRevision: "v1",
             currentRevision: "v2"
         )
-        let moveError = ironmeshRevisionConflictError(
+        let moveError = berrykeepRevisionConflictError(
             path: "documents/report.txt",
             expectedRevision: "v1",
             currentRevision: "v2"

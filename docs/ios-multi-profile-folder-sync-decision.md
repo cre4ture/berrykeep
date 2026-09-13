@@ -67,7 +67,7 @@ still inherits the verified preferred head; `parent` is not used as a substitute
 The extension performs an early metadata check for useful UI feedback, then relies on the server
 check to close the race window. When a content PUT loses the race, it refreshes metadata, writes the
 user's bytes to a deterministic sibling named
-`<name> (IronMesh conflict <stable fingerprint>).<extension>`, and reports File Provider
+`<name> (BerryKeep conflict <stable fingerprint>).<extension>`, and reports File Provider
 `cannotSynchronize` with the expected/current revisions and conflict path. Delete and rename races
 are intentionally different: rename remains `cannotSynchronize`, while delete uses File Provider's
 `fileProviderErrorForRejectedDeletion` with the current item so Files restores the retained remote
@@ -83,7 +83,7 @@ provider preserves the trailing slash required by the Rust client to request a r
 
 This is deliberately a recoverability guarantee, not namespace compare-and-swap semantics. The
 stronger namespace snapshot CAS proposal in
-[#148](https://github.com/cre4ture/ironmesh/issues/148) is deferred rather than required for iOS
+[#148](https://github.com/cre4ture/berrykeep/issues/148) is deferred rather than required for iOS
 folder deletion. Snapshot persistence and retention remain operational requirements for this
 product decision.
 
@@ -95,7 +95,7 @@ product decision.
 - Directory deletion is enabled in Files. It recursively tombstones the remote subtree; a
   concurrent child change is recoverable from snapshot/version history, but is not automatically
   restored or presented as a File Provider conflict copy.
-- Offline operation ordering and materialized-data lifetime remain OS responsibilities; IronMesh
+- Offline operation ordering and materialized-data lifetime remain OS responsibilities; BerryKeep
   does not maintain a second foreground queue.
 - Profile scopes may overlap. They are separate Files domains and can surface the same remote object;
   the UI should make this explicit rather than silently rejecting a valid configuration.

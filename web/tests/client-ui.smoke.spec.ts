@@ -62,7 +62,7 @@ registerGalleryMapContractTests({
 
 test("embedded Android accent color overrides the browser-local preference", async ({ page }) => {
   await page.addInitScript(() => {
-    window.localStorage.setItem("ironmesh-accent-color", "#db2777");
+    window.localStorage.setItem("berrykeep-accent-color", "#db2777");
   });
   await installClientUiMocks(page);
   await page.goto("/?embedded_client=android&accent_color=%232563eb");
@@ -70,7 +70,7 @@ test("embedded Android accent color overrides the browser-local preference", asy
   await expect
     .poll(() =>
       page.evaluate(() =>
-        document.documentElement.style.getPropertyValue("--ironmesh-accent-rgb").trim()
+        document.documentElement.style.getPropertyValue("--berrykeep-accent-rgb").trim()
       )
     )
     .toBe("37, 99, 235");
@@ -93,17 +93,17 @@ test("private service origins keep the launch cookie and sibling sites isolated"
     if (host.startsWith("localhost:") && request.url === "/start") {
       response.setHeader("content-type", "text/html; charset=utf-8");
       response.end(
-        `<a id="launch" href="http://strict-check.localhost:${address.port}/_ironmesh/open">Open</a>`
+        `<a id="launch" href="http://strict-check.localhost:${address.port}/_berrykeep/open">Open</a>`
       );
       return;
     }
     if (
       host.startsWith("strict-check.localhost:") &&
-      request.url === "/_ironmesh/open"
+      request.url === "/_berrykeep/open"
     ) {
       response.setHeader(
         "set-cookie",
-        "ironmesh_service_gateway_session=session-secret; HttpOnly; SameSite=Strict; Path=/"
+        "berrykeep_service_gateway_session=session-secret; HttpOnly; SameSite=Strict; Path=/"
       );
       response.setHeader("content-type", "text/html; charset=utf-8");
       response.setHeader(
@@ -119,7 +119,7 @@ test("private service origins keep the launch cookie and sibling sites isolated"
       response.setHeader("content-type", "text/html; charset=utf-8");
       response.end(
         `<script>
-          document.cookie = "ironmesh_service_gateway_session=shadow; Domain=localhost; Path=/";
+          document.cookie = "berrykeep_service_gateway_session=shadow; Domain=localhost; Path=/";
           document.cookie = "sid=sibling-injected; Domain=localhost; Path=/";
         </script>
         <a id="cross-service" href="http://strict-check.localhost:${address.port}/">Open sibling</a>`
@@ -129,10 +129,10 @@ test("private service origins keep the launch cookie and sibling sites isolated"
     if (host.startsWith("strict-check.localhost:") && request.url === "/") {
       const cookies = String(request.headers.cookie ?? "");
       const authenticated = cookies.includes(
-        "ironmesh_service_gateway_session=session-secret"
+        "berrykeep_service_gateway_session=session-secret"
       );
       const siblingCookieLeaked =
-        cookies.includes("ironmesh_service_gateway_session=shadow") ||
+        cookies.includes("berrykeep_service_gateway_session=shadow") ||
         cookies.includes("sid=sibling-injected");
       const body = siblingCookieLeaked
         ? "sibling-cookie-leaked"
@@ -363,8 +363,8 @@ async function installAndroidShareBridgeMock(page: Page): Promise<void> {
     const messages: string[] = [];
     const listeners = new Set<(event: { data: string }) => void>();
     Object.assign(window, {
-      __ironmeshShareMessages: messages,
-      IronmeshAndroidShare: {
+      __berrykeepShareMessages: messages,
+      BerryKeepAndroidShare: {
         postMessage(message: string) {
           messages.push(message);
           const request = JSON.parse(message) as { requestId: string };
@@ -386,7 +386,7 @@ async function installAndroidShareBridgeMock(page: Page): Promise<void> {
 
 async function androidShareMessages(page: Page): Promise<string[]> {
   return page.evaluate(
-    () => (window as typeof window & { __ironmeshShareMessages: string[] }).__ironmeshShareMessages
+    () => (window as typeof window & { __berrykeepShareMessages: string[] }).__berrykeepShareMessages
   );
 }
 
@@ -1088,15 +1088,15 @@ test("client-ui synchronizes direct Android gallery fullscreen with its native h
   await page.addInitScript(() => {
     const messages: string[] = [];
     (window as Window & {
-      IronmeshAndroidUi?: { postMessage: (message: string) => void };
-      ironmeshAndroidFullscreenMessages?: string[];
-    }).IronmeshAndroidUi = {
+      BerryKeepAndroidUi?: { postMessage: (message: string) => void };
+      berrykeepAndroidFullscreenMessages?: string[];
+    }).BerryKeepAndroidUi = {
       postMessage(message) {
         messages.push(message);
       }
     };
-    (window as Window & { ironmeshAndroidFullscreenMessages?: string[] })
-      .ironmeshAndroidFullscreenMessages = messages;
+    (window as Window & { berrykeepAndroidFullscreenMessages?: string[] })
+      .berrykeepAndroidFullscreenMessages = messages;
   });
   await installClientUiMocks(page);
   await page.goto("/?embedded=gallery_map&embedded_client=android");
@@ -1121,22 +1121,22 @@ test("client-ui synchronizes direct Android gallery fullscreen with its native h
   await expect
     .poll(() =>
       page.evaluate(() => {
-        const messages = (window as Window & { ironmeshAndroidFullscreenMessages?: string[] })
-          .ironmeshAndroidFullscreenMessages ?? [];
+        const messages = (window as Window & { berrykeepAndroidFullscreenMessages?: string[] })
+          .berrykeepAndroidFullscreenMessages ?? [];
         return JSON.parse(messages[messages.length - 1] ?? "{}").fullscreen;
       })
     )
     .toBe(true);
 
   await page.evaluate(() => {
-    window.dispatchEvent(new Event("ironmesh:gallery-map-exit-fullscreen"));
+    window.dispatchEvent(new Event("berrykeep:gallery-map-exit-fullscreen"));
   });
   await expect(exitControl).toHaveCount(0);
   await expect
     .poll(() =>
       page.evaluate(() => {
-        const messages = (window as Window & { ironmeshAndroidFullscreenMessages?: string[] })
-          .ironmeshAndroidFullscreenMessages ?? [];
+        const messages = (window as Window & { berrykeepAndroidFullscreenMessages?: string[] })
+          .berrykeepAndroidFullscreenMessages ?? [];
         return JSON.parse(messages[messages.length - 1] ?? "{}").fullscreen;
       })
     )
@@ -1149,8 +1149,8 @@ test("client-ui synchronizes direct Android gallery fullscreen with its native h
   await expect
     .poll(() =>
       page.evaluate(() => {
-        const messages = (window as Window & { ironmeshAndroidFullscreenMessages?: string[] })
-          .ironmeshAndroidFullscreenMessages ?? [];
+        const messages = (window as Window & { berrykeepAndroidFullscreenMessages?: string[] })
+          .berrykeepAndroidFullscreenMessages ?? [];
         return JSON.parse(messages[messages.length - 1] ?? "{}").fullscreen;
       })
     )
@@ -1226,10 +1226,10 @@ test("client-ui iOS media viewer shares an immutable original through the native
   await page.addInitScript(() => {
     const messages: Array<Record<string, unknown>> = [];
     Object.assign(window, {
-      __ironmeshIosShareMessages: messages,
+      __berrykeepIosShareMessages: messages,
       webkit: {
         messageHandlers: {
-          IronmeshIosShare: {
+          BerryKeepIosShare: {
             postMessage(message: Record<string, unknown>) {
               messages.push(message);
               return Promise.resolve({ requestId: message.requestId, status: "opened" });
@@ -1253,8 +1253,8 @@ test("client-ui iOS media viewer shares an immutable original through the native
 
   const payloads = await page.evaluate(
     () =>
-      (window as typeof window & { __ironmeshIosShareMessages: Array<Record<string, unknown>> })
-        .__ironmeshIosShareMessages
+      (window as typeof window & { __berrykeepIosShareMessages: Array<Record<string, unknown>> })
+        .__berrykeepIosShareMessages
   );
   expect(payloads).toHaveLength(1);
   expect(payloads[0]).toMatchObject({
@@ -1310,14 +1310,14 @@ test("client-ui iOS media viewer ignores stale native share responses", async ({
       resolve: (response: { requestId: string; status: "opened" | "error" }) => void;
     }> = [];
     Object.assign(window, {
-      __ironmeshIosPendingShares: pending,
-      __resolveIronmeshIosShare(index: number, status: "opened" | "error") {
+      __berrykeepIosPendingShares: pending,
+      __resolveBerryKeepIosShare(index: number, status: "opened" | "error") {
         const entry = pending[index];
         entry?.resolve({ requestId: entry.requestId, status });
       },
       webkit: {
         messageHandlers: {
-          IronmeshIosShare: {
+          BerryKeepIosShare: {
             postMessage(message: Record<string, unknown>) {
               return new Promise((resolve) => {
                 pending.push({
@@ -1352,9 +1352,9 @@ test("client-ui iOS media viewer ignores stale native share responses", async ({
         () =>
           (
             window as typeof window & {
-              __ironmeshIosPendingShares: Array<unknown>;
+              __berrykeepIosPendingShares: Array<unknown>;
             }
-          ).__ironmeshIosPendingShares.length
+          ).__berrykeepIosPendingShares.length
       )
     )
     .toBe(2);
@@ -1363,27 +1363,27 @@ test("client-ui iOS media viewer ignores stale native share responses", async ({
       () =>
         (
           window as typeof window & {
-            __ironmeshIosPendingShares: Array<{ key: string }>;
+            __berrykeepIosPendingShares: Array<{ key: string }>;
           }
-        ).__ironmeshIosPendingShares.map((entry) => entry.key)
+        ).__berrykeepIosPendingShares.map((entry) => entry.key)
     )
   ).toEqual(["gallery/cat.png", "gallery/dog.jpg"]);
 
   await page.evaluate(() => {
     (
       window as typeof window & {
-        __resolveIronmeshIosShare: (index: number, status: "opened" | "error") => void;
+        __resolveBerryKeepIosShare: (index: number, status: "opened" | "error") => void;
       }
-    ).__resolveIronmeshIosShare(0, "opened");
+    ).__resolveBerryKeepIosShare(0, "opened");
   });
   await expect(dialog.getByRole("button", { name: "Preparing share…" })).toBeVisible();
 
   await page.evaluate(() => {
     (
       window as typeof window & {
-        __resolveIronmeshIosShare: (index: number, status: "opened" | "error") => void;
+        __resolveBerryKeepIosShare: (index: number, status: "opened" | "error") => void;
       }
-    ).__resolveIronmeshIosShare(1, "opened");
+    ).__resolveBerryKeepIosShare(1, "opened");
   });
   await expect(dialog.getByRole("button", { name: "Share opened" })).toBeVisible();
 });
@@ -1595,7 +1595,7 @@ test("client-ui gallery recovers from a basemap metadata failure", async ({ page
   await page.getByRole("button", { name: "Switch to grid view" }).click();
   await expect(page.getByRole("button", { name: "Grid" })).toHaveAttribute("aria-pressed", "true");
   await expect(page.locator('[data-gallery-grid="true"]').last()).toBeVisible();
-  expect(await page.evaluate(() => window.localStorage.getItem("ironmesh.gallery.view_mode"))).toBe(
+  expect(await page.evaluate(() => window.localStorage.getItem("berrykeep.gallery.view_mode"))).toBe(
     "grid"
   );
 
@@ -1763,8 +1763,8 @@ test("client-ui gallery reuses an evicted virtual page without requesting it aga
 }) => {
   test.setTimeout(45_000);
   await page.addInitScript(() => {
-    window.localStorage.setItem("ironmesh.gallery.thumbnails_per_row", "8");
-    window.localStorage.setItem("ironmesh.gallery.show_metadata", "false");
+    window.localStorage.setItem("berrykeep.gallery.thumbnails_per_row", "8");
+    window.localStorage.setItem("berrykeep.gallery.show_metadata", "false");
   });
 
   const pageOffsets: string[] = [];
@@ -2358,7 +2358,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     const { pathname, searchParams } = url;
     const method = route.request().method();
     requestedPaths.add(pathname);
-    const diagnosticContext = route.request().headers()["x-ironmesh-diagnostic-context"];
+    const diagnosticContext = route.request().headers()["x-berrykeep-diagnostic-context"];
     if (diagnosticContext) {
       diagnosticContexts.add(diagnosticContext);
       diagnosticContextRequestCount += 1;
@@ -3223,7 +3223,7 @@ async function expireGalleryCacheSchema(page: Page): Promise<void> {
   await page.evaluate(
     () =>
       new Promise<void>((resolve, reject) => {
-        const request = indexedDB.open("ironmesh-client-gallery-cache", 1);
+        const request = indexedDB.open("berrykeep-client-gallery-cache", 1);
         request.onerror = () => reject(request.error);
         request.onsuccess = () => {
           const database = request.result;
@@ -3253,7 +3253,7 @@ async function galleryCacheDatabaseExists(page: Page): Promise<boolean> {
       return false;
     }
     const databases = await indexedDB.databases();
-    return databases.some((database) => database.name === "ironmesh-client-gallery-cache");
+    return databases.some((database) => database.name === "berrykeep-client-gallery-cache");
   });
 }
 

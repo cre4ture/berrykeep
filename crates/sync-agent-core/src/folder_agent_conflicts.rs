@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use common::content_fingerprint::file_content_fingerprint;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -228,7 +228,7 @@ pub fn resolve_conflict_action(
 
 pub fn upload_local_file(
     root_dir: &Path,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     scope: &PathScope,
     relative_path: &str,
     _size_bytes: u64,
@@ -278,7 +278,7 @@ pub fn upload_local_file(
 }
 
 pub fn delete_remote_file(
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     scope: &PathScope,
     file_path: &str,
     modification_log: Option<&ModificationLogStore>,
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn delete_remote_file_skips_empty_local_root_mapping() {
         let scope = PathScope::new(Some("cameras/vm1".to_string()));
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:65535");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:65535");
         delete_remote_file(&client, &scope, "", None, None).unwrap();
     }
 
@@ -521,7 +521,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let mut root = std::env::temp_dir();
-        root.push(format!("ironmesh-conflicts-test-{nonce}"));
+        root.push(format!("berrykeep-conflicts-test-{nonce}"));
         root
     }
 }

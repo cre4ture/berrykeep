@@ -23,7 +23,7 @@ const ADMIN_PASSWORD: &str = "cli-managed-rendezvous-password";
 /// /setup/start-cluster runs); a second, fully standalone `rendezvous-service` process is then
 /// added to the cluster's rendezvous config so both are simultaneously usable. Node B joins the
 /// same cluster as a plain runtime member (it does not get its own embedded rendezvous). This
-/// mirrors the zero-touch appliance flow real deployments use, not the classic IRONMESH_*
+/// mirrors the zero-touch appliance flow real deployments use, not the classic BERRYKEEP_*
 /// env-var startup the other cluster tests use.
 #[tokio::test]
 async fn cli_latency_test_covers_embedded_and_standalone_rendezvous_in_managed_cluster()

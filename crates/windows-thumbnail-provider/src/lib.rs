@@ -204,11 +204,11 @@ impl std::error::Error for ThumbnailProviderError {}
 
 #[allow(unsafe_code)]
 #[implement(IInitializeWithItem, IThumbnailProvider)]
-struct IronmeshThumbnailProvider {
+struct BerryKeepThumbnailProvider {
     source_path: Mutex<Option<String>>,
 }
 
-impl IronmeshThumbnailProvider {
+impl BerryKeepThumbnailProvider {
     fn new() -> Self {
         Self {
             source_path: Mutex::new(None),
@@ -222,12 +222,12 @@ impl IronmeshThumbnailProvider {
     IPropertyStore,
     IStorageProviderPropertyCapabilities
 )]
-struct IronmeshExtendedPropertyHandler {
+struct BerryKeepExtendedPropertyHandler {
     source_path: Mutex<Option<String>>,
     metadata: OnceLock<Option<PlaceholderFileIdentity>>,
 }
 
-impl IronmeshExtendedPropertyHandler {
+impl BerryKeepExtendedPropertyHandler {
     fn new() -> Self {
         Self {
             source_path: Mutex::new(None),
@@ -251,9 +251,9 @@ impl IronmeshExtendedPropertyHandler {
 
 #[allow(unsafe_code)]
 #[implement(IExplorerCommand)]
-struct IronmeshCancelHydrationCommand;
+struct BerryKeepCancelHydrationCommand;
 
-impl IronmeshCancelHydrationCommand {
+impl BerryKeepCancelHydrationCommand {
     fn new() -> Self {
         Self
     }
@@ -303,10 +303,10 @@ fn thumbnail_bytes_cache() -> &'static Mutex<ThumbnailBytesCache> {
 }
 
 fn append_diagnostic_log(message: &str) {
-    let root = std::env::var_os("LOCALAPPDATA")
+    let root = common::legacy_compatibility::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("Ironmesh");
+        .join("BerryKeep");
     if create_dir_all(&root).is_err() {
         return;
     }
@@ -581,7 +581,7 @@ fn explorer_property_value(name: &str, identity: &PlaceholderFileIdentity) -> Re
 
 #[allow(unsafe_code)]
 #[allow(non_snake_case)]
-impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
+impl IInitializeWithItem_Impl for BerryKeepThumbnailProvider_Impl {
     fn Initialize(&self, psi: Ref<'_, IShellItem>, _grfmode: u32) -> Result<()> {
         let resolved = psi
             .as_ref()
@@ -600,7 +600,7 @@ impl IInitializeWithItem_Impl for IronmeshThumbnailProvider_Impl {
 
 #[allow(unsafe_code)]
 #[allow(non_snake_case)]
-impl IInitializeWithItem_Impl for IronmeshExtendedPropertyHandler_Impl {
+impl IInitializeWithItem_Impl for BerryKeepExtendedPropertyHandler_Impl {
     fn Initialize(&self, psi: Ref<'_, IShellItem>, _grfmode: u32) -> Result<()> {
         let resolved = psi
             .as_ref()
@@ -614,7 +614,7 @@ impl IInitializeWithItem_Impl for IronmeshExtendedPropertyHandler_Impl {
 }
 
 #[allow(non_snake_case)]
-impl IStorageProviderPropertyCapabilities_Impl for IronmeshExtendedPropertyHandler_Impl {
+impl IStorageProviderPropertyCapabilities_Impl for BerryKeepExtendedPropertyHandler_Impl {
     fn IsPropertySupported(&self, propertycanonicalname: &HSTRING) -> Result<bool> {
         let name = propertycanonicalname.to_string_lossy();
         Ok(SUPPORTED_PROPERTY_NAMES.contains(&name.as_str()))
@@ -623,7 +623,7 @@ impl IStorageProviderPropertyCapabilities_Impl for IronmeshExtendedPropertyHandl
 
 #[allow(unsafe_code)]
 #[allow(non_snake_case)]
-impl IPropertyStore_Impl for IronmeshExtendedPropertyHandler_Impl {
+impl IPropertyStore_Impl for BerryKeepExtendedPropertyHandler_Impl {
     fn GetCount(&self) -> Result<u32> {
         Ok(SUPPORTED_PROPERTY_NAMES.len() as u32)
     }
@@ -666,7 +666,7 @@ impl IPropertyStore_Impl for IronmeshExtendedPropertyHandler_Impl {
 
 #[allow(unsafe_code)]
 #[allow(non_snake_case)]
-impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
+impl IThumbnailProvider_Impl for BerryKeepThumbnailProvider_Impl {
     fn GetThumbnail(
         &self,
         cx: u32,
@@ -726,7 +726,7 @@ impl IThumbnailProvider_Impl for IronmeshThumbnailProvider_Impl {
 }
 
 #[allow(non_snake_case)]
-impl IExplorerCommand_Impl for IronmeshCancelHydrationCommand_Impl {
+impl IExplorerCommand_Impl for BerryKeepCancelHydrationCommand_Impl {
     fn GetTitle(&self, _psiitemarray: Ref<'_, IShellItemArray>) -> Result<PWSTR> {
         duplicate_shell_text("Cancel Hydration")
     }
@@ -802,11 +802,11 @@ impl IExplorerCommand_Impl for IronmeshCancelHydrationCommand_Impl {
 
 #[allow(unsafe_code)]
 #[implement(IClassFactory)]
-struct IronmeshThumbnailProviderFactory;
+struct BerryKeepThumbnailProviderFactory;
 
 #[allow(unsafe_code)]
 #[allow(non_snake_case)]
-impl IClassFactory_Impl for IronmeshThumbnailProviderFactory_Impl {
+impl IClassFactory_Impl for BerryKeepThumbnailProviderFactory_Impl {
     fn CreateInstance(
         &self,
         punkouter: Ref<'_, IUnknown>,
@@ -824,7 +824,7 @@ impl IClassFactory_Impl for IronmeshThumbnailProviderFactory_Impl {
             *ppvobject = null_mut();
         }
 
-        let unknown: IUnknown = IronmeshThumbnailProvider::new().into();
+        let unknown: IUnknown = BerryKeepThumbnailProvider::new().into();
         unsafe { unknown.query(riid, ppvobject).ok() }
     }
 
@@ -835,11 +835,11 @@ impl IClassFactory_Impl for IronmeshThumbnailProviderFactory_Impl {
 
 #[allow(unsafe_code)]
 #[implement(IClassFactory)]
-struct IronmeshExtendedPropertyHandlerFactory;
+struct BerryKeepExtendedPropertyHandlerFactory;
 
 #[allow(unsafe_code)]
 #[allow(non_snake_case)]
-impl IClassFactory_Impl for IronmeshExtendedPropertyHandlerFactory_Impl {
+impl IClassFactory_Impl for BerryKeepExtendedPropertyHandlerFactory_Impl {
     fn CreateInstance(
         &self,
         punkouter: Ref<'_, IUnknown>,
@@ -857,7 +857,7 @@ impl IClassFactory_Impl for IronmeshExtendedPropertyHandlerFactory_Impl {
             *ppvobject = null_mut();
         }
 
-        let unknown: IUnknown = IronmeshExtendedPropertyHandler::new().into();
+        let unknown: IUnknown = BerryKeepExtendedPropertyHandler::new().into();
         unsafe { unknown.query(riid, ppvobject).ok() }
     }
 
@@ -868,11 +868,11 @@ impl IClassFactory_Impl for IronmeshExtendedPropertyHandlerFactory_Impl {
 
 #[allow(unsafe_code)]
 #[implement(IClassFactory)]
-struct IronmeshCancelHydrationCommandFactory;
+struct BerryKeepCancelHydrationCommandFactory;
 
 #[allow(unsafe_code)]
 #[allow(non_snake_case)]
-impl IClassFactory_Impl for IronmeshCancelHydrationCommandFactory_Impl {
+impl IClassFactory_Impl for BerryKeepCancelHydrationCommandFactory_Impl {
     fn CreateInstance(
         &self,
         punkouter: Ref<'_, IUnknown>,
@@ -890,7 +890,7 @@ impl IClassFactory_Impl for IronmeshCancelHydrationCommandFactory_Impl {
             *ppvobject = null_mut();
         }
 
-        let unknown: IUnknown = IronmeshCancelHydrationCommand::new().into();
+        let unknown: IUnknown = BerryKeepCancelHydrationCommand::new().into();
         unsafe { unknown.query(riid, ppvobject).ok() }
     }
 
@@ -946,11 +946,11 @@ pub unsafe extern "system" fn DllGetClassObject(
 
     let clsid = unsafe { *rclsid };
     let factory: IUnknown = if clsid == THUMBNAIL_PROVIDER_CLSID {
-        IronmeshThumbnailProviderFactory.into()
+        BerryKeepThumbnailProviderFactory.into()
     } else if clsid == EXTENDED_PROPERTY_HANDLER_CLSID {
-        IronmeshExtendedPropertyHandlerFactory.into()
+        BerryKeepExtendedPropertyHandlerFactory.into()
     } else if clsid == CONTEXT_MENU_HANDLER_CLSID {
-        IronmeshCancelHydrationCommandFactory.into()
+        BerryKeepCancelHydrationCommandFactory.into()
     } else if is_unsupported_handler_clsid(clsid) {
         UnsupportedHandlerFactory.into()
     } else {
@@ -1074,10 +1074,10 @@ struct ThumbnailIdentityLoad {
 
 #[derive(Clone)]
 struct ThumbnailClientBuild {
-    client: client_sdk::IronMeshClient,
+    client: client_sdk::BerryKeepClient,
     /// Keeps the shared route controller and its executor alive while this
     /// cached Explorer client is in use.
-    managed_client: Option<client_sdk::ManagedIronMeshClient>,
+    managed_client: Option<client_sdk::ManagedBerryKeepClient>,
     auth_mode: &'static str,
     candidate_paths: Vec<PathBuf>,
     selected_path: Option<PathBuf>,
@@ -1462,7 +1462,7 @@ fn load_property_metadata_for_source_path(
     identity.set_remote_media(
         entry
             .media
-            .map(client_sdk::ironmesh_client::namespace_media_metadata),
+            .map(client_sdk::berrykeep_client::namespace_media_metadata),
     );
     Ok(identity)
 }
@@ -1627,7 +1627,7 @@ fn media_thumbnail_request_path(remote_key: &str) -> AnyhowResult<String> {
         bail!("remote key is empty");
     }
 
-    let mut url = Url::parse("https://ironmesh.invalid/api/v1/media/thumbnail")
+    let mut url = Url::parse("https://berrykeep.invalid/api/v1/media/thumbnail")
         .context("invalid base thumbnail URL")?;
     url.query_pairs_mut().append_pair("key", remote_key);
     Ok(relative_request_path(&url))
@@ -1641,7 +1641,7 @@ fn relative_request_path(url: &Url) -> String {
 }
 
 fn fetch_thumbnail_bytes(
-    client: &client_sdk::IronMeshClient,
+    client: &client_sdk::BerryKeepClient,
     request_path: &str,
 ) -> ThumbnailProviderResult<Vec<u8>> {
     if let Some(cached) = thumbnail_bytes_cache()
@@ -1949,7 +1949,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "ironmesh-thumbnail-provider-{label}-{}-{unique_suffix}",
+            "berrykeep-thumbnail-provider-{label}-{}-{unique_suffix}",
             std::process::id()
         ));
         std::fs::create_dir_all(&path).expect("failed to create temp test directory");
@@ -1972,7 +1972,7 @@ mod tests {
 
     fn test_client_build(label: &str) -> ThumbnailClientBuild {
         ThumbnailClientBuild {
-            client: client_sdk::IronMeshClient::from_direct_base_url("http://127.0.0.1:9"),
+            client: client_sdk::BerryKeepClient::from_direct_base_url("http://127.0.0.1:9"),
             managed_client: None,
             auth_mode: "anonymous",
             candidate_paths: vec![],

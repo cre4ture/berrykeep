@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const DEFAULT_CLIENT_IDENTITY_FILE_NAME: &str = ".ironmesh-client-identity.json";
+const DEFAULT_CLIENT_IDENTITY_FILE_NAME: &str = ".berrykeep-client-identity.json";
 
 #[derive(Debug, Clone)]
 pub struct ClientEnrollmentOptions {
@@ -105,7 +105,7 @@ fn sibling_client_identity_path(bootstrap_path: &Path) -> PathBuf {
         return bootstrap_path.with_file_name(file_name);
     }
 
-    bootstrap_path.with_file_name("ironmesh-client-identity.json")
+    bootstrap_path.with_file_name("berrykeep-client-identity.json")
 }
 
 pub fn is_internal_client_identity_relative_path(path: &str) -> bool {
@@ -243,21 +243,21 @@ mod tests {
 
     #[test]
     fn sibling_client_identity_path_uses_bootstrap_sibling_when_bootstrap_file_is_provided() {
-        let bootstrap_path = Path::new("C:\\config\\ironmesh-client-bootstrap.json");
+        let bootstrap_path = Path::new("C:\\config\\berrykeep-client-bootstrap.json");
         let path = sibling_client_identity_path(bootstrap_path);
         assert_eq!(
             path,
-            Path::new("C:\\config\\ironmesh-client-bootstrap.client-identity.json")
+            Path::new("C:\\config\\berrykeep-client-bootstrap.client-identity.json")
         );
     }
 
     #[test]
     fn internal_client_identity_path_detection_matches_nested_and_root_relative_paths() {
         assert!(is_internal_client_identity_relative_path(
-            ".ironmesh-client-identity.json"
+            ".berrykeep-client-identity.json"
         ));
         assert!(is_internal_client_identity_relative_path(
-            "nested/.ironmesh-client-identity.json"
+            "nested/.berrykeep-client-identity.json"
         ));
         assert!(!is_internal_client_identity_relative_path(
             "nested/not-client-identity.json"
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn persisted_client_identity_round_trips_without_legacy_token_field() {
         let path =
-            std::env::temp_dir().join(format!("ironmesh-client-identity-{}.json", Uuid::now_v7()));
+            std::env::temp_dir().join(format!("berrykeep-client-identity-{}.json", Uuid::now_v7()));
         let mut identity = ClientIdentityMaterial::generate(
             Uuid::now_v7(),
             None,
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn load_persisted_client_identity_does_not_read_legacy_sync_root_file_without_explicit_path() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-sync-root-legacy-identity-{}",
+            "berrykeep-sync-root-legacy-identity-{}",
             Uuid::now_v7()
         ));
         std::fs::create_dir_all(&sync_root).expect("sync root should exist");
@@ -324,22 +324,22 @@ mod tests {
 
     #[test]
     fn inspect_persisted_client_identity_paths_prefers_local_appdata_then_bootstrap_sibling() {
-        let sync_root = Path::new(r"C:\Users\Example\IronMesh\Wiz3");
-        let bootstrap_path = Path::new(r"C:\config\ironmesh-client-bootstrap.json");
+        let sync_root = Path::new(r"C:\Users\Example\BerryKeep\Wiz3");
+        let bootstrap_path = Path::new(r"C:\config\berrykeep-client-bootstrap.json");
         let discovery =
             inspect_persisted_client_identity_paths(sync_root, Some(bootstrap_path), None);
 
         assert_eq!(discovery.selected_path, None);
         assert_eq!(discovery.candidate_paths.len(), 2);
         assert!(
-            discovery.candidate_paths[0].ends_with(Path::new("Ironmesh").join("sync-roots"))
+            discovery.candidate_paths[0].ends_with(Path::new("BerryKeep").join("sync-roots"))
                 || discovery.candidate_paths[0]
                     .to_string_lossy()
-                    .contains(r"\Ironmesh\sync-roots\")
+                    .contains(r"\BerryKeep\sync-roots\")
         );
         assert_eq!(
             discovery.candidate_paths[1],
-            Path::new(r"C:\config\ironmesh-client-bootstrap.client-identity.json")
+            Path::new(r"C:\config\berrykeep-client-bootstrap.client-identity.json")
         );
     }
 }

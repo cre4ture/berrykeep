@@ -121,7 +121,7 @@ GitHub's cache scope rules make entries written on the default branch readable
 from later pull requests. Different revisions do not replace one shared
 archive: packages and manifests have immutable content IDs and coexist until
 GitHub's repository quota or eviction policy removes cold entries. The
-format-specific `ironmesh-bazel-car-v1` namespace intentionally leaves the
+format-specific `berrykeep-bazel-car-v1` namespace intentionally leaves the
 former v0.2 object-per-entry cache available as a rollback path.
 
 This adapter is intentionally experimental. GitHub does not promise its runner

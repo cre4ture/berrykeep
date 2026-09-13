@@ -24,7 +24,7 @@ use transport_sdk::{
 use crate::iroh_lease_budget::{IrohRelayLeaseBudget, IrohRelayLeaseHandle};
 
 const IROH_RELAY_TICKET_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const MOBILE_CONNECTION_LOG_TARGET: &str = "ironmesh_mobile_connection";
+const MOBILE_CONNECTION_LOG_TARGET: &str = "berrykeep_mobile_connection";
 
 #[derive(Clone)]
 pub(crate) struct TransportSessionPool {

@@ -1032,7 +1032,7 @@ mod tests {
             .as_nanos();
         let mut root = std::env::temp_dir();
         root.push(format!(
-            "ironmesh-modification-log-test-{}-{}",
+            "berrykeep-modification-log-test-{}-{}",
             std::process::id(),
             nonce
         ));

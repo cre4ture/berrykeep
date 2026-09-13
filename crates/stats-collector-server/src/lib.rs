@@ -55,8 +55,8 @@ use crate::storage::{IngestStorage, StoredRecord};
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Admin authentication header, matching the server-node admin plane convention
-/// (`x-ironmesh-admin-token`). See doc Section 5.3.
-pub const ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
+/// (`x-berrykeep-admin-token`). See doc Section 5.3.
+pub const ADMIN_TOKEN_HEADER: &str = "x-berrykeep-admin-token";
 
 /// Ingestion token header (doc Section 5.2/8): an optional, opaque per-`telemetry_subject_id`
 /// credential issued by `POST /v1/register/{telemetry_subject_id}` and presented on subsequent
@@ -64,7 +64,7 @@ pub const ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
 /// inside the stored `raw_payload_json` blob (Section 2.6's "don't let auxiliary material leak
 /// into stored payloads" spirit) and so the node side can attach it without touching payload
 /// construction at all.
-pub const INGESTION_TOKEN_HEADER: &str = "x-ironmesh-ingestion-token";
+pub const INGESTION_TOKEN_HEADER: &str = "x-berrykeep-ingestion-token";
 
 /// Default k-anonymity minimum group size for published aggregates (doc Section 4.3).
 pub const DEFAULT_K_ANONYMITY_MIN: u32 = 5;
@@ -881,7 +881,7 @@ mod tests {
             "schema_version": 1,
             "telemetry_subject_id": "subject-happy-path",
             "generated_at_unix": 1_752_912_000_u64,
-            "ironmesh_version": "1.0.35",
+            "berrykeep_version": "1.0.35",
             "hardware_profile_id": "hp-abc",
             "country_code": "DE",
             "node_lifecycle": {"uptime_seconds": 100},

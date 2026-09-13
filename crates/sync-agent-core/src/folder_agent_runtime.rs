@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
-    ClientConnectionDiagnostics, ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
-    ManagedClientOptions, ManagedIronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller,
+    BerryKeepClient, ClientConnectionDiagnostics, ClientIdentityMaterial, ConnectionBootstrap,
+    ManagedBerryKeepClient, ManagedClientOptions, RemoteSnapshotFetcher, RemoteSnapshotPoller,
     RemoteSnapshotScope, RemoteSnapshotUpdate,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -21,7 +21,7 @@ use crate::{
     FolderAgentUiState, LocalEntryKind, LocalEntryState, LocalTreeScanProgress, LocalTreeState,
     ModificationLogContext, ModificationLogStore, ModificationOperation, ModificationOutcome,
     ModificationPhase, ModificationTriggerSource, PathScope, RemoteTreeIndex, StartupStateStore,
-    absolute_path, build_configured_client, cleanup_ironmesh_part_files,
+    absolute_path, build_configured_client, cleanup_berrykeep_part_files,
     describe_connection_target, diff_local_trees, download_transfer_state_path,
     download_transfer_temp_path, load_local_baseline_hashes_with_retries,
     load_local_baseline_with_retries, local_entry_state_for_path, local_file_content_fingerprint,
@@ -40,12 +40,12 @@ pub type FolderAgentClientIdentityPersistence = fn(&ClientIdentityMaterial) -> R
 /// Embedders such as the Android app use this handle to give every folder-sync
 /// runtime the same transport router and managed route controller as the rest
 /// of the process. Cloning the handle does not construct or probe another
-/// client; `IronMeshClient` and `ManagedIronMeshClient` both retain their
+/// client; `BerryKeepClient` and `ManagedBerryKeepClient` both retain their
 /// existing Arc-backed shared state.
 #[derive(Clone)]
 pub struct FolderAgentSharedClient {
-    client: IronMeshClient,
-    managed_client: Option<ManagedIronMeshClient>,
+    client: BerryKeepClient,
+    managed_client: Option<ManagedBerryKeepClient>,
 }
 
 impl std::fmt::Debug for FolderAgentSharedClient {
@@ -62,25 +62,25 @@ impl std::fmt::Debug for FolderAgentSharedClient {
 }
 
 impl FolderAgentSharedClient {
-    pub fn from_client(client: IronMeshClient) -> Self {
+    pub fn from_client(client: BerryKeepClient) -> Self {
         Self {
             client,
             managed_client: None,
         }
     }
 
-    pub fn from_managed_client(managed_client: ManagedIronMeshClient) -> Self {
+    pub fn from_managed_client(managed_client: ManagedBerryKeepClient) -> Self {
         Self {
             client: managed_client.client(),
             managed_client: Some(managed_client),
         }
     }
 
-    fn client(&self) -> IronMeshClient {
+    fn client(&self) -> BerryKeepClient {
         self.client.clone()
     }
 
-    fn managed_client(&self) -> Option<ManagedIronMeshClient> {
+    fn managed_client(&self) -> Option<ManagedBerryKeepClient> {
         self.managed_client.clone()
     }
 }
@@ -304,7 +304,7 @@ pub trait FolderAgentLocalBackend {
     fn materialize_remote_conflict_copies(
         &mut self,
         _options: &FolderAgentRuntimeOptions,
-        _client: &IronMeshClient,
+        _client: &BerryKeepClient,
         _scope: &PathScope,
         _conflicts: &[crate::StartupConflict],
     ) -> Result<()> {
@@ -338,7 +338,7 @@ pub trait FolderAgentLocalBackend {
     fn upload_local_file(
         &mut self,
         options: &FolderAgentRuntimeOptions,
-        client: &IronMeshClient,
+        client: &BerryKeepClient,
         scope: &PathScope,
         relative_path: &str,
         size_bytes: u64,
@@ -347,7 +347,7 @@ pub trait FolderAgentLocalBackend {
     fn download_remote_file(
         &mut self,
         options: &FolderAgentRuntimeOptions,
-        client: &IronMeshClient,
+        client: &BerryKeepClient,
         local_relative_path: &str,
         remote_key: &str,
     ) -> Result<()>;
@@ -412,13 +412,13 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
     }
 
     fn cleanup_startup_artifacts(&mut self, options: &FolderAgentRuntimeOptions) -> Result<()> {
-        cleanup_ironmesh_part_files(&options.root_dir, false).map(|_| ())
+        cleanup_berrykeep_part_files(&options.root_dir, false).map(|_| ())
     }
 
     fn materialize_remote_conflict_copies(
         &mut self,
         options: &FolderAgentRuntimeOptions,
-        client: &IronMeshClient,
+        client: &BerryKeepClient,
         scope: &PathScope,
         conflicts: &[crate::StartupConflict],
     ) -> Result<()> {
@@ -483,7 +483,7 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
     fn upload_local_file(
         &mut self,
         options: &FolderAgentRuntimeOptions,
-        client: &IronMeshClient,
+        client: &BerryKeepClient,
         scope: &PathScope,
         relative_path: &str,
         size_bytes: u64,
@@ -502,7 +502,7 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
     fn download_remote_file(
         &mut self,
         options: &FolderAgentRuntimeOptions,
-        client: &IronMeshClient,
+        client: &BerryKeepClient,
         local_relative_path: &str,
         remote_key: &str,
     ) -> Result<()> {
@@ -1561,7 +1561,7 @@ fn emit_status(
 
 fn attach_connection_diagnostics(
     callback: Option<FolderAgentStatusCallback>,
-    client: IronMeshClient,
+    client: BerryKeepClient,
 ) -> Option<FolderAgentStatusCallback> {
     callback.map(|callback| {
         let diagnostics_client = client.clone();
@@ -1682,8 +1682,8 @@ fn local_path_diverged_since_baseline<B: FolderAgentLocalBackend>(
 }
 
 struct ConfiguredFolderAgentClient {
-    client: IronMeshClient,
-    managed_client: Option<ManagedIronMeshClient>,
+    client: BerryKeepClient,
+    managed_client: Option<ManagedBerryKeepClient>,
 }
 
 fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFolderAgentClient> {
@@ -1803,7 +1803,7 @@ fn scan_local_tree_without_status<B: FolderAgentLocalBackend>(
 fn upload_local_file_with_logging<B: FolderAgentLocalBackend>(
     backend: &mut B,
     options: &FolderAgentRuntimeOptions,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     scope: &PathScope,
     relative_path: &str,
     size_bytes: u64,
@@ -1853,7 +1853,7 @@ fn upload_local_file_with_logging<B: FolderAgentLocalBackend>(
 fn download_remote_file_with_logging<B: FolderAgentLocalBackend>(
     backend: &mut B,
     options: &FolderAgentRuntimeOptions,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     local_relative_path: &str,
     remote_key: &str,
     remote_content_hash: Option<&str>,
@@ -1916,7 +1916,7 @@ fn download_remote_file_with_logging<B: FolderAgentLocalBackend>(
 }
 
 fn delete_remote_file_with_logging(
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     scope: &PathScope,
     file_path: &str,
     modification_log: Option<&ModificationLogStore>,
@@ -1936,7 +1936,7 @@ fn delete_remote_file_with_logging(
 }
 
 fn delete_remote_path_with_logging(
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     local_relative_path: &str,
     remote_key: &str,
     modification_log: Option<&ModificationLogStore>,
@@ -2048,7 +2048,7 @@ fn remove_local_path_with_logging<B: FolderAgentLocalBackend>(
 fn sync_local_changes<B: FolderAgentLocalBackend>(
     backend: &mut B,
     options: &FolderAgentRuntimeOptions,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     local_state: &mut LocalTreeState,
     state_store: Option<&StartupStateStore>,
     scope: &PathScope,
@@ -2321,7 +2321,7 @@ fn remote_index_contains_path_or_descendants(remote_index: &RemoteTreeIndex, pat
 fn apply_remote_snapshot<B: FolderAgentLocalBackend>(
     backend: &mut B,
     options: &FolderAgentRuntimeOptions,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     snapshot: &SyncSnapshot,
     mut local_state: Option<&mut LocalTreeState>,
     changed_paths: Option<&[String]>,
@@ -2770,7 +2770,7 @@ where
         let progress = progress.clone();
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let handle = thread::Builder::new()
-            .name("ironmesh-folder-status-heartbeat".to_string())
+            .name("berrykeep-folder-status-heartbeat".to_string())
             .spawn(move || {
                 let started = Instant::now();
                 loop {
@@ -3157,7 +3157,7 @@ fn format_remote_apply_summary(outcome: RemoteApplyOutcome) -> String {
 #[allow(clippy::too_many_arguments)]
 fn download_remote_file(
     root_dir: &Path,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     local_relative_path: &str,
     remote_key: &str,
     remote_content_hash: Option<&str>,
@@ -3226,7 +3226,7 @@ fn download_remote_file(
 }
 
 fn ensure_remote_directory_marker(
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     scope: &PathScope,
     directory_path: &str,
 ) -> Result<()> {
@@ -3368,7 +3368,7 @@ mod tests {
         fn upload_local_file(
             &mut self,
             _options: &FolderAgentRuntimeOptions,
-            _client: &IronMeshClient,
+            _client: &BerryKeepClient,
             _scope: &PathScope,
             _relative_path: &str,
             _size_bytes: u64,
@@ -3379,7 +3379,7 @@ mod tests {
         fn download_remote_file(
             &mut self,
             _options: &FolderAgentRuntimeOptions,
-            _client: &IronMeshClient,
+            _client: &BerryKeepClient,
             local_relative_path: &str,
             remote_key: &str,
         ) -> Result<()> {
@@ -3645,7 +3645,7 @@ mod tests {
     fn apply_remote_snapshot_ensures_directories_before_failing_file_downloads() {
         let mut backend = RecordingBackend::with_download_failure("a-file.txt");
         let options = test_runtime_options();
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
         let snapshot = SyncSnapshot {
             local: Vec::new(),
             remote: vec![
@@ -3717,7 +3717,7 @@ mod tests {
             },
         );
         let options = test_runtime_options();
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
         let snapshot = SyncSnapshot {
             local: Vec::new(),
             remote: vec![sync_core::NamespaceEntry::directory("empty-lifecycle")],
@@ -3769,7 +3769,7 @@ mod tests {
     fn apply_remote_snapshot_updates_local_state_for_downloaded_file_parents() {
         let mut backend = RecordingBackend::default();
         let options = test_runtime_options();
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
         let snapshot = SyncSnapshot {
             local: Vec::new(),
             remote: vec![sync_core::NamespaceEntry::file(
@@ -3850,7 +3850,7 @@ mod tests {
             },
         );
         let options = test_runtime_options();
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
         let snapshot = SyncSnapshot {
             local: Vec::new(),
             remote: vec![sync_core::NamespaceEntry::file(
@@ -3925,7 +3925,7 @@ mod tests {
             },
         );
         let options = test_runtime_options();
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
         let snapshot = SyncSnapshot {
             local: Vec::new(),
             remote: Vec::new(),
@@ -3987,7 +3987,7 @@ mod tests {
     fn apply_remote_snapshot_skips_recreating_known_directory_after_local_delete() {
         let mut backend = RecordingBackend::default();
         let options = test_runtime_options();
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
         let snapshot = SyncSnapshot {
             local: Vec::new(),
             remote: vec![sync_core::NamespaceEntry::directory(
@@ -4046,7 +4046,7 @@ mod tests {
     fn apply_remote_snapshot_skips_recreating_directory_before_remote_index_catches_up() {
         let mut backend = RecordingBackend::default();
         let options = test_runtime_options();
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
         let snapshot = SyncSnapshot {
             local: Vec::new(),
             remote: vec![sync_core::NamespaceEntry::directory(
@@ -4118,7 +4118,7 @@ mod tests {
             },
         );
         let options = test_runtime_options();
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
         let snapshot = SyncSnapshot {
             local: Vec::new(),
             remote: vec![sync_core::NamespaceEntry::file("flip", "v1", "remote-hash")],
@@ -4197,7 +4197,7 @@ mod tests {
             },
         );
         let options = test_runtime_options();
-        let client = IronMeshClient::from_direct_base_url("http://127.0.0.1:1");
+        let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
         let snapshot = SyncSnapshot {
             local: Vec::new(),
             remote: vec![sync_core::NamespaceEntry::file("flip", "v1", "remote-hash")],

@@ -23,13 +23,13 @@ use crate::mux::{MultiplexConfig, MultiplexMode, MultiplexedSession};
 use crate::rendezvous::IrohRelayTicket;
 
 const DIRECT_QUIC_ENDPOINT_SCHEME: &str = "iroh";
-pub const DEFAULT_DIRECT_QUIC_ALPN: &str = "ironmesh/transport/1";
+pub const DEFAULT_DIRECT_QUIC_ALPN: &str = "berrykeep/transport/1";
 
 #[derive(Clone)]
 pub struct DirectQuicEndpointConfig {
     pub secret_key: SecretKey,
     /// Whether this endpoint may use relay transport.  A direct-only fallback
-    /// must leave this disabled so an authenticated IronMesh relay cannot be
+    /// must leave this disabled so an authenticated BerryKeep relay cannot be
     /// attempted without the endpoint-bound ticket that authorizes it.
     pub relay_enabled: bool,
     pub relay_urls: Vec<String>,
@@ -315,7 +315,7 @@ impl DirectQuicEndpoint {
         // Keep the relay transport present when tickets may be installed later.
         // Direct-only fallback endpoints deliberately use RelayMode::Disabled:
         // a candidate relay address alone must never bypass endpoint-ticket
-        // authentication on an IronMesh relay.
+        // authentication on an BerryKeep relay.
         let relay_mode = if config.relay_enabled {
             RelayMode::Custom(relay_map_from_configured_relays(&configured_relays)?)
         } else {
@@ -997,7 +997,7 @@ mod tests {
     #[test]
     fn secret_key_roundtrip_persists_exact_key() {
         let path =
-            std::env::temp_dir().join(format!("ironmesh-iroh-key-{}.txt", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("berrykeep-iroh-key-{}.txt", uuid::Uuid::now_v7()));
         let secret_key = SecretKey::generate();
 
         write_secret_key_to_path(&path, &secret_key).expect("secret key should persist");

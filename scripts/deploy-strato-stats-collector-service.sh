@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 exec "${ROOT_DIR}/scripts/deploy-stats-collector-service.sh" \
-  --remote-dir /root/ironmesh/telemetry \
+  --remote-dir /root/berrykeep/telemetry \
   --bind-addr 0.0.0.0:9444 \
   --tls-cert-path /etc/letsencrypt/live/217.160.159.105/fullchain.pem \
   --tls-key-path /etc/letsencrypt/live/217.160.159.105/privkey.pem \

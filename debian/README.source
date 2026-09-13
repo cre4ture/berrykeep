@@ -41,7 +41,7 @@ Notes:
     `berrykeep-rendezvous-service` are installed but not enabled or started
     automatically. Fill in the matching `/etc/berrykeep/*.env` file and enable
     the service manually after installation.
-  * Transitional `ironmesh-*` packages depend on their `berrykeep-*`
+  * Transitional `berrykeep-*` packages depend on their `berrykeep-*`
     replacements and retain the old service/configuration paths for upgrades.
   * `berrykeep-server-node` uses the `dh-sysuser` Debhelper addon so the
     `berrykeep-server-node` system user is created automatically at package

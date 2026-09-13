@@ -1,13 +1,13 @@
 //! XMP sidecar metadata for media objects.
 //!
-//! Ironmesh keeps user labels in an XMP sidecar object next to the media object
+//! BerryKeep keeps user labels in an XMP sidecar object next to the media object
 //! (`album/photo.jpg` -> `album/photo.jpg.xmp`) instead of writing them into the
 //! media file. Any byte change to the media file would produce new chunks, a new
 //! manifest and a new object version, which is exactly what labelling must not
 //! cost.
 //!
 //! Sidecars are regularly authored by third-party tools (Lightroom, digiKam,
-//! darktable). Those tools store a large number of namespaces Ironmesh does not
+//! darktable). Those tools store a large number of namespaces BerryKeep does not
 //! model, so parsing has to be lossless: the raw XML event stream of the packet
 //! is retained verbatim. BerryKeep-generated label, GPS, and approved
 //! capture-time properties are inserted without rewriting user content.
@@ -48,7 +48,7 @@ const INDENT_STEP_FALLBACK: &str = " ";
 /// Minimal, valid and empty XMP packet used by [`XmpSidecar::new_empty`].
 const EMPTY_PACKET: &str = concat!(
     "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
-    "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"ironmesh\">\n",
+    "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"berrykeep\">\n",
     " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n",
     "  <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"/>\n",
     " </rdf:RDF>\n",
@@ -60,7 +60,7 @@ const EMPTY_PACKET: &str = concat!(
 ///
 /// Everything except the `dc:subject` property is kept as the original XML event
 /// stream, so [`XmpSidecar::to_bytes`] reproduces third-party markup byte for
-/// byte, including formatting, comments and namespaces Ironmesh knows nothing
+/// byte, including formatting, comments and namespaces BerryKeep knows nothing
 /// about.
 #[derive(Debug, Clone)]
 pub struct XmpSidecar {
@@ -517,7 +517,7 @@ impl XmpSidecar {
 
 /// A raw XML event together with the namespace URI its element name resolves to.
 ///
-/// The raw event allows byte-faithful re-serialization of content Ironmesh does
+/// The raw event allows byte-faithful re-serialization of content BerryKeep does
 /// not model, while the resolved namespace allows locating our own properties
 /// regardless of the prefixes the authoring tool happened to pick.
 #[derive(Debug, Clone)]
@@ -1297,7 +1297,7 @@ mod tests {
     };
     use anyhow::Result;
 
-    /// Sidecar in the shape Lightroom writes it: many namespaces Ironmesh does
+    /// Sidecar in the shape Lightroom writes it: many namespaces BerryKeep does
     /// not model, plus a `dc:subject` property it does.
     const THIRD_PARTY_SIDECAR: &str = concat!(
         "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",

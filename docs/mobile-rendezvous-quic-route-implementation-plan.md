@@ -26,10 +26,10 @@ This plan is implemented by the following shared and platform changes:
   their existing secure stores; synchronous desktop consumers use the shared
   blocking constructor and retain the managed handle for their lifetime.
 - Direct QUIC candidates validate their authenticated transport identity.
-  Server nodes still accept `IRONMESH_DIRECT_QUIC_RELAY_URLS` for external
+  Server nodes still accept `BERRYKEEP_DIRECT_QUIC_RELAY_URLS` for external
   relays, and now also reconcile authenticated relay advertisements returned by
   Rendezvous.
-- `ironmesh-rendezvous-service` can supervise an authenticated upstream iroh
+- `berrykeep-rendezvous-service` can supervise an authenticated upstream iroh
   relay listener in the same process and distribute its URL and admission token
   through authenticated registration and discovery responses.
 
@@ -56,7 +56,7 @@ identity persistence. They must not parse candidates, choose transports, or
 contain QUIC/NAT-specific routing rules.
 
 This is a client-route-lifecycle project. It does not replace the existing
-IronMesh Rendezvous control plane, the buffered HTTP-over-stream protocol, or
+BerryKeep Rendezvous control plane, the buffered HTTP-over-stream protocol, or
 the current relay tunnel.
 
 ## 2. Why the mobile apps do not currently use hole punching
@@ -72,7 +72,7 @@ mobile startup paths.
 | CLI | The bootstrap path refreshes dynamic targets before building the client. | This logic is application-specific and is not reusable by mobile clients. |
 | Android/iOS | Both create a client from `build_client_with_identity...` using only static bootstrap targets. | Their later route snapshot refresh probes the existing endpoint set; it does not rediscover targets. |
 
-In particular, `IronMeshClient::refresh_connection_route_snapshot()` is a
+In particular, `BerryKeepClient::refresh_connection_route_snapshot()` is a
 quality probe for routes already held by `ClientEndpointRouter`. It cannot add
 a `DirectQuic` route because the router currently owns an immutable endpoint
 vector. Therefore it is expected that an Android test never observes a
@@ -86,7 +86,7 @@ The relevant code locations are:
   refreshed targets;
 - `apps/android-app/src/lib.rs` and `apps/ios-app/src/lib.rs` — static mobile
   construction paths;
-- `crates/client-sdk/src/ironmesh_client.rs` — immutable router endpoint set;
+- `crates/client-sdk/src/berrykeep_client.rs` — immutable router endpoint set;
 - `crates/client-sdk/src/session_pool.rs` — already supports `DirectQuic`;
 - `crates/transport-sdk/src/direct_quic.rs` — iroh endpoint and candidate
   conversion.
@@ -98,7 +98,7 @@ The relevant code locations are:
 - One transport-selection implementation for CLI, sync agents, Android, and
   iOS.
 - Dynamic addition and removal of trusted Rendezvous candidates while retaining
-  a stable `IronMeshClient` handle for callers.
+  a stable `BerryKeepClient` handle for callers.
 - Bounded, fail-open discovery: a broken or unavailable Rendezvous service
   must never make a valid static direct or relay route unusable.
 - Route diagnostics that make the selected transport, candidate source, and
@@ -184,11 +184,11 @@ impl ConnectionBootstrap {
         &self,
         identity: ClientIdentityMaterial,
         options: ManagedClientOptions,
-    ) -> Result<ManagedIronMeshClient>;
+    ) -> Result<ManagedBerryKeepClient>;
 }
 
-impl ManagedIronMeshClient {
-    pub fn client(&self) -> IronMeshClient;
+impl ManagedBerryKeepClient {
+    pub fn client(&self) -> BerryKeepClient;
     pub async fn refresh_routes(
         &self,
         reason: RouteRefreshReason,
@@ -198,7 +198,7 @@ impl ManagedIronMeshClient {
 }
 ```
 
-The implementation may expose these methods directly on `IronMeshClient`
+The implementation may expose these methods directly on `BerryKeepClient`
 instead, provided that cloning the public client keeps sharing one mutable
 route controller. It must not require every app to reconstruct a new client
 after discovery.
@@ -369,7 +369,7 @@ default has no relay URL, so iroh's relay mode is disabled. Candidate exchange
 can still enable direct connections in favourable networks, but it is not a
 reliable production hole-punching solution for restrictive or symmetric NATs.
 
-The existing IronMesh HTTPS/WebSocket relay tunnel is not automatically an
+The existing BerryKeep HTTPS/WebSocket relay tunnel is not automatically an
 iroh relay. A production rollout therefore needs an iroh-compatible relay
 companion or an explicitly supported equivalent.
 
@@ -384,7 +384,7 @@ companion or an explicitly supported equivalent.
    URL in Android or iOS.
 4. Add rollout validation and diagnostics for endpoint ID, advertised relay,
    selected iroh path, direct success, and relay fallback reason.
-5. Keep the current IronMesh relay tunnel as the guaranteed fallback during
+5. Keep the current BerryKeep relay tunnel as the guaranteed fallback during
    rollout and for UDP-hostile networks.
 
 For the first implementation, one canonical relay URL per endpoint is enough
@@ -399,7 +399,7 @@ platform-specific workaround.
 | `crates/client-sdk` | Add the async route controller, route reconciliation, refresh policy, events, and diagnostics. Refactor the CLI to consume it. | Call a blocking discovery helper inside async code or expose router internals to FFI. |
 | `crates/client-sdk::ClientEndpointRouter` | Replace immutable membership with keyed, snapshot-based route reconciliation. Preserve quality/session state by key. | Use vector indices as durable route IDs. |
 | `crates/transport-sdk` | Validate DirectQuic candidate hints and expose iroh path diagnostics needed by `client-sdk`. | Add mobile-specific transport behavior. |
-| `crates/server-node-sdk` | Configure a DirectQuic relay companion, advertise its candidate metadata, and report health. | Treat IronMesh's HTTP relay as an iroh relay. |
+| `crates/server-node-sdk` | Configure a DirectQuic relay companion, advertise its candidate metadata, and report health. | Treat BerryKeep's HTTP relay as an iroh relay. |
 | `apps/cli-client` | Replace its bespoke one-shot refresh/build sequence with the common managed client. | Remain the only user of dynamic discovery. |
 | Android JNI/Rust wrapper | Construct the managed shared client, persist identity updates, and forward connectivity hints. | Parse candidate payloads or choose QUIC versus relay. |
 | iOS Rust/Swift wrapper | Construct the managed shared client, persist identity updates, and forward foreground/operation hints. | Depend on perpetual background execution. |
@@ -446,7 +446,7 @@ a discovered QUIC route without dropping its static relay fallback.
 
 Exit criterion: a test environment with a configured iroh relay can verify
 that both server and client use the advertised relay metadata, while the
-existing IronMesh relay path still succeeds when QUIC cannot.
+existing BerryKeep relay path still succeeds when QUIC cannot.
 
 ### PR 4 — thin mobile adoption
 
@@ -494,11 +494,11 @@ configuration, or app-specific fallback logic.
   from Rendezvous and exposes it in its route snapshot.
 - A reachable direct QUIC path is selected over an otherwise healthy relay
   route according to the common quality model.
-- A failed QUIC path falls back to direct HTTPS or the IronMesh relay tunnel.
+- A failed QUIC path falls back to direct HTTPS or the BerryKeep relay tunnel.
 - Candidate changes in Rendezvous are reconciled without recreating the public
   client handle.
 - With the relay companion configured, diagnostics distinguish an iroh direct
-  path from iroh relay assistance and from the existing IronMesh relay tunnel.
+  path from iroh relay assistance and from the existing BerryKeep relay tunnel.
 
 ### Android validation
 
@@ -559,7 +559,7 @@ The implementation is complete only when all of the following hold:
 | Route flapping | Preserve quality state, use TTL/grace periods, and apply the existing stability bias. |
 | iOS suspension | Treat lifecycle hooks as opportunistic hints; refresh on foreground/next operation. |
 | Android connectivity churn | Coalesce callback hints and apply backoff in core. |
-| NATs that cannot be punched | Deploy an iroh relay companion and retain the current IronMesh relay fallback. |
+| NATs that cannot be punched | Deploy an iroh relay companion and retain the current BerryKeep relay fallback. |
 | Trust-boundary regression | Retain the authenticated Rendezvous node-to-endpoint mapping and verify the DirectQuic handshake target; candidates are hints, not identities. |
 | Large review surface | Keep the five PR slices above separate; do not combine server relay deployment with native wrapper refactors. |
 

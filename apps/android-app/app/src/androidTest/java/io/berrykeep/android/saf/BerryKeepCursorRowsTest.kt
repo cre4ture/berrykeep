@@ -1,0 +1,121 @@
+package io.berrykeep.android.saf
+
+import android.database.MatrixCursor
+import android.provider.DocumentsContract
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import io.berrykeep.android.api.StoreIndexEntry
+import io.berrykeep.android.api.StoreIndexMedia
+import io.berrykeep.android.api.StoreIndexThumbnail
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class BerryKeepCursorRowsTest {
+    @Test
+    fun populateFileRow_ignoresCustomColumnsWhenProjectionOmitsThem() {
+        val cursor = MatrixCursor(
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_FLAGS,
+            ),
+        )
+
+        val row = cursor.newRow()
+        BerryKeepCursorRows.populateFileRow(
+            cursor = cursor,
+            row = row,
+            documentId = "file:gallery/cat.png",
+            entry = sampleImageEntry(),
+            fallbackMimeType = "image/png",
+            summary = "4 x 3 - ready",
+        )
+
+        assertTrue(cursor.moveToFirst())
+        assertEquals("file:gallery/cat.png", cursor.getString(0))
+        assertEquals("cat.png", cursor.getString(1))
+        assertEquals("image/png", cursor.getString(2))
+        assertTrue(cursor.getInt(3) and DocumentsContract.Document.FLAG_SUPPORTS_WRITE != 0)
+        assertTrue(
+            cursor.getInt(3) and DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL != 0,
+        )
+    }
+
+    @Test
+    fun populateFileRow_marksImagesAsThumbnailCapableWithoutPrefetchedThumbnailMetadata() {
+        val cursor = MatrixCursor(
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_FLAGS,
+            ),
+        )
+
+        val row = cursor.newRow()
+        BerryKeepCursorRows.populateFileRow(
+            cursor = cursor,
+            row = row,
+            documentId = "file:gallery/cat.png",
+            entry = sampleImageEntry(thumbnail = null),
+            fallbackMimeType = "image/png",
+            summary = "4 x 3 - ready",
+        )
+
+        assertTrue(cursor.moveToFirst())
+        assertTrue(
+            cursor.getInt(3) and DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL != 0,
+        )
+    }
+
+    @Test
+    fun populateFileRow_reportsRemoteObjectSize() {
+        val cursor = MatrixCursor(
+            arrayOf(DocumentsContract.Document.COLUMN_SIZE),
+        )
+
+        val row = cursor.newRow()
+        BerryKeepCursorRows.populateFileRow(
+            cursor = cursor,
+            row = row,
+            documentId = "file:gallery/cat.png",
+            entry = sampleImageEntry(),
+            fallbackMimeType = "image/png",
+            summary = null,
+        )
+
+        assertTrue(cursor.moveToFirst())
+        assertEquals(1_913_769L, cursor.getLong(0))
+    }
+
+    private fun sampleImageEntry(thumbnail: StoreIndexThumbnail? = sampleThumbnail()): StoreIndexEntry {
+        return StoreIndexEntry(
+            path = "gallery/cat.png",
+            entry_type = "key",
+            size_bytes = 1_913_769,
+            media = StoreIndexMedia(
+                status = "ready",
+                content_fingerprint = "cfp-cat",
+                media_type = "image",
+                mime_type = "image/png",
+                width = 4,
+                height = 3,
+                thumbnail = thumbnail,
+            ),
+        )
+    }
+
+    private fun sampleThumbnail(): StoreIndexThumbnail {
+        return StoreIndexThumbnail(
+            url = "/media/thumbnail?key=gallery%2Fcat.png",
+            profile = "grid",
+            width = 256,
+            height = 192,
+            format = "jpeg",
+            size_bytes = 1024,
+        )
+    }
+}

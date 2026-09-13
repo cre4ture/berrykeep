@@ -42,7 +42,7 @@ artifact contract described here.
 - Compile the Server Node once per CPU ABI, not once per distribution suite.
 - Remove the server executable's glibc and shared-library ABI dependency.
 - Use `berrykeep-server-node` as the public executable, package, service, user,
-  configuration, and state-directory name. Transitional IronMesh packages keep
+  configuration, and state-directory name. Transitional BerryKeep packages keep
   existing deployments on their legacy service and state paths.
 - Preserve ordinary signed apt installation and update behavior.
 - Make every published artifact independently inspectable and reproducible

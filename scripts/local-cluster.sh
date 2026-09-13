@@ -2,13 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLUSTER_DIR="${IRONMESH_LOCAL_CLUSTER_DIR:-${ROOT_DIR}/data/local-cluster}"
-BASE_PORT="${IRONMESH_LOCAL_CLUSTER_BASE_PORT:-18080}"
-PUBLIC_HOST="${IRONMESH_LOCAL_CLUSTER_PUBLIC_HOST:-127.0.0.1}"
-PUBLIC_HOST_ALT_NAMES="${IRONMESH_LOCAL_CLUSTER_PUBLIC_HOST_ALT_NAMES:-}"
+CLUSTER_DIR="${BERRYKEEP_LOCAL_CLUSTER_DIR:-${ROOT_DIR}/data/local-cluster}"
+BASE_PORT="${BERRYKEEP_LOCAL_CLUSTER_BASE_PORT:-18080}"
+PUBLIC_HOST="${BERRYKEEP_LOCAL_CLUSTER_PUBLIC_HOST:-127.0.0.1}"
+PUBLIC_HOST_ALT_NAMES="${BERRYKEEP_LOCAL_CLUSTER_PUBLIC_HOST_ALT_NAMES:-}"
 NODE_COUNT=4
-BIN_PATH="${IRONMESH_SERVER_BIN:-${ROOT_DIR}/target/debug/berrykeep-server-node}"
-CLIENT_AUTH_ENABLED="${IRONMESH_LOCAL_CLUSTER_ENABLE_CLIENT_AUTH:-true}"
+BIN_PATH="${BERRYKEEP_SERVER_BIN:-${ROOT_DIR}/target/debug/berrykeep-server-node}"
+CLIENT_AUTH_ENABLED="${BERRYKEEP_LOCAL_CLUSTER_ENABLE_CLIENT_AUTH:-true}"
 
 NODE_IDS=(
   "00000000-0000-0000-0000-00000000a001"
@@ -123,7 +123,7 @@ admin_token() {
     openssl rand -hex 24 | tee "$(admin_token_file)" >/dev/null
   else
     local fallback
-    fallback="ironmesh-local-admin-$(date +%s)"
+    fallback="berrykeep-local-admin-$(date +%s)"
     printf '%s\n' "${fallback}" | tee "$(admin_token_file)" >/dev/null
   fi
   chmod 600 "$(admin_token_file)" 2>/dev/null || true
@@ -204,7 +204,7 @@ generate_ca() {
     -out "$(ca_cert_file)" \
     -days 3650 \
     -sha256 \
-    -subj "/CN=ironmesh-local-cluster-ca" >/dev/null 2>&1
+    -subj "/CN=berrykeep-local-cluster-ca" >/dev/null 2>&1
 }
 
 generate_public_cert() {
@@ -268,13 +268,13 @@ generate_node_cert() {
 basicConstraints=CA:FALSE
 keyUsage=digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth,clientAuth
-subjectAltName=IP:127.0.0.1,URI:urn:ironmesh:node:${node_id}
+subjectAltName=IP:127.0.0.1,URI:urn:berrykeep:node:${node_id}
 EOF
 
   openssl req -new -newkey rsa:2048 -nodes \
     -keyout "$(node_key_file "$idx")" \
     -out "${csr_path}" \
-    -subj "/CN=ironmesh-node-${node_id}" >/dev/null 2>&1
+    -subj "/CN=berrykeep-node-${node_id}" >/dev/null 2>&1
 
   openssl x509 -req \
     -in "${csr_path}" \
@@ -412,7 +412,7 @@ JSON
   echo "[local-cluster] issuing pairing token via ${controller_url}"
   curl --cacert "$(ca_cert_file)" -fsS -X POST "${controller_url}/auth/pairing-tokens/issue" \
     -H "content-type: application/json" \
-    -H "x-ironmesh-admin-token: $(admin_token)" \
+    -H "x-berrykeep-admin-token: $(admin_token)" \
     --data "${payload}"
   echo
 }
@@ -441,7 +441,7 @@ JSON
 
   curl --cacert "$(ca_cert_file)" -fsS -X POST "${controller_url}/auth/pairing-tokens/issue" \
     -H "content-type: application/json" \
-    -H "x-ironmesh-admin-token: $(admin_token)" \
+    -H "x-berrykeep-admin-token: $(admin_token)" \
     --data "${payload}"
 }
 
@@ -469,7 +469,7 @@ JSON
 
   curl --cacert "$(ca_cert_file)" -fsS -X POST "${controller_url}/auth/bootstrap-bundles/issue" \
     -H "content-type: application/json" \
-    -H "x-ironmesh-admin-token: $(admin_token)" \
+    -H "x-berrykeep-admin-token: $(admin_token)" \
     --data "${payload}"
 }
 
@@ -546,21 +546,21 @@ start_cluster() {
 
     echo "[local-cluster] starting node${idx} on ${bind}"
     nohup env \
-      IRONMESH_NODE_ID="${node_id}" \
-      IRONMESH_SERVER_BIND="${bind}" \
-      IRONMESH_PUBLIC_URL="${url}" \
-      IRONMESH_PUBLIC_TLS_CERT="$(public_cert_file)" \
-      IRONMESH_PUBLIC_TLS_KEY="$(public_key_file)" \
-      IRONMESH_PUBLIC_TLS_CA_CERT="$(ca_cert_file)" \
-      IRONMESH_INTERNAL_BIND="${internal_bind}" \
-      IRONMESH_INTERNAL_URL="${internal_url}" \
-      IRONMESH_INTERNAL_TLS_CA_CERT="$(ca_cert_file)" \
-      IRONMESH_INTERNAL_TLS_CERT="$(node_cert_file "$idx")" \
-      IRONMESH_INTERNAL_TLS_KEY="$(node_key_file "$idx")" \
-      IRONMESH_DATA_DIR="${ddir}" \
-      IRONMESH_REPLICATION_FACTOR=3 \
-      IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS="${allow_unauthenticated_clients}" \
-      IRONMESH_ADMIN_TOKEN="$(admin_token)" \
+      BERRYKEEP_NODE_ID="${node_id}" \
+      BERRYKEEP_SERVER_BIND="${bind}" \
+      BERRYKEEP_PUBLIC_URL="${url}" \
+      BERRYKEEP_PUBLIC_TLS_CERT="$(public_cert_file)" \
+      BERRYKEEP_PUBLIC_TLS_KEY="$(public_key_file)" \
+      BERRYKEEP_PUBLIC_TLS_CA_CERT="$(ca_cert_file)" \
+      BERRYKEEP_INTERNAL_BIND="${internal_bind}" \
+      BERRYKEEP_INTERNAL_URL="${internal_url}" \
+      BERRYKEEP_INTERNAL_TLS_CA_CERT="$(ca_cert_file)" \
+      BERRYKEEP_INTERNAL_TLS_CERT="$(node_cert_file "$idx")" \
+      BERRYKEEP_INTERNAL_TLS_KEY="$(node_key_file "$idx")" \
+      BERRYKEEP_DATA_DIR="${ddir}" \
+      BERRYKEEP_REPLICATION_FACTOR=3 \
+      BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS="${allow_unauthenticated_clients}" \
+      BERRYKEEP_ADMIN_TOKEN="$(admin_token)" \
       "${BIN_PATH}" >"${logfile}" 2>&1 </dev/null &
 
     echo "$!" >"${pid_path}"
@@ -656,12 +656,12 @@ Extra commands:
   bootstrap [label] [expires_in_secs] [node_idx] [output_file]
 
 Environment variables:
-  IRONMESH_LOCAL_CLUSTER_DIR        Default: ${ROOT_DIR}/data/local-cluster
-  IRONMESH_LOCAL_CLUSTER_BASE_PORT  Default: 18080
-  IRONMESH_LOCAL_CLUSTER_PUBLIC_HOST  Default: 127.0.0.1
-  IRONMESH_LOCAL_CLUSTER_PUBLIC_HOST_ALT_NAMES  Optional comma-separated extra DNS/IP SANs
-  IRONMESH_SERVER_BIN               Default: ${ROOT_DIR}/target/debug/berrykeep-server-node
-  IRONMESH_LOCAL_CLUSTER_ENABLE_CLIENT_AUTH  Default: true
+  BERRYKEEP_LOCAL_CLUSTER_DIR        Default: ${ROOT_DIR}/data/local-cluster
+  BERRYKEEP_LOCAL_CLUSTER_BASE_PORT  Default: 18080
+  BERRYKEEP_LOCAL_CLUSTER_PUBLIC_HOST  Default: 127.0.0.1
+  BERRYKEEP_LOCAL_CLUSTER_PUBLIC_HOST_ALT_NAMES  Optional comma-separated extra DNS/IP SANs
+  BERRYKEEP_SERVER_BIN               Default: ${ROOT_DIR}/target/debug/berrykeep-server-node
+  BERRYKEEP_LOCAL_CLUSTER_ENABLE_CLIENT_AUTH  Default: true
 
 Requirements:
   openssl                         Used to generate local TLS certificates

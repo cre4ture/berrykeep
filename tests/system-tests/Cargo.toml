@@ -3,7 +3,7 @@ name = "system-tests"
 version = "1.0.0-beta.1"
 edition = "2024"
 license = "MIT"
-authors = ["ironmesh contributors"]
+authors = ["berrykeep contributors"]
 
 [workspace]
 
@@ -56,9 +56,9 @@ patchbay = "0.6"
 base64 = "0.22"
 server_node = { path = "../../apps/server-node", package = "server-node", artifact = "bin" }
 cli_client = { path = "../../apps/cli-client", package = "cli-client", artifact = "bin" }
-ironmesh_config_app = { path = "../../apps/config-app", package = "ironmesh-config-app", artifact = "bin" }
+berrykeep_config_app = { path = "../../apps/config-app", package = "berrykeep-config-app", artifact = "bin" }
 os_integration = { path = "../../apps/os-integration", package = "os-integration", artifact = "bin" }
-ironmesh_folder_agent = { path = "../../apps/folder-agent", package = "ironmesh-folder-agent", artifact = "bin" }
+berrykeep_folder_agent = { path = "../../apps/folder-agent", package = "berrykeep-folder-agent", artifact = "bin" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 rendezvous-server = { path = "../../crates/rendezvous-server" }
 rendezvous_service = { path = "../../apps/rendezvous-service", package = "rendezvous-service", artifact = "bin" }

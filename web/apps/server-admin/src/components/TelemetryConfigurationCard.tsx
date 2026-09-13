@@ -4,9 +4,9 @@ import {
   rotateTelemetryIdentity,
   updateTelemetrySettings,
   type TelemetrySettingsResponse
-} from "@ironmesh/api";
+} from "@berrykeep/api";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { JsonBlock } from "@ironmesh/ui";
+import { JsonBlock } from "@berrykeep/ui";
 import {
   Alert,
   Badge,
@@ -107,7 +107,7 @@ export function TelemetryConfigurationCard({ canInspect }: TelemetryConfiguratio
             <Text c="dimmed" size="sm" maw={860}>
               This node periodically sends an anonymized, reduced hardware reliability summary (SMART
               counters, uptime, ECC and finding statistics — never hostnames, IPs, serial numbers, or
-              object data) to the central IronMesh statistics collector so hardware failure trends can
+              object data) to the central BerryKeep statistics collector so hardware failure trends can
               be compared across the whole fleet. Sending is enabled by default and can be switched
               off here at any time (opt-out); the full concept is documented in{" "}
               <Code>docs/server-node-hardware-reliability-telemetry-strategy.md</Code>.

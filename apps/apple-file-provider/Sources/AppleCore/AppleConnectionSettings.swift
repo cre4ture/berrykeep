@@ -116,20 +116,24 @@ public protocol AppleBootstrapEnroller: Sendable {
 }
 
 public final class AppleConnectionSettingsStore: @unchecked Sendable {
-    public static let defaultStateKey = "ironmesh.connection.state"
+    public static let defaultStateKey = "berrykeep.connection.state"
+    public static let legacyStateKey = "ironmesh.connection.state"
     public static let defaultLegacyDraftStateKey = "IronmeshIosApp.connectionDraft"
 
     private let defaults: UserDefaults
     private let stateKey: String
+    private let legacyPersistedStateKey: String?
     let secretStore: any AppleSecretStore
 
     public init(
         defaults: UserDefaults = .standard,
         stateKey: String = defaultStateKey,
+        legacyStateKey: String? = AppleConnectionSettingsStore.legacyStateKey,
         secretStore: any AppleSecretStore = AppleKeychainSecretStore()
     ) {
         self.defaults = defaults
         self.stateKey = stateKey
+        self.legacyPersistedStateKey = legacyStateKey?.nilIfBlank
         self.secretStore = secretStore
     }
 
@@ -137,6 +141,7 @@ public final class AppleConnectionSettingsStore: @unchecked Sendable {
         preferencesSuiteName: String?,
         keychainAccessGroup: String?,
         stateKey: String = defaultStateKey,
+        legacyStateKey: String? = AppleConnectionSettingsStore.legacyStateKey,
         secretStore: (any AppleSecretStore)? = nil
     ) {
         let normalizedSuiteName = preferencesSuiteName?.nilIfBlank
@@ -148,12 +153,14 @@ public final class AppleConnectionSettingsStore: @unchecked Sendable {
             self.init(
                 defaults: defaults,
                 stateKey: stateKey,
+                legacyStateKey: legacyStateKey,
                 secretStore: resolvedSecretStore
             )
         } else {
             self.init(
                 defaults: .standard,
                 stateKey: stateKey,
+                legacyStateKey: legacyStateKey,
                 secretStore: resolvedSecretStore
             )
         }
@@ -222,13 +229,25 @@ public final class AppleConnectionSettingsStore: @unchecked Sendable {
     public func clear() throws {
         try secretStore.clear()
         defaults.removeObject(forKey: stateKey)
+        if let legacyPersistedStateKey, legacyPersistedStateKey != stateKey {
+            defaults.removeObject(forKey: legacyPersistedStateKey)
+        }
     }
 
     private func loadPersistedState() throws -> AppleStoredConnectionState? {
-        guard let data = defaults.data(forKey: stateKey) else {
+        if let data = defaults.data(forKey: stateKey) {
+            return try JSONDecoder().decode(AppleStoredConnectionState.self, from: data)
+        }
+        guard let legacyPersistedStateKey,
+              legacyPersistedStateKey != stateKey,
+              let data = defaults.data(forKey: legacyPersistedStateKey)
+        else {
             return nil
         }
-        return try JSONDecoder().decode(AppleStoredConnectionState.self, from: data)
+        let state = try JSONDecoder().decode(AppleStoredConnectionState.self, from: data)
+        defaults.set(data, forKey: stateKey)
+        defaults.removeObject(forKey: legacyPersistedStateKey)
+        return state
     }
 
     private static func encode(_ state: AppleStoredConnectionState) throws -> Data {

@@ -1643,7 +1643,7 @@ pub fn rendezvous_client_identity_has_expected_cluster_uri_san(
     let certificate_der = rendezvous_client_identity_certificate_der(client_identity_pem)?;
     let (_, certificate) = parse_x509_certificate(certificate_der.as_ref())
         .map_err(|error| anyhow!("failed parsing rendezvous client certificate: {error}"))?;
-    let expected_cluster_uri = format!("urn:ironmesh:cluster:{expected_cluster_id}");
+    let expected_cluster_uri = format!("urn:berrykeep:cluster:{expected_cluster_id}");
 
     Ok(certificate.extensions().iter().any(|extension| {
         matches!(
@@ -1821,7 +1821,7 @@ mod tests {
         let key_pair = KeyPair::generate().expect("test identity key should generate");
         let mut params = CertificateParams::new(Vec::new()).expect("test certificate params");
         params.subject_alt_names = vec![SanType::URI(
-            format!("urn:ironmesh:cluster:{cluster_id}")
+            format!("urn:berrykeep:cluster:{cluster_id}")
                 .try_into()
                 .expect("test cluster SAN should parse"),
         )];

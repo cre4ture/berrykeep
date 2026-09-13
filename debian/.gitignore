@@ -8,10 +8,10 @@
 /*.debhelper.log
 /*.debhelper
 /*.substvars
-/ironmesh-client/
-/ironmesh-rendezvous-service/
-/ironmesh-server-node/
-/ironmesh-server-node-map-tools/
+/berrykeep-client/
+/berrykeep-rendezvous-service/
+/berrykeep-server-node/
+/berrykeep-server-node-map-tools/
 /berrykeep-client/
 /berrykeep-rendezvous-service/
 /berrykeep-server-node/

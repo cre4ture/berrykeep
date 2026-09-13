@@ -1,0 +1,603 @@
+package io.berrykeep.android.ui.screens
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import io.berrykeep.android.BuildConfig
+import io.berrykeep.android.R
+import io.berrykeep.android.data.MAX_NODE_CONNECTION_PRIORITY
+import io.berrykeep.android.data.MIN_NODE_CONNECTION_PRIORITY
+import io.berrykeep.android.ui.SettingsUiState
+import io.berrykeep.android.ui.components.PermissionExplainerCard
+import io.berrykeep.android.ui.components.SectionCard
+import io.berrykeep.android.ui.theme.DEFAULT_BERRYKEEP_ACCENT_COLOR_HEX
+import io.berrykeep.android.ui.theme.BERRYKEEP_ACCENT_COLOR_SWATCHES
+import io.berrykeep.android.ui.theme.berrykeepAccentColorToHex
+import io.berrykeep.android.ui.theme.normalizeBerryKeepAccentColorHex
+import io.berrykeep.android.ui.theme.parseBerryKeepAccentColorOrDefault
+import kotlin.math.roundToInt
+
+@Composable
+fun SettingsScreen(
+    state: SettingsUiState,
+    hasPhotoAccess: Boolean,
+    hasWifiNamePermissions: Boolean,
+    isLocationEnabled: Boolean,
+    onRequestPhotoAccess: () -> Unit,
+    onRequestWifiNameAccess: () -> Unit,
+    onOpenLocationSettings: () -> Unit,
+    onOpenFiles: () -> Unit,
+    onOpenConnectionDiagnostics: () -> Unit,
+    onOpenTimingDiagnostics: () -> Unit,
+    onOpenWebConsole: () -> Unit,
+    onClearCachedData: () -> Unit,
+    onThemeAccentColorChange: (String) -> Unit,
+    onTitleLatencyMonitorEnabledChange: (Boolean) -> Unit,
+    onTitleLatencyMonitorPeriodSecondsChange: (Long) -> Unit,
+    onRevealNodePriorities: () -> Unit,
+    onNodePriorityOverrideChange: (String, Int?) -> Unit,
+    onKeyChange: (String) -> Unit,
+    onPayloadChange: (String) -> Unit,
+    onPutObject: () -> Unit,
+    onGetObject: () -> Unit,
+) {
+    val wifiAccessGranted = hasWifiNamePermissions && isLocationEnabled
+    val wifiStatusText = when {
+        wifiAccessGranted -> stringResource(R.string.permission_granted)
+        !hasWifiNamePermissions -> stringResource(R.string.permission_needed)
+        else -> stringResource(R.string.location_required)
+    }
+    val wifiActionLabel = when {
+        wifiAccessGranted -> null
+        !hasWifiNamePermissions -> stringResource(R.string.grant_access)
+        else -> stringResource(R.string.open_location_settings)
+    }
+    val wifiAction = when {
+        wifiAccessGranted -> null
+        !hasWifiNamePermissions -> onRequestWifiNameAccess
+        else -> onOpenLocationSettings
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        SectionCard(
+            title = stringResource(R.string.settings_device),
+            supportingText = state.deviceIdentity.deviceId.ifBlank { "This phone is not enrolled yet." },
+        ) {
+            Text(
+                text = state.deviceIdentity.label.orEmpty().ifBlank { "No device label set" },
+                style = MaterialTheme.typography.bodyLarge,
+            )
+        }
+
+        SectionCard(title = stringResource(R.string.settings_permissions)) {
+            PermissionExplainerCard(
+                title = stringResource(R.string.photo_access_title),
+                body = stringResource(R.string.photo_access_body),
+                status = stringResource(
+                    if (hasPhotoAccess) {
+                        R.string.permission_granted
+                    } else {
+                        R.string.permission_needed
+                    },
+                ),
+                actionLabel = if (hasPhotoAccess) null else stringResource(R.string.grant_access),
+                onAction = if (hasPhotoAccess) null else onRequestPhotoAccess,
+            )
+            PermissionExplainerCard(
+                title = stringResource(R.string.wifi_access_title),
+                body = stringResource(R.string.wifi_access_body),
+                status = wifiStatusText,
+                actionLabel = wifiActionLabel,
+                onAction = wifiAction,
+            )
+        }
+
+        SectionCard(
+            title = stringResource(R.string.settings_appearance),
+            supportingText = stringResource(R.string.theme_color_body),
+        ) {
+            ThemeAccentColorEditor(
+                accentColorHex = state.themeAccentColorHex,
+                onAccentColorChange = onThemeAccentColorChange,
+            )
+        }
+
+        SectionCard(
+            title = stringResource(R.string.title_latency_monitor_title),
+            supportingText = stringResource(R.string.title_latency_monitor_body),
+        ) {
+            TitleLatencyMonitorSettingsEditor(
+                enabled = state.titleLatencyMonitorSettings.enabled,
+                periodSeconds = state.titleLatencyMonitorSettings.periodSeconds,
+                onEnabledChange = onTitleLatencyMonitorEnabledChange,
+                onPeriodSecondsChange = onTitleLatencyMonitorPeriodSecondsChange,
+            )
+        }
+
+        SectionCard(title = stringResource(R.string.settings_storage)) {
+            Button(onClick = onOpenFiles) {
+                Text(stringResource(R.string.open_files))
+            }
+            OutlinedButton(onClick = onClearCachedData) {
+                Text("Clear cached data")
+            }
+            Text(
+                text = "Removes locally cached map and Web UI data. Enrollment and files stay intact.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        SectionCard(title = stringResource(R.string.settings_advanced)) {
+            ExperimentalNodePrioritiesEditor(
+                state = state,
+                onReveal = onRevealNodePriorities,
+                onPriorityOverrideChange = onNodePriorityOverrideChange,
+            )
+            OutlinedButton(onClick = onOpenConnectionDiagnostics) {
+                Text(stringResource(R.string.connection_diagnostics))
+            }
+            OutlinedButton(onClick = onOpenTimingDiagnostics) {
+                Text(stringResource(R.string.timing_diagnostics))
+            }
+            Button(onClick = onOpenWebConsole) {
+                Text(stringResource(R.string.open_web_console))
+            }
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = state.key,
+                onValueChange = onKeyChange,
+                label = { Text(stringResource(R.string.key)) },
+                singleLine = true,
+            )
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = state.payload,
+                onValueChange = onPayloadChange,
+                label = { Text(stringResource(R.string.payload)) },
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = onPutObject) {
+                    Text(stringResource(R.string.put))
+                }
+                OutlinedButton(onClick = onGetObject) {
+                    Text(stringResource(R.string.get))
+                }
+            }
+        }
+
+        SectionCard(title = stringResource(R.string.version)) {
+            SelectionContainer {
+                Text(BuildConfig.LONG_VERSION)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExperimentalNodePrioritiesEditor(
+    state: SettingsUiState,
+    onReveal: () -> Unit,
+    onPriorityOverrideChange: (String, Int?) -> Unit,
+) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    val overrides = state.nodePriorityOverrides
+    val routeNodes = state.connectionRoutes
+        ?.endpoints
+        .orEmpty()
+        .mapNotNull { endpoint ->
+            endpoint.targetNodeId?.let { nodeId ->
+                NodePriorityRoute(
+                    nodeId = nodeId,
+                    hostname = endpoint.targetNodeHostname?.trim()?.takeIf(String::isNotEmpty),
+                    priority = endpoint.nodeConnectionPriority,
+                )
+            }
+        }
+    val routePriorities = routeNodes.associate { route -> route.nodeId to route.priority }
+    val routeHostnames = routeNodes
+        .mapNotNull { route -> route.hostname?.let { hostname -> route.nodeId to hostname } }
+        .toMap()
+    val nodeIds = (routePriorities.keys + overrides.keys).sorted()
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        OutlinedButton(
+            onClick = {
+                expanded = !expanded
+                if (expanded) {
+                    onReveal()
+                }
+            },
+        ) {
+            Text(if (expanded) "Hide experimental node priorities" else "Experimental node priorities")
+        }
+
+        if (expanded) {
+            Text(
+                text = "Test feature. Manual values override the priority advertised by each server node. Higher values are preferred.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (nodeIds.isEmpty()) {
+                Text(
+                    text = if (state.connectionRoutesLoading) {
+                        "Loading known server nodes…"
+                    } else {
+                        "No server nodes have been discovered yet."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            nodeIds.forEach { nodeId ->
+                NodePriorityOverrideRow(
+                    nodeId = nodeId,
+                    hostname = routeHostnames[nodeId],
+                    automaticPriority = routePriorities[nodeId] ?: 0,
+                    overridePriority = overrides[nodeId],
+                    onPriorityOverrideChange = onPriorityOverrideChange,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NodePriorityOverrideRow(
+    nodeId: String,
+    hostname: String?,
+    automaticPriority: Int,
+    overridePriority: Int?,
+    onPriorityOverrideChange: (String, Int?) -> Unit,
+) {
+    var pendingPriority by remember(nodeId, overridePriority, automaticPriority) {
+        mutableStateOf((overridePriority ?: automaticPriority).toFloat())
+    }
+    val hasOverride = overridePriority != null
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, MaterialTheme.shapes.small)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(text = hostname ?: nodeId, style = MaterialTheme.typography.labelSmall)
+        if (hostname != null) {
+            Text(
+                text = nodeId,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Manual override", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    if (hasOverride) "Priority ${pendingPriority.roundToInt()}" else "Automatic · priority $automaticPriority",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = hasOverride,
+                onCheckedChange = { enabled ->
+                    onPriorityOverrideChange(nodeId, if (enabled) pendingPriority.roundToInt() else null)
+                },
+            )
+        }
+        if (hasOverride) {
+            Slider(
+                value = pendingPriority,
+                onValueChange = { pendingPriority = it.roundToInt().toFloat() },
+                onValueChangeFinished = {
+                    onPriorityOverrideChange(nodeId, pendingPriority.roundToInt())
+                },
+                valueRange = MIN_NODE_CONNECTION_PRIORITY.toFloat()..MAX_NODE_CONNECTION_PRIORITY.toFloat(),
+                steps = MAX_NODE_CONNECTION_PRIORITY - MIN_NODE_CONNECTION_PRIORITY - 1,
+            )
+        }
+    }
+}
+
+private data class NodePriorityRoute(
+    val nodeId: String,
+    val hostname: String?,
+    val priority: Int,
+)
+
+@Composable
+private fun TitleLatencyMonitorSettingsEditor(
+    enabled: Boolean,
+    periodSeconds: Long,
+    onEnabledChange: (Boolean) -> Unit,
+    onPeriodSecondsChange: (Long) -> Unit,
+) {
+    var pendingPeriodSeconds by remember(periodSeconds) { mutableStateOf(periodSeconds.toFloat()) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.title_latency_monitor_enable),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Text(
+                    text = stringResource(
+                        if (enabled) R.string.enabled else R.string.disabled,
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = enabled,
+                onCheckedChange = onEnabledChange,
+            )
+        }
+
+        if (enabled) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = stringResource(R.string.title_latency_monitor_period),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                    Text(
+                        text = stringResource(
+                            R.string.title_latency_monitor_period_value,
+                            pendingPeriodSeconds.roundToInt(),
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Slider(
+                    value = pendingPeriodSeconds,
+                    onValueChange = { value ->
+                        pendingPeriodSeconds = value.roundToInt().toFloat()
+                    },
+                    onValueChangeFinished = {
+                        onPeriodSecondsChange(pendingPeriodSeconds.roundToInt().toLong())
+                    },
+                    valueRange = 1f..300f,
+                    steps = 298,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThemeAccentColorEditor(
+    accentColorHex: String,
+    onAccentColorChange: (String) -> Unit,
+) {
+    val accentColor = parseBerryKeepAccentColorOrDefault(accentColorHex)
+    val red = colorChannel(accentColor.red)
+    val green = colorChannel(accentColor.green)
+    val blue = colorChannel(accentColor.blue)
+    var hexInput by remember { mutableStateOf(accentColorHex) }
+
+    LaunchedEffect(accentColorHex) {
+        if (normalizeBerryKeepAccentColorHex(hexInput) != accentColorHex) {
+            hexInput = accentColorHex
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(accentColor)
+                    .border(
+                        width = 2.dp,
+                        color = MaterialTheme.colorScheme.outline,
+                        shape = CircleShape,
+                    ),
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = stringResource(R.string.theme_color_preview),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Text(
+                    text = accentColorHex,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        OutlinedTextField(
+            modifier = Modifier.fillMaxWidth(),
+            value = hexInput,
+            onValueChange = { value ->
+                hexInput = value.uppercase()
+                normalizeBerryKeepAccentColorHex(value)?.let(onAccentColorChange)
+            },
+            label = { Text(stringResource(R.string.theme_color_hex_label)) },
+            singleLine = true,
+        )
+
+        Text(
+            text = stringResource(R.string.theme_color_presets),
+            style = MaterialTheme.typography.labelLarge,
+        )
+        BERRYKEEP_ACCENT_COLOR_SWATCHES.chunked(3).forEach { rowColors ->
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                rowColors.forEach { swatch ->
+                    ThemeAccentSwatch(
+                        colorHex = swatch,
+                        selected = swatch == accentColorHex,
+                        onClick = { onAccentColorChange(swatch) },
+                    )
+                }
+            }
+        }
+
+        ColorChannelSlider(
+            label = stringResource(R.string.theme_color_red),
+            value = red,
+            onValueChange = { value ->
+                onAccentColorChange(
+                    updateAccentColorChannel(
+                        accentColor = accentColor,
+                        red = value,
+                    ),
+                )
+            },
+        )
+        ColorChannelSlider(
+            label = stringResource(R.string.theme_color_green),
+            value = green,
+            onValueChange = { value ->
+                onAccentColorChange(
+                    updateAccentColorChannel(
+                        accentColor = accentColor,
+                        green = value,
+                    ),
+                )
+            },
+        )
+        ColorChannelSlider(
+            label = stringResource(R.string.theme_color_blue),
+            value = blue,
+            onValueChange = { value ->
+                onAccentColorChange(
+                    updateAccentColorChannel(
+                        accentColor = accentColor,
+                        blue = value,
+                    ),
+                )
+            },
+        )
+
+        OutlinedButton(onClick = { onAccentColorChange(DEFAULT_BERRYKEEP_ACCENT_COLOR_HEX) }) {
+            Text(stringResource(R.string.theme_color_reset))
+        }
+    }
+}
+
+@Composable
+private fun ThemeAccentSwatch(
+    colorHex: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val swatchColor = parseBerryKeepAccentColorOrDefault(colorHex)
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .clip(CircleShape)
+            .background(swatchColor)
+            .border(
+                width = if (selected) 3.dp else 1.dp,
+                color = if (selected) {
+                    MaterialTheme.colorScheme.onSurface
+                } else {
+                    MaterialTheme.colorScheme.outline
+                },
+                shape = CircleShape,
+            )
+            .clickable(onClick = onClick),
+    )
+}
+
+@Composable
+private fun ColorChannelSlider(
+    label: String,
+    value: Int,
+    onValueChange: (Int) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(text = label, style = MaterialTheme.typography.labelLarge)
+            Text(
+                text = value.toString(),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Slider(
+            value = value.toFloat(),
+            onValueChange = { next -> onValueChange(next.roundToInt().coerceIn(0, 255)) },
+            valueRange = 0f..255f,
+        )
+    }
+}
+
+private fun updateAccentColorChannel(
+    accentColor: Color,
+    red: Int? = null,
+    green: Int? = null,
+    blue: Int? = null,
+): String =
+    berrykeepAccentColorToHex(
+        accentColor.copy(
+            red = (red ?: colorChannel(accentColor.red)) / 255f,
+            green = (green ?: colorChannel(accentColor.green)) / 255f,
+            blue = (blue ?: colorChannel(accentColor.blue)) / 255f,
+        ),
+    )
+
+private fun colorChannel(value: Float): Int =
+    (value.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)

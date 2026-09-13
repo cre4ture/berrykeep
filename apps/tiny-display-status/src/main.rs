@@ -22,8 +22,8 @@ const FB_DEVICE: &str = "/dev/fb0";
 #[cfg(target_os = "linux")]
 const TOUCH_DEVICE: &str = "/dev/input/event0";
 // Matches the server-node's optional unauthenticated local status listener,
-// see IRONMESH_LOCAL_STATUS_BIND (crates/server-node-sdk).
-const IRONMESH_BASE_URL: &str = "http://127.0.0.1:18090";
+// see BERRYKEEP_LOCAL_STATUS_BIND (crates/server-node-sdk).
+const BERRYKEEP_BASE_URL: &str = "http://127.0.0.1:18090";
 const NUM_PAGES: usize = 3;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -148,10 +148,10 @@ fn render_page(fb: &mut FrameBuffer, page: usize) {
             )
         }
         _ => {
-            let info = stats::collect_ironmesh_info(IRONMESH_BASE_URL);
+            let info = stats::collect_berrykeep_info(BERRYKEEP_BASE_URL);
             if info.reachable {
                 (
-                    "IRONMESH",
+                    "BERRYKEEP",
                     palette::CATEGORY_YELLOW,
                     vec![
                         line_colored("node: ", "online".to_string(), palette::STATUS_GOOD),
@@ -174,7 +174,7 @@ fn render_page(fb: &mut FrameBuffer, page: usize) {
                 )
             } else {
                 (
-                    "IRONMESH",
+                    "BERRYKEEP",
                     palette::CATEGORY_YELLOW,
                     vec![line_colored(
                         "node: ",

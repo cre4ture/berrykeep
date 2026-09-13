@@ -2,10 +2,10 @@
 
 This guide is the operator-facing packaged Windows validation for Pass 8.
 
-It proves that a packaged `ironmesh-os-integration` instance can:
+It proves that a packaged `berrykeep-os-integration` instance can:
 
 - register a Windows sync root from the packaged config app,
-- persist bootstrap and identity state under `%LocalAppData%\Ironmesh\sync-roots\...`,
+- persist bootstrap and identity state under `%LocalAppData%\BerryKeep\sync-roots\...`,
 - reconnect after the packaged runtime is stopped,
 - continue syncing after the original bootstrap file is removed.
 
@@ -26,13 +26,13 @@ The easiest way to obtain the bootstrap is to use the direct-enroll flow documen
 Run these PowerShell commands first:
 
 ```powershell
-$Bootstrap = Join-Path $env:TEMP "ironmesh-client-bootstrap.json"
-$Root = Join-Path $env:USERPROFILE "Desktop\Ironmesh Manual Sync Root"
-$SyncRootId = "ironmesh.manual.release.syncroot"
-$DisplayName = "Ironmesh Manual Sync Root"
-$ConfigPath = Join-Path $env:LOCALAPPDATA "Ironmesh\desktop-client-config\instances.json"
-$LaunchReportPath = Join-Path $env:LOCALAPPDATA "Ironmesh\desktop-client-config\last-launch-report.json"
-$SyncRootsRoot = Join-Path $env:LOCALAPPDATA "Ironmesh\sync-roots"
+$Bootstrap = Join-Path $env:TEMP "berrykeep-client-bootstrap.json"
+$Root = Join-Path $env:USERPROFILE "Desktop\BerryKeep Manual Sync Root"
+$SyncRootId = "berrykeep.manual.release.syncroot"
+$DisplayName = "BerryKeep Manual Sync Root"
+$ConfigPath = Join-Path $env:LOCALAPPDATA "BerryKeep\desktop-client-config\instances.json"
+$LaunchReportPath = Join-Path $env:LOCALAPPDATA "BerryKeep\desktop-client-config\last-launch-report.json"
+$SyncRootsRoot = Join-Path $env:LOCALAPPDATA "BerryKeep\sync-roots"
 
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
 Remove-Item -Recurse -Force $Root\* -ErrorAction SilentlyContinue
@@ -42,7 +42,7 @@ Copy the bootstrap bundle into `$Bootstrap` before continuing.
 
 ## 1. Launch the packaged config app
 
-Open the installed `Ironmesh Config App` from the Start menu.
+Open the installed `BerryKeep Config App` from the Start menu.
 
 Confirm the app reports these paths on the overview panel:
 
@@ -97,8 +97,8 @@ You should find a sync-root-specific state directory containing at least:
 
 Pass or fail rule:
 
-- both files exist under `%LocalAppData%\Ironmesh\sync-roots\...`
-- the original sync-root folder does not contain legacy hidden bootstrap files such as `.ironmesh-connection.json` or `.ironmesh-client-identity.json`
+- both files exist under `%LocalAppData%\BerryKeep\sync-roots\...`
+- the original sync-root folder does not contain legacy hidden bootstrap files such as `.berrykeep-connection.json` or `.berrykeep-client-identity.json`
 
 ## 5. Prove the first live sync works
 
@@ -110,7 +110,7 @@ Set-Content -Path (Join-Path $Root "manual-first-upload.txt") -Value "first pack
 
 Verify the remote side sees the new object using whatever release-candidate validation surface you are already using for the same environment. Acceptable checks include:
 
-- `ironmesh` CLI `get manual-first-upload.txt`
+- `berrykeep` CLI `get manual-first-upload.txt`
 - server-admin object browser
 - direct server API read through an authenticated client
 
@@ -121,12 +121,12 @@ Pass or fail rule:
 
 ## 6. Stop the packaged runtime and remove the original bootstrap file
 
-Stop the packaged `ironmesh-os-integration` process using Task Manager or PowerShell.
+Stop the packaged `berrykeep-os-integration` process using Task Manager or PowerShell.
 
 One reliable PowerShell option is:
 
 ```powershell
-Get-Process ironmesh-os-integration -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process berrykeep-os-integration -ErrorAction SilentlyContinue | Stop-Process -Force
 Remove-Item $Bootstrap
 ```
 
@@ -134,7 +134,7 @@ Pass or fail rule:
 
 - the process stops,
 - the original bootstrap file at `$Bootstrap` is gone,
-- the `%LocalAppData%\Ironmesh\sync-roots\...` state files remain.
+- the `%LocalAppData%\BerryKeep\sync-roots\...` state files remain.
 
 ## 7. Restart from persisted LocalAppData state only
 
@@ -170,7 +170,7 @@ If you want one stronger reconnect proof, create a remote file while the runtime
 This manual flow passes only if all of the following are true:
 
 - the packaged config app can save and relaunch an enabled Windows OS integration instance,
-- LocalAppData sync-root state is created under `%LocalAppData%\Ironmesh\sync-roots\...`,
+- LocalAppData sync-root state is created under `%LocalAppData%\BerryKeep\sync-roots\...`,
 - deleting the original bootstrap file does not break restart,
 - uploads succeed both before and after restart.
 

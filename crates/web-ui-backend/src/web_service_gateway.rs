@@ -30,8 +30,8 @@ use uuid::Uuid;
 use super::{WebRuntime, WebState, cookie_values, current_sdk, error_response};
 
 const SERVICE_HOST_SUFFIX: &str = ".localhost";
-const OPEN_PATH: &str = "/_ironmesh/open";
-const GATEWAY_SESSION_COOKIE: &str = "ironmesh_service_gateway_session";
+const OPEN_PATH: &str = "/_berrykeep/open";
+const GATEWAY_SESSION_COOKIE: &str = "berrykeep_service_gateway_session";
 const LAUNCH_TOKEN_TTL: Duration = Duration::from_secs(60);
 const SERVICE_SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_PENDING_LAUNCHES: usize = 1_024;
@@ -98,7 +98,7 @@ struct WebServiceConnector {
     node_id: NodeId,
     service_id: String,
     metadata: ServiceConnectionMetadata,
-    initial_connection: Arc<Mutex<Option<client_sdk::ironmesh_client::WebServiceProxyConnection>>>,
+    initial_connection: Arc<Mutex<Option<client_sdk::berrykeep_client::WebServiceProxyConnection>>>,
     connect_permits: Arc<Semaphore>,
 }
 
@@ -112,7 +112,7 @@ struct PooledServiceStream {
 
 impl ServiceConnectionMetadata {
     fn from_connection(
-        connection: &client_sdk::ironmesh_client::WebServiceProxyConnection,
+        connection: &client_sdk::berrykeep_client::WebServiceProxyConnection,
     ) -> Self {
         Self {
             authority: connection.authority.clone(),
@@ -135,7 +135,7 @@ impl ServiceConnectionMetadata {
 impl PooledServiceClient {
     fn new(
         runtime: Arc<RwLock<WebRuntime>>,
-        connection: client_sdk::ironmesh_client::WebServiceProxyConnection,
+        connection: client_sdk::berrykeep_client::WebServiceProxyConnection,
     ) -> Self {
         let metadata = ServiceConnectionMetadata::from_connection(&connection);
         let connector = WebServiceConnector {
@@ -169,7 +169,7 @@ where
 impl WebServiceConnector {
     async fn open_connection(
         &self,
-    ) -> io::Result<client_sdk::ironmesh_client::WebServiceProxyConnection> {
+    ) -> io::Result<client_sdk::berrykeep_client::WebServiceProxyConnection> {
         if let Some(connection) = self.initial_connection.lock().await.take() {
             return Ok(connection);
         }
@@ -285,7 +285,7 @@ struct WebServiceNodeListResponse {
 struct WebServiceNodeResponse {
     node_id: NodeId,
     available: bool,
-    services: Vec<client_sdk::ironmesh_client::WebServiceSummary>,
+    services: Vec<client_sdk::berrykeep_client::WebServiceSummary>,
 }
 
 impl WebServiceGateway {
@@ -540,7 +540,7 @@ pub(super) async fn list_services_on_node(
 fn web_service_node_response(
     node_id: NodeId,
     available: bool,
-    services: Vec<client_sdk::ironmesh_client::WebServiceSummary>,
+    services: Vec<client_sdk::berrykeep_client::WebServiceSummary>,
 ) -> WebServiceNodeResponse {
     WebServiceNodeResponse {
         node_id,
@@ -891,7 +891,7 @@ fn rewrite_request_headers(
     remove_hop_by_hop_headers(headers, websocket);
     let private_headers = headers
         .keys()
-        .filter(|name| name.as_str().starts_with("x-ironmesh-"))
+        .filter(|name| name.as_str().starts_with("x-berrykeep-"))
         .cloned()
         .collect::<Vec<_>>();
     for name in private_headers {
@@ -1420,7 +1420,7 @@ mod tests {
     #[test]
     fn gateway_cookie_is_never_forwarded_upstream() {
         assert_eq!(
-            remove_gateway_cookie("nas=one; ironmesh_service_gateway_session=secret; theme=dark"),
+            remove_gateway_cookie("nas=one; berrykeep_service_gateway_session=secret; theme=dark"),
             "nas=one; theme=dark"
         );
     }
@@ -1509,7 +1509,7 @@ mod tests {
         headers.append(SET_COOKIE, malformed_cookie.clone());
         headers.append(
             SET_COOKIE,
-            HeaderValue::from_static("ironmesh_service_gateway_session =attempt; Path=/"),
+            HeaderValue::from_static("berrykeep_service_gateway_session =attempt; Path=/"),
         );
         headers.append(
             SET_COOKIE,
@@ -1613,7 +1613,7 @@ mod tests {
         );
         assert!(
             rewrite_set_cookie(
-                "ironmesh_service_gateway_session=overwritten; Path=/; HttpOnly",
+                "berrykeep_service_gateway_session=overwritten; Path=/; HttpOnly",
                 "/ui",
             )
             .is_none()

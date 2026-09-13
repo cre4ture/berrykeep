@@ -20,7 +20,7 @@ mod tests {
     use anyhow::Context;
     use bytes::Bytes;
     use client_sdk::{
-        ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient,
+        ClientIdentityMaterial, ConnectionBootstrap, BerryKeepClient,
         enroll_connection_input_blocking,
     };
     use reqwest::Client;
@@ -57,8 +57,8 @@ mod tests {
         debug_thumbnail_outcome_for_source_path,
     };
 
-    const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "ironmesh-client-bootstrap.json";
-    const LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
+    const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "berrykeep-client-bootstrap.json";
+    const LOCAL_STATE_ROOT_DIR: &str = "BerryKeep";
     const LOCAL_STATE_SYNC_ROOTS_DIR: &str = "sync-roots";
     const LOCAL_STATE_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "connection-bootstrap.json";
     const LOCAL_STATE_CLIENT_IDENTITY_FILE_NAME: &str = "client-identity.json";
@@ -138,7 +138,7 @@ mod tests {
     struct AuthenticatedCfapiFixture {
         server: crate::framework::ChildGuard,
         server_data_dir: PathBuf,
-        sdk: IronMeshClient,
+        sdk: BerryKeepClient,
         bootstrap_file: PathBuf,
     }
 
@@ -212,8 +212,8 @@ mod tests {
 
         // start CFAPI adapter to monitor the sync root and upload changes to server
         let _adapter = start_cfapi_adapter_with_bootstrap(
-            "ironmesh.systemtest.syncroot",
-            "ironmesh System Test Sync Root",
+            "berrykeep.systemtest.syncroot",
+            "berrykeep System Test Sync Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -345,7 +345,7 @@ mod tests {
     }
 
     async fn wait_for_remote_payload(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         key: &str,
         expected: &[u8],
         retries: usize,
@@ -368,7 +368,7 @@ mod tests {
         );
     }
 
-    async fn wait_for_remote_file_absence(sdk: &IronMeshClient, key: &str, retries: usize) {
+    async fn wait_for_remote_file_absence(sdk: &BerryKeepClient, key: &str, retries: usize) {
         for _ in 0..retries {
             if sdk.get(key).await.is_err() {
                 return;
@@ -386,7 +386,7 @@ mod tests {
     }
 
     async fn wait_for_remote_store_index_file_absence(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         key: &str,
         retries: usize,
     ) {
@@ -416,10 +416,10 @@ mod tests {
     }
 
     async fn wait_for_remote_version_graph(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         key: &str,
         retries: usize,
-    ) -> client_sdk::ironmesh_client::VersionGraphSummary {
+    ) -> client_sdk::berrykeep_client::VersionGraphSummary {
         for _ in 0..retries {
             if let Ok(Some(summary)) = sdk.list_versions(key).await {
                 return summary;
@@ -722,7 +722,7 @@ mod tests {
     }
 
     async fn wait_for_remote_directory_marker_shape(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         dir_name: &str,
         retries: usize,
     ) {
@@ -766,7 +766,7 @@ mod tests {
     }
 
     async fn wait_for_remote_directory_absence(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         dir_name: &str,
         retries: usize,
     ) {
@@ -805,7 +805,7 @@ mod tests {
     }
 
     async fn wait_for_remote_directory_presence_any_shape(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         dir_name: &str,
         retries: usize,
     ) {
@@ -871,12 +871,12 @@ mod tests {
             .expect("failed to seed remote object");
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.hydration.{}",
+            "berrykeep.systemtest.hydration.{}",
             bind.replace(['.', ':'], "_")
         );
         let _adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Hydration Root",
+            "berrykeep System Test Hydration Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -926,12 +926,12 @@ mod tests {
             .expect("failed to seed remote object");
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.no.auto.hydration.{}",
+            "berrykeep.systemtest.no.auto.hydration.{}",
             bind.replace(['.', ':'], "_")
         );
         let _adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test No Auto Hydration Root",
+            "berrykeep System Test No Auto Hydration Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -984,12 +984,12 @@ mod tests {
             .expect("failed to seed remote object");
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.concurrent.boundary.read.{}",
+            "berrykeep.systemtest.concurrent.boundary.read.{}",
             bind.replace(['.', ':'], "_")
         );
         let _adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Concurrent Boundary Read Root",
+            "berrykeep System Test Concurrent Boundary Read Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1092,12 +1092,12 @@ mod tests {
             .expect("failed to seed remote object");
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.no.auto.hydration.restart.{}",
+            "berrykeep.systemtest.no.auto.hydration.restart.{}",
             bind.replace(['.', ':'], "_")
         );
         let mut adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test No Auto Hydration Restart Root",
+            "berrykeep System Test No Auto Hydration Restart Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1121,7 +1121,7 @@ mod tests {
 
         let mut restarted_adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test No Auto Hydration Restart Root",
+            "berrykeep System Test No Auto Hydration Restart Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1187,12 +1187,12 @@ mod tests {
             .expect("failed to seed second remote object");
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.sibling.hydration.{}",
+            "berrykeep.systemtest.sibling.hydration.{}",
             bind.replace(['.', ':'], "_")
         );
         let _adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Sibling Hydration Root",
+            "berrykeep System Test Sibling Hydration Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1270,12 +1270,12 @@ mod tests {
         }
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.restart.cold.placeholders.{}",
+            "berrykeep.systemtest.restart.cold.placeholders.{}",
             bind.replace(['.', ':'], "_")
         );
         let mut adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Restart Cold Placeholders Root",
+            "berrykeep System Test Restart Cold Placeholders Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1311,7 +1311,7 @@ mod tests {
 
         let mut restarted_adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Restart Cold Placeholders Root",
+            "berrykeep System Test Restart Cold Placeholders Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1367,12 +1367,12 @@ mod tests {
             .expect("failed to seed remote object");
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.pin.hydration.{}",
+            "berrykeep.systemtest.pin.hydration.{}",
             bind.replace(['.', ':'], "_")
         );
         let _adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Pin Hydration Root",
+            "berrykeep System Test Pin Hydration Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1420,12 +1420,12 @@ mod tests {
                 .expect("failed to start authenticated CFAPI fixture");
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.remote.additions.{}",
+            "berrykeep.systemtest.remote.additions.{}",
             bind.replace(['.', ':'], "_")
         );
         let _adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Remote Additions Root",
+            "berrykeep System Test Remote Additions Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1482,12 +1482,12 @@ mod tests {
         let old_object_id = old_versions.object_id.clone();
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.remote.file.rename.{}",
+            "berrykeep.systemtest.remote.file.rename.{}",
             bind.replace(['.', ':'], "_")
         );
         let _adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Remote File Rename Root",
+            "berrykeep System Test Remote File Rename Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1603,8 +1603,8 @@ mod tests {
             .expect("failed to seed remote file for folder rename");
 
         let _adapter = start_cfapi_adapter_with_bootstrap(
-            "ironmesh.systemtest.local.folder.rename.with.content",
-            "ironmesh System Test Local Folder Rename With Content",
+            "berrykeep.systemtest.local.folder.rename.with.content",
+            "berrykeep System Test Local Folder Rename With Content",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1683,8 +1683,8 @@ mod tests {
             .expect("failed to seed remote file for remote folder rename");
 
         let _adapter = start_cfapi_adapter_with_bootstrap(
-            "ironmesh.systemtest.remote.folder.rename.refresh",
-            "ironmesh System Test Remote Folder Rename Refresh",
+            "berrykeep.systemtest.remote.folder.rename.refresh",
+            "berrykeep System Test Remote Folder Rename Refresh",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1753,7 +1753,7 @@ mod tests {
                 .context("failed to start authenticated CFAPI fixture")?;
 
         let sync_root_id = format!(
-            "ironmesh.systemtest.remote.delete.restart.{}",
+            "berrykeep.systemtest.remote.delete.restart.{}",
             bind.replace(['.', ':'], "_")
         );
 
@@ -1765,7 +1765,7 @@ mod tests {
 
         let mut adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Remote Delete Restart Root",
+            "berrykeep System Test Remote Delete Restart Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -1821,7 +1821,7 @@ mod tests {
 
         let mut restarted_adapter = start_cfapi_adapter_with_bootstrap(
             &sync_root_id,
-            "ironmesh System Test Remote Delete Restart Root",
+            "berrykeep System Test Remote Delete Restart Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -2152,10 +2152,10 @@ mod tests {
             .await
             .expect("failed to seed remote object");
 
-        let sync_root_id = "ironmesh.systemtest.manual.free_up_space";
+        let sync_root_id = "berrykeep.systemtest.manual.free_up_space";
         let _adapter = start_cfapi_adapter_with_bootstrap(
             sync_root_id,
-            "ironmesh Manual Free Up Space Root",
+            "berrykeep Manual Free Up Space Root",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -2223,8 +2223,8 @@ mod tests {
         .expect("failed to start authenticated CFAPI fixture");
 
         let _adapter = start_cfapi_adapter_with_bootstrap(
-            "ironmesh.systemtest.local.empty.folder",
-            "ironmesh System Test Local Empty Folder",
+            "berrykeep.systemtest.local.empty.folder",
+            "berrykeep System Test Local Empty Folder",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -2262,8 +2262,8 @@ mod tests {
             .expect("failed to seed remote empty folder marker");
 
         let _adapter = start_cfapi_adapter_with_bootstrap(
-            "ironmesh.systemtest.local.empty.folder.rename",
-            "ironmesh System Test Local Empty Folder Rename",
+            "berrykeep.systemtest.local.empty.folder.rename",
+            "berrykeep System Test Local Empty Folder Rename",
             &sync_root,
             500,
             &fixture.bootstrap_file,
@@ -2455,9 +2455,9 @@ mod tests {
         let output = Command::new(os_integration_bin)
             .arg("register")
             .arg("--sync-root-id")
-            .arg("ironmesh.systemtest.reject.nonempty.first.register")
+            .arg("berrykeep.systemtest.reject.nonempty.first.register")
             .arg("--display-name")
-            .arg("ironmesh Reject Non-Empty First Register")
+            .arg("berrykeep Reject Non-Empty First Register")
             .arg("--root-path")
             .arg(&sync_root)
             .arg("--cluster-id")
@@ -2498,9 +2498,9 @@ mod tests {
             "",
             1,
             &[
-                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-                ("IRONMESH_ADMIN_TOKEN", admin_token),
-                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+                ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+                ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+                ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
             ],
         )
         .await
@@ -2518,7 +2518,7 @@ mod tests {
             .await?;
 
             let sync_root_id = format!(
-                "ironmesh.systemtest.authenticated.{}",
+                "berrykeep.systemtest.authenticated.{}",
                 bind.replace(['.', ':'], "_")
             );
             let local_appdata_root = actual_local_appdata_root();
@@ -2533,7 +2533,7 @@ mod tests {
                 .expect("failed to write bootstrap bundle");
             let _adapter = start_cfapi_adapter_with_bootstrap(
                 &sync_root_id,
-                "ironmesh System Test Authenticated Root",
+                "berrykeep System Test Authenticated Root",
                 &sync_root,
                 500,
                 &bootstrap_file,
@@ -2597,9 +2597,9 @@ mod tests {
             "",
             1,
             &[
-                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-                ("IRONMESH_ADMIN_TOKEN", admin_token),
-                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+                ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+                ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+                ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
             ],
         )
         .await
@@ -2657,12 +2657,12 @@ mod tests {
                 .expect("failed to overwrite bootstrap with invalid pairing token");
 
             let sync_root_id = format!(
-                "ironmesh.systemtest.authenticated.existing.{}",
+                "berrykeep.systemtest.authenticated.existing.{}",
                 bind.replace(['.', ':'], "_")
             );
             let _adapter = start_cfapi_adapter_with_bootstrap(
                 &sync_root_id,
-                "ironmesh System Test Existing Identity Root",
+                "berrykeep System Test Existing Identity Root",
                 &sync_root,
                 500,
                 &bootstrap_file,
@@ -2724,9 +2724,9 @@ mod tests {
             "",
             1,
             &[
-                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-                ("IRONMESH_ADMIN_TOKEN", admin_token),
-                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+                ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+                ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+                ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
             ],
         )
         .await
@@ -2752,12 +2752,12 @@ mod tests {
                 .expect("failed to write bootstrap bundle");
 
             let sync_root_id = format!(
-                "ironmesh.systemtest.thumbnail.provider.{}",
+                "berrykeep.systemtest.thumbnail.provider.{}",
                 bind.replace(['.', ':'], "_")
             );
             let mut adapter = start_cfapi_adapter_with_bootstrap(
                 &sync_root_id,
-                "ironmesh System Test Thumbnail Provider Root",
+                "berrykeep System Test Thumbnail Provider Root",
                 &sync_root,
                 500,
                 &bootstrap_file,
@@ -2865,9 +2865,9 @@ mod tests {
             "",
             1,
             &[
-                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-                ("IRONMESH_ADMIN_TOKEN", admin_token),
-                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+                ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+                ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+                ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
             ],
         )
         .await
@@ -2893,12 +2893,12 @@ mod tests {
                 .expect("failed to write bootstrap bundle");
 
             let sync_root_id = format!(
-                "ironmesh.systemtest.thumbnail.provider.anon.{}",
+                "berrykeep.systemtest.thumbnail.provider.anon.{}",
                 bind.replace(['.', ':'], "_")
             );
             let mut adapter = start_cfapi_adapter_with_bootstrap(
                 &sync_root_id,
-                "ironmesh System Test Thumbnail Provider Anonymous Root",
+                "berrykeep System Test Thumbnail Provider Anonymous Root",
                 &sync_root,
                 500,
                 &bootstrap_file,
@@ -2989,9 +2989,9 @@ mod tests {
             "",
             1,
             &[
-                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-                ("IRONMESH_ADMIN_TOKEN", admin_token),
-                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+                ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+                ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+                ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
             ],
         )
         .await
@@ -3018,12 +3018,12 @@ mod tests {
                 .expect("failed to write bootstrap bundle");
 
             let sync_root_id = format!(
-                "ironmesh.systemtest.thumbnail.provider.unsupported.{}",
+                "berrykeep.systemtest.thumbnail.provider.unsupported.{}",
                 bind.replace(['.', ':'], "_")
             );
             let mut adapter = start_cfapi_adapter_with_bootstrap(
                 &sync_root_id,
-                "ironmesh System Test Thumbnail Provider Unsupported Root",
+                "berrykeep System Test Thumbnail Provider Unsupported Root",
                 &sync_root,
                 500,
                 &bootstrap_file,
@@ -3127,9 +3127,9 @@ mod tests {
             "",
             1,
             &[
-                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-                ("IRONMESH_ADMIN_TOKEN", admin_token),
-                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+                ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+                ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+                ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
             ],
         )
         .await
@@ -3156,12 +3156,12 @@ mod tests {
                 .expect("failed to write bootstrap bundle");
 
             let sync_root_id = format!(
-                "ironmesh.systemtest.thumbnail.provider.pending.{}",
+                "berrykeep.systemtest.thumbnail.provider.pending.{}",
                 bind.replace(['.', ':'], "_")
             );
             let mut adapter = start_cfapi_adapter_with_bootstrap(
                 &sync_root_id,
-                "ironmesh System Test Thumbnail Provider Pending Root",
+                "berrykeep System Test Thumbnail Provider Pending Root",
                 &sync_root,
                 500,
                 &bootstrap_file,
@@ -3259,9 +3259,9 @@ mod tests {
             "",
             1,
             &[
-                ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-                ("IRONMESH_ADMIN_TOKEN", admin_token),
-                ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+                ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+                ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+                ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
             ],
         )
         .await
@@ -3294,12 +3294,12 @@ mod tests {
                 local_appdata_client_identity_path(&local_appdata_dir, &sync_root);
 
             let sync_root_id = format!(
-                "ironmesh.systemtest.authenticated.localappdata.{}",
+                "berrykeep.systemtest.authenticated.localappdata.{}",
                 bind.replace(['.', ':'], "_")
             );
             let mut adapter = start_cfapi_adapter_with_bootstrap_and_local_appdata(
                 &sync_root_id,
-                "ironmesh System Test LocalAppData Root",
+                "berrykeep System Test LocalAppData Root",
                 &sync_root,
                 500,
                 &bootstrap_file,
@@ -3326,11 +3326,11 @@ mod tests {
                 Some(local_appdata_state_dir.as_path())
             );
             assert!(
-                !sync_root.join(".ironmesh-connection.json").exists(),
+                !sync_root.join(".berrykeep-connection.json").exists(),
                 "legacy sync-root bootstrap file should not be created"
             );
             assert!(
-                !sync_root.join(".ironmesh-client-identity.json").exists(),
+                !sync_root.join(".berrykeep-client-identity.json").exists(),
                 "legacy sync-root identity file should not be created"
             );
 
@@ -3367,7 +3367,7 @@ mod tests {
 
             let mut restarted_adapter = start_cfapi_adapter_with_local_appdata(
                 &sync_root_id,
-                "ironmesh System Test LocalAppData Root",
+                "berrykeep System Test LocalAppData Root",
                 &sync_root,
                 500,
                 &local_appdata_dir,
@@ -3447,8 +3447,8 @@ mod tests {
                 .expect("failed to seed remote object");
 
             let _adapter = start_cfapi_adapter_with_bootstrap(
-                "ironmesh.systemtest.sync.status.check",
-                "ironmesh System Test Sync Status",
+                "berrykeep.systemtest.sync.status.check",
+                "berrykeep System Test Sync Status",
                 &sync_root,
                 500,
                 &fixture.bootstrap_file,
@@ -3504,8 +3504,8 @@ mod tests {
                 .expect("failed to seed remote object");
 
             let _adapter = start_cfapi_adapter_with_bootstrap(
-                "ironmesh.systemtest.directory.sync.state",
-                "ironmesh System Test Directory Sync State",
+                "berrykeep.systemtest.directory.sync.state",
+                "berrykeep System Test Directory Sync State",
                 &sync_root,
                 500,
                 &fixture.bootstrap_file,
@@ -3572,8 +3572,8 @@ mod tests {
                 .expect("failed to seed remote object");
 
             let _adapter = start_cfapi_adapter_with_bootstrap(
-                "ironmesh.systemtest.overwrite.quiet.period",
-                "ironmesh System Test Overwrite Quiet Period",
+                "berrykeep.systemtest.overwrite.quiet.period",
+                "berrykeep System Test Overwrite Quiet Period",
                 &sync_root,
                 500,
                 &fixture.bootstrap_file,
@@ -3643,8 +3643,8 @@ mod tests {
                     .await?;
 
             let _adapter = start_cfapi_adapter_with_bootstrap(
-                "ironmesh.systemtest.overwrite.uploaded.file",
-                "ironmesh System Test Overwrite Uploaded File",
+                "berrykeep.systemtest.overwrite.uploaded.file",
+                "berrykeep System Test Overwrite Uploaded File",
                 &sync_root,
                 500,
                 &fixture.bootstrap_file,

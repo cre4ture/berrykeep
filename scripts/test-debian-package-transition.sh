@@ -10,7 +10,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/test-debian-package-transition.sh [--package-dir DIR]
 
-Unpack synthetic pre-rename Ironmesh and released BerryKeep package sets with
+Unpack synthetic pre-rename IronMesh and released BerryKeep package sets with
 the supplied packages into isolated dpkg roots. The host package database is
 not changed.
 EOF
@@ -65,14 +65,14 @@ PACKAGE_DIR="$(cd "${PACKAGE_DIR}" && pwd)"
 
 declare -A PACKAGE_PATHS=()
 for package_name in \
-  berrykeep-client \
-  berrykeep-server-node \
-  berrykeep-server-node-map-tools \
-  berrykeep-rendezvous-service \
   ironmesh-client \
   ironmesh-server-node \
   ironmesh-server-node-map-tools \
-  ironmesh-rendezvous-service; do
+  ironmesh-rendezvous-service \
+  berrykeep-client \
+  berrykeep-server-node \
+  berrykeep-server-node-map-tools \
+  berrykeep-rendezvous-service; do
   PACKAGE_PATHS["${package_name}"]="$(find_package "${package_name}")"
 done
 
@@ -191,6 +191,11 @@ test "$(readlink "${DPKG_ROOT}/usr/bin/ironmesh")" = ../lib/berrykeep-client/iro
 test -d "${DPKG_ROOT}/usr/lib/ironmesh-client"
 test "$(readlink "${DPKG_ROOT}/usr/lib/ironmesh-client/ironmesh-config-app")" = ../berrykeep-client/berrykeep-config-app
 test -f "${DPKG_ROOT}/usr/lib/ironmesh-client/gnome-shell-extension/ironmesh-status@ironmesh.io/extension.js"
+test -f "${DPKG_ROOT}/usr/lib/ironmesh-client/gnome-shell-extension/ironmesh-status@ironmesh.io/icons/berrykeep-brand-symbolic.svg"
+grep -Fxq "const BerryKeepIndicator = GObject.registerClass(" \
+  "${DPKG_ROOT}/usr/lib/ironmesh-client/gnome-shell-extension/ironmesh-status@ironmesh.io/extension.js"
+grep -Fxq '  "uuid": "ironmesh-status@ironmesh.io",' \
+  "${DPKG_ROOT}/usr/lib/ironmesh-client/gnome-shell-extension/ironmesh-status@ironmesh.io/metadata.json"
 test -f "${DPKG_ROOT}/usr/share/applications/ironmesh-config-app.desktop"
 test -f "${DPKG_ROOT}/etc/xdg/autostart/ironmesh-config-app-background.desktop"
 grep -Fxq 'NoDisplay=true' "${DPKG_ROOT}/usr/share/applications/ironmesh-config-app.desktop"
@@ -209,7 +214,7 @@ grep -Fxq 'Conflicts=ironmesh-server-node.service' \
 grep -Fxq 'Conflicts=ironmesh-rendezvous-service.service' \
   "${DPKG_ROOT}/usr/lib/systemd/system/berrykeep-rendezvous-service.service"
 
-# The originally released berrykeep-client briefly owned the legacy desktop
+# The originally released BerryKeep client briefly owned the legacy desktop
 # paths. Verify the new transitional package can claim those paths regardless
 # of unpack order, while dpkg still retains administrator conffile changes.
 DPKG_ROOT="${TEST_ROOT}/released-berrykeep-root"
@@ -229,4 +234,4 @@ grep -Fxq '# administrator setting' \
 dpkg-query --admindir "${DPKG_ROOT}/var/lib/dpkg" --showformat='${Conffiles}\n' --show ironmesh-client | \
   grep -Fq '/etc/xdg/autostart/ironmesh-config-app-background.desktop'
 
-printf 'Debian Ironmesh-to-BerryKeep package transition passed\n'
+printf 'Debian IronMesh-to-BerryKeep package transition passed\n'

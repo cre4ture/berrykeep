@@ -8,7 +8,7 @@ Accepted.
 
 - The current implementation renews node enrollment packages through an admin-authenticated issuer endpoint and a separate runtime renewal token.
 - That design keeps renewal under explicit operator-controlled authorization, but it couples routine certificate rotation to a human/admin-style credential path.
-- The intended purpose of forced certificate renewal in Ironmesh is primarily cryptographic hygiene:
+- The intended purpose of forced certificate renewal in BerryKeep is primarily cryptographic hygiene:
   - rekeying,
   - algorithm/profile upgrades,
   - bounded credential lifetime as a backstop.

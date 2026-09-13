@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACKAGE_ID="io.ironmesh.server-node"
+PACKAGE_ID="io.berrykeep.server-node"
 PACKAGE_VERSION="$(awk -F '"' '/^version = "/ { print $2; exit }' "${ROOT_DIR}/Cargo.toml")"
 PACKAGE_VERSION="${PACKAGE_VERSION:?failed to determine workspace package version}"
 CARGO_BUILD_DIR=""
@@ -204,26 +204,26 @@ main() {
   payload_dir="${STAGE_DIR}/payload"
   scripts_dir="${ROOT_DIR}/macos/server-node/pkg-scripts"
 
-  install -d "${payload_dir}/Library/Application Support/Ironmesh/bin"
-  install -d "${payload_dir}/Library/Application Support/Ironmesh/server-node"
+  install -d "${payload_dir}/Library/Application Support/BerryKeep/bin"
+  install -d "${payload_dir}/Library/Application Support/BerryKeep/server-node"
   install -d "${payload_dir}/Library/LaunchDaemons"
-  install -d "${payload_dir}/Library/Logs/Ironmesh"
+  install -d "${payload_dir}/Library/Logs/BerryKeep"
   install -m 0755 "${binary_path}" \
-    "${payload_dir}/Library/Application Support/Ironmesh/bin/berrykeep-server-node"
+    "${payload_dir}/Library/Application Support/BerryKeep/bin/berrykeep-server-node"
   ln -sf berrykeep-server-node \
-    "${payload_dir}/Library/Application Support/Ironmesh/bin/ironmesh-server-node"
-  install -m 0755 "${ROOT_DIR}/macos/server-node/ironmesh-server-node-launcher" \
-    "${payload_dir}/Library/Application Support/Ironmesh/bin/ironmesh-server-node-launcher"
+    "${payload_dir}/Library/Application Support/BerryKeep/bin/ironmesh-server-node"
+  install -m 0755 "${ROOT_DIR}/macos/server-node/berrykeep-server-node-launcher" \
+    "${payload_dir}/Library/Application Support/BerryKeep/bin/berrykeep-server-node-launcher"
   install -m 0644 "${ROOT_DIR}/macos/server-node/server-node.env.example" \
-    "${payload_dir}/Library/Application Support/Ironmesh/server-node.env.example"
-  install -m 0644 "${ROOT_DIR}/macos/server-node/io.ironmesh.server-node.plist" \
+    "${payload_dir}/Library/Application Support/BerryKeep/server-node.env.example"
+  install -m 0644 "${ROOT_DIR}/macos/server-node/io.berrykeep.server-node.plist" \
     "${payload_dir}/Library/LaunchDaemons/${PACKAGE_ID}.plist"
 
   if [[ -n "${CODE_SIGN_IDENTITY}" ]]; then
     require_command codesign
     log "signing staged server-node executable"
     codesign --force --options runtime --timestamp --sign "${CODE_SIGN_IDENTITY}" \
-      "${payload_dir}/Library/Application Support/Ironmesh/bin/berrykeep-server-node"
+      "${payload_dir}/Library/Application Support/BerryKeep/bin/berrykeep-server-node"
   fi
 
   # Do not carry Finder or provenance attributes from a checkout or build

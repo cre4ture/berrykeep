@@ -1,8 +1,8 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
-# This leaf crate has only third-party dependencies, all of which are derived
-# from Cargo.toml by Crate Universe.
+# First-party workspace dependencies are native targets because Crate Universe
+# deliberately omits them from all_crate_deps.
 rust_library(
     name = "desktop_client_config",
     srcs = glob(["src/**/*.rs"]),
@@ -11,7 +11,9 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = crate_edition(),
     visibility = ["//apps:__subpackages__"],
-    deps = all_crate_deps(normal = True),
+    deps = all_crate_deps(normal = True) + [
+        "//crates/common:common",
+    ],
 )
 
 rust_test(

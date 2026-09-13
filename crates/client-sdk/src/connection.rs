@@ -20,10 +20,10 @@ use transport_sdk::{
     RendezvousControlClient, TransportPathKind,
 };
 
+use crate::berrykeep_client::blocking_runtime;
 use crate::iroh_lease_budget::IrohRelayLeaseBudget;
-use crate::ironmesh_client::blocking_runtime;
 use crate::latency_probe::LatencyProbeConfig;
-use crate::{IronMeshClient, PlannedConnectionBootstrapTarget};
+use crate::{BerryKeepClient, PlannedConnectionBootstrapTarget};
 
 const RELAY_REQUEST_BASE_URL: &str = "https://relay.invalid/";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,7 +36,7 @@ const STARTUP_PROBE_SUCCESS_GRACE: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_STARTUP_ROUTE_PROBES: usize = 4;
 
 type StartupProbeResult = (usize, Result<f64>);
-type StartupProbeWorkerResult = (Vec<IronMeshClient>, Vec<StartupProbeResult>);
+type StartupProbeWorkerResult = (Vec<BerryKeepClient>, Vec<StartupProbeResult>);
 
 #[derive(Serialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
@@ -197,7 +197,7 @@ pub(crate) fn build_blocking_reqwest_client_from_pem_for_url_with_expected_serve
 pub fn build_http_client_from_pem(
     server_ca_pem: Option<&str>,
     base_url_str: &str,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     build_http_client_from_pem_with_target_node_id(server_ca_pem, base_url_str, None, None)
 }
 
@@ -206,7 +206,7 @@ fn build_http_client_from_pem_with_target_node_id(
     base_url_str: &str,
     target_node_id: Option<NodeId>,
     target_cluster_id: Option<ClusterId>,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let expected_server_identity = expected_server_identity(target_node_id, target_cluster_id)?;
@@ -216,7 +216,7 @@ fn build_http_client_from_pem_with_target_node_id(
         expected_server_identity,
     )?;
     Ok(
-        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+        BerryKeepClient::from_direct_http_client_with_target_node_id_and_ca_pem(
             base_url.as_str(),
             http,
             target_node_id,
@@ -230,7 +230,7 @@ pub fn build_http_client_with_identity_from_pem(
     server_ca_pem: Option<&str>,
     base_url_str: &str,
     identity: &ClientIdentityMaterial,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     build_http_client_with_identity_from_pem_with_target_node_id(
         server_ca_pem,
         base_url_str,
@@ -246,7 +246,7 @@ fn build_http_client_with_identity_from_pem_with_target_node_id(
     identity: &ClientIdentityMaterial,
     target_node_id: Option<NodeId>,
     target_cluster_id: Option<ClusterId>,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     let base_url = Url::parse(base_url_str)
         .with_context(|| format!("failed to parse server base URL from {}", base_url_str))?;
     let expected_server_identity = expected_server_identity(target_node_id, target_cluster_id)?;
@@ -256,7 +256,7 @@ fn build_http_client_with_identity_from_pem_with_target_node_id(
         expected_server_identity,
     )?;
     Ok(
-        IronMeshClient::from_direct_http_client_with_target_node_id_and_ca_pem(
+        BerryKeepClient::from_direct_http_client_with_target_node_id_and_ca_pem(
             base_url.as_str(),
             http,
             target_node_id,
@@ -270,7 +270,7 @@ fn build_http_client_with_identity_from_pem_with_target_node_id(
 pub fn build_http_client_with_identity_from_planned_target(
     target: &PlannedConnectionBootstrapTarget,
     identity: &ClientIdentityMaterial,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     let client = build_http_client_with_identity_from_planned_target_unkeyed(
         target,
         identity,
@@ -284,7 +284,7 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
     target: &PlannedConnectionBootstrapTarget,
     identity: &ClientIdentityMaterial,
     lease_budget: IrohRelayLeaseBudget,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     match target.path_kind {
         TransportPathKind::DirectHttps => {
             let server_base_url =
@@ -318,7 +318,7 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
                 None
             };
             return Ok(
-                IronMeshClient::from_direct_quic_candidate_with_rendezvous_and_lease_budget(
+                BerryKeepClient::from_direct_quic_candidate_with_rendezvous_and_lease_budget(
                     candidate.clone(),
                     target.target_node_id,
                     rendezvous,
@@ -365,7 +365,7 @@ fn build_http_client_with_identity_from_planned_target_unkeyed(
     };
     let rendezvous = build_rendezvous_control_client_for_target(target, identity)?;
 
-    Ok(IronMeshClient::with_relay_transport(
+    Ok(BerryKeepClient::with_relay_transport(
         RELAY_REQUEST_BASE_URL,
         rendezvous,
         target_node_id,
@@ -574,22 +574,22 @@ const fn candidate_kind_label(kind: CandidateKind) -> &'static str {
 pub fn build_http_client_with_identity_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: &ClientIdentityMaterial,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     let lease_budget = IrohRelayLeaseBudget::default();
     let clients = collect_signed_planned_target_clients(targets, identity, lease_budget.clone())?;
     if clients.len() == 1 {
-        return IronMeshClient::combine_with_iroh_relay_lease_budget(clients, lease_budget);
+        return BerryKeepClient::combine_with_iroh_relay_lease_budget(clients, lease_budget);
     }
 
     let ordered = order_clients_by_startup_probe(clients, true)?;
-    IronMeshClient::combine_with_iroh_relay_lease_budget(ordered, lease_budget)
+    BerryKeepClient::combine_with_iroh_relay_lease_budget(ordered, lease_budget)
 }
 
 fn collect_signed_planned_target_clients(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: &ClientIdentityMaterial,
     lease_budget: IrohRelayLeaseBudget,
-) -> Result<Vec<IronMeshClient>> {
+) -> Result<Vec<BerryKeepClient>> {
     let mut clients = Vec::new();
     let mut build_errors = Vec::new();
 
@@ -623,19 +623,19 @@ fn collect_signed_planned_target_clients(
 
 pub fn build_http_client_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     let clients = collect_anonymous_planned_target_clients(targets)?;
     if clients.len() == 1 {
-        return IronMeshClient::combine(clients);
+        return BerryKeepClient::combine(clients);
     }
 
     let ordered = order_clients_by_startup_probe(clients, false)?;
-    IronMeshClient::combine(ordered)
+    BerryKeepClient::combine(ordered)
 }
 
 fn collect_anonymous_planned_target_clients(
     targets: &[PlannedConnectionBootstrapTarget],
-) -> Result<Vec<IronMeshClient>> {
+) -> Result<Vec<BerryKeepClient>> {
     let mut clients = Vec::new();
     let mut build_errors = Vec::new();
 
@@ -658,7 +658,7 @@ fn collect_anonymous_planned_target_clients(
 pub fn build_client_with_optional_identity_from_planned_target(
     target: &PlannedConnectionBootstrapTarget,
     identity: Option<&ClientIdentityMaterial>,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     match identity {
         Some(identity) => build_http_client_with_identity_from_planned_target(target, identity),
         None => {
@@ -699,7 +699,7 @@ pub fn build_client_with_optional_identity_from_planned_target(
 pub fn build_client_with_optional_identity_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: Option<&ClientIdentityMaterial>,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     match identity {
         Some(identity) => build_http_client_with_identity_from_planned_targets(targets, identity),
         None => build_http_client_from_planned_targets(targets),
@@ -713,7 +713,7 @@ pub fn build_client_with_optional_identity_from_planned_targets(
 pub(crate) fn build_unprobed_client_with_optional_identity_from_planned_targets(
     targets: &[PlannedConnectionBootstrapTarget],
     identity: Option<&ClientIdentityMaterial>,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     let lease_budget = IrohRelayLeaseBudget::default();
     let clients = match identity {
         Some(identity) => {
@@ -721,13 +721,13 @@ pub(crate) fn build_unprobed_client_with_optional_identity_from_planned_targets(
         }
         None => collect_anonymous_planned_target_clients(targets)?,
     };
-    IronMeshClient::combine_with_iroh_relay_lease_budget(clients, lease_budget)
+    BerryKeepClient::combine_with_iroh_relay_lease_budget(clients, lease_budget)
 }
 
 pub fn build_http_client(
     server_ca_cert: Option<&Path>,
     base_url_str: &str,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     let server_ca_pem = server_ca_cert
         .map(|path| {
             fs::read_to_string(path)
@@ -741,7 +741,7 @@ pub fn build_http_client_with_identity(
     server_ca_cert: Option<&Path>,
     base_url_str: &str,
     identity: &ClientIdentityMaterial,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     let server_ca_pem = server_ca_cert
         .map(|path| {
             fs::read_to_string(path)
@@ -812,11 +812,11 @@ fn apply_best_effort_url_resolution_blocking(
 }
 
 fn order_clients_by_startup_probe(
-    clients: Vec<IronMeshClient>,
+    clients: Vec<BerryKeepClient>,
     signed_probe: bool,
-) -> Result<Vec<IronMeshClient>> {
+) -> Result<Vec<BerryKeepClient>> {
     let worker = std::thread::Builder::new()
-        .name("ironmesh-client-startup-probe".to_string())
+        .name("berrykeep-client-startup-probe".to_string())
         .spawn(move || -> Result<StartupProbeWorkerResult> {
             // Direct QUIC endpoints and multiplex sessions spawn transport
             // drivers on the runtime that performs their startup probe. Keep
@@ -912,7 +912,7 @@ fn order_clients_by_startup_probe(
     Ok(ordered)
 }
 
-async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
+async fn probe_signed_client_startup_quality(client: &BerryKeepClient) -> Result<f64> {
     let target_label = startup_probe_target_label(client);
     if let Some(rendezvous) = client.rendezvous_client()
         && let Some(diagnostic) = rendezvous.client_identity_expiry_diagnostic()
@@ -964,7 +964,7 @@ async fn probe_signed_client_startup_quality(client: &IronMeshClient) -> Result<
     Ok(latency_ms + result.summary.failure_count as f64 * STARTUP_PROBE_FAILURE_PENALTY_MS)
 }
 
-async fn probe_direct_client_startup_quality(client: &IronMeshClient) -> Result<f64> {
+async fn probe_direct_client_startup_quality(client: &BerryKeepClient) -> Result<f64> {
     let target_label = startup_probe_target_label(client);
     tokio::time::timeout(STARTUP_PROBE_TIMEOUT, async {
         let total_probe_count = STARTUP_PROBE_WARMUP_COUNT + STARTUP_PROBE_SAMPLE_COUNT;
@@ -994,7 +994,7 @@ async fn probe_direct_client_startup_quality(client: &IronMeshClient) -> Result<
     })?
 }
 
-fn startup_probe_target_label(client: &IronMeshClient) -> String {
+fn startup_probe_target_label(client: &BerryKeepClient) -> String {
     client
         .connection_diagnostics()
         .endpoints
@@ -1231,7 +1231,7 @@ mod tests {
                     .transport_hints
                     .as_mut()
                     .expect("hints should exist")
-                    .alpn = Some("ironmesh/test/2".to_string());
+                    .alpn = Some("berrykeep/test/2".to_string());
             }),
             (
                 "direct_socket_addrs",
@@ -1448,7 +1448,7 @@ mod tests {
     #[test]
     fn load_root_certificate_reports_missing_file() {
         let missing_path =
-            std::env::temp_dir().join(format!("ironmesh-missing-{}.pem", Uuid::now_v7()));
+            std::env::temp_dir().join(format!("berrykeep-missing-{}.pem", Uuid::now_v7()));
         let error =
             load_root_certificate(&missing_path).expect_err("missing certificate file should fail");
         assert!(
@@ -1507,8 +1507,8 @@ mod tests {
         let started = Instant::now();
         let ordered = order_clients_by_startup_probe(
             vec![
-                IronMeshClient::from_direct_base_url(&slow_url),
-                IronMeshClient::from_direct_base_url(&fast_url),
+                BerryKeepClient::from_direct_base_url(&slow_url),
+                BerryKeepClient::from_direct_base_url(&fast_url),
             ],
             false,
         )
@@ -1554,7 +1554,7 @@ mod tests {
             .expect("probe test runtime should build");
         let error = runtime
             .block_on(probe_signed_client_startup_quality(
-                &IronMeshClient::from_direct_base_url(format!("http://{address}")),
+                &BerryKeepClient::from_direct_base_url(format!("http://{address}")),
             ))
             .expect_err("an all-failed diagnostic report must not mark the path reachable");
 

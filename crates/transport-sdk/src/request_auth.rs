@@ -10,16 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::ClientIdentityMaterial;
 
-pub const HEADER_CLUSTER_ID: &str = "x-ironmesh-cluster-id";
-pub const HEADER_DEVICE_ID: &str = "x-ironmesh-device-id";
-pub const HEADER_CONNECTION_NAME: &str = "x-ironmesh-connection-name";
-pub const HEADER_OPERATION_ID: &str = "x-ironmesh-operation-id";
-pub const HEADER_CREDENTIAL_FINGERPRINT: &str = "x-ironmesh-credential-fingerprint";
-pub const HEADER_AUTH_TIMESTAMP: &str = "x-ironmesh-auth-timestamp";
-pub const HEADER_AUTH_NONCE: &str = "x-ironmesh-auth-nonce";
-pub const HEADER_AUTH_SIGNATURE: &str = "x-ironmesh-auth-signature";
+pub const HEADER_CLUSTER_ID: &str = "x-berrykeep-cluster-id";
+pub const HEADER_DEVICE_ID: &str = "x-berrykeep-device-id";
+pub const HEADER_CONNECTION_NAME: &str = "x-berrykeep-connection-name";
+pub const HEADER_OPERATION_ID: &str = "x-berrykeep-operation-id";
+pub const HEADER_CREDENTIAL_FINGERPRINT: &str = "x-berrykeep-credential-fingerprint";
+pub const HEADER_AUTH_TIMESTAMP: &str = "x-berrykeep-auth-timestamp";
+pub const HEADER_AUTH_NONCE: &str = "x-berrykeep-auth-nonce";
+pub const HEADER_AUTH_SIGNATURE: &str = "x-berrykeep-auth-signature";
 
-const REQUEST_AUTH_CONTEXT: &str = "ironmesh-client-request-v1";
+const REQUEST_AUTH_CONTEXT: &str = "berrykeep-client-request-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedRequestHeaders {

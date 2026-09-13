@@ -485,8 +485,8 @@ mod tests {
 
     #[test]
     fn path_to_relative_strips_full_root_prefix_with_drive() {
-        let sync_root = Path::new(r"C:\Users\hornu\AppData\Local\Temp\ironmesh-sync");
-        let normalized_path = r"C:\Users\hornu\AppData\Local\Temp\ironmesh-sync\docs\readme.txt";
+        let sync_root = Path::new(r"C:\Users\hornu\AppData\Local\Temp\berrykeep-sync");
+        let normalized_path = r"C:\Users\hornu\AppData\Local\Temp\berrykeep-sync\docs\readme.txt";
 
         let relative = path_to_relative(sync_root, normalized_path);
         assert_eq!(relative, "docs/readme.txt");
@@ -494,8 +494,8 @@ mod tests {
 
     #[test]
     fn path_to_relative_handles_root_name_prefixed_path() {
-        let sync_root = Path::new(r"C:\sync\ironmesh-sync2");
-        let normalized_path = r"\ironmesh-sync2\folder\file.txt";
+        let sync_root = Path::new(r"C:\sync\berrykeep-sync2");
+        let normalized_path = r"\berrykeep-sync2\folder\file.txt";
 
         let relative = path_to_relative(sync_root, normalized_path);
         assert_eq!(relative, "folder/file.txt");
@@ -504,9 +504,9 @@ mod tests {
     #[test]
     fn path_to_relative_handles_missing_drive_letter_in_normalized_path() {
         let sync_root = Path::new(
-            r"C:\Users\hornu\AppData\Local\Temp\ironmesh-cfapi-monitor-sync-root-1772014035705750400",
+            r"C:\Users\hornu\AppData\Local\Temp\berrykeep-cfapi-monitor-sync-root-1772014035705750400",
         );
-        let normalized_path = r"\Users\hornu\AppData\Local\Temp\ironmesh-cfapi-monitor-sync-root-1772014035705750400\monitor_test.txt";
+        let normalized_path = r"\Users\hornu\AppData\Local\Temp\berrykeep-cfapi-monitor-sync-root-1772014035705750400\monitor_test.txt";
 
         let relative = path_to_relative(sync_root, normalized_path);
         assert_eq!(relative, "monitor_test.txt");
@@ -515,9 +515,9 @@ mod tests {
     #[test]
     fn path_to_relative_handles_short_sync_root_and_full_user_path_without_drive() {
         let sync_root = Path::new(
-            r"C:\Users\RUNNER~1\AppData\Local\Temp\ironmesh-cfapi-monitor-sync-root-parameterized-1772260118959530900",
+            r"C:\Users\RUNNER~1\AppData\Local\Temp\berrykeep-cfapi-monitor-sync-root-parameterized-1772260118959530900",
         );
-        let normalized_path = r"\Users\runneradmin\AppData\Local\Temp\ironmesh-cfapi-monitor-sync-root-parameterized-1772260118959530900\monitor_test.txt";
+        let normalized_path = r"\Users\runneradmin\AppData\Local\Temp\berrykeep-cfapi-monitor-sync-root-parameterized-1772260118959530900\monitor_test.txt";
 
         let relative = path_to_relative(sync_root, normalized_path);
         assert_eq!(relative, "monitor_test.txt");

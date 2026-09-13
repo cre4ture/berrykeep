@@ -41,7 +41,7 @@ pub(super) fn write_node_tls(
     let mut node_params = CertificateParams::default();
     node_params
         .distinguished_name
-        .push(DnType::CommonName, format!("ironmesh-node-{node_id}"));
+        .push(DnType::CommonName, format!("berrykeep-node-{node_id}"));
     node_params
         .subject_alt_names
         .push(SanType::IpAddress(IpAddr::V4(node_ip)));
@@ -52,11 +52,11 @@ pub(super) fn write_node_tls(
         .subject_alt_names
         .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     node_params.subject_alt_names.push(SanType::URI(
-        Ia5String::try_from(format!("urn:ironmesh:node:{node_id}"))
+        Ia5String::try_from(format!("urn:berrykeep:node:{node_id}"))
             .context("node identity URI is invalid")?,
     ));
     node_params.subject_alt_names.push(SanType::URI(
-        Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+        Ia5String::try_from(format!("urn:berrykeep:cluster:{cluster_id}"))
             .context("cluster identity URI is invalid")?,
     ));
     node_params.extended_key_usages = vec![
@@ -86,7 +86,7 @@ fn cluster_ca_params() -> CertificateParams {
     params.distinguished_name = DistinguishedName::new();
     params
         .distinguished_name
-        .push(DnType::CommonName, "ironmesh-quic-network-test-ca");
+        .push(DnType::CommonName, "berrykeep-quic-network-test-ca");
     params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::CrlSign,

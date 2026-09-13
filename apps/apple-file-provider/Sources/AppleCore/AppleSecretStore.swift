@@ -8,25 +8,85 @@ public protocol AppleSecretStore: Sendable {
 }
 
 public struct AppleKeychainSecretStore: AppleSecretStore, Sendable {
-    public static let defaultService = "dev.ironmesh.apple.client-identity"
+    public static let defaultService = "dev.berrykeep.apple.client-identity"
+    public static let legacyDefaultService = "dev.ironmesh.apple.client-identity"
     public static let defaultAccount = "clientIdentityJSON"
 
     private let service: String
+    private let legacyService: String?
     private let account: String
     let accessGroup: String?
 
     public init(
         service: String = defaultService,
         account: String = defaultAccount,
-        accessGroup: String? = nil
+        accessGroup: String? = nil,
+        legacyService: String? = legacyDefaultService
     ) {
         self.service = service
+        self.legacyService = legacyService?.nilIfBlank
         self.account = account
         self.accessGroup = accessGroup?.nilIfBlank
     }
 
     public func load() throws -> String? {
-        var query = baseQuery
+        if let secret = try load(service: service) {
+            return secret
+        }
+        guard let legacyService, legacyService != service,
+              let legacySecret = try load(service: legacyService)
+        else {
+            return nil
+        }
+
+        try save(legacySecret)
+        try delete(service: legacyService)
+        return legacySecret
+    }
+
+    public func save(_ secret: String) throws {
+        let value = Data(secret.utf8)
+        let updateAttributes: [CFString: Any] = [
+            kSecValueData: value,
+            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let updateStatus = SecItemUpdate(
+            baseQuery(service: service) as CFDictionary,
+            updateAttributes as CFDictionary
+        )
+
+        switch updateStatus {
+        case errSecSuccess:
+            return
+        case errSecItemNotFound:
+            var attributes = baseQuery(service: service)
+            attributes[kSecValueData] = value
+            attributes[kSecAttrAccessible] =
+                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            let addStatus = SecItemAdd(attributes as CFDictionary, nil)
+            guard addStatus == errSecSuccess else {
+                throw AppleKeychainSecretStoreError.operationFailed(
+                    operation: "save",
+                    status: addStatus
+                )
+            }
+        default:
+            throw AppleKeychainSecretStoreError.operationFailed(
+                operation: "save",
+                status: updateStatus
+            )
+        }
+    }
+
+    public func clear() throws {
+        try delete(service: service)
+        if let legacyService, legacyService != service {
+            try delete(service: legacyService)
+        }
+    }
+
+    private func load(service: String) throws -> String? {
+        var query = baseQuery(service: service)
         query[kSecMatchLimit] = kSecMatchLimitOne
         query[kSecReturnData] = kCFBooleanTrue
 
@@ -50,42 +110,8 @@ public struct AppleKeychainSecretStore: AppleSecretStore, Sendable {
         }
     }
 
-    public func save(_ secret: String) throws {
-        let value = Data(secret.utf8)
-        let updateAttributes: [CFString: Any] = [
-            kSecValueData: value,
-            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-        ]
-        let updateStatus = SecItemUpdate(
-            baseQuery as CFDictionary,
-            updateAttributes as CFDictionary
-        )
-
-        switch updateStatus {
-        case errSecSuccess:
-            return
-        case errSecItemNotFound:
-            var attributes = baseQuery
-            attributes[kSecValueData] = value
-            attributes[kSecAttrAccessible] =
-                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            let addStatus = SecItemAdd(attributes as CFDictionary, nil)
-            guard addStatus == errSecSuccess else {
-                throw AppleKeychainSecretStoreError.operationFailed(
-                    operation: "save",
-                    status: addStatus
-                )
-            }
-        default:
-            throw AppleKeychainSecretStoreError.operationFailed(
-                operation: "save",
-                status: updateStatus
-            )
-        }
-    }
-
-    public func clear() throws {
-        let status = SecItemDelete(baseQuery as CFDictionary)
+    private func delete(service: String) throws {
+        let status = SecItemDelete(baseQuery(service: service) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw AppleKeychainSecretStoreError.operationFailed(
                 operation: "clear",
@@ -94,7 +120,7 @@ public struct AppleKeychainSecretStore: AppleSecretStore, Sendable {
         }
     }
 
-    private var baseQuery: [CFString: Any] {
+    private func baseQuery(service: String) -> [CFString: Any] {
         var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,

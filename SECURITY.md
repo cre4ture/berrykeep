@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Ironmesh is still experimental. Security fixes land on `main` first, and
+BerryKeep is still experimental. Security fixes land on `main` first, and
 backports are limited to the newest published package or release line.
 
 | Version | Supported |
@@ -19,7 +19,7 @@ Use one of these private channels:
 
 - Preferred: GitHub Private Vulnerability Reporting for this repository, when
   it is available.
-- Fallback: email `creature@creax.de` with the subject `Ironmesh security report`.
+- Fallback: email `creature@creax.de` with the subject `BerryKeep security report`.
 
 Please include:
 

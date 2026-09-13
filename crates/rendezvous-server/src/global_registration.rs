@@ -553,7 +553,7 @@ mod tests {
 
     fn registry_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "ironmesh-global-registration-{name}-{}.json",
+            "berrykeep-global-registration-{name}-{}.json",
             ClusterId::now_v7()
         ))
     }

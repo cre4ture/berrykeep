@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 const CLOSE_UPLOAD_QUIET_PERIOD: Duration = Duration::from_millis(750);
 const CLOSE_UPLOAD_RETRY_DELAY: Duration = Duration::from_millis(1000);
 const CLOSE_UPLOAD_PERMIT_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
-const CLOSE_UPLOAD_TRACE_FILE_ENV: &str = "IRONMESH_CFAPI_CLOSE_UPLOAD_TRACE_FILE";
+const CLOSE_UPLOAD_TRACE_FILE_ENV: &str = "BERRYKEEP_CFAPI_CLOSE_UPLOAD_TRACE_FILE";
 
 pub(crate) struct UploadWorkerContext {
     pub(crate) sync_root: PathBuf,
@@ -30,9 +30,9 @@ pub(crate) struct UploadWorkerContext {
 }
 
 pub(crate) fn close_upload_max_concurrency_from_env() -> Result<usize> {
-    const ENV_NAME: &str = "IRONMESH_CFAPI_CLOSE_UPLOAD_MAX_CONCURRENCY";
+    const ENV_NAME: &str = "BERRYKEEP_CFAPI_CLOSE_UPLOAD_MAX_CONCURRENCY";
 
-    match std::env::var(ENV_NAME) {
+    match common::legacy_compatibility::var(ENV_NAME) {
         Ok(value) => {
             let parsed = value
                 .parse::<usize>()
@@ -468,7 +468,9 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn close_upload_trace_event(message: String) {
-    let Some(path) = std::env::var_os(CLOSE_UPLOAD_TRACE_FILE_ENV).map(PathBuf::from) else {
+    let Some(path) =
+        common::legacy_compatibility::var_os(CLOSE_UPLOAD_TRACE_FILE_ENV).map(PathBuf::from)
+    else {
         return;
     };
 
@@ -945,7 +947,7 @@ mod tests {
 
     fn make_test_file(payload: &[u8]) -> (std::path::PathBuf, std::fs::File) {
         let path = std::env::temp_dir().join(format!(
-            "ironmesh-cfapi-close-upload-test-{}-{}.bin",
+            "berrykeep-cfapi-close-upload-test-{}-{}.bin",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -959,7 +961,7 @@ mod tests {
 
     fn test_upload_worker_context(uploader: Arc<dyn Uploader>) -> UploadWorkerContext {
         UploadWorkerContext {
-            sync_root: Path::new("C:/ironmesh-test").to_path_buf(),
+            sync_root: Path::new("C:/berrykeep-test").to_path_buf(),
             provider_instance_id: uuid::Uuid::nil(),
             runtime: Arc::new(CfapiRuntime::default()),
             uploader,

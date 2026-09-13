@@ -1,4 +1,4 @@
-# Ironmesh Security Architecture (Implementation Target)
+# BerryKeep Security Architecture (Implementation Target)
 
 Status: Design baseline for upcoming implementation (experimental environment, no production rollout constraints yet)
 
@@ -13,8 +13,8 @@ This document replaces ad-hoc security decisions with one coherent model.
 
 ## 2. Current Baseline (Already Implemented)
 - Admin endpoints support shared token gate:
-  - env: `IRONMESH_ADMIN_TOKEN`
-  - header: `x-ironmesh-admin-token`
+  - env: `BERRYKEEP_ADMIN_TOKEN`
+  - header: `x-berrykeep-admin-token`
 - Destructive maintenance operations require explicit approval:
   - `dry_run=false` requires `approve=true`
 - Admin actions are written to persistent audit log:
@@ -29,7 +29,7 @@ Definition:
 
 - Data plane:
   - object transfer (`put/get/delete`, replication flows).
-  - regular clients operate here, including `ironmesh-folder-agent`, CLI clients, platform adapters, and future user-facing clients.
+  - regular clients operate here, including `berrykeep-folder-agent`, CLI clients, platform adapters, and future user-facing clients.
 - Control plane:
   - node membership, maintenance, restore/purge tooling.
 - Admin plane:
@@ -41,7 +41,7 @@ Each plane must be independently authenticated, authorized, encrypted, and audit
 ### 4.1 Service Identity
 - Every server-node gets a unique workload identity (certificate subject/SPIFFE-like ID).
 - Every non-node client gets a unique client/device/workload identity.
-- `ironmesh-folder-agent` is one client implementation under this model; it is not a separate security plane.
+- `berrykeep-folder-agent` is one client implementation under this model; it is not a separate security plane.
 
 ### 4.1.2 Suggested Rust Library Stack (Pure Rust)
 Cluster-internal mTLS (server-node <-> server-node) can be implemented with the following Rust crates:
@@ -59,18 +59,18 @@ Model:
 - Cluster maintains a stable logical identifier: `node_id` (UUID).
 - Each node holds a client certificate signed by a cluster "Node CA".
 - The certificate encodes the logical `node_id` as an identity claim (SAN URI recommended):
-  - `URI: urn:ironmesh:node:<uuid>`
+  - `URI: urn:berrykeep:node:<uuid>`
   - Optional (strongly recommended): bind the cert to a specific cluster:
-    - `URI: urn:ironmesh:cluster:<cluster_uuid>`
+    - `URI: urn:berrykeep:cluster:<cluster_uuid>`
 
 Authorization invariant:
 - For any internal endpoint that includes `{node_id}` in the URL path, the authenticated caller identity
   extracted from the peer TLS certificate MUST match that `{node_id}`.
-- No internal request should rely on a user-provided `x-ironmesh-node-id` header for caller identity.
+- No internal request should rely on a user-provided `x-berrykeep-node-id` header for caller identity.
 
 Certificate rotation:
 - Cert renewal and rekey are allowed without changing `node_id`, as long as the new cert is signed by
-  the Node CA and still contains `urn:ironmesh:node:<same uuid>`.
+  the Node CA and still contains `urn:berrykeep:node:<same uuid>`.
 - Revocation is handled by CA/CRL/short-lived certs (preferred) rather than by changing `node_id`.
 
 Follow-up design note:
@@ -82,7 +82,7 @@ Follow-up design note:
 - Require TLS for all HTTP traffic.
 - Prefer mTLS for:
   - server-node <-> server-node,
-  - client <-> server-node (including `ironmesh-folder-agent`).
+  - client <-> server-node (including `berrykeep-folder-agent`).
 - Reject plaintext HTTP outside explicit local-dev mode.
 
 ### 4.2.1 Rendezvous and Relay Transport
@@ -94,13 +94,13 @@ Follow-up design note:
 - The global rendezvous/relay has a hard data boundary: it can observe only outer metadata needed to broker a session, including authenticated endpoint identities, cluster scope, relay ticket or session id, timing, and frame or byte sizes. It forwards an encrypted inner TLS stream and has no access to application payloads, HTTP bytes, application credentials, or inner TLS private keys.
 - A global rendezvous may terminate its own external HTTPS or WSS connections, but it does not terminate, inspect, or participate in the inner TLS handshake. Altering an inner TLS record is detected by the endpoints and fails the session.
 - A global deployment must not expose the legacy pre-enrollment bootstrap-claim relay as a general application-data path, because that exception does not meet the inner-TLS boundary.
-- The relay tunnel therefore brokers opaque byte streams and does not need feature-specific knowledge of gallery, maps, replication, or other HTTP routes. Ironmesh carries serialized HTTP/1.1 request/response bytes through the encrypted tunnel; node-side and client-side authorization still happens at the actual Ironmesh endpoint.
+- The relay tunnel therefore brokers opaque byte streams and does not need feature-specific knowledge of gallery, maps, replication, or other HTTP routes. BerryKeep carries serialized HTTP/1.1 request/response bytes through the encrypted tunnel; node-side and client-side authorization still happens at the actual BerryKeep endpoint.
 - Private web-service proxy streams reuse the authenticated multiplex transport. The client submits only a node-local opaque service ID; the target node resolves the fixed upstream, revalidates signed device authentication and the service ACL, and owns upstream TLS verification. Browser access is served from an isolated loopback `.localhost` origin with a single-use launch token, so upstream self-signed trust is never delegated to the browser or disabled globally. See [Private Web Services](private-web-services.md).
 - `tests/system-tests/src/relay_security_e2e_test.rs` verifies a relay-only enrolled client against a real node and rendezvous service. It confirms that known HTTP, authorization, credential, and object payload bytes are absent from observed relay binary frames. It also modifies one post-handshake TLS application-data record and verifies that the client discards the affected session, reconnects with inner mTLS, and retries the unchanged request without exposing or committing modified application data.
 
 ### 4.2.2 Global Rendezvous Option 1 Trust Selection
 - Option 1 has exactly one active registered P-256 CA for each cluster.
-- The verified `urn:ironmesh:cluster:<cluster_id>` SAN selects that exact CA. The verifier must not fall back to trying all registered CAs when the selected CA does not validate the certificate.
+- The verified `urn:berrykeep:cluster:<cluster_id>` SAN selects that exact CA. The verifier must not fall back to trying all registered CAs when the selected CA does not validate the certificate.
 - CA rotation is outside the Option 1 MVP. A request with an existing `cluster_id` and a different CA cannot replace the registered CA, including when the requester proves possession of that different CA.
 - The self-registration challenge and canonical proof requirements are defined in `docs/global-rendezvous-relay-e2e-plan.md`. The operational configuration contract is defined in `docs/global-rendezvous-operations.md`.
 
@@ -115,8 +115,8 @@ Goal: only approved nodes can join the cluster, and node credentials can be rota
 Recommended baseline (experimental-friendly):
 1. Operator provisions a `node_id` (UUID) and a public `public_url` for the node.
 2. Operator (or control plane) issues a Node CA-signed client certificate containing:
-   - `urn:ironmesh:node:<uuid>`
-   - optionally `urn:ironmesh:cluster:<cluster_uuid>`
+   - `urn:berrykeep:node:<uuid>`
+   - optionally `urn:berrykeep:cluster:<cluster_uuid>`
 3. Operator registers membership in the cluster (admin-authenticated endpoint).
 4. Node starts and uses mTLS for all internal cluster endpoints (replication push/pull, reconcile, heartbeat).
 
@@ -154,7 +154,7 @@ See `docs/node-certificate-renewal-model-decision.md` for the accepted decision.
 - Strong cipher suites only; disable legacy ciphers/protocols.
 - For relayed traffic, distinguish:
   - outer transport protection between endpoint and rendezvous,
-  - inner endpoint authentication and authorization between the actual Ironmesh peers.
+  - inner endpoint authentication and authorization between the actual BerryKeep peers.
 
 ### 6.2 At Rest
 - Encrypt server state storage where feasible (disk/volume encryption baseline).

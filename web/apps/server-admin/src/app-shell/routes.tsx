@@ -99,7 +99,7 @@ export const serverAdminRoutes = [
   {
     id: "web-services",
     label: "Web Services",
-    description: "Expose fixed node-local HTTP(S) applications to selected devices through the authenticated IronMesh transport and isolated local browser origins.",
+    description: "Expose fixed node-local HTTP(S) applications to selected devices through the authenticated BerryKeep transport and isolated local browser origins.",
     icon: IconWorldWww,
     element: <WebServicesPage />
   },

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 exec "${ROOT_DIR}/scripts/deploy-stats-collector-service.sh" \
-  --remote-dir /home/creature/ironmesh/telemetry \
+  --remote-dir /home/creature/berrykeep/telemetry \
   --tls-cert-path /home/creature/etc/certificates/creax.de.crt \
   --tls-key-path /home/creature/etc/certificates/creax.de.key \
   --health-url https://creax.de:44044/health \

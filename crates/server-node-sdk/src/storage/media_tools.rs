@@ -116,9 +116,9 @@ fn smartctl_dependency_check_for_path(configured_path: &Path) -> HostDependencyC
         "smartctl",
         "SMART / NVMe hardware health",
         configured_path,
-        "SMART and NVMe lifecycle collection needs smartctl on the server host. The IronMesh service also needs permission to read the physical block devices.",
+        "SMART and NVMe lifecycle collection needs smartctl on the server host. The BerryKeep service also needs permission to read the physical block devices.",
         Some(
-            "Install the `smartmontools` package to provide `smartctl` (Ubuntu/Debian: `sudo apt install smartmontools`). Then grant the IronMesh service access to the physical block devices.",
+            "Install the `smartmontools` package to provide `smartctl` (Ubuntu/Debian: `sudo apt install smartmontools`). Then grant the BerryKeep service access to the physical block devices.",
         ),
     )
 }
@@ -139,7 +139,7 @@ fn cockpit_dependency_check_for_candidates(candidates: &[PathBuf]) -> HostDepend
             feature: "Cockpit host administration".to_string(),
             status: HostDependencyStatus::Ready,
             summary: format!("Cockpit web service found at {}", path.display()),
-            detail: "Cockpit is available as a separate host-administration interface. Use its own sign-in and UI for host-level tasks such as restarting the IronMesh service, applying updates, or rebooting the host. IronMesh does not invoke Cockpit or share credentials with it.".to_string(),
+            detail: "Cockpit is available as a separate host-administration interface. Use its own sign-in and UI for host-level tasks such as restarting the BerryKeep service, applying updates, or rebooting the host. BerryKeep does not invoke Cockpit or share credentials with it.".to_string(),
             configured_path: None,
             resolved_path: Some(path.display().to_string()),
             install_hint: None,
@@ -149,7 +149,7 @@ fn cockpit_dependency_check_for_candidates(candidates: &[PathBuf]) -> HostDepend
             feature: "Cockpit host administration".to_string(),
             status: HostDependencyStatus::Optional,
             summary: "Cockpit web service was not found on this host".to_string(),
-            detail: "Cockpit is optional and is not required by IronMesh. If you use Cockpit for host administration, install and access it separately to restart the IronMesh service, apply updates, or reboot the host.".to_string(),
+            detail: "Cockpit is optional and is not required by BerryKeep. If you use Cockpit for host administration, install and access it separately to restart the BerryKeep service, apply updates, or reboot the host.".to_string(),
             configured_path: None,
             resolved_path: None,
             install_hint: Some(
@@ -284,7 +284,7 @@ fn resolve_host_dependency_path(configured_path: &Path) -> Option<PathBuf> {
             .then(|| configured_path.to_path_buf());
     }
 
-    let path_env = std::env::var_os("PATH")?;
+    let path_env = common::legacy_compatibility::var_os("PATH")?;
     for entry in std::env::split_paths(&path_env) {
         #[cfg(windows)]
         {
@@ -338,7 +338,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("ironmesh-cockpit-dependency-{unique_suffix}"));
+            std::env::temp_dir().join(format!("berrykeep-cockpit-dependency-{unique_suffix}"));
         std::fs::create_dir_all(&root).unwrap();
         let missing_path = root.join("missing-cockpit-ws");
 
@@ -369,7 +369,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let missing_path =
-            std::env::temp_dir().join(format!("ironmesh-missing-smartctl-{unique_suffix}"));
+            std::env::temp_dir().join(format!("berrykeep-missing-smartctl-{unique_suffix}"));
         let check = smartctl_dependency_check_for_path(&missing_path);
 
         assert_eq!(check.status, HostDependencyStatus::Missing);
@@ -387,7 +387,7 @@ fn windows_dependency_candidates(path: &Path) -> Vec<PathBuf> {
     }
 
     let mut candidates = Vec::new();
-    if let Some(path_exts) = std::env::var_os("PATHEXT") {
+    if let Some(path_exts) = common::legacy_compatibility::var_os("PATHEXT") {
         let path_exts = path_exts.to_string_lossy();
         for extension in path_exts
             .split(';')

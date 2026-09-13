@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 
 const MIN_YAMUX_STREAM_WINDOW_BYTES: usize = 256 * 1024;
 
-/// A single byte stream carried by an authenticated IronMesh transport session.
+/// A single byte stream carried by an authenticated BerryKeep transport session.
 ///
 /// This alias intentionally hides the multiplexing implementation from SDK users
 /// that need a long-lived, full-duplex application stream.

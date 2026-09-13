@@ -3,7 +3,7 @@ import "./styles/globals.css";
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { IronmeshMantineProvider } from "@ironmesh/ui";
+import { BerryKeepMantineProvider } from "@berrykeep/ui";
 import { App } from "./App";
 
 const root = document.getElementById("root");
@@ -14,8 +14,8 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <IronmeshMantineProvider>
+    <BerryKeepMantineProvider>
       <App />
-    </IronmeshMantineProvider>
+    </BerryKeepMantineProvider>
   </StrictMode>
 );

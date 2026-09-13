@@ -4,7 +4,7 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 
 ## Repository snapshot
 
-- Project: `ironmesh` (Rust workspace)
+- Project: `berrykeep` (Rust workspace)
 - Primary backend: `apps/server-node`
 - Mobile: Android native shell + SAF provider under `apps/android-app`
 - Cross-platform filesystem work:
@@ -29,7 +29,7 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 ### Client route priority
 
 - Server nodes advertise a configurable client connection priority from `-20` through `20`.
-- The node-local admin Hardware page and `IRONMESH_NODE_CONNECTION_PRIORITY` configure the
+- The node-local admin Hardware page and `BERRYKEEP_NODE_CONNECTION_PRIORITY` configure the
   server value; enrollment-based nodes persist it in their enrollment package.
 - Rendezvous discovery carries the advertised value into client route scoring as a soft bias, so
   latency, failures, circuit breaking, transport preference, and failover remain active.
@@ -44,7 +44,7 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - Linux Server Node releases use one verified static musl binary per CPU ABI.
   The current portable variants are generic x86_64 and AArch64; client, FUSE,
   and rendezvous packaging remains distribution-specific.
-- `ironmesh-server-node-map-tools` carries the optional GDAL and unzip
+- `berrykeep-server-node-map-tools` carries the optional GDAL and unzip
   dependencies, keeping them out of the core Server Node package.
 
 ### Android
@@ -89,13 +89,13 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - `crates/adapter-windows-cfapi/src/runtime.rs`
 - `crates/adapter-windows-cfapi/src/register.rs`
 - `apps/os-integration/src/main.rs`
-- `apps/android-app/app/src/main/java/io/ironmesh/android/ui/MainViewModel.kt`
-- `apps/android-app/app/src/main/java/io/ironmesh/android/data/DeviceAuthState.kt`
-- `apps/android-app/app/src/main/java/io/ironmesh/android/data/IronmeshPreferences.kt`
-- `apps/android-app/app/src/main/java/io/ironmesh/android/saf/IronmeshDocumentsProvider.kt`
-- `apps/apple-file-provider/Sources/AppleCore/IronmeshConnectionDraft.swift`
+- `apps/android-app/app/src/main/java/io/berrykeep/android/ui/MainViewModel.kt`
+- `apps/android-app/app/src/main/java/io/berrykeep/android/data/DeviceAuthState.kt`
+- `apps/android-app/app/src/main/java/io/berrykeep/android/data/BerryKeepPreferences.kt`
+- `apps/android-app/app/src/main/java/io/berrykeep/android/saf/BerryKeepDocumentsProvider.kt`
+- `apps/apple-file-provider/Sources/AppleCore/BerryKeepConnectionDraft.swift`
 - `crates/client-sdk/src/bootstrap.rs`
-- `crates/client-sdk/src/ironmesh_client.rs`
+- `crates/client-sdk/src/berrykeep_client.rs`
 - `crates/server-node-sdk/src/lib.rs`
 - `crates/transport-sdk/src/rendezvous.rs`
 - `.github/workflows/check.yml`
@@ -120,20 +120,20 @@ Linux mount smoke tests:
 ```bash
 cargo run -p os-integration -- \
   --snapshot-file /tmp/snapshot.json \
-  --mountpoint /tmp/ironmesh-mount
+  --mountpoint /tmp/berrykeep-mount
 
 cargo run -p os-integration -- \
   --server-base-url https://127.0.0.1:18080 \
-  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
-  --client-identity-file /path/to/ironmesh-client-identity.json \
-  --mountpoint /tmp/ironmesh-mount-live
+  --server-ca-pem-file /path/to/berrykeep-public-ca.pem \
+  --client-identity-file /path/to/berrykeep-client-identity.json \
+  --mountpoint /tmp/berrykeep-mount-live
 
 cargo run -p os-integration -- \
   --server-base-url https://127.0.0.1:18080 \
-  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
-  --client-identity-file /path/to/ironmesh-client-identity.json \
+  --server-ca-pem-file /path/to/berrykeep-public-ca.pem \
+  --client-identity-file /path/to/berrykeep-client-identity.json \
   --offline-object-cache off \
-  --mountpoint /tmp/ironmesh-mount-live
+  --mountpoint /tmp/berrykeep-mount-live
 ```
 
 ## Immediate next objective

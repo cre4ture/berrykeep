@@ -27,19 +27,19 @@ async fn cli_latency_test_supports_list_targets_and_explicit_node_and_relay_sele
     let client_dir = fresh_data_dir("cli-latency-client");
 
     // relay_mode "fallback" keeps both direct and relay connectivity usable.
-    // IRONMESH_REQUIRE_CLIENT_AUTH=true matches every other cluster test in this suite: the
+    // BERRYKEEP_REQUIRE_CLIENT_AUTH=true matches every other cluster test in this suite: the
     // direct multiplexed transport used by latency diagnostics (/transport/ws) requires an
     // authenticated client identity to be attached to the request, which the server only does
     // when client auth is required.
     let node_env = [
-        ("IRONMESH_CLUSTER_ID", CLUSTER_ID),
-        ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-        ("IRONMESH_RELAY_MODE", "fallback"),
-        ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-        ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-        ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-        ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-        ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+        ("BERRYKEEP_CLUSTER_ID", CLUSTER_ID),
+        ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+        ("BERRYKEEP_RELAY_MODE", "fallback"),
+        ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+        ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+        ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+        ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+        ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
     ];
 
     let mut rendezvous = start_rendezvous_service(RENDEZVOUS_BIND).await?;

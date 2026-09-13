@@ -901,7 +901,7 @@ async fn geolocation_apply_requires_explicit_approval() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::operations::start_operation_run(
         State(state.clone()),
@@ -1041,7 +1041,7 @@ fn generate_test_internal_ca() -> (String, String) {
     params.distinguished_name = rcgen::DistinguishedName::new();
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "ironmesh-test-cluster-ca");
+        .push(rcgen::DnType::CommonName, "berrykeep-test-cluster-ca");
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
     (cert.pem(), key_pair.serialize_pem())
@@ -1306,7 +1306,7 @@ async fn register_node_with_server(
             base_url.trim_end_matches('/'),
             node_id
         ))
-        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+        .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
         .json(&serde_json::json!({
             "reachability": {
                 "public_api_url": public_api_url,
@@ -1341,7 +1341,7 @@ async fn register_node_with_server_client(
             base_url.trim_end_matches('/'),
             node_id
         ))
-        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+        .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
         .json(&serde_json::json!({
             "reachability": {
                 "public_api_url": public_api_url,
@@ -1395,7 +1395,7 @@ fn issue_legacy_public_node_tls_material(
     params.distinguished_name = rcgen::DistinguishedName::new();
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
-        format!("ironmesh-public-{node_id}"),
+        format!("berrykeep-public-{node_id}"),
     );
     params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64).unwrap();
     params.not_after = OffsetDateTime::from_unix_timestamp(policy.not_after_unix as i64).unwrap();
@@ -1643,7 +1643,7 @@ fn generate_test_https_ca_and_server_material_with_identity(
     ca_params.distinguished_name = rcgen::DistinguishedName::new();
     ca_params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, format!("ironmesh-{label}-ca"));
+        .push(rcgen::DnType::CommonName, format!("berrykeep-{label}-ca"));
     let ca_key_pair = rcgen::KeyPair::generate().unwrap();
     let ca_cert = ca_params.self_signed(&ca_key_pair).unwrap();
     let ca_cert_pem = ca_cert.pem();
@@ -1655,7 +1655,7 @@ fn generate_test_https_ca_and_server_material_with_identity(
     server_params.distinguished_name = rcgen::DistinguishedName::new();
     server_params.distinguished_name.push(
         rcgen::DnType::CommonName,
-        format!("ironmesh-{label}-server"),
+        format!("berrykeep-{label}-server"),
     );
     server_params.is_ca = rcgen::IsCa::NoCa;
     server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
@@ -1664,10 +1664,10 @@ fn generate_test_https_ca_and_server_material_with_identity(
         .push(rcgen::SanType::IpAddress(bind_addr.ip()));
     if let Some((node_id, cluster_id)) = identity {
         server_params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:node:{node_id}")).unwrap(),
+            rcgen::string::Ia5String::try_from(format!("urn:berrykeep:node:{node_id}")).unwrap(),
         ));
         server_params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+            rcgen::string::Ia5String::try_from(format!("urn:berrykeep:cluster:{cluster_id}"))
                 .unwrap(),
         ));
     }
@@ -2036,7 +2036,7 @@ fn global_rendezvous_registration_requires_readable_internal_node_client_identit
 #[tokio::test]
 async fn global_rendezvous_registration_signs_canonical_proof_without_client_identity() {
     let root = std::env::temp_dir().join(format!(
-        "ironmesh-global-rendezvous-registration-{}",
+        "berrykeep-global-rendezvous-registration-{}",
         Uuid::now_v7()
     ));
     std::fs::create_dir_all(&root).unwrap();
@@ -2154,7 +2154,7 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
 #[tokio::test]
 async fn global_rendezvous_registration_rejects_empty_completion_response() {
     let root = std::env::temp_dir().join(format!(
-        "ironmesh-global-rendezvous-registration-empty-completion-{}",
+        "berrykeep-global-rendezvous-registration-empty-completion-{}",
         Uuid::now_v7()
     ));
     std::fs::create_dir_all(&root).unwrap();
@@ -2231,7 +2231,7 @@ fn token_matches_requires_exact_match() {
 #[test]
 fn cluster_config_requires_explicit_insecure_public_http_override() {
     let data_dir =
-        std::env::temp_dir().join(format!("ironmesh-public-http-test-{}", Uuid::now_v7()));
+        std::env::temp_dir().join(format!("berrykeep-public-http-test-{}", Uuid::now_v7()));
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let mut config = test_cluster_config_without_internal_tls(data_dir, free_bind_addr());
@@ -2241,7 +2241,7 @@ fn cluster_config_requires_explicit_insecure_public_http_override() {
     assert!(
         error
             .to_string()
-            .contains("IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP")
+            .contains("BERRYKEEP_ALLOW_INSECURE_PUBLIC_HTTP")
     );
 }
 
@@ -3019,7 +3019,7 @@ async fn admin_authorization_requires_explicit_approval_for_destructive_action_i
     let admin_token = fresh_test_secret("admin");
     state.access.admin_control.admin_token = Some(admin_token.clone());
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", admin_token.parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", admin_token.parse().unwrap());
 
     let result = super::authorize_admin_request(
         &state,
@@ -3069,7 +3069,7 @@ async fn public_logs_route_requires_client_or_admin_auth_impl(backend: MainTestB
         .oneshot(
             Request::builder()
                 .uri("/logs")
-                .header("x-ironmesh-admin-token", admin_token)
+                .header("x-berrykeep-admin-token", admin_token)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3216,7 +3216,7 @@ fn client_device_enroll_response_serializes_device_label() {
         label: Some("Tablet".to_string()),
         public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----".to_string(),
         credential_pem:
-            "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\ntest\n-----END IRONMESH CLIENT CREDENTIAL-----\n"
+            "-----BEGIN BERRYKEEP CLIENT CREDENTIAL-----\ntest\n-----END BERRYKEEP CLIENT CREDENTIAL-----\n"
                 .to_string(),
         rendezvous_client_identity_pem: None,
         created_at_unix: 10,
@@ -3257,7 +3257,7 @@ fn sample_replicated_client_credential(
 
 fn test_admin_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
     headers
 }
 
@@ -3795,7 +3795,7 @@ run_on_main_metadata_backends!(
 
 async fn export_client_credentials_omits_issued_credential_pem_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
-    let issued_credential_pem = "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\nexport-test\n-----END IRONMESH CLIENT CREDENTIAL-----\n";
+    let issued_credential_pem = "-----BEGIN BERRYKEEP CLIENT CREDENTIAL-----\nexport-test\n-----END BERRYKEEP CLIENT CREDENTIAL-----\n";
     let expected_fingerprint =
         transport_sdk::credential_fingerprint(issued_credential_pem).unwrap();
     {
@@ -4993,7 +4993,7 @@ async fn s3_listener_supports_bucket_listing_and_object_crud_impl(backend: MainT
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(version_record.ironmesh_key, "tenant/photos/docs/hello.txt");
+        assert_eq!(version_record.berrykeep_key, "tenant/photos/docs/hello.txt");
 
         let versions = store
             .list_s3_object_versions_for_key("photos.example", "tenant/photos/docs/hello.txt")
@@ -7245,7 +7245,7 @@ async fn s3_object_version_prefix_listing_treats_wildcards_literally_impl(
         store
             .persist_s3_object_version(&S3ObjectVersionRecord {
                 bucket_name: "photos.example".to_string(),
-                ironmesh_key: "tenant/photos/100%/match.txt".to_string(),
+                berrykeep_key: "tenant/photos/100%/match.txt".to_string(),
                 version_id: "version-percent-match".to_string(),
                 etag: "etag-percent-match".to_string(),
                 multipart_part_count: None,
@@ -7256,7 +7256,7 @@ async fn s3_object_version_prefix_listing_treats_wildcards_literally_impl(
         store
             .persist_s3_object_version(&S3ObjectVersionRecord {
                 bucket_name: "photos.example".to_string(),
-                ironmesh_key: "tenant/photos/100abc/other.txt".to_string(),
+                berrykeep_key: "tenant/photos/100abc/other.txt".to_string(),
                 version_id: "version-percent-other".to_string(),
                 etag: "etag-percent-other".to_string(),
                 multipart_part_count: None,
@@ -7267,7 +7267,7 @@ async fn s3_object_version_prefix_listing_treats_wildcards_literally_impl(
         store
             .persist_s3_object_version(&S3ObjectVersionRecord {
                 bucket_name: "photos.example".to_string(),
-                ironmesh_key: "tenant/photos/a_b/match.txt".to_string(),
+                berrykeep_key: "tenant/photos/a_b/match.txt".to_string(),
                 version_id: "version-underscore-match".to_string(),
                 etag: "etag-underscore-match".to_string(),
                 multipart_part_count: None,
@@ -7278,7 +7278,7 @@ async fn s3_object_version_prefix_listing_treats_wildcards_literally_impl(
         store
             .persist_s3_object_version(&S3ObjectVersionRecord {
                 bucket_name: "photos.example".to_string(),
-                ironmesh_key: "tenant/photos/acb/other.txt".to_string(),
+                berrykeep_key: "tenant/photos/acb/other.txt".to_string(),
                 version_id: "version-underscore-other".to_string(),
                 etag: "etag-underscore-other".to_string(),
                 multipart_part_count: None,
@@ -7814,8 +7814,9 @@ async fn enroll_client_device_issues_relay_identity_when_control_mtls_is_disable
         {
             for name in &san.general_names {
                 if let x509_parser::extensions::GeneralName::URI(uri) = name {
-                    saw_device_uri |= *uri == format!("urn:ironmesh:device:{device_id}");
-                    saw_cluster_uri |= *uri == format!("urn:ironmesh:cluster:{}", state.cluster_id);
+                    saw_device_uri |= *uri == format!("urn:berrykeep:device:{device_id}");
+                    saw_cluster_uri |=
+                        *uri == format!("urn:berrykeep:cluster:{}", state.cluster_id);
                 }
             }
         }
@@ -7929,7 +7930,7 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
         .unwrap();
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_bootstrap_bundle(
         State(state.clone()),
@@ -8020,7 +8021,7 @@ async fn issue_bootstrap_bundle_keeps_cluster_endpoints_when_client_auth_is_requ
     };
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_bootstrap_bundle(
         State(state.clone()),
@@ -8309,7 +8310,7 @@ async fn issue_bootstrap_claim_returns_compact_qr_payload_and_stores_claim_on_no
     )]);
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_bootstrap_claim(
         State(state.clone()),
@@ -8498,7 +8499,7 @@ async fn issue_bootstrap_claim_uses_selected_rendezvous_service_when_requested()
     ]);
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_bootstrap_claim(
         State(state.clone()),
@@ -8632,7 +8633,7 @@ async fn issue_bootstrap_claim_automatic_mode_uses_rendezvous_that_reports_healt
         ),
     ]);
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_bootstrap_claim(
         State(state.clone()),
@@ -8691,7 +8692,7 @@ async fn issue_bootstrap_claim_returns_json_error_when_rendezvous_is_unavailable
     state.network.cluster_ca_pem = Some(cluster_ca_pem);
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_bootstrap_claim(
         State(state.clone()),
@@ -8724,7 +8725,7 @@ async fn issue_pairing_token_returns_json_error_when_rendezvous_mtls_signing_is_
     state.network.rendezvous_mtls_required = true;
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_pairing_token(
         State(state.clone()),
@@ -8759,7 +8760,7 @@ async fn issue_bootstrap_claim_returns_json_error_when_rendezvous_mtls_signing_i
     state.network.rendezvous_mtls_required = true;
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_bootstrap_claim(
         State(state.clone()),
@@ -9295,7 +9296,7 @@ async fn issue_node_bootstrap_includes_runtime_and_rendezvous_metadata() {
     state.network.relay_mode = transport_sdk::RelayMode::Required;
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let requested_node_id = NodeId::new_v4();
 
     let response = super::issue_node_bootstrap(
@@ -9397,7 +9398,7 @@ async fn issue_node_bootstrap_rejects_invalid_public_url() {
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_node_bootstrap(
         State(state.clone()),
@@ -9437,7 +9438,7 @@ async fn issue_node_bootstrap_rejects_invalid_bind_addr_default_url() {
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_node_bootstrap(
         State(state.clone()),
@@ -9542,9 +9543,9 @@ async fn internal_node_tls_material_uses_identity_only_sans() {
             for name in &san.general_names {
                 match name {
                     x509_parser::extensions::GeneralName::URI(uri) => {
-                        saw_node_uri |= *uri == format!("urn:ironmesh:node:{}", bootstrap.node_id);
+                        saw_node_uri |= *uri == format!("urn:berrykeep:node:{}", bootstrap.node_id);
                         saw_cluster_uri |=
-                            *uri == format!("urn:ironmesh:cluster:{}", state.cluster_id);
+                            *uri == format!("urn:berrykeep:cluster:{}", state.cluster_id);
                     }
                     x509_parser::extensions::GeneralName::DNSName(_)
                     | x509_parser::extensions::GeneralName::IPAddress(_) => {
@@ -9584,7 +9585,7 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
     state.network.rendezvous_mtls_required = true;
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::issue_node_enrollment(
         State(state.clone()),
@@ -9696,9 +9697,9 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
                 match name {
                     x509_parser::extensions::GeneralName::URI(uri) => {
                         saw_node_uri |=
-                            *uri == format!("urn:ironmesh:node:{}", package.bootstrap.node_id);
+                            *uri == format!("urn:berrykeep:node:{}", package.bootstrap.node_id);
                         saw_cluster_uri |=
-                            *uri == format!("urn:ironmesh:cluster:{}", state.cluster_id);
+                            *uri == format!("urn:berrykeep:cluster:{}", state.cluster_id);
                     }
                     x509_parser::extensions::GeneralName::DNSName(name) => {
                         saw_public_dns_name |= *name == "node-b.example";
@@ -9734,7 +9735,7 @@ async fn issue_node_enrollment_from_join_request_returns_enrollment_package() {
     state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let join_request = transport_sdk::NodeJoinRequest {
         version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
         node_id: NodeId::new_v4(),
@@ -9796,7 +9797,7 @@ async fn export_managed_signer_backup_returns_encrypted_backup() {
     state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let response = super::export_managed_signer_backup_handler(
         State(state.clone()),
         headers,
@@ -9849,7 +9850,7 @@ async fn admin_password_login_creates_session_cookie() {
         .and_then(|value| value.to_str().ok())
         .unwrap()
         .to_string();
-    let expected_cookie_name = format!("ironmesh_admin_session_{}", state.node_id.simple());
+    let expected_cookie_name = format!("berrykeep_admin_session_{}", state.node_id.simple());
     assert!(set_cookie.contains(&format!("{expected_cookie_name}=")));
     assert!(set_cookie.contains("HttpOnly"));
 
@@ -9977,11 +9978,11 @@ async fn admin_session_cookies_are_isolated_per_node() {
 
     assert_ne!(cookie_a, cookie_b);
     assert!(cookie_a.starts_with(&format!(
-        "ironmesh_admin_session_{}=",
+        "berrykeep_admin_session_{}=",
         node_a.node_id.simple()
     )));
     assert!(cookie_b.starts_with(&format!(
-        "ironmesh_admin_session_{}=",
+        "berrykeep_admin_session_{}=",
         node_b.node_id.simple()
     )));
 
@@ -10116,7 +10117,7 @@ async fn change_admin_password_accepts_correct_current_password_and_updates_hash
         .unwrap() = Some(make_test_pbkdf2_hash("old-password"));
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
     let response = super::change_admin_password(
         State(state.clone()),
         headers,
@@ -10168,7 +10169,7 @@ async fn change_admin_password_rejects_wrong_current_password() {
         .unwrap() = Some(make_test_pbkdf2_hash("correct"));
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", TEST_ADMIN_TOKEN.parse().unwrap());
     let response = super::change_admin_password(
         State(state.clone()),
         headers,
@@ -10206,7 +10207,7 @@ async fn import_managed_signer_backup_persists_signer_material_and_requires_rest
     importer.access.admin_control.admin_token = Some("admin-secret".to_string());
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let response = super::import_managed_signer_backup_handler(
         State(importer.clone()),
         headers,
@@ -10466,7 +10467,7 @@ async fn renew_node_enrollment_reissues_tls_material_with_new_fingerprints() {
     state.network.rendezvous_registration_enabled = true;
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let issued = super::issue_node_enrollment(
         State(state.clone()),
         headers.clone(),
@@ -10610,7 +10611,7 @@ async fn renew_node_enrollment_rejects_invalid_current_public_certificate() {
     state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let issued = super::issue_node_enrollment(
         State(state.clone()),
         headers,
@@ -10681,7 +10682,7 @@ async fn renew_node_enrollment_rejects_node_missing_from_cluster_membership() {
     state.network.internal_ca_key_pem = Some(internal_ca_key_pem);
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let issued = super::issue_node_enrollment(
         State(state.clone()),
         headers,
@@ -10919,7 +10920,7 @@ async fn manual_node_enrollment_renewal_forces_live_tls_reload() {
     .await;
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let response = super::renew_node_certificates_now(State(state.clone()), headers)
         .await
         .into_response();
@@ -12515,7 +12516,7 @@ async fn list_client_credentials_returns_fingerprint_metadata_impl(backend: Main
             ),
             public_key_fingerprint: Some("pub-fingerprint".to_string()),
             issued_credential_pem: Some(
-                "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\nlist-test\n-----END IRONMESH CLIENT CREDENTIAL-----\n"
+                "-----BEGIN BERRYKEEP CLIENT CREDENTIAL-----\nlist-test\n-----END BERRYKEEP CLIENT CREDENTIAL-----\n"
                     .to_string(),
             ),
             credential_fingerprint: Some("cred-fingerprint".to_string()),
@@ -12528,7 +12529,7 @@ async fn list_client_credentials_returns_fingerprint_metadata_impl(backend: Main
     }
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::list_client_credentials(State(state.clone()), headers)
         .await
@@ -12613,7 +12614,7 @@ async fn list_client_bootstrap_claims_returns_recent_claim_status_impl(backend: 
     }
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = super::list_client_bootstrap_claims(State(state.clone()), headers)
         .await
@@ -12684,9 +12685,9 @@ async fn revoke_client_credential_persists_reason_and_admin_metadata_impl(
     }
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
-    headers.insert("x-ironmesh-admin-actor", "qa-operator".parse().unwrap());
-    headers.insert("x-ironmesh-node-id", "node-admin".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-actor", "qa-operator".parse().unwrap());
+    headers.insert("x-berrykeep-node-id", "node-admin".parse().unwrap());
 
     let response = super::revoke_client_credential(
         State(state.clone()),
@@ -16800,18 +16801,18 @@ async fn list_store_index_sets_timing_headers_impl(backend: MainTestBackend) {
         "store index response should expose server timing details"
     );
     assert!(
-        headers.get("x-ironmesh-store-index-request-id").is_some(),
+        headers.get("x-berrykeep-store-index-request-id").is_some(),
         "store index response should expose a request id for log correlation"
     );
     assert_eq!(
         headers
-            .get("x-ironmesh-store-index-matching-keys")
+            .get("x-berrykeep-store-index-matching-keys")
             .and_then(|value| value.to_str().ok()),
         Some("1")
     );
     assert_eq!(
         headers
-            .get("x-ironmesh-store-index-visible-files")
+            .get("x-berrykeep-store-index-visible-files")
             .and_then(|value| value.to_str().ok()),
         Some("1")
     );
@@ -16985,7 +16986,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
     assert_eq!(
         first_response
             .headers()
-            .get("x-ironmesh-store-index-materialized-entries")
+            .get("x-berrykeep-store-index-materialized-entries")
             .and_then(|value| value.to_str().ok()),
         Some("1"),
         "the cold page should materialize only its requested sorted prefix"
@@ -17043,7 +17044,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
     assert_eq!(
         second_response
             .headers()
-            .get("x-ironmesh-store-index-materialized-entries")
+            .get("x-berrykeep-store-index-materialized-entries")
             .and_then(|value| value.to_str().ok()),
         Some("2"),
         "the cached second page should extend the sorted prefix by one entry"
@@ -17191,7 +17192,7 @@ async fn list_store_index_reuses_paginated_page_cache_impl(backend: MainTestBack
     assert_eq!(
         invalidated_response
             .headers()
-            .get("x-ironmesh-store-index-materialized-entries")
+            .get("x-berrykeep-store-index-materialized-entries")
             .and_then(|value| value.to_str().ok()),
         Some("1")
     );
@@ -17310,7 +17311,7 @@ async fn list_store_index_uses_gallery_projection_for_captured_pagination_impl(
     assert_eq!(
         first_response
             .headers()
-            .get("x-ironmesh-store-index-materialized-entries")
+            .get("x-berrykeep-store-index-materialized-entries")
             .and_then(|value| value.to_str().ok()),
         Some("1")
     );
@@ -18723,7 +18724,7 @@ async fn list_store_index_admin_uses_admin_thumbnail_route_impl(backend: MainTes
     }
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = axum::response::IntoResponse::into_response(
         super::list_store_index_admin(
@@ -18809,7 +18810,7 @@ async fn get_media_thumbnail_admin_requires_auth_and_serves_image_impl(backend: 
     assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = axum::response::IntoResponse::into_response(
         super::get_media_thumbnail_admin(
@@ -19356,7 +19357,7 @@ async fn clear_media_cache_admin_requires_auth_and_clears_cached_media_impl(
     assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let missing_approval = axum::response::IntoResponse::into_response(
         super::clear_media_cache_admin(
@@ -19437,7 +19438,7 @@ async fn get_object_admin_returns_bytes_with_admin_token_impl(backend: MainTestB
     }
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = axum::response::IntoResponse::into_response(
         super::get_object_admin(
@@ -19953,7 +19954,7 @@ async fn process_stats_memory_reports_current_objects_uploads_and_last_gc_pass()
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     {
         let mut store = lock_store(&state, "tests.process_stats_memory.seed").await;
@@ -20051,7 +20052,7 @@ async fn process_stats_current_reports_temperature_snapshot() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     {
         let mut runtime = state
@@ -21203,7 +21204,7 @@ async fn register_node_uses_structured_reachability_payload() {
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let node_id = NodeId::new_v4();
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let response = axum::response::IntoResponse::into_response(
         super::register_node(
@@ -21371,7 +21372,7 @@ async fn remove_node_persists_forget_to_cluster_state() {
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let node_id = NodeId::new_v4();
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     {
         let mut cluster = state.cluster.lock().await;
@@ -21525,7 +21526,7 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let mut headers = HeaderMap::new();
-    headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
 
     let list_response = super::list_manual_repair_actions(State(state.clone()), headers.clone())
         .await
@@ -21596,7 +21597,7 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
         State(state.clone()),
         {
             let mut headers = HeaderMap::new();
-            headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+            headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
             headers
         },
         Path(super::CLEANUP_DELETE_RECREATE_LOOP_METADATA_REPAIR_ACTION_ID.to_string()),
@@ -21627,7 +21628,7 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
         State(state.clone()),
         {
             let mut headers = HeaderMap::new();
-            headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+            headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
             headers
         },
         Path(super::COMPACT_SNAPSHOT_HISTORY_REPAIR_ACTION_ID.to_string()),
@@ -21646,7 +21647,7 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
 
     let activity_response = super::manual_repair_action_activity_status(State(state.clone()), {
         let mut headers = HeaderMap::new();
-        headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+        headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
         headers
     })
     .await
@@ -21667,7 +21668,7 @@ async fn manual_repair_action_handlers_list_and_run_dry_run() {
         State(state.clone()),
         {
             let mut headers = HeaderMap::new();
-            headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+            headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
             headers
         },
         Query(super::RepairHistoryQuery {
@@ -22189,7 +22190,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
     }
 
     let mut cleanup_headers = HeaderMap::new();
-    cleanup_headers.insert("x-ironmesh-admin-token", "admin-secret".parse().unwrap());
+    cleanup_headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let response = super::execute_replication_cleanup(
         State(state.clone()),
         cleanup_headers,
@@ -22307,7 +22308,7 @@ async fn direct_quic_transport_accepts_device_clients() {
     .expect("client identity should generate");
     identity.credential_pem = Some("issued-credential".to_string());
 
-    let client = client_sdk::IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+    let client = client_sdk::BerryKeepClient::from_direct_quic_candidate_with_target_node_id(
         candidate,
         Some(state.node_id),
     )
@@ -23773,7 +23774,7 @@ fn embedded_rendezvous_restart_delay_backs_off_and_caps() {
 
 #[test]
 fn configured_file_paths_must_stay_within_data_dir() {
-    let data_dir = std::env::temp_dir().join("ironmesh-configured-file-paths");
+    let data_dir = std::env::temp_dir().join("berrykeep-configured-file-paths");
     let relative = super::resolve_configured_file_path(
         &data_dir,
         PathBuf::from("tls/node.pem").as_path(),
@@ -23844,7 +23845,7 @@ fn node_enrollment_persistence_path_rejects_symlink_escape() {
 }
 
 fn fresh_test_dir(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("ironmesh-{name}-{}", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("berrykeep-{name}-{}", Uuid::new_v4()));
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::create_dir_all(&path);
     path

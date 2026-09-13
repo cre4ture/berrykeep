@@ -235,7 +235,7 @@ pub struct DemoHydrator;
 impl Hydrator for DemoHydrator {
     fn hydrate(&self, path: &str, remote_version: &str) -> Result<Vec<u8>> {
         Ok(
-            format!("ironmesh cfapi hydration: path={path} version={remote_version}\n")
+            format!("berrykeep cfapi hydration: path={path} version={remote_version}\n")
                 .into_bytes(),
         )
     }
@@ -977,7 +977,7 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
             || existing.identity.prefix != registration.prefix
         {
             return Err(anyhow!(
-                "sync root {} at {} is registered to a different IronMesh root (registered: sync_root_id={} cluster_id={} prefix='{}'; requested: sync_root_id={} cluster_id={} prefix='{}')",
+                "sync root {} at {} is registered to a different BerryKeep root (registered: sync_root_id={} cluster_id={} prefix='{}'; requested: sync_root_id={} cluster_id={} prefix='{}')",
                 registration.display_name,
                 registration.root_path.display(),
                 existing.identity.sync_root_id,
@@ -2813,7 +2813,7 @@ fn validate_registration(registration: &SyncRootRegistration) -> Result<()> {
 }
 
 fn build_shell_sync_root_id(registration: &SyncRootRegistration) -> Result<SyncRootId> {
-    SyncRootIdBuilder::new(U16String::from_str("Ironmesh"))
+    SyncRootIdBuilder::new(U16String::from_str("BerryKeep"))
         .user_security_id(
             SecurityId::current_user().context("failed to resolve current Windows security id")?,
         )
@@ -2867,10 +2867,10 @@ mod tests {
     fn registration_validation_rejects_empty_inputs() {
         let cluster_id = uuid::Uuid::nil();
         let registration =
-            SyncRootRegistration::new("", "Ironmesh", "C:/ironmesh", cluster_id, None);
+            SyncRootRegistration::new("", "BerryKeep", "C:/berrykeep", cluster_id, None);
         assert!(register_sync_root(&registration).is_err());
 
-        let registration = SyncRootRegistration::new("id", "", "C:/ironmesh", cluster_id, None);
+        let registration = SyncRootRegistration::new("id", "", "C:/berrykeep", cluster_id, None);
         assert!(register_sync_root(&registration).is_err());
     }
 
@@ -3069,7 +3069,7 @@ mod tests {
         };
 
         let temp_root =
-            std::env::temp_dir().join(format!("ironmesh-sync-state-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("berrykeep-sync-state-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root).expect("temp root should be created");
         let stats = reconcile_sync_states(&temp_root, &plan);
 
@@ -3088,11 +3088,11 @@ mod tests {
     fn apply_action_plan_creates_remote_placeholder_with_in_sync_baseline() {
         let unique = uuid::Uuid::new_v4();
         let sync_root =
-            std::env::temp_dir().join(format!("ironmesh-apply-action-plan-placeholder-{unique}"));
+            std::env::temp_dir().join(format!("berrykeep-apply-action-plan-placeholder-{unique}"));
         let _guard = TestSyncRootGuard::new(sync_root.clone());
         let registration = SyncRootRegistration::new(
             format!("test-sync-root-{unique}"),
-            "Ironmesh Test",
+            "BerryKeep Test",
             &sync_root,
             uuid::Uuid::new_v4(),
             None,
@@ -3166,12 +3166,12 @@ mod tests {
     fn apply_action_plan_refuses_ambiguous_paths_for_one_object_id() {
         let unique = uuid::Uuid::new_v4();
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-apply-action-plan-ambiguous-object-{unique}"
+            "berrykeep-apply-action-plan-ambiguous-object-{unique}"
         ));
         let _guard = TestSyncRootGuard::new(sync_root.clone());
         let registration = SyncRootRegistration::new(
             format!("test-sync-root-{unique}"),
-            "Ironmesh Test",
+            "BerryKeep Test",
             &sync_root,
             uuid::Uuid::new_v4(),
             None,
@@ -3207,12 +3207,12 @@ mod tests {
     fn apply_action_plan_does_not_duplicate_existing_object_at_new_path() {
         let unique = uuid::Uuid::new_v4();
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-apply-action-plan-existing-object-{unique}"
+            "berrykeep-apply-action-plan-existing-object-{unique}"
         ));
         let _guard = TestSyncRootGuard::new(sync_root.clone());
         let registration = SyncRootRegistration::new(
             format!("test-sync-root-{unique}"),
-            "Ironmesh Test",
+            "BerryKeep Test",
             &sync_root,
             uuid::Uuid::new_v4(),
             None,
@@ -3256,7 +3256,7 @@ mod tests {
     #[test]
     fn close_completion_ignores_provider_originated_callbacks() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-close-completion-{}",
+            "berrykeep-close-completion-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&sync_root).expect("sync root should be created");
@@ -3356,7 +3356,7 @@ mod tests {
     #[test]
     fn queued_fetch_cancellation_is_registered_before_worker_execution() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-queued-fetch-cancellation-{}",
+            "berrykeep-queued-fetch-cancellation-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&sync_root).expect("sync root should be created");

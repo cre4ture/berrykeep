@@ -51,7 +51,7 @@ This note extends that direction from "prototype package works" to "production r
 
 The reserved Partner Center identity for this repo is now:
 
-- `Name`: `UlrichHornung.IronMesh`
+- `Name`: `UlrichHornung.BerryKeep`
 - `Publisher`: `CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21`
 - `PublisherDisplayName`: `Ulrich Hornung`
 
@@ -59,8 +59,8 @@ These values should now be treated as fixed production identity.
 
 Historical prototype values were:
 
-- current prototype `Name`: `Ironmesh.ThumbnailProvider.Prototype`
-- current prototype `Publisher`: `CN=Ironmesh Dev`
+- current prototype `Name`: `BerryKeep.ThumbnailProvider.Prototype`
+- current prototype `Publisher`: `CN=BerryKeep Dev`
 
 Important consequences:
 
@@ -78,15 +78,15 @@ For this repo, the manifest should now carry the exact Partner Center identity v
 
 The production package should include at least:
 
-- `ironmesh.exe`
+- `berrykeep.exe`
   - packaged local client-service host for background `serve-web` instances created from the config app.
-- `ironmesh-config-app.exe`
+- `berrykeep-config-app.exe`
   - visible packaged configuration UI and first-run entry point for Windows users.
-- `ironmesh-background-launcher.exe`
+- `berrykeep-background-launcher.exe`
   - startup-task target that relaunches enabled background instances after user login.
-- `ironmesh-os-integration.exe`
+- `berrykeep-os-integration.exe`
   - packaged full-trust host for Windows filesystem integration and status surface.
-- `ironmesh-folder-agent.exe`
+- `berrykeep-folder-agent.exe`
   - packaged folder synchronization agent so Windows installs can reuse the same helper binary without a second installer.
 - `windows_thumbnail_provider.dll`
   - packaged COM DLL for thumbnail and related Cloud Files handlers.
@@ -96,8 +96,8 @@ The intended user flow is:
 
 - install the package from Microsoft Store,
 - open the packaged configuration app first,
-- optionally define one or more local `ironmesh serve-web` client services,
-- define one or more `ironmesh-os-integration.exe` and `ironmesh-folder-agent.exe` instances,
+- optionally define one or more local `berrykeep serve-web` client services,
+- define one or more `berrykeep-os-integration.exe` and `berrykeep-folder-agent.exe` instances,
 - let the packaged background launcher restart enabled instances after login.
 
 If additional Windows-only helpers are required later, they should either live in the same package or in a deliberately versioned packaged companion path. The first release should avoid splitting the Windows desktop product across multiple independently updating installers.
@@ -108,15 +108,15 @@ Package upgrades must not be the place where user state lives.
 
 Persist mutable state in the existing external locations instead:
 
-- `%LocalAppData%\Ironmesh\desktop-client-config\instances.json`
-  - persisted multi-instance definitions for packaged `ironmesh-os-integration.exe` and `ironmesh-folder-agent.exe` launches.
-- `%LocalAppData%\Ironmesh\desktop-client-config\last-launch-report.json`
+- `%LocalAppData%\BerryKeep\desktop-client-config\instances.json`
+  - persisted multi-instance definitions for packaged `berrykeep-os-integration.exe` and `berrykeep-folder-agent.exe` launches.
+- `%LocalAppData%\BerryKeep\desktop-client-config\last-launch-report.json`
   - last startup-task launch report recorded by the packaged background launcher.
-- `%LocalAppData%\Ironmesh\sync-roots\...`
+- `%LocalAppData%\BerryKeep\sync-roots\...`
   - per-sync-root bootstrap, client identity, and related runtime state.
-- `%LocalAppData%\Ironmesh\thumbnail-cache`
+- `%LocalAppData%\BerryKeep\thumbnail-cache`
   - packaged thumbnail cache.
-- `%LocalAppData%\Ironmesh\thumbnail-provider.log`
+- `%LocalAppData%\BerryKeep\thumbnail-provider.log`
   - current prototype diagnostics.
 - Windows sync-root registration metadata
   - root ownership and reconnect identity, as described in the CFAPI reconnect note.
@@ -143,7 +143,7 @@ When Windows on ARM becomes a target, switch from a single-architecture `.msix` 
 
 Recommended user-facing flow:
 
-1. The user discovers Ironmesh in Microsoft Store or via the Store web listing.
+1. The user discovers BerryKeep in Microsoft Store or via the Store web listing.
 2. Microsoft Store installs the published MSIX package.
 3. Later updates are delivered through Microsoft Store.
 
@@ -183,9 +183,9 @@ That is a better fit than a custom self-updater, especially because the product 
 6. The submission is published immediately or per the configured schedule.
 7. Microsoft Store offers the new package version to customers.
 8. Customer machines receive the update through Store-managed package replacement.
-9. The next Ironmesh launch runs from the new package location automatically.
+9. The next BerryKeep launch runs from the new package location automatically.
 
-The package manager owns the code replacement. Ironmesh only needs to be restart-friendly and state-safe.
+The package manager owns the code replacement. BerryKeep only needs to be restart-friendly and state-safe.
 
 ## Microsoft Store upload requirements
 
@@ -205,7 +205,7 @@ Current Microsoft guidance says the new onboarding flow is free for both:
 
 Important account-type rule:
 
-- use a company account if Ironmesh is being published in relation to a business, trade, profession, or business entity name.
+- use a company account if BerryKeep is being published in relation to a business, trade, profession, or business entity name.
 
 For company accounts, Microsoft currently requires:
 
@@ -301,7 +301,7 @@ Required or practically required fields include:
 - Store listing description
 - At least one screenshot
 
-Conditionally required fields that matter for Ironmesh:
+Conditionally required fields that matter for BerryKeep:
 
 - Privacy policy URL
   - required if the app collects or transmits personal information
@@ -310,11 +310,11 @@ Conditionally required fields that matter for Ironmesh:
 - Restricted capability justification
   - required if the app declares restricted capabilities
 
-For this repo, the privacy policy item should be treated as required because Ironmesh handles user files, account identity, and networked synchronization. The current package also declares `runFullTrust`, so the restricted-capability explanation path should be expected.
+For this repo, the privacy policy item should be treated as required because BerryKeep handles user files, account identity, and networked synchronization. The current package also declares `runFullTrust`, so the restricted-capability explanation path should be expected.
 
-### Certification notes likely required for Ironmesh
+### Certification notes likely required for BerryKeep
 
-Ironmesh should assume the `Notes for certification` field is required in practice, even if Partner Center labels it optional.
+BerryKeep should assume the `Notes for certification` field is required in practice, even if Partner Center labels it optional.
 
 Reason:
 
@@ -335,11 +335,11 @@ The certification notes should include:
 
 If Microsoft cannot actually test the app because the required backend or credentials are unavailable, certification can fail.
 
-## Update-time behavior inside Ironmesh
+## Update-time behavior inside BerryKeep
 
 ### 1. Package version detection
 
-The packaged host should record the last launched package version under `%LocalAppData%\Ironmesh\...`.
+The packaged host should record the last launched package version under `%LocalAppData%\BerryKeep\...`.
 
 On startup:
 
@@ -359,7 +359,7 @@ The first production design should assume short downtime during upgrade is accep
 
 That means:
 
-- `ironmesh-os-integration.exe` should be able to shut down cleanly,
+- `berrykeep-os-integration.exe` should be able to shut down cleanly,
 - external state should be sufficient for reconnect on the next launch,
 - the host should not rely on in-memory-only registration state that would be lost during update.
 
@@ -367,7 +367,7 @@ This aligns with the existing reconnect direction: root identity lives in Window
 
 ### 3. Relaunch path
 
-Because Ironmesh is a background-style desktop integration host, the Windows package needs a defined relaunch story after update.
+Because BerryKeep is a background-style desktop integration host, the Windows package needs a defined relaunch story after update.
 
 The product should provide one of these packaged relaunch mechanisms before general release:
 
@@ -404,7 +404,7 @@ The first implementation can be explicit and conservative. It does not need a co
 
 Not every update needs the same user interruption.
 
-- If only `ironmesh-os-integration.exe` changes and the packaged shell DLLs do not, restarting the host is sufficient.
+- If only `berrykeep-os-integration.exe` changes and the packaged shell DLLs do not, restarting the host is sufficient.
 - If any packaged shell COM DLL changes, Explorer restart guidance should be shown.
 
 That split gives us a better user experience than forcing the same restart guidance for every release.

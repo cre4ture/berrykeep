@@ -6,7 +6,7 @@ interchangeable with the BerryKeep HTTPS/WebSocket relay tunnel. That tunnel
 remains the independent fallback for UDP-hostile networks and mixed-version
 deployments.
 
-`ironmesh-rendezvous-service` runs the upstream Iroh relay protocol on its
+`berrykeep-rendezvous-service` runs the upstream Iroh relay protocol on its
 existing public origin and listener. Rendezvous control requests and Iroh
 `GET /relay` upgrades therefore use the same host, port, TLS certificate, and
 TCP firewall rule. Iroh QUIC Address Discovery (QAD) uses UDP port `7842` with
@@ -20,7 +20,7 @@ The implementation and security model are summarized in
 ## Default behavior
 
 The embedded relay is enabled automatically. Its public origin is derived from
-`IRONMESH_RENDEZVOUS_PUBLIC_URL`, and its TLS behavior follows the Rendezvous
+`BERRYKEEP_RENDEZVOUS_PUBLIC_URL`, and its TLS behavior follows the Rendezvous
 listener.
 
 When Rendezvous TLS is configured, QAD is enabled automatically on
@@ -48,7 +48,7 @@ release abandoned tickets through the authenticated release endpoints; expiry
 is the crash-safety fallback.
 
 Plain HTTP is accepted only with
-`IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` for local development and tests.
+`BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` for local development and tests.
 It does not provide the production mTLS authorization boundary.
 
 ## Optional controls
@@ -58,32 +58,32 @@ deployment. Advanced settings are:
 
 ```bash
 # Disable only when the deployment intentionally provides no embedded relay.
-IRONMESH_IROH_RELAY_ENABLED=true
+BERRYKEEP_IROH_RELAY_ENABLED=true
 
 # Defaults: one-hour tickets, 16 MiB/s receive rate, 32 MiB burst.
-IRONMESH_IROH_RELAY_TICKET_TTL_SECS=3600
-IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND=16777216
-IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES=33554432
+BERRYKEEP_IROH_RELAY_TICKET_TTL_SECS=3600
+BERRYKEEP_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND=16777216
+BERRYKEEP_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES=33554432
 
 # Global admission defaults for every Rendezvous listener mode.
-IRONMESH_RENDEZVOUS_MAX_CONNECTIONS=512
-IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES=64
-IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT=10
-IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE=10
+BERRYKEEP_RENDEZVOUS_MAX_CONNECTIONS=512
+BERRYKEEP_RENDEZVOUS_MAX_TLS_HANDSHAKES=64
+BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT=10
+BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE=10
 
 # Defaults: 10 outstanding leases/tickets, 10 ticket issues per minute,
 # and 10 simultaneously connected Iroh relay endpoints per client.
-IRONMESH_IROH_RELAY_MAX_TICKET_LEASES_PER_CLIENT=10
-IRONMESH_IROH_RELAY_MAX_TICKET_ISSUES_PER_MINUTE=10
-IRONMESH_IROH_RELAY_MAX_ACTIVE_CONNECTIONS_PER_CLIENT=10
+BERRYKEEP_IROH_RELAY_MAX_TICKET_LEASES_PER_CLIENT=10
+BERRYKEEP_IROH_RELAY_MAX_TICKET_ISSUES_PER_MINUTE=10
+BERRYKEEP_IROH_RELAY_MAX_ACTIVE_CONNECTIONS_PER_CLIENT=10
 
 # Optional when the public UDP port differs from the default.
-IRONMESH_IROH_RELAY_QUIC_BIND=0.0.0.0:7842
-IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT=7842
+BERRYKEEP_IROH_RELAY_QUIC_BIND=0.0.0.0:7842
+BERRYKEEP_IROH_RELAY_QUIC_PUBLIC_PORT=7842
 
 # Optional dedicated QAD identity; normally Rendezvous TLS is reused.
-IRONMESH_IROH_RELAY_QUIC_TLS_CERT=/etc/ironmesh/qad.pem
-IRONMESH_IROH_RELAY_QUIC_TLS_KEY=/etc/ironmesh/qad.key
+BERRYKEEP_IROH_RELAY_QUIC_TLS_CERT=/etc/berrykeep/qad.pem
+BERRYKEEP_IROH_RELAY_QUIC_TLS_KEY=/etc/berrykeep/qad.key
 ```
 
 Ticket lifetime must be between 300 and 86400 seconds. Receive limits are
@@ -101,8 +101,8 @@ and must not exceed the connection limit. If the connection limit is set below
 These defaults leave descriptor headroom when the service runs with
 `RLIMIT_NOFILE=1024`.
 
-`IRONMESH_DIRECT_QUIC_RELAY_URLS` and
-`IRONMESH_DIRECT_QUIC_RELAY_AUTH_TOKEN` remain supported on server nodes for an
+`BERRYKEEP_DIRECT_QUIC_RELAY_URLS` and
+`BERRYKEEP_DIRECT_QUIC_RELAY_AUTH_TOKEN` remain supported on server nodes for an
 operator-managed external relay. Those settings are independent of the
 embedded same-port relay and remain authoritative for overlapping URLs.
 

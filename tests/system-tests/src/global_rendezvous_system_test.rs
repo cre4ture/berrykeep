@@ -48,7 +48,7 @@ impl TemporaryRegistry {
     fn new() -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "ironmesh-global-rendezvous-system-test-{}.json",
+                "berrykeep-global-rendezvous-system-test-{}.json",
                 Uuid::new_v4()
             )),
         }
@@ -99,7 +99,7 @@ async fn global_rendezvous_system_test() -> Result<()> {
     let registry = TemporaryRegistry::new();
     let bind_addr = unused_loopback_address()?;
     let base_url = format!("https://{bind_addr}");
-    let server_ca = p256_ca("ironmesh-global-rendezvous-server-ca")?;
+    let server_ca = p256_ca("berrykeep-global-rendezvous-server-ca")?;
     let server_identity = server_identity(&server_ca)?;
     let mut server = start_global_rendezvous(
         bind_addr,
@@ -112,8 +112,8 @@ async fn global_rendezvous_system_test() -> Result<()> {
 
     let cluster_a = Uuid::new_v4();
     let cluster_b = Uuid::new_v4();
-    let cluster_ca_a = p256_ca("ironmesh-global-rendezvous-cluster-a-ca")?;
-    let cluster_ca_b = p256_ca("ironmesh-global-rendezvous-cluster-b-ca")?;
+    let cluster_ca_a = p256_ca("berrykeep-global-rendezvous-cluster-a-ca")?;
+    let cluster_ca_b = p256_ca("berrykeep-global-rendezvous-cluster-b-ca")?;
 
     // This client deliberately has no client identity: registration precedes mTLS enrollment.
     let registration_http = strict_https_client(&server_ca.cert_pem)?;
@@ -259,7 +259,7 @@ fn server_identity(ca: &TestCa) -> Result<RendezvousServerTlsIdentity> {
     let mut params = CertificateParams::default();
     params
         .distinguished_name
-        .push(DnType::CommonName, "ironmesh-global-rendezvous-system-test");
+        .push(DnType::CommonName, "berrykeep-global-rendezvous-system-test");
     params
         .subject_alt_names
         .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
@@ -281,7 +281,7 @@ fn client_identity(ca: &TestCa, cluster_id: Uuid, identity: &PeerIdentity) -> Re
     let mut params = CertificateParams::default();
     params.distinguished_name.push(
         DnType::CommonName,
-        "ironmesh-global-rendezvous-system-client",
+        "berrykeep-global-rendezvous-system-client",
     );
     params.subject_alt_names = vec![
         SanType::URI(
@@ -289,7 +289,7 @@ fn client_identity(ca: &TestCa, cluster_id: Uuid, identity: &PeerIdentity) -> Re
                 .context("invalid peer identity SAN")?,
         ),
         SanType::URI(
-            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+            rcgen::string::Ia5String::try_from(format!("urn:berrykeep:cluster:{cluster_id}"))
                 .context("invalid cluster SAN")?,
         ),
     ];
@@ -306,8 +306,8 @@ fn client_identity(ca: &TestCa, cluster_id: Uuid, identity: &PeerIdentity) -> Re
 
 fn peer_identity_san(identity: &PeerIdentity) -> String {
     match identity {
-        PeerIdentity::Node(node_id) => format!("urn:ironmesh:node:{node_id}"),
-        PeerIdentity::Device(device_id) => format!("urn:ironmesh:device:{device_id}"),
+        PeerIdentity::Node(node_id) => format!("urn:berrykeep:node:{node_id}"),
+        PeerIdentity::Device(device_id) => format!("urn:berrykeep:device:{device_id}"),
     }
 }
 

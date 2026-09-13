@@ -42,8 +42,8 @@ export function makeViteConfig(appName: string) {
     plugins: [react()],
     publicDir: path.join(repoRoot, "docs", "assets"),
     define: {
-      __IRONMESH_UI_VERSION__: JSON.stringify(workspaceVersion),
-      __IRONMESH_UI_REVISION__: JSON.stringify(workspaceRevision)
+      __BERRYKEEP_UI_VERSION__: JSON.stringify(workspaceVersion),
+      __BERRYKEEP_UI_REVISION__: JSON.stringify(workspaceRevision)
     },
     server: {
       host: "127.0.0.1",

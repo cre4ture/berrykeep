@@ -377,8 +377,8 @@ rsync "${RSYNC_ADDITION_ARGS[@]}" \
   "${REMOTE}:${REMOTE_DIR%/}/berrykeep-archive-keyring.asc"
 rsync "${RSYNC_ADDITION_ARGS[@]}" \
   --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-  "${REPO_DIR%/}/ironmesh-archive-keyring.asc" \
-  "${REMOTE}:${REMOTE_DIR%/}/ironmesh-archive-keyring.asc"
+  "${REPO_DIR%/}/berrykeep-archive-keyring.asc" \
+  "${REMOTE}:${REMOTE_DIR%/}/berrykeep-archive-keyring.asc"
 
 for suite in "${SUITES[@]}"; do
   log "syncing ${suite} metadata"
@@ -392,9 +392,9 @@ done
 # pool. Apply this deletion only after the signed metadata no longer references
 # those files: a metadata-sync failure then leaves harmless extra files instead
 # of a published index with a missing package. Each source package namespace is
-# pruned separately, so the transitional Ironmesh packages remain available.
+# pruned separately, so the transitional BerryKeep packages remain available.
 for suite in "${SUITES[@]}"; do
-  for package_namespace in b/berrykeep i/ironmesh; do
+  for package_namespace in b/berrykeep i/berrykeep; do
     suite_pool_dir="${REPO_DIR}/pool/${COMPONENT}/${package_namespace}/${suite}"
     [[ -d "${suite_pool_dir}" ]] || continue
     log "pruning ${suite} ${package_namespace} package pool"

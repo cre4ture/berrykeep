@@ -17,8 +17,8 @@ import {
   updateDirectEndpointsConfig,
   updateRendezvousContactConfiguration,
   updateRendezvousConfig
-} from "@ironmesh/api";
-import { JsonBlock } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { JsonBlock } from "@berrykeep/ui";
 import {
   Alert,
   Badge,

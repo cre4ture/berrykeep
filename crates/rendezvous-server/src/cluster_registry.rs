@@ -24,7 +24,7 @@ const LEGACY_SUSPENSION_REASON: &str = "Suspended by a legacy registry caller";
 const LEGACY_SUSPENSION_MIGRATION_REASON: &str = "Suspension state migrated from a legacy registry";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// The single active trust anchor for one globally registered IronMesh cluster.
+/// The single active trust anchor for one globally registered BerryKeep cluster.
 ///
 /// `created_at_unix_secs` tracks the lifetime of this CA binding. Re-registering
 /// an unchanged CA preserves it, while replacing a CA starts a new binding.
@@ -375,7 +375,7 @@ fn persist_registry(
     .context("failed serializing cluster CA registry")?;
     let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary_name = format!(
-        ".ironmesh-cluster-ca-registry.{}.{}.tmp",
+        ".berrykeep-cluster-ca-registry.{}.{}.tmp",
         std::process::id(),
         sequence
     );
@@ -509,7 +509,7 @@ mod tests {
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 
     fn test_registry_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ironmesh-{name}-{}.json", ClusterId::now_v7()))
+        std::env::temp_dir().join(format!("berrykeep-{name}-{}.json", ClusterId::now_v7()))
     }
 
     fn test_ca(common_name: &str) -> String {

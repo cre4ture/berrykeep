@@ -19,7 +19,7 @@ use x509_parser::parse_x509_certificate;
 /// The only currently supported cluster-registration wire protocol version.
 pub const CLUSTER_REGISTRATION_PROTOCOL_VERSION: u16 = 1;
 
-const PROOF_MESSAGE_DOMAIN: &[u8] = b"ironmesh.cluster-registration-proof\0";
+const PROOF_MESSAGE_DOMAIN: &[u8] = b"berrykeep.cluster-registration-proof\0";
 const SHA256_FINGERPRINT_HEX_LENGTH: usize = 64;
 const MAX_CA_PEM_BYTES: usize = 32 * 1024;
 const MIN_CHALLENGE_NONCE_BYTES: usize = 16;
@@ -30,7 +30,7 @@ const MAX_SUSPEND_REASON_BYTES: usize = 1024;
 
 /// Supported proof algorithm for the MVP cluster CA.
 ///
-/// IronMesh currently creates P-256 CA keys. The proof signature uses the ASN.1 DER encoding
+/// BerryKeep currently creates P-256 CA keys. The proof signature uses the ASN.1 DER encoding
 /// produced and verified by the corresponding P-256 SHA-256 implementation. New algorithms
 /// require a new enum variant and explicit verifier support; APIs must not accept free-form
 /// algorithm names.
@@ -317,7 +317,7 @@ pub fn cluster_ca_fingerprint_sha256(cluster_ca_pem: &str) -> Result<String> {
 ///
 /// Its byte layout is `domain || version:u16be || cluster_id:16 || ca_fingerprint:32 ||
 /// challenge_id:16 || nonce_length:u16be || nonce || expires_at_unix:u64be`, where `domain` is
-/// the ASCII string `ironmesh.cluster-registration-proof` followed by one NUL byte. All UUIDs
+/// the ASCII string `berrykeep.cluster-registration-proof` followed by one NUL byte. All UUIDs
 /// use their RFC 4122 network byte order and the fingerprint is decoded from normalized lowercase
 /// hexadecimal before it is appended.
 pub fn cluster_registration_proof_message_v1(
@@ -562,7 +562,7 @@ mod tests {
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params
             .distinguished_name
-            .push(DnType::CommonName, "ironmesh-cluster-registration-test-ca");
+            .push(DnType::CommonName, "berrykeep-cluster-registration-test-ca");
         params
             .self_signed(&key_pair)
             .expect("test CA certificate should issue")
@@ -596,7 +596,7 @@ mod tests {
             .expect("proof message should build");
 
         let mut expected = Vec::new();
-        expected.extend_from_slice(b"ironmesh.cluster-registration-proof\0");
+        expected.extend_from_slice(b"berrykeep.cluster-registration-proof\0");
         expected.extend_from_slice(&1_u16.to_be_bytes());
         expected.extend_from_slice(&[
             0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,

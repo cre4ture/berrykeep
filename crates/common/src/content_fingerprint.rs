@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::Path;
 
 pub const CONTENT_FINGERPRINT_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
-const CONTENT_FINGERPRINT_PREFIX: &[u8] = b"ironmesh-content-fingerprint-v1";
+const CONTENT_FINGERPRINT_PREFIX: &[u8] = b"berrykeep-content-fingerprint-v1";
 
 #[derive(Debug, Clone)]
 pub struct ContentFingerprintBuilder {
@@ -189,7 +189,7 @@ mod tests {
             "\ncontent-fingerprint"
         );
         let path = std::env::temp_dir().join(format!(
-            "ironmesh-content-fingerprint-{}.bin",
+            "berrykeep-content-fingerprint-{}.bin",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, payload.as_bytes())?;

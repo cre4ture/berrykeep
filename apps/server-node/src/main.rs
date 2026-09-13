@@ -47,13 +47,13 @@ fn run_server_node() -> Result<()> {
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    let use_current_thread =
-        std::env::var_os("IRONMESH_TOKIO_CURRENT_THREAD").is_some_and(|v| v != "0");
+    let use_current_thread = common::legacy_compatibility::var_os("BERRYKEEP_TOKIO_CURRENT_THREAD")
+        .is_some_and(|v| v != "0");
 
     let mut runtime_builder = if use_current_thread {
         eprintln!(
             "berrykeep-server-node: using Tokio current-thread runtime because \
-IRONMESH_TOKIO_CURRENT_THREAD is set; this avoids worker-pool overhead on \
+BERRYKEEP_TOKIO_CURRENT_THREAD is set; this avoids worker-pool overhead on \
 single-core hosts"
         );
         tokio::runtime::Builder::new_current_thread()
@@ -233,7 +233,7 @@ mod windows_service_host {
     }
 
     fn service_environment_file_path() -> PathBuf {
-        let program_data = std::env::var_os("ProgramData")
+        let program_data = common::legacy_compatibility::var_os("ProgramData")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
         program_data
@@ -246,7 +246,7 @@ mod windows_service_host {
         name == "RUST_LOG"
             || name == "BERRYKEEP_SERVER_NODE_DATA_DIR"
             || name == "BERRYKEEP_SERVER_NODE_BIND"
-            || name.starts_with("IRONMESH_")
+            || name.starts_with("BERRYKEEP_")
     }
 
     #[cfg(test)]
@@ -256,7 +256,7 @@ mod windows_service_host {
         #[test]
         fn service_environment_allows_node_settings_only() {
             assert!(is_allowed_environment_name("BERRYKEEP_SERVER_NODE_BIND"));
-            assert!(is_allowed_environment_name("IRONMESH_RENDEZVOUS_URLS"));
+            assert!(is_allowed_environment_name("BERRYKEEP_RENDEZVOUS_URLS"));
             assert!(is_allowed_environment_name("RUST_LOG"));
             assert!(!is_allowed_environment_name("PATH"));
             assert!(!is_allowed_environment_name("BERRYKEEP_UNRELATED"));

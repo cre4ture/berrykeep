@@ -376,7 +376,7 @@ async fn list_buckets(
     xml.push_str(S3_XML_NAMESPACE);
     xml.push_str(r#""><Owner><ID>"#);
     xml.push_str(&xml_escape(&state.cluster_id.to_string()));
-    xml.push_str(r#"</ID><DisplayName>ironmesh</DisplayName></Owner><Buckets>"#);
+    xml.push_str(r#"</ID><DisplayName>berrykeep</DisplayName></Owner><Buckets>"#);
     for bucket in buckets {
         xml.push_str("<Bucket><Name>");
         xml.push_str(&xml_escape(&bucket.bucket_name));
@@ -1094,7 +1094,7 @@ async fn list_object_versions_response(
     let mut records_by_key = BTreeMap::<String, Vec<S3ObjectVersionRecord>>::new();
     for record in records {
         records_by_key
-            .entry(record.ironmesh_key.clone())
+            .entry(record.berrykeep_key.clone())
             .or_default()
             .push(record);
     }
@@ -1478,7 +1478,7 @@ async fn put_object(
     if let Err(err) = store
         .persist_s3_object_version(&S3ObjectVersionRecord {
             bucket_name: bucket.bucket_name.clone(),
-            ironmesh_key: full_key.clone(),
+            berrykeep_key: full_key.clone(),
             version_id: outcome.version_id.clone(),
             etag: object_etag(&outcome.manifest_hash),
             multipart_part_count: None,
@@ -1804,7 +1804,7 @@ async fn copy_object_response(
     if let Err(err) = store
         .persist_s3_object_version(&S3ObjectVersionRecord {
             bucket_name: destination_bucket.bucket_name.clone(),
-            ironmesh_key: destination_full_key.to_string(),
+            berrykeep_key: destination_full_key.to_string(),
             version_id: destination_head.version_id.clone(),
             etag: destination_etag.clone(),
             multipart_part_count: None,
@@ -2410,7 +2410,7 @@ async fn complete_multipart_upload_response(
     if let Err(err) = store
         .persist_s3_object_version(&S3ObjectVersionRecord {
             bucket_name: bucket.bucket_name.clone(),
-            ironmesh_key: full_key.to_string(),
+            berrykeep_key: full_key.to_string(),
             version_id: outcome.version_id.clone(),
             etag: multipart_etag.clone(),
             multipart_part_count: Some(selected_parts.len() as u32),
@@ -2693,7 +2693,7 @@ async fn execute_s3_current_object_delete(
     for deleted in &deleted_paths {
         let s3_object_version = S3ObjectVersionRecord {
             bucket_name: bucket.bucket_name.clone(),
-            ironmesh_key: deleted.path.clone(),
+            berrykeep_key: deleted.path.clone(),
             version_id: deleted.version_id.clone(),
             etag: object_etag(TOMBSTONE_MANIFEST_HASH),
             multipart_part_count: None,
@@ -3929,7 +3929,7 @@ async fn resolve_requested_version_id(
                 request_id,
             ));
         };
-        if version.ironmesh_key != full_key {
+        if version.berrykeep_key != full_key {
             return Err(s3_error_response(
                 StatusCode::NOT_FOUND,
                 "NoSuchVersion",
@@ -4038,7 +4038,7 @@ async fn resolve_copy_source_version(
                 request_id,
             ));
         };
-        if version.ironmesh_key != full_key {
+        if version.berrykeep_key != full_key {
             return Err(s3_error_response(
                 StatusCode::NOT_FOUND,
                 "NoSuchVersion",

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const PNPM_PACKAGE_MANAGER: &str = "pnpm@10.6.0";
-const FLEET_DASHBOARD_PACKAGE: &str = "@ironmesh/fleet-telemetry";
-const EMBEDDED_PUBLIC_FILES: &[&str] = &["ironmesh-favicon.svg"];
+const FLEET_DASHBOARD_PACKAGE: &str = "@berrykeep/fleet-telemetry";
+const EMBEDDED_PUBLIC_FILES: &[&str] = &["berrykeep-favicon.svg"];
 
 fn main() {
     let manifest_dir =
@@ -237,7 +237,7 @@ struct FrontendBuildLock {
 
 impl FrontendBuildLock {
     fn acquire(web_workspace_dir: &Path) -> Self {
-        let lock_path = web_workspace_dir.join(".ironmesh-build.lock");
+        let lock_path = web_workspace_dir.join(".berrykeep-build.lock");
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)

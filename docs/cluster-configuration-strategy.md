@@ -2,7 +2,7 @@
 
 ## Purpose
 
-IronMesh needs a small set of cluster-owned settings that every server node can
+BerryKeep needs a small set of cluster-owned settings that every server node can
 resolve consistently. The first use case is a rendezvous contact list that an
 authenticated client can download after reaching any node, directly or through
 a relay. Further candidates include replication policy and selected UI/runtime

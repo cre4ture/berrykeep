@@ -11,12 +11,12 @@ server_bootstrap.txt
 web/node_modules
 web/**/node_modules
 web/**/dist
-web/.ironmesh-build.lock
+web/.berrykeep-build.lock
 web/.turbo
 web/playwright-report
 web/test-results
 !.vscode/extensions.json
-ironmesh-client-*.json
+berrykeep-client-*.json
 map/
 windows/thumbnail-provider/out/
 windows/server-node-installer/out/

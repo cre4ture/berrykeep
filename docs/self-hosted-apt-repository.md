@@ -10,7 +10,7 @@ The primary BerryKeep repository URL is:
 https://creax.de/apt/berrykeep
 ```
 
-The former `https://creax.de/apt/ironmesh` location is retained as a signed
+The former `https://creax.de/apt/berrykeep` location is retained as a signed
 compatibility mirror. Existing clients can keep using it, but new
 installations should use the BerryKeep URL.
 
@@ -134,10 +134,10 @@ package increments the legacy repository revision, so it supersedes an
 otherwise identical `~repo1~ubuntu…` package in APT's version comparison.
 
 When a server-only matrix refreshes an already-published suite, the matrix
-discovers and publishes the matching `ironmesh-server-node` transition package
+discovers and publishes the matching `berrykeep-server-node` transition package
 beside each `berrykeep-server-node` input. Its existing client, rendezvous, and
 map-tools `.deb` files are retained from both the legacy shared pool and the
-previous Ironmesh suite pool, then copied into the new BerryKeep suite pool
+previous BerryKeep suite pool, then copied into the new BerryKeep suite pool
 before the index is regenerated.
 The script migrates only files explicitly listed in that suite's existing
 `Packages` index. If it finds a legacy Map Tools package with an exact Server
@@ -168,14 +168,14 @@ same signed repository to both locations:
 APT_REPO_SIGN_KEY=5D7762BDB9A2A564D500DE702A2E3C589C188616 \
   ./scripts/build-apt-repository.sh \
     --server-node-matrix server-node-debian-matrix.txt \
-    --import-remote creature@creax.de:/home/creature/html/apt/ironmesh
+    --import-remote creature@creax.de:/home/creature/html/apt/berrykeep
 
 ./scripts/deploy-apt-repository.sh \
   --server-node-matrix server-node-debian-matrix.txt
 ./scripts/deploy-apt-repository.sh \
   --server-node-matrix server-node-debian-matrix.txt \
-  --remote-dir /home/creature/html/apt/ironmesh \
-  --url https://creax.de/apt/ironmesh
+  --remote-dir /home/creature/html/apt/berrykeep \
+  --url https://creax.de/apt/berrykeep
 ```
 
 ## CI build, signing, and deployment
@@ -212,9 +212,9 @@ Add these environment variables:
 - `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE`: SSH target of the legacy
   mirror, normally `creature@creax.de`.
 - `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE_DIR`: legacy mirror directory,
-  `/home/creature/html/apt/ironmesh`.
+  `/home/creature/html/apt/berrykeep`.
 - `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_URL`: legacy mirror URL,
-  `https://creax.de/apt/ironmesh`.
+  `https://creax.de/apt/berrykeep`.
 
 The publish job imports the private key into a fresh temporary keyring,
 confirms its fingerprint, imports the primary archive, and deploys identical
@@ -240,9 +240,9 @@ curl -fsSL https://creax.de/apt/berrykeep/dists/focal/main/binary-arm64/Packages
   | gzip -dc \
   | grep '^Package: '
 
-# Existing Ironmesh clients continue to receive the same signed metadata.
+# Existing BerryKeep clients continue to receive the same signed metadata.
 cmp <(curl -fsSL https://creax.de/apt/berrykeep/dists/noble/InRelease) \
-  <(curl -fsSL https://creax.de/apt/ironmesh/dists/noble/InRelease)
+  <(curl -fsSL https://creax.de/apt/berrykeep/dists/noble/InRelease)
 ```
 
 ## Client setup
@@ -256,7 +256,7 @@ curl -fsSL https://creax.de/apt/berrykeep/berrykeep-archive-keyring.asc \
 
 Add exactly one apt source, matching the distribution suite and architecture of
 the host. New installations use `berrykeep.list`; existing clients can retain
-their `ironmesh.list` source because the legacy URL is a compatibility mirror:
+their `berrykeep.list` source because the legacy URL is a compatibility mirror:
 
 ```bash
 # Ubuntu 20.04 ARM64

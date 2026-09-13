@@ -1,5 +1,5 @@
 [package]
-name = "ironmesh-background-launcher"
+name = "berrykeep-background-launcher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+common = { path = "../../crates/common" }
 desktop-client-config = { path = "../../crates/desktop-client-config" }
 
 [target.'cfg(windows)'.build-dependencies]

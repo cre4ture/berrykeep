@@ -36,12 +36,12 @@ use super::{
 
 pub(super) const MEDIA_CACHE_SCHEMA_VERSION: u32 = 13;
 pub(super) const MEDIA_CACHE_INCOMPLETE_RETRY_SECS: u64 = 10 * 60;
-const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
-const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
-const MEDIA_CACHE_BUILD_BYTES_PER_PERMIT_ENV: &str = "IRONMESH_MEDIA_CACHE_BUILD_BYTES_PER_PERMIT";
-const MEDIA_CACHE_IMAGE_MAX_DIMENSION_ENV: &str = "IRONMESH_MEDIA_CACHE_IMAGE_MAX_DIMENSION";
-const MEDIA_CACHE_IMAGE_MAX_PIXELS_ENV: &str = "IRONMESH_MEDIA_CACHE_IMAGE_MAX_PIXELS";
-const MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES_ENV: &str = "IRONMESH_MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES";
+const MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV: &str = "BERRYKEEP_MEDIA_CACHE_INCOMPLETE_RETRY_SECS";
+const MEDIA_CACHE_BUILD_TOTAL_PERMITS_ENV: &str = "BERRYKEEP_MEDIA_CACHE_BUILD_TOTAL_PERMITS";
+const MEDIA_CACHE_BUILD_BYTES_PER_PERMIT_ENV: &str = "BERRYKEEP_MEDIA_CACHE_BUILD_BYTES_PER_PERMIT";
+const MEDIA_CACHE_IMAGE_MAX_DIMENSION_ENV: &str = "BERRYKEEP_MEDIA_CACHE_IMAGE_MAX_DIMENSION";
+const MEDIA_CACHE_IMAGE_MAX_PIXELS_ENV: &str = "BERRYKEEP_MEDIA_CACHE_IMAGE_MAX_PIXELS";
+const MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES_ENV: &str = "BERRYKEEP_MEDIA_CACHE_IMAGE_MAX_DECODE_BYTES";
 const DEFAULT_MEDIA_CACHE_BUILD_TOTAL_PERMITS: u32 = 8;
 const DEFAULT_MEDIA_CACHE_BUILD_BYTES_PER_PERMIT: u64 = 16 * 1024 * 1024;
 const DEFAULT_MEDIA_CACHE_IMAGE_MAX_DIMENSION: u32 = 12_288;
@@ -813,7 +813,7 @@ pub fn media_cache_incomplete_retry_after_unix(now_unix: u64) -> u64 {
 }
 
 fn media_cache_incomplete_retry_secs() -> u64 {
-    std::env::var(MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV)
+    common::legacy_compatibility::var(MEDIA_CACHE_INCOMPLETE_RETRY_SECS_ENV)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -923,7 +923,7 @@ pub fn media_cache_retry_due(metadata: &CachedMediaMetadata, now_unix: u64) -> b
 }
 
 fn positive_env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
+    common::legacy_compatibility::var(key)
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
@@ -931,7 +931,7 @@ fn positive_env_u32(key: &str, default: u32) -> u32 {
 }
 
 fn positive_env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
+    common::legacy_compatibility::var(key)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -1258,7 +1258,7 @@ async fn derive_video_media_cache(
     collect_local_chunk_paths(manifest, storage_pool).await?;
     let chunk_index = Arc::new(ChunkVideoIndex::new(storage_pool.clone(), manifest));
 
-    let temp_dir = std::env::temp_dir().join(format!("ironmesh-media-cache-{}", Uuid::new_v4()));
+    let temp_dir = std::env::temp_dir().join(format!("berrykeep-media-cache-{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir)
         .await
         .with_context(|| format!("failed to create temp dir {}", temp_dir.display()))?;

@@ -23,13 +23,13 @@ importers:
 
   apps/client-ui:
     dependencies:
-      '@ironmesh/api':
+      '@berrykeep/api':
         specifier: workspace:*
         version: link:../../packages/api
-      '@ironmesh/config':
+      '@berrykeep/config':
         specifier: workspace:*
         version: link:../../packages/config
-      '@ironmesh/ui':
+      '@berrykeep/ui':
         specifier: workspace:*
         version: link:../../packages/ui
       '@mantine/core':
@@ -63,13 +63,13 @@ importers:
 
   apps/fleet-telemetry:
     dependencies:
-      '@ironmesh/api':
+      '@berrykeep/api':
         specifier: workspace:*
         version: link:../../packages/api
-      '@ironmesh/config':
+      '@berrykeep/config':
         specifier: workspace:*
         version: link:../../packages/config
-      '@ironmesh/ui':
+      '@berrykeep/ui':
         specifier: workspace:*
         version: link:../../packages/ui
       '@mantine/core':
@@ -100,13 +100,13 @@ importers:
 
   apps/server-admin:
     dependencies:
-      '@ironmesh/api':
+      '@berrykeep/api':
         specifier: workspace:*
         version: link:../../packages/api
-      '@ironmesh/config':
+      '@berrykeep/config':
         specifier: workspace:*
         version: link:../../packages/config
-      '@ironmesh/ui':
+      '@berrykeep/ui':
         specifier: workspace:*
         version: link:../../packages/ui
       '@mantine/core':

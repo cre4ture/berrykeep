@@ -7,7 +7,7 @@ description: Cut a BerryKeep release commit and annotated tag. Use when preparin
 
 Keep the final release commit atomic: product and CI fixes land first; the release commit contains versioning and release metadata only unless the caller explicitly requests otherwise.
 
-Read [references/ironmesh-release-facts.md](references/ironmesh-release-facts.md) for stable repository-specific facts. Derive mutable conventions from the current repository and recent release history.
+Read [references/berrykeep-release-facts.md](references/berrykeep-release-facts.md) for stable repository-specific facts. Derive mutable conventions from the current repository and recent release history.
 
 ## 1. Resolve the release base
 

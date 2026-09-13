@@ -1,6 +1,6 @@
 # Zero-Touch Cluster Setup Strategy
 
-Status: In progress as the regular Ironmesh setup UX target
+Status: In progress as the regular BerryKeep setup UX target
 
 Related documents:
 
@@ -48,13 +48,13 @@ The regular setup flow should not require the admin to:
 - call backend enrollment endpoints directly,
 - paste raw cryptographic material into config files.
 
-## 3. Why This Strategy Fits Ironmesh
+## 3. Why This Strategy Fits BerryKeep
 
 This is the best fit for the current architecture because:
 
-- Ironmesh already has enrollment flows,
-- Ironmesh already has node enrollment packages,
-- Ironmesh already has client bootstrap and enrollment,
+- BerryKeep already has enrollment flows,
+- BerryKeep already has node enrollment packages,
+- BerryKeep already has client bootstrap and enrollment,
 - the current security direction is still certificate-backed identities,
 - the operational pain is mostly setup UX, not the existence of a CA itself.
 
@@ -160,7 +160,7 @@ This preserves the desired security property:
 - the cluster approves and signs it,
 - the operator does not manually handle TLS assets.
 
-This is also the best fit to the current implementation direction because Ironmesh already has node enrollment package issuance. A live approval queue can still be added later.
+This is also the best fit to the current implementation direction because BerryKeep already has node enrollment package issuance. A live approval queue can still be added later.
 
 ## 8. Admin UX Direction
 
@@ -266,7 +266,7 @@ Decision:
 
 Reason:
 
-- this fits the current implementation best because Ironmesh already has node enrollment package issuance, so the smallest extension is:
+- this fits the current implementation best because BerryKeep already has node enrollment package issuance, so the smallest extension is:
   - joining node creates a join request,
   - existing cluster UI imports that request and issues a node enrollment package,
   - joining node imports the enrollment package.
@@ -431,4 +431,4 @@ The chosen strategy is:
 - request/import plus enrollment/import as the first join transport,
 - minimal reliance on CLI flags or environment variables for the normal path.
 
-This is the most practical next-direction because it fits the current Ironmesh architecture while removing the biggest current usability pain: manual PKI and setup complexity.
+This is the most practical next-direction because it fits the current BerryKeep architecture while removing the biggest current usability pain: manual PKI and setup complexity.

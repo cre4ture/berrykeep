@@ -2,8 +2,8 @@ import {
   getHostDependencyReport,
   type HostDependencyReport,
   type HostDependencyStatus
-} from "@ironmesh/api";
-import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { berrykeepPrimaryColor, StatCard } from "@berrykeep/ui";
 import { Alert, Badge, Button, Code, Grid, Group, Stack, Table, Text } from "@mantine/core";
 import { useCallback, useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
@@ -47,14 +47,14 @@ export function DependenciesPage() {
           Resolve the missing checks below before relying on their affected server features.
         </Alert>
       ) : report ? (
-        <Alert color={ironmeshPrimaryColor} title="Host dependency checks passed">
+        <Alert color={berrykeepPrimaryColor} title="Host dependency checks passed">
           This node has the currently known runtime dependencies for media processing, SMART/NVMe hardware health, and
           automatic Natural Earth map conversion.
         </Alert>
       ) : null}
       {optionalCount > 0 ? (
         <Alert color="blue" title="Optional host administration tooling unavailable">
-          Cockpit is not installed on this host. IronMesh does not require it, but you can install and use Cockpit as a
+          Cockpit is not installed on this host. BerryKeep does not require it, but you can install and use Cockpit as a
           separate web interface for service restarts, updates, and host reboots.
         </Alert>
       ) : null}
@@ -63,7 +63,7 @@ export function DependenciesPage() {
           This page checks host packages and commands required by server-node features, including <Code>smartctl</Code>
           for SMART/NVMe hardware health and the Natural Earth map-import tools. It also reports whether optional Cockpit
           host-administration tooling is installed. Cockpit remains a separate, separately authenticated interface for
-          host-level operations; IronMesh does not restart services or the host itself.
+          host-level operations; BerryKeep does not restart services or the host itself.
         </Text>
         <Button variant="light" onClick={() => void refresh()} loading={loading}>
           Refresh
@@ -166,7 +166,7 @@ export function DependenciesPage() {
 function dependencyBadgeColor(status: HostDependencyStatus): string {
   switch (status) {
     case "ready":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "missing":
       return "red";
     case "builtin":

@@ -48,14 +48,14 @@ Options:
                        before updating it, for example
                        creature@creax.de:/home/creature/html/apt/berrykeep.
   --sign-key KEY       GPG key ID or fingerprint used for Release signing.
-  --server-node-only   Publish berrykeep-server-node and its Ironmesh
+  --server-node-only   Publish berrykeep-server-node and its BerryKeep
                        transition package. With no explicit .deb path,
                        expects both packages.
   --server-node-matrix FILE
                        Sign each server-node-only matrix row. Each non-comment
                        row is: SUITE ARCH PACKAGE_PATH. Relative package paths
                        are resolved from FILE's directory. The matching
-                       ironmesh-server-node transition package is discovered
+                       berrykeep-server-node transition package is discovered
                        beside each primary package. The existing remote
                        repository is imported only before the first row.
   --no-sign            Build repository metadata without signing it.
@@ -220,7 +220,7 @@ run_server_node_matrix() {
       package_path="${matrix_dir}/${package_path}"
     fi
     package_version="$(dpkg-deb -f "${package_path}" Version)"
-    transition_package_path="$(dirname "${package_path}")/ironmesh-server-node_${package_version}_${architecture}.deb"
+    transition_package_path="$(dirname "${package_path}")/berrykeep-server-node_${package_version}_${architecture}.deb"
     [[ -f "${transition_package_path}" ]] || {
       printf 'server-node transition package not found beside %s: %s\n' \
         "${package_path}" "${transition_package_path}" >&2
@@ -229,7 +229,7 @@ run_server_node_matrix() {
     transition_package_name="$(dpkg-deb -f "${transition_package_path}" Package)"
     transition_package_architecture="$(dpkg-deb -f "${transition_package_path}" Architecture)"
     transition_package_version="$(dpkg-deb -f "${transition_package_path}" Version)"
-    if [[ "${transition_package_name}" != "ironmesh-server-node" || \
+    if [[ "${transition_package_name}" != "berrykeep-server-node" || \
       "${transition_package_architecture}" != "${architecture}" || \
       "${transition_package_version}" != "${package_version}" ]]; then
       printf 'invalid server-node transition package: %s\n' "${transition_package_path}" >&2
@@ -486,7 +486,7 @@ has_server_node_transition_package_for_architecture() {
     package_name="$(dpkg-deb -f "${package_path}" Package)"
     package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
     package_version="$(dpkg-deb -f "${package_path}" Version)"
-    if [[ "${package_name}" == "ironmesh-server-node" && \
+    if [[ "${package_name}" == "berrykeep-server-node" && \
       "${package_architecture}" == "${architecture}" && \
       "${package_version}" == "${expected_version}" ]] && \
       is_server_node_transition_package "${package_path}"; then
@@ -589,7 +589,7 @@ is_server_node_transition_package() {
 
   package_name="$(dpkg-deb -f "${package_path}" Package)"
   package_architecture="$(dpkg-deb -f "${package_path}" Architecture)"
-  [[ "${package_name}" == "ironmesh-server-node" && "${package_architecture}" != "all" ]] || return 1
+  [[ "${package_name}" == "berrykeep-server-node" && "${package_architecture}" != "all" ]] || return 1
 
   depends="$(dpkg-deb -f "${package_path}" Depends)"
   grep -Eq '(^|, )berrykeep-server-node[[:space:]]*\(>=' <<<"${depends}"
@@ -600,12 +600,12 @@ prune_server_node_versions() {
   local package_path package_name package_architecture package_version depends required_version retained
   local retained_version
   local -a retained_berrykeep_versions=()
-  local -a retained_ironmesh_versions=()
+  local -a retained_berrykeep_versions=()
   local -a retained_transition_versions=()
   local -a retained_versions=()
 
   # Keep the BerryKeep Server Node version being published. An exact legacy
-  # Map Tools dependency protects only the matching Ironmesh Server Node while
+  # Map Tools dependency protects only the matching BerryKeep Server Node while
   # it is still needed; the compatibility rebuild removes that dependency.
   for package_path in "${DEB_PATHS[@]}"; do
     package_name="$(dpkg-deb -f "${package_path}" Package)"
@@ -613,7 +613,7 @@ prune_server_node_versions() {
     package_version="$(dpkg-deb -f "${package_path}" Version)"
     if [[ "${package_name}" == "berrykeep-server-node" && "${package_architecture}" == "${architecture}" ]]; then
       retained_berrykeep_versions+=("${package_version}")
-    elif [[ "${package_name}" == "ironmesh-server-node" && \
+    elif [[ "${package_name}" == "berrykeep-server-node" && \
       "${package_architecture}" == "${architecture}" ]] && \
       is_server_node_transition_package "${package_path}"; then
       retained_transition_versions+=("${package_version}")
@@ -623,10 +623,10 @@ prune_server_node_versions() {
   for package_path in "${POOL_DIR}"/*_"${architecture}".deb; do
     [[ -f "${package_path}" ]] || continue
     package_name="$(dpkg-deb -f "${package_path}" Package)"
-    [[ "${package_name}" == "ironmesh-server-node-map-tools" ]] || continue
+    [[ "${package_name}" == "berrykeep-server-node-map-tools" ]] || continue
     depends="$(dpkg-deb -f "${package_path}" Depends)"
-    required_version="$(sed -n 's/.*ironmesh-server-node[[:space:]]*(=[[:space:]]*\([^)]*\)).*/\1/p' <<<"${depends}" | tr -d '[:space:]')"
-    [[ -n "${required_version}" ]] && retained_ironmesh_versions+=("${required_version}")
+    required_version="$(sed -n 's/.*berrykeep-server-node[[:space:]]*(=[[:space:]]*\([^)]*\)).*/\1/p' <<<"${depends}" | tr -d '[:space:]')"
+    [[ -n "${required_version}" ]] && retained_berrykeep_versions+=("${required_version}")
   done
 
   for package_path in "${POOL_DIR}"/*_"${architecture}".deb; do
@@ -636,11 +636,11 @@ prune_server_node_versions() {
       berrykeep-server-node)
         retained_versions=("${retained_berrykeep_versions[@]}")
         ;;
-      ironmesh-server-node)
+      berrykeep-server-node)
         if is_server_node_transition_package "${package_path}"; then
           retained_versions=("${retained_transition_versions[@]}")
         else
-          retained_versions=("${retained_ironmesh_versions[@]}")
+          retained_versions=("${retained_berrykeep_versions[@]}")
         fi
         ;;
       *)
@@ -680,9 +680,9 @@ repack_exact_map_tools_dependencies() {
   for package_path in "${POOL_DIR}"/*_"${architecture}".deb; do
     [[ -f "${package_path}" ]] || continue
     package_name="$(dpkg-deb -f "${package_path}" Package)"
-    [[ "${package_name}" == "ironmesh-server-node-map-tools" ]] || continue
+    [[ "${package_name}" == "berrykeep-server-node-map-tools" ]] || continue
     depends="$(dpkg-deb -f "${package_path}" Depends)"
-    required_version="$(sed -n 's/.*ironmesh-server-node[[:space:]]*(=[[:space:]]*\([^)]*\)).*/\1/p' <<<"${depends}" | tr -d '[:space:]')"
+    required_version="$(sed -n 's/.*berrykeep-server-node[[:space:]]*(=[[:space:]]*\([^)]*\)).*/\1/p' <<<"${depends}" | tr -d '[:space:]')"
     [[ -n "${required_version}" ]] || continue
 
     package_version="$(dpkg-deb -f "${package_path}" Version)"
@@ -709,9 +709,9 @@ repack_exact_map_tools_dependencies() {
   dpkg-deb -R "${selected_package}" "${staging_dir}/map-tools"
   sed -i \
     -e "s/^Version: .*/Version: ${server_node_version}/" \
-    -e "s/ironmesh-server-node[[:space:]]*(=[[:space:]]*[^)]*)/berrykeep-server-node (>= ${server_node_upstream})/" \
+    -e "s/berrykeep-server-node[[:space:]]*(=[[:space:]]*[^)]*)/berrykeep-server-node (>= ${server_node_upstream})/" \
     "${staging_dir}/map-tools/DEBIAN/control"
-  compatibility_path="${POOL_DIR}/ironmesh-server-node-map-tools_${server_node_version}_${architecture}.deb"
+  compatibility_path="${POOL_DIR}/berrykeep-server-node-map-tools_${server_node_version}_${architecture}.deb"
   dpkg-deb --root-owner-group --build "${staging_dir}/map-tools" "${compatibility_path}" >/dev/null
   rm -rf "${staging_dir}"
 
@@ -750,7 +750,7 @@ if ((${#DEB_PATHS[@]} == 0)); then
     if [[ "${SERVER_NODE_ONLY}" == true ]]; then
       DEB_PATHS+=(
         "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${architecture}.deb"
-        "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${architecture}.deb"
       )
     else
       DEB_PATHS+=(
@@ -758,10 +758,10 @@ if ((${#DEB_PATHS[@]} == 0)); then
         "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${architecture}.deb"
         "${ARTIFACT_DIR}/berrykeep-server-node-map-tools_${VERSION}_${architecture}.deb"
         "${ARTIFACT_DIR}/berrykeep-rendezvous-service_${VERSION}_${architecture}.deb"
-        "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${architecture}.deb"
-        "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${architecture}.deb"
-        "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${architecture}.deb"
-        "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/berrykeep-client_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/berrykeep-server-node-map-tools_${VERSION}_${architecture}.deb"
+        "${ARTIFACT_DIR}/berrykeep-rendezvous-service_${VERSION}_${architecture}.deb"
       )
     fi
   done
@@ -778,7 +778,7 @@ done
 for path in "${DEB_PATHS[@]}"; do
   package_name="$(dpkg-deb -f "${path}" Package)"
   package_architecture="$(dpkg-deb -f "${path}" Architecture)"
-  if [[ "${SERVER_NODE_ONLY}" == true && "${package_name}" != "berrykeep-server-node" && "${package_name}" != "ironmesh-server-node" ]]; then
+  if [[ "${SERVER_NODE_ONLY}" == true && "${package_name}" != "berrykeep-server-node" && "${package_name}" != "berrykeep-server-node" ]]; then
     printf 'server-node-only repository input must be berrykeep-server-node or its transitional package, got %s: %s\n' \
       "${package_name:-empty}" "${path}" >&2
     exit 1
@@ -833,8 +833,8 @@ done
 SUITE_DIR="${REPO_DIR}/dists/${SUITE}"
 POOL_REL="pool/${COMPONENT}/b/berrykeep/${SUITE}"
 POOL_DIR="${REPO_DIR}/${POOL_REL}"
-LEGACY_POOL_DIR="${REPO_DIR}/pool/${COMPONENT}/i/ironmesh"
-LEGACY_POOL_REL="pool/${COMPONENT}/i/ironmesh"
+LEGACY_POOL_DIR="${REPO_DIR}/pool/${COMPONENT}/i/berrykeep"
+LEGACY_POOL_REL="pool/${COMPONENT}/i/berrykeep"
 PREVIOUS_SUITE_POOL_DIR="${LEGACY_POOL_DIR}/${SUITE}"
 PREVIOUS_SUITE_POOL_REL="${LEGACY_POOL_REL}/${SUITE}"
 
@@ -928,7 +928,7 @@ if [[ "${SIGN_REPO}" == true ]]; then
     exit 1
   fi
   cp -f "${REPO_DIR}/berrykeep-archive-keyring.asc" \
-    "${REPO_DIR}/ironmesh-archive-keyring.asc"
+    "${REPO_DIR}/berrykeep-archive-keyring.asc"
 
   log "signing Release metadata with ${SIGNING_KEY}"
   sign_release clearsign "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release"

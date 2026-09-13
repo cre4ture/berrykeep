@@ -1,11 +1,11 @@
 {
-  "name": "@ironmesh/web-workspace",
+  "name": "@berrykeep/web-workspace",
   "private": true,
   "packageManager": "pnpm@10.6.0",
   "scripts": {
-    "dev:server-admin": "pnpm --filter @ironmesh/server-admin dev",
-    "dev:client-ui": "pnpm --filter @ironmesh/client-ui dev",
-    "dev:fleet-telemetry": "pnpm --filter @ironmesh/fleet-telemetry dev",
+    "dev:server-admin": "pnpm --filter @berrykeep/server-admin dev",
+    "dev:client-ui": "pnpm --filter @berrykeep/client-ui dev",
+    "dev:fleet-telemetry": "pnpm --filter @berrykeep/fleet-telemetry dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test:e2e:client-ui": "pnpm build && playwright test tests/client-ui.smoke.spec.ts --config playwright.client-ui.config.ts",

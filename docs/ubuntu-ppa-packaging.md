@@ -8,7 +8,7 @@ single source package that builds four primary BerryKeep packages:
 - `berrykeep-client`
 - `berrykeep-rendezvous-service`
 
-It also builds four `ironmesh-*` transition packages with matching package
+It also builds four `berrykeep-*` transition packages with matching package
 roles. They depend on the BerryKeep packages so existing installations upgrade
 without changing their installed package names first.
 
@@ -176,14 +176,14 @@ current changelog entry is preserved.
    DEBUILD_KEYID=<your-gpg-key-id> ./scripts/build-ppa-source.sh
    ```
 
-   The helper refreshes `../ironmesh_<upstream-version>.orig.tar.gz`
+   The helper refreshes `../berrykeep_<upstream-version>.orig.tar.gz`
    automatically from the current working tree before it calls
    `debuild --no-lintian -S -sa -nc`.
 
 4. Upload the resulting source changes file:
 
    ```bash
-   dput ppa:<launchpad-user>/<ppa-name> ../ironmesh_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes
+   dput ppa:<launchpad-user>/<ppa-name> ../berrykeep_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes
    ```
 
 ## Notes

@@ -7,8 +7,8 @@ use crate::framework::{
 use crate::framework_win::start_cfapi_adapter_with_bootstrap_and_local_appdata;
 use anyhow::{Context, Result, bail};
 use blake3::Hash;
-use client_sdk::IronMeshClient;
-use client_sdk::ironmesh_client::StoreIndexRequestOptions;
+use client_sdk::BerryKeepClient;
+use client_sdk::berrykeep_client::StoreIndexRequestOptions;
 use reqwest::Client;
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -43,24 +43,24 @@ impl LocalRuntimeKind {
     fn workload_env(self) -> WorkloadEnvNames {
         match self {
             Self::Cfapi => WorkloadEnvNames {
-                file_count: "IRONMESH_WINDOWS_CFAPI_LOAD_FILE_COUNT",
-                min_bytes: "IRONMESH_WINDOWS_CFAPI_LOAD_MIN_BYTES",
-                max_bytes: "IRONMESH_WINDOWS_CFAPI_LOAD_MAX_BYTES",
-                sample_verify_count: "IRONMESH_WINDOWS_CFAPI_LOAD_VERIFY_SAMPLE_COUNT",
-                subdir_count: "IRONMESH_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT",
-                max_dir_depth: "IRONMESH_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH",
-                upload_timeout_secs: "IRONMESH_WINDOWS_CFAPI_UPLOAD_TIMEOUT_SECS",
-                replication_timeout_secs: "IRONMESH_WINDOWS_CFAPI_REPLICATION_TIMEOUT_SECS",
+                file_count: "BERRYKEEP_WINDOWS_CFAPI_LOAD_FILE_COUNT",
+                min_bytes: "BERRYKEEP_WINDOWS_CFAPI_LOAD_MIN_BYTES",
+                max_bytes: "BERRYKEEP_WINDOWS_CFAPI_LOAD_MAX_BYTES",
+                sample_verify_count: "BERRYKEEP_WINDOWS_CFAPI_LOAD_VERIFY_SAMPLE_COUNT",
+                subdir_count: "BERRYKEEP_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT",
+                max_dir_depth: "BERRYKEEP_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH",
+                upload_timeout_secs: "BERRYKEEP_WINDOWS_CFAPI_UPLOAD_TIMEOUT_SECS",
+                replication_timeout_secs: "BERRYKEEP_WINDOWS_CFAPI_REPLICATION_TIMEOUT_SECS",
             },
             Self::FolderAgent => WorkloadEnvNames {
-                file_count: "IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_FILE_COUNT",
-                min_bytes: "IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MIN_BYTES",
-                max_bytes: "IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_BYTES",
-                sample_verify_count: "IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_VERIFY_SAMPLE_COUNT",
-                subdir_count: "IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_SUBDIR_COUNT",
-                max_dir_depth: "IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_DIR_DEPTH",
-                upload_timeout_secs: "IRONMESH_WINDOWS_FOLDER_AGENT_UPLOAD_TIMEOUT_SECS",
-                replication_timeout_secs: "IRONMESH_WINDOWS_FOLDER_AGENT_REPLICATION_TIMEOUT_SECS",
+                file_count: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_FILE_COUNT",
+                min_bytes: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_MIN_BYTES",
+                max_bytes: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_MAX_BYTES",
+                sample_verify_count: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_VERIFY_SAMPLE_COUNT",
+                subdir_count: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_SUBDIR_COUNT",
+                max_dir_depth: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_MAX_DIR_DEPTH",
+                upload_timeout_secs: "BERRYKEEP_WINDOWS_FOLDER_AGENT_UPLOAD_TIMEOUT_SECS",
+                replication_timeout_secs: "BERRYKEEP_WINDOWS_FOLDER_AGENT_REPLICATION_TIMEOUT_SECS",
             },
         }
     }
@@ -68,22 +68,22 @@ impl LocalRuntimeKind {
     fn live_env(self) -> LiveEnvNames {
         match self {
             Self::Cfapi => LiveEnvNames {
-                manifest_path: "IRONMESH_WINDOWS_CFAPI_LIVE_MANIFEST_PATH",
-                continue_signal_path: "IRONMESH_WINDOWS_CFAPI_LIVE_CONTINUE_SIGNAL_PATH",
-                cleanup_signal_path: "IRONMESH_WINDOWS_CFAPI_LIVE_CLEANUP_SIGNAL_PATH",
-                hold_after_copy: "IRONMESH_WINDOWS_CFAPI_LIVE_HOLD_AFTER_COPY",
-                hold_after_upload: "IRONMESH_WINDOWS_CFAPI_LIVE_HOLD_AFTER_UPLOAD",
-                hold_after_replication: "IRONMESH_WINDOWS_CFAPI_LIVE_HOLD_AFTER_REPLICATION",
-                hold_on_failure: "IRONMESH_WINDOWS_CFAPI_LIVE_HOLD_ON_FAILURE",
+                manifest_path: "BERRYKEEP_WINDOWS_CFAPI_LIVE_MANIFEST_PATH",
+                continue_signal_path: "BERRYKEEP_WINDOWS_CFAPI_LIVE_CONTINUE_SIGNAL_PATH",
+                cleanup_signal_path: "BERRYKEEP_WINDOWS_CFAPI_LIVE_CLEANUP_SIGNAL_PATH",
+                hold_after_copy: "BERRYKEEP_WINDOWS_CFAPI_LIVE_HOLD_AFTER_COPY",
+                hold_after_upload: "BERRYKEEP_WINDOWS_CFAPI_LIVE_HOLD_AFTER_UPLOAD",
+                hold_after_replication: "BERRYKEEP_WINDOWS_CFAPI_LIVE_HOLD_AFTER_REPLICATION",
+                hold_on_failure: "BERRYKEEP_WINDOWS_CFAPI_LIVE_HOLD_ON_FAILURE",
             },
             Self::FolderAgent => LiveEnvNames {
-                manifest_path: "IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_MANIFEST_PATH",
-                continue_signal_path: "IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_CONTINUE_SIGNAL_PATH",
-                cleanup_signal_path: "IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_CLEANUP_SIGNAL_PATH",
-                hold_after_copy: "IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_COPY",
-                hold_after_upload: "IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_UPLOAD",
-                hold_after_replication: "IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_REPLICATION",
-                hold_on_failure: "IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_ON_FAILURE",
+                manifest_path: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_MANIFEST_PATH",
+                continue_signal_path: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_CONTINUE_SIGNAL_PATH",
+                cleanup_signal_path: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_CLEANUP_SIGNAL_PATH",
+                hold_after_copy: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_COPY",
+                hold_after_upload: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_UPLOAD",
+                hold_after_replication: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_REPLICATION",
+                hold_on_failure: "BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_HOLD_ON_FAILURE",
             },
         }
     }
@@ -174,17 +174,17 @@ enum FolderAgentStartMode {
 
 impl FolderAgentStartMode {
     fn from_env() -> Result<Self> {
-        match std::env::var("IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE") {
+        match std::env::var("BERRYKEEP_WINDOWS_FOLDER_AGENT_START_MODE") {
             Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
                 "before_copy" | "before-copy" | "before" => Ok(Self::BeforeCopy),
                 "after_copy" | "after-copy" | "after" => Ok(Self::AfterCopy),
                 other => bail!(
-                    "failed parsing IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE={other}; expected before_copy or after_copy"
+                    "failed parsing BERRYKEEP_WINDOWS_FOLDER_AGENT_START_MODE={other}; expected before_copy or after_copy"
                 ),
             },
             Err(std::env::VarError::NotPresent) => Ok(Self::BeforeCopy),
             Err(err) => {
-                Err(err).with_context(|| "failed reading IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE")
+                Err(err).with_context(|| "failed reading BERRYKEEP_WINDOWS_FOLDER_AGENT_START_MODE")
             }
         }
     }
@@ -266,7 +266,7 @@ struct ClusterNodeFixture {
     data_dir: PathBuf,
     client_dir: PathBuf,
     bootstrap_file: PathBuf,
-    sdk: IronMeshClient,
+    sdk: BerryKeepClient,
     server: ChildGuard,
 }
 
@@ -1356,8 +1356,8 @@ async fn start_cluster_node(
         .with_context(|| format!("failed to create {}", client_dir.display()))?;
 
     let env = [
-        ("IRONMESH_CLUSTER_ID", cluster_id),
-        ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+        ("BERRYKEEP_CLUSTER_ID", cluster_id),
+        ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
     ];
 
     let server = start_authenticated_server_with_env_options(
@@ -1408,8 +1408,8 @@ async fn start_local_runtime(
     match kind {
         LocalRuntimeKind::Cfapi => {
             let adapter = start_cfapi_adapter_with_bootstrap_and_local_appdata(
-                "ironmesh.systemtest.cluster.load",
-                "Ironmesh Cluster Load Test",
+                "berrykeep.systemtest.cluster.load",
+                "BerryKeep Cluster Load Test",
                 &paths.sync_root,
                 DEFAULT_RUNTIME_REFRESH_INTERVAL_MS,
                 &node_a.bootstrap_file,
@@ -1531,7 +1531,7 @@ async fn register_full_mesh(http: &Client, nodes: &[&ClusterNodeFixture]) -> Res
     Ok(())
 }
 
-async fn fetch_all_store_file_paths(sdk: &IronMeshClient) -> Result<BTreeSet<String>> {
+async fn fetch_all_store_file_paths(sdk: &BerryKeepClient) -> Result<BTreeSet<String>> {
     let response = sdk
         .store_index_with_options(
             None,
@@ -1552,7 +1552,7 @@ async fn fetch_all_store_file_paths(sdk: &IronMeshClient) -> Result<BTreeSet<Str
         .collect())
 }
 
-async fn fetch_store_entry_count(sdk: &IronMeshClient) -> Result<usize> {
+async fn fetch_store_entry_count(sdk: &BerryKeepClient) -> Result<usize> {
     let response = sdk
         .store_index_with_options(
             None,
@@ -1591,7 +1591,7 @@ fn expected_store_entry_count(expected_paths: &BTreeSet<String>) -> usize {
 }
 
 async fn wait_for_store_file_paths(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     expected_paths: &BTreeSet<String>,
     label: &str,
     timeout: Duration,
@@ -1676,7 +1676,7 @@ async fn wait_for_store_file_paths(
 async fn local_available_subjects(http: &Client, base_url: &str) -> Result<BTreeSet<String>> {
     let payload = http
         .get(format!("{base_url}/cluster/availability/subjects/local"))
-        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+        .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
         .send()
         .await?
         .error_for_status()?
@@ -1754,7 +1754,7 @@ async fn wait_for_local_subjects(
 async fn current_under_replicated(http: &Client, base_url: &str) -> Result<u64> {
     let payload = http
         .get(format!("{base_url}/cluster/replication/plan"))
-        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+        .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
         .send()
         .await?
         .error_for_status()?
@@ -1785,7 +1785,7 @@ async fn drive_replication_to_completion(
         if last_repair.elapsed() >= Duration::from_secs(15) {
             let report = http
                 .post(format!("{base_url}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -1838,7 +1838,7 @@ fn select_sample_specs(file_specs: &[FileSpec], sample_count: usize) -> Vec<File
 }
 
 async fn verify_sample_content(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     label: &str,
     sample_specs: &[FileSpec],
 ) -> Result<()> {

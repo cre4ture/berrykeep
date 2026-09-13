@@ -142,7 +142,7 @@ The Android Server Node release APK is intentionally excluded from ordinary
 `main` pushes and manual CI runs. It is built only for a pull request bearing
 that label or for an explicit stable `vX.Y.Z` release tag.
 
-This requires the repository secrets `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64`
+This requires the repository secrets `BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_B64`
 and the corresponding release-signing credentials. For pull requests from
 forks, GitHub does not expose these secrets to the standard `pull_request`
 workflow, so the release legs remain unavailable there by design.
@@ -314,12 +314,12 @@ The `ios-build` lane runs on `macos-latest` and covers:
 
 - `cargo test -p ios-app`
 - `swift test` in `apps/apple-file-provider`
-- `xcodebuild test` for the `IronmeshIosProject` scheme on a dynamically selected iPhone simulator, with an explicit boot-and-wait step to avoid flaky first-launch failures on macOS runners
-- a `Release` archive for `IronmeshIosApp`, on pushes/tags/manual runs or on a
+- `xcodebuild test` for the `BerryKeepIosProject` scheme on a dynamically selected iPhone simulator, with an explicit boot-and-wait step to avoid flaky first-launch failures on macOS runners
+- a `Release` archive for `BerryKeepIosApp`, on pushes/tags/manual runs or on a
   pull request labeled `ci:ios-release` (see
   [iOS release archive builds on pull requests](#ios-release-archive-builds-on-pull-requests))
 
-The `IronmeshIosProject` XCTest bundle is intentionally unhosted: it links only the shared Apple modules and no longer depends on launching `IronmeshIosApp` in the simulator.
+The `BerryKeepIosProject` XCTest bundle is intentionally unhosted: it links only the shared Apple modules and no longer depends on launching `BerryKeepIosApp` in the simulator.
 
 Artifact behavior:
 
@@ -328,30 +328,30 @@ Artifact behavior:
 
 Configure these repository secrets for signed iOS artifacts:
 
-- `IRONMESH_IOS_SIGNING_CERT_B64` — base64-encoded `.p12` signing certificate
-- `IRONMESH_IOS_SIGNING_CERT_PASSWORD` — password for that `.p12`
-- `IRONMESH_IOS_APP_PROFILE_B64` — base64-encoded provisioning profile for `dev.ironmesh.apple.iosapp`
-- `IRONMESH_IOS_EXTENSION_PROFILE_B64` — base64-encoded provisioning profile for `dev.ironmesh.apple.iosapp.fileprovider`
+- `BERRYKEEP_IOS_SIGNING_CERT_B64` — base64-encoded `.p12` signing certificate
+- `BERRYKEEP_IOS_SIGNING_CERT_PASSWORD` — password for that `.p12`
+- `BERRYKEEP_IOS_APP_PROFILE_B64` — base64-encoded provisioning profile for `dev.berrykeep.apple.iosapp`
+- `BERRYKEEP_IOS_EXTENSION_PROFILE_B64` — base64-encoded provisioning profile for `dev.berrykeep.apple.iosapp.fileprovider`
 
-Both provisioning profiles must grant the App Group `group.dev.ironmesh.apple.shared`
+Both provisioning profiles must grant the App Group `group.dev.berrykeep.apple.shared`
 and the resolved Keychain Sharing group
-`<AppIdentifierPrefix>dev.ironmesh.apple.shared-keychain`. The source entitlement uses
+`<AppIdentifierPrefix>dev.berrykeep.apple.shared-keychain`. The source entitlement uses
 `$(AppIdentifierPrefix)`; Xcode expands that build-setting placeholder to the signing
 team/app-identifier prefix in the built plist and entitlement. Regenerate the profiles
 after enabling either capability. Any future signed macOS host and extension profiles
 must grant the same pair of shared-access entitlements.
 
 Integration note: PR #93 changes the final iOS File Provider bundle identifier from
-`dev.ironmesh.apple.iosfileprovider` to `dev.ironmesh.apple.iosapp.fileprovider` and
+`dev.berrykeep.apple.iosfileprovider` to `dev.berrykeep.apple.iosapp.fileprovider` and
 overlaps `project.yml`, the generated `project.pbxproj`, and this signing setup. After
 both changes land, replace the extension profile with one for the nested PR #93 bundle
 identifier that grants both shared-access capabilities above. Whichever PR lands second
-must reconcile the generated project and preserve `IronmeshSharedAccess.entitlements`
+must reconcile the generated project and preserve `BerryKeepSharedAccess.entitlements`
 for both the iOS host and extension configurations.
 
 Optional repository variable:
 
-- `IRONMESH_IOS_EXPORT_METHOD` — defaults to `development`; set to `ad-hoc` when you want shareable sideload builds for registered devices.
+- `BERRYKEEP_IOS_EXPORT_METHOD` — defaults to `development`; set to `ad-hoc` when you want shareable sideload builds for registered devices.
 
 Useful per-lane shortcuts:
 
@@ -414,7 +414,7 @@ Patchbay network namespaces and therefore requires `nft`, `tc`, and
 unprivileged user namespaces; it does not require root at runtime.
 
 The serial test suite starts the real Rendezvous service, Server Node, and
-IronMesh Client CLI in separate Patchbay network namespaces. It covers:
+BerryKeep Client CLI in separate Patchbay network namespaces. It covers:
 
 - IPv4 EIM/APDF (`Nat::Home`) on both peers, without an additional firewall,
   and requires Iroh to migrate the pooled Direct QUIC connection from relay to
@@ -422,7 +422,7 @@ IronMesh Client CLI in separate Patchbay network namespaces. It covers:
 - the Patchbay `Hotel` profile (symmetric NAT and UDP blocked), with the Iroh
   relay enabled, and requires a relay-assisted Direct QUIC path;
 - the same blocked-UDP profile with the Iroh relay disabled, and requires the
-  IronMesh relay tunnel to remain usable;
+  BerryKeep relay tunnel to remain usable;
 - a fault endpoint placed before a healthy rendezvous endpoint. The client
   must race both Iroh relay-ticket requests and establish relay-assisted Direct
   QUIC through the healthy endpoint without exhausting the three-second budget.
@@ -432,7 +432,7 @@ by app shells, so no phone simulator is needed for these transport assertions.
 Client-SDK tests separately hold every configured Iroh ticket endpoint open
 beyond the three-second budget and verify that Direct-only continuation or
 failure remains bounded. The blocked-UDP scenario without Iroh relay separately
-verifies the IronMesh relay fallback.
+verifies the BerryKeep relay fallback.
 The Home-NAT case also runs the Rendezvous relay's UDP QUIC Address Discovery
 (QAD) endpoint. Without QAD, peers behind separate NATs cannot learn their
 public UDP mappings and Iroh correctly remains on its packet-forwarding relay.
@@ -512,19 +512,19 @@ Issue a bootstrap from the local-cluster helper, enroll once, then round-trip on
 
 ```bash
 scripts/local-cluster.sh start
-scripts/local-cluster.sh bootstrap manual-cli 600 1 /tmp/ironmesh-client-bootstrap.json
+scripts/local-cluster.sh bootstrap manual-cli 600 1 /tmp/berrykeep-client-bootstrap.json
 cargo run -p cli-client -- \
-	--bootstrap-file /tmp/ironmesh-client-bootstrap.json \
-	--client-identity-file /tmp/ironmesh-client-bootstrap.client-identity.json \
+	--bootstrap-file /tmp/berrykeep-client-bootstrap.json \
+	--client-identity-file /tmp/berrykeep-client-bootstrap.client-identity.json \
 	enroll \
 	--label manual-cli
 cargo run -p cli-client -- \
-	--bootstrap-file /tmp/ironmesh-client-bootstrap.json \
-	--client-identity-file /tmp/ironmesh-client-bootstrap.client-identity.json \
+	--bootstrap-file /tmp/berrykeep-client-bootstrap.json \
+	--client-identity-file /tmp/berrykeep-client-bootstrap.client-identity.json \
 	put notes/manual.txt "hello manual release"
 cargo run -p cli-client -- \
-	--bootstrap-file /tmp/ironmesh-client-bootstrap.json \
-	--client-identity-file /tmp/ironmesh-client-bootstrap.client-identity.json \
+	--bootstrap-file /tmp/berrykeep-client-bootstrap.json \
+	--client-identity-file /tmp/berrykeep-client-bootstrap.client-identity.json \
 	get notes/manual.txt
 scripts/local-cluster.sh stop
 ```
@@ -549,37 +549,37 @@ Pass or fail rule:
 Reuse the bootstrap issued in the direct-enroll flow:
 
 ```bash
-mkdir -p /tmp/ironmesh-mount
+mkdir -p /tmp/berrykeep-mount
 cargo run -p os-integration -- \
-	--bootstrap-file /tmp/ironmesh-client-bootstrap.json \
-	--mountpoint /tmp/ironmesh-mount
+	--bootstrap-file /tmp/berrykeep-client-bootstrap.json \
+	--mountpoint /tmp/berrykeep-mount
 ```
 
 In another shell, verify one existing object is visible and one new write round-trips:
 
 ```bash
-cat /tmp/ironmesh-mount/notes/manual.txt
-printf 'hello from fuse\n' >/tmp/ironmesh-mount/notes/fuse.txt
+cat /tmp/berrykeep-mount/notes/manual.txt
+printf 'hello from fuse\n' >/tmp/berrykeep-mount/notes/fuse.txt
 cargo run -p cli-client -- \
-	--bootstrap-file /tmp/ironmesh-client-bootstrap.json \
-	--client-identity-file /tmp/ironmesh-client-bootstrap.client-identity.json \
+	--bootstrap-file /tmp/berrykeep-client-bootstrap.json \
+	--client-identity-file /tmp/berrykeep-client-bootstrap.client-identity.json \
 	get notes/fuse.txt
 ```
 
 Pass or fail rule:
 
 - the mount comes up without authentication errors,
-- `/tmp/ironmesh-mount/notes/manual.txt` is readable,
+- `/tmp/berrykeep-mount/notes/manual.txt` is readable,
 - the CLI read-back returns `hello from fuse`.
 
 ### 5. Folder-agent restart or resume
 
 ```bash
-mkdir -p /tmp/ironmesh-folder-agent-root
-cargo run -p ironmesh-folder-agent -- \
-	--root-dir /tmp/ironmesh-folder-agent-root \
-	--bootstrap-file /tmp/ironmesh-client-bootstrap.json \
-	--client-identity-file /tmp/ironmesh-client-bootstrap.client-identity.json \
+mkdir -p /tmp/berrykeep-folder-agent-root
+cargo run -p berrykeep-folder-agent -- \
+	--root-dir /tmp/berrykeep-folder-agent-root \
+	--bootstrap-file /tmp/berrykeep-client-bootstrap.json \
+	--client-identity-file /tmp/berrykeep-client-bootstrap.client-identity.json \
 	--remote-refresh-interval-ms 500 \
 	--local-scan-interval-ms 500
 ```

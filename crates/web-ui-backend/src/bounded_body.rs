@@ -142,7 +142,7 @@ impl Write for BoundedBodyWriter {
 }
 
 fn configured_stream_limit(name: &str, default: usize) -> usize {
-    std::env::var(name)
+    common::legacy_compatibility::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -152,7 +152,7 @@ fn configured_stream_limit(name: &str, default: usize) -> usize {
 fn stream_write_idle_timeout() -> Duration {
     static TIMEOUT: OnceLock<Duration> = OnceLock::new();
     *TIMEOUT.get_or_init(|| {
-        std::env::var("IRONMESH_WEB_STREAM_WRITE_IDLE_TIMEOUT_MS")
+        common::legacy_compatibility::var("BERRYKEEP_WEB_STREAM_WRITE_IDLE_TIMEOUT_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
@@ -168,13 +168,13 @@ fn stream_producer_slots(class: StreamProducerClass) -> Arc<Semaphore> {
     match class {
         StreamProducerClass::Inline => Arc::clone(INLINE_SLOTS.get_or_init(|| {
             Arc::new(Semaphore::new(configured_stream_limit(
-                "IRONMESH_WEB_MAX_INLINE_STREAMS",
+                "BERRYKEEP_WEB_MAX_INLINE_STREAMS",
                 DEFAULT_MAX_INLINE_STREAM_PRODUCERS,
             )))
         })),
         StreamProducerClass::Attachment => Arc::clone(ATTACHMENT_SLOTS.get_or_init(|| {
             Arc::new(Semaphore::new(configured_stream_limit(
-                "IRONMESH_WEB_MAX_ATTACHMENT_STREAMS",
+                "BERRYKEEP_WEB_MAX_ATTACHMENT_STREAMS",
                 DEFAULT_MAX_ATTACHMENT_STREAM_PRODUCERS,
             )))
         })),
@@ -291,7 +291,7 @@ where
     });
 
     std::thread::Builder::new()
-        .name("ironmesh-web-binary-stream".to_string())
+        .name("berrykeep-web-binary-stream".to_string())
         .spawn(move || {
             let _permit = permit;
             run_producer(

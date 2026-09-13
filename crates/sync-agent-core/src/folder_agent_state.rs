@@ -13,7 +13,7 @@ use crate::{LocalEntryKind, LocalEntryState, LocalTreeState, normalize_relative_
 
 pub(crate) const FOLDER_AGENT_BASELINE_FILE_NAME: &str = "baseline.sqlite";
 pub(crate) const FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME: &str = "modification-log.sqlite";
-const FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN: &str = "ironmesh-folder-agent-profile-v1";
+const FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN: &str = "berrykeep-folder-agent-profile-v1";
 
 #[derive(Debug, Clone)]
 pub struct PathScope {
@@ -78,7 +78,7 @@ pub(crate) struct FolderAgentProfilePaths {
 pub(crate) fn default_folder_agent_state_root() -> PathBuf {
     xdg_state_home()
         .unwrap_or_else(std::env::temp_dir)
-        .join("ironmesh")
+        .join("berrykeep")
         .join("folder-agent")
 }
 
@@ -292,11 +292,13 @@ fn rewrite_scope_fingerprint_metadata(
 }
 
 fn xdg_state_home() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+    if let Some(path) =
+        common::legacy_compatibility::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty())
+    {
         return Some(PathBuf::from(path));
     }
 
-    std::env::var_os("HOME")
+    common::legacy_compatibility::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|home| home.join(".local").join("state"))
@@ -907,7 +909,7 @@ pub fn load_local_baseline_hashes_with_retries(
     }
 }
 
-pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usize> {
+pub fn cleanup_berrykeep_part_files(root_dir: &Path, dry_run: bool) -> Result<usize> {
     if !root_dir.exists() {
         return Ok(0);
     }
@@ -960,7 +962,7 @@ pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usi
                 continue;
             };
 
-            if !is_ironmesh_part_file_name(file_name) {
+            if !is_berrykeep_part_file_name(file_name) {
                 continue;
             }
 
@@ -984,7 +986,10 @@ pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usi
 pub fn conflict_copy_dir(root_dir: &Path, side: &str, relative_path: &str) -> PathBuf {
     let rel = Path::new(relative_path);
     let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-    root_dir.join(".ironmesh-conflicts").join(side).join(parent)
+    root_dir
+        .join(".berrykeep-conflicts")
+        .join(side)
+        .join(parent)
 }
 
 pub fn newest_remote_conflict_copy(root_dir: &Path, relative_path: &str) -> Result<PathBuf> {
@@ -1085,7 +1090,7 @@ pub fn copy_file_atomically(source: &Path, target: &Path) -> Result<()> {
     }
 
     let temp_name = format!(
-        ".{}.ironmesh-part-{}",
+        ".{}.berrykeep-part-{}",
         target
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
@@ -1130,12 +1135,12 @@ pub fn current_unix_ms() -> u128 {
         .as_millis()
 }
 
-fn is_ironmesh_part_file_name(file_name: &str) -> bool {
+fn is_berrykeep_part_file_name(file_name: &str) -> bool {
     if !file_name.starts_with('.') {
         return false;
     }
 
-    let Some((_, suffix)) = file_name.rsplit_once(".ironmesh-part-") else {
+    let Some((_, suffix)) = file_name.rsplit_once(".berrykeep-part-") else {
         return false;
     };
 
@@ -1507,7 +1512,7 @@ mod tests {
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .filter(|name| name.contains(".ironmesh-part-"))
+            .filter(|name| name.contains(".berrykeep-part-"))
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty());
 
@@ -1521,7 +1526,7 @@ mod tests {
             .as_nanos();
         let mut root = std::env::temp_dir();
         root.push(format!(
-            "ironmesh-folder-agent-state-test-{}-{}",
+            "berrykeep-folder-agent-state-test-{}-{}",
             std::process::id(),
             nonce
         ));

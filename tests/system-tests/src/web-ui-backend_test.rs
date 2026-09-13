@@ -1668,7 +1668,7 @@ mod tests {
             web_bind,
             "web-ui-vector-server",
             "web-ui-vector-client",
-            &[("IRONMESH_MAP_GLYPHS_DIR", glyphs_dir_env.as_str())],
+            &[("BERRYKEEP_MAP_GLYPHS_DIR", glyphs_dir_env.as_str())],
         )
         .await?;
 
@@ -1803,15 +1803,15 @@ mod tests {
         let client_dir = fresh_data_dir("web-ui-relay-latency-client");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -1960,15 +1960,15 @@ mod tests {
         let client_dir = fresh_data_dir("web-ui-direct-latency-client");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -2175,16 +2175,16 @@ mod tests {
         let part_ac_key = "sys/maps/relay-openmaptiles.mbtiles-part-ac";
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-            ("IRONMESH_MAP_GLYPHS_DIR", glyphs_dir_env.as_str()),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_MAP_GLYPHS_DIR", glyphs_dir_env.as_str()),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;

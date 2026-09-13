@@ -212,7 +212,7 @@ impl IngestStorage {
     }
 
     /// Looks up the registered ingestion token for `telemetry_subject_id`, if any. Used by the
-    /// ingest handler to validate an `X-Ironmesh-Ingestion-Token` header (doc Section 5.2/8).
+    /// ingest handler to validate an `X-BerryKeep-Ingestion-Token` header (doc Section 5.2/8).
     /// Never exposed via any admin/raw-record view (see the `ingestion_tokens` table doc comment
     /// above) - it is a bearer secret, not telemetry content.
     pub async fn token_for_subject(&self, telemetry_subject_id: &str) -> Result<Option<String>> {

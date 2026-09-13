@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use common::content_fingerprint::file_content_fingerprint;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -318,7 +318,7 @@ impl Write for SleepAfterFirstWrite {
 
 pub fn materialize_remote_conflict_copies(
     root_dir: &Path,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     scope: &PathScope,
     conflicts: &[StartupConflict],
 ) -> Result<()> {
@@ -336,7 +336,7 @@ pub fn materialize_remote_conflict_copies(
             continue;
         };
 
-        let base_relative = format!(".ironmesh-conflicts/remote/{}", conflict.path);
+        let base_relative = format!(".berrykeep-conflicts/remote/{}", conflict.path);
         let base_target = absolute_path(root_dir, &base_relative);
         let file_name = base_target
             .file_name()
@@ -357,7 +357,7 @@ pub fn materialize_remote_conflict_copies(
         }
 
         let temp_name = format!(
-            ".{}.ironmesh-part-{}",
+            ".{}.berrykeep-part-{}",
             conflict_target
                 .file_name()
                 .map(|value| value.to_string_lossy().to_string())
@@ -381,23 +381,26 @@ pub fn materialize_remote_conflict_copies(
         };
 
         if cfg!(debug_assertions) {
-            if let Ok(raw) = std::env::var("IRONMESH_TEST_CONFLICT_COPY_SLEEP_AFTER_TEMP_CREATE_MS")
-                && let Ok(delay_ms) = raw.parse::<u64>()
+            if let Ok(raw) = common::legacy_compatibility::var(
+                "BERRYKEEP_TEST_CONFLICT_COPY_SLEEP_AFTER_TEMP_CREATE_MS",
+            ) && let Ok(delay_ms) = raw.parse::<u64>()
                 && delay_ms > 0
             {
                 thread::sleep(Duration::from_millis(delay_ms));
             }
 
-            if std::env::var("IRONMESH_TEST_CRASH_AFTER_CONFLICT_COPY_TEMP_CREATE")
-                .ok()
-                .is_some_and(|value| value == "1")
+            if common::legacy_compatibility::var(
+                "BERRYKEEP_TEST_CRASH_AFTER_CONFLICT_COPY_TEMP_CREATE",
+            )
+            .ok()
+            .is_some_and(|value| value == "1")
             {
                 std::process::abort();
             }
         }
 
         let delay = if cfg!(debug_assertions) {
-            std::env::var("IRONMESH_TEST_CONFLICT_COPY_WRITE_DELAY_MS")
+            common::legacy_compatibility::var("BERRYKEEP_TEST_CONFLICT_COPY_WRITE_DELAY_MS")
                 .ok()
                 .and_then(|raw| raw.parse::<u64>().ok())
                 .filter(|ms| *ms > 0)
@@ -1064,7 +1067,7 @@ mod tests {
             .as_nanos();
         let mut root = std::env::temp_dir();
         root.push(format!(
-            "ironmesh-folder-agent-startup-test-{}-{}",
+            "berrykeep-folder-agent-startup-test-{}-{}",
             std::process::id(),
             nonce
         ));

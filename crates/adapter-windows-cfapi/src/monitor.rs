@@ -2418,10 +2418,11 @@ mod tests {
     ) -> (RegisteredMonitorTestSyncRoot, uuid::Uuid) {
         let registration_lock = crate::lock_sync_root_registration_tests();
         let unique = uuid::Uuid::new_v4();
-        let root_path = std::env::temp_dir().join(format!("ironmesh-monitor-{test_name}-{unique}"));
+        let root_path =
+            std::env::temp_dir().join(format!("berrykeep-monitor-{test_name}-{unique}"));
         let registration = SyncRootRegistration::new(
             format!("test-monitor-{test_name}-{unique}"),
-            "Ironmesh Monitor Test",
+            "BerryKeep Monitor Test",
             &root_path,
             uuid::Uuid::new_v4(),
             None,
@@ -2477,7 +2478,7 @@ mod tests {
     #[test]
     fn seed_seen_makes_startup_walk_passive_for_existing_entries() {
         let unique = uuid::Uuid::new_v4();
-        let sync_root = std::env::temp_dir().join(format!("ironmesh-monitor-seed-seen-{unique}"));
+        let sync_root = std::env::temp_dir().join(format!("berrykeep-monitor-seed-seen-{unique}"));
         std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create sync root");
         std::fs::write(sync_root.join("docs").join("readme.txt"), b"hello")
             .expect("failed to seed existing file");
@@ -2515,7 +2516,8 @@ mod tests {
     #[test]
     fn seed_remote_entries_keeps_local_only_files_pending_for_upload() {
         let unique = uuid::Uuid::new_v4();
-        let sync_root = std::env::temp_dir().join(format!("ironmesh-monitor-remote-seed-{unique}"));
+        let sync_root =
+            std::env::temp_dir().join(format!("berrykeep-monitor-remote-seed-{unique}"));
         std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create sync root");
         std::fs::write(
             sync_root.join("docs").join("readme.txt"),
@@ -2569,7 +2571,7 @@ mod tests {
     fn failed_upload_is_retried_on_next_walk_for_local_file() {
         let unique = uuid::Uuid::new_v4();
         let sync_root =
-            std::env::temp_dir().join(format!("ironmesh-monitor-retry-local-file-{unique}"));
+            std::env::temp_dir().join(format!("berrykeep-monitor-retry-local-file-{unique}"));
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
 
         let uploader = Arc::new(FailOnceUploader::default());
@@ -2615,7 +2617,7 @@ mod tests {
     fn remote_applied_directory_is_suppressed_but_later_local_directory_uploads() {
         let unique = uuid::Uuid::new_v4();
         let sync_root =
-            std::env::temp_dir().join(format!("ironmesh-monitor-remote-apply-{unique}"));
+            std::env::temp_dir().join(format!("berrykeep-monitor-remote-apply-{unique}"));
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
 
         let uploader = Arc::new(MockUploader::default());
@@ -2836,7 +2838,7 @@ mod tests {
     fn incomplete_snapshot_preserves_missing_paths_and_skips_delete_emission() {
         let unique = uuid::Uuid::new_v4();
         let sync_root =
-            std::env::temp_dir().join(format!("ironmesh-monitor-partial-scan-{unique}"));
+            std::env::temp_dir().join(format!("berrykeep-monitor-partial-scan-{unique}"));
         std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
 
         let uploader = Arc::new(MockUploader::default());
@@ -2964,7 +2966,7 @@ mod tests {
         let mut monitor = SyncRootMonitor::new(
             "monitor-test",
             std::env::temp_dir().join(format!(
-                "ironmesh-monitor-directory-delete-{}",
+                "berrykeep-monitor-directory-delete-{}",
                 uuid::Uuid::new_v4()
             )),
             uuid::Uuid::nil(),
@@ -3048,7 +3050,7 @@ mod tests {
     fn transient_object_id_rename_failure_is_retried_after_topology_baseline_advances() {
         let unique = uuid::Uuid::new_v4();
         let sync_root =
-            std::env::temp_dir().join(format!("ironmesh-monitor-rename-retry-{unique}"));
+            std::env::temp_dir().join(format!("berrykeep-monitor-rename-retry-{unique}"));
         let uploader = Arc::new(TransientRenameUploader::default());
         let mut monitor = SyncRootMonitor::new(
             "monitor-test",

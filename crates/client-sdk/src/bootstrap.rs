@@ -20,6 +20,7 @@ use transport_sdk::{
 };
 use uuid::Uuid;
 
+use crate::berrykeep_client::{BerryKeepClient, CLIENT_API_V1_PREFIX, normalize_server_base_url};
 use crate::connection::{
     build_blocking_reqwest_client_from_pem_for_url,
     build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity,
@@ -29,7 +30,6 @@ use crate::device_auth::{
     DeviceEnrollmentRequest, DeviceEnrollmentResponse, enroll_device_blocking_from_pem,
     renew_rendezvous_identity,
 };
-use crate::ironmesh_client::{CLIENT_API_V1_PREFIX, IronMeshClient, normalize_server_base_url};
 
 const DISCOVERY_MAX_CONCURRENCY: usize = 8;
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -586,7 +586,7 @@ impl ConnectionBootstrap {
     pub fn build_client_with_identity(
         &self,
         identity: &ClientIdentityMaterial,
-    ) -> Result<IronMeshClient> {
+    ) -> Result<BerryKeepClient> {
         self.validate()?;
         identity.validate()?;
         if identity.cluster_id != self.cluster_id {
@@ -715,12 +715,12 @@ impl ConnectionBootstrap {
     pub fn build_client_with_identity_renewing(
         &self,
         identity: &mut ClientIdentityMaterial,
-    ) -> Result<IronMeshClient> {
+    ) -> Result<BerryKeepClient> {
         self.renew_rendezvous_identity_if_needed(identity)?;
         self.build_client_with_identity(identity)
     }
 
-    pub fn build_client(&self) -> Result<IronMeshClient> {
+    pub fn build_client(&self) -> Result<BerryKeepClient> {
         self.validate()?;
 
         let planned_targets = self.planned_targets()?;
@@ -749,7 +749,7 @@ impl ConnectionBootstrap {
     pub fn build_client_with_optional_identity(
         &self,
         identity: Option<&ClientIdentityMaterial>,
-    ) -> Result<IronMeshClient> {
+    ) -> Result<BerryKeepClient> {
         match identity {
             Some(identity) => self.build_client_with_identity(identity),
             None => self.build_client(),
@@ -2038,7 +2038,7 @@ fn try_renew_rendezvous_identity(
     let renewal_client = build_http_client_with_identity_from_planned_targets(targets, identity)
         .context("failed to build client for rendezvous identity renewal")?;
     let worker = std::thread::Builder::new()
-        .name("ironmesh-rendezvous-renewal".to_string())
+        .name("berrykeep-rendezvous-renewal".to_string())
         .spawn(move || -> Result<String> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

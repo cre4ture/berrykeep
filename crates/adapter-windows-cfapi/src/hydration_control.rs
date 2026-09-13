@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn cancel_request_requires_active_hydration_marker() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-hydration-control-{}",
+            "berrykeep-hydration-control-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&sync_root).expect("sync root should be created");

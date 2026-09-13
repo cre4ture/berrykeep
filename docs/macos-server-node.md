@@ -2,8 +2,8 @@
 
 The macOS server-node distribution is a headless `launchd` `LaunchDaemon`.
 It is intended for a Mac that should host a node independently of any logged-in
-desktop user. The package uses a dedicated non-login `_ironmesh` account, keeps
-state under `/Library/Application Support/Ironmesh/server-node`, and runs the
+desktop user. The package uses a dedicated non-login `_berrykeep` account, keeps
+state under `/Library/Application Support/BerryKeep/server-node`, and runs the
 node as that account rather than as `root`.
 
 This is distinct from a user-scoped `LaunchAgent`: a `LaunchAgent` is suitable
@@ -54,12 +54,12 @@ Install the generated or released package on the target Mac:
 sudo installer -pkg target/macos/berrykeep-server-node-<version>.pkg -target /
 ```
 
-The installer creates the `_ironmesh` non-login account, starts the daemon, and
+The installer creates the `_berrykeep` non-login account, starts the daemon, and
 preserves both configuration and server data when the package is upgraded. The
 initial configuration is copied only once to:
 
 ```text
-/Library/Application Support/Ironmesh/server-node.env
+/Library/Application Support/BerryKeep/server-node.env
 ```
 
 It listens on `127.0.0.1:8443` by default. Before exposing the node on the
@@ -67,12 +67,12 @@ network, edit the configuration and set an appropriate bind address, public
 URL, TLS material, and administrative token:
 
 ```bash
-sudoedit '/Library/Application Support/Ironmesh/server-node.env'
-sudo launchctl kickstart -k system/io.ironmesh.server-node
+sudoedit '/Library/Application Support/BerryKeep/server-node.env'
+sudo launchctl kickstart -k system/io.berrykeep.server-node
 ```
 
 The configuration file is deliberately not sourced as a shell program. It
-accepts literal `IRONMESH_*` runtime settings and `RUST_LOG` only. Comments
+accepts literal `BERRYKEEP_*` runtime settings and `RUST_LOG` only. Comments
 must begin in the first column, and shell quoting, interpolation, and command
 substitutions are not supported.
 
@@ -83,24 +83,24 @@ an unsuccessful exit, with a five-second restart throttle.
 
 ```bash
 # Inspect the loaded job and its last exit status.
-sudo launchctl print system/io.ironmesh.server-node
+sudo launchctl print system/io.berrykeep.server-node
 
 # Restart after changing configuration.
-sudo launchctl kickstart -k system/io.ironmesh.server-node
+sudo launchctl kickstart -k system/io.berrykeep.server-node
 
 # Follow process output written by launchd.
-sudo tail -f /Library/Logs/Ironmesh/server-node.stderr.log
+sudo tail -f /Library/Logs/BerryKeep/server-node.stderr.log
 ```
 
 The installed files are:
 
 | Path | Purpose |
 | --- | --- |
-| `/Library/LaunchDaemons/io.ironmesh.server-node.plist` | System-wide `launchd` job |
-| `/Library/Application Support/Ironmesh/bin/` | Root-owned server binary and configuration launcher |
-| `/Library/Application Support/Ironmesh/server-node.env` | Service-owned, mode `0600` runtime configuration |
-| `/Library/Application Support/Ironmesh/server-node/` | Service-owned durable node state |
-| `/Library/Logs/Ironmesh/` | `launchd` stdout and stderr logs |
+| `/Library/LaunchDaemons/io.berrykeep.server-node.plist` | System-wide `launchd` job |
+| `/Library/Application Support/BerryKeep/bin/` | Root-owned server binary and configuration launcher |
+| `/Library/Application Support/BerryKeep/server-node.env` | Service-owned, mode `0600` runtime configuration |
+| `/Library/Application Support/BerryKeep/server-node/` | Service-owned durable node state |
+| `/Library/Logs/BerryKeep/` | `launchd` stdout and stderr logs |
 
 ## Uninstall
 
@@ -112,9 +112,9 @@ configuration by default so a reinstall or recovery does not destroy a node:
 sudo ./scripts/uninstall-macos-server-node.sh
 ```
 
-The `_ironmesh` non-login account is intentionally retained. Removing an
+The `_berrykeep` non-login account is intentionally retained. Removing an
 account is a machine-administration decision and is not necessary for a later
-reinstall; remove it manually only after confirming that no Ironmesh service or
+reinstall; remove it manually only after confirming that no BerryKeep service or
 data still needs it.
 
 Only use `--purge-data` when the configuration, identities, and all stored data

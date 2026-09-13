@@ -8,7 +8,7 @@ import {
   restoreAdminStoreVersion,
   retryAdminMediaCacheEntry,
   setAdminStoreMediaLabels
-} from "@ironmesh/api";
+} from "@berrykeep/api";
 import {
   GallerySurface,
   galleryBasemapsFromConfiguration,
@@ -17,7 +17,7 @@ import {
   MOBILE_VIEWER_THUMBNAIL_PROFILE,
   withMediaThumbnailProfile,
   type GalleryDataSource
-} from "@ironmesh/ui";
+} from "@berrykeep/ui";
 import { Stack, Tabs } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";

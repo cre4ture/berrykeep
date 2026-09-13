@@ -6,8 +6,8 @@ Proposal for redesigning the native Android client app in `apps/android-app`.
 
 This note is based on the current implementation in:
 
-- `apps/android-app/app/src/main/java/io/ironmesh/android/MainActivity.kt`
-- `apps/android-app/app/src/main/java/io/ironmesh/android/ui/MainViewModel.kt`
+- `apps/android-app/app/src/main/java/io/berrykeep/android/MainActivity.kt`
+- `apps/android-app/app/src/main/java/io/berrykeep/android/ui/MainViewModel.kt`
 - `apps/android-app/app/src/main/res/values/themes.xml`
 
 The smaller `apps/android-server-node-app` already feels more focused, but it should share the
@@ -21,7 +21,7 @@ Move the Android app from an MVP control shell to a product-grade mobile client 
 - surfaces the sync state immediately,
 - separates onboarding, daily use, and advanced tools,
 - keeps technical power features available without making them the default experience,
-- aligns with the existing Ironmesh brand direction already visible in the web theme and logo.
+- aligns with the existing BerryKeep brand direction already visible in the web theme and logo.
 
 ## Current Assessment
 
@@ -50,7 +50,7 @@ Main issues:
 
 The app should present itself as a mobile control surface for one clear job:
 
-- connect this phone to an Ironmesh deployment,
+- connect this phone to an BerryKeep deployment,
 - keep one or more folders in sync,
 - inspect recent work and media,
 - hand off to the richer web surface only when needed.
@@ -121,7 +121,7 @@ Show this instead of the main app when no valid device enrollment exists.
 
 Steps:
 
-1. Welcome and short explanation of what Ironmesh does on Android.
+1. Welcome and short explanation of what BerryKeep does on Android.
 2. Import bootstrap claim:
    - paste,
    - scan QR,
@@ -140,7 +140,7 @@ Wireframe:
 
 ```text
 +--------------------------------------------------+
-| Ironmesh                                         |
+| BerryKeep                                         |
 | Connect this phone to your edge storage          |
 |                                                  |
 | [ Paste claim ]   [ Scan QR ]                    |
@@ -187,7 +187,7 @@ Wireframe:
 
 ```text
 +--------------------------------------------------+
-| Ironmesh                          Connected      |
+| BerryKeep                          Connected      |
 | Pixel 9 Pro                                       |
 |                                                  |
 | Sync is healthy                                  |
@@ -209,7 +209,7 @@ Wireframe:
 
 Why:
 
-- gives the user one answer immediately: "is Ironmesh working on this phone right now?"
+- gives the user one answer immediately: "is BerryKeep working on this phone right now?"
 - makes daily usage possible without entering settings,
 - promotes the web console as an advanced action, not the primary product.
 
@@ -341,7 +341,7 @@ Suggested groups:
   - Wi-Fi rule access status,
   - guided repair buttons.
 - `Storage & Files`
-  - open Ironmesh root in Files,
+  - open BerryKeep root in Files,
   - storage diagnostics.
 - `Advanced`
   - open web console,
@@ -425,7 +425,7 @@ Recommended package split:
 
 Recommended shared components:
 
-- `IronmeshAppShell`
+- `BerryKeepAppShell`
 - `StatusHeroCard`
 - `MetricPill`
 - `ProfileCard`
@@ -433,7 +433,7 @@ Recommended shared components:
 - `PermissionExplainerCard`
 - `EmptyStateCard`
 - `SectionHeader`
-- `IronmeshTopBar`
+- `BerryKeepTopBar`
 
 This should replace the current pattern where most of the surface composition sits in
 `MainActivity.kt`.
@@ -507,9 +507,9 @@ Recommended sequence:
 
 Concrete backlog items:
 
-- Create `IronmeshTheme` for Android.
+- Create `BerryKeepTheme` for Android.
 - Add branded typography and font loading.
-- Introduce `IronmeshAppShell` with bottom navigation.
+- Introduce `BerryKeepAppShell` with bottom navigation.
 - Create destination-specific screen composables and route state.
 - Replace global status text with snackbar plus banners.
 - Add onboarding screen flow and enrollment gating.
@@ -533,7 +533,7 @@ The redesign is successful when:
 - the current sync state is visible within two seconds after launch,
 - daily use does not require entering a catch-all settings screen,
 - advanced features remain available but no longer dominate the experience,
-- the app looks recognizably like Ironmesh rather than default Compose scaffolding.
+- the app looks recognizably like BerryKeep rather than default Compose scaffolding.
 
 ## Recommendation
 

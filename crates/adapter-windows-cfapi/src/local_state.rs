@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-const LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
+const LOCAL_STATE_ROOT_DIR: &str = "BerryKeep";
 const LOCAL_STATE_SYNC_ROOTS_DIR: &str = "sync-roots";
 const LOCAL_STATE_CONNECTION_BOOTSTRAP_FILE_NAME: &str = "connection-bootstrap.json";
 const LOCAL_STATE_CLIENT_IDENTITY_FILE_NAME: &str = "client-identity.json";
@@ -28,7 +28,7 @@ pub(crate) fn local_appdata_desktop_status_path(sync_root_path: &Path) -> PathBu
 }
 
 fn local_appdata_root() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
+    common::legacy_compatibility::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn local_appdata_state_paths_are_stable_for_sync_root() {
-        let sync_root = Path::new(r"C:\Users\Example\IronMesh\Wiz3");
+        let sync_root = Path::new(r"C:\Users\Example\BerryKeep\Wiz3");
         let bootstrap = local_appdata_connection_bootstrap_path(sync_root);
         let identity = local_appdata_client_identity_path(sync_root);
 

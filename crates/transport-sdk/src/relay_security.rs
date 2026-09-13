@@ -18,7 +18,7 @@ use x509_parser::prelude::FromDer;
 
 use crate::peer::PeerIdentity;
 
-const RELAY_TLS_SERVER_NAME: &str = "relay-tunnel.ironmesh.invalid";
+const RELAY_TLS_SERVER_NAME: &str = "relay-tunnel.berrykeep.invalid";
 
 /// PEM certificate-chain and private-key material for an inner relay TLS endpoint.
 ///
@@ -374,16 +374,16 @@ fn certificate_san_uris(certificate: &CertificateDer<'_>) -> Result<Vec<String>>
 }
 
 fn node_san_uri(node_id: NodeId) -> String {
-    format!("urn:ironmesh:node:{node_id}")
+    format!("urn:berrykeep:node:{node_id}")
 }
 
 fn cluster_san_uri(cluster_id: ClusterId) -> String {
-    format!("urn:ironmesh:cluster:{cluster_id}")
+    format!("urn:berrykeep:cluster:{cluster_id}")
 }
 
 fn peer_san_uri(peer: &PeerIdentity) -> String {
     match peer {
         PeerIdentity::Node(node_id) => node_san_uri(*node_id),
-        PeerIdentity::Device(device_id) => format!("urn:ironmesh:device:{device_id}"),
+        PeerIdentity::Device(device_id) => format!("urn:berrykeep:device:{device_id}"),
     }
 }

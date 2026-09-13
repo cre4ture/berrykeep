@@ -783,7 +783,7 @@ fn android_system_dns_server_count() -> Result<usize> {
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_getAndroidSystemDnsServerCount(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_getAndroidSystemDnsServerCount(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jint {
@@ -803,7 +803,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge
 /// This function is intended to be called from Java via JNI during instrumentation tests.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_startRendezvousRenewalScenario(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_startRendezvousRenewalScenario(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -834,7 +834,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge
 /// This function is intended to be called from Java via JNI during instrumentation tests.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_startFolderSyncOutageScenario(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_startFolderSyncOutageScenario(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -865,7 +865,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge
 /// This function is intended to be called from Java via JNI during instrumentation tests.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_setFolderSyncOutageScenarioAvailable(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_setFolderSyncOutageScenarioAvailable(
     mut env: JNIEnv,
     _class: JClass,
     available: jboolean,
@@ -882,7 +882,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge
 /// This function is intended to be called from Java via JNI during instrumentation tests.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_getFolderSyncOutageDirectConnectionAttemptCount(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_getFolderSyncOutageDirectConnectionAttemptCount(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jint {
@@ -902,7 +902,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge
 /// This function is intended to be called from Java via JNI during instrumentation tests.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_getFolderSyncOutageRendezvousContactAttemptCount(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_getFolderSyncOutageRendezvousContactAttemptCount(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jint {
@@ -922,7 +922,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge
 /// This function is intended to be called from Java via JNI during instrumentation tests.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_getCapturedRequestPaths(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_getCapturedRequestPaths(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -951,7 +951,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge
 /// This function is intended to be called from Java via JNI during instrumentation tests.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_getPairedSessionCount(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_getPairedSessionCount(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jint {
@@ -971,7 +971,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge
 /// This function is intended to be called from Java via JNI during instrumentation tests.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientTestBridge_stopRendezvousRenewalScenario(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientTestBridge_stopRendezvousRenewalScenario(
     mut env: JNIEnv,
     _class: JClass,
 ) {

@@ -560,8 +560,8 @@ if [[ -n "${PREBUILT_BINARIES_DIR}" ]]; then
 
   "${ROOT_DIR}/scripts/sync-debian-version.sh" --check
   validate_prebuilt_binaries
-  export IRONMESH_PREBUILT_BIN_DIR="${PREBUILT_BINARIES_DIR}"
-  export IRONMESH_USE_PREBUILT_BINARIES=1
+  export BERRYKEEP_PREBUILT_BIN_DIR="${PREBUILT_BINARIES_DIR}"
+  export BERRYKEEP_USE_PREBUILT_BINARIES=1
   log "packaging prebuilt binaries from ${PREBUILT_BINARIES_DIR}"
   DPKG_BUILD_ARGS=(-d "${DPKG_BUILD_ARGS[@]}")
 else
@@ -574,16 +574,16 @@ else
       exit 1
     }
     PREBUILT_SERVER_NODE="$(cd "$(dirname "${PREBUILT_SERVER_NODE}")" && pwd)/$(basename "${PREBUILT_SERVER_NODE}")"
-    export IRONMESH_PREBUILT_SERVER_NODE_BIN="${PREBUILT_SERVER_NODE}"
-    export IRONMESH_USE_PREBUILT_SERVER_NODE=1
+    export BERRYKEEP_PREBUILT_SERVER_NODE_BIN="${PREBUILT_SERVER_NODE}"
+    export BERRYKEEP_USE_PREBUILT_SERVER_NODE=1
     if [[ "${SERVER_NODE_ONLY}" == true ]]; then
       validate_server_node_binary "${PREBUILT_SERVER_NODE}"
     fi
     log "packaging prebuilt server node from ${PREBUILT_SERVER_NODE}"
   elif [[ -n "${STATIC_SERVER_NODE_ARTIFACT}" ]]; then
     extract_static_server_node_artifact "${STATIC_SERVER_NODE_ARTIFACT}"
-    export IRONMESH_PREBUILT_SERVER_NODE_BIN="${PREBUILT_SERVER_NODE}"
-    export IRONMESH_USE_PREBUILT_SERVER_NODE=1
+    export BERRYKEEP_PREBUILT_SERVER_NODE_BIN="${PREBUILT_SERVER_NODE}"
+    export BERRYKEEP_USE_PREBUILT_SERVER_NODE=1
     log "packaging verified static server node from ${STATIC_SERVER_NODE_ARTIFACT}"
   fi
 
@@ -608,7 +608,7 @@ BUILDINFO_PATH="${ARTIFACT_DIR}/${SOURCE_NAME}_${VERSION}_${ARCH}.buildinfo"
 if [[ "${SERVER_NODE_ONLY}" == true ]]; then
   PACKAGE_PATHS=(
     "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${ARCH}.deb"
   )
 else
   PACKAGE_PATHS=(
@@ -616,10 +616,10 @@ else
     "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/berrykeep-server-node-map-tools_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/berrykeep-rendezvous-service_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/berrykeep-client_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/berrykeep-server-node-map-tools_${VERSION}_${ARCH}.deb"
+    "${ARTIFACT_DIR}/berrykeep-rendezvous-service_${VERSION}_${ARCH}.deb"
   )
 fi
 

@@ -61,7 +61,7 @@ pub fn run_with_gnome_status(
             publisher.clone(),
             client,
             gnome_options.remote_status_poll_interval_ms,
-            "ironmesh-gnome-status",
+            "berrykeep-gnome-status",
         )?),
         Err(error) => {
             if let Err(persist_error) = publisher.update_remote_error(&error) {

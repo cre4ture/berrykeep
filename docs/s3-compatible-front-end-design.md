@@ -4,14 +4,14 @@ Status: proposal
 
 ## Summary
 
-Add an optional S3-compatible HTTP surface to `ironmesh-server-node` so standard
+Add an optional S3-compatible HTTP surface to `berrykeep-server-node` so standard
 S3 SDKs and tools can read, write, list, copy, and multipart-upload objects
-without speaking the native Ironmesh API.
+without speaking the native BerryKeep API.
 
-This design keeps the existing Ironmesh storage engine as the source of truth:
+This design keeps the existing BerryKeep storage engine as the source of truth:
 
 - bytes still land in the normal chunk store,
-- manifests and version graphs stay in the current Ironmesh model,
+- manifests and version graphs stay in the current BerryKeep model,
 - replication, deduplication, media cache, and read-through chunk fetches stay
   unchanged below the compatibility layer.
 
@@ -21,15 +21,15 @@ The S3 surface is a protocol adapter plus:
   shared core, and
 - a small amount of truly S3-specific compatibility metadata
 
-It is not a replacement for the native Ironmesh API.
+It is not a replacement for the native BerryKeep API.
 
 ## Goals
 
 - Support common S3 object workflows from existing clients and SDKs.
-- Reuse the current Ironmesh chunk store, version store, and read path.
-- Keep the native Ironmesh API unchanged.
+- Reuse the current BerryKeep chunk store, version store, and read path.
+- Keep the native BerryKeep API unchanged.
 - Keep the first implementation small enough to land in slices.
-- Preserve Ironmesh's existing byte-level deduplication and clustered read path.
+- Preserve BerryKeep's existing byte-level deduplication and clustered read path.
 
 ## Non-goals
 
@@ -50,9 +50,9 @@ Out of scope for the first implementation:
 
 These can be layered on later if the base object API proves useful.
 
-## Current Constraints From Ironmesh
+## Current Constraints From BerryKeep
 
-Ironmesh is not an S3-shaped storage engine today.
+BerryKeep is not an S3-shaped storage engine today.
 
 Important current properties:
 
@@ -81,20 +81,20 @@ existing public API router.
 
 New env vars:
 
-- `IRONMESH_S3_BIND`
-- `IRONMESH_S3_PUBLIC_URL`
-- `IRONMESH_S3_TLS_CERT`
-- `IRONMESH_S3_TLS_KEY`
+- `BERRYKEEP_S3_BIND`
+- `BERRYKEEP_S3_PUBLIC_URL`
+- `BERRYKEEP_S3_TLS_CERT`
+- `BERRYKEEP_S3_TLS_KEY`
 
 Defaults:
 
-- the S3 listener is disabled unless `IRONMESH_S3_BIND` is set
+- the S3 listener is disabled unless `BERRYKEEP_S3_BIND` is set
 - if explicit S3 TLS files are not set, reuse the normal public TLS identity
 
 Why a separate listener:
 
 - S3 clients expect bucket paths at the root path, not under `/api/v1/...`
-- it avoids route collisions with the native Ironmesh API
+- it avoids route collisions with the native BerryKeep API
 - it keeps S3-specific auth, XML errors, and protocol quirks isolated
 
 ### Cluster-wide S3 availability from the first implementation
@@ -140,24 +140,24 @@ concern.
 Direct public S3 listeners are not enough for all deployments because some nodes
 will only be reachable through the existing rendezvous/relay transport.
 
-Standard S3 clients cannot speak Ironmesh's rendezvous or multiplex transport
+Standard S3 clients cannot speak BerryKeep's rendezvous or multiplex transport
 protocols directly, so the recommended design is an S3 gateway that translates
-normal HTTPS S3 requests into Ironmesh transport requests.
+normal HTTPS S3 requests into BerryKeep transport requests.
 
 Recommended component:
 
-- `ironmesh-s3-gateway`
+- `berrykeep-s3-gateway`
 
 Possible product shapes:
 
 - a standalone binary
-- a mode of the existing CLI/client app such as `ironmesh serve-s3`
+- a mode of the existing CLI/client app such as `berrykeep serve-s3`
 - a deployable edge service in front of private nodes
 
 Gateway behavior:
 
 - accepts standard HTTPS S3 requests from ordinary S3 clients
-- forwards the raw method, path, query, headers, and body through Ironmesh's
+- forwards the raw method, path, query, headers, and body through BerryKeep's
   direct or relay-capable transport session layer
 - targets any cluster node that has the replicated S3 control-plane metadata
 - lets the remote node perform the authoritative SigV4 validation using the
@@ -168,7 +168,7 @@ Gateway behavior:
 Security model:
 
 - the external S3 client authenticates with S3 access keys
-- the gateway authenticates to Ironmesh as a normal client or service identity
+- the gateway authenticates to BerryKeep as a normal client or service identity
   over direct or relay transport
 - the gateway does not become the source of truth for bucket or access-key
   metadata
@@ -202,16 +202,16 @@ Fields:
 - `updated_at_unix`
 - `created_by`
 
-### Bucket to Ironmesh mapping
+### Bucket to BerryKeep mapping
 
-Each bucket maps to a prefix in the normal Ironmesh namespace.
+Each bucket maps to a prefix in the normal BerryKeep namespace.
 
 Example:
 
 - bucket `photos`
 - `root_prefix = s3/photos/`
 - S3 object `2025/cat.jpg`
-- Ironmesh key `s3/photos/2025/cat.jpg`
+- BerryKeep key `s3/photos/2025/cat.jpg`
 
 Why prefix mapping instead of true bucket-native storage:
 
@@ -222,13 +222,13 @@ Why prefix mapping instead of true bucket-native storage:
 
 ### Prefix ownership rule
 
-An S3 bucket should be treated as the owner of its mapped Ironmesh prefix.
+An S3 bucket should be treated as the owner of its mapped BerryKeep prefix.
 
 Recommendation:
 
 - objects under an S3 bucket prefix should be mutated through either:
   - the S3 surface, or
-  - a native Ironmesh path API mode that explicitly opts into S3-compatible
+  - a native BerryKeep path API mode that explicitly opts into S3-compatible
     semantics for that prefix
 
 Plain native path writes should not be allowed to bypass those semantics for
@@ -274,7 +274,7 @@ current generic path API is already S3-safe.
 
 ### Separate S3 credentials
 
-Do not try to reuse Ironmesh client request signatures as S3 credentials.
+Do not try to reuse BerryKeep client request signatures as S3 credentials.
 
 Instead, add a separate S3 access-key store.
 
@@ -375,12 +375,12 @@ Return `NotImplemented` XML errors for:
 
 ### Read mode
 
-The S3 surface should read Ironmesh objects with `confirmed_only` semantics.
+The S3 surface should read BerryKeep objects with `confirmed_only` semantics.
 
 Reason:
 
 - S3 clients expect the stable committed object view
-- Ironmesh provisional versions should not leak through the compatibility layer
+- BerryKeep provisional versions should not leak through the compatibility layer
 
 This implies the S3 layer needs storage helpers that can:
 
@@ -392,7 +392,7 @@ based on the current preferred namespace view and may include provisional heads.
 
 ### Linear-write contract
 
-S3 keys should behave like a linear object history even though Ironmesh
+S3 keys should behave like a linear object history even though BerryKeep
 internally supports branching version graphs.
 
 To make that reliable, add compare-and-swap style storage helpers:
@@ -424,7 +424,7 @@ transport-specific.
 
 ### External mutation rule
 
-If plain native Ironmesh APIs bypass S3-compatible mode and create multi-head
+If plain native BerryKeep APIs bypass S3-compatible mode and create multi-head
 history for an S3-managed key, the S3 surface and any native S3-compatible mode
 should:
 
@@ -439,7 +439,7 @@ branch to S3 clients.
 
 ### Why a metadata split is required
 
-Ironmesh manifests currently describe:
+BerryKeep manifests currently describe:
 
 - logical key
 - ordered chunk refs
@@ -457,7 +457,7 @@ The stronger design is:
 - keep only truly S3-specific protocol compatibility artifacts in a thin
   sidecar
 
-This makes the metadata model more broadly useful for native Ironmesh APIs too.
+This makes the metadata model more broadly useful for native BerryKeep APIs too.
 
 ### Promote generic object metadata into shared per-version metadata
 
@@ -494,7 +494,7 @@ Notes:
 Fields:
 
 - `bucket_name`
-- `ironmesh_key`
+- `berrykeep_key`
 - `version_id`
 - `etag`
 - `multipart_part_count`
@@ -508,7 +508,7 @@ This record is keyed by `(bucket_name, version_id)`.
 
 - captures request metadata headers
 - stores generic object metadata in `object_version_metadata` after the
-  Ironmesh write returns a version id
+  BerryKeep write returns a version id
 - stores S3-specific compatibility artifacts in `s3_object_versions`
 
 Native S3-compatible `PUT` / copy / delete / rename style mutations should
@@ -528,7 +528,7 @@ they must also maintain:
 
 `GetObject` and `HeadObject`:
 
-- resolve the exact Ironmesh version
+- resolve the exact BerryKeep version
 - load shared object metadata for that version
 - load S3 compatibility metadata for that version
 - render standard S3 response headers
@@ -551,7 +551,7 @@ always have:
 
 ## ETag Strategy
 
-The S3 surface should not expose the native Ironmesh manifest hash as the normal
+The S3 surface should not expose the native BerryKeep manifest hash as the normal
 object `ETag`.
 
 Recommended behavior:
@@ -562,13 +562,13 @@ Recommended behavior:
   `md5(concat(part_md5_bytes)) + "-" + part_count`
 - persist that ETag in `s3_object_versions`
 
-The native Ironmesh API should continue to use manifest-hash ETags on `/store/*`
+The native BerryKeep API should continue to use manifest-hash ETags on `/store/*`
 routes.
 
 This split is important because:
 
 - many S3 clients treat ETag as MD5-like compatibility data
-- Ironmesh manifest hashes include storage-model details that are not part of
+- BerryKeep manifest hashes include storage-model details that are not part of
   normal S3 expectations
 
 ## Multipart Upload Design
@@ -577,7 +577,7 @@ This split is important because:
 
 The current design should not assume a pure adapter-only multipart subsystem.
 
-Ironmesh's native finalize path is already close to what S3 multipart needs:
+BerryKeep's native finalize path is already close to what S3 multipart needs:
 
 - the storage layer can already finalize an object from an arbitrary ordered
   list of `UploadChunkRef` values
@@ -668,7 +668,7 @@ ingest_payload_to_chunk_refs(payload: &[u8]) -> Result<Vec<UploadChunkRef>>
 
 Behavior:
 
-- split the uploaded payload into the normal internal Ironmesh chunk size
+- split the uploaded payload into the normal internal BerryKeep chunk size
 - ingest each internal chunk into the content-addressed chunk store
 - return the ordered `UploadChunkRef` list for that uploaded payload
 
@@ -708,7 +708,7 @@ Recommended S3 overlay record:
 
 - `upload_id`
 - `bucket_name`
-- `ironmesh_key`
+- `berrykeep_key`
 - `expected_current_version_id`
 - `content_type`
 - `content_encoding`
@@ -739,7 +739,7 @@ For each `UploadPart` request:
 5. persist or refresh the S3 overlay metadata
 6. return the part ETag
 
-No temporary user-visible Ironmesh object is created for a part.
+No temporary user-visible BerryKeep object is created for a part.
 
 ### CompleteMultipartUpload flow
 
@@ -747,7 +747,7 @@ No temporary user-visible Ironmesh object is created for a part.
 2. verify all referenced part numbers exist and ETags match
 3. flatten each part's `chunk_refs` into one final ordered chunk-ref list
 4. compute the final total size from the selected parts
-5. call the native CAS-style finalizer on the Ironmesh store
+5. call the native CAS-style finalizer on the BerryKeep store
 6. persist the final shared object metadata plus S3 compatibility metadata
 7. delete the staged upload session and S3 overlay metadata
 
@@ -791,7 +791,7 @@ native `/store/index` path keeps its current offset-based pagination model.
 Instead, improve the native listing core so it can support stable cursor-based
 pagination for both:
 
-- native Ironmesh listing use cases
+- native BerryKeep listing use cases
 - the S3 adapter's `ListObjectsV2` and later `ListObjectVersions`
 
 The S3 layer can then be the first consumer of that improved listing core
@@ -979,7 +979,7 @@ Expose two S3 bucket modes:
 - `disabled`
 - `enabled`
 
-Under the hood Ironmesh still retains historical versions in both modes. The S3
+Under the hood BerryKeep still retains historical versions in both modes. The S3
 surface decides how much of that history it exposes.
 
 ### Versioning disabled
@@ -987,19 +987,19 @@ surface decides how much of that history it exposes.
 Behavior:
 
 - `PutObject` replaces the visible current object through a CAS write
-- `DeleteObject` creates an Ironmesh tombstone but does not expose a public S3
+- `DeleteObject` creates an BerryKeep tombstone but does not expose a public S3
   delete-marker history surface
 - normal `GetObject` reads the latest confirmed visible object only
 
 This gives the external behavior most S3 clients expect while preserving
-Ironmesh's internal no-loss history.
+BerryKeep's internal no-loss history.
 
 ### Versioning enabled
 
 Behavior:
 
-- S3 `VersionId` maps directly to Ironmesh `version_id`
-- `GetObject?versionId=...` reads the exact Ironmesh version
+- S3 `VersionId` maps directly to BerryKeep `version_id`
+- `GetObject?versionId=...` reads the exact BerryKeep version
 - `DeleteObject` creates a tombstone version and returns delete-marker fields
 - `ListObjectVersions` translates the linearized S3-managed history into S3 XML
 
@@ -1007,7 +1007,7 @@ This mapping is only valid for keys that stayed on the S3-linear contract.
 
 ## CopyObject Design
 
-`CopyObject` should reuse Ironmesh's copy primitives for zero-reupload server-side
+`CopyObject` should reuse BerryKeep's copy primitives for zero-reupload server-side
 copy.
 
 Required additions:
@@ -1127,7 +1127,7 @@ Core mappings:
 - `PreconditionFailed`
 - `InternalError`
 
-## Interaction With Existing Ironmesh Features
+## Interaction With Existing BerryKeep Features
 
 ### Replication and deduplication
 
@@ -1142,13 +1142,13 @@ Benefits:
 
 ### Media cache
 
-Objects uploaded through the S3 surface still become normal Ironmesh objects, so
+Objects uploaded through the S3 surface still become normal BerryKeep objects, so
 existing media metadata warming and thumbnail logic can continue to operate on
 their paths if those paths look like media files.
 
 ### Native clients
 
-Native Ironmesh clients should continue to ignore the S3-specific compatibility
+Native BerryKeep clients should continue to ignore the S3-specific compatibility
 metadata. The S3 front end is an adapter, not the new canonical data model.
 
 However, the shared per-version object metadata is a good candidate to become
@@ -1216,7 +1216,7 @@ Verification:
 
 ### Slice 3: Relay and gateway-backed S3 access
 
-- add an `ironmesh-s3-gateway` or equivalent gateway mode
+- add an `berrykeep-s3-gateway` or equivalent gateway mode
 - let the gateway route over direct transport when available
 - let the gateway fall back to rendezvous/relay transport when direct transport
   is unavailable
@@ -1296,7 +1296,7 @@ Build the S3 surface as:
 - complemented by a relay-capable S3 gateway for deployments where direct S3
   listeners are not reachable.
 
-That gives Ironmesh a practical interoperability story for:
+That gives BerryKeep a practical interoperability story for:
 
 - existing backup tools
 - `aws s3api` / `aws s3`

@@ -9,7 +9,7 @@ The MSI installs `berrykeep-server-node.exe` as the `BerryKeepServerNode`
 Windows service. The stable service identity and data root preserve existing
 Windows deployments during the executable-name transition.
 
-An MSI major upgrade replaces the old `ironmesh-server-node.exe` program
+An MSI major upgrade replaces the old `berrykeep-server-node.exe` program
 component and its firewall rules with the BerryKeep executable. No manual
 program-file or firewall cleanup is required; service identity and node state
 are retained.
@@ -45,7 +45,7 @@ already-built binary from a nondefault Cargo target directory:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\windows\server-node-installer\Build-Msi.ps1 `
   -SkipCargoBuild `
-  -CargoTargetDir C:\build\ironmesh-target `
+  -CargoTargetDir C:\build\berrykeep-target `
   -ProductVersion 1.0.38
 ```
 
@@ -125,7 +125,7 @@ Get-Content C:\ProgramData\BerryKeep\ServerNode\server-node.env
 
 `server-node.env` supplies only installation-local start values. Restart the
 service after editing it. Retain the supplied `BERRYKEEP_SERVER_NODE_*`
-variables for the guided setup mode; adding ordinary `IRONMESH_*` runtime
+variables for the guided setup mode; adding ordinary `BERRYKEEP_*` runtime
 variables selects the advanced environment-driven startup path instead.
 
 To remove the program and service while preserving data:

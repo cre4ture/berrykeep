@@ -8,8 +8,8 @@ import {
   type HardwareNetworkInterface,
   type HardwareStorageDevice,
   updateNodeConnectionPriority
-} from "@ironmesh/api";
-import { ironmeshPrimaryColor, JsonBlock, StatCard } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { berrykeepPrimaryColor, JsonBlock, StatCard } from "@berrykeep/ui";
 import { Alert, Badge, Button, Card, Code, Grid, Group, Loader, NumberInput, Stack, Text } from "@mantine/core";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
@@ -96,7 +96,7 @@ export function HardwarePage() {
           {warningFindings.length} warning finding{warningFindings.length === 1 ? "" : "s"} are currently reported for this node.
         </Alert>
       ) : report ? (
-        <Alert color={ironmeshPrimaryColor} title="No active hardware warnings">
+        <Alert color={berrykeepPrimaryColor} title="No active hardware warnings">
           The latest structured hardware report contains no warning or critical findings.
         </Alert>
       ) : null}
@@ -490,7 +490,7 @@ function CollectorRemediation({ collector }: { collector: HardwareHealthCollecto
           </Text>
           <Code block>sudo apt install smartmontools</Code>
           <Text size="sm">
-            Then restart IronMesh (or wait for its next collection) and use Refresh. The service also
+            Then restart BerryKeep (or wait for its next collection) and use Refresh. The service also
             needs access to the physical block devices.
           </Text>
         </Stack>
@@ -500,7 +500,7 @@ function CollectorRemediation({ collector }: { collector: HardwareHealthCollecto
 
   if (collector.last_error_code === "permission_denied") {
     return (
-      <Alert color="yellow" variant="light" title="Grant the IronMesh service device access">
+      <Alert color="yellow" variant="light" title="Grant the BerryKeep service device access">
         <Text size="sm">
           Run the service with least-privilege access to the physical block devices, then restart it
           and use Refresh. For a systemd service this is commonly configured with a dedicated
@@ -544,7 +544,7 @@ function NetworkInterfaceCard({ iface }: { iface: HardwareNetworkInterface }) {
 function collectorStateColor(collector: HardwareHealthCollectorStatus): string {
   switch (collector.state) {
     case "ready":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "degraded":
       return "yellow";
     case "unavailable":
@@ -559,7 +559,7 @@ function findingSeverityColor(finding: HardwareHealthFinding): string {
     case "warn":
       return "yellow";
     case "info":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
   }
 }
 

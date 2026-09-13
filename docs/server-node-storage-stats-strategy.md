@@ -181,7 +181,7 @@ frontend for the current storage-stats feature.
 - The current storage-stats history is stored directly in the node metadata backend
   (`sqlite` / `turso`).
 - GreptimeDB's dashboard/frontend is coupled to a running GreptimeDB instance and cannot simply be
-  pointed at the existing Ironmesh SQLite or Turso data.
+  pointed at the existing BerryKeep SQLite or Turso data.
 - Running one GreptimeDB instance per node would also not automatically produce a cluster-wide
   accumulated view. It would still require fan-in, cross-node querying, or a dedicated central
   GreptimeDB deployment.

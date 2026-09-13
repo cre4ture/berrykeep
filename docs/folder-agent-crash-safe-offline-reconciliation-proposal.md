@@ -28,13 +28,13 @@ Implemented so far:
   - `dual_modify_missing_baseline`
   - `dual_modify_conflict`
 - Incremental per-path baseline upserts/removals during startup/runtime apply/upload/delete flows to reduce crash windows.
-- Startup cleanup of leftover `.ironmesh-part-*` files (partial download artifacts) to avoid disk accumulation across crashes.
-- Remote conflict copy materialization at startup for dual-modify conflicts into `.ironmesh-conflicts/remote/...` (no-loss policy).
-- Basic conflict lifecycle CLI tooling in `ironmesh-folder-agent`:
+- Startup cleanup of leftover `.berrykeep-part-*` files (partial download artifacts) to avoid disk accumulation across crashes.
+- Remote conflict copy materialization at startup for dual-modify conflicts into `.berrykeep-conflicts/remote/...` (no-loss policy).
+- Basic conflict lifecycle CLI tooling in `berrykeep-folder-agent`:
   - `conflicts list` (json/table)
   - `conflicts resolve <path> --strategy keep-local|keep-remote [--delete-conflict-copies]`
   - `conflicts clear [--delete-conflict-copies]`
-  - `cleanup` (remove `.ironmesh-part-*` artifacts)
+  - `cleanup` (remove `.berrykeep-part-*` artifacts)
 - Optional local web UI for conflict surfacing + resolution buttons:
   - start agent with `--ui-bind 127.0.0.1:3030` and open `http://127.0.0.1:3030`
 - Crash-window system test coverage for abrupt kill during active sync writes, with restart reconciliation checks (local + remote changes).
@@ -44,7 +44,7 @@ Implemented so far:
   - `GET /maintenance/tombstones/archive`
   - `POST /maintenance/tombstones/archive/restore`
   - `POST /maintenance/tombstones/archive/purge`
-  - token-based admin access control via `IRONMESH_ADMIN_TOKEN` + `x-ironmesh-admin-token`
+  - token-based admin access control via `BERRYKEEP_ADMIN_TOKEN` + `x-berrykeep-admin-token`
   - explicit approval gate for destructive runs (`dry_run=false` requires `approve=true`)
   - persistent admin audit trail in `state/admin_audit.jsonl`
   - dry-run support

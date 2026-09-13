@@ -8,14 +8,14 @@ main README.
 - `crates/common` — shared models used by all nodes/apps.
 - `crates/client-sdk` — client library with server access + local cache.
 - `apps/server-node` — storage server node.
-- `apps/cli-client` — Cargo package for the public `ironmesh` CLI and built-in web interface endpoint.
+- `apps/cli-client` — Cargo package for the public `berrykeep` CLI and built-in web interface endpoint.
 - `apps/android-app` — Android-facing Rust app layer.
 - `apps/ios-app` — iOS-facing Rust app layer.
 
 ## First-release scope snapshot
 
-- Stable release-facing command names are `ironmesh`, `ironmesh-server-node`, `ironmesh-rendezvous-service`, `ironmesh-os-integration`, and `ironmesh-folder-agent`.
-- Canonical release-facing bootstrap filenames use the `ironmesh-client-bootstrap*.json` family with sibling `*.client-identity.json` files, while Windows persisted sync-root state stays on `connection-bootstrap.json` and `client-identity.json` under `%LOCALAPPDATA%\Ironmesh\sync-roots\...`.
+- Stable release-facing command names are `berrykeep`, `berrykeep-server-node`, `berrykeep-rendezvous-service`, `berrykeep-os-integration`, and `berrykeep-folder-agent`.
+- Canonical release-facing bootstrap filenames use the `berrykeep-client-bootstrap*.json` family with sibling `*.client-identity.json` files, while Windows persisted sync-root state stays on `connection-bootstrap.json` and `client-identity.json` under `%LOCALAPPDATA%\BerryKeep\sync-roots\...`.
 - Source-checkout examples in this repo may still use `cargo run -p ...`; those are Cargo package names for local development, not the installed command names users should depend on.
 - Android and iOS remain app shells rather than first-release consumer products, Apple filesystem integration is still expected to evolve, and GNOME desktop integration remains optional rather than a mandatory packaging contract.
 - Advanced tuning or debug envs outside the runtime env contract below are operational knobs, not frozen first-release compatibility promises.
@@ -50,7 +50,7 @@ just test-system-nightly-one tests::autonomous_peer_heartbeat_recovers_after_pee
 
 ## System-tests toolchain policy (nightly)
 
-`tests/system-tests` uses Cargo binary artifact dependencies to consume the `ironmesh-server-node` and `ironmesh` binaries directly during test runs.
+`tests/system-tests` uses Cargo binary artifact dependencies to consume the `berrykeep-server-node` and `berrykeep` binaries directly during test runs.
 
 Why this was chosen:
 
@@ -92,22 +92,22 @@ Defaults:
 - Base port: `18080` (nodes on `18080..18083`)
 - Data + logs + pid files: `data/local-cluster/`
 
-For the newer rendezvous-plus-relay architecture, use the dedicated manual recipe in [manual-rendezvous-relay-test.md](manual-rendezvous-relay-test.md). The helper script does not yet start `ironmesh-rendezvous-service`. For local plain-HTTP rendezvous testing, the manual recipe now sets `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` explicitly because insecure startup is refused by default.
+For the newer rendezvous-plus-relay architecture, use the dedicated manual recipe in [manual-rendezvous-relay-test.md](manual-rendezvous-relay-test.md). The helper script does not yet start `berrykeep-rendezvous-service`. For local plain-HTTP rendezvous testing, the manual recipe now sets `BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` explicitly because insecure startup is refused by default.
 
 Optional overrides:
 
-- `IRONMESH_LOCAL_CLUSTER_BASE_PORT`
-- `IRONMESH_LOCAL_CLUSTER_DIR`
-- `IRONMESH_SERVER_BIN`
+- `BERRYKEEP_LOCAL_CLUSTER_BASE_PORT`
+- `BERRYKEEP_LOCAL_CLUSTER_DIR`
+- `BERRYKEEP_SERVER_BIN`
 
 ## Runtime Env Contract
 
 Treat only a small runtime subset as the first-release env var contract.
 
-- `ironmesh-server-node` supported runtime envs: `IRONMESH_NODE_ENROLLMENT_FILE`, `IRONMESH_NODE_BOOTSTRAP_FILE`, `IRONMESH_NODE_ID`, `IRONMESH_CLUSTER_ID`, `IRONMESH_DATA_DIR`, `IRONMESH_SERVER_BIND`, `IRONMESH_PUBLIC_URL`, `IRONMESH_PUBLIC_TLS_CERT`, `IRONMESH_PUBLIC_TLS_KEY`, `IRONMESH_INTERNAL_BIND`, `IRONMESH_INTERNAL_URL`, `IRONMESH_INTERNAL_TLS_CA_CERT`, `IRONMESH_INTERNAL_TLS_CERT`, `IRONMESH_INTERNAL_TLS_KEY`, `IRONMESH_LOCAL_STATUS_BIND`, `IRONMESH_RENDEZVOUS_URLS`, `IRONMESH_RENDEZVOUS_CA_CERT`, `IRONMESH_RENDEZVOUS_MTLS_REQUIRED`, `IRONMESH_RELAY_MODE`, and `IRONMESH_ADMIN_TOKEN`.
-- `ironmesh-rendezvous-service` supported runtime envs: `IRONMESH_RENDEZVOUS_BIND`, `IRONMESH_RENDEZVOUS_PUBLIC_URL`, `IRONMESH_RELAY_PUBLIC_URLS`, `IRONMESH_RENDEZVOUS_CLIENT_CA_CERT`, `IRONMESH_RENDEZVOUS_TLS_CERT`, `IRONMESH_RENDEZVOUS_TLS_KEY`, `IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE`, `IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE`, `IRONMESH_RENDEZVOUS_MAX_CONNECTIONS`, `IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES`, `IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT`, and `IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE`. The same-port embedded Iroh relay is enabled by default; `IRONMESH_IROH_RELAY_ENABLED`, `IRONMESH_IROH_RELAY_TICKET_TTL_SECS`, `IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND`, `IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES`, `IRONMESH_IROH_RELAY_MAX_TICKET_LEASES_PER_CLIENT`, `IRONMESH_IROH_RELAY_MAX_TICKET_ISSUES_PER_MINUTE`, and `IRONMESH_IROH_RELAY_MAX_ACTIVE_CONNECTIONS_PER_CLIENT` disable or tune its endpoint leases. QUIC Address Discovery reuses the Rendezvous TLS identity on UDP `7842`; `IRONMESH_IROH_RELAY_QUIC_BIND`, `IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT`, `IRONMESH_IROH_RELAY_QUIC_TLS_CERT`, and `IRONMESH_IROH_RELAY_QUIC_TLS_KEY` override that listener or identity; see [Embedded Iroh Relay Operations](iroh-relay-companion-operations.md). Standalone failover startup now expects `--bind-addr`, and new failover exports embed the rendezvous client CA so `IRONMESH_RENDEZVOUS_CLIENT_CA_CERT` is only needed for file-based TLS or legacy failover packages.
-- Local-dev or helper-only envs are intentionally separate contracts: `IRONMESH_LOCAL_CLUSTER_*`, `IRONMESH_SERVER_BIN`, `IRONMESH_CLI_BIN`, and `IRONMESH_RENDEZVOUS_DEPLOY_*`. `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP`, `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP`, and `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS` are development-only and should not be treated as production runtime contracts.
-- Advanced tuning and debug envs such as `IRONMESH_METADATA_*`, `IRONMESH_AUTONOMOUS_*`, `IRONMESH_REPLICATION_*`, `IRONMESH_REPAIR_*`, `IRONMESH_DATA_SCRUB_*`, `IRONMESH_STORAGE_STATS_*`, `IRONMESH_MAP_*`, and `IRONMESH_TEST_*` are current operational knobs, not frozen compatibility promises for the first release.
+- `berrykeep-server-node` supported runtime envs: `BERRYKEEP_NODE_ENROLLMENT_FILE`, `BERRYKEEP_NODE_BOOTSTRAP_FILE`, `BERRYKEEP_NODE_ID`, `BERRYKEEP_CLUSTER_ID`, `BERRYKEEP_DATA_DIR`, `BERRYKEEP_SERVER_BIND`, `BERRYKEEP_PUBLIC_URL`, `BERRYKEEP_PUBLIC_TLS_CERT`, `BERRYKEEP_PUBLIC_TLS_KEY`, `BERRYKEEP_INTERNAL_BIND`, `BERRYKEEP_INTERNAL_URL`, `BERRYKEEP_INTERNAL_TLS_CA_CERT`, `BERRYKEEP_INTERNAL_TLS_CERT`, `BERRYKEEP_INTERNAL_TLS_KEY`, `BERRYKEEP_LOCAL_STATUS_BIND`, `BERRYKEEP_RENDEZVOUS_URLS`, `BERRYKEEP_RENDEZVOUS_CA_CERT`, `BERRYKEEP_RENDEZVOUS_MTLS_REQUIRED`, `BERRYKEEP_RELAY_MODE`, and `BERRYKEEP_ADMIN_TOKEN`.
+- `berrykeep-rendezvous-service` supported runtime envs: `BERRYKEEP_RENDEZVOUS_BIND`, `BERRYKEEP_RENDEZVOUS_PUBLIC_URL`, `BERRYKEEP_RELAY_PUBLIC_URLS`, `BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT`, `BERRYKEEP_RENDEZVOUS_TLS_CERT`, `BERRYKEEP_RENDEZVOUS_TLS_KEY`, `BERRYKEEP_RENDEZVOUS_FAILOVER_PACKAGE`, `BERRYKEEP_RENDEZVOUS_FAILOVER_PASSPHRASE`, `BERRYKEEP_RENDEZVOUS_MAX_CONNECTIONS`, `BERRYKEEP_RENDEZVOUS_MAX_TLS_HANDSHAKES`, `BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT`, and `BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE`. The same-port embedded Iroh relay is enabled by default; `BERRYKEEP_IROH_RELAY_ENABLED`, `BERRYKEEP_IROH_RELAY_TICKET_TTL_SECS`, `BERRYKEEP_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND`, `BERRYKEEP_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES`, `BERRYKEEP_IROH_RELAY_MAX_TICKET_LEASES_PER_CLIENT`, `BERRYKEEP_IROH_RELAY_MAX_TICKET_ISSUES_PER_MINUTE`, and `BERRYKEEP_IROH_RELAY_MAX_ACTIVE_CONNECTIONS_PER_CLIENT` disable or tune its endpoint leases. QUIC Address Discovery reuses the Rendezvous TLS identity on UDP `7842`; `BERRYKEEP_IROH_RELAY_QUIC_BIND`, `BERRYKEEP_IROH_RELAY_QUIC_PUBLIC_PORT`, `BERRYKEEP_IROH_RELAY_QUIC_TLS_CERT`, and `BERRYKEEP_IROH_RELAY_QUIC_TLS_KEY` override that listener or identity; see [Embedded Iroh Relay Operations](iroh-relay-companion-operations.md). Standalone failover startup now expects `--bind-addr`, and new failover exports embed the rendezvous client CA so `BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT` is only needed for file-based TLS or legacy failover packages.
+- Local-dev or helper-only envs are intentionally separate contracts: `BERRYKEEP_LOCAL_CLUSTER_*`, `BERRYKEEP_SERVER_BIN`, `BERRYKEEP_CLI_BIN`, and `BERRYKEEP_RENDEZVOUS_DEPLOY_*`. `BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP`, `BERRYKEEP_ALLOW_INSECURE_PUBLIC_HTTP`, and `BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS` are development-only and should not be treated as production runtime contracts.
+- Advanced tuning and debug envs such as `BERRYKEEP_METADATA_*`, `BERRYKEEP_AUTONOMOUS_*`, `BERRYKEEP_REPLICATION_*`, `BERRYKEEP_REPAIR_*`, `BERRYKEEP_DATA_SCRUB_*`, `BERRYKEEP_STORAGE_STATS_*`, `BERRYKEEP_MAP_*`, and `BERRYKEEP_TEST_*` are current operational knobs, not frozen compatibility promises for the first release.
 
 ## Local git hooks (recommended)
 
@@ -186,9 +186,9 @@ Those bridges can be added incrementally without changing the workspace topology
 - 2026-07-06: dedicated-listener runtime coverage now includes versioned-object and delete-marker behavior over real HTTP.
   The `system-tests` S3 suite now validates enabled-bucket version headers, current-object deletes that produce delete markers, historical reads by `versionId`, and `?versions=` listings against a spawned `server-node` S3 listener.
 - 2026-07-06: dedicated-listener runtime coverage now includes multipart upload flows over real HTTP.
-  The `system-tests` S3 suite now drives `CreateMultipartUpload`, `UploadPart`, paged `ListParts`, `CompleteMultipartUpload`, final-object reads, and abort handling against a spawned `server-node` process with `IRONMESH_S3_BIND` enabled.
+  The `system-tests` S3 suite now drives `CreateMultipartUpload`, `UploadPart`, paged `ListParts`, `CompleteMultipartUpload`, final-object reads, and abort handling against a spawned `server-node` process with `BERRYKEEP_S3_BIND` enabled.
 - 2026-07-06: `system-tests` now covers a real dedicated S3 listener socket end to end.
-  The harness reserves `IRONMESH_S3_BIND` ports alongside the public and internal listener ports, and the new runtime test provisions S3 control-plane state through the admin API before exercising SigV4 list, `PUT`, `HEAD`, `GET`, prefix listing, and `DELETE` flows against the bound S3 listener on a spawned `server-node` process.
+  The harness reserves `BERRYKEEP_S3_BIND` ports alongside the public and internal listener ports, and the new runtime test provisions S3 control-plane state through the admin API before exercising SigV4 list, `PUT`, `HEAD`, `GET`, prefix listing, and `DELETE` flows against the bound S3 listener on a spawned `server-node` process.
 - 2026-07-06: relay-backed `serve-s3` gateway coverage now exercises both direct and rendezvous/relay forwarding paths.
   The `system-tests` S3 suite now spawns a real `cli-client serve-s3` gateway with a bootstrap whose direct public API endpoint has been deliberately blackholed, then proves signed bucket listing, small object traffic, and a multi-MiB object round-trip still succeed by falling back through the rendezvous/relay transport path.
 - 2026-07-06: bootstrap bundles no longer collapse client direct endpoints to the local node when client auth is enabled.
@@ -216,28 +216,28 @@ Those bridges can be added incrementally without changing the workspace topology
 
 ## Linux FUSE mount
 
-The Linux entrypoint is `ironmesh-os-integration`. The mountpoint directory must already exist, and in practice it should be empty before mounting.
+The Linux entrypoint is `berrykeep-os-integration`. The mountpoint directory must already exist, and in practice it should be empty before mounting.
 
 Direct server mode:
 
 ```bash
-mkdir -p /tmp/ironmesh-mount
+mkdir -p /tmp/berrykeep-mount
 cargo run -p os-integration -- \
 	--server-base-url https://127.0.0.1:18080 \
-	--server-ca-pem-file /path/to/ironmesh-public-ca.pem \
-	--client-identity-file /path/to/ironmesh-client-identity.json \
-  --mountpoint /tmp/ironmesh-mount
+	--server-ca-pem-file /path/to/berrykeep-public-ca.pem \
+	--client-identity-file /path/to/berrykeep-client-identity.json \
+  --mountpoint /tmp/berrykeep-mount
 ```
 
 Notes:
 
-- Regular server-node deployments now expect public TLS. Plain HTTP is only available for explicit local testing with `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP=true`.
+- Regular server-node deployments now expect public TLS. Plain HTTP is only available for explicit local testing with `BERRYKEEP_ALLOW_INSECURE_PUBLIC_HTTP=true`.
 - Live mounts now require client auth when the server protects `/store/*` APIs. In direct mode,
   pass `--client-identity-file`.
-- In bootstrap mode, `ironmesh-os-integration` auto-loads a sibling
+- In bootstrap mode, `berrykeep-os-integration` auto-loads a sibling
 	`*.client-identity.json` file when present, for example
-	`ironmesh-client-bootstrap.client-identity.json` next to
-	`ironmesh-client-bootstrap.json`.
+	`berrykeep-client-bootstrap.client-identity.json` next to
+	`berrykeep-client-bootstrap.json`.
 - On first startup, live mounts fail instead of presenting an empty namespace when `/store/index`
   cannot be fetched and no cached snapshot exists. Use `--allow-empty-initial-namespace` only for
   deliberate offline-first testing.
@@ -264,7 +264,7 @@ The env vars referenced in the tuning subsections below are current operational 
 - Version commit endpoints:
 	- `POST /versions/{key}/commit/{version_id}`
 	- `POST /versions/{key}/confirm/{version_id}` (compatibility alias)
-- Metadata commit mode is configurable with `IRONMESH_METADATA_COMMIT_MODE`:
+- Metadata commit mode is configurable with `BERRYKEEP_METADATA_COMMIT_MODE`:
 	- `local` (default): commit allowed locally.
 	- `quorum`: commit requires cluster majority online.
 
@@ -287,20 +287,20 @@ The env vars referenced in the tuning subsections below are current operational 
 
 ### CLI status and browsing commands
 
-- `ironmesh list --prefix <prefix> --depth <n>`
-- `ironmesh health`
-- `ironmesh cluster-status`
-- `ironmesh nodes`
-- `ironmesh replication-plan`
-- `ironmesh serve-web` provides an interactive web UI for upload/download, key browsing, health checks, and replication-plan inspection.
+- `berrykeep list --prefix <prefix> --depth <n>`
+- `berrykeep health`
+- `berrykeep cluster-status`
+- `berrykeep nodes`
+- `berrykeep replication-plan`
+- `berrykeep serve-web` provides an interactive web UI for upload/download, key browsing, health checks, and replication-plan inspection.
 	- Web backend routes and static assets are provided by `crates/web-ui-backend`.
 
 ### CLI connection flags
 
-- `ironmesh`, `ironmesh-os-integration`, and `ironmesh-folder-agent` should all treat `--server-base-url` as the canonical direct-connection flag.
+- `berrykeep`, `berrykeep-os-integration`, and `berrykeep-folder-agent` should all treat `--server-base-url` as the canonical direct-connection flag.
 - `--bootstrap-file` is the canonical bootstrap-driven alternative across those clients.
 - `--client-identity-file` and `--server-ca-pem-file` remain the canonical explicit auth and CA override flags for these direct/bootstrap flows, including Windows CFAPI; legacy `--server-ca-cert` is compatibility-only where it is still accepted.
-- `ironmesh` still accepts legacy `--server-url` as a compatibility alias, but release-facing docs and automation should move to `--server-base-url`.
+- `berrykeep` still accepts legacy `--server-url` as a compatibility alias, but release-facing docs and automation should move to `--server-base-url`.
 
 ### Reconciliation and maintenance
 
@@ -313,34 +313,34 @@ The env vars referenced in the tuning subsections below are current operational 
 
 - Server nodes send periodic heartbeats to known peers by default.
 - Configuration:
-	- `IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED` (default: `true`)
-	- `IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS` (default: `15`)
+	- `BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED` (default: `true`)
+	- `BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS` (default: `15`)
 
 ### Autonomous replication on write
 
 - Successful `PUT /store/{key}` writes can trigger an immediate asynchronous replication repair pass.
 - Configuration:
-	- `IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED` (default: `true`)
+	- `BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED` (default: `true`)
 
 ### Periodic replication audit and repair
 
 - Cluster-mode nodes run a background replication auditor and execute repair passes for under-replicated data by default.
 - Configuration:
-	- `IRONMESH_REPLICATION_REPAIR_ENABLED` (default: `true`)
-	- `IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS` (default: `3600`)
-	- `IRONMESH_REPLICATION_REPAIR_BATCH_SIZE` (default: `256`)
-	- `IRONMESH_REPLICATION_REPAIR_MAX_RETRIES` (default: `3`)
-	- `IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS` (default: `30`)
-	- `IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED` (default: `true`)
-	- `IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD` (default: `32`)
-	- `IRONMESH_REPAIR_BUSY_WAIT_MILLIS` (default: `100`)
+	- `BERRYKEEP_REPLICATION_REPAIR_ENABLED` (default: `true`)
+	- `BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS` (default: `3600`)
+	- `BERRYKEEP_REPLICATION_REPAIR_BATCH_SIZE` (default: `256`)
+	- `BERRYKEEP_REPLICATION_REPAIR_MAX_RETRIES` (default: `3`)
+	- `BERRYKEEP_REPLICATION_REPAIR_BACKOFF_SECS` (default: `30`)
+	- `BERRYKEEP_REPAIR_BUSY_THROTTLE_ENABLED` (default: `true`)
+	- `BERRYKEEP_REPAIR_BUSY_INFLIGHT_THRESHOLD` (default: `32`)
+	- `BERRYKEEP_REPAIR_BUSY_WAIT_MILLIS` (default: `100`)
 
 ### Startup replication repair
 
 - On startup, the server can run a one-shot replication repair pass after a short delay to heal inconsistent states.
 - Configuration:
-	- `IRONMESH_STARTUP_REPAIR_ENABLED` (default: `true`)
-	- `IRONMESH_STARTUP_REPAIR_DELAY_SECS` (default: `5`)
+	- `BERRYKEEP_STARTUP_REPAIR_ENABLED` (default: `true`)
+	- `BERRYKEEP_STARTUP_REPAIR_DELAY_SECS` (default: `5`)
 
 - When busy-throttle is enabled, each repair transfer waits while current in-flight request count is above the configured threshold.
 
@@ -356,13 +356,13 @@ The env vars referenced in the tuning subsections below are current operational 
 
 - Internal cluster traffic now uses a dedicated mTLS listener.
 - Required server env:
-	- `IRONMESH_INTERNAL_BIND`
-	- `IRONMESH_INTERNAL_URL`
-	- `IRONMESH_INTERNAL_TLS_CA_CERT`
-	- `IRONMESH_INTERNAL_TLS_CERT`
-	- `IRONMESH_INTERNAL_TLS_KEY`
+	- `BERRYKEEP_INTERNAL_BIND`
+	- `BERRYKEEP_INTERNAL_URL`
+	- `BERRYKEEP_INTERNAL_TLS_CA_CERT`
+	- `BERRYKEEP_INTERNAL_TLS_CERT`
+	- `BERRYKEEP_INTERNAL_TLS_KEY`
 - Peer node identity is derived from the client certificate SAN:
-	- `urn:ironmesh:node:<uuid>`
+	- `urn:berrykeep:node:<uuid>`
 - This internal listener is used for node-to-node replication, reconcile, and heartbeat traffic.
 
 - Obsolete note: the old internal token lifecycle bullets below are no longer current. Internal node traffic now uses mTLS as described above.
@@ -370,11 +370,11 @@ The env vars referenced in the tuning subsections below are current operational 
 ### Client device authentication
 
 - Public client auth is enabled by default.
-- Unauthenticated public client APIs are only intended for explicit local testing with `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS=true`; this is not part of the first-release runtime contract.
-- Public admin and maintenance routes are fail-closed. Use the local admin password flow or set `IRONMESH_ADMIN_TOKEN` for automation-oriented environments; nodes without either configured reject admin requests instead of leaving the surface open.
+- Unauthenticated public client APIs are only intended for explicit local testing with `BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS=true`; this is not part of the first-release runtime contract.
+- Public admin and maintenance routes are fail-closed. Use the local admin password flow or set `BERRYKEEP_ADMIN_TOKEN` for automation-oriented environments; nodes without either configured reject admin requests instead of leaving the surface open.
 - Admin can issue one-time pairing authorizations:
 	- `POST /auth/pairing-tokens/issue`
-	- header: `x-ironmesh-admin-token: <admin token>`
+	- header: `x-berrykeep-admin-token: <admin token>`
 - Clients enroll with a pairing token and receive issued credential material:
 	- `POST /auth/device/enroll`
 - Client-enrollment and bootstrap-claim redemption JSON should use `device_label` as the canonical label field; bare `label` is compatibility-only for older pre-release callers.

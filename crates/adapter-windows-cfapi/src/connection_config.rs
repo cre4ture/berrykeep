@@ -4,7 +4,7 @@ use crate::local_state::local_appdata_connection_bootstrap_path;
 use anyhow::{Context, Result, anyhow};
 use client_sdk::{
     BootstrapEndpoint, BootstrapEndpointUse, BootstrapTrustRoots, ClientIdentityMaterial,
-    ConnectionBootstrap, ManagedClientOptions, ManagedIronMeshClient, RelayMode,
+    ConnectionBootstrap, ManagedBerryKeepClient, ManagedClientOptions, RelayMode,
     normalize_server_base_url,
 };
 use reqwest::Url;
@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".ironmesh-connection.json";
+const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".berrykeep-connection.json";
 
 #[derive(Debug, Clone)]
 pub struct ResolvedConnectionConfig {
@@ -165,7 +165,7 @@ impl ResolvedConnectionConfig {
     pub fn build_managed_client(
         &self,
         client_identity: Option<&ClientIdentityMaterial>,
-    ) -> Result<ManagedIronMeshClient> {
+    ) -> Result<ManagedBerryKeepClient> {
         self.bootstrap.build_managed_client_blocking(
             client_identity.cloned(),
             ManagedClientOptions::default(),
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn resolve_connection_config_without_existing_bootstrap_targets_local_appdata_path() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-sync-root-local-appdata-bootstrap-{}",
+            "berrykeep-sync-root-local-appdata-bootstrap-{}",
             Uuid::now_v7()
         ));
         std::fs::create_dir_all(&sync_root).expect("sync root should exist");
@@ -214,10 +214,10 @@ mod tests {
     #[test]
     fn internal_connection_bootstrap_path_detection_matches_nested_and_root_relative_paths() {
         assert!(is_internal_connection_bootstrap_relative_path(
-            ".ironmesh-connection.json"
+            ".berrykeep-connection.json"
         ));
         assert!(is_internal_connection_bootstrap_relative_path(
-            "nested/.ironmesh-connection.json"
+            "nested/.berrykeep-connection.json"
         ));
         assert!(!is_internal_connection_bootstrap_relative_path(
             "nested/not-connection.json"
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn persist_connection_config_preserves_rendezvous_bootstrap_metadata() {
         let path = std::env::temp_dir().join(format!(
-            "ironmesh-windows-bootstrap-{}.json",
+            "berrykeep-windows-bootstrap-{}.json",
             Uuid::now_v7()
         ));
         let bootstrap = ConnectionBootstrap {
@@ -289,7 +289,8 @@ mod tests {
 
     #[test]
     fn resolve_connection_config_keeps_relay_bootstrap_without_direct_probe() {
-        let sync_root = std::env::temp_dir().join(format!("ironmesh-sync-root-{}", Uuid::now_v7()));
+        let sync_root =
+            std::env::temp_dir().join(format!("berrykeep-sync-root-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&sync_root).expect("sync root should exist");
         let bootstrap_path = local_appdata_connection_bootstrap_path(&sync_root);
         let bootstrap = ConnectionBootstrap {
@@ -345,7 +346,7 @@ mod tests {
     #[test]
     fn resolve_connection_config_does_not_force_reenroll_for_bootstrap_pairing_token() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-sync-root-no-force-reenroll-{}",
+            "berrykeep-sync-root-no-force-reenroll-{}",
             Uuid::now_v7()
         ));
         std::fs::create_dir_all(&sync_root).expect("sync root should exist");
@@ -401,7 +402,7 @@ mod tests {
     #[test]
     fn resolve_connection_config_does_not_read_legacy_sync_root_bootstrap_without_explicit_path() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-sync-root-legacy-bootstrap-{}",
+            "berrykeep-sync-root-legacy-bootstrap-{}",
             Uuid::now_v7()
         ));
         std::fs::create_dir_all(&sync_root).expect("sync root should exist");

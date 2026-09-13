@@ -17,7 +17,7 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await expect(page.getByText("Version info", { exact: true })).toBeVisible();
   await expect(page.getByText(/UI build:\s*\S+\s+\(.+\)/)).toBeVisible();
   await expect(page.getByText(/Backend build:\s*\S+\s+\(.+\)/)).toBeVisible();
-  await expect(page.getByRole("heading", { name: "ironmesh Server Node" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "berrykeep Server Node" })).toHaveCount(0);
   await expect(page.getByText("Server Admin", { exact: true })).toBeVisible();
 
   await expect(page.getByTestId("dashboard-cluster-nodes-card")).toContainText("1 / 1", { timeout: 60_000 });

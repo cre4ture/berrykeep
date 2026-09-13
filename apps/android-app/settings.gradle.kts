@@ -14,6 +14,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ironmesh-android"
+rootProject.name = "berrykeep-android"
 include(":app")
 include(":macrobenchmark")

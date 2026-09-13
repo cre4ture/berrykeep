@@ -18,7 +18,7 @@ Directory marker uploads should stay out of scope because they are internal book
 - The desktop folder agent already has a persistent state concept, but the default `StartupStateStore` root currently falls back to `std::env::temp_dir()`. That is a poor default for retained history because temp storage can be cleaned independently of the agent lifecycle.
 - Android continuous folder sync currently puts its state root under the app cache directory. Cache is also the wrong durability class for an audit/history surface because Android may evict it under storage pressure.
 - The runtime already has the right action boundaries for logging: uploads happen in `sync_local_changes`, and downloads happen in `download_remote_file` / `apply_remote_snapshot`.
-- The Android app already has the right presentation path: Rust JNI bridge -> `IronmeshRepository` -> `MainViewModel` -> Compose in `MainActivity`.
+- The Android app already has the right presentation path: Rust JNI bridge -> `BerryKeepRepository` -> `MainViewModel` -> Compose in `MainActivity`.
 
 ## Recommended Storage Location
 
@@ -29,7 +29,7 @@ Do not store the modification log inside the synced root.
 Reasons:
 
 - it becomes user-visible clutter,
-- it risks syncing internal agent state back into Ironmesh,
+- it risks syncing internal agent state back into BerryKeep,
 - it can be deleted or moved as part of normal user file activity,
 - it mixes operational state with customer data.
 
@@ -39,8 +39,8 @@ The log should live next to other agent-owned state under a durable, app-owned s
 
 Use a persistent state root derived from XDG state, not temp space:
 
-- preferred: `${XDG_STATE_HOME}/ironmesh/folder-agent/`
-- fallback: `${HOME}/.local/state/ironmesh/folder-agent/`
+- preferred: `${XDG_STATE_HOME}/berrykeep/folder-agent/`
+- fallback: `${HOME}/.local/state/berrykeep/folder-agent/`
 - last resort only: `std::env::temp_dir()` when neither environment is available
 
 Add a CLI override so tests and power users can pin it explicitly:
@@ -51,8 +51,8 @@ Add a CLI override so tests and power users can pin it explicitly:
 
 Use an app-internal durable directory, not `cacheDir`:
 
-- preferred: `context.noBackupFilesDir/ironmesh/folder-sync-state/`
-- acceptable fallback: `context.filesDir/ironmesh/folder-sync-state/`
+- preferred: `context.noBackupFilesDir/berrykeep/folder-sync-state/`
+- acceptable fallback: `context.filesDir/berrykeep/folder-sync-state/`
 
 `noBackupFilesDir` is the better default because this is runtime state/history, not user-authored content that should be restored onto a different device via OS backup.
 

@@ -1,6 +1,6 @@
 # Windows CFAPI Thumbnail Provider Plan
 
-Status: Design note plus initial fixed-bitmap prototype scaffold for Explorer thumbnails on dehydrated Ironmesh placeholders
+Status: Design note plus initial fixed-bitmap prototype scaffold for Explorer thumbnails on dehydrated BerryKeep placeholders
 
 Related notes:
 
@@ -9,8 +9,8 @@ Related notes:
 
 ## Goal
 
-- Show thumbnails in Windows Explorer for dehydrated Ironmesh placeholders without hydrating the full file.
-- Reuse the existing Ironmesh remote thumbnail service instead of inventing a second thumbnail pipeline.
+- Show thumbnails in Windows Explorer for dehydrated BerryKeep placeholders without hydrating the full file.
+- Reuse the existing BerryKeep remote thumbnail service instead of inventing a second thumbnail pipeline.
 - Keep the current CFAPI provider responsible for namespace, placeholder creation, hydration, pinning, and upload.
 
 ## Key conclusion
@@ -36,9 +36,9 @@ In other words:
     - `path=<remote path>`
     - `version=<remote version>`
 - `crates/adapter-windows-cfapi/src/connection_config.rs`
-  - persists `connection-bootstrap.json` under `%LocalAppData%\Ironmesh\sync-roots\...`
+  - persists `connection-bootstrap.json` under `%LocalAppData%\BerryKeep\sync-roots\...`
 - `crates/adapter-windows-cfapi/src/auth.rs`
-  - persists `client-identity.json` under `%LocalAppData%\Ironmesh\sync-roots\...`
+  - persists `client-identity.json` under `%LocalAppData%\BerryKeep\sync-roots\...`
 
 ### Remote thumbnail side
 
@@ -46,7 +46,7 @@ In other words:
   - exposes `/media/thumbnail` and `/auth/media/thumbnail`
 - `crates/web-ui-backend/src/lib.rs`
   - already proxies `/media/thumbnail`
-- `apps/android-app/app/src/main/java/io/ironmesh/android/saf/IronmeshDocumentsProvider.kt`
+- `apps/android-app/app/src/main/java/io/berrykeep/android/saf/BerryKeepDocumentsProvider.kt`
   - already streams remote thumbnails without hydrating the full object
 
 This means the missing part is not thumbnail generation. The missing part is Windows Explorer integration.
@@ -68,14 +68,14 @@ Do not try to overload the CFAPI fetch-data path to answer thumbnail requests. T
 
 ### 2. Add a separate Windows thumbnail handler
 
-Add a new packaged Shell component that implements the Explorer thumbnail-provider contract for Ironmesh placeholders.
+Add a new packaged Shell component that implements the Explorer thumbnail-provider contract for BerryKeep placeholders.
 
 Responsibilities:
 
 - receive a shell item/path for the placeholder,
-- determine the Ironmesh key and version for that placeholder,
+- determine the BerryKeep key and version for that placeholder,
 - load the connection bootstrap and client identity for the owning sync root,
-- fetch the thumbnail from Ironmesh,
+- fetch the thumbnail from BerryKeep,
 - return a bitmap to Explorer,
 - cache the result locally.
 
@@ -105,15 +105,15 @@ Add a reusable core crate for thumbnail fetch logic:
 Suggested responsibilities:
 
 - discover the sync root from a file path,
-- load `%LocalAppData%\Ironmesh\sync-roots\...\connection-bootstrap.json`,
-- load `%LocalAppData%\Ironmesh\sync-roots\...\client-identity.json`,
+- load `%LocalAppData%\BerryKeep\sync-roots\...\connection-bootstrap.json`,
+- load `%LocalAppData%\BerryKeep\sync-roots\...\client-identity.json`,
 - parse placeholder file identity or derive the remote key from the path,
-- build an authenticated `IronMeshClient`,
+- build an authenticated `BerryKeepClient`,
 - call the existing thumbnail endpoint,
 - cache thumbnail bytes and decode them into a bitmap-friendly form,
 - provide structured errors for the shell layer.
 
-This keeps Ironmesh-specific logic in Rust and shared with tests.
+This keeps BerryKeep-specific logic in Rust and shared with tests.
 
 ### New shell component
 
@@ -134,7 +134,7 @@ Recommended implementation style:
 
 - thin native COM DLL boundary,
 - minimal shell-specific code,
-- delegate Ironmesh logic into `crates/windows-thumbnail-core`.
+- delegate BerryKeep logic into `crates/windows-thumbnail-core`.
 
 Reasoning:
 
@@ -178,15 +178,15 @@ The thumbnail handler should not invent a second auth story.
 
 Use the same local sync-root artifacts the CFAPI provider already persists:
 
-- `%LocalAppData%\Ironmesh\sync-roots\...\connection-bootstrap.json`
-- `%LocalAppData%\Ironmesh\sync-roots\...\client-identity.json`
+- `%LocalAppData%\BerryKeep\sync-roots\...\connection-bootstrap.json`
+- `%LocalAppData%\BerryKeep\sync-roots\...\client-identity.json`
 
 Flow:
 
 1. Resolve the selected placeholder path to its owning sync root.
 2. Load the persisted connection bootstrap.
 3. Load the persisted client identity.
-4. Build `IronMeshClient`.
+4. Build `BerryKeepClient`.
 5. Request the existing thumbnail route.
 
 This keeps direct-vs-relay behavior consistent with the rest of the Windows integration.
@@ -209,7 +209,7 @@ This is an implementation recommendation, not a repo constraint yet.
 
 Add a thumbnail cache under the user profile, for example:
 
-- `%LocalAppData%\\Ironmesh\\thumbnail-cache`
+- `%LocalAppData%\\BerryKeep\\thumbnail-cache`
 
 Cache key should include:
 
@@ -241,14 +241,14 @@ Do not silently download the full file just to satisfy a thumbnail request.
 
 - create packaged thumbnail-provider COM DLL,
 - register it in the package manifest,
-- make it activate for the Ironmesh sync-root placeholders,
+- make it activate for the BerryKeep sync-root placeholders,
 - return a fixed test bitmap.
 
 Success criterion:
 
-- Explorer loads the handler for Ironmesh placeholders without hydrating the file.
+- Explorer loads the handler for BerryKeep placeholders without hydrating the file.
 
-### Phase 2: Ironmesh wiring
+### Phase 2: BerryKeep wiring
 
 - add `crates/windows-thumbnail-core`,
 - locate sync-root bootstrap + identity,
@@ -258,7 +258,7 @@ Success criterion:
 
 Success criterion:
 
-- dehydrated image placeholder shows the remote Ironmesh thumbnail.
+- dehydrated image placeholder shows the remote BerryKeep thumbnail.
 
 ### Phase 3: caching + diagnostics
 
@@ -288,14 +288,14 @@ Success criterion:
 
 ### Integration tests
 
-- package-installed thumbnail provider loads for a registered Ironmesh sync root,
+- package-installed thumbnail provider loads for a registered BerryKeep sync root,
 - dehydrated placeholder still reports dehydrated state after thumbnail fetch,
 - remote thumbnail is shown without full-file hydration,
 - cache invalidates when placeholder version changes.
 
 ### Manual validation
 
-1. Register and serve an Ironmesh CFAPI sync root.
+1. Register and serve an BerryKeep CFAPI sync root.
 2. Materialize dehydrated placeholders for image files.
 3. Open the directory in Explorer large-icon mode.
 4. Confirm:
@@ -318,13 +318,13 @@ Do not change the current CFAPI runtime first.
 Instead:
 
 1. create the packaged thumbnail-provider prototype returning a fixed bitmap,
-2. confirm Explorer loads it for Ironmesh placeholders,
+2. confirm Explorer loads it for BerryKeep placeholders,
 3. only then wire in `windows-thumbnail-core` and the existing remote thumbnail endpoint.
 
 That gives a clean risk split:
 
 - first prove the Shell registration path,
-- then connect Ironmesh transport/auth logic,
+- then connect BerryKeep transport/auth logic,
 - then optimize caching and metadata.
 
 ## Reference links

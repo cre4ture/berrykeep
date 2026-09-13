@@ -730,7 +730,7 @@ pub(crate) async fn run_setup_mode(
     let app = Router::new()
         .route("/", get(ui::index))
         .route("/health", get(setup_health))
-        .route("/ironmesh-favicon.svg", get(ui::favicon))
+        .route("/berrykeep-favicon.svg", get(ui::favicon))
         .route("/ui/app.css", get(ui::app_css))
         .route("/ui/app.js", get(ui::app_js))
         .route("/setup/status", get(get_setup_status))
@@ -1335,32 +1335,32 @@ fn resolve_setup_metadata_backend(
 
 fn explicit_runtime_env_vars_present() -> Vec<&'static str> {
     [
-        "IRONMESH_NODE_ENROLLMENT_FILE",
-        "IRONMESH_NODE_BOOTSTRAP_FILE",
-        "IRONMESH_NODE_ID",
-        "IRONMESH_CLUSTER_ID",
-        "IRONMESH_PUBLIC_URL",
-        "IRONMESH_PUBLIC_TLS_CERT",
-        "IRONMESH_PUBLIC_TLS_KEY",
-        "IRONMESH_PUBLIC_TLS_CA_CERT",
-        "IRONMESH_PUBLIC_TLS_CA_KEY",
-        "IRONMESH_INTERNAL_BIND",
-        "IRONMESH_INTERNAL_URL",
-        "IRONMESH_INTERNAL_TLS_CA_CERT",
-        "IRONMESH_INTERNAL_TLS_CERT",
-        "IRONMESH_INTERNAL_TLS_KEY",
-        "IRONMESH_INTERNAL_TLS_CA_KEY",
-        "IRONMESH_RENDEZVOUS_URLS",
-        "IRONMESH_RENDEZVOUS_CA_CERT",
-        "IRONMESH_RENDEZVOUS_MTLS_REQUIRED",
-        "IRONMESH_RELAY_MODE",
-        "IRONMESH_ADMIN_TOKEN",
-        "IRONMESH_REQUIRE_CLIENT_AUTH",
+        "BERRYKEEP_NODE_ENROLLMENT_FILE",
+        "BERRYKEEP_NODE_BOOTSTRAP_FILE",
+        "BERRYKEEP_NODE_ID",
+        "BERRYKEEP_CLUSTER_ID",
+        "BERRYKEEP_PUBLIC_URL",
+        "BERRYKEEP_PUBLIC_TLS_CERT",
+        "BERRYKEEP_PUBLIC_TLS_KEY",
+        "BERRYKEEP_PUBLIC_TLS_CA_CERT",
+        "BERRYKEEP_PUBLIC_TLS_CA_KEY",
+        "BERRYKEEP_INTERNAL_BIND",
+        "BERRYKEEP_INTERNAL_URL",
+        "BERRYKEEP_INTERNAL_TLS_CA_CERT",
+        "BERRYKEEP_INTERNAL_TLS_CERT",
+        "BERRYKEEP_INTERNAL_TLS_KEY",
+        "BERRYKEEP_INTERNAL_TLS_CA_KEY",
+        "BERRYKEEP_RENDEZVOUS_URLS",
+        "BERRYKEEP_RENDEZVOUS_CA_CERT",
+        "BERRYKEEP_RENDEZVOUS_MTLS_REQUIRED",
+        "BERRYKEEP_RELAY_MODE",
+        "BERRYKEEP_ADMIN_TOKEN",
+        "BERRYKEEP_REQUIRE_CLIENT_AUTH",
     ]
     .iter()
     .copied()
     .filter(|key| {
-        std::env::var(*key)
+        common::legacy_compatibility::var(*key)
             .ok()
             .is_some_and(|value| !value.trim().is_empty())
     })
@@ -1468,12 +1468,12 @@ fn transition_managed_setup_state_to_recovery(
 
 fn default_setup_bootstrap_config() -> Result<SetupBootstrapConfig> {
     let data_dir = PathBuf::from(
-        std::env::var("BERRYKEEP_SERVER_NODE_DATA_DIR")
-            .or_else(|_| std::env::var("IRONMESH_DATA_DIR"))
+        common::legacy_compatibility::var("BERRYKEEP_SERVER_NODE_DATA_DIR")
+            .or_else(|_| common::legacy_compatibility::var("BERRYKEEP_DATA_DIR"))
             .unwrap_or_else(|_| "./data/server-node".to_string()),
     );
-    let bind_addr: SocketAddr = std::env::var("BERRYKEEP_SERVER_NODE_BIND")
-        .or_else(|_| std::env::var("IRONMESH_SERVER_BIND"))
+    let bind_addr: SocketAddr = common::legacy_compatibility::var("BERRYKEEP_SERVER_NODE_BIND")
+        .or_else(|_| common::legacy_compatibility::var("BERRYKEEP_SERVER_BIND"))
         .unwrap_or_else(|_| "0.0.0.0:8443".to_string())
         .parse()
         .context("invalid server-node bind address for bootstrap setup mode")?;
@@ -1730,7 +1730,7 @@ fn migrate_managed_setup_metadata_backend(
     if state.metadata_backend.is_some() {
         return Ok(false);
     }
-    let legacy_env_value = std::env::var(METADATA_BACKEND_ENV).ok();
+    let legacy_env_value = common::legacy_compatibility::var(METADATA_BACKEND_ENV).ok();
     migrate_managed_setup_metadata_backend_with_value(path, state, legacy_env_value.as_deref())
 }
 
@@ -1777,7 +1777,7 @@ fn populate_legacy_metadata_backend_from_env(state: &mut ManagedSetupState) -> R
             state.version
         );
     }
-    let legacy_env_value = std::env::var(METADATA_BACKEND_ENV).ok();
+    let legacy_env_value = common::legacy_compatibility::var(METADATA_BACKEND_ENV).ok();
     state.metadata_backend = Some(legacy_setup_metadata_backend(legacy_env_value.as_deref())?);
     Ok(())
 }
@@ -2195,7 +2195,7 @@ fn generate_bootstrap_tls_identity(bind_addr: SocketAddr) -> Result<(String, Str
     params.distinguished_name = DistinguishedName::new();
     params
         .distinguished_name
-        .push(DnType::CommonName, "ironmesh-bootstrap-ui");
+        .push(DnType::CommonName, "berrykeep-bootstrap-ui");
     params.is_ca = IsCa::NoCa;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.not_before = OffsetDateTime::from_unix_timestamp(unix_ts().saturating_sub(300) as i64)
@@ -2216,9 +2216,9 @@ fn generate_bootstrap_tls_identity(bind_addr: SocketAddr) -> Result<(String, Str
             .subject_alt_names
             .push(SanType::IpAddress(bind_addr.ip()));
     }
-    if let Some(hostname) = std::env::var("COMPUTERNAME")
+    if let Some(hostname) = common::legacy_compatibility::var("COMPUTERNAME")
         .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| common::legacy_compatibility::var("HOSTNAME").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
@@ -2272,9 +2272,10 @@ fn generate_cluster_ca(cluster_id: ClusterId) -> Result<(String, String)> {
     let mut params =
         CertificateParams::new(Vec::new()).context("failed creating cluster CA params")?;
     params.distinguished_name = DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, format!("ironmesh-cluster-{cluster_id}"));
+    params.distinguished_name.push(
+        DnType::CommonName,
+        format!("berrykeep-cluster-{cluster_id}"),
+    );
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.not_before = OffsetDateTime::from_unix_timestamp(unix_ts().saturating_sub(300) as i64)
         .context("failed setting cluster CA not_before")?;
@@ -2302,7 +2303,7 @@ fn issue_internal_node_tls_material_from_ca(
     params.distinguished_name = DistinguishedName::new();
     params.distinguished_name.push(
         DnType::CommonName,
-        format!("ironmesh-node-{}", bootstrap.node_id),
+        format!("berrykeep-node-{}", bootstrap.node_id),
     );
     params.is_ca = IsCa::NoCa;
     params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64)
@@ -2346,7 +2347,7 @@ fn issue_public_node_tls_material_from_ca(
     params.distinguished_name = DistinguishedName::new();
     params.distinguished_name.push(
         DnType::CommonName,
-        format!("ironmesh-public-{}", bootstrap.node_id),
+        format!("berrykeep-public-{}", bootstrap.node_id),
     );
     params.is_ca = IsCa::NoCa;
     params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64)
@@ -2359,14 +2360,14 @@ fn issue_public_node_tls_material_from_ca(
     // continue to use the DNS/IP SANs supplied by the bootstrap origin.
     let mut subject_alt_names = build_public_node_subject_alt_names(bootstrap)?;
     subject_alt_names.push(SanType::URI(
-        format!("urn:ironmesh:node:{}", bootstrap.node_id)
+        format!("urn:berrykeep:node:{}", bootstrap.node_id)
             .try_into()
-            .context("invalid IronMesh node identity URI SAN")?,
+            .context("invalid BerryKeep node identity URI SAN")?,
     ));
     subject_alt_names.push(SanType::URI(
-        format!("urn:ironmesh:cluster:{}", bootstrap.cluster_id)
+        format!("urn:berrykeep:cluster:{}", bootstrap.cluster_id)
             .try_into()
-            .context("invalid IronMesh cluster identity URI SAN")?,
+            .context("invalid BerryKeep cluster identity URI SAN")?,
     ));
     params.subject_alt_names = subject_alt_names;
     let key_pair = KeyPair::generate().context("failed generating public TLS keypair")?;
@@ -2485,7 +2486,7 @@ pub(crate) fn issue_managed_rendezvous_tls_identity_from_ca(
     params.distinguished_name = DistinguishedName::new();
     params.distinguished_name.push(
         DnType::CommonName,
-        format!("ironmesh-rendezvous-{cluster_id}"),
+        format!("berrykeep-rendezvous-{cluster_id}"),
     );
     params.is_ca = IsCa::NoCa;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -2524,7 +2525,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = Uuid::now_v7();
-        let path = std::env::temp_dir().join(format!("ironmesh-setup-{name}-{unique}"));
+        let path = std::env::temp_dir().join(format!("berrykeep-setup-{name}-{unique}"));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
@@ -2824,7 +2825,7 @@ mod tests {
     #[test]
     fn relative_enrollment_data_dir_materializes_tls_paths_exactly_once() {
         let relative_data_dir = PathBuf::from("target")
-            .join(format!("ironmesh-relative-enrollment-{}", Uuid::now_v7()));
+            .join(format!("berrykeep-relative-enrollment-{}", Uuid::now_v7()));
         let absolute_data_dir = std::env::current_dir().unwrap().join(&relative_data_dir);
         let _ = std::fs::remove_dir_all(&absolute_data_dir);
         let bind_addr = "127.0.0.1:28443".parse::<SocketAddr>().unwrap();
@@ -2856,7 +2857,7 @@ mod tests {
             managed_startup_bootstrap_config(setup_dir.clone(), "127.0.0.1:28444".parse().unwrap())
                 .unwrap();
         let relative_runtime_data_dir = PathBuf::from("target").join(format!(
-            "ironmesh-legacy-managed-runtime-{}",
+            "berrykeep-legacy-managed-runtime-{}",
             Uuid::now_v7()
         ));
         let absolute_runtime_data_dir = std::env::current_dir()

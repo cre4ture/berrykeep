@@ -19,7 +19,7 @@ import {
   type GalleryMapViewport
 } from "./gallery-map-viewport";
 
-const MBTILES_PROTOCOL = "ironmesh-mbtiles";
+const MBTILES_PROTOCOL = "berrykeep-mbtiles";
 const SQLJS_WORKER_URL = new URL(
   "sql.js-httpvfs/dist/sqlite.worker.js",
   import.meta.url
@@ -1857,7 +1857,7 @@ function buildHybridStyle(
 
 /**
  * Natural Earth does not use OpenMapTiles source-layer names. These are the
- * intentionally small overlay layers produced for IronMesh Natural Earth
+ * intentionally small overlay layers produced for BerryKeep Natural Earth
  * packages: `ne_boundaries`, `ne_roads`, and `ne_places`. Missing optional
  * layers are harmless in MapLibre, so an administrator can import a cities-
  * only overlay before adding roads later.
@@ -2100,7 +2100,7 @@ function absolutizeStyleUrl(urlValue: string): string {
   const placeholderMap = new Map<string, string>();
 
   for (const [index, token] of tokens.entries()) {
-    const placeholder = `__ironmesh_style_token_${index}__`;
+    const placeholder = `__berrykeep_style_token_${index}__`;
     normalizedUrl = normalizedUrl.replace(token, placeholder);
     placeholderMap.set(placeholder, token);
   }
