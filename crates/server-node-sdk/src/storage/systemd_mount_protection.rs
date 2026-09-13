@@ -7,14 +7,14 @@ use std::path::{Component, PathBuf};
 use std::process::Stdio;
 #[cfg(all(target_os = "linux", not(test)))]
 use std::sync::OnceLock;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::time::Duration;
 #[cfg(all(target_os = "linux", not(test)))]
 use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use tokio::process::Command;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use tokio::time::timeout;
 
 use super::StoragePathConfig;
@@ -682,13 +682,13 @@ async fn mount_protection_targets_for_current_process(
     .map_err(|error| format!("mount protection path inspection failed: {error}"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 struct ResolvedMountProtectionPath {
     path: PathBuf,
     failed: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 async fn resolve_mount_protection_path(path: &Path) -> ResolvedMountProtectionPath {
     let lexical_path = absolutize_mount_protection_path(path);
     let path = path.to_path_buf();
@@ -803,7 +803,9 @@ fn backing_mount_points_for_path(
     mount_points
         .iter()
         .filter(|candidate| {
-            candidate.device == mount_point.device && candidate.path != mount_point.path
+            candidate.device == mount_point.device
+                && candidate.path != mount_point.path
+                && candidate.path != Path::new("/")
         })
         .filter(|candidate| filesystem_path.starts_with(&candidate.root))
         .map(|candidate| candidate.path.clone())
@@ -1617,5 +1619,37 @@ mod tests {
             ),
             vec![PathBuf::from("/mnt/data")]
         );
+    }
+
+    #[test]
+    fn subvolume_mount_cannot_use_root_as_a_backing_dependency() {
+        let mount_points = mount_points_from_mountinfo(
+            "36 25 0:30 / / rw,nosuid,nodev - btrfs /dev/sda2 rw\n37 25 0:30 /data /mnt/data rw,nosuid,nodev - btrfs /dev/sda2 rw\n",
+        );
+        let mount_point = mount_point_for_path(Path::new("/mnt/data/pool"), &mount_points).unwrap();
+        let target = MountProtectionTarget {
+            id: "systemd-mount-storage-primary".to_string(),
+            feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
+            path: PathBuf::from("/mnt/data/pool"),
+            mount_point: Some(mount_point.path.clone()),
+            mount_point_is_bind: true,
+            backing_mount_points: backing_mount_points_for_path(
+                Path::new("/mnt/data/pool"),
+                mount_point,
+                &mount_points,
+            ),
+            path_resolution_failed: false,
+            missing_severity: HostDependencySeverity::Critical,
+        };
+        let checks = checks_for_inspection(
+            &[target],
+            dependencies_with_host_mount_points(
+                vec![systemd_mount("-.mount", "/")],
+                &["/", "/mnt/data"],
+            ),
+        );
+
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Critical);
     }
 }
