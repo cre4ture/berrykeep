@@ -13762,6 +13762,45 @@ fn store_index_query_rejects_unknown_projection_views() {
     assert!(error.to_string().contains("unknown variant"));
 }
 
+#[tokio::test]
+async fn store_index_query_rejection_exposes_the_children_capability_signal() {
+    #[derive(serde::Deserialize)]
+    struct LegacyStoreIndexQuery {
+        view: Option<LegacyStoreIndexView>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyStoreIndexView {
+        Raw,
+        Tree,
+    }
+
+    async fn accept_store_index_query(Query(query): Query<LegacyStoreIndexQuery>) -> StatusCode {
+        let _ = query.view;
+        StatusCode::NO_CONTENT
+    }
+
+    let app = Router::new().route("/api/v1/store/index", get(accept_store_index_query));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/store/index?view=children")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("query route should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("query rejection body should be readable");
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("unknown variant"));
+    assert!(body.contains("children"));
+}
+
 #[test]
 fn store_index_object_map_filter_respects_prefix_boundaries() {
     let (hashes, object_ids) = super::filter_store_index_object_maps_for_prefix(
