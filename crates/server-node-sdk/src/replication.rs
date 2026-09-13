@@ -495,7 +495,7 @@ async fn execute_replication_repair_plan(
             {
                 Ok(Some(bundle))
                     if store
-                        .verify_replication_source(&bundle.manifest_hash, local_missing)
+                        .check_owned_replica_presence(&bundle.manifest_hash)
                         .await
                         .is_ok() =>
                 {
@@ -506,8 +506,8 @@ async fn execute_replication_repair_plan(
         };
 
         if bundle.is_some() && local_missing {
-            // Only verified bytes, never an exportable manifest alone, establish
-            // a local replica. Availability refresh may not have seen a new write yet.
+            // An already-owned, complete replica can be re-advertised without a
+            // second scrub. Unowned cache and pending integrity findings cannot.
             info!(
                 repair_run_id,
                 subject = %item.key,

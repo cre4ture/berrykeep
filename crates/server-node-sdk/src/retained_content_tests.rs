@@ -1,5 +1,73 @@
 use super::*;
 
+async fn retained_content_source_presence_is_not_a_second_scrub_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend.init_store("source-presence-cost").await;
+    let put = store
+        .put_object_versioned(
+            "owned.bin",
+            Bytes::from_static(b"known bytes"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    fs::write(
+        store.chunk_path_for_test(&hash_hex(b"known bytes")),
+        b"other bytes",
+    )
+    .await
+    .unwrap();
+    // An audit uses the same cheap presence contract as availability. Only scrub
+    // and repair completion rehash the payload; repeating that work on every
+    // under-replication pass would read the whole store indefinitely.
+    assert!(
+        store
+            .check_owned_replica_presence(&put.manifest_hash)
+            .await
+            .is_ok(),
+        "routine source checks must inspect sizes, not rehash owned chunk payloads"
+    );
+    assert!(store.run_data_scrub().await.unwrap().issue_count > 0);
+    let reference = store
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject("owned.bin")
+        .unwrap()
+        .clone();
+    let task = content_recovery::ContentRepairTask::new(reference, true);
+    store.persist_content_repair_task(&task).await.unwrap();
+    assert!(
+        store
+            .check_owned_replica_presence(&put.manifest_hash)
+            .await
+            .is_err(),
+        "a pending integrity finding overrides matching sizes"
+    );
+    assert!(
+        store.finish_content_repair(&task).await.is_err(),
+        "completion must still verify the full content hash"
+    );
+    store
+        .ingest_chunk(&hash_hex(b"known bytes"), b"known bytes")
+        .await
+        .unwrap();
+    store.finish_content_repair(&task).await.unwrap();
+    assert!(
+        store
+            .check_owned_replica_presence(&put.manifest_hash)
+            .await
+            .is_ok()
+    );
+    drop(store);
+    fs::remove_dir_all(root).await.unwrap();
+}
+
+run_on_all_metadata_backends!(
+    retained_content_source_presence_is_not_a_second_scrub_impl,
+    retained_content_source_presence_is_not_a_second_scrub,
+    retained_content_source_presence_is_not_a_second_scrub_turso
+);
+
 #[test]
 fn retained_content_identity_does_not_require_a_path() {
     let reference = retained_content::RetainedReference {
@@ -84,6 +152,18 @@ async fn retained_content_metadata_only_is_not_a_broken_replica_impl(backend: St
         .await
         .unwrap();
     assert!(target.list_replication_subjects().await.unwrap().is_empty());
+    let hash = target
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject("metadata.bin")
+        .unwrap()
+        .manifest_hash
+        .clone();
+    assert!(
+        target.check_owned_replica_presence(&hash).await.is_err(),
+        "a cheap replica presence check must not accept unowned cache content"
+    );
     drop(source);
     drop(target);
     fs::remove_dir_all(source_root).await.unwrap();

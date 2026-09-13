@@ -474,6 +474,17 @@ impl MetadataStore for TursoMetadataStore {
         Ok(keys)
     }
 
+    async fn content_repair_pending(&self, manifest_hash: &str) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM content_repair_tasks WHERE manifest_hash=?1",
+                [manifest_hash],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
     async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
         let mut rows = self
             .connection
