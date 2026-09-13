@@ -24,7 +24,7 @@ use client_sdk::{
     normalize_server_base_url,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -438,16 +438,21 @@ fn effective_client_edge_state_dir(args: &Args) -> Result<PathBuf> {
 
 fn default_client_edge_state_dir(args: &Args) -> Result<PathBuf> {
     let state_home = xdg_state_home().unwrap_or_else(std::env::temp_dir);
-    let mut path = state_home
+    let mut canonical_path = state_home
         .join("berrykeep")
+        .join("os-integration")
+        .join("client-rights-edge");
+    let mut legacy_path = state_home
+        .join("ironmesh")
         .join("os-integration")
         .join("client-rights-edge");
     let scope = client_edge_scope_label(args);
     if scope.is_empty() {
         anyhow::bail!("failed to derive client-rights edge storage scope");
     }
-    path.push(scope);
-    Ok(path)
+    canonical_path.push(&scope);
+    legacy_path.push(scope);
+    migrate_legacy_state_dir(&canonical_path, &legacy_path)
 }
 
 fn xdg_state_home() -> Option<PathBuf> {
@@ -481,14 +486,55 @@ fn client_edge_scope_label(args: &Args) -> String {
 
 fn download_stage_root(args: &Args) -> Result<PathBuf> {
     let state_home = xdg_state_home().unwrap_or_else(std::env::temp_dir);
-    let path = state_home
+    let scope = download_scope_label(args);
+    let canonical_path = state_home
         .join("berrykeep")
         .join("os-integration")
         .join("downloads")
-        .join(download_scope_label(args));
+        .join(&scope);
+    let legacy_path = state_home
+        .join("ironmesh")
+        .join("os-integration")
+        .join("downloads")
+        .join(scope);
+    let path = migrate_legacy_state_dir(&canonical_path, &legacy_path)?;
     fs::create_dir_all(&path)
         .with_context(|| format!("failed to create download stage root {}", path.display()))?;
     Ok(path)
+}
+
+fn migrate_legacy_state_dir(canonical_path: &Path, legacy_path: &Path) -> Result<PathBuf> {
+    if canonical_path.exists() || !legacy_path.exists() {
+        return Ok(canonical_path.to_path_buf());
+    }
+
+    let parent = canonical_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "canonical state path has no parent: {}",
+            canonical_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create canonical state parent {}",
+            parent.display()
+        )
+    })?;
+
+    match fs::rename(legacy_path, canonical_path) {
+        Ok(()) => Ok(canonical_path.to_path_buf()),
+        Err(_) if canonical_path.exists() || !legacy_path.exists() => {
+            Ok(canonical_path.to_path_buf())
+        }
+        Err(error) => {
+            tracing::warn!(
+                "failed to migrate legacy Linux FUSE state from {} to {}: {error}; using the legacy location",
+                legacy_path.display(),
+                canonical_path.display(),
+            );
+            Ok(legacy_path.to_path_buf())
+        }
+    }
 }
 
 fn download_scope_label(args: &Args) -> String {
@@ -1303,6 +1349,26 @@ mod tests {
 
         let derived = effective_client_edge_state_dir(&args).unwrap();
         assert_eq!(derived, PathBuf::from("/tmp/custom-edge-state"));
+    }
+
+    #[test]
+    fn legacy_linux_fuse_state_directory_migrates_to_canonical_location() {
+        let root = unique_temp_dir("legacy-state-migration");
+        let canonical = root.join("berrykeep/os-integration/client-rights-edge/scope");
+        let legacy = root.join("ironmesh/os-integration/client-rights-edge/scope");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("snapshot.json"), b"legacy snapshot").unwrap();
+
+        let resolved = migrate_legacy_state_dir(&canonical, &legacy).unwrap();
+
+        assert_eq!(resolved, canonical);
+        assert_eq!(
+            fs::read(resolved.join("snapshot.json")).unwrap(),
+            b"legacy snapshot"
+        );
+        assert!(!legacy.exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
