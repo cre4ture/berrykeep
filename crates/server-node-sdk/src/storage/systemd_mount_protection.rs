@@ -84,7 +84,6 @@ struct MountProtectionTarget {
     path: PathBuf,
     mount_point: Option<PathBuf>,
     mount_point_is_bind: bool,
-    allows_root_filesystem: bool,
     missing_severity: HostDependencySeverity,
 }
 
@@ -185,33 +184,30 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
     };
 
     let mount_units = ordered_mount_units_from_service_properties(&service_dependencies);
-    if mount_units.is_empty() {
-        return SystemdMountProtectionInspection::Dependencies {
-            service: service.name,
-            mounts: Vec::new(),
-            host_mount_points: BTreeSet::new(),
+    let mounts = if mount_units.is_empty() {
+        Vec::new()
+    } else {
+        let mut where_arguments = Vec::with_capacity(mount_units.len() + 5);
+        where_arguments.extend(["show", "--all", "--property=Id", "--property=Where"]);
+        where_arguments.push("--");
+        where_arguments.extend(mount_units.iter().map(String::as_str));
+        let where_output = match run_systemctl(&systemctl, where_arguments).await {
+            Ok(output) => output,
+            Err(reason) => {
+                return SystemdMountProtectionInspection::QueryFailed {
+                    service: service.name,
+                    reason,
+                };
+            }
         };
-    }
-    let mut where_arguments = Vec::with_capacity(mount_units.len() + 5);
-    where_arguments.extend(["show", "--all", "--property=Id", "--property=Where"]);
-    where_arguments.push("--");
-    where_arguments.extend(mount_units.iter().map(String::as_str));
-    let where_output = match run_systemctl(&systemctl, where_arguments).await {
-        Ok(output) => output,
-        Err(reason) => {
-            return SystemdMountProtectionInspection::QueryFailed {
-                service: service.name,
-                reason,
-            };
-        }
-    };
-    let mounts = match mount_dependencies_from_properties(&mount_units, &where_output) {
-        Ok(mounts) => mounts,
-        Err(reason) => {
-            return SystemdMountProtectionInspection::QueryFailed {
-                service: service.name,
-                reason,
-            };
+        match mount_dependencies_from_properties(&mount_units, &where_output) {
+            Ok(mounts) => mounts,
+            Err(reason) => {
+                return SystemdMountProtectionInspection::QueryFailed {
+                    service: service.name,
+                    reason,
+                };
+            }
         }
     };
     let host_mount_points = match run_systemctl(
@@ -536,7 +532,6 @@ fn mount_protection_targets(
         mount_point: data_dir_mount_point.map(|mount_point| mount_point.path.clone()),
         mount_point_is_bind: data_dir_mount_point
             .is_some_and(|mount_point| mount_point.root != Path::new("/")),
-        allows_root_filesystem: true,
         path: data_dir,
         missing_severity: HostDependencySeverity::Critical,
     }];
@@ -560,7 +555,6 @@ fn mount_protection_targets(
                     mount_point: mount_point.map(|mount_point| mount_point.path.clone()),
                     mount_point_is_bind: mount_point
                         .is_some_and(|mount_point| mount_point.root != Path::new("/")),
-                    allows_root_filesystem: true,
                     path,
                     missing_severity: match configured_path.state {
                         StoragePathState::Active => HostDependencySeverity::Critical,
@@ -764,7 +758,7 @@ fn checks_for_inspection(
                         )),
                         install_hint: None,
                     },
-                    None if target.mount_point.as_deref() == Some(Path::new("/")) && target.allows_root_filesystem => HostDependencyCheck {
+                    None if target.mount_point.as_deref() == Some(Path::new("/")) && expected_host_mount_point(target, &host_mount_points).is_none() => HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
                         status: HostDependencyStatus::NotApplicable,
@@ -862,6 +856,19 @@ fn nearest_ancestor_mount_dependency<'a>(
             mount.where_path != Path::new("/") && target.path.starts_with(&mount.where_path)
         })
         .max_by_key(|mount| mount.where_path.components().count())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn expected_host_mount_point<'a>(
+    target: &MountProtectionTarget,
+    host_mount_points: &'a BTreeSet<PathBuf>,
+) -> Option<&'a PathBuf> {
+    host_mount_points
+        .iter()
+        .filter(|mount_point| {
+            *mount_point != Path::new("/") && target.path.starts_with(mount_point)
+        })
+        .max_by_key(|mount_point| mount_point.components().count())
 }
 
 #[cfg(test)]
@@ -1152,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn root_filesystem_is_not_applicable_for_data_and_storage_paths() {
+    fn root_filesystem_distinguishes_unconfigured_and_expected_storage_paths() {
         let targets = vec![
             MountProtectionTarget {
                 id: "systemd-mount-data-dir".to_string(),
@@ -1160,7 +1167,6 @@ mod tests {
                 path: PathBuf::from("/var/lib/berrykeep"),
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
-                allows_root_filesystem: true,
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
@@ -1170,7 +1176,6 @@ mod tests {
                 path: PathBuf::from("/var/lib/berrykeep"),
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
-                allows_root_filesystem: true,
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
@@ -1179,7 +1184,6 @@ mod tests {
                 path: PathBuf::from("/var/lib/berrykeep/pool-a"),
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
-                allows_root_filesystem: true,
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
@@ -1188,12 +1192,16 @@ mod tests {
                 path: PathBuf::from("/mnt/primary"),
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
-                allows_root_filesystem: true,
                 missing_severity: HostDependencySeverity::Critical,
             },
         ];
-        let checks =
-            checks_for_inspection(&targets, dependencies(vec![systemd_mount("-.mount", "/")]));
+        let checks = checks_for_inspection(
+            &targets,
+            dependencies_with_host_mount_points(
+                vec![systemd_mount("-.mount", "/")],
+                &["/", "/mnt/primary"],
+            ),
+        );
 
         let root = checks
             .iter()
@@ -1225,9 +1233,15 @@ mod tests {
             .iter()
             .find(|check| check.id == "systemd-mount-storage-primary")
             .unwrap();
-        assert_eq!(root_storage.status, HostDependencyStatus::NotApplicable);
-        assert_eq!(root_storage.severity, HostDependencySeverity::Info);
-        assert!(root_storage.install_hint.is_none());
+        assert_eq!(root_storage.status, HostDependencyStatus::Missing);
+        assert_eq!(root_storage.severity, HostDependencySeverity::Critical);
+        assert!(
+            root_storage
+                .install_hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Mount the intended filesystem")
+        );
     }
 
     #[test]
@@ -1238,7 +1252,6 @@ mod tests {
             path: PathBuf::from("/srv/pool/media"),
             mount_point: Some(PathBuf::from("/srv/pool")),
             mount_point_is_bind: false,
-            allows_root_filesystem: false,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
@@ -1266,7 +1279,6 @@ mod tests {
             path: PathBuf::from("/srv/berrykeep"),
             mount_point: Some(PathBuf::from("/srv/berrykeep")),
             mount_point_is_bind: true,
-            allows_root_filesystem: true,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
