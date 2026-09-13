@@ -965,7 +965,7 @@ export function GallerySurface({
       !scope ||
       update.prefix !== scope.prefix ||
       update.snapshotId !== scope.snapshotId ||
-      update.options.view !== "tree"
+      (update.options.view !== "tree" && update.options.view !== "children")
     ) {
       return;
     }

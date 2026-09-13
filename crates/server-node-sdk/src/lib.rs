@@ -13380,7 +13380,6 @@ struct StoreIndexQuery {
     prefix: Option<String>,
     depth: Option<usize>,
     snapshot: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_store_index_view")]
     view: Option<StoreIndexView>,
     cursor: Option<String>,
     page_size: Option<usize>,
@@ -13548,23 +13547,6 @@ enum StoreIndexView {
     /// Directory browsers use this view so an explicit marker for the current
     /// directory is never presented as one of its children.
     Children,
-}
-
-fn deserialize_optional_store_index_view<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<StoreIndexView>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    Ok(match value.as_deref() {
-        Some("raw") => Some(StoreIndexView::Raw),
-        Some("tree") => Some(StoreIndexView::Tree),
-        Some("children") => Some(StoreIndexView::Children),
-        // A view is a projection preference. Ignore a projection introduced
-        // by a newer client instead of rejecting the entire list request.
-        _ => None,
-    })
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

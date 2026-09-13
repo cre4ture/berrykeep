@@ -13753,13 +13753,13 @@ fn store_index_children_plan_excludes_the_queried_directory_marker() {
 }
 
 #[test]
-fn store_index_query_ignores_unknown_projection_views() {
-    let query: super::StoreIndexQuery = serde_json::from_value(serde_json::json!({
+fn store_index_query_rejects_unknown_projection_views() {
+    let error = serde_json::from_value::<super::StoreIndexQuery>(serde_json::json!({
         "view": "future_projection",
     }))
-    .expect("unknown projection views should remain query-compatible");
+    .expect_err("unknown projections must produce the compatibility error");
 
-    assert_eq!(query.view, None);
+    assert!(error.to_string().contains("unknown variant"));
 }
 
 #[test]

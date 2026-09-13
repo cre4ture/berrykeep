@@ -1425,6 +1425,7 @@ test("client-ui gallery visibly replaces restored data after background revalida
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
   await expect(page.getByText("gallery/revalidated.png", { exact: true })).toBeVisible();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("revalidated-folder/", { exact: true })).toBeVisible();
   expect(mocks.galleryStoreListRequestCount()).toBe(initialRequestCount + 2);
 });
 
@@ -3198,27 +3199,30 @@ function createMockStoreEntries(): MockStoreEntry[] {
 }
 
 function createRevalidatedGalleryMockStoreEntries(): MockStoreEntry[] {
-  return createMockStoreEntries().map((entry) => {
-    if (entry.path !== "gallery/cat.png" || !entry.media) {
-      return entry;
-    }
-    return {
-      ...entry,
-      path: "gallery/revalidated.png",
-      media: {
-        ...entry.media,
-        content_fingerprint: "fingerprint-revalidated",
-        thumbnail: {
-          url: "/media/thumbnail?key=gallery%2Frevalidated.png",
-          profile: "grid",
-          width: 256,
-          height: 192,
-          format: "jpeg",
-          size_bytes: 1234
-        }
+  return [
+    ...createMockStoreEntries().map((entry) => {
+      if (entry.path !== "gallery/cat.png" || !entry.media) {
+        return entry;
       }
-    };
-  });
+      return {
+        ...entry,
+        path: "gallery/revalidated.png",
+        media: {
+          ...entry.media,
+          content_fingerprint: "fingerprint-revalidated",
+          thumbnail: {
+            url: "/media/thumbnail?key=gallery%2Frevalidated.png",
+            profile: "grid",
+            width: 256,
+            height: 192,
+            format: "jpeg",
+            size_bytes: 1234
+          }
+        }
+      };
+    }),
+    { path: "revalidated-folder/", entry_type: "prefix" }
+  ];
 }
 
 async function expireGalleryCacheSchema(page: Page): Promise<void> {
