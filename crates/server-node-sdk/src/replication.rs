@@ -23,9 +23,6 @@ pub(crate) struct ReplicationRepairReport {
 
 impl ReplicationRepairReport {
     pub(crate) fn run_status(&self) -> RepairRunStatus {
-        if self.failed_transfers == 0 && self.skipped_items == 0 {
-            return RepairRunStatus::Completed;
-        }
         let chunk_progress = self.detailed_log.iter().any(|entry| {
             entry
                 .context
@@ -34,17 +31,39 @@ impl ReplicationRepairReport {
                 .and_then(serde_json::Value::as_u64)
                 .is_some_and(|n| n > 0)
         });
-        if self.successful_transfers > 0 || chunk_progress {
-            return RepairRunStatus::PartiallyRepaired;
-        }
-        if self
+        let waiting_for_source = self
             .detailed_log
             .iter()
-            .any(|entry| entry.event == "repair_waiting")
-        {
+            .any(|entry| entry.event == "repair_waiting");
+        let unresolved = self
+            .detailed_log
+            .iter()
+            .any(|entry| entry.event == "repair_unresolved");
+
+        if self.failed_transfers > 0 {
+            if self.successful_transfers > 0 || chunk_progress {
+                return RepairRunStatus::PartiallyRepaired;
+            }
+            if waiting_for_source {
+                return RepairRunStatus::WaitingForSource;
+            }
+            return RepairRunStatus::Unresolved;
+        }
+
+        // Plan execution runs on every node. A node that is not an owned source
+        // for an under-replicated subject correctly skips that bundle; it did not
+        // fail a repair and must not turn the run red. Content recovery records
+        // its durable pending state explicitly through these events.
+        if waiting_for_source {
             return RepairRunStatus::WaitingForSource;
         }
-        RepairRunStatus::Unresolved
+        if unresolved {
+            return RepairRunStatus::Unresolved;
+        }
+        if self.skipped_items > 0 && (self.successful_transfers > 0 || chunk_progress) {
+            return RepairRunStatus::PartiallyRepaired;
+        }
+        RepairRunStatus::Completed
     }
 }
 
@@ -2172,6 +2191,37 @@ mod tests {
             detailed_log.last().map(|entry| entry.detail.as_str()),
             Some(expected_last.as_str())
         );
+    }
+
+    #[test]
+    fn repair_status_treats_a_non_source_bundle_skip_as_completed() {
+        let node_id = NodeId::new_v4();
+        let mut report = empty_report();
+        report.skipped_items = 1;
+        report.skipped_details.push(ReplicationRepairSkippedItem {
+            report_node_id: node_id,
+            subject: "retained-version@ver-1".to_string(),
+            key: Some("retained-version".to_string()),
+            version_id: Some("ver-1".to_string()),
+            source_node_id: None,
+            target_node_id: None,
+            reason: ReplicationRepairSkipReason::BundleUnavailable,
+            detail: "replication bundle was not available on the reporting node".to_string(),
+        });
+        push_repair_log_entry(
+            &mut report.detailed_log,
+            node_id,
+            "subject_skipped",
+            "replication bundle was not available on the reporting node",
+            Some("retained-version@ver-1".to_string()),
+            Some("retained-version".to_string()),
+            Some("ver-1".to_string()),
+            None,
+            None,
+            Some(serde_json::json!({"reason": "bundle_unavailable", "local_missing": false})),
+        );
+
+        assert_eq!(report.run_status(), RepairRunStatus::Completed);
     }
 
     #[test]
