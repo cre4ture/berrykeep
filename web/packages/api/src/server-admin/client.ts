@@ -438,12 +438,13 @@ async function fetchAdminStoreIndexLegacyChildrenProjection(
 ): Promise<AdminStoreListResponse> {
   const requestKey = buildAdminStoreEntriesQuery(prefix, depth, snapshot, options, "tree", false)
     .toString();
+  const canRevalidateCachedTree = canRevalidateLegacyStoreIndexTree(options);
   let cachedTree = legacyStoreIndexTreeCache;
   if (cachedTree !== null && cachedTree.expiresAt <= Date.now()) {
     clearLegacyStoreIndexTreeCache();
     cachedTree = null;
   }
-  if (cachedTree?.requestKey === requestKey) {
+  if (canRevalidateCachedTree && cachedTree?.requestKey === requestKey) {
     // Revalidate the complete legacy tree with a one-entry server page before
     // slicing it locally. This avoids repeat full-index transfers while the
     // node's consistency token guarantees live listings are never stale.
@@ -471,12 +472,22 @@ async function fetchAdminStoreIndexLegacyChildrenProjection(
     "tree",
     false
   );
-  if (treeResponse.consistency_token) {
+  if (canRevalidateCachedTree && treeResponse.consistency_token) {
     rememberLegacyStoreIndexTreeCache(requestKey, treeResponse.consistency_token, treeResponse);
   } else {
     clearLegacyStoreIndexTreeCache();
   }
   return projectAdminStoreIndexChildren(treeResponse, prefix, options);
+}
+
+function canRevalidateLegacyStoreIndexTree(options: StoreListRequestOptions): boolean {
+  // A one-entry tree probe would take the gallery-index fast path for this
+  // shape, while the unpaged legacy tree comes from the general index path.
+  // Those responses use different consistency-token namespaces.
+  return (
+    !options.mediaFilter ||
+    (options.sort !== "captured_asc" && options.sort !== "captured_desc")
+  );
 }
 
 function storeIndexViewWasRejected(error: unknown, requestedView: StoreListView): boolean {

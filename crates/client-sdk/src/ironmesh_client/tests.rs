@@ -216,20 +216,57 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
     assert_eq!(refreshed_response.entries.len(), 1);
     assert_eq!(refreshed_response.entries[0].path, "docs/c.txt");
 
+    let recorded_queries = queries.lock().await.clone();
+    assert_eq!(recorded_queries.len(), 4);
+    assert!(matches!(
+        recorded_queries[0].view,
+        Some(LegacyStoreIndexView::Tree)
+    ));
+    assert_eq!(recorded_queries[0].offset, None);
+    assert_eq!(recorded_queries[0].limit, None);
+    assert!(matches!(
+        recorded_queries[1].view,
+        Some(LegacyStoreIndexView::Tree)
+    ));
+    assert_eq!(recorded_queries[1].offset, Some(0));
+    assert_eq!(recorded_queries[1].limit, Some(1));
+    assert!(matches!(
+        recorded_queries[2].view,
+        Some(LegacyStoreIndexView::Tree)
+    ));
+    assert_eq!(recorded_queries[2].offset, Some(0));
+    assert_eq!(recorded_queries[2].limit, Some(1));
+    assert!(matches!(
+        recorded_queries[3].view,
+        Some(LegacyStoreIndexView::Tree)
+    ));
+    assert_eq!(recorded_queries[3].offset, None);
+    assert_eq!(recorded_queries[3].limit, None);
+
+    let captured_media_options = StoreIndexRequestOptions {
+        view: Some(StoreIndexView::Children),
+        offset: Some(0),
+        limit: Some(1),
+        sort: Some(StoreIndexSortOrder::CapturedDesc),
+        media_filter: Some(StoreIndexMediaFilter::Image),
+        ..StoreIndexRequestOptions::default()
+    };
+    client
+        .store_index_with_options(Some("docs"), 1, None, captured_media_options.clone())
+        .await
+        .expect("captured-media fallback should succeed without caching its full tree");
+    client
+        .store_index_with_options(Some("docs"), 1, None, captured_media_options)
+        .await
+        .expect("captured-media fallback should not issue an incompatible cache probe");
+
     let queries = queries.lock().await.clone();
-    assert_eq!(queries.len(), 4);
-    assert!(matches!(queries[0].view, Some(LegacyStoreIndexView::Tree)));
-    assert_eq!(queries[0].offset, None);
-    assert_eq!(queries[0].limit, None);
-    assert!(matches!(queries[1].view, Some(LegacyStoreIndexView::Tree)));
-    assert_eq!(queries[1].offset, Some(0));
-    assert_eq!(queries[1].limit, Some(1));
-    assert!(matches!(queries[2].view, Some(LegacyStoreIndexView::Tree)));
-    assert_eq!(queries[2].offset, Some(0));
-    assert_eq!(queries[2].limit, Some(1));
-    assert!(matches!(queries[3].view, Some(LegacyStoreIndexView::Tree)));
-    assert_eq!(queries[3].offset, None);
-    assert_eq!(queries[3].limit, None);
+    assert_eq!(queries.len(), 6);
+    for query in &queries[4..] {
+        assert!(matches!(query.view, Some(LegacyStoreIndexView::Tree)));
+        assert_eq!(query.offset, None);
+        assert_eq!(query.limit, None);
+    }
 
     server.abort();
 }

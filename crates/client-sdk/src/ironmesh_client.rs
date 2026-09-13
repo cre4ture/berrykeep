@@ -5957,9 +5957,17 @@ impl IronMeshClient {
         fallback_options.offset = None;
         fallback_options.limit = None;
 
+        // A one-entry tree probe would take the gallery-index fast path for a
+        // captured-media query, while this unpaged fallback necessarily takes
+        // the general index path. Their consistency-token namespaces differ,
+        // so retain no complete tree for that shape rather than probing and
+        // re-fetching it on every page.
+        let can_revalidate_cached_tree = legacy_store_index_tree_cache_is_revalidatable(options);
         let request_key =
             self.store_index_request_cache_key(prefix, depth, snapshot, &fallback_options)?;
-        if let Some(cached) = self.legacy_store_index_tree_response(&request_key) {
+        if can_revalidate_cached_tree
+            && let Some(cached) = self.legacy_store_index_tree_response(&request_key)
+        {
             // A tree projection must be complete before children pagination can
             // be recreated locally. Revalidate the cached complete response by
             // requesting a one-entry tree page and comparing the node's
@@ -5988,7 +5996,9 @@ impl IronMeshClient {
             fallback_response,
             &fallback_options,
         )?);
-        if let Some(consistency_token) = response.consistency_token.clone() {
+        if can_revalidate_cached_tree
+            && let Some(consistency_token) = response.consistency_token.clone()
+        {
             self.remember_legacy_store_index_tree_response(
                 request_key,
                 consistency_token,
@@ -10210,6 +10220,14 @@ fn project_store_index_children_response(
         media_summary: response.media_summary.clone(),
         entries,
     }
+}
+
+fn legacy_store_index_tree_cache_is_revalidatable(options: &StoreIndexRequestOptions) -> bool {
+    options.media_filter.is_none()
+        || !matches!(
+            options.sort,
+            Some(StoreIndexSortOrder::CapturedAsc | StoreIndexSortOrder::CapturedDesc)
+        )
 }
 
 fn append_optional_query(url: &mut Url, key: &str, value: Option<&str>) {
