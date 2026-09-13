@@ -74,6 +74,7 @@ struct MountProtectionTarget {
     feature: String,
     path: PathBuf,
     mount_point: Option<PathBuf>,
+    allows_root_filesystem: bool,
     missing_severity: HostDependencySeverity,
 }
 
@@ -429,12 +430,14 @@ fn mount_protection_targets(
 ) -> Vec<MountProtectionTarget> {
     let mount_points = mount_points_for_current_process();
     let data_dir = resolved_mount_protection_path(data_dir);
+    let storage_data_dir = data_dir.clone();
     let mut targets = vec![MountProtectionTarget {
         id: "systemd-mount-data-dir".to_string(),
         feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
         mount_point: mount_points
             .as_deref()
             .and_then(|mount_points| mount_point_for_path(&data_dir, mount_points)),
+        allows_root_filesystem: true,
         path: data_dir,
         missing_severity: HostDependencySeverity::Critical,
     }];
@@ -455,6 +458,7 @@ fn mount_protection_targets(
                     mount_point: mount_points
                         .as_deref()
                         .and_then(|mount_points| mount_point_for_path(&path, mount_points)),
+                    allows_root_filesystem: path == storage_data_dir || path == Path::new("/"),
                     path,
                     missing_severity: match configured_path.state {
                         StoragePathState::Active => HostDependencySeverity::Critical,
@@ -652,7 +656,7 @@ fn checks_for_inspection(
                         )),
                         install_hint: None,
                     },
-                    None if target.mount_point.as_deref() == Some(Path::new("/")) => HostDependencyCheck {
+                    None if target.mount_point.as_deref() == Some(Path::new("/")) && target.allows_root_filesystem => HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
                         status: HostDependencyStatus::NotApplicable,
@@ -935,13 +939,23 @@ mod tests {
     }
 
     #[test]
-    fn root_filesystem_storage_and_data_targets_are_informational() {
+    fn root_filesystem_exemption_does_not_mask_a_distinct_storage_pool() {
         let targets = vec![
             MountProtectionTarget {
                 id: "systemd-mount-data-dir".to_string(),
                 feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
                 path: PathBuf::from("/var/lib/berrykeep"),
                 mount_point: Some(PathBuf::from("/")),
+                allows_root_filesystem: true,
+                missing_severity: HostDependencySeverity::Critical,
+            },
+            MountProtectionTarget {
+                id: "systemd-mount-storage-legacy-primary".to_string(),
+                feature: "Systemd mount protection: storage pool `legacy-primary` (active)"
+                    .to_string(),
+                path: PathBuf::from("/var/lib/berrykeep"),
+                mount_point: Some(PathBuf::from("/")),
+                allows_root_filesystem: true,
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
@@ -949,6 +963,7 @@ mod tests {
                 feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
                 path: PathBuf::from("/mnt/primary"),
                 mount_point: Some(PathBuf::from("/")),
+                allows_root_filesystem: false,
                 missing_severity: HostDependencySeverity::Critical,
             },
         ];
@@ -970,11 +985,18 @@ mod tests {
 
         let storage = checks
             .iter()
-            .find(|check| check.id == "systemd-mount-storage-primary")
+            .find(|check| check.id == "systemd-mount-storage-legacy-primary")
             .unwrap();
         assert_eq!(storage.status, HostDependencyStatus::NotApplicable);
         assert_eq!(storage.severity, HostDependencySeverity::Info);
         assert!(storage.install_hint.is_none());
+
+        let missing_storage = checks
+            .iter()
+            .find(|check| check.id == "systemd-mount-storage-primary")
+            .unwrap();
+        assert_eq!(missing_storage.status, HostDependencyStatus::Missing);
+        assert_eq!(missing_storage.severity, HostDependencySeverity::Critical);
     }
 
     #[test]
@@ -984,6 +1006,7 @@ mod tests {
             feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
             path: PathBuf::from("/srv/pool/media"),
             mount_point: Some(PathBuf::from("/srv/pool")),
+            allows_root_filesystem: false,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
