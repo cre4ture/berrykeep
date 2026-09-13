@@ -17643,7 +17643,15 @@ fn store_index_gallery_query(
     depth: usize,
     label_filter: storage::GalleryLabelFilter,
 ) -> Option<storage::GalleryIndexQuery> {
-    if query.snapshot.is_some() || query.cursor.is_some() || query.page_size.is_some() {
+    // The gallery index contains only media rows, whereas children is a
+    // directory projection that must run before filtering and pagination.
+    // Keep children on the general index path so its contract remains valid
+    // even if gallery rows later gain directory markers.
+    if matches!(query.view, Some(StoreIndexView::Children))
+        || query.snapshot.is_some()
+        || query.cursor.is_some()
+        || query.page_size.is_some()
+    {
         return None;
     }
     let media_filter = match query.media_filter? {

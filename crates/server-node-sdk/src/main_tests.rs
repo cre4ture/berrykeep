@@ -13802,6 +13802,32 @@ async fn store_index_query_rejection_exposes_the_children_capability_signal() {
 }
 
 #[test]
+fn store_index_gallery_fast_path_skips_the_children_projection() {
+    let query = super::StoreIndexQuery {
+        prefix: Some("docs".to_string()),
+        depth: Some(1),
+        snapshot: None,
+        view: Some(super::StoreIndexView::Children),
+        cursor: None,
+        page_size: None,
+        offset: Some(0),
+        limit: Some(50),
+        sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+        media_filter: Some(super::StoreIndexMediaFilter::Image),
+        captured_from_unix: None,
+        captured_until_unix: None,
+        south: None,
+        west: None,
+        north: None,
+        east: None,
+        require_labels: None,
+        exclude_labels: None,
+    };
+
+    assert!(super::store_index_gallery_query(&query, "docs", 1, Default::default()).is_none());
+}
+
+#[test]
 fn store_index_object_map_filter_respects_prefix_boundaries() {
     let (hashes, object_ids) = super::filter_store_index_object_maps_for_prefix(
         HashMap::from([
