@@ -302,10 +302,7 @@ pub fn utf16_verbatim_path(path: &Path) -> Vec<u16> {
     ];
 
     let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    if !path.is_absolute()
-        || encoded.starts_with(VERBATIM_PREFIX)
-        || encoded.starts_with(DEVICE_PREFIX)
-    {
+    if !path.is_absolute() {
         encoded.push(0);
         return encoded;
     }
@@ -314,6 +311,11 @@ pub fn utf16_verbatim_path(path: &Path) -> Vec<u16> {
         if *unit == FORWARD_SLASH {
             *unit = BACKSLASH;
         }
+    }
+
+    if encoded.starts_with(VERBATIM_PREFIX) || encoded.starts_with(DEVICE_PREFIX) {
+        encoded.push(0);
+        return encoded;
     }
 
     let mut verbatim = if encoded.starts_with(&[BACKSLASH, BACKSLASH]) {
@@ -464,6 +466,21 @@ mod tests {
             decode_nul_terminated_path(utf16_verbatim_path(Path::new(r"deep\file.txt"))),
             r"deep\file.txt"
         );
+    }
+
+    #[test]
+    fn verbatim_path_encoding_preserves_forward_slash_device_prefixes() {
+        for (input, expected) in [
+            ("//?/C:/deep/file.txt", r"\\?\C:\deep\file.txt"),
+            ("//./C:/deep/file.txt", r"\\.\C:\deep\file.txt"),
+        ] {
+            assert!(Path::new(input).is_absolute());
+            assert_eq!(
+                decode_nul_terminated_path(utf16_verbatim_path(Path::new(input))),
+                expected,
+                "an existing verbatim or device prefix must not be treated as a UNC server"
+            );
+        }
     }
 
     #[test]
