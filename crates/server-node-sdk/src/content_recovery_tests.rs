@@ -390,6 +390,15 @@ async fn recovery_snapshot_only_uses_hash_without_version_export_impl(backend: M
     .unwrap();
     let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
     register_online_source_node(&target, &source, &url).await;
+    crate::refresh_local_availability_view_once(&source).await;
+    crate::sync_availability_views_once(&target).await;
+    assert!(
+        !crate::planning_replication_subjects(&target)
+            .await
+            .iter()
+            .any(|subject| subject.starts_with("cas-manifest:")),
+        "hash-only obligations must not enter the legacy object-key planner"
+    );
     let output = crate::content_recovery::scrubber(&target)
         .await
         .unwrap()

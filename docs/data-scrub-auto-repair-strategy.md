@@ -10,6 +10,8 @@ not extend version history or recreate expired namespace entries.
 A path/version describes why bytes are retained. The manifest hash identifies a recovery task,
 and chunk hashes identify transferable bytes. Snapshot-only references use the internal
 `cas-manifest:<hash>` subject rather than pretending to be a current path.
+These hash-only subjects are excluded from the legacy object-key replication planner;
+the retained-content assignment audit and durable worker handle them directly.
 
 ## Metadata, ownership, availability and verification
 
