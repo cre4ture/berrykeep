@@ -23,6 +23,7 @@ use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDepend
 #[cfg(target_os = "linux")]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SystemdMountProtectionInspection {
     NotManagedBySystemd,
@@ -215,7 +216,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
     SystemdMountProtectionInspection::NotManagedBySystemd
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 impl SystemdService {
     fn systemctl_arguments<'a>(
         &self,
