@@ -20,6 +20,7 @@ use x509_parser::parse_x509_certificate;
 pub const CLUSTER_REGISTRATION_PROTOCOL_VERSION: u16 = 1;
 
 const PROOF_MESSAGE_DOMAIN: &[u8] = b"berrykeep.cluster-registration-proof\0";
+const LEGACY_PROOF_MESSAGE_DOMAIN: &[u8] = b"ironmesh.cluster-registration-proof\0";
 const SHA256_FINGERPRINT_HEX_LENGTH: usize = 64;
 const MAX_CA_PEM_BYTES: usize = 32 * 1024;
 const MIN_CHALLENGE_NONCE_BYTES: usize = 16;
@@ -161,6 +162,18 @@ impl ClusterRegistrationChallengeResponse {
             self.expires_at_unix,
         )
     }
+
+    pub fn legacy_proof_message_v1(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        cluster_registration_proof_message_v1_with_domain(
+            LEGACY_PROOF_MESSAGE_DOMAIN,
+            self.cluster_id,
+            &self.cluster_ca_fingerprint_sha256,
+            self.challenge_id,
+            &self.challenge_nonce_b64u,
+            self.expires_at_unix,
+        )
+    }
 }
 
 impl ClusterRegistrationCompleteRequest {
@@ -190,6 +203,18 @@ impl ClusterRegistrationCompleteRequest {
     pub fn canonical_proof_message_v1(&self) -> Result<Vec<u8>> {
         self.validate()?;
         cluster_registration_proof_message_v1(
+            self.cluster_id,
+            &self.cluster_ca_fingerprint_sha256,
+            self.challenge_id,
+            &self.challenge_nonce_b64u,
+            self.expires_at_unix,
+        )
+    }
+
+    pub fn legacy_proof_message_v1(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        cluster_registration_proof_message_v1_with_domain(
+            LEGACY_PROOF_MESSAGE_DOMAIN,
             self.cluster_id,
             &self.cluster_ca_fingerprint_sha256,
             self.challenge_id,
@@ -327,6 +352,24 @@ pub fn cluster_registration_proof_message_v1(
     challenge_nonce_b64u: &str,
     expires_at_unix: u64,
 ) -> Result<Vec<u8>> {
+    cluster_registration_proof_message_v1_with_domain(
+        PROOF_MESSAGE_DOMAIN,
+        cluster_id,
+        cluster_ca_fingerprint_sha256,
+        challenge_id,
+        challenge_nonce_b64u,
+        expires_at_unix,
+    )
+}
+
+fn cluster_registration_proof_message_v1_with_domain(
+    domain: &[u8],
+    cluster_id: ClusterId,
+    cluster_ca_fingerprint_sha256: &str,
+    challenge_id: Uuid,
+    challenge_nonce_b64u: &str,
+    expires_at_unix: u64,
+) -> Result<Vec<u8>> {
     validate_proof_fields(
         CLUSTER_REGISTRATION_PROTOCOL_VERSION,
         cluster_id,
@@ -340,10 +383,9 @@ pub fn cluster_registration_proof_message_v1(
     let nonce = decode_challenge_nonce(challenge_nonce_b64u)?;
     let nonce_len = u16::try_from(nonce.len()).context("challenge nonce is too large")?;
 
-    let mut message = Vec::with_capacity(
-        PROOF_MESSAGE_DOMAIN.len() + 2 + 16 + fingerprint.len() + 16 + 2 + nonce.len() + 8,
-    );
-    message.extend_from_slice(PROOF_MESSAGE_DOMAIN);
+    let mut message =
+        Vec::with_capacity(domain.len() + 2 + 16 + fingerprint.len() + 16 + 2 + nonce.len() + 8);
+    message.extend_from_slice(domain);
     message.extend_from_slice(&CLUSTER_REGISTRATION_PROTOCOL_VERSION.to_be_bytes());
     message.extend_from_slice(cluster_id.as_bytes());
     message.extend_from_slice(&fingerprint);

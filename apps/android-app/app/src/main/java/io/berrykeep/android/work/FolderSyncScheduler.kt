@@ -16,6 +16,8 @@ object FolderSyncScheduler {
     private const val TAG = "FolderSyncScheduler"
     private const val UNIQUE_PERIODIC_WORK = "berrykeep-folder-sync-periodic"
     private const val UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK = "berrykeep-folder-sync-outage-attempt"
+    private const val LEGACY_UNIQUE_PERIODIC_WORK = "ironmesh-folder-sync-periodic"
+    private const val LEGACY_UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK = "ironmesh-folder-sync-outage-attempt"
     private const val PERIODIC_INTERVAL_MINUTES = 15L
 
     fun reschedule(
@@ -23,6 +25,8 @@ object FolderSyncScheduler {
         resetOutageBackoff: Boolean = false,
     ) {
         val workManager = WorkManager.getInstance(context)
+        workManager.cancelUniqueWork(LEGACY_UNIQUE_PERIODIC_WORK)
+        workManager.cancelUniqueWork(LEGACY_UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK)
         val enabledProfiles = BerryKeepPreferences
             .getFolderSyncConfigs(context)
             .filter { it.enabled }
@@ -133,6 +137,7 @@ object FolderSyncScheduler {
     internal fun clearOutageRetryCircuit(context: Context) {
         val appContext = context.applicationContext
         WorkManager.getInstance(appContext).cancelUniqueWork(UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK)
+        WorkManager.getInstance(appContext).cancelUniqueWork(LEGACY_UNIQUE_OUTAGE_RETRY_ATTEMPT_WORK)
         FolderSyncOutageRetryScheduler.cancel(appContext)
         FolderSyncOutageRetryStore(appContext).clear()
     }

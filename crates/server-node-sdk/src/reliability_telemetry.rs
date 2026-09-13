@@ -8,6 +8,7 @@ type HmacSha256 = Hmac<Sha256>;
 const RELIABILITY_TELEMETRY_STATE_FILE: &str = "telemetry/reliability-telemetry-state.json";
 const TELEMETRY_SCHEMA_VERSION: u32 = 1;
 const TELEMETRY_HMAC_DOMAIN: &[u8] = b"berrykeep-telemetry-v1";
+const LEGACY_TELEMETRY_HMAC_DOMAIN: &[u8] = b"ironmesh-telemetry-v1";
 
 /// Central collector ingest URL. Per doc Section 5.2 the production collector is hosted directly
 /// on the STRATO public IPv4 address at port 9444; the endpoint path matches
@@ -307,9 +308,17 @@ pub(crate) fn build_reliability_telemetry_payload(
 }
 
 fn compute_telemetry_subject_id(local_random_salt: &[u8], node_id: NodeId) -> String {
+    compute_telemetry_subject_id_for_domain(local_random_salt, node_id, TELEMETRY_HMAC_DOMAIN)
+}
+
+fn compute_telemetry_subject_id_for_domain(
+    local_random_salt: &[u8],
+    node_id: NodeId,
+    domain: &[u8],
+) -> String {
     let mut mac =
         HmacSha256::new_from_slice(local_random_salt).expect("HMAC accepts arbitrary key sizes");
-    mac.update(TELEMETRY_HMAC_DOMAIN);
+    mac.update(domain);
     mac.update(node_id.as_bytes());
     hex_encode(&mac.finalize().into_bytes())
 }
@@ -609,7 +618,19 @@ impl ReliabilityTelemetryRuntime {
     /// local random salt on first use if one does not exist yet.
     pub(crate) async fn telemetry_subject_id(&mut self, node_id: NodeId) -> Result<String> {
         let salt = self.ensure_salt().await?;
-        Ok(compute_telemetry_subject_id(&salt, node_id))
+        let subject_id = compute_telemetry_subject_id(&salt, node_id);
+        if self.persisted.ingestion_token.is_some()
+            && subject_id
+                != compute_telemetry_subject_id_for_domain(
+                    &salt,
+                    node_id,
+                    LEGACY_TELEMETRY_HMAC_DOMAIN,
+                )
+        {
+            self.persisted.ingestion_token = None;
+            self.persist().await?;
+        }
+        Ok(subject_id)
     }
 
     async fn ensure_salt(&mut self) -> Result<Vec<u8>> {

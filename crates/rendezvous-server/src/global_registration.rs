@@ -434,8 +434,12 @@ fn verify_proof(ca_pem: &str, completion: &ClusterRegistrationCompleteRequest) -
     let signature = Signature::from_der(&signature)
         .context("global registration proof signature is not ASN.1 ECDSA P-256")?;
     let verifying_key = verifying_key_from_ca(ca_pem, completion.proof_algorithm)?;
+    if verifying_key.verify(&message, &signature).is_ok() {
+        return Ok(());
+    }
+    let legacy_message = completion.legacy_proof_message_v1()?;
     verifying_key
-        .verify(&message, &signature)
+        .verify(&legacy_message, &signature)
         .context("global registration proof signature does not verify")
 }
 
