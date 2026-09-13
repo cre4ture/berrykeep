@@ -459,7 +459,7 @@ Working evidence log:
    - The Server Node should use the product-owned signed apt repository and a
      static musl binary per CPU ABI. Client and rendezvous packages may keep
      using the Launchpad PPA while they remain distribution-specific. Both
-     paths retain ordinary apt upgrades rather than an BerryKeep self-updater.
+     paths retain ordinary apt upgrades rather than a BerryKeep self-updater.
    - The current Ubuntu beta package target is `1.0.0~beta.1-1~ppa2~ubuntu24.04.1` for `noble`.
    - `berrykeep-client` installs the public `berrykeep` CLI and the packaged helpers `berrykeep-config-app`, `berrykeep-folder-agent`, `berrykeep-os-integration`, and `berrykeep-background-launcher` under one package root, with `/usr/bin` symlinks for the documented commands.
    - Linux background launching resolves sibling binaries from `current_exe().parent()`, so keeping the client helpers together under one package root is part of the update contract for `apt`-delivered upgrades.

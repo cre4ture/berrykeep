@@ -30,7 +30,7 @@ One listener owns the configured `BERRYKEEP_RENDEZVOUS_BIND` address:
 
 The listener continues to offer optional client-certificate authentication.
 Rendezvous control handlers enforce the authenticated certificate at the
-application boundary. Iroh does not present an BerryKeep client certificate, so
+application boundary. Iroh does not present a BerryKeep client certificate, so
 the relay path uses a relay ticket instead.
 
 Plain HTTP remains available only when

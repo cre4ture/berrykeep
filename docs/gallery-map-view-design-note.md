@@ -194,7 +194,7 @@ The first vector slice should stay intentionally small:
 
 - serve vector tiles from the split OpenMapTiles MBTiles via server-side tile endpoints,
 - serve glyph PBFs from a configured font directory,
-- use an BerryKeep-owned minimal MapLibre style,
+- use a BerryKeep-owned minimal MapLibre style,
 - avoid sprite/icon dependencies in the first pass,
 - expose `Satellite` and `Street` as separate basemap choices in the gallery.
 

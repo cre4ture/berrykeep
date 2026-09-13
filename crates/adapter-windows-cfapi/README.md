@@ -4,7 +4,7 @@ This crate contains the Windows Cloud Files (`CFAPI`) adapter used by `berrykeep
 
 It is responsible for:
 
-- registering and serving an BerryKeep sync root on Windows
+- registering and serving a BerryKeep sync root on Windows
 - materializing remote namespace entries as local placeholders
 - hydrating placeholder file ranges on demand
 - observing local changes and syncing them back to the server

@@ -50,7 +50,7 @@ Main issues:
 
 The app should present itself as a mobile control surface for one clear job:
 
-- connect this phone to an BerryKeep deployment,
+- connect this phone to a BerryKeep deployment,
 - keep one or more folders in sync,
 - inspect recent work and media,
 - hand off to the richer web surface only when needed.

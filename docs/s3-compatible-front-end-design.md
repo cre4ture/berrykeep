@@ -987,7 +987,7 @@ surface decides how much of that history it exposes.
 Behavior:
 
 - `PutObject` replaces the visible current object through a CAS write
-- `DeleteObject` creates an BerryKeep tombstone but does not expose a public S3
+- `DeleteObject` creates a BerryKeep tombstone but does not expose a public S3
   delete-marker history surface
 - normal `GetObject` reads the latest confirmed visible object only
 

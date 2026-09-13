@@ -168,7 +168,7 @@ Example layout:
 
 Preferred source for the Facet scanner:
 
-- an BerryKeep-managed local replica of the target tree.
+- a BerryKeep-managed local replica of the target tree.
 
 Acceptable variants:
 
@@ -384,7 +384,7 @@ Goal:
 
 Work:
 
-1. Stand up a dedicated Facet worker against an BerryKeep-managed local mirror.
+1. Stand up a dedicated Facet worker against a BerryKeep-managed local mirror.
 2. Keep Facet DB and `storage/` local-only.
 3. Document the worker deployment contract.
 4. Do not import metadata back into BerryKeep yet.
@@ -450,7 +450,7 @@ This phase should only start if the sidecar path proves product value first.
 
 The right first move is:
 
-- treat Facet as a local analysis engine attached to an BerryKeep-managed photo
+- treat Facet as a local analysis engine attached to a BerryKeep-managed photo
   replica,
 - keep Facet's live database and heavy derived state local,
 - import only path-independent summaries back into BerryKeep,

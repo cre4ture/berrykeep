@@ -70,7 +70,7 @@ Relevant code:
 
 In scope:
 
-- add an BerryKeep `analysis` thumbnail profile
+- add a BerryKeep `analysis` thumbnail profile
 - add profile-aware thumbnail requests and metadata
 - create a Facet thumbnail backend abstraction that supports BerryKeep-backed
   fetches

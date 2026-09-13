@@ -469,7 +469,7 @@ fn cluster_id_from_certificate(certificate: &CertificateDer<'_>) -> Result<Clust
             }
         }
     }
-    cluster_id.context("peer certificate is missing an berrykeep cluster URI SAN")
+    cluster_id.context("peer certificate is missing a BerryKeep cluster URI SAN")
 }
 
 fn extract_authenticated_peer_from_peer_certs(

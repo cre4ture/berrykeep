@@ -16,8 +16,8 @@ This note proposes a stricter lifecycle for the Windows CFAPI provider:
 
 The main goal is to make the local/cloud relationship predictable and reviewable. A folder should be in one of two states:
 
-- not an BerryKeep sync root, or
-- an BerryKeep sync root with explicit persisted ownership metadata.
+- not a BerryKeep sync root, or
+- a BerryKeep sync root with explicit persisted ownership metadata.
 
 We should avoid the ambiguous middle ground where an ordinary populated folder can silently become cloud-managed just because the provider was started on it.
 
@@ -81,7 +81,7 @@ Implications:
 
 ### 3.4 Reconnect is only for matching BerryKeep-managed roots
 
-A non-empty folder should only be reconnectable when Windows already knows it as an BerryKeep-managed sync root and the persisted registration identity matches the requested identity.
+A non-empty folder should only be reconnectable when Windows already knows it as a BerryKeep-managed sync root and the persisted registration identity matches the requested identity.
 
 This should not rely on incidental files like the connection bootstrap or runtime snapshot cache alone.
 

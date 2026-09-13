@@ -295,7 +295,7 @@ Success criterion:
 
 ### Manual validation
 
-1. Register and serve an BerryKeep CFAPI sync root.
+1. Register and serve a BerryKeep CFAPI sync root.
 2. Materialize dehydrated placeholders for image files.
 3. Open the directory in Explorer large-icon mode.
 4. Confirm:

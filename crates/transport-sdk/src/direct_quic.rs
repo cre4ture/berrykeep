@@ -316,7 +316,7 @@ impl DirectQuicEndpoint {
         // Keep the relay transport present when tickets may be installed later.
         // Direct-only fallback endpoints deliberately use RelayMode::Disabled:
         // a candidate relay address alone must never bypass endpoint-ticket
-        // authentication on an BerryKeep relay.
+        // authentication on a BerryKeep relay.
         let relay_mode = if config.relay_enabled {
             RelayMode::Custom(relay_map_from_configured_relays(&configured_relays)?)
         } else {
