@@ -1289,9 +1289,33 @@ impl MetadataStore for TursoMetadataStore {
         Ok(replicas)
     }
 
-    async fn persist_cluster_replicas(
+    async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT subject, node_id
+                 FROM cluster_available
+                 ORDER BY subject, node_id",
+                (),
+            )
+            .await?;
+        let mut available = HashMap::<String, Vec<NodeId>>::new();
+        while let Some(row) = rows.next().await? {
+            let subject = row_string(&row, 0, "cluster_available.subject")?;
+            let node_id = row_string(&row, 1, "cluster_available.node_id")?
+                .parse::<NodeId>()
+                .with_context(|| {
+                    format!("invalid node id in cluster availability for {subject}")
+                })?;
+            available.entry(subject).or_default().push(node_id);
+        }
+        Ok(available)
+    }
+
+    async fn persist_cluster_replica_views(
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
+        available: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
         let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
@@ -1299,11 +1323,25 @@ impl MetadataStore for TursoMetadataStore {
             self.connection
                 .execute("DELETE FROM cluster_replicas", ())
                 .await?;
+            self.connection
+                .execute("DELETE FROM cluster_available", ())
+                .await?;
             for (subject, nodes) in replicas {
                 for node_id in nodes {
                     self.connection
                         .execute(
                             "INSERT INTO cluster_replicas (subject, node_id)
+                             VALUES (?1, ?2)",
+                            (subject.as_str(), node_id.to_string()),
+                        )
+                        .await?;
+                }
+            }
+            for (subject, nodes) in available {
+                for node_id in nodes {
+                    self.connection
+                        .execute(
+                            "INSERT INTO cluster_available (subject, node_id)
                              VALUES (?1, ?2)",
                             (subject.as_str(), node_id.to_string()),
                         )
@@ -3421,6 +3459,11 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 node_id TEXT NOT NULL,
                 PRIMARY KEY(subject, node_id)
             );
+            CREATE TABLE IF NOT EXISTS cluster_available (
+                subject TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                PRIMARY KEY(subject, node_id)
+            );
 
             CREATE TABLE IF NOT EXISTS client_credential_state (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -3567,6 +3610,8 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 ON data_change_events(actor_id);
             CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject
                 ON cluster_replicas(subject);
+            CREATE INDEX IF NOT EXISTS idx_cluster_available_subject
+                ON cluster_available(subject);
             CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
                 ON s3_object_versions(bucket_name, berrykeep_key, created_at_unix DESC, version_id DESC);
             ",

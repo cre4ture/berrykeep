@@ -3366,20 +3366,59 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn persist_cluster_replicas(
+    async fn load_cluster_availability(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<NodeId>>> {
+        self.read(|db| {
+            let mut stmt = db.prepare(
+                "SELECT subject, node_id
+                 FROM cluster_available
+                 ORDER BY subject, node_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+            let mut available: std::collections::HashMap<String, Vec<NodeId>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let (subject, node_id) = row?;
+                let node_id = node_id.parse::<NodeId>().with_context(|| {
+                    format!("invalid node id in cluster availability: {node_id}")
+                })?;
+                available.entry(subject).or_default().push(node_id);
+            }
+            Ok(available)
+        })
+        .await
+    }
+
+    async fn persist_cluster_replica_views(
         &self,
         replicas: &std::collections::HashMap<String, Vec<NodeId>>,
+        available: &std::collections::HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
         let replicas = replicas.clone();
+        let available = available.clone();
         self.write_tx(move |db| {
             db.execute("DELETE FROM cluster_replicas", [])?;
-            let mut stmt = db.prepare(
+            db.execute("DELETE FROM cluster_available", [])?;
+            let mut replica_stmt = db.prepare(
                 "INSERT INTO cluster_replicas (subject, node_id)
                  VALUES (?1, ?2)",
             )?;
             for (subject, nodes) in replicas {
                 for node_id in nodes {
-                    stmt.execute(params![subject, node_id.to_string()])?;
+                    replica_stmt.execute(params![subject, node_id.to_string()])?;
+                }
+            }
+            let mut available_stmt = db.prepare(
+                "INSERT INTO cluster_available (subject, node_id)
+                 VALUES (?1, ?2)",
+            )?;
+            for (subject, nodes) in available {
+                for node_id in nodes {
+                    available_stmt.execute(params![subject, node_id.to_string()])?;
                 }
             }
             Ok(())
@@ -5503,6 +5542,11 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             node_id TEXT NOT NULL,
             PRIMARY KEY(subject, node_id)
         );
+        CREATE TABLE IF NOT EXISTS cluster_available (
+            subject TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            PRIMARY KEY(subject, node_id)
+        );
 
         CREATE TABLE IF NOT EXISTS client_credential_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -5655,6 +5699,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON data_change_events(actor_id);
         CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject
             ON cluster_replicas(subject);
+        CREATE INDEX IF NOT EXISTS idx_cluster_available_subject
+            ON cluster_available(subject);
         CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
             ON s3_object_versions(bucket_name, berrykeep_key, created_at_unix DESC, version_id DESC);
         ",

@@ -105,6 +105,59 @@ run_on_main_metadata_backends!(
     recovery_targeted_repair_respects_busy_throttle_turso
 );
 
+async fn recovery_backoff_starts_after_a_slow_transfer_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.repair_config.backoff_secs = 1;
+    let key = "slow-backoff.bin";
+    let version = "v1";
+    for state in [&source, &target] {
+        seed_subject_version(state, key, version, b"slow retry payload".to_vec(), vec![]).await;
+    }
+    let manifest = bundle(&target, key, version).await;
+    remove_chunks(&target, &manifest, &[0]).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/cluster/v2/replication/chunk/{hash}",
+        axum::routing::get(|| async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            StatusCode::NOT_FOUND
+        }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    register_online_source_node(&target, &source, &url).await;
+
+    let report = crate::execute_tracked_targeted_local_replication_repair(
+        &target,
+        vec![format!("{key}@{version}")],
+        crate::RepairRunTrigger::DataScrubAutoRepair,
+    )
+    .await;
+    assert_eq!(report.failed_transfers, 1, "{report:?}");
+    let store = read_store(&target, "test.recovery.slow_backoff").await;
+    let pending = store.content_repair_tasks().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0].next_attempt_unix > crate::unix_ts(),
+        "backoff must begin after a slow failed transfer, not before it"
+    );
+    drop(store);
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_backoff_starts_after_a_slow_transfer_impl,
+    recovery_backoff_starts_after_a_slow_transfer,
+    recovery_backoff_starts_after_a_slow_transfer_turso
+);
+
 async fn recovery_scrub_persists_intent_when_execution_is_disabled_impl(backend: MainTestBackend) {
     let mut target = build_test_state(1, false, backend).await;
     target.repair_config.enabled = false;

@@ -7685,6 +7685,33 @@ run_on_all_metadata_backends!(
     persist_and_load_cluster_replicas_roundtrip_turso
 );
 
+async fn persist_and_load_cluster_replica_views_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-replica-views-roundtrip").await;
+    let node_id = NodeId::new_v4();
+    let replicas = HashMap::from([
+        ("subject-a".to_string(), vec![node_id]),
+        ("subject-a@historical".to_string(), vec![node_id]),
+    ]);
+    let available = HashMap::from([("subject-a".to_string(), vec![node_id])]);
+
+    store
+        .persist_cluster_replica_views(&replicas, &available)
+        .await
+        .unwrap();
+
+    assert_eq!(store.load_cluster_replicas().await.unwrap(), replicas);
+    assert_eq!(store.load_cluster_availability().await.unwrap(), available);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    persist_and_load_cluster_replica_views_roundtrip_impl,
+    persist_and_load_cluster_replica_views_roundtrip,
+    persist_and_load_cluster_replica_views_roundtrip_turso
+);
+
 async fn persist_cluster_replicas_rolls_back_on_duplicate_rows_impl(backend: StorageTestBackend) {
     let (root, store) = backend.init_store("cluster-replicas-rollback").await;
     let original = HashMap::from([("subject-original".to_string(), vec![NodeId::new_v4()])]);

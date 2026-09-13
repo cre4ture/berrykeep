@@ -2604,6 +2604,10 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["subject", "node_id"],
     },
     MetadataDbLogicalTableSpec {
+        table: "cluster_available",
+        tracked_columns: &["subject", "node_id"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "client_credential_state",
         tracked_columns: &["state_json"],
     },
@@ -2957,8 +2961,12 @@ trait MetadataStore: Send + Sync {
     async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>>;
     async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()>;
     async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>>;
-    async fn persist_cluster_replicas(&self, replicas: &HashMap<String, Vec<NodeId>>)
-    -> Result<()>;
+    async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>>;
+    async fn persist_cluster_replica_views(
+        &self,
+        replicas: &HashMap<String, Vec<NodeId>>,
+        available: &HashMap<String, Vec<NodeId>>,
+    ) -> Result<()>;
     async fn load_client_credential_state(&self) -> Result<ClientCredentialState>;
     async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()>;
     async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState>;
@@ -4135,11 +4143,14 @@ impl ClusterReplicasPersister {
         Self { metadata_store }
     }
 
-    pub(crate) async fn persist_cluster_replicas(
+    pub(crate) async fn persist_cluster_replica_views(
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
+        available: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
-        self.metadata_store.persist_cluster_replicas(replicas).await
+        self.metadata_store
+            .persist_cluster_replica_views(replicas, available)
+            .await
     }
 }
 
@@ -5258,6 +5269,10 @@ impl PersistentStore {
         self.metadata_store.load_cluster_replicas().await
     }
 
+    pub async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>> {
+        self.metadata_store.load_cluster_availability().await
+    }
+
     pub async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>> {
         self.metadata_store.load_cluster_nodes().await
     }
@@ -5272,7 +5287,20 @@ impl PersistentStore {
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
-        self.metadata_store.persist_cluster_replicas(replicas).await
+        self.metadata_store
+            .persist_cluster_replica_views(replicas, &HashMap::new())
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn persist_cluster_replica_views(
+        &self,
+        replicas: &HashMap<String, Vec<NodeId>>,
+        available: &HashMap<String, Vec<NodeId>>,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_cluster_replica_views(replicas, available)
+            .await
     }
 
     pub async fn load_client_credential_state(&self) -> Result<ClientCredentialState> {

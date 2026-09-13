@@ -20064,6 +20064,8 @@ async fn build_test_state(
             repair_run_history_retention_secs: super::REPAIR_RUN_HISTORY_RETENTION_SECS,
             local_availability_refresh_lock: Arc::new(Mutex::new(())),
             local_availability_refresh_notify: Arc::new(tokio::sync::Notify::new()),
+            local_availability_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_availability_cache: Arc::new(Mutex::new(None)),
         },
         metadata_commit_mode: MetadataCommitMode::Local,
         autonomous_replication_on_put_enabled: false,

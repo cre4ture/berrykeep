@@ -407,6 +407,7 @@ async fn repair_subjects_inner(
         task.repair_chunks |= owned || required.contains(&reference.manifest_hash);
         tasks.insert(reference.manifest_hash.clone(), task);
     }
+    let availability_may_have_changed = !tasks.is_empty();
     for (index, mut task) in tasks.into_values().enumerate() {
         // The execution budget bounds this pass, not the lifetime of its work.
         read_store(state, "content_recovery.enqueue")
@@ -466,7 +467,7 @@ async fn repair_subjects_inner(
                     "repair_unresolved"
                 };
                 let detail = format!("{error:#}");
-                task.defer(detail.clone(), now, state.repair_config.backoff_secs);
+                task.defer(detail.clone(), unix_ts(), state.repair_config.backoff_secs);
                 read_store(state, "content_recovery.defer")
                     .await
                     .persist_content_repair_task(&task)
@@ -483,6 +484,9 @@ async fn repair_subjects_inner(
                 );
             }
         }
+    }
+    if availability_may_have_changed {
+        invalidate_local_availability_cache(state);
     }
     refresh_local_availability_view_once(state).await;
     Ok(())
@@ -548,6 +552,7 @@ pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
         .into_iter()
         .collect::<HashSet<_>>();
     let pending = pending.into_iter().collect::<HashSet<_>>();
+    let mut enqueued = false;
     for (hash, references) in retained.manifests {
         if hash == storage::TOMBSTONE_MANIFEST_HASH
             || !required.contains(&hash)
@@ -570,7 +575,11 @@ pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
                 .await
                 .persist_content_repair_task(&task)
                 .await?;
+            enqueued = true;
         }
+    }
+    if enqueued {
+        invalidate_local_availability_cache(state);
     }
     state.maintenance.content_repair_notify.notify_one();
     Ok(())
