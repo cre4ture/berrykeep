@@ -20351,7 +20351,13 @@ async fn hydrate_missing_chunks_for_range(
     subject: &str,
     missing_chunks: &[ReplicationChunkInfo],
 ) -> Result<()> {
-    let result = content_recovery::recover_chunks(state, subject, missing_chunks, None, true).await;
+    let result = content_recovery::recover_chunks_for_read(
+        state,
+        subject,
+        missing_chunks,
+        content_recovery::READ_THROUGH_RECOVERY_BUDGET,
+    )
+    .await?;
     if !result.remaining.is_empty() {
         bail!(
             "failed read-through chunk recovery for subject={subject}: {}",

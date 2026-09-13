@@ -1,6 +1,66 @@
 use super::*;
 use crate::storage::ReplicationExportBundle;
 
+async fn recovery_read_budget_bounds_slow_unadvertised_peers_impl(backend: MainTestBackend) {
+    let target = build_test_state(1, false, backend).await;
+    let source = build_test_state(1, false, backend).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let wait = release.clone();
+    let app = axum::Router::new().route(
+        "/cluster/v2/replication/chunk/{hash}",
+        axum::routing::get(move || {
+            let wait = wait.clone();
+            async move {
+                wait.notified().await;
+                StatusCode::NOT_FOUND
+            }
+        }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    register_online_source_node(&target, &source, &url).await;
+    let chunk = crate::storage::ReplicationChunkInfo {
+        hash: blake3::hash(b"absent").to_hex().to_string(),
+        size_bytes: 6,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::content_recovery::recover_chunks_for_read(
+            &target,
+            "unadvertised.bin",
+            &[chunk],
+            Duration::from_millis(50),
+        ),
+    )
+    .await;
+    release.notify_waiters();
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+    assert!(
+        result.is_ok(),
+        "foreground recovery ignored its total time budget"
+    );
+    let error = match result.unwrap() {
+        Err(error) => error,
+        Ok(_) => panic!("expected a deadline error"),
+    };
+    assert!(
+        error.to_string().contains("read-through recovery deadline"),
+        "{error:#}"
+    );
+}
+
+run_on_main_metadata_backends!(
+    recovery_read_budget_bounds_slow_unadvertised_peers_impl,
+    recovery_read_budget_bounds_slow_unadvertised_peers,
+    recovery_read_budget_bounds_slow_unadvertised_peers_turso
+);
+
 async fn recovery_scrub_persists_intent_when_execution_is_disabled_impl(backend: MainTestBackend) {
     let mut target = build_test_state(1, false, backend).await;
     target.repair_config.enabled = false;
