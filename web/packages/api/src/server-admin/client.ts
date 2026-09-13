@@ -107,12 +107,6 @@ type AdminRequestOptions = {
 
 const API_V1_PREFIX = "/api/v1";
 type GalleryMapEndpoint = "clusters" | "clusterEntries";
-type LegacyStoreIndexTreeCacheEntry = {
-  requestKey: string;
-  consistencyToken: string;
-  expiresAt: number;
-  response: AdminStoreListResponse;
-};
 
 const galleryMapEndpointPaths = {
   clusters: {
@@ -128,33 +122,6 @@ const galleryMapEndpointPaths = {
 const galleryMapEndpointRoutes = new Map<GalleryMapEndpoint, "canonical" | "legacy">();
 const STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS = 5 * 60 * 1_000;
 let storeIndexChildrenViewUnsupportedUntil = 0;
-let legacyStoreIndexTreeCache: LegacyStoreIndexTreeCacheEntry | null = null;
-let legacyStoreIndexTreeCacheExpiryTimer: ReturnType<typeof setTimeout> | null = null;
-
-function clearLegacyStoreIndexTreeCache(): void {
-  legacyStoreIndexTreeCache = null;
-  if (legacyStoreIndexTreeCacheExpiryTimer !== null) {
-    clearTimeout(legacyStoreIndexTreeCacheExpiryTimer);
-    legacyStoreIndexTreeCacheExpiryTimer = null;
-  }
-}
-
-function rememberLegacyStoreIndexTreeCache(
-  requestKey: string,
-  consistencyToken: string,
-  response: AdminStoreListResponse
-): void {
-  clearLegacyStoreIndexTreeCache();
-  const expiresAt = Date.now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS;
-  legacyStoreIndexTreeCache = { requestKey, consistencyToken, expiresAt, response };
-  legacyStoreIndexTreeCacheExpiryTimer = setTimeout(() => {
-    const cached = legacyStoreIndexTreeCache;
-    if (cached !== null && cached.expiresAt <= Date.now()) {
-      legacyStoreIndexTreeCache = null;
-      legacyStoreIndexTreeCacheExpiryTimer = null;
-    }
-  }, STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS);
-}
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
@@ -391,7 +358,6 @@ export async function listAdminStoreEntries(
   const view: StoreListView = options.view ?? "tree";
   if (view === "children" && Date.now() >= storeIndexChildrenViewUnsupportedUntil) {
     storeIndexChildrenViewUnsupportedUntil = 0;
-    clearLegacyStoreIndexTreeCache();
   }
   if (view === "children" && Date.now() < storeIndexChildrenViewUnsupportedUntil) {
     return fetchAdminStoreIndexLegacyChildrenProjection(
@@ -436,33 +402,9 @@ async function fetchAdminStoreIndexLegacyChildrenProjection(
   adminTokenOverride: string | undefined,
   options: StoreListRequestOptions
 ): Promise<AdminStoreListResponse> {
-  const requestKey = buildAdminStoreEntriesQuery(prefix, depth, snapshot, options, "tree", false)
-    .toString();
-  const canRevalidateCachedTree = canRevalidateLegacyStoreIndexTree(options);
-  let cachedTree = legacyStoreIndexTreeCache;
-  if (cachedTree !== null && cachedTree.expiresAt <= Date.now()) {
-    clearLegacyStoreIndexTreeCache();
-    cachedTree = null;
-  }
-  if (canRevalidateCachedTree && cachedTree?.requestKey === requestKey) {
-    // Revalidate the complete legacy tree with a one-entry server page before
-    // slicing it locally. This avoids repeat full-index transfers while the
-    // node's consistency token guarantees live listings are never stale.
-    const probe = await fetchAdminStoreEntries(
-      prefix,
-      depth,
-      snapshot,
-      adminTokenOverride,
-      { ...options, offset: 0, limit: 1 },
-      "tree",
-      true
-    );
-    if (probe.consistency_token === cachedTree.consistencyToken) {
-      return projectAdminStoreIndexChildren(cachedTree.response, prefix, options);
-    }
-    clearLegacyStoreIndexTreeCache();
-  }
-
+  // An older node's consistency token is process-local, so it cannot validate
+  // a complete cached tree after request routing changes or a node restart.
+  // Keep only the rejected-capability cache and fetch fresh legacy tree data.
   const treeResponse = await fetchAdminStoreEntries(
     prefix,
     depth,
@@ -472,22 +414,7 @@ async function fetchAdminStoreIndexLegacyChildrenProjection(
     "tree",
     false
   );
-  if (canRevalidateCachedTree && treeResponse.consistency_token) {
-    rememberLegacyStoreIndexTreeCache(requestKey, treeResponse.consistency_token, treeResponse);
-  } else {
-    clearLegacyStoreIndexTreeCache();
-  }
   return projectAdminStoreIndexChildren(treeResponse, prefix, options);
-}
-
-function canRevalidateLegacyStoreIndexTree(options: StoreListRequestOptions): boolean {
-  // A one-entry tree probe would take the gallery-index fast path for this
-  // shape, while the unpaged legacy tree comes from the general index path.
-  // Those responses use different consistency-token namespaces.
-  return (
-    !options.mediaFilter ||
-    (options.sort !== "captured_asc" && options.sort !== "captured_desc")
-  );
 }
 
 function storeIndexViewWasRejected(error: unknown, requestedView: StoreListView): boolean {

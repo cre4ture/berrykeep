@@ -667,7 +667,7 @@ test("server-admin explorer restores snapshot entries", async ({ page }) => {
   await expect(page.getByRole("cell", { name: "restored/readme-restored.txt" })).toBeVisible();
 });
 
-test("server-admin remembers an older store index projection", async ({ page }) => {
+test("server-admin remembers an older store index capability", async ({ page }) => {
   const storeIndexRequests: URL[] = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
@@ -709,8 +709,8 @@ test("server-admin remembers an older store index projection", async ({ page }) 
   const fallbackRequests = storeIndexRequests.filter(
     (request) => request.searchParams.get("view") === "tree"
   );
-  expect(fallbackRequests[treeRequestCount].searchParams.get("offset")).toBe("0");
-  expect(fallbackRequests[treeRequestCount].searchParams.get("limit")).toBe("1");
+  expect(fallbackRequests[treeRequestCount].searchParams.has("offset")).toBe(false);
+  expect(fallbackRequests[treeRequestCount].searchParams.has("limit")).toBe(false);
 });
 
 test("server-admin prepares, validates, and saves a host-checked storage path with recovery guidance", async ({ page }) => {

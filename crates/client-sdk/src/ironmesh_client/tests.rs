@@ -124,10 +124,10 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
                 route_queries.lock().await.push(query.clone());
                 assert!(matches!(query.view, Some(LegacyStoreIndexView::Tree)));
                 let tree_request = route_tree_request_count.fetch_add(1, Ordering::SeqCst);
-                let (consistency_token, second_file) = if tree_request < 2 {
-                    ("namespace:1", "docs/b.txt")
+                let second_file = if tree_request == 0 {
+                    "docs/b.txt"
                 } else {
-                    ("namespace:2", "docs/c.txt")
+                    "docs/c.txt"
                 };
 
                 Json(serde_json::json!({
@@ -135,7 +135,7 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
                     "depth": 1,
                     "entry_count": 3,
                     "total_entry_count": 3,
-                    "consistency_token": consistency_token,
+                    "consistency_token": "namespace:1",
                     "entries": [
                         { "path": "docs/", "entry_type": "prefix" },
                         { "path": "docs/a.txt", "entry_type": "key" },
@@ -175,28 +175,6 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
     assert_eq!(response.entries.len(), 1);
     assert_eq!(response.entries[0].path, "docs/b.txt");
 
-    let cached_response = client
-        .store_index_with_options(
-            Some("docs"),
-            1,
-            None,
-            StoreIndexRequestOptions {
-                view: Some(StoreIndexView::Children),
-                offset: Some(0),
-                limit: Some(1),
-                ..StoreIndexRequestOptions::default()
-            },
-        )
-        .await
-        .expect("a remembered older node should request its tree projection directly");
-
-    assert_eq!(cached_response.total_entry_count, 2);
-    assert_eq!(cached_response.offset, 0);
-    assert_eq!(cached_response.limit, Some(1));
-    assert!(cached_response.has_more);
-    assert_eq!(cached_response.entries.len(), 1);
-    assert_eq!(cached_response.entries[0].path, "docs/a.txt");
-
     let refreshed_response = client
         .store_index_with_options(
             Some("docs"),
@@ -210,14 +188,17 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
             },
         )
         .await
-        .expect("a changed consistency token should refresh the cached tree");
+        .expect("a remembered older node should request its tree projection directly");
 
     assert_eq!(refreshed_response.total_entry_count, 2);
+    assert_eq!(refreshed_response.offset, 1);
+    assert_eq!(refreshed_response.limit, Some(1));
+    assert!(!refreshed_response.has_more);
     assert_eq!(refreshed_response.entries.len(), 1);
     assert_eq!(refreshed_response.entries[0].path, "docs/c.txt");
 
     let recorded_queries = queries.lock().await.clone();
-    assert_eq!(recorded_queries.len(), 4);
+    assert_eq!(recorded_queries.len(), 2);
     assert!(matches!(
         recorded_queries[0].view,
         Some(LegacyStoreIndexView::Tree)
@@ -228,45 +209,8 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
         recorded_queries[1].view,
         Some(LegacyStoreIndexView::Tree)
     ));
-    assert_eq!(recorded_queries[1].offset, Some(0));
-    assert_eq!(recorded_queries[1].limit, Some(1));
-    assert!(matches!(
-        recorded_queries[2].view,
-        Some(LegacyStoreIndexView::Tree)
-    ));
-    assert_eq!(recorded_queries[2].offset, Some(0));
-    assert_eq!(recorded_queries[2].limit, Some(1));
-    assert!(matches!(
-        recorded_queries[3].view,
-        Some(LegacyStoreIndexView::Tree)
-    ));
-    assert_eq!(recorded_queries[3].offset, None);
-    assert_eq!(recorded_queries[3].limit, None);
-
-    let captured_media_options = StoreIndexRequestOptions {
-        view: Some(StoreIndexView::Children),
-        offset: Some(0),
-        limit: Some(1),
-        sort: Some(StoreIndexSortOrder::CapturedDesc),
-        media_filter: Some(StoreIndexMediaFilter::Image),
-        ..StoreIndexRequestOptions::default()
-    };
-    client
-        .store_index_with_options(Some("docs"), 1, None, captured_media_options.clone())
-        .await
-        .expect("captured-media fallback should succeed without caching its full tree");
-    client
-        .store_index_with_options(Some("docs"), 1, None, captured_media_options)
-        .await
-        .expect("captured-media fallback should not issue an incompatible cache probe");
-
-    let queries = queries.lock().await.clone();
-    assert_eq!(queries.len(), 6);
-    for query in &queries[4..] {
-        assert!(matches!(query.view, Some(LegacyStoreIndexView::Tree)));
-        assert_eq!(query.offset, None);
-        assert_eq!(query.limit, None);
-    }
+    assert_eq!(recorded_queries[1].offset, None);
+    assert_eq!(recorded_queries[1].limit, None);
 
     server.abort();
 }

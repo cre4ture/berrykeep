@@ -254,6 +254,7 @@ export function ExplorerSurface({
   const [showHistoricalEntries, setShowHistoricalEntries] = useState(false);
   const [selectedHistoricalEntries, setSelectedHistoricalEntries] = useState<string[]>([]);
   const quickUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const entriesRequestSequenceRef = useRef(0);
   const canCreateFolder = snapshotId == null && mutations?.createFolderMarker != null;
   const canDeleteCurrentStore = snapshotId == null && mutations?.deletePath != null;
   const canRenameCurrentStore = snapshotId == null && mutations?.renamePath != null;
@@ -303,6 +304,8 @@ export function ExplorerSurface({
       includeHistorical?: boolean;
     }
   ) {
+    const requestSequence = entriesRequestSequenceRef.current + 1;
+    entriesRequestSequenceRef.current = requestSequence;
     setLoading("entries");
     setError(null);
     const targetPrefix = nextPrefix ?? prefix;
@@ -356,6 +359,9 @@ export function ExplorerSurface({
         }),
         historyRequest
       ]);
+      if (requestSequence !== entriesRequestSequenceRef.current) {
+        return;
+      }
       setEntriesPayload(payload);
       if (includeHistorical) {
         setHistoryEntriesPayload(historyResult.payload);
@@ -372,6 +378,9 @@ export function ExplorerSurface({
         setPrefix(nextPrefix);
       }
     } catch (nextError) {
+      if (requestSequence !== entriesRequestSequenceRef.current) {
+        return;
+      }
       if (includeHistorical) {
         setHistoryEntriesPayload(null);
         setHistoryLoadState("failed");
@@ -379,7 +388,9 @@ export function ExplorerSurface({
       }
       setError(nextError instanceof Error ? nextError.message : "Failed to load store entries");
     } finally {
-      setLoading(null);
+      if (requestSequence === entriesRequestSequenceRef.current) {
+        setLoading(null);
+      }
     }
   }
 

@@ -233,15 +233,6 @@ struct GalleryMapApiRoutes {
 #[derive(Debug, Default)]
 struct StoreIndexChildrenViewCapability {
     unsupported_until: Option<Instant>,
-    legacy_tree_response: Option<LegacyStoreIndexTreeCacheEntry>,
-}
-
-#[derive(Debug, Clone)]
-struct LegacyStoreIndexTreeCacheEntry {
-    request_key: String,
-    consistency_token: String,
-    expires_at: Instant,
-    response: Arc<StoreIndexResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5859,7 +5850,6 @@ impl IronMeshClient {
             return true;
         }
         capability.unsupported_until = None;
-        capability.legacy_tree_response = None;
         false
     }
 
@@ -5870,77 +5860,6 @@ impl IronMeshClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         capability.unsupported_until =
             Some(Instant::now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER);
-    }
-
-    fn legacy_store_index_tree_response(
-        &self,
-        request_key: &str,
-    ) -> Option<LegacyStoreIndexTreeCacheEntry> {
-        let mut capability = self
-            .store_index_children_view_capability
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if capability
-            .legacy_tree_response
-            .as_ref()
-            .is_some_and(|entry| entry.expires_at <= Instant::now())
-        {
-            capability.legacy_tree_response = None;
-            return None;
-        }
-        capability
-            .legacy_tree_response
-            .as_ref()
-            .filter(|entry| entry.request_key == request_key)
-            .cloned()
-    }
-
-    fn remember_legacy_store_index_tree_response(
-        &self,
-        request_key: String,
-        consistency_token: String,
-        response: Arc<StoreIndexResponse>,
-    ) {
-        let expires_at = Instant::now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER;
-        let capability = Arc::clone(&self.store_index_children_view_capability);
-        capability
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .legacy_tree_response = Some(LegacyStoreIndexTreeCacheEntry {
-            request_key,
-            consistency_token,
-            expires_at,
-            response,
-        });
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)).await;
-                let mut capability = capability
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if capability
-                    .legacy_tree_response
-                    .as_ref()
-                    .is_some_and(|entry| entry.expires_at <= Instant::now())
-                {
-                    capability.legacy_tree_response = None;
-                }
-            });
-        }
-    }
-
-    fn forget_legacy_store_index_tree_response(&self, request_key: &str) {
-        let mut capability = self
-            .store_index_children_view_capability
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if capability
-            .legacy_tree_response
-            .as_ref()
-            .is_some_and(|entry| entry.request_key == request_key)
-        {
-            capability.legacy_tree_response = None;
-        }
     }
 
     async fn store_index_with_legacy_tree_projection(
@@ -5957,54 +5876,15 @@ impl IronMeshClient {
         fallback_options.offset = None;
         fallback_options.limit = None;
 
-        // A one-entry tree probe would take the gallery-index fast path for a
-        // captured-media query, while this unpaged fallback necessarily takes
-        // the general index path. Their consistency-token namespaces differ,
-        // so retain no complete tree for that shape rather than probing and
-        // re-fetching it on every page.
-        let can_revalidate_cached_tree = legacy_store_index_tree_cache_is_revalidatable(options);
-        let request_key =
-            self.store_index_request_cache_key(prefix, depth, snapshot, &fallback_options)?;
-        if can_revalidate_cached_tree
-            && let Some(cached) = self.legacy_store_index_tree_response(&request_key)
-        {
-            // A tree projection must be complete before children pagination can
-            // be recreated locally. Revalidate the cached complete response by
-            // requesting a one-entry tree page and comparing the node's
-            // consistency token, so a live listing never serves stale data.
-            let mut probe_options = fallback_options.clone();
-            probe_options.offset = Some(0);
-            probe_options.limit = Some(1);
-            let probe_response = self
-                .request_store_index(prefix, depth, snapshot, &probe_options)
-                .await?;
-            let probe = decode_store_index_response(probe_response, &probe_options)?;
-            if probe.consistency_token.as_deref() == Some(cached.consistency_token.as_str()) {
-                return Ok(project_store_index_children_response(
-                    &cached.response,
-                    prefix,
-                    options,
-                ));
-            }
-            self.forget_legacy_store_index_tree_response(&request_key);
-        }
-
+        // A legacy node exposes no durable token that is safe across request
+        // routes or process restarts. Fetch its complete tree for every
+        // projected request instead of risking a stale live listing. The
+        // rejected capability itself is cached above, so this does not repeat
+        // the doomed `children` request until the reprobe window expires.
         let fallback_response = self
             .request_store_index(prefix, depth, snapshot, &fallback_options)
             .await?;
-        let response = Arc::new(decode_store_index_response(
-            fallback_response,
-            &fallback_options,
-        )?);
-        if can_revalidate_cached_tree
-            && let Some(consistency_token) = response.consistency_token.clone()
-        {
-            self.remember_legacy_store_index_tree_response(
-                request_key,
-                consistency_token,
-                Arc::clone(&response),
-            );
-        }
+        let response = decode_store_index_response(fallback_response, &fallback_options)?;
         Ok(project_store_index_children_response(
             &response, prefix, options,
         ))
@@ -6022,18 +5902,6 @@ impl IronMeshClient {
         self.execute_buffered_request(Method::GET, url, Vec::new(), None)
             .await
             .context("failed to request /store/index")
-    }
-
-    fn store_index_request_cache_key(
-        &self,
-        prefix: Option<&str>,
-        depth: usize,
-        snapshot: Option<&str>,
-        options: &StoreIndexRequestOptions,
-    ) -> Result<String> {
-        Ok(path_and_query(&self.store_index_request_url(
-            prefix, depth, snapshot, options,
-        )?))
     }
 
     fn store_index_request_url(
@@ -10220,14 +10088,6 @@ fn project_store_index_children_response(
         media_summary: response.media_summary.clone(),
         entries,
     }
-}
-
-fn legacy_store_index_tree_cache_is_revalidatable(options: &StoreIndexRequestOptions) -> bool {
-    options.media_filter.is_none()
-        || !matches!(
-            options.sort,
-            Some(StoreIndexSortOrder::CapturedAsc | StoreIndexSortOrder::CapturedDesc)
-        )
 }
 
 fn append_optional_query(url: &mut Url, key: &str, value: Option<&str>) {

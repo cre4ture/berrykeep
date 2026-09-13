@@ -1910,6 +1910,39 @@ test("client-ui explorer requests paged children instead of the complete index",
   expect(requestPages.every((request) => request.view === "children")).toBe(true);
 });
 
+test("client-ui explorer ignores a late response for a previous prefix", async ({ page }) => {
+  const mocks = await installClientUiMocks(page, {
+    storeEntries: [
+      { path: "a/", entry_type: "prefix" },
+      { path: "a/only-a.txt", entry_type: "key", size_bytes: 1 },
+      { path: "b/", entry_type: "prefix" },
+      { path: "b/only-b.txt", entry_type: "key", size_bytes: 1 }
+    ]
+  });
+  mocks.setGalleryStoreListDelayForPrefix("a/", 1_000);
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  const firstPrefixRow = page.getByRole("cell", { name: "a/", exact: true }).locator("..");
+  const secondPrefixRow = page.getByRole("cell", { name: "b/", exact: true }).locator("..");
+  const firstPrefixResponse = page.waitForResponse((response) => {
+    const requestUrl = new URL(response.url());
+    return requestUrl.pathname === apiV1("/store/list") && requestUrl.searchParams.get("prefix") === "a/";
+  });
+  const firstPrefixRequest = page.waitForRequest((request) => {
+    const requestUrl = new URL(request.url());
+    return requestUrl.pathname === apiV1("/store/list") && requestUrl.searchParams.get("prefix") === "a/";
+  });
+  await firstPrefixRow.getByRole("button", { name: "Open" }).evaluate((button) => button.click());
+  await firstPrefixRequest;
+  await secondPrefixRow.getByRole("button", { name: "Open" }).evaluate((button) => button.click());
+  await expect(page.getByRole("cell", { name: "only-b.txt", exact: true })).toBeVisible();
+
+  await firstPrefixResponse;
+  await expect(page.getByRole("cell", { name: "only-a.txt", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("cell", { name: "only-b.txt", exact: true })).toBeVisible();
+});
+
 test("client-ui explorer refreshes history while paging current entries", async ({ page }) => {
   let historyRequestCount = 0;
   page.on("request", (request) => {
@@ -2317,6 +2350,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const galleryMapMock = new GalleryMapMockSession<MockStoreEntry>();
   let galleryStoreListDelayMs = 0;
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
+  const galleryStoreListDelayByPrefix = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const restoredHistoryEntries: MockHistoryEntry[][] = [];
   let historyRestoreRequestCount = 0;
@@ -2945,6 +2979,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         return;
       }
       const storeListDelay =
+        galleryStoreListDelayByPrefix.get(searchParams.get("prefix") ?? "") ??
         galleryStoreListDelayByMediaFilter.get(searchParams.get("media_filter") ?? "") ??
         galleryStoreListDelayMs;
       if (storeListDelay > 0) {
@@ -3148,6 +3183,9 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     },
     setGalleryStoreListDelayForMediaFilter: (mediaFilter: string, delayMs: number) => {
       galleryStoreListDelayByMediaFilter.set(mediaFilter, delayMs);
+    },
+    setGalleryStoreListDelayForPrefix: (prefix: string, delayMs: number) => {
+      galleryStoreListDelayByPrefix.set(prefix, delayMs);
     },
     setCacheScope: (scope: string | null) => {
       cacheScope = scope;
