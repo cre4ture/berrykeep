@@ -172,11 +172,14 @@ fn systemd_service_from_cgroup_path(path: &str) -> Option<SystemdService> {
         .split('/')
         .filter(|component| !component.is_empty())
         .collect::<Vec<_>>();
-    let manager = units
+    let manager = if units
         .iter()
         .any(|unit| is_systemd_user_manager_service(unit))
-        .then_some(SystemdServiceManager::User)
-        .unwrap_or(SystemdServiceManager::System);
+    {
+        SystemdServiceManager::User
+    } else {
+        SystemdServiceManager::System
+    };
 
     for unit in units.iter().rev() {
         // A scope contains processes started outside a service unit (such as a
