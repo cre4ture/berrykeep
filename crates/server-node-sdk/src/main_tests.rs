@@ -2245,6 +2245,15 @@ fn cluster_config_requires_explicit_insecure_public_http_override() {
     );
 }
 
+#[test]
+fn canonical_admin_token_header_takes_precedence_over_legacy_header() {
+    let mut headers = HeaderMap::new();
+    headers.insert(super::ADMIN_TOKEN_HEADER, "canonical".parse().unwrap());
+    headers.insert(super::LEGACY_ADMIN_TOKEN_HEADER, "legacy".parse().unwrap());
+
+    assert_eq!(super::admin_token_header_value(&headers), Some("canonical"));
+}
+
 async fn admin_authorization_requires_configured_auth_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let headers = HeaderMap::new();
@@ -2295,6 +2304,38 @@ run_on_main_metadata_backends!(
     admin_authorization_requires_token_when_configured_impl,
     admin_authorization_requires_token_when_configured,
     admin_authorization_requires_token_when_configured_turso
+);
+
+async fn admin_authorization_accepts_legacy_token_header_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    let admin_token = fresh_test_secret("admin");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        super::LEGACY_ADMIN_TOKEN_HEADER,
+        admin_token
+            .parse()
+            .expect("admin token should be a header value"),
+    );
+
+    let result = super::authorize_admin_request(
+        &state,
+        &headers,
+        "maintenance/tombstones/compact",
+        true,
+        true,
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(result.is_ok());
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    admin_authorization_accepts_legacy_token_header_impl,
+    admin_authorization_accepts_legacy_token_header,
+    admin_authorization_accepts_legacy_token_header_turso
 );
 
 async fn gallery_delta_admin_route_requires_authorization_and_accepts_current_token_impl(

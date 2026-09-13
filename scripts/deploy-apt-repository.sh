@@ -10,6 +10,8 @@ COMPONENT="${APT_REPO_COMPONENT:-main}"
 REMOTE="${APT_REPO_REMOTE:-creature@creax.de}"
 REMOTE_DIR="${APT_REPO_REMOTE_DIR:-/home/creature/html/apt/berrykeep}"
 REMOTE_URL="${APT_REPO_URL:-https://creax.de/apt/berrykeep}"
+LEGACY_REMOTE_DIR="${APT_REPO_LEGACY_REMOTE_DIR:-/home/creature/html/apt/ironmesh}"
+LEGACY_REMOTE_URL="${APT_REPO_LEGACY_URL:-https://creax.de/apt/ironmesh}"
 DRY_RUN=false
 MATRIX_FILE=""
 SUITES=()
@@ -39,12 +41,16 @@ Options:
   --remote HOST      SSH remote. Defaults to creature@creax.de.
   --remote-dir DIR   Remote web directory. Defaults to /home/creature/html/apt/berrykeep.
   --url URL          Public repository URL printed at the end.
+  --legacy-remote-dir DIR
+                    Legacy repository mirror directory. Defaults to
+                    /home/creature/html/apt/ironmesh.
+  --legacy-url URL   Public URL used to verify the legacy repository mirror.
   --dry-run          Show the rsync changes without uploading.
   -h, --help         Show this help text.
 
 Environment defaults:
   APT_REPO_DIR, APT_REPO_SUITE, APT_REPO_COMPONENT, APT_REPO_REMOTE, APT_REPO_REMOTE_DIR,
-  APT_REPO_URL.
+  APT_REPO_URL, APT_REPO_LEGACY_REMOTE_DIR, APT_REPO_LEGACY_URL.
 EOF
 }
 
@@ -244,6 +250,30 @@ while (($# > 0)); do
       REMOTE_URL="${1#*=}"
       shift
       ;;
+    --legacy-remote-dir)
+      [[ $# -ge 2 ]] || {
+        printf '%s\n' '--legacy-remote-dir requires a directory' >&2
+        exit 1
+      }
+      LEGACY_REMOTE_DIR="$2"
+      shift 2
+      ;;
+    --legacy-remote-dir=*)
+      LEGACY_REMOTE_DIR="${1#*=}"
+      shift
+      ;;
+    --legacy-url)
+      [[ $# -ge 2 ]] || {
+        printf '%s\n' '--legacy-url requires a URL' >&2
+        exit 1
+      }
+      LEGACY_REMOTE_URL="$2"
+      shift 2
+      ;;
+    --legacy-url=*)
+      LEGACY_REMOTE_URL="${1#*=}"
+      shift
+      ;;
     --dry-run)
       DRY_RUN=true
       shift
@@ -296,6 +326,11 @@ if [[ ! -s "${REPO_DIR}/berrykeep-archive-keyring.asc" ]]; then
   exit 1
 fi
 
+# The legacy endpoint continues to serve the same signing key under its former
+# filename so existing signed-by and key-download instructions remain valid.
+cp -f "${REPO_DIR}/berrykeep-archive-keyring.asc" \
+  "${REPO_DIR}/ironmesh-archive-keyring.asc"
+
 for suite in "${SUITES[@]}"; do
   if [[ ! -f "${REPO_DIR}/dists/${suite}/InRelease" ]]; then
     printf 'signed apt metadata not found: %s\n' "${REPO_DIR}/dists/${suite}/InRelease" >&2
@@ -309,21 +344,25 @@ done
 
 verify_deployed_suite() {
   local suite="$1"
-  local remote_suite_dir="${REMOTE_DISTS_DIR}/${suite}"
+  local remote_dists_dir="$2"
+  local remote_url="$3"
+  local repository_label="$4"
+  local remote_suite_dir="${remote_dists_dir}/${suite}"
   local remote_inrelease public_inrelease
 
   remote_inrelease="$(mktemp)"
   if ! ssh "${REMOTE}" "cat $(shell_quote "${remote_suite_dir}/InRelease")" \
     > "${remote_inrelease}"; then
     rm -f "${remote_inrelease}"
-    printf 'failed to download deployed %s InRelease from %s for verification\n' \
-      "${suite}" "${REMOTE}" >&2
+    printf 'failed to download deployed %s %s InRelease from %s for verification\n' \
+      "${repository_label}" "${suite}" "${REMOTE}" >&2
     exit 1
   fi
   if ! verify_signed_release "${remote_inrelease}" "deployed remote ${suite}" || \
     ! cmp -s "${REPO_DIR}/dists/${suite}/InRelease" "${remote_inrelease}"; then
     rm -f "${remote_inrelease}"
-    printf 'deployed %s InRelease differs from the locally verified metadata\n' "${suite}" >&2
+    printf 'deployed %s %s InRelease differs from the locally verified metadata\n' \
+      "${repository_label}" "${suite}" >&2
     exit 1
   fi
   rm -f "${remote_inrelease}"
@@ -331,15 +370,17 @@ verify_deployed_suite() {
   public_inrelease="$(mktemp)"
   if ! curl --fail --silent --show-error --location \
     --output "${public_inrelease}" \
-    "${REMOTE_URL%/}/dists/${suite}/InRelease"; then
+    "${remote_url%/}/dists/${suite}/InRelease"; then
     rm -f "${public_inrelease}"
-    printf 'failed to download public %s InRelease for verification\n' "${suite}" >&2
+    printf 'failed to download public %s %s InRelease for verification\n' \
+      "${repository_label}" "${suite}" >&2
     exit 1
   fi
   if ! verify_signed_release "${public_inrelease}" "public ${suite}" || \
     ! cmp -s "${REPO_DIR}/dists/${suite}/InRelease" "${public_inrelease}"; then
     rm -f "${public_inrelease}"
-    printf 'public %s InRelease differs from the locally verified metadata\n' "${suite}" >&2
+    printf 'public %s %s InRelease differs from the locally verified metadata\n' \
+      "${repository_label}" "${suite}" >&2
     exit 1
   fi
   rm -f "${public_inrelease}"
@@ -353,63 +394,80 @@ if [[ "${DRY_RUN}" == true ]]; then
 fi
 
 REMOTE_DISTS_DIR="${REMOTE_DIR%/}/dists"
+LEGACY_REMOTE_DISTS_DIR="${LEGACY_REMOTE_DIR%/}/dists"
 
-if [[ "${DRY_RUN}" == false ]]; then
+ensure_remote_suite_directories() {
+  local target_dir="$1"
+  local repository_label="$2"
+  local target_dists_dir="${target_dir%/}/dists"
+  local suite remote_suite_dir
+
+  [[ "${DRY_RUN}" == false ]] || return
   for suite in "${SUITES[@]}"; do
-    remote_suite_dir="${REMOTE_DISTS_DIR}/${suite}"
-    log "ensuring ${REMOTE}:${REMOTE_DIR}/dists/${suite} exists"
+    remote_suite_dir="${target_dists_dir}/${suite}"
+    log "ensuring ${repository_label} mirror ${REMOTE}:${target_dir}/dists/${suite} exists"
     ssh "${REMOTE}" \
       "mkdir -p $(shell_quote "${remote_suite_dir}") && \
-        chmod a+rx $(shell_quote "${REMOTE_DISTS_DIR}") $(shell_quote "${remote_suite_dir}")"
+        chmod a+rx $(shell_quote "${target_dists_dir}") $(shell_quote "${remote_suite_dir}")"
   done
-fi
+}
 
-log "syncing package pool additions"
-rsync "${RSYNC_ADDITION_ARGS[@]}" \
-  --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-  "${REPO_DIR%/}/pool/" \
-  "${REMOTE}:${REMOTE_DIR%/}/pool/"
+sync_repository_mirror() {
+  local target_dir="$1"
+  local repository_label="$2"
+  local suite package_namespace suite_pool_dir
 
-log "syncing archive signing keys"
-rsync "${RSYNC_ADDITION_ARGS[@]}" \
-  --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-  "${REPO_DIR%/}/berrykeep-archive-keyring.asc" \
-  "${REMOTE}:${REMOTE_DIR%/}/ironmesh-archive-keyring.asc"
-rsync "${RSYNC_ADDITION_ARGS[@]}" \
-  --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-  "${REPO_DIR%/}/berrykeep-archive-keyring.asc" \
-  "${REMOTE}:${REMOTE_DIR%/}/berrykeep-archive-keyring.asc"
-
-for suite in "${SUITES[@]}"; do
-  log "syncing ${suite} metadata"
-  rsync "${RSYNC_ARGS[@]}" \
+  log "syncing ${repository_label} package pool additions"
+  rsync "${RSYNC_ADDITION_ARGS[@]}" \
     --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-    "${REPO_DIR%/}/dists/${suite}/" \
-    "${REMOTE}:${REMOTE_DIR%/}/dists/${suite}/"
-done
+    "${REPO_DIR%/}/pool/" \
+    "${REMOTE}:${target_dir%/}/pool/"
 
-# Server-node-only publication prunes superseded files from a suite-scoped
-# pool. Apply this deletion only after the signed metadata no longer references
-# those files: a metadata-sync failure then leaves harmless extra files instead
-# of a published index with a missing package. Each source package namespace is
-# pruned separately, so the transitional legacy packages remain available.
-for suite in "${SUITES[@]}"; do
-  for package_namespace in b/berrykeep i/ironmesh; do
-    suite_pool_dir="${REPO_DIR}/pool/${COMPONENT}/${package_namespace}/${suite}"
-    [[ -d "${suite_pool_dir}" ]] || continue
-    log "pruning ${suite} ${package_namespace} package pool"
+  log "syncing ${repository_label} archive signing keys"
+  rsync "${RSYNC_ADDITION_ARGS[@]}" \
+    --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+    "${REPO_DIR%/}/berrykeep-archive-keyring.asc" \
+    "${REPO_DIR%/}/ironmesh-archive-keyring.asc" \
+    "${REMOTE}:${target_dir%/}/"
+
+  for suite in "${SUITES[@]}"; do
+    log "syncing ${repository_label} ${suite} metadata"
     rsync "${RSYNC_ARGS[@]}" \
       --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-      "${suite_pool_dir%/}/" \
-      "${REMOTE}:${REMOTE_DIR%/}/pool/${COMPONENT}/${package_namespace}/${suite}/"
+      "${REPO_DIR%/}/dists/${suite}/" \
+      "${REMOTE}:${target_dir%/}/dists/${suite}/"
   done
-done
+
+  # Server-node-only publication prunes superseded files from a suite-scoped
+  # pool. Apply this deletion only after the signed metadata no longer references
+  # those files: a metadata-sync failure then leaves harmless extra files instead
+  # of a published index with a missing package. Each source package namespace is
+  # pruned separately, so transitional legacy packages remain available.
+  for suite in "${SUITES[@]}"; do
+    for package_namespace in b/berrykeep i/ironmesh; do
+      suite_pool_dir="${REPO_DIR}/pool/${COMPONENT}/${package_namespace}/${suite}"
+      [[ -d "${suite_pool_dir}" ]] || continue
+      log "pruning ${repository_label} ${suite} ${package_namespace} package pool"
+      rsync "${RSYNC_ARGS[@]}" \
+        --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+        "${suite_pool_dir%/}/" \
+        "${REMOTE}:${target_dir%/}/pool/${COMPONENT}/${package_namespace}/${suite}/"
+    done
+  done
+}
+
+ensure_remote_suite_directories "${REMOTE_DIR}" "canonical"
+ensure_remote_suite_directories "${LEGACY_REMOTE_DIR}" "legacy"
+sync_repository_mirror "${REMOTE_DIR}" "canonical"
+sync_repository_mirror "${LEGACY_REMOTE_DIR}" "legacy"
 
 if [[ "${DRY_RUN}" == true ]]; then
   log "dry run complete"
 else
   for suite in "${SUITES[@]}"; do
-    verify_deployed_suite "${suite}"
+    verify_deployed_suite "${suite}" "${REMOTE_DISTS_DIR}" "${REMOTE_URL}" "canonical"
+    verify_deployed_suite \
+      "${suite}" "${LEGACY_REMOTE_DISTS_DIR}" "${LEGACY_REMOTE_URL}" "legacy"
   done
-  log "published ${REMOTE_URL%/}/"
+  log "published ${REMOTE_URL%/} and ${LEGACY_REMOTE_URL%/}"
 fi

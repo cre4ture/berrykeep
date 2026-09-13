@@ -57,6 +57,7 @@ const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Admin authentication header, matching the server-node admin plane convention
 /// (`x-berrykeep-admin-token`). See doc Section 5.3.
 pub const ADMIN_TOKEN_HEADER: &str = "x-berrykeep-admin-token";
+const LEGACY_ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
 
 /// Ingestion token header (doc Section 5.2/8): an optional, opaque per-`telemetry_subject_id`
 /// credential issued by `POST /v1/register/{telemetry_subject_id}` and presented on subsequent
@@ -674,6 +675,7 @@ fn authorize_admin(state: &StatsCollectorAppState, headers: &HeaderMap) -> Resul
     };
     let provided = headers
         .get(ADMIN_TOKEN_HEADER)
+        .or_else(|| headers.get(LEGACY_ADMIN_TOKEN_HEADER))
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
@@ -1306,6 +1308,25 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_raw_accepts_the_legacy_admin_token_header() {
+        let state = test_state()
+            .await
+            .with_admin_token(Some("secret".to_string()));
+        let router = build_router(state);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/raw?telemetry_subject_id=whatever")
+                    .header(LEGACY_ADMIN_TOKEN_HEADER, "secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

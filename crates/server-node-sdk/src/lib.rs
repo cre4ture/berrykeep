@@ -2052,14 +2052,7 @@ async fn request_has_admin_auth(state: &ServerState, headers: &HeaderMap) -> boo
         .admin_control
         .admin_token
         .as_deref()
-        .map(|expected| {
-            token_matches(
-                expected,
-                headers
-                    .get(ADMIN_TOKEN_HEADER)
-                    .and_then(|value| value.to_str().ok()),
-            )
-        })
+        .map(|expected| token_matches(expected, admin_token_header_value(headers)))
         .unwrap_or(false)
         || current_admin_session_expiry(state, headers).await.is_some()
 }
@@ -30973,6 +30966,7 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
 }
 
 const ADMIN_TOKEN_HEADER: &str = "x-berrykeep-admin-token";
+const LEGACY_ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
 const ADMIN_ACTOR_HEADER: &str = "x-berrykeep-admin-actor";
 const ADMIN_SOURCE_NODE_HEADER: &str = "x-berrykeep-node-id";
 const ADMIN_SESSION_COOKIE_PREFIX: &str = "berrykeep_admin_session";
@@ -30981,6 +30975,13 @@ const ADMIN_SESSION_COOKIE_PREFIX: &str = "berrykeep_admin_session";
 struct AdminRequestMetadata {
     actor: Option<String>,
     source_node: Option<String>,
+}
+
+fn admin_token_header_value(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(ADMIN_TOKEN_HEADER)
+        .or_else(|| headers.get(LEGACY_ADMIN_TOKEN_HEADER))
+        .and_then(|value| value.to_str().ok())
 }
 
 fn admin_request_metadata(headers: &HeaderMap) -> AdminRequestMetadata {
@@ -31150,14 +31151,7 @@ async fn get_admin_session_status(
         .admin_control
         .admin_token
         .as_deref()
-        .map(|expected| {
-            token_matches(
-                expected,
-                headers
-                    .get(ADMIN_TOKEN_HEADER)
-                    .and_then(|value| value.to_str().ok()),
-            )
-        })
+        .map(|expected| token_matches(expected, admin_token_header_value(&headers)))
         .unwrap_or(false);
     let session_expires_at_unix = current_admin_session_expiry(&state, &headers).await;
     let authenticated = token_valid || session_expires_at_unix.is_some();
@@ -31533,14 +31527,7 @@ async fn authorize_admin_request(
         .admin_control
         .admin_token
         .as_deref()
-        .map(|expected| {
-            token_matches(
-                expected,
-                headers
-                    .get(ADMIN_TOKEN_HEADER)
-                    .and_then(|value| value.to_str().ok()),
-            )
-        })
+        .map(|expected| token_matches(expected, admin_token_header_value(headers)))
         .unwrap_or(false);
     let session_expires_at_unix = current_admin_session_expiry(state, headers).await;
 
