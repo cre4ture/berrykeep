@@ -1,6 +1,6 @@
 ---
 name: pr-followup
-description: Follow an open BerryKeep pull request after creation or update. Use after opening or pushing to a PR, or when asked to follow it until merge-ready; watch target-branch drift, merge conflicts, review feedback, and CI failures.
+description: How to follow an open pull request. Use automatically after opening or pushing to a PR and follow it until merge-ready; watch target-branch drift, merge conflicts, review feedback, and CI failures.
 ---
 
 # PR Follow-up
