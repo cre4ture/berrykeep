@@ -898,7 +898,7 @@ test("server-admin dashboard filters dependency findings by severity", async ({ 
   await page.keyboard.press("Escape");
 
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
-  await expect(page.getByText("Storage mount protection needs attention", { exact: true })).toBeVisible();
+  await expect(page.getByText("Host dependencies need attention", { exact: true })).toBeVisible();
   await expect(page.getByText(/Draining storage needs mount protection/)).toBeVisible();
   await expect(page.getByText(/Data directory needs mount protection/)).toBeVisible();
   await expect(page.getByText("Optional GDAL tooling unavailable", { exact: true })).toHaveCount(0);
