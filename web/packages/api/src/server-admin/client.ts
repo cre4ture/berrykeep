@@ -450,10 +450,10 @@ function projectAdminStoreIndexChildren(
   prefix: string | undefined,
   options: StoreListRequestOptions
 ): AdminStoreListResponse {
-  const normalizedPrefix = prefix?.trim().replace(/^\/+|\/+$/g, "") ?? "";
+  const normalizedPrefix = prefix ? normalizeStoreIndexPath(prefix) : "";
   const entries = normalizedPrefix
     ? response.entries.filter(
-        (entry) => entry.path.trim().replace(/^\/+|\/+$/g, "") !== normalizedPrefix
+        (entry) => normalizeStoreIndexPath(entry.path) !== normalizedPrefix
       )
     : response.entries;
   const totalEntryCount = entries.length;
@@ -472,6 +472,19 @@ function projectAdminStoreIndexChildren(
     has_more: pageEnd < totalEntryCount,
     next_cursor: null
   };
+}
+
+function normalizeStoreIndexPath(path: string): string {
+  const trimmed = path.trim();
+  let start = 0;
+  let end = trimmed.length;
+  while (start < end && trimmed.charCodeAt(start) === 47) {
+    start += 1;
+  }
+  while (end > start && trimmed.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return trimmed.slice(start, end);
 }
 
 function normalizedStoreIndexOffset(offset: number | undefined): number {
