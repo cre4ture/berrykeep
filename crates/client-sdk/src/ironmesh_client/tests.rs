@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        Path as AxumPath, RawQuery, State,
+        Path as AxumPath, Query, RawQuery, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{Response, header},
@@ -92,6 +92,19 @@ fn store_index_children_view_uses_its_wire_value() {
 
 #[tokio::test]
 async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
+    #[derive(Clone, Debug, serde::Deserialize)]
+    struct LegacyStoreIndexQuery {
+        view: Option<LegacyStoreIndexView>,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyStoreIndexView {
+        Tree,
+    }
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
@@ -100,30 +113,33 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
         .expect("listener should expose its address");
     let queries = Arc::new(Mutex::new(Vec::new()));
     let route_queries = Arc::clone(&queries);
+    let tree_request_count = Arc::new(AtomicUsize::new(0));
+    let route_tree_request_count = Arc::clone(&tree_request_count);
     let router = Router::new().route(
         "/api/v1/store/index",
-        get(move |RawQuery(query): RawQuery| {
+        get(move |Query(query): Query<LegacyStoreIndexQuery>| {
             let route_queries = Arc::clone(&route_queries);
+            let route_tree_request_count = Arc::clone(&route_tree_request_count);
             async move {
-                let query = query.unwrap_or_default();
                 route_queries.lock().await.push(query.clone());
-                if query.contains("view=children") {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": "unknown variant `children`" })),
-                    )
-                        .into_response();
-                }
+                assert!(matches!(query.view, Some(LegacyStoreIndexView::Tree)));
+                let tree_request = route_tree_request_count.fetch_add(1, Ordering::SeqCst);
+                let (consistency_token, second_file) = if tree_request < 2 {
+                    ("namespace:1", "docs/b.txt")
+                } else {
+                    ("namespace:2", "docs/c.txt")
+                };
 
                 Json(serde_json::json!({
                     "prefix": "docs",
                     "depth": 1,
                     "entry_count": 3,
                     "total_entry_count": 3,
+                    "consistency_token": consistency_token,
                     "entries": [
                         { "path": "docs/", "entry_type": "prefix" },
                         { "path": "docs/a.txt", "entry_type": "key" },
-                        { "path": "docs/b.txt", "entry_type": "key" },
+                        { "path": second_file, "entry_type": "key" },
                     ],
                 }))
                 .into_response()
@@ -181,17 +197,39 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
     assert_eq!(cached_response.entries.len(), 1);
     assert_eq!(cached_response.entries[0].path, "docs/a.txt");
 
+    let refreshed_response = client
+        .store_index_with_options(
+            Some("docs"),
+            1,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                offset: Some(1),
+                limit: Some(1),
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect("a changed consistency token should refresh the cached tree");
+
+    assert_eq!(refreshed_response.total_entry_count, 2);
+    assert_eq!(refreshed_response.entries.len(), 1);
+    assert_eq!(refreshed_response.entries[0].path, "docs/c.txt");
+
     let queries = queries.lock().await.clone();
-    assert_eq!(queries.len(), 3);
-    assert!(queries[0].contains("view=children"));
-    assert!(queries[0].contains("offset=1"));
-    assert!(queries[0].contains("limit=1"));
-    assert!(queries[1].contains("view=tree"));
-    assert!(!queries[1].contains("offset="));
-    assert!(!queries[1].contains("limit="));
-    assert!(queries[2].contains("view=tree"));
-    assert!(!queries[2].contains("offset="));
-    assert!(!queries[2].contains("limit="));
+    assert_eq!(queries.len(), 4);
+    assert!(matches!(queries[0].view, Some(LegacyStoreIndexView::Tree)));
+    assert_eq!(queries[0].offset, None);
+    assert_eq!(queries[0].limit, None);
+    assert!(matches!(queries[1].view, Some(LegacyStoreIndexView::Tree)));
+    assert_eq!(queries[1].offset, Some(0));
+    assert_eq!(queries[1].limit, Some(1));
+    assert!(matches!(queries[2].view, Some(LegacyStoreIndexView::Tree)));
+    assert_eq!(queries[2].offset, Some(0));
+    assert_eq!(queries[2].limit, Some(1));
+    assert!(matches!(queries[3].view, Some(LegacyStoreIndexView::Tree)));
+    assert_eq!(queries[3].offset, None);
+    assert_eq!(queries[3].limit, None);
 
     server.abort();
 }

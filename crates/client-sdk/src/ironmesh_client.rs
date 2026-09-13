@@ -233,6 +233,14 @@ struct GalleryMapApiRoutes {
 #[derive(Debug, Default)]
 struct StoreIndexChildrenViewCapability {
     unsupported_until: Option<Instant>,
+    legacy_tree_response: Option<LegacyStoreIndexTreeCacheEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct LegacyStoreIndexTreeCacheEntry {
+    request_key: String,
+    consistency_token: String,
+    response: Arc<StoreIndexResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5850,6 +5858,7 @@ impl IronMeshClient {
             return true;
         }
         capability.unsupported_until = None;
+        capability.legacy_tree_response = None;
         false
     }
 
@@ -5862,6 +5871,49 @@ impl IronMeshClient {
             Some(Instant::now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER);
     }
 
+    fn legacy_store_index_tree_response(
+        &self,
+        request_key: &str,
+    ) -> Option<LegacyStoreIndexTreeCacheEntry> {
+        self.store_index_children_view_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .legacy_tree_response
+            .as_ref()
+            .filter(|entry| entry.request_key == request_key)
+            .cloned()
+    }
+
+    fn remember_legacy_store_index_tree_response(
+        &self,
+        request_key: String,
+        consistency_token: String,
+        response: Arc<StoreIndexResponse>,
+    ) {
+        self.store_index_children_view_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .legacy_tree_response = Some(LegacyStoreIndexTreeCacheEntry {
+            request_key,
+            consistency_token,
+            response,
+        });
+    }
+
+    fn forget_legacy_store_index_tree_response(&self, request_key: &str) {
+        let mut capability = self
+            .store_index_children_view_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if capability
+            .legacy_tree_response
+            .as_ref()
+            .is_some_and(|entry| entry.request_key == request_key)
+        {
+            capability.legacy_tree_response = None;
+        }
+    }
+
     async fn store_index_with_legacy_tree_projection(
         &self,
         prefix: Option<&str>,
@@ -5869,10 +5921,6 @@ impl IronMeshClient {
         snapshot: Option<&str>,
         options: &StoreIndexRequestOptions,
     ) -> Result<StoreIndexResponse> {
-        // The unsupported capability is cached, not the index response. A
-        // complete tree is still fetched for every live listing so callers
-        // never receive stale store data. Reprobe periodically so a rolling
-        // node upgrade can resume its server-side children projection.
         let mut fallback_options = options.clone();
         fallback_options.view = Some(StoreIndexView::Tree);
         fallback_options.cursor = None;
@@ -5880,12 +5928,47 @@ impl IronMeshClient {
         fallback_options.offset = None;
         fallback_options.limit = None;
 
+        let request_key =
+            self.store_index_request_cache_key(prefix, depth, snapshot, &fallback_options)?;
+        if let Some(cached) = self.legacy_store_index_tree_response(&request_key) {
+            // A tree projection must be complete before children pagination can
+            // be recreated locally. Revalidate the cached complete response by
+            // requesting a one-entry tree page and comparing the node's
+            // consistency token, so a live listing never serves stale data.
+            let mut probe_options = fallback_options.clone();
+            probe_options.offset = Some(0);
+            probe_options.limit = Some(1);
+            let probe_response = self
+                .request_store_index(prefix, depth, snapshot, &probe_options)
+                .await?;
+            let probe = decode_store_index_response(probe_response, &probe_options)?;
+            if probe.consistency_token.as_deref() == Some(cached.consistency_token.as_str()) {
+                return Ok(project_store_index_children_response(
+                    &cached.response,
+                    prefix,
+                    options,
+                ));
+            }
+            self.forget_legacy_store_index_tree_response(&request_key);
+        }
+
         let fallback_response = self
             .request_store_index(prefix, depth, snapshot, &fallback_options)
             .await?;
-        let mut projected = decode_store_index_response(fallback_response, &fallback_options)?;
-        project_store_index_children_response(&mut projected, prefix, options);
-        Ok(projected)
+        let response = Arc::new(decode_store_index_response(
+            fallback_response,
+            &fallback_options,
+        )?);
+        if let Some(consistency_token) = response.consistency_token.clone() {
+            self.remember_legacy_store_index_tree_response(
+                request_key,
+                consistency_token,
+                Arc::clone(&response),
+            );
+        }
+        Ok(project_store_index_children_response(
+            &response, prefix, options,
+        ))
     }
 
     async fn request_store_index(
@@ -5895,6 +5978,32 @@ impl IronMeshClient {
         snapshot: Option<&str>,
         options: &StoreIndexRequestOptions,
     ) -> Result<BufferedTransportResponse> {
+        let url = self.store_index_request_url(prefix, depth, snapshot, options)?;
+
+        self.execute_buffered_request(Method::GET, url, Vec::new(), None)
+            .await
+            .context("failed to request /store/index")
+    }
+
+    fn store_index_request_cache_key(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: &StoreIndexRequestOptions,
+    ) -> Result<String> {
+        Ok(path_and_query(&self.store_index_request_url(
+            prefix, depth, snapshot, options,
+        )?))
+    }
+
+    fn store_index_request_url(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: &StoreIndexRequestOptions,
+    ) -> Result<Url> {
         let mut url = self.store_index_url()?;
         url.query_pairs_mut()
             .append_pair("depth", &depth.max(1).to_string());
@@ -5944,10 +6053,7 @@ impl IronMeshClient {
         }
         append_comma_separated_labels(&mut url, "require_labels", &options.require_labels);
         append_comma_separated_labels(&mut url, "exclude_labels", &options.exclude_labels);
-
-        self.execute_buffered_request(Method::GET, url, Vec::new(), None)
-            .await
-            .context("failed to request /store/index")
+        Ok(url)
     }
 
     pub fn store_index_blocking(
@@ -10029,38 +10135,52 @@ fn store_index_view_was_rejected(
 }
 
 fn project_store_index_children_response(
-    response: &mut StoreIndexResponse,
+    response: &StoreIndexResponse,
     prefix: Option<&str>,
     requested_options: &StoreIndexRequestOptions,
-) {
+) -> StoreIndexResponse {
     let normalized_prefix = prefix
         .map(str::trim)
         .map(|value| value.trim_matches('/'))
         .filter(|value| !value.is_empty());
 
-    if let Some(normalized_prefix) = normalized_prefix {
-        response
-            .entries
-            .retain(|entry| entry.path.trim().trim_matches('/') != normalized_prefix);
-    }
-
-    let total_entry_count = response.entries.len();
+    let is_visible_entry = |entry: &StoreIndexEntry| {
+        normalized_prefix.is_none_or(|normalized_prefix| {
+            entry.path.trim().trim_matches('/') != normalized_prefix
+        })
+    };
+    let total_entry_count = response
+        .entries
+        .iter()
+        .filter(|entry| is_visible_entry(entry))
+        .count();
     let offset = requested_options.offset.unwrap_or(0);
     let limit = requested_options.limit.map(|limit| limit.max(1));
     let page_end = limit
         .map(|limit| offset.saturating_add(limit).min(total_entry_count))
         .unwrap_or(total_entry_count);
-    response.entries = response
+    let entries = response
         .entries
-        .get(offset..page_end)
-        .unwrap_or_default()
-        .to_vec();
-    response.entry_count = response.entries.len();
-    response.total_entry_count = total_entry_count;
-    response.offset = offset;
-    response.limit = limit;
-    response.has_more = page_end < total_entry_count;
-    response.next_cursor = None;
+        .iter()
+        .filter(|entry| is_visible_entry(entry))
+        .skip(offset)
+        .take(page_end.saturating_sub(offset))
+        .cloned()
+        .collect::<Vec<_>>();
+    StoreIndexResponse {
+        prefix: response.prefix.clone(),
+        depth: response.depth,
+        entry_count: entries.len(),
+        total_entry_count,
+        offset,
+        limit,
+        has_more: page_end < total_entry_count,
+        next_cursor: None,
+        sync_token: response.sync_token.clone(),
+        consistency_token: response.consistency_token.clone(),
+        media_summary: response.media_summary.clone(),
+        entries,
+    }
 }
 
 fn append_optional_query(url: &mut Url, key: &str, value: Option<&str>) {

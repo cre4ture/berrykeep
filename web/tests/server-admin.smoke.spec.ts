@@ -709,12 +709,8 @@ test("server-admin remembers an older store index projection", async ({ page }) 
   const fallbackRequests = storeIndexRequests.filter(
     (request) => request.searchParams.get("view") === "tree"
   );
-  expect(fallbackRequests.slice(treeRequestCount).every((request) => !request.searchParams.has("offset"))).toBe(
-    true
-  );
-  expect(fallbackRequests.slice(treeRequestCount).every((request) => !request.searchParams.has("limit"))).toBe(
-    true
-  );
+  expect(fallbackRequests[treeRequestCount].searchParams.get("offset")).toBe("0");
+  expect(fallbackRequests[treeRequestCount].searchParams.get("limit")).toBe("1");
 });
 
 test("server-admin prepares, validates, and saves a host-checked storage path with recovery guidance", async ({ page }) => {
@@ -3649,6 +3645,7 @@ function buildAdminStoreIndexResponse(
     offset,
     limit,
     has_more: offset + pagedEntries.length < totalEntryCount,
+    consistency_token: "namespace:server-admin-test",
     media_summary: summarizeAdminMediaEntries(filteredEntries),
     entries: pagedEntries
   };
