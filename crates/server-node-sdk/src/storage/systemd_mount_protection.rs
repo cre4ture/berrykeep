@@ -169,6 +169,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
             "--property=Requires",
             "--property=BindsTo",
             "--property=After",
+            "--",
             service.name.as_str(),
         ],
     )
@@ -526,6 +527,7 @@ fn mount_protection_targets(
     let data_dir_mount_point = mount_points
         .as_deref()
         .and_then(|mount_points| mount_point_for_path(&data_dir, mount_points));
+    let mut protected_paths = BTreeSet::from([data_dir.clone()]);
     let mut targets = vec![MountProtectionTarget {
         id: "systemd-mount-data-dir".to_string(),
         feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
@@ -540,12 +542,15 @@ fn mount_protection_targets(
         storage_paths
             .iter()
             .filter(|path| !matches!(path.state, StoragePathState::Disabled))
-            .map(|configured_path| {
+            .filter_map(|configured_path| {
                 let path = normalized_mount_protection_path(&configured_path.path);
+                if !protected_paths.insert(path.clone()) {
+                    return None;
+                }
                 let mount_point = mount_points
                     .as_deref()
                     .and_then(|mount_points| mount_point_for_path(&path, mount_points));
-                MountProtectionTarget {
+                Some(MountProtectionTarget {
                     id: format!("systemd-mount-storage-{}", configured_path.id),
                     feature: format!(
                         "Systemd mount protection: storage pool `{}` ({})",
@@ -561,7 +566,7 @@ fn mount_protection_targets(
                         StoragePathState::Draining => HostDependencySeverity::Warning,
                         StoragePathState::Disabled => HostDependencySeverity::Info,
                     },
-                }
+                })
             }),
     );
     targets
@@ -1043,6 +1048,51 @@ mod tests {
     }
 
     #[test]
+    fn storage_path_matching_data_dir_is_checked_once() {
+        let mut targets = mount_protection_targets(
+            Path::new("/var/lib/berrykeep"),
+            &[
+                storage_path(
+                    "legacy-primary",
+                    "/var/lib/berrykeep/.",
+                    StoragePathState::Active,
+                ),
+                storage_path("archive", "/mnt/archive", StoragePathState::Draining),
+            ],
+        );
+        targets_without_known_mount_point(&mut targets);
+        let checks = checks_for_inspection(
+            &targets,
+            dependencies(vec![systemd_mount("archive.mount", "/mnt/archive")]),
+        );
+
+        assert_eq!(checks.len(), 2);
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.id == "systemd-mount-data-dir")
+        );
+        assert_eq!(
+            checks
+                .iter()
+                .find(|check| check.id == "systemd-mount-data-dir")
+                .unwrap()
+                .severity,
+            HostDependencySeverity::Critical
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.id != "systemd-mount-storage-legacy-primary")
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.id == "systemd-mount-storage-archive")
+        );
+    }
+
+    #[test]
     fn systemd_checks_data_dir_and_active_or_draining_storage_paths() {
         let mut targets = mount_protection_targets(
             Path::new("/srv/berrykeep"),
@@ -1170,15 +1220,6 @@ mod tests {
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
-                id: "systemd-mount-storage-legacy-primary".to_string(),
-                feature: "Systemd mount protection: storage pool `legacy-primary` (active)"
-                    .to_string(),
-                path: PathBuf::from("/var/lib/berrykeep"),
-                mount_point: Some(PathBuf::from("/")),
-                mount_point_is_bind: false,
-                missing_severity: HostDependencySeverity::Critical,
-            },
-            MountProtectionTarget {
                 id: "systemd-mount-storage-data-child".to_string(),
                 feature: "Systemd mount protection: storage pool `data-child` (active)".to_string(),
                 path: PathBuf::from("/var/lib/berrykeep/pool-a"),
@@ -1210,14 +1251,6 @@ mod tests {
         assert_eq!(root.status, HostDependencyStatus::NotApplicable);
         assert_eq!(root.severity, HostDependencySeverity::Info);
         assert!(root.install_hint.is_none());
-
-        let storage = checks
-            .iter()
-            .find(|check| check.id == "systemd-mount-storage-legacy-primary")
-            .unwrap();
-        assert_eq!(storage.status, HostDependencyStatus::NotApplicable);
-        assert_eq!(storage.severity, HostDependencySeverity::Info);
-        assert!(storage.install_hint.is_none());
 
         let data_child_storage = checks
             .iter()
