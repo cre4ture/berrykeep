@@ -323,99 +323,79 @@ export function DashboardPage() {
         </Group>
       </Group>
       {error ? <Alert color="red" title="Failed to load dashboard">{error}</Alert> : null}
-      <Grid>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Cluster Nodes"
-            value={
-              clusterSummary ? `${clusterSummary.online_nodes} / ${clusterSummary.total_nodes}` : clusterSummaryLoading ? <Loader size="sm" /> : "unknown"
-            }
-            hint="Online / total nodes"
-            testId="dashboard-cluster-nodes-card"
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Offline Nodes"
-            value={clusterSummary ? clusterSummary.offline_nodes : clusterSummaryLoading ? <Loader size="sm" /> : "unknown"}
-            hint="Detected from cluster heartbeats"
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Replication Factor"
-            value={
-              clusterSummary ? clusterSummary.policy.replication_factor : clusterSummaryLoading ? <Loader size="sm" /> : "unknown"
-            }
-            hint="Current cluster replication policy"
-          />
-        </Grid.Col>
-      </Grid>
-
-      <Grid>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Under-replicated Items"
-            value={replicationPlan?.under_replicated ?? (replicationPlanLoading ? <Loader size="sm" /> : "unknown")}
-            hint="Items still missing desired copies"
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Over-replicated Items"
-            value={replicationPlan?.over_replicated ?? (replicationPlanLoading ? <Loader size="sm" /> : "unknown")}
-            hint="Items with extra copies pending cleanup"
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Deferred Cleanup"
-            value={replicationPlan?.cleanup_deferred_items ?? (replicationPlanLoading ? <Loader size="sm" /> : "unknown")}
-            hint="Items whose cleanup is intentionally deferred"
-          />
-        </Grid.Col>
-      </Grid>
-
-      <Grid>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Chunk Store"
-            value={
-              latestStorageSample
-                ? formatBytes(latestStorageSample.chunk_store_bytes)
-                : storageStats?.collecting || storageStatsLoading
-                  ? <Loader size="sm" />
-                  : "pending"
-            }
-            hint="Chunk bytes currently stored on disk"
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Metadata Footprint"
-            value={
-              metadataFootprintBytes !== null
-                ? formatBytes(metadataFootprintBytes)
-                : storageStats?.collecting || storageStatsLoading
-                  ? <Loader size="sm" />
-                  : "pending"
-            }
-            hint="Metadata DB, manifests, and media cache"
-          />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <StatCard
-            label="Latest Snapshot Unique"
-            value={
-              latestStorageSample
-                ? formatBytes(latestStorageSample.latest_snapshot_unique_chunk_bytes)
-                : storageStats?.collecting || storageStatsLoading
-                  ? <Loader size="sm" />
-                  : "pending"
-            }
-            hint="Deduplicated bytes referenced by the latest snapshot"
-          />
-        </Grid.Col>
+      <Grid data-testid="dashboard-summary-metrics">
+        {[
+          {
+            label: "Cluster Nodes",
+            value: clusterSummary
+              ? `${clusterSummary.online_nodes} / ${clusterSummary.total_nodes}`
+              : clusterSummaryLoading
+                ? <Loader size="sm" />
+                : "unknown",
+            hint: "Online / total nodes",
+            testId: "dashboard-cluster-nodes-card"
+          },
+          {
+            label: "Offline Nodes",
+            value: clusterSummary ? clusterSummary.offline_nodes : clusterSummaryLoading ? <Loader size="sm" /> : "unknown",
+            hint: "Detected from cluster heartbeats"
+          },
+          {
+            label: "Replication Factor",
+            value: clusterSummary
+              ? clusterSummary.policy.replication_factor
+              : clusterSummaryLoading
+                ? <Loader size="sm" />
+                : "unknown",
+            hint: "Current cluster replication policy"
+          },
+          {
+            label: "Under-replicated Items",
+            value: replicationPlan?.under_replicated ?? (replicationPlanLoading ? <Loader size="sm" /> : "unknown"),
+            hint: "Items still missing desired copies"
+          },
+          {
+            label: "Over-replicated Items",
+            value: replicationPlan?.over_replicated ?? (replicationPlanLoading ? <Loader size="sm" /> : "unknown"),
+            hint: "Items with extra copies pending cleanup"
+          },
+          {
+            label: "Deferred Cleanup",
+            value: replicationPlan?.cleanup_deferred_items ?? (replicationPlanLoading ? <Loader size="sm" /> : "unknown"),
+            hint: "Items whose cleanup is intentionally deferred"
+          },
+          {
+            label: "Chunk Store",
+            value: latestStorageSample
+              ? formatBytes(latestStorageSample.chunk_store_bytes)
+              : storageStats?.collecting || storageStatsLoading
+                ? <Loader size="sm" />
+                : "pending",
+            hint: "Chunk bytes currently stored on disk"
+          },
+          {
+            label: "Metadata Footprint",
+            value: metadataFootprintBytes !== null
+              ? formatBytes(metadataFootprintBytes)
+              : storageStats?.collecting || storageStatsLoading
+                ? <Loader size="sm" />
+                : "pending",
+            hint: "Metadata DB, manifests, and media cache"
+          },
+          {
+            label: "Latest Snapshot Unique",
+            value: latestStorageSample
+              ? formatBytes(latestStorageSample.latest_snapshot_unique_chunk_bytes)
+              : storageStats?.collecting || storageStatsLoading
+                ? <Loader size="sm" />
+                : "pending",
+            hint: "Deduplicated bytes referenced by the latest snapshot"
+          }
+        ].map((metric) => (
+          <Grid.Col key={metric.label} span={{ base: 12, sm: 6, md: 4 }}>
+            <StatCard {...metric} variant="compact" />
+          </Grid.Col>
+        ))}
       </Grid>
 
       <Grid>
