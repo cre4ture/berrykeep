@@ -240,6 +240,7 @@ struct StoreIndexChildrenViewCapability {
 struct LegacyStoreIndexTreeCacheEntry {
     request_key: String,
     consistency_token: String,
+    expires_at: Instant,
     response: Arc<StoreIndexResponse>,
 }
 
@@ -5875,9 +5876,19 @@ impl IronMeshClient {
         &self,
         request_key: &str,
     ) -> Option<LegacyStoreIndexTreeCacheEntry> {
-        self.store_index_children_view_capability
+        let mut capability = self
+            .store_index_children_view_capability
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if capability
+            .legacy_tree_response
+            .as_ref()
+            .is_some_and(|entry| entry.expires_at <= Instant::now())
+        {
+            capability.legacy_tree_response = None;
+            return None;
+        }
+        capability
             .legacy_tree_response
             .as_ref()
             .filter(|entry| entry.request_key == request_key)
@@ -5890,14 +5901,32 @@ impl IronMeshClient {
         consistency_token: String,
         response: Arc<StoreIndexResponse>,
     ) {
-        self.store_index_children_view_capability
+        let expires_at = Instant::now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER;
+        let capability = Arc::clone(&self.store_index_children_view_capability);
+        capability
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .legacy_tree_response = Some(LegacyStoreIndexTreeCacheEntry {
             request_key,
             consistency_token,
+            expires_at,
             response,
         });
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)).await;
+                let mut capability = capability
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if capability
+                    .legacy_tree_response
+                    .as_ref()
+                    .is_some_and(|entry| entry.expires_at <= Instant::now())
+                {
+                    capability.legacy_tree_response = None;
+                }
+            });
+        }
     }
 
     fn forget_legacy_store_index_tree_response(&self, request_key: &str) {

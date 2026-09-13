@@ -32,15 +32,27 @@ function apiV1(path: string): string {
 
 test("client-ui store-index mock excludes the queried marker only for children", () => {
   const entries = [
-    { path: "docs/", entry_type: "prefix" as const },
-    { path: "docs/", entry_type: "key" as const },
+    {
+      path: "docs/",
+      entry_type: "key" as const,
+      object_id: "directory-marker-object",
+      version: "directory-marker-version",
+      size_bytes: 42,
+      modified_at_unix: 1_712_345_678
+    },
     { path: "docs/readme.txt", entry_type: "key" as const }
   ];
 
-  expect(projectMockStoreTreeEntries(entries, "docs", 1).map((entry) => entry.path)).toEqual([
-    "docs/",
-    "docs/readme.txt"
-  ]);
+  const treeEntries = projectMockStoreTreeEntries(entries, "docs", 1);
+  expect(treeEntries.map((entry) => entry.path)).toEqual(["docs/", "docs/readme.txt"]);
+  expect(treeEntries[0]).toMatchObject({
+    path: "docs/",
+    entry_type: "prefix",
+    object_id: "directory-marker-object",
+    version: "directory-marker-version",
+    size_bytes: 42,
+    modified_at_unix: 1_712_345_678
+  });
   expect(projectMockStoreChildrenEntries(entries, "docs", 1).map((entry) => entry.path)).toEqual([
     "docs/readme.txt"
   ]);

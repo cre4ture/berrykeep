@@ -43,7 +43,11 @@ export function projectMockStoreTreeEntries<T extends MockStoreIndexEntry>(
     if (normalizedPrefix) {
       if (pathWithoutTrailingSlash === normalizedPrefix) {
         const normalizedPath = `${pathWithoutTrailingSlash}/`;
-        projectedEntries.set(normalizedPath, { path: normalizedPath, entry_type: "prefix" });
+        projectedEntries.set(normalizedPath, {
+          ...entry,
+          path: normalizedPath,
+          entry_type: "prefix"
+        });
         continue;
       }
       const prefixWithSeparator = `${normalizedPrefix}/`;
@@ -74,7 +78,9 @@ export function projectMockStoreTreeEntries<T extends MockStoreIndexEntry>(
       : pathWithoutTrailingSlash;
     projectedEntries.set(
       normalizedPath,
-      isDirectoryLike ? { path: normalizedPath, entry_type: "prefix" } : { ...entry, path: normalizedPath }
+      isDirectoryLike
+        ? { ...entry, path: normalizedPath, entry_type: "prefix" }
+        : { ...entry, path: normalizedPath }
     );
   }
 

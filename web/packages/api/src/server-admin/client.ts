@@ -110,6 +110,7 @@ type GalleryMapEndpoint = "clusters" | "clusterEntries";
 type LegacyStoreIndexTreeCacheEntry = {
   requestKey: string;
   consistencyToken: string;
+  expiresAt: number;
   response: AdminStoreListResponse;
 };
 
@@ -128,6 +129,32 @@ const galleryMapEndpointRoutes = new Map<GalleryMapEndpoint, "canonical" | "lega
 const STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS = 5 * 60 * 1_000;
 let storeIndexChildrenViewUnsupportedUntil = 0;
 let legacyStoreIndexTreeCache: LegacyStoreIndexTreeCacheEntry | null = null;
+let legacyStoreIndexTreeCacheExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearLegacyStoreIndexTreeCache(): void {
+  legacyStoreIndexTreeCache = null;
+  if (legacyStoreIndexTreeCacheExpiryTimer !== null) {
+    clearTimeout(legacyStoreIndexTreeCacheExpiryTimer);
+    legacyStoreIndexTreeCacheExpiryTimer = null;
+  }
+}
+
+function rememberLegacyStoreIndexTreeCache(
+  requestKey: string,
+  consistencyToken: string,
+  response: AdminStoreListResponse
+): void {
+  clearLegacyStoreIndexTreeCache();
+  const expiresAt = Date.now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS;
+  legacyStoreIndexTreeCache = { requestKey, consistencyToken, expiresAt, response };
+  legacyStoreIndexTreeCacheExpiryTimer = setTimeout(() => {
+    const cached = legacyStoreIndexTreeCache;
+    if (cached !== null && cached.expiresAt <= Date.now()) {
+      legacyStoreIndexTreeCache = null;
+      legacyStoreIndexTreeCacheExpiryTimer = null;
+    }
+  }, STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS);
+}
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
@@ -364,7 +391,7 @@ export async function listAdminStoreEntries(
   const view: StoreListView = options.view ?? "tree";
   if (view === "children" && Date.now() >= storeIndexChildrenViewUnsupportedUntil) {
     storeIndexChildrenViewUnsupportedUntil = 0;
-    legacyStoreIndexTreeCache = null;
+    clearLegacyStoreIndexTreeCache();
   }
   if (view === "children" && Date.now() < storeIndexChildrenViewUnsupportedUntil) {
     return fetchAdminStoreIndexLegacyChildrenProjection(
@@ -411,7 +438,12 @@ async function fetchAdminStoreIndexLegacyChildrenProjection(
 ): Promise<AdminStoreListResponse> {
   const requestKey = buildAdminStoreEntriesQuery(prefix, depth, snapshot, options, "tree", false)
     .toString();
-  if (legacyStoreIndexTreeCache?.requestKey === requestKey) {
+  let cachedTree = legacyStoreIndexTreeCache;
+  if (cachedTree !== null && cachedTree.expiresAt <= Date.now()) {
+    clearLegacyStoreIndexTreeCache();
+    cachedTree = null;
+  }
+  if (cachedTree?.requestKey === requestKey) {
     // Revalidate the complete legacy tree with a one-entry server page before
     // slicing it locally. This avoids repeat full-index transfers while the
     // node's consistency token guarantees live listings are never stale.
@@ -424,10 +456,10 @@ async function fetchAdminStoreIndexLegacyChildrenProjection(
       "tree",
       true
     );
-    if (probe.consistency_token === legacyStoreIndexTreeCache.consistencyToken) {
-      return projectAdminStoreIndexChildren(legacyStoreIndexTreeCache.response, prefix, options);
+    if (probe.consistency_token === cachedTree.consistencyToken) {
+      return projectAdminStoreIndexChildren(cachedTree.response, prefix, options);
     }
-    legacyStoreIndexTreeCache = null;
+    clearLegacyStoreIndexTreeCache();
   }
 
   const treeResponse = await fetchAdminStoreEntries(
@@ -440,13 +472,9 @@ async function fetchAdminStoreIndexLegacyChildrenProjection(
     false
   );
   if (treeResponse.consistency_token) {
-    legacyStoreIndexTreeCache = {
-      requestKey,
-      consistencyToken: treeResponse.consistency_token,
-      response: treeResponse
-    };
+    rememberLegacyStoreIndexTreeCache(requestKey, treeResponse.consistency_token, treeResponse);
   } else {
-    legacyStoreIndexTreeCache = null;
+    clearLegacyStoreIndexTreeCache();
   }
   return projectAdminStoreIndexChildren(treeResponse, prefix, options);
 }
