@@ -33,6 +33,7 @@ mod tests {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::io::FromRawHandle;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::thread;
@@ -1510,6 +1511,31 @@ mod tests {
 
         std::fs::rename(&old_path, &new_path).expect("failed to rename cloud-backed file locally");
         wait_for_path(&new_path, 80).await;
+        let remote_rename_observed = Arc::new(AtomicBool::new(false));
+        let cold_rename_probe = (!hydrate_before_rename).then(|| {
+            let renamed_path = new_path.clone();
+            let remote_rename_observed = Arc::clone(&remote_rename_observed);
+            tokio::spawn(async move {
+                let mut remote_rename_observed_at = None;
+                loop {
+                    let info = placeholder_standard_info(&renamed_path)
+                        .expect("renamed placeholder state should remain readable");
+                    assert_eq!(
+                        info.OnDiskDataSize, 0,
+                        "renaming a never-hydrated placeholder must not fetch its content"
+                    );
+                    assert_eq!(info.ModifiedDataSize, 0);
+                    if remote_rename_observed.load(Ordering::Acquire) {
+                        let observed_at = remote_rename_observed_at
+                            .get_or_insert_with(tokio::time::Instant::now);
+                        if observed_at.elapsed() >= Duration::from_secs(8) {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+        });
         wait_for_remote_payload(&fixture.sdk, new_key, payload, 260).await;
         wait_for_remote_file_absence(&fixture.sdk, old_key, 260).await;
 
@@ -1518,10 +1544,15 @@ mod tests {
             new_versions.object_id, old_object_id,
             "local rename should preserve remote object identity instead of reuploading"
         );
+        remote_rename_observed.store(true, Ordering::Release);
 
         if hydrate_before_rename {
             wait_for_hydrated_payload(&new_path, payload, 220).await;
         } else {
+            cold_rename_probe
+                .expect("cold rename should have a hydration probe")
+                .await
+                .expect("cold rename hydration probe should finish");
             wait_for_placeholder_in_sync(&new_path, 220).await;
             wait_for_placeholder_dehydrated(&new_path, 120).await;
             assert_placeholder_stays_dehydrated(
@@ -2262,11 +2293,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_cfapi_dehydrated_in_sync_file_rename_preserves_remote_object_identity() {
+        let payload = vec![b'r'; 3 * 1024 * 1024];
         run_cfapi_remote_file_rename_case(
             "127.0.0.1:19113",
             "rename-remote/dehydrated-source.jpg",
             "rename-remote/dehydrated-target.jpg",
-            b"dehydrated rename payload",
+            &payload,
             false,
         )
         .await;

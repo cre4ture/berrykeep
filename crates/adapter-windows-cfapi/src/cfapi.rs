@@ -145,6 +145,27 @@ pub fn cf_set_in_sync(file: &std::fs::File) -> Result<()> {
     )
 }
 
+pub fn cf_set_in_sync_metadata_only(path: &Path) -> Result<()> {
+    cf_set_sync_state_metadata_only(
+        path,
+        windows_sys::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE_IN_SYNC,
+    )
+}
+
+pub fn cf_set_not_in_sync_metadata_only(path: &Path) -> Result<()> {
+    cf_set_sync_state_metadata_only(
+        path,
+        windows_sys::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE_NOT_IN_SYNC,
+    )
+}
+
+fn cf_set_sync_state_metadata_only(
+    path: &Path,
+    state: windows_sys::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE,
+) -> Result<()> {
+    with_cf_metadata_update_handle(path, |handle| set_in_sync_state(handle, state, None))
+}
+
 pub fn cf_set_not_in_sync(file: &std::fs::File) -> Result<i64> {
     let mut usn = 0i64;
     cf_set_in_sync_state(
