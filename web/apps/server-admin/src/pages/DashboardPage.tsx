@@ -198,7 +198,8 @@ export function DashboardPage() {
     queryKey: ["dashboard", "host-dependencies", normalizedAdminTokenOverride],
     queryFn: () => getHostDependencyReport(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    staleTime: HOST_DEPENDENCY_REPORT_STALE_TIME_MS
+    staleTime: HOST_DEPENDENCY_REPORT_STALE_TIME_MS,
+    refetchOnWindowFocus: false
   });
 
   async function refresh() {
