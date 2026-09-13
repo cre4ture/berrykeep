@@ -3,7 +3,21 @@
 This is the only documentation page that names **IronMesh**. BerryKeep is the
 canonical name for every new command, package, setting, protocol value, source
 symbol, asset, and document. The persistent identifiers below are retained only
-where changing them would strand an installed client or its protected data.
+where changing them would strand a supported deployment or immutable platform
+identity.
+
+## Desktop-client cutover
+
+Desktop clients have no automatic migration. Before installing BerryKeep,
+uninstall the IronMesh client package or application, remove its GNOME Shell
+extension, then install BerryKeep as a fresh client. Reauthenticate and
+recreate every local service, sync root, and desktop integration; the BerryKeep
+desktop tools do not read, move, or revive former local state. Clear the former
+browser site data before using the BerryKeep web client.
+
+This deliberate client boundary keeps the server-node compatibility contracts
+below small and independently testable. It does not apply to active server-node
+or rendezvous deployments.
 
 ## Active compatibility contracts
 
@@ -14,13 +28,11 @@ where changing them would strand an installed client or its protected data.
 | `IRONMESH_*` environment variables | `BERRYKEEP_*` environment variables | The shared compatibility reader gives the canonical setting precedence and falls back to the former prefix only when it is absent. |
 | Former GitHub Actions signing-secret and repository-variable names | BerryKeep-named workflow environment variables | Repository settings are not renamed by a source change. Release workflows bind the former setting names to canonical environment variables so signing keeps working until settings can be migrated separately. |
 | `urn:ironmesh:*` certificate identity SANs | `urn:berrykeep:*` certificate identity SANs | New certificates carry canonical and former URI SANs during the compatibility window; node and rendezvous authentication parse both forms so either rollout direction can renew in place. |
-| `x-ironmesh-*` signed-request, admin-token, ingestion-token, and web-service-proxy headers, plus the v1 request-signing context | `x-berrykeep-*` headers and the BerryKeep v1 request-signing context | New requests and responses use canonical headers and signatures; upgraded servers accept former request headers and emit former proxy response headers as aliases, upgraded clients accept former proxy response headers, and either signing context verifies during the compatibility window. |
+| `x-ironmesh-*` signed-request, admin-token, ingestion-token, and web-service-proxy headers, plus the v1 request-signing context | `x-berrykeep-*` headers and the BerryKeep v1 request-signing context | New requests, proxy responses, and client parsing use canonical headers and signatures. Upgraded servers accept former request headers and either signing context verifies during the compatibility window. |
 | `.ironmesh*` internal sync artifacts, transfer- and conflict-copy roots, Linux FUSE client-rights and download roots, folder-agent and Android folder-sync state roots and profile fingerprints, and `user.ironmesh.*` Linux FUSE xattrs | BerryKeep-named internal artifacts, transfer- and conflict-copy roots, state roots, profile fingerprints, and xattrs | Rust and Android SAF sync scanning and cleanup ignore former artifacts, the folder agent, Linux FUSE adapter, and Android app move recognized state to canonical storage, conflict resolution also reads former copies, and Linux FUSE accepts former xattr reads while listing canonical names. |
-| `Ironmesh/desktop-client-config` local configuration and state roots, including Windows `windows-client-config` | `BerryKeep/desktop-client-config` local configuration and state roots | The launcher and configuration app merge every missing former state entry into the canonical location without overwriting newer canonical data. |
 | The v1 `ironmesh` content-fingerprint domain | Canonical content-fingerprint APIs | The opaque storage-key domain remains unchanged to retain media-analysis and thumbnail caches across an upgrade; it is never surfaced as a product-facing identifier. |
-| `IronMeshClient`, `ManagedIronMeshClient`, `IronmeshIosBytes`, and `IronmeshInfo` Rust symbols | `BerryKeepClient`, `ManagedBerryKeepClient`, `BerryKeepIosBytes`, and `BerryKeepInfo` | Deprecated Rust aliases keep source consumers building while directing new code to the canonical names. |
+| `IronmeshIosBytes` and `IronmeshInfo` Rust symbols | `BerryKeepIosBytes` and `BerryKeepInfo` | Deprecated Rust aliases keep source consumers building while directing new code to the canonical names. |
 | `ironmesh-*.exe` Windows execution aliases and the `UlrichHornung.IronMesh` MSIX identity | `berrykeep-*.exe` execution aliases and BerryKeep display identity | The packaged application retains its previous identity and aliases so Windows upgrades and invocations continue to work; all visible names and primary aliases are BerryKeep. |
-| `ironmesh-status@ironmesh.io` GNOME extension UUID and installation directory | `berrykeep-status@berrykeep.io` GNOME extension UUID and installation directory | The canonical extension is installed normally; the package also supplies a transformed former UUID only for installed clients. |
 | `io.ironmesh.android` and `io.ironmesh.servernode.android` Android application IDs | `io.berrykeep.android` and `io.berrykeep.servernode.android` source namespaces and BerryKeep app display identities | Android treats an application ID as its update and private-data identity. The released BerryKeep apps retain the former IDs so installed clients keep their data, Keystore entries, and document-provider grants. |
 | `ironmesh.device-identity.aes-gcm.v1`, legacy Android preference files, share-capability store, and server-node data directory | BerryKeep-named Keystore alias, preference files, share-capability store, and server-node data directory | Android migrates readable state to canonical storage and falls back to the former identifiers only while completing that migration. |
 | `ironmesh-client-gallery-cache` IndexedDB data and `ironmesh.*` browser gallery/theme preferences | BerryKeep-named browser cache and preferences | Gallery cache data is derived and browser display preferences are non-critical, so the web client initializes canonical storage rather than retaining a browser-storage migration. Users can clear the former origin storage through their browser's site-data controls, and reapply display preferences in the BerryKeep UI. |

@@ -54,8 +54,6 @@ Description: BerryKeep client CLI and desktop helper applications
  applications used for desktop workflows:
  `berrykeep-config-app`, `berrykeep-folder-agent`, `berrykeep-os-integration`,
  and the internal `berrykeep-background-launcher` helper.
-Breaks: ironmesh-client (<< ${binary:Version})
-Replaces: ironmesh-client (<< ${binary:Version})
 
 Package: berrykeep-rendezvous-service
 Section: net
@@ -92,20 +90,6 @@ Depends:
  berrykeep-server-node-map-tools (>= ${source:Upstream-Version})
 Description: Transitional package for BerryKeep server-node map tools
  This package keeps existing Ironmesh map-tools installations upgrading to the
- renamed BerryKeep package during the compatibility window.
-
-Package: ironmesh-client
-Section: oldlibs
-Priority: optional
-Architecture: any
-Build-Profiles: <!server-node-only>
-Depends:
- ${misc:Depends},
- berrykeep-client (>= ${source:Upstream-Version})
-Breaks: berrykeep-client (<< ${binary:Version})
-Replaces: berrykeep-client (<< ${binary:Version})
-Description: Transitional package for BerryKeep client applications
- This package keeps existing Ironmesh client installations upgrading to the
  renamed BerryKeep package during the compatibility window.
 
 Package: ironmesh-rendezvous-service

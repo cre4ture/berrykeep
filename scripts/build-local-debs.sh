@@ -616,7 +616,6 @@ else
     "${ARTIFACT_DIR}/berrykeep-server-node_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/berrykeep-server-node-map-tools_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/berrykeep-rendezvous-service_${VERSION}_${ARCH}.deb"
-    "${ARTIFACT_DIR}/ironmesh-client_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/ironmesh-server-node_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/ironmesh-server-node-map-tools_${VERSION}_${ARCH}.deb"
     "${ARTIFACT_DIR}/ironmesh-rendezvous-service_${VERSION}_${ARCH}.deb"
