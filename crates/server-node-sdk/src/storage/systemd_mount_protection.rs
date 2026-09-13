@@ -911,7 +911,7 @@ fn backing_mount_points_for_path(
         return Vec::new();
     };
     let filesystem_path = mount_point.root.join(relative_path);
-    mount_points
+    let mut backing_mount_points = mount_points
         .iter()
         .filter(|candidate| {
             candidate.device == mount_point.device
@@ -922,7 +922,9 @@ fn backing_mount_points_for_path(
         .map(|candidate| candidate.path.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect()
+        .collect::<Vec<_>>();
+    backing_mount_points.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    backing_mount_points
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1967,6 +1969,41 @@ mod tests {
                 &mount_points,
             ),
             vec![PathBuf::from("/mnt/data")]
+        );
+    }
+
+    #[test]
+    fn backing_mount_sources_are_reported_most_specific_first() {
+        let mount_points = vec![
+            MountPoint {
+                device: "8:1".to_string(),
+                path: PathBuf::from("/mnt/data"),
+                root: PathBuf::from("/data"),
+            },
+            MountPoint {
+                device: "8:1".to_string(),
+                path: PathBuf::from("/mnt/data/nested"),
+                root: PathBuf::from("/data/nested"),
+            },
+            MountPoint {
+                device: "8:1".to_string(),
+                path: PathBuf::from("/srv/berrykeep"),
+                root: PathBuf::from("/data/nested"),
+            },
+        ];
+        let mount_point =
+            mount_point_for_path(Path::new("/srv/berrykeep/pool"), &mount_points).unwrap();
+
+        assert_eq!(
+            backing_mount_points_for_path(
+                Path::new("/srv/berrykeep/pool"),
+                mount_point,
+                &mount_points,
+            ),
+            vec![
+                PathBuf::from("/mnt/data/nested"),
+                PathBuf::from("/mnt/data")
+            ]
         );
     }
 
