@@ -323,7 +323,7 @@ pub fn materialize_remote_conflict_copies(
     conflicts: &[StartupConflict],
 ) -> Result<()> {
     let timestamp = current_unix_ms();
-    let staged_download_root = transfer_state_root(root_dir).join("conflict-copies");
+    let staged_download_root = transfer_state_root(root_dir)?.join("conflict-copies");
 
     for conflict in conflicts {
         if conflict.reason != "dual_modify_conflict"

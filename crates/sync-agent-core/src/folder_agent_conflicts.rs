@@ -241,7 +241,7 @@ pub fn upload_local_file(
     let remote_key = scope.local_to_remote(relative_path).ok_or_else(|| {
         anyhow::anyhow!("refusing to upload local root without concrete scoped path")
     })?;
-    let state_path = upload_transfer_state_path(root_dir, &remote_key);
+    let state_path = upload_transfer_state_path(root_dir, &remote_key)?;
 
     let result = client.put_file_resumable(remote_key.clone(), &absolute, &state_path);
     if let Err(error) = result {

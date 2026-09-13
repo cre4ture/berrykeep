@@ -230,30 +230,75 @@ fn is_berrykeep_internal_relative_path(relative_path: &str) -> bool {
     })
 }
 
-pub(crate) fn transfer_state_root(root_dir: &Path) -> PathBuf {
-    root_dir.join(".berrykeep").join("transfers")
+pub(crate) fn transfer_state_root(root_dir: &Path) -> Result<PathBuf> {
+    let canonical_path = root_dir.join(".berrykeep").join("transfers");
+    let legacy_path = root_dir.join(".ironmesh").join("transfers");
+    migrate_legacy_transfer_state_root(&canonical_path, &legacy_path)
+}
+
+fn migrate_legacy_transfer_state_root(
+    canonical_path: &Path,
+    legacy_path: &Path,
+) -> Result<PathBuf> {
+    if canonical_path.exists() || !legacy_path.exists() {
+        return Ok(canonical_path.to_path_buf());
+    }
+
+    let parent = canonical_path.parent().ok_or_else(|| {
+        anyhow!(
+            "canonical transfer state path has no parent: {}",
+            canonical_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create transfer state parent {}",
+            parent.display()
+        )
+    })?;
+
+    match fs::rename(legacy_path, canonical_path) {
+        Ok(()) => Ok(canonical_path.to_path_buf()),
+        Err(_) if canonical_path.exists() || !legacy_path.exists() => {
+            Ok(canonical_path.to_path_buf())
+        }
+        Err(error) => {
+            tracing::warn!(
+                "failed to migrate legacy transfer state from {} to {}: {error}; using the legacy location",
+                legacy_path.display(),
+                canonical_path.display(),
+            );
+            Ok(legacy_path.to_path_buf())
+        }
+    }
 }
 
 pub(crate) fn transfer_path_stem(remote_key: &str) -> String {
     blake3::hash(remote_key.as_bytes()).to_hex().to_string()
 }
 
-pub(crate) fn upload_transfer_state_path(root_dir: &Path, remote_key: &str) -> PathBuf {
-    transfer_state_root(root_dir)
-        .join("uploads")
-        .join(format!("{}.json", transfer_path_stem(remote_key)))
+pub(crate) fn upload_transfer_state_path(root_dir: &Path, remote_key: &str) -> Result<PathBuf> {
+    transfer_state_root(root_dir).map(|state_root| {
+        state_root
+            .join("uploads")
+            .join(format!("{}.json", transfer_path_stem(remote_key)))
+    })
 }
 
-pub(crate) fn download_transfer_state_path(root_dir: &Path, remote_key: &str) -> PathBuf {
-    transfer_state_root(root_dir)
-        .join("downloads")
-        .join(format!("{}.json", transfer_path_stem(remote_key)))
+pub(crate) fn download_transfer_state_path(root_dir: &Path, remote_key: &str) -> Result<PathBuf> {
+    transfer_state_root(root_dir).map(|state_root| {
+        state_root
+            .join("downloads")
+            .join(format!("{}.json", transfer_path_stem(remote_key)))
+    })
 }
 
-pub(crate) fn download_transfer_temp_path(root_dir: &Path, remote_key: &str) -> PathBuf {
-    transfer_state_root(root_dir)
-        .join("downloads")
-        .join(format!("{}.part", transfer_path_stem(remote_key)))
+pub(crate) fn download_transfer_temp_path(root_dir: &Path, remote_key: &str) -> Result<PathBuf> {
+    transfer_state_root(root_dir).map(|state_root| {
+        state_root
+            .join("downloads")
+            .join(format!("{}.part", transfer_path_stem(remote_key)))
+    })
 }
 
 pub fn local_entry_state_for_path(
@@ -540,6 +585,26 @@ mod tests {
                 .and_then(|progress| progress.current_path.clone()),
             None
         );
+
+        fs::remove_dir_all(root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn transfer_state_root_migrates_legacy_state_to_canonical_location() {
+        let root = test_root();
+        let legacy = root.join(".ironmesh/transfers/uploads");
+        fs::create_dir_all(&legacy).expect("legacy transfer state should create");
+        fs::write(legacy.join("upload.json"), b"legacy transfer")
+            .expect("legacy transfer state should write");
+
+        let resolved = transfer_state_root(&root).expect("transfer state should migrate");
+
+        assert_eq!(resolved, root.join(".berrykeep/transfers"));
+        assert_eq!(
+            fs::read(resolved.join("uploads/upload.json")).expect("migrated state should read"),
+            b"legacy transfer"
+        );
+        assert!(!root.join(".ironmesh/transfers").exists());
 
         fs::remove_dir_all(root).expect("temp root should be removed");
     }

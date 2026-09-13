@@ -3166,8 +3166,8 @@ fn download_remote_file(
     modification_context: Option<&ModificationLogContext>,
 ) -> Result<()> {
     let target = absolute_path(root_dir, local_relative_path);
-    let temp_path = download_transfer_temp_path(root_dir, remote_key);
-    let state_path = download_transfer_state_path(root_dir, remote_key);
+    let temp_path = download_transfer_temp_path(root_dir, remote_key)?;
+    let state_path = download_transfer_state_path(root_dir, remote_key)?;
 
     if target.is_dir() {
         fs::remove_dir_all(&target)

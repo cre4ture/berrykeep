@@ -66,6 +66,7 @@ const LEGACY_ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
 /// into stored payloads" spirit) and so the node side can attach it without touching payload
 /// construction at all.
 pub const INGESTION_TOKEN_HEADER: &str = "x-berrykeep-ingestion-token";
+const LEGACY_INGESTION_TOKEN_HEADER: &str = "x-ironmesh-ingestion-token";
 
 /// Default k-anonymity minimum group size for published aggregates (doc Section 4.3).
 pub const DEFAULT_K_ANONYMITY_MIN: u32 = 5;
@@ -411,6 +412,7 @@ async fn ingest_hardware_reliability(
     //   for nodes that haven't upgraded.
     let provided_token = headers
         .get(INGESTION_TOKEN_HEADER)
+        .or_else(|| headers.get(LEGACY_INGESTION_TOKEN_HEADER))
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -830,13 +832,25 @@ mod tests {
         addr: SocketAddr,
         token: Option<&str>,
     ) -> Request<Body> {
+        ingest_request_with_header(
+            body,
+            addr,
+            token.map(|token| (INGESTION_TOKEN_HEADER, token)),
+        )
+    }
+
+    fn ingest_request_with_header(
+        body: Value,
+        addr: SocketAddr,
+        token_header: Option<(&str, &str)>,
+    ) -> Request<Body> {
         let mut builder = Request::builder()
             .method("POST")
             .uri("/v1/ingest/hardware-reliability")
             .header(header::CONTENT_TYPE, "application/json")
             .extension(ConnectInfo(addr));
-        if let Some(token) = token {
-            builder = builder.header(INGESTION_TOKEN_HEADER, token);
+        if let Some((header_name, token)) = token_header {
+            builder = builder.header(header_name, token);
         }
         builder
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -1461,6 +1475,38 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_accepts_a_matching_legacy_ingestion_token_header() {
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let addr = source_addr(34);
+
+        let register_response = router
+            .clone()
+            .oneshot(register_request("subject-legacy-token", addr))
+            .await
+            .unwrap();
+        let token = body_json(register_response).await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let payload = json!({
+            "schema_version": 1,
+            "telemetry_subject_id": "subject-legacy-token",
+        });
+        let response = router
+            .oneshot(ingest_request_with_header(
+                payload,
+                addr,
+                Some((LEGACY_INGESTION_TOKEN_HEADER, &token)),
+            ))
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
