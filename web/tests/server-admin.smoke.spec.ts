@@ -645,6 +645,7 @@ test("server-admin explorer restores snapshot entries", async ({ page }) => {
 
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("button", { name: "Refresh snapshots" })).toBeVisible();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
 
   await page.getByRole("textbox", { name: "Snapshot" }).click();
   await page.getByRole("option", { name: "snapshot-admin-001" }).click();
@@ -819,6 +820,9 @@ test("server-admin explorer loads version history with thumbnails", async ({ pag
   await page.keyboard.press("Escape");
 
   await page.getByText("Explorer", { exact: true }).click();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
+  await expect(page.getByRole("row", { name: /gallery\/cat\.png/ })).toBeVisible();
   await page
     .getByRole("row", { name: /gallery\/cat\.png/ })
     .getByRole("button", { name: "History" })
