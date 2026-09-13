@@ -163,6 +163,18 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.keyboard.press("Escape");
 
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const dashboardSummaryMetrics = page.getByTestId("dashboard-summary-metrics");
+  await expect(dashboardSummaryMetrics).toBeVisible();
+  const compactDashboardMetricCards = dashboardSummaryMetrics.locator(
+    '[data-stat-card-variant="compact"]'
+  );
+  await expect(compactDashboardMetricCards).toHaveCount(9);
+  const dashboardMetricCardCount = await compactDashboardMetricCards.count();
+  const dashboardMetricRowCount = await compactDashboardMetricCards.evaluateAll(
+    (cards) => new Set(cards.map((card) => Math.round(card.getBoundingClientRect().top))).size
+  );
+  expect(dashboardMetricRowCount).toBeLessThanOrEqual(Math.ceil(dashboardMetricCardCount / 3));
   const desktopSidebarToggle = page.getByRole("button", { name: "Toggle navigation sidebar" });
   const primaryNavigation = page.getByLabel("Primary navigation");
   await expect(desktopSidebarToggle).toBeVisible();
