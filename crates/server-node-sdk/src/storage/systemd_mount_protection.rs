@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 #[cfg(any(target_os = "linux", test))]
 use std::path::{Component, PathBuf};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::process::Stdio;
 #[cfg(all(target_os = "linux", not(test)))]
 use std::sync::OnceLock;
@@ -12,10 +12,13 @@ use std::time::Duration;
 #[cfg(all(target_os = "linux", not(test)))]
 use std::time::Instant;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use tokio::process::Command;
 #[cfg(any(target_os = "linux", test))]
 use tokio::time::timeout;
+
+#[cfg(any(target_os = "linux", test))]
+use futures_util::future::join_all;
 
 use super::StoragePathConfig;
 #[cfg(any(target_os = "linux", test))]
@@ -26,6 +29,8 @@ use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDepend
 
 #[cfg(target_os = "linux")]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "linux", test))]
+const PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(all(target_os = "linux", not(test)))]
 const MOUNT_PROTECTION_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -92,7 +97,7 @@ struct MountProtectionTarget {
     mount_point: Option<PathBuf>,
     mount_point_is_bind: bool,
     backing_mount_points: Vec<PathBuf>,
-    path_resolution_failed: bool,
+    path_resolution_error: Option<String>,
     missing_severity: HostDependencySeverity,
 }
 
@@ -581,15 +586,15 @@ fn mount_protection_targets(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
 ) -> Vec<MountProtectionTarget> {
-    mount_protection_targets_with_path_resolution(data_dir, storage_paths, false, &BTreeSet::new())
+    mount_protection_targets_with_path_resolution(data_dir, storage_paths, None, &BTreeMap::new())
 }
 
 #[cfg(any(target_os = "linux", test))]
 fn mount_protection_targets_with_path_resolution(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
-    data_dir_resolution_failed: bool,
-    storage_path_resolution_failures: &BTreeSet<String>,
+    data_dir_resolution_error: Option<String>,
+    storage_path_resolution_errors: &BTreeMap<String, String>,
 ) -> Vec<MountProtectionTarget> {
     let mount_points = mount_points_for_current_process().unwrap_or_default();
     let data_dir = normalized_mount_protection_path(data_dir);
@@ -606,7 +611,7 @@ fn mount_protection_targets_with_path_resolution(
         mount_point_is_bind: data_dir_mount_point
             .is_some_and(|mount_point| mount_point.root != Path::new("/")),
         backing_mount_points: data_dir_backing_mount_points,
-        path_resolution_failed: data_dir_resolution_failed,
+        path_resolution_error: data_dir_resolution_error,
         path: data_dir,
         missing_severity: HostDependencySeverity::Critical,
     }];
@@ -638,8 +643,9 @@ fn mount_protection_targets_with_path_resolution(
                     mount_point_is_bind: mount_point
                         .is_some_and(|mount_point| mount_point.root != Path::new("/")),
                     backing_mount_points,
-                    path_resolution_failed: storage_path_resolution_failures
-                        .contains(&configured_path.id),
+                    path_resolution_error: storage_path_resolution_errors
+                        .get(&configured_path.id)
+                        .cloned(),
                     path,
                     missing_severity: match configured_path.state {
                         StoragePathState::Active => HostDependencySeverity::Critical,
@@ -657,25 +663,39 @@ async fn mount_protection_targets_for_current_process(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
 ) -> Result<Vec<MountProtectionTarget>, String> {
-    let data_dir = resolve_mount_protection_path(data_dir).await;
+    let storage_path_futures = storage_paths
+        .iter()
+        .filter(|storage_path| !matches!(storage_path.state, StoragePathState::Disabled))
+        .map(|storage_path| async {
+            (
+                storage_path.id.clone(),
+                resolve_mount_protection_path(&storage_path.path).await,
+            )
+        });
+    let (data_dir, resolved_storage_paths) = tokio::join!(
+        resolve_mount_protection_path(data_dir),
+        join_all(storage_path_futures),
+    );
+    let resolved_storage_paths = resolved_storage_paths
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
     let mut storage_paths = storage_paths.to_vec();
-    let mut storage_path_resolution_failures = BTreeSet::new();
+    let mut storage_path_resolution_errors = BTreeMap::new();
     for storage_path in &mut storage_paths {
-        if matches!(storage_path.state, StoragePathState::Disabled) {
+        let Some(resolved_path) = resolved_storage_paths.get(&storage_path.id) else {
             continue;
+        };
+        if let Some(error) = &resolved_path.error {
+            storage_path_resolution_errors.insert(storage_path.id.clone(), error.clone());
         }
-        let resolved_path = resolve_mount_protection_path(&storage_path.path).await;
-        if resolved_path.failed {
-            storage_path_resolution_failures.insert(storage_path.id.clone());
-        }
-        storage_path.path = resolved_path.path;
+        storage_path.path = resolved_path.path.clone();
     }
     tokio::task::spawn_blocking(move || {
         mount_protection_targets_with_path_resolution(
             &data_dir.path,
             &storage_paths,
-            data_dir.failed,
-            &storage_path_resolution_failures,
+            data_dir.error,
+            &storage_path_resolution_errors,
         )
     })
     .await
@@ -683,28 +703,55 @@ async fn mount_protection_targets_for_current_process(
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Clone)]
 struct ResolvedMountProtectionPath {
     path: PathBuf,
-    failed: bool,
+    error: Option<String>,
 }
 
 #[cfg(any(target_os = "linux", test))]
 async fn resolve_mount_protection_path(path: &Path) -> ResolvedMountProtectionPath {
     let lexical_path = absolutize_mount_protection_path(path);
-    let path = path.to_path_buf();
-    let resolved_path = timeout(
-        Duration::from_secs(1),
-        tokio::task::spawn_blocking(move || std::fs::canonicalize(path)),
-    )
-    .await;
-    match resolved_path {
-        Ok(Ok(Ok(path))) => ResolvedMountProtectionPath {
-            path,
-            failed: false,
-        },
-        _ => ResolvedMountProtectionPath {
+    let mut command = Command::new("readlink");
+    command
+        .args(["--canonicalize-existing", "--"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = timeout(PATH_RESOLUTION_TIMEOUT, command.output()).await;
+    match output {
+        Ok(Ok(output)) if output.status.success() => {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if path.is_empty() {
+                ResolvedMountProtectionPath {
+                    path: lexical_path,
+                    error: Some("readlink returned an empty path".to_string()),
+                }
+            } else {
+                ResolvedMountProtectionPath {
+                    path: PathBuf::from(path),
+                    error: None,
+                }
+            }
+        }
+        Ok(Ok(output)) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            ResolvedMountProtectionPath {
+                path: lexical_path,
+                error: Some(if detail.is_empty() {
+                    format!("readlink exited with {}", output.status)
+                } else {
+                    format!("readlink exited with {}: {detail}", output.status)
+                }),
+            }
+        }
+        Ok(Err(error)) => ResolvedMountProtectionPath {
             path: lexical_path,
-            failed: true,
+            error: Some(format!("failed to start readlink: {error}")),
+        },
+        Err(_) => ResolvedMountProtectionPath {
+            path: lexical_path,
+            error: Some("readlink did not resolve the path within one second".to_string()),
         },
     }
 }
@@ -900,7 +947,7 @@ fn checks_for_inspection(
                     (Some(actual), Some(expected)) => actual.starts_with(expected),
                     _ => true,
                 };
-                let protecting_mount = (!target.path_resolution_failed
+                let protecting_mount = (target.path_resolution_error.is_none()
                     && target_is_on_expected_host_mount)
                     .then(|| protecting_mount_dependency(target, &mounts))
                     .flatten();
@@ -924,7 +971,7 @@ fn checks_for_inspection(
                         )),
                         install_hint: None,
                     },
-                    None if target.path_resolution_failed => HostDependencyCheck {
+                    None if target.path_resolution_error.is_some() => HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
                         status: HostDependencyStatus::Missing,
@@ -933,7 +980,13 @@ fn checks_for_inspection(
                             "Could not resolve the filesystem path for {}",
                             target.path.display()
                         ),
-                        detail: "The storage path could not be resolved to its physical filesystem within one second, so mount protection has not been verified. This avoids treating a symlinked or unavailable path as root-backed.".to_string(),
+                        detail: format!(
+                            "The storage path could not be resolved to its physical filesystem: {}. Mount protection has not been verified, so the path is not treated as root-backed.",
+                            target
+                                .path_resolution_error
+                                .as_deref()
+                                .unwrap_or("unknown resolution failure")
+                        ),
                         configured_path: Some(target.path.display().to_string()),
                         resolved_path: None,
                         install_hint: Some(format!(
@@ -1387,7 +1440,7 @@ mod tests {
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
                 backing_mount_points: Vec::new(),
-                path_resolution_failed: false,
+                path_resolution_error: None,
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
@@ -1397,7 +1450,7 @@ mod tests {
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
                 backing_mount_points: Vec::new(),
-                path_resolution_failed: false,
+                path_resolution_error: None,
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
@@ -1407,7 +1460,7 @@ mod tests {
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
                 backing_mount_points: Vec::new(),
-                path_resolution_failed: false,
+                path_resolution_error: None,
                 missing_severity: HostDependencySeverity::Critical,
             },
         ];
@@ -1461,7 +1514,7 @@ mod tests {
             mount_point: Some(PathBuf::from("/")),
             mount_point_is_bind: false,
             backing_mount_points: Vec::new(),
-            path_resolution_failed: true,
+            path_resolution_error: Some("readlink could not resolve the path".to_string()),
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
@@ -1483,7 +1536,7 @@ mod tests {
             mount_point: Some(PathBuf::from("/srv/pool")),
             mount_point_is_bind: false,
             backing_mount_points: Vec::new(),
-            path_resolution_failed: false,
+            path_resolution_error: None,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
@@ -1512,7 +1565,7 @@ mod tests {
             mount_point: Some(PathBuf::from("/srv")),
             mount_point_is_bind: false,
             backing_mount_points: Vec::new(),
-            path_resolution_failed: false,
+            path_resolution_error: None,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
@@ -1536,7 +1589,7 @@ mod tests {
             mount_point: Some(PathBuf::from("/srv/berrykeep")),
             mount_point_is_bind: true,
             backing_mount_points: vec![PathBuf::from("/mnt/data")],
-            path_resolution_failed: false,
+            path_resolution_error: None,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
@@ -1571,7 +1624,7 @@ mod tests {
             mount_point: Some(PathBuf::from("/srv/berrykeep")),
             mount_point_is_bind: true,
             backing_mount_points: vec![PathBuf::from("/srv")],
-            path_resolution_failed: false,
+            path_resolution_error: None,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
@@ -1609,8 +1662,23 @@ mod tests {
         let resolved = resolve_mount_protection_path(&link).await;
 
         assert_eq!(resolved.path, target);
-        assert!(!resolved.failed);
+        assert!(resolved.error.is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn unresolved_mount_protection_path_reports_its_readlink_error() {
+        let path = std::env::temp_dir().join(format!(
+            "ironmesh-mount-protection-missing-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+
+        let resolved = resolve_mount_protection_path(&path).await;
+
+        assert_eq!(resolved.path, path);
+        assert!(resolved.error.is_some());
     }
 
     #[test]
@@ -1667,7 +1735,7 @@ mod tests {
                 mount_point,
                 &mount_points,
             ),
-            path_resolution_failed: false,
+            path_resolution_error: None,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
