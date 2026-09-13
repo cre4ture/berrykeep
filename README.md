@@ -44,6 +44,16 @@ otherwise sit unused, start with a single external drive per node, then add
 capacity or nodes when your library grows. The current supported installation
 paths are documented below.
 
+## Multimedia optimized User Interface
+
+### Gallery for your smartphone pictures
+
+Example for the web-ui (apps have similar):
+
+<img width="1209" height="934" alt="image" src="https://github.com/user-attachments/assets/62cf8841-b1d2-45dc-bc55-d350c48e68f5" />
+
+<img width="1647" height="1386" alt="image" src="https://github.com/user-attachments/assets/382bdf31-189b-4e7f-867f-a5e7ec534ed0" />
+
 ## Renaming from IronMesh
 
 This project is being renamed from **IronMesh** to **BerryKeep** because the
