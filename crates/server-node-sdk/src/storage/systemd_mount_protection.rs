@@ -803,8 +803,9 @@ async fn resolve_mount_protection_path(
         Err(_) => ResolvedMountProtectionPath {
             path: lexical_path,
             error: Some(format!(
-                "`{}` did not resolve the path within one second",
-                canonicalizer.display()
+                "`{}` did not resolve the path within {} seconds",
+                canonicalizer.display(),
+                PATH_RESOLUTION_TIMEOUT.as_secs()
             )),
         },
     }
