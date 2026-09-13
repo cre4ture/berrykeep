@@ -340,7 +340,7 @@ export function DashboardPage() {
       {hostDependencyFindings.length > 0 ? (
         <Alert
           color={hostDependencyFindings.some((check) => check.severity === "critical") ? "red" : "yellow"}
-          title="Storage mount protection needs attention"
+          title="Host dependencies need attention"
         >
           <Stack gap={4}>
             {hostDependencyFindings.map((check) => (

@@ -469,7 +469,6 @@ fn mount_dependencies_from_properties(
     let mut where_path = None;
 
     for line in properties.lines().chain(std::iter::once("")) {
-        let line = line.trim();
         if line.is_empty() {
             finish_mount_dependency(
                 &expected_units,
@@ -517,7 +516,6 @@ fn host_mount_points_from_properties(properties: &str) -> Result<BTreeSet<PathBu
     let mut where_path = None;
 
     for line in properties.lines().chain(std::iter::once("")) {
-        let line = line.trim();
         if line.is_empty() {
             finish_host_mount_point(&mut mount_points, &mut unit, &mut where_path)?;
             continue;
@@ -1561,6 +1559,27 @@ mod tests {
                 systemd_mount("mnt-primary.mount", "/mnt/primary"),
                 systemd_mount("mnt-archive.mount", "/mnt/archive"),
             ]
+        );
+    }
+
+    #[test]
+    fn systemctl_properties_preserve_whitespace_in_mount_paths() {
+        let mounts = mount_dependencies_from_properties(
+            &["mnt-primary.mount".to_string()],
+            "Id=mnt-primary.mount\nWhere=/mnt/primary \n",
+        )
+        .unwrap();
+        assert_eq!(
+            mounts,
+            vec![systemd_mount("mnt-primary.mount", "/mnt/primary ")]
+        );
+
+        let mount_points =
+            host_mount_points_from_properties("Id=mnt-primary.mount\nWhere=/mnt/primary \n")
+                .unwrap();
+        assert_eq!(
+            mount_points,
+            BTreeSet::from([PathBuf::from("/mnt/primary ")])
         );
     }
 
