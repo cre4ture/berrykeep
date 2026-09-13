@@ -1,3 +1,4 @@
+use super::media_tools::HostDependencySeverity;
 use super::*;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;

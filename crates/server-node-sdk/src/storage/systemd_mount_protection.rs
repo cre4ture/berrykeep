@@ -1,16 +1,22 @@
+#[cfg(any(target_os = "linux", test))]
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use tokio::process::Command;
+#[cfg(target_os = "linux")]
 use tokio::time::timeout;
 
-use super::media_tools::{
-    HostDependencyCheck, HostDependencySeverity, HostDependencyStatus, resolve_host_dependency_path,
-};
+#[cfg(target_os = "linux")]
+use super::media_tools::resolve_host_dependency_path;
+use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDependencyStatus};
 use super::{StoragePathConfig, StoragePathState};
 
+#[cfg(target_os = "linux")]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,12 +41,14 @@ struct SystemdMountDependency {
     where_path: PathBuf,
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SystemdService {
     name: String,
     manager: SystemdServiceManager,
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SystemdServiceManager {
     System,
@@ -66,6 +74,7 @@ pub(super) async fn mount_protection_checks(
     checks_for_inspection(&targets, inspection)
 }
 
+#[cfg(target_os = "linux")]
 async fn inspect_current_process() -> SystemdMountProtectionInspection {
     let Some(service) = current_systemd_service() else {
         return SystemdMountProtectionInspection::NotManagedBySystemd;
@@ -134,6 +143,12 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+async fn inspect_current_process() -> SystemdMountProtectionInspection {
+    SystemdMountProtectionInspection::NotManagedBySystemd
+}
+
+#[cfg(any(target_os = "linux", test))]
 impl SystemdService {
     fn systemctl_arguments<'a>(
         &self,
@@ -147,19 +162,13 @@ impl SystemdService {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn current_systemd_service() -> Option<SystemdService> {
-    #[cfg(target_os = "linux")]
-    {
-        let cgroups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-        systemd_service_from_cgroups(&cgroups)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    let cgroups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    systemd_service_from_cgroups(&cgroups)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn systemd_service_from_cgroups(cgroups: &str) -> Option<SystemdService> {
     cgroups
         .lines()
@@ -167,6 +176,7 @@ fn systemd_service_from_cgroups(cgroups: &str) -> Option<SystemdService> {
         .find_map(systemd_service_from_cgroup_path)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn systemd_service_from_cgroup_path(path: &str) -> Option<SystemdService> {
     let units = path
         .split('/')
@@ -198,16 +208,19 @@ fn systemd_service_from_cgroup_path(path: &str) -> Option<SystemdService> {
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn is_systemd_service_unit(unit: &str) -> bool {
     unit.strip_suffix(".service")
         .is_some_and(|name| !name.is_empty())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn is_systemd_user_manager_service(unit: &str) -> bool {
     unit.strip_suffix(".service")
         .is_some_and(|name| name.starts_with("user@"))
 }
 
+#[cfg(target_os = "linux")]
 async fn run_systemctl<'a>(
     systemctl: &Path,
     arguments: impl IntoIterator<Item = &'a str>,
@@ -236,6 +249,7 @@ async fn run_systemctl<'a>(
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn direct_mount_units_from_service_properties(output: &str) -> Vec<String> {
     let mut units = BTreeSet::new();
     for (_, dependencies) in output
@@ -252,10 +266,12 @@ fn direct_mount_units_from_service_properties(output: &str) -> Vec<String> {
     units.into_iter().collect()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn mount_unit_from_token(token: &str) -> Option<String> {
     token.ends_with(".mount").then(|| token.to_string())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn mount_dependencies_from_properties(
     mount_units: &[String],
     properties: &str,
@@ -312,6 +328,7 @@ fn mount_dependencies_from_properties(
         .collect()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn finish_mount_dependency(
     expected_units: &BTreeSet<String>,
     dependencies: &mut BTreeMap<String, PathBuf>,
@@ -421,6 +438,7 @@ fn path_is_on_root_filesystem(path: &Path) -> bool {
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = path;
         false
     }
 }
