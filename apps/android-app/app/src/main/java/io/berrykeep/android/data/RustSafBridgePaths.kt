@@ -21,7 +21,10 @@ internal object RustSafBridgePaths {
             segment == ".berrykeep" ||
                 segment == ".berrykeep-conflicts" ||
                 segment == ".thumbnails" ||
-                segment.contains(".berrykeep-part-")
+                segment.contains(".berrykeep-part-") ||
+                segment == ".ironmesh" ||
+                segment == ".ironmesh-conflicts" ||
+                segment.contains(".ironmesh-part-")
         }
     }
 }

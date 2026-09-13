@@ -28,6 +28,9 @@ class RustSafBridgePathsTest {
         assertTrue(RustSafBridgePaths.shouldIgnorePath("nested/.berrykeep-conflicts/file.txt"))
         assertTrue(RustSafBridgePaths.shouldIgnorePath("Pictures/.thumbnails/thumb.jpg"))
         assertTrue(RustSafBridgePaths.shouldIgnorePath("Pictures/.berrykeep-part-123.tmp"))
+        assertTrue(RustSafBridgePaths.shouldIgnorePath(".ironmesh/state.json"))
+        assertTrue(RustSafBridgePaths.shouldIgnorePath("nested/.ironmesh-conflicts/file.txt"))
+        assertTrue(RustSafBridgePaths.shouldIgnorePath("Pictures/.ironmesh-part-123.tmp"))
     }
 
     @Test

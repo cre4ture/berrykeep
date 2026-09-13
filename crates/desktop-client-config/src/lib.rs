@@ -60,6 +60,7 @@ pub const STARTUP_INTEGRATION_NOTE: &str = if cfg!(windows) {
 pub const OS_INTEGRATION_MANAGEMENT_SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 
 const LOCAL_STATE_ROOT_DIR: &str = "BerryKeep";
+const LEGACY_LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
 const CONFIG_SUBDIR: &str = "desktop-client-config";
 #[cfg(windows)]
 const LEGACY_WINDOWS_CONFIG_SUBDIR: &str = "windows-client-config";
@@ -830,11 +831,27 @@ pub fn service_desktop_status_file_path(instance_kind: &str, id: &str) -> PathBu
 pub fn migrate_legacy_state_paths() -> Result<()> {
     #[cfg(windows)]
     {
-        migrate_legacy_windows_file(
-            &legacy_instance_store_path(),
-            &default_instance_store_path(),
+        let current_state_dir = local_appdata_root().join(CONFIG_SUBDIR);
+        migrate_legacy_state_directory(
+            &legacy_local_appdata_root().join(CONFIG_SUBDIR),
+            &current_state_dir,
         )?;
-        migrate_legacy_windows_file(&legacy_launch_report_path(), &default_launch_report_path())?;
+        migrate_legacy_state_directory(
+            &local_appdata_root().join(LEGACY_WINDOWS_CONFIG_SUBDIR),
+            &current_state_dir,
+        )?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        migrate_legacy_state_directory(
+            &legacy_config_home_root().join(CONFIG_SUBDIR),
+            &config_home_root().join(CONFIG_SUBDIR),
+        )?;
+        migrate_legacy_state_directory(
+            &legacy_state_home_root().join(CONFIG_SUBDIR),
+            &state_home_root().join(CONFIG_SUBDIR),
+        )?;
     }
 
     Ok(())
@@ -1616,80 +1633,225 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn local_appdata_root() -> PathBuf {
-    common::legacy_compatibility::var_os("LOCALAPPDATA")
+fn local_appdata_base_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join(LOCAL_STATE_ROOT_DIR)
 }
 
 #[cfg(windows)]
-fn legacy_instance_store_path() -> PathBuf {
-    local_appdata_root()
-        .join(LEGACY_WINDOWS_CONFIG_SUBDIR)
-        .join(INSTANCE_STORE_FILE_NAME)
+fn local_appdata_root() -> PathBuf {
+    local_appdata_root_for_product(LOCAL_STATE_ROOT_DIR)
 }
 
 #[cfg(windows)]
-fn legacy_launch_report_path() -> PathBuf {
-    local_appdata_root()
-        .join(LEGACY_WINDOWS_CONFIG_SUBDIR)
-        .join(LAST_LAUNCH_REPORT_FILE_NAME)
+fn legacy_local_appdata_root() -> PathBuf {
+    local_appdata_root_for_product(LEGACY_LOCAL_STATE_ROOT_DIR)
 }
 
 #[cfg(windows)]
-fn migrate_legacy_windows_file(legacy_path: &Path, current_path: &Path) -> Result<()> {
-    if current_path.exists() || !legacy_path.exists() {
+fn local_appdata_root_for_product(product_directory: &str) -> PathBuf {
+    local_appdata_base_dir().join(product_directory)
+}
+
+fn migrate_legacy_state_directory(legacy_path: &Path, current_path: &Path) -> Result<()> {
+    if !legacy_path.exists() {
         return Ok(());
     }
 
-    ensure_parent_dir(current_path)?;
-    match fs::rename(legacy_path, current_path) {
+    if !current_path.exists() {
+        return move_or_copy_state_path(legacy_path, current_path);
+    }
+
+    for entry in fs::read_dir(legacy_path).with_context(|| {
+        format!(
+            "failed reading legacy config directory {}",
+            legacy_path.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed reading an entry in legacy config directory {}",
+                legacy_path.display()
+            )
+        })?;
+        let target_path = current_path.join(entry.file_name());
+        migrate_legacy_state_entry(&entry.path(), &target_path)?;
+    }
+
+    let _ = fs::remove_dir(legacy_path);
+    Ok(())
+}
+
+fn migrate_legacy_state_entry(source: &Path, target: &Path) -> Result<()> {
+    if !target.exists() {
+        return move_or_copy_state_path(source, target);
+    }
+
+    if source.is_file()
+        && target.is_file()
+        && source
+            .file_name()
+            .is_some_and(|name| name == INSTANCE_STORE_FILE_NAME)
+    {
+        return merge_legacy_managed_instance_store(source, target);
+    }
+
+    Ok(())
+}
+
+fn merge_legacy_managed_instance_store(legacy_path: &Path, current_path: &Path) -> Result<()> {
+    let legacy_store = ManagedInstanceStore::load_or_default(legacy_path)?;
+    let mut current_store = ManagedInstanceStore::load_or_default(current_path)?;
+
+    for identity in legacy_store.client_identities {
+        if current_store.client_identity(&identity.id).is_none() {
+            current_store.upsert_client_identity(identity);
+        }
+    }
+    for instance in legacy_store.client_cli_instances {
+        if !current_store
+            .client_cli_instances
+            .iter()
+            .any(|candidate| candidate.id == instance.id)
+        {
+            current_store.upsert_client_cli(instance);
+        }
+    }
+    for instance in legacy_store.os_integration_instances {
+        if !current_store
+            .os_integration_instances
+            .iter()
+            .any(|candidate| candidate.id == instance.id)
+        {
+            current_store.upsert_os_integration(instance);
+        }
+    }
+    for instance in legacy_store.folder_agent_instances {
+        if !current_store
+            .folder_agent_instances
+            .iter()
+            .any(|candidate| candidate.id == instance.id)
+        {
+            current_store.upsert_folder_agent(instance);
+        }
+    }
+
+    current_store.save(current_path)?;
+    fs::remove_file(legacy_path).with_context(|| {
+        format!(
+            "failed removing migrated legacy instance store {}",
+            legacy_path.display()
+        )
+    })
+}
+
+fn move_or_copy_state_path(source: &Path, target: &Path) -> Result<()> {
+    ensure_parent_dir(target)?;
+    match fs::rename(source, target) {
         Ok(()) => Ok(()),
         Err(rename_error) => {
-            fs::copy(legacy_path, current_path).with_context(|| {
+            copy_state_path(source, target).with_context(|| {
                 format!(
                     "failed copying legacy config state from {} to {} after rename error: {}",
-                    legacy_path.display(),
-                    current_path.display(),
+                    source.display(),
+                    target.display(),
                     rename_error
                 )
             })?;
-            fs::remove_file(legacy_path).with_context(|| {
-                format!(
-                    "failed removing legacy config state {} after migration",
-                    legacy_path.display()
-                )
-            })?;
+            if source.is_dir() {
+                fs::remove_dir_all(source).with_context(|| {
+                    format!(
+                        "failed removing migrated legacy state directory {}",
+                        source.display()
+                    )
+                })?;
+            } else {
+                fs::remove_file(source).with_context(|| {
+                    format!(
+                        "failed removing migrated legacy state file {}",
+                        source.display()
+                    )
+                })?;
+            }
             Ok(())
         }
     }
 }
 
+fn copy_state_path(source: &Path, target: &Path) -> Result<()> {
+    if source.is_dir() {
+        fs::create_dir_all(target).with_context(|| {
+            format!(
+                "failed creating migrated state directory {}",
+                target.display()
+            )
+        })?;
+        for entry in fs::read_dir(source).with_context(|| {
+            format!("failed reading legacy state directory {}", source.display())
+        })? {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed reading an entry in legacy state directory {}",
+                    source.display()
+                )
+            })?;
+            copy_state_path(&entry.path(), &target.join(entry.file_name()))?;
+        }
+    } else {
+        fs::copy(source, target).with_context(|| {
+            format!(
+                "failed copying legacy state file {} to {}",
+                source.display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(not(windows))]
 fn config_home_root() -> PathBuf {
+    config_home_root_for_product(LOCAL_STATE_ROOT_DIR)
+}
+
+#[cfg(not(windows))]
+fn legacy_config_home_root() -> PathBuf {
+    config_home_root_for_product(LEGACY_LOCAL_STATE_ROOT_DIR)
+}
+
+#[cfg(not(windows))]
+fn config_home_root_for_product(product_directory: &str) -> PathBuf {
     xdg_dir("XDG_CONFIG_HOME", &[".config"])
         .unwrap_or_else(std::env::temp_dir)
-        .join(LOCAL_STATE_ROOT_DIR)
+        .join(product_directory)
 }
 
 #[cfg(not(windows))]
 fn state_home_root() -> PathBuf {
+    state_home_root_for_product(LOCAL_STATE_ROOT_DIR)
+}
+
+#[cfg(not(windows))]
+fn legacy_state_home_root() -> PathBuf {
+    state_home_root_for_product(LEGACY_LOCAL_STATE_ROOT_DIR)
+}
+
+#[cfg(not(windows))]
+fn state_home_root_for_product(product_directory: &str) -> PathBuf {
     xdg_dir("XDG_STATE_HOME", &[".local", "state"])
         .unwrap_or_else(std::env::temp_dir)
-        .join(LOCAL_STATE_ROOT_DIR)
+        .join(product_directory)
 }
 
 #[cfg(not(windows))]
 fn xdg_dir(env_var: &str, home_suffix: &[&str]) -> Option<PathBuf> {
-    if let Some(path) =
-        common::legacy_compatibility::var_os(env_var).filter(|value| !value.is_empty())
-    {
+    if let Some(path) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(path));
     }
 
-    let home = common::legacy_compatibility::var_os("HOME").filter(|value| !value.is_empty())?;
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
     let mut path = PathBuf::from(home);
     for segment in home_suffix {
         path.push(segment);
@@ -1820,6 +1982,79 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn legacy_state_directory_migration_merges_without_overwriting_current_entries() {
+        let path = temp_path("legacy-state-directory");
+        let root = path.parent().expect("temp path should have a parent");
+        let legacy_dir = root.join("legacy");
+        let current_dir = root.join("current");
+        let legacy_instance_store = legacy_dir.join(INSTANCE_STORE_FILE_NAME);
+        let legacy_log = legacy_dir.join("logs").join("folder-agent.log");
+        let current_report = current_dir.join(LAST_LAUNCH_REPORT_FILE_NAME);
+
+        std::fs::create_dir_all(legacy_log.parent().expect("log should have a parent"))
+            .expect("legacy log directory should create");
+        std::fs::create_dir_all(&current_dir).expect("current state directory should create");
+        std::fs::write(
+            &legacy_instance_store,
+            r#"{
+  "client_cli_instances": [
+    { "id": "legacy", "label": "Legacy" },
+    { "id": "shared", "label": "Legacy shared" }
+  ]
+}"#,
+        )
+        .expect("legacy instance store should write");
+        std::fs::write(
+            current_dir.join(INSTANCE_STORE_FILE_NAME),
+            r#"{
+  "client_cli_instances": [
+    { "id": "canonical", "label": "Canonical" },
+    { "id": "shared", "label": "Canonical shared" }
+  ]
+}"#,
+        )
+        .expect("current instance store should write");
+        std::fs::write(&legacy_log, "legacy log").expect("legacy log should write");
+        std::fs::write(&current_report, "current report").expect("current report should write");
+
+        migrate_legacy_state_directory(&legacy_dir, &current_dir)
+            .expect("legacy state directory should migrate");
+
+        let store =
+            ManagedInstanceStore::load_or_default(&current_dir.join(INSTANCE_STORE_FILE_NAME))
+                .expect("migrated instance store should load");
+        assert_eq!(
+            store
+                .client_cli_instances
+                .iter()
+                .map(|instance| instance.id.as_str())
+                .collect::<Vec<_>>(),
+            ["canonical", "shared", "legacy"]
+        );
+        assert_eq!(
+            store
+                .client_cli_instances
+                .iter()
+                .find(|instance| instance.id == "shared")
+                .expect("shared instance should exist")
+                .label,
+            "Canonical shared"
+        );
+        assert_eq!(
+            std::fs::read_to_string(current_dir.join("logs").join("folder-agent.log"))
+                .expect("migrated log should read"),
+            "legacy log"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&current_report).expect("current report should still read"),
+            "current report"
+        );
+        assert!(!legacy_dir.exists());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
