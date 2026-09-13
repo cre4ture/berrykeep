@@ -208,8 +208,6 @@ main() {
   install -d "${payload_dir}/Library/LaunchDaemons"
   install -m 0755 "${binary_path}" \
     "${payload_dir}/Library/Application Support/BerryKeep/bin/berrykeep-server-node"
-  ln -sf berrykeep-server-node \
-    "${payload_dir}/Library/Application Support/BerryKeep/bin/ironmesh-server-node"
   install -m 0755 "${ROOT_DIR}/macos/server-node/berrykeep-server-node-launcher" \
     "${payload_dir}/Library/Application Support/BerryKeep/bin/berrykeep-server-node-launcher"
   install -m 0644 "${ROOT_DIR}/macos/server-node/server-node.env.example" \

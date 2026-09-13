@@ -125,8 +125,8 @@ Get-Content C:\ProgramData\BerryKeep\ServerNode\server-node.env
 
 `server-node.env` supplies only installation-local start values. Restart the
 service after editing it. Retain the supplied `BERRYKEEP_SERVER_NODE_*`
-variables for the guided setup mode; adding ordinary `BERRYKEEP_*` runtime
-variables selects the advanced environment-driven startup path instead.
+variables for the guided setup mode; adding explicit runtime variables such as
+`BERRYKEEP_PUBLIC_URL` selects the advanced environment-driven startup path.
 
 To remove the program and service while preserving data:
 

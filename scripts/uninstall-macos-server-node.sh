@@ -51,7 +51,6 @@ launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
 launchctl bootout system "${PLIST_PATH}" >/dev/null 2>&1 || true
 rm -f "${PLIST_PATH}"
 rm -f "${SERVICE_ROOT}/bin/berrykeep-server-node" \
-  "${SERVICE_ROOT}/bin/ironmesh-server-node" \
   "${SERVICE_ROOT}/bin/berrykeep-server-node-launcher" \
   "${SERVICE_ROOT}/server-node.env.example"
 rmdir "${SERVICE_ROOT}/bin" 2>/dev/null || true

@@ -4,8 +4,6 @@ set -euo pipefail
 
 readonly LABEL="io.berrykeep.server-node"
 readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
-readonly LEGACY_LABEL="io.ironmesh.server-node"
-readonly LEGACY_PLIST_PATH="/Library/LaunchDaemons/${LEGACY_LABEL}.plist"
 
 # Package Installer passes the target volume as its third argument. A package
 # installed onto a non-running volume must not attempt to modify this Mac's
@@ -22,14 +20,4 @@ fi
 # when `launchctl print` did not find a running job.
 if [[ -f "${PLIST_PATH}" ]]; then
   launchctl bootout system "${PLIST_PATH}" >/dev/null 2>&1 || true
-fi
-
-# A pre-transition service must be stopped before the canonical daemon takes
-# over its data directory and launchd slot.
-if launchctl print "system/${LEGACY_LABEL}" >/dev/null 2>&1; then
-  launchctl bootout "system/${LEGACY_LABEL}" || true
-fi
-if [[ -f "${LEGACY_PLIST_PATH}" ]]; then
-  launchctl bootout system "${LEGACY_PLIST_PATH}" >/dev/null 2>&1 || true
-  rm -f "${LEGACY_PLIST_PATH}"
 fi

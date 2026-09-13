@@ -41,7 +41,6 @@ package_path="${TMP_DIR}/berrykeep-server-node.pkg"
 payload_files="$(pkgutil --payload-files "${package_path}")"
 for expected_path in \
   './Library/Application Support/BerryKeep/bin/berrykeep-server-node' \
-  './Library/Application Support/BerryKeep/bin/ironmesh-server-node' \
   './Library/Application Support/BerryKeep/bin/berrykeep-server-node-launcher' \
   './Library/Application Support/BerryKeep/server-node.env.example' \
   './Library/LaunchDaemons/io.berrykeep.server-node.plist'; do
@@ -49,9 +48,19 @@ for expected_path in \
     || fail "package payload is missing ${expected_path}"
 done
 
-# Mutable directories must be created after the installer has migrated legacy
-# state. Shipping either empty directory would make the migration incorrectly
-# preserve an empty canonical path and strand an upgraded installation's data.
+# The package contains only canonical executables. A macOS server-node install
+# is a fresh setup, so it must not include an additional server binary.
+unexpected_binary_paths="$(printf '%s\n' "${payload_files}" | awk '
+  /^\.\/Library\/Application Support\/BerryKeep\/bin\// &&
+  $0 != "./Library/Application Support/BerryKeep/bin/berrykeep-server-node" &&
+  $0 != "./Library/Application Support/BerryKeep/bin/berrykeep-server-node-launcher" { print }
+')"
+if [[ -n "${unexpected_binary_paths}" ]]; then
+  fail "package payload contains unexpected server binaries: ${unexpected_binary_paths}"
+fi
+
+# Mutable directories are created by post-install and are not part of the
+# package payload.
 for unexpected_path in \
   './Library/Application Support/BerryKeep/server-node' \
   './Library/Logs/BerryKeep'; do
