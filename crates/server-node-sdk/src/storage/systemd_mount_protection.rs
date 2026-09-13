@@ -160,6 +160,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
             "--all",
             "--property=Requires",
             "--property=BindsTo",
+            "--property=After",
             service.name.as_str(),
         ]),
     )
@@ -174,7 +175,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
         }
     };
 
-    let mount_units = direct_mount_units_from_service_properties(&service_dependencies);
+    let mount_units = ordered_mount_units_from_service_properties(&service_dependencies);
     if mount_units.is_empty() {
         return SystemdMountProtectionInspection::Dependencies {
             service: service.name,
@@ -318,20 +319,20 @@ async fn run_systemctl<'a>(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn direct_mount_units_from_service_properties(output: &str) -> Vec<String> {
-    let mut units = BTreeSet::new();
-    for (_, dependencies) in output
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .filter(|(property, _)| matches!(*property, "Requires" | "BindsTo"))
-    {
-        units.extend(
-            dependencies
-                .split_whitespace()
-                .filter_map(mount_unit_from_token),
-        );
+fn ordered_mount_units_from_service_properties(output: &str) -> Vec<String> {
+    let mut required = BTreeSet::new();
+    let mut ordered_after = BTreeSet::new();
+    for (property, dependencies) in output.lines().filter_map(|line| line.split_once('=')) {
+        let units = dependencies
+            .split_whitespace()
+            .filter_map(mount_unit_from_token);
+        match property {
+            "Requires" | "BindsTo" => required.extend(units),
+            "After" => ordered_after.extend(units),
+            _ => {}
+        }
     }
-    units.into_iter().collect()
+    required.intersection(&ordered_after).cloned().collect()
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -671,6 +672,27 @@ fn checks_for_inspection(
                         resolved_path: Some("/".to_string()),
                         install_hint: None,
                     },
+                    None if target.mount_point.as_deref() == Some(Path::new("/")) => HostDependencyCheck {
+                        id: target.id.clone(),
+                        feature: target.feature.clone(),
+                        status: HostDependencyStatus::Missing,
+                        severity: target.missing_severity,
+                        summary: format!(
+                            "{} is currently served by the root filesystem",
+                            target.path.display()
+                        ),
+                        detail: format!(
+                            "This storage path is not currently on a separate mount, so `RequiresMountsFor={}` would only depend on the root filesystem and cannot protect the intended storage device.",
+                            target.path.display()
+                        ),
+                        configured_path: Some(target.path.display().to_string()),
+                        resolved_path: Some("/".to_string()),
+                        install_hint: Some(format!(
+                            "Mount the intended filesystem at {}, then add `RequiresMountsFor={}` to the [Unit] section of a drop-in for `{service}`, run `sudo systemctl daemon-reload`, and restart the service.",
+                            target.path.display(),
+                            target.path.display()
+                        )),
+                    },
                     None => HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
@@ -900,12 +922,21 @@ mod tests {
     }
 
     #[test]
-    fn direct_service_dependencies_extract_effective_mount_units() {
-        let units = direct_mount_units_from_service_properties(
-            "Requires=mnt-primary.mount sysinit.target\nBindsTo=var-lib-berrykeep.mount\nWants=unrelated.mount\nAfter=unrelated.mount\n",
+    fn effective_mount_dependencies_require_a_mount_and_start_order() {
+        let units = ordered_mount_units_from_service_properties(
+            "Requires=mnt-primary.mount sysinit.target\nBindsTo=var-lib-berrykeep.mount\nAfter=mnt-primary.mount var-lib-berrykeep.mount unrelated.mount\nWants=unrelated.mount\n",
         );
 
         assert_eq!(units, vec!["mnt-primary.mount", "var-lib-berrykeep.mount"]);
+    }
+
+    #[test]
+    fn mount_requirement_without_start_order_is_not_protected() {
+        let units = ordered_mount_units_from_service_properties(
+            "Requires=mnt-primary.mount\nAfter=network.target\n",
+        );
+
+        assert!(units.is_empty());
     }
 
     #[test]
@@ -998,6 +1029,13 @@ mod tests {
             .unwrap();
         assert_eq!(missing_storage.status, HostDependencyStatus::Missing);
         assert_eq!(missing_storage.severity, HostDependencySeverity::Critical);
+        assert!(
+            missing_storage
+                .install_hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Mount the intended filesystem")
+        );
     }
 
     #[test]
