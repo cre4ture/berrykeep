@@ -120,6 +120,8 @@ const galleryMapEndpointPaths = {
 } as const;
 
 const galleryMapEndpointRoutes = new Map<GalleryMapEndpoint, "canonical" | "legacy">();
+const STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS = 5 * 60 * 1_000;
+let storeIndexChildrenViewUnsupportedUntil = 0;
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
@@ -354,6 +356,15 @@ export async function listAdminStoreEntries(
   options: StoreListRequestOptions = {}
 ): Promise<AdminStoreListResponse> {
   const view: StoreListView = options.view ?? "tree";
+  if (view === "children" && Date.now() < storeIndexChildrenViewUnsupportedUntil) {
+    return fetchAdminStoreIndexLegacyChildrenProjection(
+      prefix,
+      depth,
+      snapshot,
+      adminTokenOverride,
+      options
+    );
+  }
   try {
     return await fetchAdminStoreEntries(
       prefix,
@@ -369,20 +380,38 @@ export async function listAdminStoreEntries(
       throw error;
     }
 
-    // Nodes predating `children` reject the new enum value during query
-    // deserialization. Fetch their established tree response without a page,
-    // then apply the projection before recreating the requested page locally.
-    const treeResponse = await fetchAdminStoreEntries(
+    storeIndexChildrenViewUnsupportedUntil =
+      Date.now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS;
+    return fetchAdminStoreIndexLegacyChildrenProjection(
       prefix,
       depth,
       snapshot,
       adminTokenOverride,
-      options,
-      "tree",
-      false
+      options
     );
-    return projectAdminStoreIndexChildren(treeResponse, prefix, options);
   }
+}
+
+async function fetchAdminStoreIndexLegacyChildrenProjection(
+  prefix: string | undefined,
+  depth: number,
+  snapshot: string | null | undefined,
+  adminTokenOverride: string | undefined,
+  options: StoreListRequestOptions
+): Promise<AdminStoreListResponse> {
+  // Cache only the rejected capability, never the index data. The unpaged
+  // tree remains necessary to apply the projection before pagination, while
+  // a periodic reprobe lets an upgraded node resume server-side paging.
+  const treeResponse = await fetchAdminStoreEntries(
+    prefix,
+    depth,
+    snapshot,
+    adminTokenOverride,
+    options,
+    "tree",
+    false
+  );
+  return projectAdminStoreIndexChildren(treeResponse, prefix, options);
 }
 
 function storeIndexViewWasRejected(error: unknown, requestedView: StoreListView): boolean {

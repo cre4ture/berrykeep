@@ -666,6 +666,56 @@ test("server-admin explorer restores snapshot entries", async ({ page }) => {
   await expect(page.getByRole("cell", { name: "restored/readme-restored.txt" })).toBeVisible();
 });
 
+test("server-admin remembers an older store index projection", async ({ page }) => {
+  const storeIndexRequests: URL[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === apiV1("/auth/store/index")) {
+      storeIndexRequests.push(url);
+    }
+  });
+
+  await installServerAdminMocks(page, { legacyStoreIndexChildren: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Explorer", { exact: true }).click();
+  await expect(page.getByRole("button", { name: "Load entries" })).toBeVisible();
+  await expect
+    .poll(() => storeIndexRequests.some((request) => request.searchParams.get("view") === "tree"))
+    .toBe(true);
+
+  const childrenRequestCount = storeIndexRequests.filter(
+    (request) => request.searchParams.get("view") === "children"
+  ).length;
+  const treeRequestCount = storeIndexRequests.filter(
+    (request) => request.searchParams.get("view") === "tree"
+  ).length;
+  await page.getByRole("button", { name: "Load entries" }).click();
+  await expect
+    .poll(
+      () =>
+        storeIndexRequests.filter((request) => request.searchParams.get("view") === "tree").length
+    )
+    .toBeGreaterThan(treeRequestCount);
+  expect(
+    storeIndexRequests.filter((request) => request.searchParams.get("view") === "children")
+  ).toHaveLength(childrenRequestCount);
+  const fallbackRequests = storeIndexRequests.filter(
+    (request) => request.searchParams.get("view") === "tree"
+  );
+  expect(fallbackRequests.slice(treeRequestCount).every((request) => !request.searchParams.has("offset"))).toBe(
+    true
+  );
+  expect(fallbackRequests.slice(treeRequestCount).every((request) => !request.searchParams.has("limit"))).toBe(
+    true
+  );
+});
+
 test("server-admin prepares, validates, and saves a host-checked storage path with recovery guidance", async ({ page }) => {
   const mockState = await installServerAdminMocks(page, { cockpitStatus: "optional" });
 
@@ -1860,6 +1910,7 @@ async function installServerAdminMocks(
     mapConfiguration?: GalleryMapConfiguration;
     mapConfigurationStatus?: number;
     legacyGalleryMapApiOnly?: boolean;
+    legacyStoreIndexChildren?: boolean;
   }
 ) {
   const imageBody = tinyPngBuffer();
@@ -2247,6 +2298,14 @@ async function installServerAdminMocks(
 
     if (pathname === apiV1("/auth/store/index") && method === "GET") {
       expect(["tree", "children"]).toContain(searchParams.get("view"));
+      if (options?.legacyStoreIndexChildren && searchParams.get("view") === "children") {
+        await route.fulfill({
+          status: 400,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "unknown variant `children`" })
+        });
+        return;
+      }
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
     }
 

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_core::{EntryKind, NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
@@ -84,6 +84,7 @@ const MOBILE_CONNECTION_LOG_TARGET: &str = "ironmesh_mobile_connection";
 const STORE_INDEX_WAIT_DEFAULT_TIMEOUT_MS: u64 = 25_000;
 const STORE_INDEX_WAIT_MIN_TIMEOUT_MS: u64 = 250;
 const STORE_INDEX_WAIT_MAX_TIMEOUT_MS: u64 = 60_000;
+const STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER: Duration = Duration::from_secs(5 * 60);
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
 const GALLERY_MAP_CLUSTERS_PATH: &str = "/gallery/map/clusters";
 const GALLERY_MAP_CLUSTER_ENTRIES_PATH: &str = "/gallery/map/cluster-entries";
@@ -192,6 +193,7 @@ pub struct IronMeshClient {
     connection_diagnostic_impact: ClientConnectionDiagnosticImpact,
     upload_session_affinities: Arc<Mutex<HashMap<String, NodeRouteAffinity>>>,
     gallery_map_api_routes: Arc<RwLock<GalleryMapApiRoutes>>,
+    store_index_children_view_capability: Arc<Mutex<StoreIndexChildrenViewCapability>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -226,6 +228,11 @@ enum GalleryMapApiEndpoint {
 struct GalleryMapApiRoutes {
     clusters: GalleryMapApiRoute,
     cluster_entries: GalleryMapApiRoute,
+}
+
+#[derive(Debug, Default)]
+struct StoreIndexChildrenViewCapability {
+    unsupported_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4139,6 +4146,9 @@ impl IronMeshClient {
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
             gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
+            store_index_children_view_capability: Arc::new(Mutex::new(
+                StoreIndexChildrenViewCapability::default(),
+            )),
         }
     }
 
@@ -4195,6 +4205,9 @@ impl IronMeshClient {
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
             gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
+            store_index_children_view_capability: Arc::new(Mutex::new(
+                StoreIndexChildrenViewCapability::default(),
+            )),
         }
     }
 
@@ -4223,6 +4236,9 @@ impl IronMeshClient {
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
             gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
+            store_index_children_view_capability: Arc::new(Mutex::new(
+                StoreIndexChildrenViewCapability::default(),
+            )),
         }
     }
 
@@ -4275,6 +4291,9 @@ impl IronMeshClient {
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
             gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
+            store_index_children_view_capability: Arc::new(Mutex::new(
+                StoreIndexChildrenViewCapability::default(),
+            )),
         })
     }
 
@@ -5786,6 +5805,15 @@ impl IronMeshClient {
         snapshot: Option<&str>,
         options: StoreIndexRequestOptions,
     ) -> Result<StoreIndexResponse> {
+        let can_fallback_to_tree = options.view == Some(StoreIndexView::Children)
+            && options.cursor.is_none()
+            && options.page_size.is_none();
+        if can_fallback_to_tree && self.store_index_children_view_is_known_unsupported() {
+            return self
+                .store_index_with_legacy_tree_projection(prefix, depth, snapshot, &options)
+                .await;
+        }
+
         let response = self
             .request_store_index(prefix, depth, snapshot, &options)
             .await?;
@@ -5796,27 +5824,68 @@ impl IronMeshClient {
         // locally. The fallback deliberately fetches the unpaged tree: the
         // server must apply the children projection before pagination for its
         // offset and total to remain meaningful.
-        if options.view == Some(StoreIndexView::Children)
-            && options.cursor.is_none()
-            && options.page_size.is_none()
-            && store_index_view_was_rejected(&response, StoreIndexView::Children)
-        {
-            let mut fallback_options = options.clone();
-            fallback_options.view = Some(StoreIndexView::Tree);
-            fallback_options.cursor = None;
-            fallback_options.page_size = None;
-            fallback_options.offset = None;
-            fallback_options.limit = None;
-
-            let fallback_response = self
-                .request_store_index(prefix, depth, snapshot, &fallback_options)
-                .await?;
-            let mut projected = decode_store_index_response(fallback_response, &fallback_options)?;
-            project_store_index_children_response(&mut projected, prefix, &options);
-            return Ok(projected);
+        let children_view_was_rejected = options.view == Some(StoreIndexView::Children)
+            && store_index_view_was_rejected(&response, StoreIndexView::Children);
+        if children_view_was_rejected {
+            self.remember_store_index_children_view_is_unsupported();
+            if can_fallback_to_tree {
+                return self
+                    .store_index_with_legacy_tree_projection(prefix, depth, snapshot, &options)
+                    .await;
+            }
         }
 
         decode_store_index_response(response, &options)
+    }
+
+    fn store_index_children_view_is_known_unsupported(&self) -> bool {
+        let mut capability = self
+            .store_index_children_view_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(unsupported_until) = capability.unsupported_until else {
+            return false;
+        };
+        if Instant::now() < unsupported_until {
+            return true;
+        }
+        capability.unsupported_until = None;
+        false
+    }
+
+    fn remember_store_index_children_view_is_unsupported(&self) {
+        let mut capability = self
+            .store_index_children_view_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        capability.unsupported_until =
+            Some(Instant::now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER);
+    }
+
+    async fn store_index_with_legacy_tree_projection(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: &StoreIndexRequestOptions,
+    ) -> Result<StoreIndexResponse> {
+        // The unsupported capability is cached, not the index response. A
+        // complete tree is still fetched for every live listing so callers
+        // never receive stale store data. Reprobe periodically so a rolling
+        // node upgrade can resume its server-side children projection.
+        let mut fallback_options = options.clone();
+        fallback_options.view = Some(StoreIndexView::Tree);
+        fallback_options.cursor = None;
+        fallback_options.page_size = None;
+        fallback_options.offset = None;
+        fallback_options.limit = None;
+
+        let fallback_response = self
+            .request_store_index(prefix, depth, snapshot, &fallback_options)
+            .await?;
+        let mut projected = decode_store_index_response(fallback_response, &fallback_options)?;
+        project_store_index_children_response(&mut projected, prefix, options);
+        Ok(projected)
     }
 
     async fn request_store_index(

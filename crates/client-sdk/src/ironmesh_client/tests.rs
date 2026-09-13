@@ -91,7 +91,7 @@ fn store_index_children_view_uses_its_wire_value() {
 }
 
 #[tokio::test]
-async fn store_index_children_retries_the_tree_view_on_an_older_node() {
+async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
@@ -159,14 +159,39 @@ async fn store_index_children_retries_the_tree_view_on_an_older_node() {
     assert_eq!(response.entries.len(), 1);
     assert_eq!(response.entries[0].path, "docs/b.txt");
 
+    let cached_response = client
+        .store_index_with_options(
+            Some("docs"),
+            1,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                offset: Some(0),
+                limit: Some(1),
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect("a remembered older node should request its tree projection directly");
+
+    assert_eq!(cached_response.total_entry_count, 2);
+    assert_eq!(cached_response.offset, 0);
+    assert_eq!(cached_response.limit, Some(1));
+    assert!(cached_response.has_more);
+    assert_eq!(cached_response.entries.len(), 1);
+    assert_eq!(cached_response.entries[0].path, "docs/a.txt");
+
     let queries = queries.lock().await.clone();
-    assert_eq!(queries.len(), 2);
+    assert_eq!(queries.len(), 3);
     assert!(queries[0].contains("view=children"));
     assert!(queries[0].contains("offset=1"));
     assert!(queries[0].contains("limit=1"));
     assert!(queries[1].contains("view=tree"));
     assert!(!queries[1].contains("offset="));
     assert!(!queries[1].contains("limit="));
+    assert!(queries[2].contains("view=tree"));
+    assert!(!queries[2].contains("offset="));
+    assert!(!queries[2].contains("limit="));
 
     server.abort();
 }
