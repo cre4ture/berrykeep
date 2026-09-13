@@ -14,7 +14,6 @@ readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
 readonly LEGACY_SERVICE_ROOT="/Library/Application Support/Ironmesh"
 readonly LEGACY_DATA_DIR="${LEGACY_SERVICE_ROOT}/server-node"
 readonly LEGACY_CONFIG_PATH="${LEGACY_SERVICE_ROOT}/server-node.env"
-readonly LEGACY_LOG_DIR="/Library/Logs/Ironmesh"
 
 fail() {
   printf 'berrykeep-server-node installer: %s\n' "$*" >&2
@@ -69,12 +68,12 @@ if [[ "${3:-/}" != "/" ]]; then
   exit 0
 fi
 
-# Package payload files already establish the canonical root. Move only the
-# mutable paths that must survive an upgrade; never overwrite state created by
-# a prior canonical installation.
+# Package payload files already establish the canonical root. Move only data
+# and configuration that must survive an upgrade; never overwrite state
+# created by a prior canonical installation. Historical logs remain at their
+# original path for an administrator to archive or move explicitly.
 migrate_legacy_path_if_absent "${LEGACY_DATA_DIR}" "${DATA_DIR}"
 migrate_legacy_path_if_absent "${LEGACY_CONFIG_PATH}" "${CONFIG_PATH}"
-migrate_legacy_path_if_absent "${LEGACY_LOG_DIR}" "${LOG_DIR}"
 
 create_service_user
 

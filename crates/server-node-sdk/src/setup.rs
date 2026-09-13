@@ -2369,6 +2369,16 @@ fn issue_public_node_tls_material_from_ca(
             .try_into()
             .context("invalid BerryKeep cluster identity URI SAN")?,
     ));
+    subject_alt_names.push(SanType::URI(
+        format!("urn:ironmesh:node:{}", bootstrap.node_id)
+            .try_into()
+            .context("invalid legacy node identity URI SAN")?,
+    ));
+    subject_alt_names.push(SanType::URI(
+        format!("urn:ironmesh:cluster:{}", bootstrap.cluster_id)
+            .try_into()
+            .context("invalid legacy cluster identity URI SAN")?,
+    ));
     params.subject_alt_names = subject_alt_names;
     let key_pair = KeyPair::generate().context("failed generating public TLS keypair")?;
     let cert = params

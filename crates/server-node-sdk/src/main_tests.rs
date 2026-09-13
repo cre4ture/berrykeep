@@ -7870,6 +7870,8 @@ async fn enroll_client_device_issues_relay_identity_when_control_mtls_is_disable
         .expect("rendezvous client identity certificate DER should parse");
     let mut saw_device_uri = false;
     let mut saw_cluster_uri = false;
+    let mut saw_legacy_device_uri = false;
+    let mut saw_legacy_cluster_uri = false;
 
     for extension in parsed.extensions() {
         if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
@@ -7880,6 +7882,9 @@ async fn enroll_client_device_issues_relay_identity_when_control_mtls_is_disable
                     saw_device_uri |= *uri == format!("urn:berrykeep:device:{device_id}");
                     saw_cluster_uri |=
                         *uri == format!("urn:berrykeep:cluster:{}", state.cluster_id);
+                    saw_legacy_device_uri |= *uri == format!("urn:ironmesh:device:{device_id}");
+                    saw_legacy_cluster_uri |=
+                        *uri == format!("urn:ironmesh:cluster:{}", state.cluster_id);
                 }
             }
         }
@@ -7892,6 +7897,14 @@ async fn enroll_client_device_issues_relay_identity_when_control_mtls_is_disable
     assert!(
         saw_cluster_uri,
         "expected rendezvous client cluster identity SAN from server state"
+    );
+    assert!(
+        saw_legacy_device_uri,
+        "expected legacy rendezvous client device identity SAN during the compatibility window"
+    );
+    assert!(
+        saw_legacy_cluster_uri,
+        "expected legacy rendezvous client cluster identity SAN during the compatibility window"
     );
 
     cleanup_test_state(&state).await;
@@ -9598,6 +9611,8 @@ async fn internal_node_tls_material_uses_identity_only_sans() {
         .expect("issued internal certificate DER should parse");
     let mut saw_node_uri = false;
     let mut saw_cluster_uri = false;
+    let mut saw_legacy_node_uri = false;
+    let mut saw_legacy_cluster_uri = false;
 
     for extension in parsed.extensions() {
         if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
@@ -9609,6 +9624,10 @@ async fn internal_node_tls_material_uses_identity_only_sans() {
                         saw_node_uri |= *uri == format!("urn:berrykeep:node:{}", bootstrap.node_id);
                         saw_cluster_uri |=
                             *uri == format!("urn:berrykeep:cluster:{}", state.cluster_id);
+                        saw_legacy_node_uri |=
+                            *uri == format!("urn:ironmesh:node:{}", bootstrap.node_id);
+                        saw_legacy_cluster_uri |=
+                            *uri == format!("urn:ironmesh:cluster:{}", state.cluster_id);
                     }
                     x509_parser::extensions::GeneralName::DNSName(_)
                     | x509_parser::extensions::GeneralName::IPAddress(_) => {
@@ -9627,6 +9646,14 @@ async fn internal_node_tls_material_uses_identity_only_sans() {
     assert!(
         saw_cluster_uri,
         "expected internal certificate cluster identity SAN"
+    );
+    assert!(
+        saw_legacy_node_uri,
+        "expected legacy internal certificate node identity SAN during the compatibility window"
+    );
+    assert!(
+        saw_legacy_cluster_uri,
+        "expected legacy internal certificate cluster identity SAN during the compatibility window"
     );
 
     cleanup_test_state(&state).await;
@@ -9750,6 +9777,8 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
         .expect("issued public certificate DER should parse");
     let mut saw_node_uri = false;
     let mut saw_cluster_uri = false;
+    let mut saw_legacy_node_uri = false;
+    let mut saw_legacy_cluster_uri = false;
     let mut saw_public_dns_name = false;
 
     for extension in parsed.extensions() {
@@ -9763,6 +9792,10 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
                             *uri == format!("urn:berrykeep:node:{}", package.bootstrap.node_id);
                         saw_cluster_uri |=
                             *uri == format!("urn:berrykeep:cluster:{}", state.cluster_id);
+                        saw_legacy_node_uri |=
+                            *uri == format!("urn:ironmesh:node:{}", package.bootstrap.node_id);
+                        saw_legacy_cluster_uri |=
+                            *uri == format!("urn:ironmesh:cluster:{}", state.cluster_id);
                     }
                     x509_parser::extensions::GeneralName::DNSName(name) => {
                         saw_public_dns_name |= *name == "node-b.example";
@@ -9779,6 +9812,14 @@ async fn issue_node_enrollment_includes_internal_and_public_tls_material() {
     assert!(
         saw_cluster_uri,
         "public certificate should include cluster identity SAN"
+    );
+    assert!(
+        saw_legacy_node_uri,
+        "public certificate should include legacy node identity SAN during the compatibility window"
+    );
+    assert!(
+        saw_legacy_cluster_uri,
+        "public certificate should include legacy cluster identity SAN during the compatibility window"
     );
     assert!(
         saw_public_dns_name,

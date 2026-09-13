@@ -8,7 +8,6 @@ type HmacSha256 = Hmac<Sha256>;
 const RELIABILITY_TELEMETRY_STATE_FILE: &str = "telemetry/reliability-telemetry-state.json";
 const TELEMETRY_SCHEMA_VERSION: u32 = 1;
 const TELEMETRY_HMAC_DOMAIN: &[u8] = b"berrykeep-telemetry-v1";
-const LEGACY_TELEMETRY_HMAC_DOMAIN: &[u8] = b"ironmesh-telemetry-v1";
 
 /// Central collector ingest URL. Per doc Section 5.2 the production collector is hosted directly
 /// on the STRATO public IPv4 address at port 9444; the endpoint path matches
@@ -431,6 +430,11 @@ struct PersistedReliabilityTelemetryState {
     /// collector itself, as the `X-BerryKeep-Ingestion-Token` header on ingest requests.
     #[serde(default)]
     ingestion_token: Option<String>,
+    /// Subject for which `ingestion_token` was issued. Persisting the binding makes an
+    /// identifier-domain migration a one-time registration event instead of invalidating a
+    /// freshly issued token on every telemetry send.
+    #[serde(default)]
+    ingestion_token_subject_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -602,8 +606,13 @@ impl ReliabilityTelemetryRuntime {
 
     /// Persists a freshly issued ingestion token (doc Section 5.2/8), so subsequent sends can
     /// attach it without repeating the registration handshake.
-    pub(crate) async fn set_ingestion_token(&mut self, token: String) -> Result<()> {
+    pub(crate) async fn set_ingestion_token(
+        &mut self,
+        token: String,
+        subject_id: &str,
+    ) -> Result<()> {
         self.persisted.ingestion_token = Some(token);
+        self.persisted.ingestion_token_subject_id = Some(subject_id.to_string());
         self.persist().await
     }
 
@@ -620,14 +629,13 @@ impl ReliabilityTelemetryRuntime {
         let salt = self.ensure_salt().await?;
         let subject_id = compute_telemetry_subject_id(&salt, node_id);
         if self.persisted.ingestion_token.is_some()
-            && subject_id
-                != compute_telemetry_subject_id_for_domain(
-                    &salt,
-                    node_id,
-                    LEGACY_TELEMETRY_HMAC_DOMAIN,
-                )
+            && self.persisted.ingestion_token_subject_id.as_deref() != Some(subject_id.as_str())
         {
+            // State written before this binding existed may contain a token issued for the former
+            // telemetry subject domain. Clear it once so the next send registers the canonical
+            // subject. Newly persisted tokens carry their subject and remain valid on later calls.
             self.persisted.ingestion_token = None;
+            self.persisted.ingestion_token_subject_id = None;
             self.persist().await?;
         }
         Ok(subject_id)
@@ -691,6 +699,7 @@ impl ReliabilityTelemetryRuntime {
         self.persisted.local_random_salt_b64 = Some(BASE64_STANDARD.encode(&salt));
         self.persisted.last_sent_fingerprint = None;
         self.persisted.ingestion_token = None;
+        self.persisted.ingestion_token_subject_id = None;
         self.persist().await
     }
 
@@ -1137,7 +1146,10 @@ async fn send_reliability_telemetry_once(state: &ServerState) -> bool {
                 match register_for_ingestion_token(&register_url).await {
                     Ok(token) => {
                         let mut runtime = state.reliability_telemetry_runtime.lock().await;
-                        if let Err(err) = runtime.set_ingestion_token(token.clone()).await {
+                        if let Err(err) = runtime
+                            .set_ingestion_token(token.clone(), &payload.telemetry_subject_id)
+                            .await
+                        {
                             warn!(error = %err, "failed to persist newly issued ingestion token");
                         }
                         Some(token)
@@ -1845,7 +1857,7 @@ mod tests {
 
         let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
         runtime
-            .set_ingestion_token("some-token".to_string())
+            .set_ingestion_token("some-token".to_string(), "old-subject")
             .await
             .unwrap();
         assert_eq!(runtime.ingestion_token(), Some("some-token".to_string()));
@@ -1872,7 +1884,7 @@ mod tests {
         let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
         assert_eq!(runtime.ingestion_token(), None);
         runtime
-            .set_ingestion_token("persisted-token".to_string())
+            .set_ingestion_token("persisted-token".to_string(), "canonical-subject")
             .await
             .unwrap();
 
@@ -1880,6 +1892,43 @@ mod tests {
         assert_eq!(
             reloaded.ingestion_token(),
             Some("persisted-token".to_string())
+        );
+        assert_eq!(
+            reloaded.persisted.ingestion_token_subject_id.as_deref(),
+            Some("canonical-subject")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn unmarked_ingestion_token_is_cleared_once_before_canonical_registration() {
+        let tmp = std::env::temp_dir().join(format!(
+            "berrykeep-reliability-telemetry-token-migration-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let node_id = NodeId::from_u128(13);
+        let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
+        runtime.persisted.local_random_salt_b64 = Some(BASE64_STANDARD.encode("test-salt"));
+        runtime.persisted.ingestion_token = Some("legacy-token".to_string());
+
+        let subject_id = runtime.telemetry_subject_id(node_id).await.unwrap();
+        assert_eq!(runtime.ingestion_token(), None);
+
+        runtime
+            .set_ingestion_token("canonical-token".to_string(), &subject_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.telemetry_subject_id(node_id).await.unwrap(),
+            subject_id,
+            "the canonical token binding must survive later telemetry cycles"
+        );
+        assert_eq!(
+            runtime.ingestion_token(),
+            Some("canonical-token".to_string())
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;

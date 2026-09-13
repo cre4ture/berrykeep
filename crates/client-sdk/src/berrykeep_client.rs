@@ -6368,14 +6368,17 @@ impl BerryKeepClient {
                     let authority = required_transport_header(
                         &response_headers,
                         "x-berrykeep-web-service-authority",
+                        "x-ironmesh-web-service-authority",
                     )?;
                     let base_path = required_transport_header(
                         &response_headers,
                         "x-berrykeep-web-service-base-path",
+                        "x-ironmesh-web-service-base-path",
                     )?;
                     let upstream_scheme = required_transport_header(
                         &response_headers,
                         "x-berrykeep-web-service-scheme",
+                        "x-ironmesh-web-service-scheme",
                     )?;
                     if !matches!(upstream_scheme.as_str(), "http" | "https") {
                         bail!("node returned an invalid web service upstream scheme");
@@ -8652,13 +8655,21 @@ fn validate_web_service_id(service_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn required_transport_header(headers: &[TransportHeader], name: &str) -> Result<String> {
-    headers
-        .iter()
-        .find(|header| header.name.eq_ignore_ascii_case(name))
-        .map(|header| header.value.clone())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("web service proxy response omitted {name}"))
+fn required_transport_header(
+    headers: &[TransportHeader],
+    canonical_name: &str,
+    legacy_name: &str,
+) -> Result<String> {
+    [canonical_name, legacy_name]
+        .into_iter()
+        .find_map(|name| {
+            headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case(name))
+                .map(|header| header.value.clone())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| anyhow!("web service proxy response omitted {canonical_name}"))
 }
 
 async fn open_web_service_proxy_stream(

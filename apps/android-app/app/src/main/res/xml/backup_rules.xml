@@ -3,4 +3,6 @@
     <!-- Device identity metadata and pre-migration cleartext must never leave this device. -->
     <exclude domain="sharedpref" path="berrykeep_prefs.xml" />
     <exclude domain="sharedpref" path="berrykeep_share_capabilities.xml" />
+    <exclude domain="sharedpref" path="ironmesh_prefs.xml" />
+    <exclude domain="sharedpref" path="ironmesh_share_capabilities.xml" />
 </full-backup-content>

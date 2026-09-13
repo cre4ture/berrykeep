@@ -47,6 +47,40 @@ impl Drop for ConnectionDiagnosticsObserverReset {
 }
 
 #[test]
+fn web_service_proxy_response_headers_prefer_canonical_and_accept_legacy() {
+    let headers = vec![
+        TransportHeader {
+            name: "x-ironmesh-web-service-authority".to_string(),
+            value: "legacy.example".to_string(),
+        },
+        TransportHeader {
+            name: "x-berrykeep-web-service-authority".to_string(),
+            value: "canonical.example".to_string(),
+        },
+    ];
+
+    assert_eq!(
+        required_transport_header(
+            &headers,
+            "x-berrykeep-web-service-authority",
+            "x-ironmesh-web-service-authority",
+        )
+        .unwrap(),
+        "canonical.example"
+    );
+
+    assert_eq!(
+        required_transport_header(
+            &headers[..1],
+            "x-berrykeep-web-service-authority",
+            "x-ironmesh-web-service-authority",
+        )
+        .unwrap(),
+        "legacy.example"
+    );
+}
+
+#[test]
 fn direct_quic_route_identity_changes_on_relay_token_rotation_without_exposing_tokens() {
     let mut candidate = ConnectionCandidate {
         kind: CandidateKind::DirectQuic,

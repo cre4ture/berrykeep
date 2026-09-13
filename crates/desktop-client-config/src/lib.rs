@@ -837,7 +837,7 @@ pub fn migrate_legacy_state_paths() -> Result<()> {
             &current_state_dir,
         )?;
         migrate_legacy_state_directory(
-            &local_appdata_base_dir().join(LEGACY_WINDOWS_CONFIG_SUBDIR),
+            &legacy_local_appdata_root().join(LEGACY_WINDOWS_CONFIG_SUBDIR),
             &current_state_dir,
         )?;
     }

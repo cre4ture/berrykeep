@@ -2191,6 +2191,16 @@ fn issue_client_rendezvous_identity_pem(
                 .try_into()
                 .context("invalid rendezvous client cluster SAN URI")?,
         ),
+        SanType::URI(
+            format!("urn:ironmesh:device:{device_id}")
+                .try_into()
+                .context("invalid legacy rendezvous client device SAN URI")?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:cluster:{}", state.cluster_id)
+                .try_into()
+                .context("invalid legacy rendezvous client cluster SAN URI")?,
+        ),
     ];
 
     let key_pair = KeyPair::generate().context("failed generating rendezvous client key")?;
@@ -23689,6 +23699,16 @@ fn build_internal_node_subject_alt_names(
                 .try_into()
                 .context("invalid cluster identity URI SAN")?,
         ),
+        SanType::URI(
+            format!("urn:ironmesh:node:{}", bootstrap.node_id)
+                .try_into()
+                .context("invalid legacy node identity URI SAN")?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:cluster:{}", bootstrap.cluster_id)
+                .try_into()
+                .context("invalid legacy cluster identity URI SAN")?,
+        ),
     ])
 }
 
@@ -23829,6 +23849,16 @@ fn issue_internal_node_tls_material_for_identity(
                 .try_into()
                 .map_err(|_| StatusCode::BAD_REQUEST)?,
         ),
+        SanType::URI(
+            format!("urn:ironmesh:node:{node_id}")
+                .try_into()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:cluster:{cluster_id}")
+                .try_into()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        ),
     ];
 
     let key_pair = KeyPair::generate().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -23896,6 +23926,16 @@ fn issue_public_node_tls_material_with_subject_alt_names(
     ));
     subject_alt_names.push(SanType::URI(
         format!("urn:berrykeep:cluster:{}", state.cluster_id)
+            .try_into()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+    ));
+    subject_alt_names.push(SanType::URI(
+        format!("urn:ironmesh:node:{node_id}")
+            .try_into()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+    ));
+    subject_alt_names.push(SanType::URI(
+        format!("urn:ironmesh:cluster:{}", state.cluster_id)
             .try_into()
             .map_err(|_| StatusCode::BAD_REQUEST)?,
     ));
