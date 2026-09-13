@@ -49,4 +49,15 @@ for expected_path in \
     || fail "package payload is missing ${expected_path}"
 done
 
+# Mutable directories must be created after the installer has migrated legacy
+# state. Shipping either empty directory would make the migration incorrectly
+# preserve an empty canonical path and strand an upgraded installation's data.
+for unexpected_path in \
+  './Library/Application Support/BerryKeep/server-node' \
+  './Library/Logs/BerryKeep'; do
+  if printf '%s\n' "${payload_files}" | grep -Fqx "${unexpected_path}"; then
+    fail "package payload must not pre-create mutable directory ${unexpected_path}"
+  fi
+done
+
 printf 'macOS server-node package structure is valid\n'

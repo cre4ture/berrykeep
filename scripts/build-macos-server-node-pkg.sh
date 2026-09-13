@@ -205,9 +205,7 @@ main() {
   scripts_dir="${ROOT_DIR}/macos/server-node/pkg-scripts"
 
   install -d "${payload_dir}/Library/Application Support/BerryKeep/bin"
-  install -d "${payload_dir}/Library/Application Support/BerryKeep/server-node"
   install -d "${payload_dir}/Library/LaunchDaemons"
-  install -d "${payload_dir}/Library/Logs/BerryKeep"
   install -m 0755 "${binary_path}" \
     "${payload_dir}/Library/Application Support/BerryKeep/bin/berrykeep-server-node"
   ln -sf berrykeep-server-node \
