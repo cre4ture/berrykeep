@@ -897,7 +897,7 @@ fn checks_for_inspection(
                     target.mount_point.as_deref(),
                     expected_host_mount.map(PathBuf::as_path),
                 ) {
-                    (Some(actual), Some(expected)) => actual == expected,
+                    (Some(actual), Some(expected)) => actual.starts_with(expected),
                     _ => true,
                 };
                 let protecting_mount = (!target.path_resolution_failed
@@ -1563,6 +1563,29 @@ mod tests {
     }
 
     #[test]
+    fn namespace_bind_mount_can_use_its_host_ancestor_dependency() {
+        let target = MountProtectionTarget {
+            id: "systemd-mount-data-dir".to_string(),
+            feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+            path: PathBuf::from("/srv/berrykeep"),
+            mount_point: Some(PathBuf::from("/srv/berrykeep")),
+            mount_point_is_bind: true,
+            backing_mount_points: vec![PathBuf::from("/srv")],
+            path_resolution_failed: false,
+            missing_severity: HostDependencySeverity::Critical,
+        };
+        let checks = checks_for_inspection(
+            &[target],
+            dependencies_with_host_mount_points(
+                vec![systemd_mount("srv.mount", "/srv")],
+                &["/srv"],
+            ),
+        );
+
+        assert_eq!(checks[0].status, HostDependencyStatus::Ready);
+    }
+
+    #[test]
     fn mount_protection_paths_are_normalized_without_filesystem_access() {
         let path = normalized_mount_protection_path(Path::new("./data/server-node/../pool"));
 
@@ -1608,6 +1631,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn bind_mount_source_is_mapped_to_its_backing_mount() {
         let mount_points = mount_points_from_mountinfo(
             "36 25 8:1 / /mnt/data rw,nosuid,nodev - ext4 /dev/sda1 rw\n37 25 8:1 /berrykeep /srv/berrykeep rw,nosuid,nodev - ext4 /dev/sda1 rw\n",
@@ -1626,6 +1650,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn subvolume_mount_cannot_use_root_as_a_backing_dependency() {
         let mount_points = mount_points_from_mountinfo(
             "36 25 0:30 / / rw,nosuid,nodev - btrfs /dev/sda2 rw\n37 25 0:30 /data /mnt/data rw,nosuid,nodev - btrfs /dev/sda2 rw\n",
