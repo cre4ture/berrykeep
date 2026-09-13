@@ -769,23 +769,13 @@ async fn resolve_mount_protection_path(
         .kill_on_drop(true);
     let output = timeout(PATH_RESOLUTION_TIMEOUT, command.output()).await;
     match output {
-        Ok(Ok(output)) if output.status.success() => {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if path.is_empty() {
-                ResolvedMountProtectionPath {
-                    path: lexical_path,
-                    error: Some(format!(
-                        "`{}` returned an empty path",
-                        canonicalizer.display()
-                    )),
-                }
-            } else {
-                ResolvedMountProtectionPath {
-                    path: PathBuf::from(path),
-                    error: None,
-                }
-            }
-        }
+        Ok(Ok(output)) if output.status.success() => match readlink_output_path(&output.stdout) {
+            Ok(path) => ResolvedMountProtectionPath { path, error: None },
+            Err(reason) => ResolvedMountProtectionPath {
+                path: lexical_path,
+                error: Some(format!("`{}` {reason}", canonicalizer.display())),
+            },
+        },
         Ok(Ok(output)) => {
             let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
             ResolvedMountProtectionPath {
@@ -820,6 +810,16 @@ async fn resolve_mount_protection_path(
             )),
         },
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn readlink_output_path(output: &[u8]) -> Result<PathBuf, &'static str> {
+    let output = output.strip_suffix(b"\n").unwrap_or(output);
+    if output.is_empty() {
+        return Err("returned an empty path");
+    }
+    let path = std::str::from_utf8(output).map_err(|_| "returned a non-UTF-8 path")?;
+    Ok(PathBuf::from(path))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1860,6 +1860,22 @@ mod tests {
 
         assert!(path.is_absolute());
         assert!(path.ends_with("data/pool"));
+    }
+
+    #[test]
+    fn readlink_output_preserves_whitespace_in_path_components() {
+        let path = readlink_output_path(b"/mnt/ primary \n").unwrap();
+        assert_eq!(path, PathBuf::from("/mnt/ primary "));
+
+        let path = readlink_output_path(b"/mnt/data \n\n").unwrap();
+        assert_eq!(path, PathBuf::from("/mnt/data \n"));
+    }
+
+    #[test]
+    fn non_utf8_readlink_output_fails_closed() {
+        let error = readlink_output_path(b"/mnt/\xff\n").unwrap_err();
+
+        assert_eq!(error, "returned a non-UTF-8 path");
     }
 
     #[tokio::test]
