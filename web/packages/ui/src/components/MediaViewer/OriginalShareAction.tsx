@@ -60,10 +60,10 @@ type ScopedShareStatus = {
 
 declare global {
   interface Window {
-    IronmeshAndroidShare?: AndroidShareBridge;
+    BerryKeepAndroidShare?: AndroidShareBridge;
     webkit?: {
       messageHandlers?: {
-        IronmeshIosShare?: IosShareBridge;
+        BerryKeepIosShare?: IosShareBridge;
       };
     };
   }
@@ -284,8 +284,8 @@ function hasShareBridge(client: EmbeddedShareClient): boolean {
     return false;
   }
   return client === "android"
-    ? Boolean(window.IronmeshAndroidShare)
-    : Boolean(window.webkit?.messageHandlers?.IronmeshIosShare);
+    ? Boolean(window.BerryKeepAndroidShare)
+    : Boolean(window.webkit?.messageHandlers?.BerryKeepIosShare);
 }
 
 function sendShareRequest(
@@ -293,14 +293,14 @@ function sendShareRequest(
   payload: Record<string, unknown>
 ): Promise<unknown> {
   if (client === "ios") {
-    const bridge = window.webkit?.messageHandlers?.IronmeshIosShare;
+    const bridge = window.webkit?.messageHandlers?.BerryKeepIosShare;
     if (!bridge) {
       return Promise.reject(new Error("The iOS share bridge is unavailable in this WebView."));
     }
     return bridge.postMessage(payload);
   }
 
-  const bridge = window.IronmeshAndroidShare;
+  const bridge = window.BerryKeepAndroidShare;
   if (!bridge) {
     return Promise.reject(new Error("The Android share bridge is unavailable in this WebView."));
   }

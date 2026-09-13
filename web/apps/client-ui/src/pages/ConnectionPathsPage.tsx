@@ -19,8 +19,8 @@ import {
   type ClientConnectionRouteEndpointSnapshot,
   type ClientConnectionRouteSnapshot,
   type ClientRendezvousView
-} from "@ironmesh/api";
-import { PageHeader, StatCard } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { PageHeader, StatCard } from "@berrykeep/ui";
 import { useEffect, useMemo, useState } from "react";
 
 type ConnectionSummary = {

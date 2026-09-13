@@ -305,7 +305,7 @@ fn start_embedded_server(
 
     let thread_data_dir = data_dir.clone();
     let thread = thread::Builder::new()
-        .name("ironmesh-android-server-node".to_string())
+        .name("berrykeep-android-server-node".to_string())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -592,7 +592,7 @@ fn stop_node() {
 /// This function is intended to be called from Kotlin via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_servernode_android_RustServerNodeBridge_startNode(
+pub unsafe extern "system" fn Java_io_berrykeep_servernode_android_RustServerNodeBridge_startNode(
     mut env: JNIEnv,
     _class: JClass,
     data_dir_path: JString,
@@ -614,7 +614,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_servernode_android_RustServerNode
 /// This function is intended to be called from Kotlin via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_servernode_android_RustServerNodeBridge_stopNode(
+pub unsafe extern "system" fn Java_io_berrykeep_servernode_android_RustServerNodeBridge_stopNode(
     _env: JNIEnv,
     _class: JClass,
 ) {
@@ -625,7 +625,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_servernode_android_RustServerNode
 /// This function is intended to be called from Kotlin via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_servernode_android_RustServerNodeBridge_statusJson(
+pub unsafe extern "system" fn Java_io_berrykeep_servernode_android_RustServerNodeBridge_statusJson(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {

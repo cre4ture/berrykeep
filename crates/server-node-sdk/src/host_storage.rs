@@ -125,7 +125,7 @@ async fn prepare_directory_from_volumes(
         false => {
             fs::create_dir(&target_path).await.with_context(|| {
                 format!(
-                    "failed creating storage directory {} as the IronMesh service account",
+                    "failed creating storage directory {} as the BerryKeep service account",
                     target_path.display()
                 )
             })?;
@@ -193,7 +193,7 @@ async fn verify_target_is_within_mount(mount_path: &Path, target_path: &Path) ->
 }
 
 async fn write_probe(target_path: &Path) -> Result<()> {
-    let probe_path = target_path.join(format!(".ironmesh-write-check-{}.tmp", Uuid::new_v4()));
+    let probe_path = target_path.join(format!(".berrykeep-write-check-{}.tmp", Uuid::new_v4()));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -201,11 +201,11 @@ async fn write_probe(target_path: &Path) -> Result<()> {
         .await
         .with_context(|| {
             format!(
-                "the IronMesh service account cannot create a write-check file in {}",
+                "the BerryKeep service account cannot create a write-check file in {}",
                 target_path.display()
             )
         })?;
-    file.write_all(b"ironmesh storage preflight\n")
+    file.write_all(b"berrykeep storage preflight\n")
         .await
         .with_context(|| {
             format!(
@@ -251,11 +251,11 @@ mod tests {
 
     #[tokio::test]
     async fn prepares_a_safe_child_directory_and_checks_writes() {
-        let root = std::env::temp_dir().join(format!("ironmesh-host-storage-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("berrykeep-host-storage-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&root).await.unwrap();
         let request = PrepareHostStorageDirectoryRequest {
             mount_path: root.display().to_string(),
-            directory_name: "ironmesh-data".to_string(),
+            directory_name: "berrykeep-data".to_string(),
         };
 
         let response = prepare_directory_from_volumes(&[test_volume(&root)], &request)
@@ -265,7 +265,7 @@ mod tests {
         assert!(response.directory_created);
         assert_eq!(
             response.path,
-            root.join("ironmesh-data").display().to_string()
+            root.join("berrykeep-data").display().to_string()
         );
         assert!(
             tokio::fs::try_exists(PathBuf::from(&response.path))
@@ -277,11 +277,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_a_path_that_is_not_a_reported_mount() {
-        let root = std::env::temp_dir().join(format!("ironmesh-host-storage-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("berrykeep-host-storage-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&root).await.unwrap();
         let request = PrepareHostStorageDirectoryRequest {
             mount_path: root.join("other").display().to_string(),
-            directory_name: "ironmesh-data".to_string(),
+            directory_name: "berrykeep-data".to_string(),
         };
 
         let error = prepare_directory_from_volumes(&[test_volume(&root)], &request)
@@ -294,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_a_directory_name_that_could_escape_the_mount() {
-        let root = std::env::temp_dir().join(format!("ironmesh-host-storage-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("berrykeep-host-storage-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&root).await.unwrap();
         let request = PrepareHostStorageDirectoryRequest {
             mount_path: root.display().to_string(),

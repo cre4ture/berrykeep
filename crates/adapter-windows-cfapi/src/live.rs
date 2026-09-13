@@ -7,9 +7,9 @@ use crate::runtime::{
     UploadReceipt, Uploader,
 };
 use anyhow::{Context, Result, anyhow};
-use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest, ObjectLookup};
+use client_sdk::berrykeep_client::{DownloadProgress, DownloadRangeRequest, ObjectLookup};
 use client_sdk::{
-    ClientIdentityMaterial, IronMeshClient, build_http_client_from_pem,
+    BerryKeepClient, ClientIdentityMaterial, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, normalize_server_base_url,
 };
 use common::range_chunk_cache::{RANGE_CHUNK_CACHE_CHUNK_SIZE_BYTES, RangeChunkCache};
@@ -46,13 +46,13 @@ struct CachedRangeChunk {
 
 #[derive(Clone)]
 pub struct ServerNodeHydrator {
-    sdk: IronMeshClient,
+    sdk: BerryKeepClient,
     download_stage_root: PathBuf,
     range_chunk_cache: Arc<Mutex<RangeChunkCache<RangeChunkCacheKey, CachedRangeChunk>>>,
 }
 
 impl ServerNodeHydrator {
-    pub fn with_client(sdk: IronMeshClient, download_stage_root: PathBuf) -> Self {
+    pub fn with_client(sdk: BerryKeepClient, download_stage_root: PathBuf) -> Self {
         Self {
             sdk,
             download_stage_root,
@@ -425,11 +425,11 @@ pub fn normalize_base_url(input: &str) -> Result<Url> {
     normalize_server_base_url(input)
 }
 
-const WINDOWS_LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
+const WINDOWS_LOCAL_STATE_ROOT_DIR: &str = "BerryKeep";
 const WINDOWS_DOWNLOAD_STAGE_SUBDIR: &str = "cfapi-downloads";
 
 pub fn windows_download_stage_root(scope: &str) -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
+    let base = common::legacy_compatibility::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -524,11 +524,11 @@ mod tests {
     }
 
     #[test]
-    fn windows_download_stage_root_uses_ironmesh_localappdata_root() {
+    fn windows_download_stage_root_uses_berrykeep_localappdata_root() {
         let base = PathBuf::from("C:/Users/Example/AppData/Local");
         assert_eq!(
             windows_download_stage_base_root(base.clone()),
-            base.join("Ironmesh").join("cfapi-downloads")
+            base.join("BerryKeep").join("cfapi-downloads")
         );
     }
 
@@ -561,10 +561,10 @@ mod tests {
     #[test]
     fn windows_delete_request_uses_object_id_and_revision_precondition() {
         let (base_url, server, request_rx) = capture_single_http_request();
-        let client = IronMeshClient::from_direct_base_url(base_url);
+        let client = BerryKeepClient::from_direct_base_url(base_url);
         let hydrator = ServerNodeHydrator::with_client(
             client,
-            std::env::temp_dir().join(format!("ironmesh-delete-request-{}", uuid::Uuid::new_v4())),
+            std::env::temp_dir().join(format!("berrykeep-delete-request-{}", uuid::Uuid::new_v4())),
         );
 
         Uploader::delete_object(&hydrator, "obj-stale", "revision-7")
@@ -594,8 +594,8 @@ mod tests {
         .into_bytes();
         let (base_url, server, request_rx) = capture_single_http_request_with_response(response);
         let hydrator = ServerNodeHydrator::with_client(
-            IronMeshClient::from_direct_base_url(base_url),
-            std::env::temp_dir().join(format!("ironmesh-rename-request-{}", uuid::Uuid::new_v4())),
+            BerryKeepClient::from_direct_base_url(base_url),
+            std::env::temp_dir().join(format!("berrykeep-rename-request-{}", uuid::Uuid::new_v4())),
         );
 
         let receipt =
@@ -631,8 +631,8 @@ mod tests {
         .into_bytes();
         let (base_url, server, request_rx) = capture_single_http_request_with_response(response);
         let hydrator = ServerNodeHydrator::with_client(
-            IronMeshClient::from_direct_base_url(base_url),
-            std::env::temp_dir().join(format!("ironmesh-upload-request-{}", uuid::Uuid::new_v4())),
+            BerryKeepClient::from_direct_base_url(base_url),
+            std::env::temp_dir().join(format!("berrykeep-upload-request-{}", uuid::Uuid::new_v4())),
         );
         let payload = b"new content";
         let mut reader = std::io::Cursor::new(payload);
@@ -664,8 +664,11 @@ mod tests {
             b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         );
         let hydrator = ServerNodeHydrator::with_client(
-            IronMeshClient::from_direct_base_url(base_url),
-            std::env::temp_dir().join(format!("ironmesh-upload-conflict-{}", uuid::Uuid::new_v4())),
+            BerryKeepClient::from_direct_base_url(base_url),
+            std::env::temp_dir().join(format!(
+                "berrykeep-upload-conflict-{}",
+                uuid::Uuid::new_v4()
+            )),
         );
         let payload = b"local content";
         let mut reader = std::io::Cursor::new(payload);

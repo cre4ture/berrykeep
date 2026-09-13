@@ -5,17 +5,17 @@ following packages replace their previous names:
 
 | New primary package | Transitional package |
 | --- | --- |
-| `berrykeep-client` | `ironmesh-client` |
-| `berrykeep-server-node` | `ironmesh-server-node` |
-| `berrykeep-server-node-map-tools` | `ironmesh-server-node-map-tools` |
-| `berrykeep-rendezvous-service` | `ironmesh-rendezvous-service` |
+| `berrykeep-client` | `berrykeep-client` |
+| `berrykeep-server-node` | `berrykeep-server-node` |
+| `berrykeep-server-node-map-tools` | `berrykeep-server-node-map-tools` |
+| `berrykeep-rendezvous-service` | `berrykeep-rendezvous-service` |
 
 For an existing installation, run the usual `apt update` and `apt upgrade`.
 The transitional package pulls in a compatible `berrykeep-*` replacement, and
 the legacy service, configuration path, and executable command continue to work.
 Its dependency uses the upstream version rather than an architecture-specific
 Debian revision, so independently rebuilt suite packages remain upgradeable.
-The replacement packages also provide `ironmesh-*` executable symlinks during
+The replacement packages also provide `berrykeep-*` executable symlinks during
 the transition window.
 
 New installations should install a `berrykeep-*` package and configure its
@@ -27,8 +27,8 @@ paths. Starting a new `berrykeep-server-node.service` or
 the two identities cannot run simultaneously during that migration.
 
 The client package installs its executable payload under
-`/usr/lib/berrykeep-client`; the public `berrykeep` and legacy `ironmesh`
+`/usr/lib/berrykeep-client`; the public `berrykeep` and legacy `berrykeep`
 commands remain available in `/usr/bin` during the transition.
-`/usr/lib/ironmesh-client` remains a compatibility directory containing aliases
+`/usr/lib/berrykeep-client` remains a compatibility directory containing aliases
 to the new payload and extension assets, so an already-running legacy config
 app can complete its package-upgrade handoff.

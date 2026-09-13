@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+common = { path = "../../crates/common" }
 git-version.workspace = true
 server-node-sdk = { path = "../../crates/server-node-sdk" }
 tokio.workspace = true

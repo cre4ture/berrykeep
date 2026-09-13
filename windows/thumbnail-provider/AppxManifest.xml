@@ -48,8 +48,8 @@
           Executable="berrykeep-config-app.exe"
           EntryPoint="Windows.FullTrustApplication">
           <uap3:AppExecutionAlias>
-            <desktop:ExecutionAlias Alias="berrykeep-config-app.exe" />
             <desktop:ExecutionAlias Alias="ironmesh-config-app.exe" />
+            <desktop:ExecutionAlias Alias="berrykeep-config-app.exe" />
           </uap3:AppExecutionAlias>
         </uap3:Extension>
         <desktop:Extension
@@ -80,8 +80,8 @@
           Executable="berrykeep-background-launcher.exe"
           EntryPoint="Windows.FullTrustApplication">
           <uap3:AppExecutionAlias>
-            <desktop:ExecutionAlias Alias="berrykeep-background-launcher.exe" />
             <desktop:ExecutionAlias Alias="ironmesh-background-launcher.exe" />
+            <desktop:ExecutionAlias Alias="berrykeep-background-launcher.exe" />
           </uap3:AppExecutionAlias>
         </uap3:Extension>
       </Extensions>
@@ -103,8 +103,8 @@
           Executable="berrykeep-os-integration.exe"
           EntryPoint="Windows.FullTrustApplication">
           <uap3:AppExecutionAlias>
-            <desktop:ExecutionAlias Alias="berrykeep-os-integration.exe" />
             <desktop:ExecutionAlias Alias="ironmesh-os-integration.exe" />
+            <desktop:ExecutionAlias Alias="berrykeep-os-integration.exe" />
           </uap3:AppExecutionAlias>
         </uap3:Extension>
         <com:Extension Category="windows.comServer">
@@ -173,8 +173,8 @@
           Executable="berrykeep-folder-agent.exe"
           EntryPoint="Windows.FullTrustApplication">
           <uap3:AppExecutionAlias>
-            <desktop:ExecutionAlias Alias="berrykeep-folder-agent.exe" />
             <desktop:ExecutionAlias Alias="ironmesh-folder-agent.exe" />
+            <desktop:ExecutionAlias Alias="berrykeep-folder-agent.exe" />
           </uap3:AppExecutionAlias>
         </uap3:Extension>
       </Extensions>
@@ -196,8 +196,8 @@
           Executable="berrykeep.exe"
           EntryPoint="Windows.FullTrustApplication">
           <uap3:AppExecutionAlias>
-            <desktop:ExecutionAlias Alias="berrykeep.exe" />
             <desktop:ExecutionAlias Alias="ironmesh.exe" />
+            <desktop:ExecutionAlias Alias="berrykeep.exe" />
           </uap3:AppExecutionAlias>
         </uap3:Extension>
       </Extensions>

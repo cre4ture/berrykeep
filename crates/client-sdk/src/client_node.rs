@@ -6,8 +6,8 @@ use bytes::Bytes;
 use common::{CacheEntry, StorageObjectMeta};
 use tokio::sync::RwLock;
 
-use crate::ironmesh_client::{
-    IronMeshClient, ObjectHeadInfo, SnapshotRestoreResponse, StoreIndexResponse, StoreIndexView,
+use crate::berrykeep_client::{
+    BerryKeepClient, ObjectHeadInfo, SnapshotRestoreResponse, StoreIndexResponse, StoreIndexView,
     UploadResult, VersionGraphSummary,
 };
 
@@ -122,26 +122,26 @@ impl ClientContentCache {
 
 #[derive(Clone)]
 pub struct ClientNode {
-    client: IronMeshClient,
+    client: BerryKeepClient,
     cache: Arc<RwLock<ClientContentCache>>,
 }
 
 impl ClientNode {
     pub fn from_direct_base_url(server_base_url: impl Into<String>) -> Self {
-        Self::with_client(IronMeshClient::from_direct_base_url(server_base_url))
+        Self::with_client(BerryKeepClient::from_direct_base_url(server_base_url))
     }
 
     pub fn from_direct_http_client(
         server_base_url: impl Into<String>,
         http: reqwest::Client,
     ) -> Self {
-        Self::with_client(IronMeshClient::from_direct_http_client(
+        Self::with_client(BerryKeepClient::from_direct_http_client(
             server_base_url,
             http,
         ))
     }
 
-    pub fn with_client(client: IronMeshClient) -> Self {
+    pub fn with_client(client: BerryKeepClient) -> Self {
         Self {
             client,
             cache: Arc::new(RwLock::new(ClientContentCache::unbounded())),
@@ -151,7 +151,7 @@ impl ClientNode {
     /// Creates a client node with a byte-weighted LRU content cache. Payloads
     /// larger than `max_entry_bytes` are served but never retained.
     pub fn with_client_cache_limits(
-        client: IronMeshClient,
+        client: BerryKeepClient,
         capacity_bytes: usize,
         max_entry_bytes: usize,
         capacity_entries: usize,
@@ -510,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn content_cache_evicts_by_recency_and_rejects_oversized_entries() {
         let node = ClientNode::with_client_cache_limits(
-            IronMeshClient::from_direct_base_url("http://127.0.0.1:1"),
+            BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
             6,
             4,
             2,
@@ -534,7 +534,7 @@ mod tests {
     #[tokio::test]
     async fn cached_hit_does_not_wait_for_exclusive_lru_access() {
         let node = ClientNode::with_client_cache_limits(
-            IronMeshClient::from_direct_base_url("http://127.0.0.1:1"),
+            BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
             16,
             16,
             2,

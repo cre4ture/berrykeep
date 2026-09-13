@@ -7,12 +7,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 const RELIABILITY_TELEMETRY_STATE_FILE: &str = "telemetry/reliability-telemetry-state.json";
 const TELEMETRY_SCHEMA_VERSION: u32 = 1;
-const TELEMETRY_HMAC_DOMAIN: &[u8] = b"ironmesh-telemetry-v1";
+const TELEMETRY_HMAC_DOMAIN: &[u8] = b"berrykeep-telemetry-v1";
 
 /// Central collector ingest URL. Per doc Section 5.2 the production collector is hosted directly
 /// on the STRATO public IPv4 address at port 9444; the endpoint path matches
 /// `stats-collector-server`'s ingest route.
-/// Overridable via `IRONMESH_RELIABILITY_TELEMETRY_COLLECTOR_URL` (chiefly so tests can point the
+/// Overridable via `BERRYKEEP_RELIABILITY_TELEMETRY_COLLECTOR_URL` (chiefly so tests can point the
 /// sender at a local listener).
 const DEFAULT_COLLECTOR_URL: &str = "https://217.160.159.105:9444/v1/ingest/hardware-reliability";
 /// Path suffix of the ingest URL, stripped off to derive the registration endpoint's base URL
@@ -21,7 +21,7 @@ const INGEST_URL_PATH_SUFFIX: &str = "/v1/ingest/hardware-reliability";
 /// Ingestion token header (doc Section 5.2/8), matching `stats-collector-server`'s
 /// `INGESTION_TOKEN_HEADER` constant exactly. Sent only when this node has successfully completed
 /// the registration handshake; omitted otherwise (see `send_reliability_telemetry_once`).
-const INGESTION_TOKEN_HEADER: &str = "x-ironmesh-ingestion-token";
+const INGESTION_TOKEN_HEADER: &str = "x-berrykeep-ingestion-token";
 /// Default send cadence: rare batching (doc Section 6), well inside the recommended 6-24h band.
 const DEFAULT_SEND_INTERVAL_SECS: u64 = 12 * 60 * 60;
 const SEND_INTERVAL_MIN_SECS: u64 = 6 * 60 * 60;
@@ -48,7 +48,7 @@ pub(crate) struct ReliabilityTelemetryPayload {
     schema_version: u32,
     telemetry_subject_id: String,
     generated_at_unix: u64,
-    ironmesh_version: String,
+    berrykeep_version: String,
     hardware_profile_id: String,
     // `country_code` is intentionally not a field here: per doc Section 4.2 it is derived
     // server-side (central collector) from the TCP source IP of the ingest request, and is
@@ -286,7 +286,7 @@ pub(crate) fn build_reliability_telemetry_payload(
         schema_version: TELEMETRY_SCHEMA_VERSION,
         telemetry_subject_id,
         generated_at_unix,
-        ironmesh_version: report.ironmesh_version.clone(),
+        berrykeep_version: report.berrykeep_version.clone(),
         hardware_profile_id: report.hardware_profile_id.clone(),
         node_lifecycle: TelemetryNodeLifecycle {
             uptime_seconds: report.node_lifecycle.uptime_seconds,
@@ -307,9 +307,17 @@ pub(crate) fn build_reliability_telemetry_payload(
 }
 
 fn compute_telemetry_subject_id(local_random_salt: &[u8], node_id: NodeId) -> String {
+    compute_telemetry_subject_id_for_domain(local_random_salt, node_id, TELEMETRY_HMAC_DOMAIN)
+}
+
+fn compute_telemetry_subject_id_for_domain(
+    local_random_salt: &[u8],
+    node_id: NodeId,
+    domain: &[u8],
+) -> String {
     let mut mac =
         HmacSha256::new_from_slice(local_random_salt).expect("HMAC accepts arbitrary key sizes");
-    mac.update(TELEMETRY_HMAC_DOMAIN);
+    mac.update(domain);
     mac.update(node_id.as_bytes());
     hex_encode(&mac.finalize().into_bytes())
 }
@@ -323,13 +331,13 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// env var opt-out toggle, in the exact style already used for
-/// `IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED` and specified verbatim in doc Section 3.1. This does
+/// `BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED` and specified verbatim in doc Section 3.1. This does
 /// not reuse the crate's `env_flag_or` helper: that helper treats any non-truthy value
 /// (including unset) as `false`-leaning, whereas this toggle must default to *enabled* unless
 /// explicitly disabled with `"0"`/`"false"`/`"no"` - a different (inverted-default) semantic.
 fn reliability_telemetry_env_enabled() -> bool {
     parse_reliability_telemetry_env_flag(
-        std::env::var("IRONMESH_RELIABILITY_TELEMETRY_ENABLED").ok(),
+        common::legacy_compatibility::var("BERRYKEEP_RELIABILITY_TELEMETRY_ENABLED").ok(),
     )
 }
 
@@ -344,7 +352,7 @@ fn parse_reliability_telemetry_env_flag(value: Option<String>) -> bool {
 
 /// Central collector ingest URL, from env or the built-in default.
 fn collector_url() -> String {
-    std::env::var("IRONMESH_RELIABILITY_TELEMETRY_COLLECTOR_URL")
+    common::legacy_compatibility::var("BERRYKEEP_RELIABILITY_TELEMETRY_COLLECTOR_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -355,7 +363,7 @@ fn collector_url() -> String {
 /// replacing the known `/v1/ingest/hardware-reliability` suffix with
 /// `/v1/register/{telemetry_subject_id}`. Kept derived from the ingest URL - rather than a second,
 /// independently configurable env var - so tests (and deployments) that override
-/// `IRONMESH_RELIABILITY_TELEMETRY_COLLECTOR_URL` to point at a local/alternate listener
+/// `BERRYKEEP_RELIABILITY_TELEMETRY_COLLECTOR_URL` to point at a local/alternate listener
 /// automatically get a matching registration URL on the same origin, without a second setting to
 /// keep in sync.
 fn registration_url(ingest_url: &str, telemetry_subject_id: &str) -> String {
@@ -371,7 +379,7 @@ fn registration_url(ingest_url: &str, telemetry_subject_id: &str) -> String {
 
 /// Effective send interval, clamped into the doc Section 6 recommended 6-24h band.
 fn send_interval_secs() -> u64 {
-    std::env::var("IRONMESH_RELIABILITY_TELEMETRY_SEND_INTERVAL_SECS")
+    common::legacy_compatibility::var("BERRYKEEP_RELIABILITY_TELEMETRY_SEND_INTERVAL_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(|value| value.clamp(SEND_INTERVAL_MIN_SECS, SEND_INTERVAL_MAX_SECS))
@@ -419,9 +427,14 @@ struct PersistedReliabilityTelemetryState {
     /// issued. `None` until registration has succeeded at least once; cleared on
     /// [`ReliabilityTelemetryRuntime::rotate_identity`] since a rotated salt yields a new subject
     /// id the old token was never scoped to. Never transmitted anywhere except back to the
-    /// collector itself, as the `X-Ironmesh-Ingestion-Token` header on ingest requests.
+    /// collector itself, as the `X-BerryKeep-Ingestion-Token` header on ingest requests.
     #[serde(default)]
     ingestion_token: Option<String>,
+    /// Subject for which `ingestion_token` was issued. Persisting the binding makes an
+    /// identifier-domain migration a one-time registration event instead of invalidating a
+    /// freshly issued token on every telemetry send.
+    #[serde(default)]
+    ingestion_token_subject_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -593,8 +606,13 @@ impl ReliabilityTelemetryRuntime {
 
     /// Persists a freshly issued ingestion token (doc Section 5.2/8), so subsequent sends can
     /// attach it without repeating the registration handshake.
-    pub(crate) async fn set_ingestion_token(&mut self, token: String) -> Result<()> {
+    pub(crate) async fn set_ingestion_token(
+        &mut self,
+        token: String,
+        subject_id: &str,
+    ) -> Result<()> {
         self.persisted.ingestion_token = Some(token);
+        self.persisted.ingestion_token_subject_id = Some(subject_id.to_string());
         self.persist().await
     }
 
@@ -609,7 +627,18 @@ impl ReliabilityTelemetryRuntime {
     /// local random salt on first use if one does not exist yet.
     pub(crate) async fn telemetry_subject_id(&mut self, node_id: NodeId) -> Result<String> {
         let salt = self.ensure_salt().await?;
-        Ok(compute_telemetry_subject_id(&salt, node_id))
+        let subject_id = compute_telemetry_subject_id(&salt, node_id);
+        if self.persisted.ingestion_token.is_some()
+            && self.persisted.ingestion_token_subject_id.as_deref() != Some(subject_id.as_str())
+        {
+            // State written before this binding existed may contain a token issued for the former
+            // telemetry subject domain. Clear it once so the next send registers the canonical
+            // subject. Newly persisted tokens carry their subject and remain valid on later calls.
+            self.persisted.ingestion_token = None;
+            self.persisted.ingestion_token_subject_id = None;
+            self.persist().await?;
+        }
+        Ok(subject_id)
     }
 
     async fn ensure_salt(&mut self) -> Result<Vec<u8>> {
@@ -670,6 +699,7 @@ impl ReliabilityTelemetryRuntime {
         self.persisted.local_random_salt_b64 = Some(BASE64_STANDARD.encode(&salt));
         self.persisted.last_sent_fingerprint = None;
         self.persisted.ingestion_token = None;
+        self.persisted.ingestion_token_subject_id = None;
         self.persist().await
     }
 
@@ -1116,7 +1146,10 @@ async fn send_reliability_telemetry_once(state: &ServerState) -> bool {
                 match register_for_ingestion_token(&register_url).await {
                     Ok(token) => {
                         let mut runtime = state.reliability_telemetry_runtime.lock().await;
-                        if let Err(err) = runtime.set_ingestion_token(token.clone()).await {
+                        if let Err(err) = runtime
+                            .set_ingestion_token(token.clone(), &payload.telemetry_subject_id)
+                            .await
+                        {
                             warn!(error = %err, "failed to persist newly issued ingestion token");
                         }
                         Some(token)
@@ -1166,7 +1199,7 @@ async fn send_reliability_telemetry_once(state: &ServerState) -> bool {
 /// queue). The whole batch is dropped after the last attempt fails; the next timer tick will build
 /// a fresh batch from current state rather than replaying a stale one.
 ///
-/// `ingestion_token`, if present, is attached as the `X-Ironmesh-Ingestion-Token` header (doc
+/// `ingestion_token`, if present, is attached as the `X-BerryKeep-Ingestion-Token` header (doc
 /// Section 5.2/8) - never as part of the JSON body, so it cannot end up embedded in any stored
 /// payload on the collector side. `None` simply omits the header; the collector's tolerant policy
 /// still accepts the request either way (see `stats-collector-server`'s ingest handler).
@@ -1292,7 +1325,7 @@ mod tests {
     #[tokio::test]
     async fn persisted_state_round_trips_through_load_and_save() {
         let tmp = std::env::temp_dir().join(format!(
-            "ironmesh-reliability-telemetry-test-{}",
+            "berrykeep-reliability-telemetry-test-{}",
             Uuid::new_v4()
         ));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
@@ -1319,7 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_identity_changes_the_subject_id_and_is_not_derivable_from_the_old_salt() {
         let tmp = std::env::temp_dir().join(format!(
-            "ironmesh-reliability-telemetry-rotate-test-{}",
+            "berrykeep-reliability-telemetry-rotate-test-{}",
             Uuid::new_v4()
         ));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
@@ -1372,7 +1405,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_identity_clears_the_dedup_fingerprint_so_the_next_send_is_not_skipped() {
         let tmp = std::env::temp_dir().join(format!(
-            "ironmesh-reliability-telemetry-rotate-fingerprint-test-{}",
+            "berrykeep-reliability-telemetry-rotate-fingerprint-test-{}",
             Uuid::new_v4()
         ));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
@@ -1579,7 +1612,7 @@ mod tests {
     #[tokio::test]
     async fn record_hardware_health_sample_accumulates_across_calls_and_persists() {
         let tmp = std::env::temp_dir().join(format!(
-            "ironmesh-reliability-telemetry-accum-test-{}",
+            "berrykeep-reliability-telemetry-accum-test-{}",
             Uuid::new_v4()
         ));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
@@ -1624,7 +1657,7 @@ mod tests {
     #[tokio::test]
     async fn record_send_success_resets_the_temperature_accumulation_window() {
         let tmp = std::env::temp_dir().join(format!(
-            "ironmesh-reliability-telemetry-reset-test-{}",
+            "berrykeep-reliability-telemetry-reset-test-{}",
             Uuid::new_v4()
         ));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
@@ -1817,14 +1850,14 @@ mod tests {
     #[tokio::test]
     async fn rotate_identity_clears_the_persisted_ingestion_token() {
         let tmp = std::env::temp_dir().join(format!(
-            "ironmesh-reliability-telemetry-rotate-token-test-{}",
+            "berrykeep-reliability-telemetry-rotate-token-test-{}",
             Uuid::new_v4()
         ));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
         runtime
-            .set_ingestion_token("some-token".to_string())
+            .set_ingestion_token("some-token".to_string(), "old-subject")
             .await
             .unwrap();
         assert_eq!(runtime.ingestion_token(), Some("some-token".to_string()));
@@ -1843,7 +1876,7 @@ mod tests {
     #[tokio::test]
     async fn ingestion_token_round_trips_through_load_and_save() {
         let tmp = std::env::temp_dir().join(format!(
-            "ironmesh-reliability-telemetry-token-persist-test-{}",
+            "berrykeep-reliability-telemetry-token-persist-test-{}",
             Uuid::new_v4()
         ));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
@@ -1851,7 +1884,7 @@ mod tests {
         let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
         assert_eq!(runtime.ingestion_token(), None);
         runtime
-            .set_ingestion_token("persisted-token".to_string())
+            .set_ingestion_token("persisted-token".to_string(), "canonical-subject")
             .await
             .unwrap();
 
@@ -1859,6 +1892,43 @@ mod tests {
         assert_eq!(
             reloaded.ingestion_token(),
             Some("persisted-token".to_string())
+        );
+        assert_eq!(
+            reloaded.persisted.ingestion_token_subject_id.as_deref(),
+            Some("canonical-subject")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn unmarked_ingestion_token_is_cleared_once_before_canonical_registration() {
+        let tmp = std::env::temp_dir().join(format!(
+            "berrykeep-reliability-telemetry-token-migration-test-{}",
+            Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let node_id = NodeId::from_u128(13);
+        let mut runtime = ReliabilityTelemetryRuntime::load(&tmp);
+        runtime.persisted.local_random_salt_b64 = Some(BASE64_STANDARD.encode("test-salt"));
+        runtime.persisted.ingestion_token = Some("legacy-token".to_string());
+
+        let subject_id = runtime.telemetry_subject_id(node_id).await.unwrap();
+        assert_eq!(runtime.ingestion_token(), None);
+
+        runtime
+            .set_ingestion_token("canonical-token".to_string(), &subject_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.telemetry_subject_id(node_id).await.unwrap(),
+            subject_id,
+            "the canonical token binding must survive later telemetry cycles"
+        );
+        assert_eq!(
+            runtime.ingestion_token(),
+            Some("canonical-token".to_string())
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;

@@ -130,7 +130,7 @@ final class AppleCoreTests: XCTestCase {
 
     func testNodePriorityOverrideRoundTripsInsideConnectionBootstrap() throws {
         let nodeID = "018f1f74-7b65-7c09-9d13-3a6644d0d999"
-        var draft = IronmeshConnectionDraft(
+        var draft = BerryKeepConnectionDraft(
             bootstrapInput: #"{"version":1,"cluster_id":"018f1f74-7b65-7c09-9d13-3a6644d0d111"}"#
         )
 
@@ -143,7 +143,7 @@ final class AppleCoreTests: XCTestCase {
     }
 
     func testNodePriorityOverrideRejectsOutOfRangeValue() {
-        var draft = IronmeshConnectionDraft(bootstrapInput: #"{"version":1}"#)
+        var draft = BerryKeepConnectionDraft(bootstrapInput: #"{"version":1}"#)
 
         XCTAssertThrowsError(
             try draft.setNodePriorityOverride(

@@ -10,16 +10,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::ClientIdentityMaterial;
 
-pub const HEADER_CLUSTER_ID: &str = "x-ironmesh-cluster-id";
-pub const HEADER_DEVICE_ID: &str = "x-ironmesh-device-id";
-pub const HEADER_CONNECTION_NAME: &str = "x-ironmesh-connection-name";
-pub const HEADER_OPERATION_ID: &str = "x-ironmesh-operation-id";
-pub const HEADER_CREDENTIAL_FINGERPRINT: &str = "x-ironmesh-credential-fingerprint";
-pub const HEADER_AUTH_TIMESTAMP: &str = "x-ironmesh-auth-timestamp";
-pub const HEADER_AUTH_NONCE: &str = "x-ironmesh-auth-nonce";
-pub const HEADER_AUTH_SIGNATURE: &str = "x-ironmesh-auth-signature";
+pub const HEADER_CLUSTER_ID: &str = "x-berrykeep-cluster-id";
+pub const HEADER_DEVICE_ID: &str = "x-berrykeep-device-id";
+pub const HEADER_CONNECTION_NAME: &str = "x-berrykeep-connection-name";
+pub const HEADER_OPERATION_ID: &str = "x-berrykeep-operation-id";
+pub const HEADER_CREDENTIAL_FINGERPRINT: &str = "x-berrykeep-credential-fingerprint";
+pub const HEADER_AUTH_TIMESTAMP: &str = "x-berrykeep-auth-timestamp";
+pub const HEADER_AUTH_NONCE: &str = "x-berrykeep-auth-nonce";
+pub const HEADER_AUTH_SIGNATURE: &str = "x-berrykeep-auth-signature";
+pub const LEGACY_HEADER_CLUSTER_ID: &str = "x-ironmesh-cluster-id";
+pub const LEGACY_HEADER_DEVICE_ID: &str = "x-ironmesh-device-id";
+pub const LEGACY_HEADER_CONNECTION_NAME: &str = "x-ironmesh-connection-name";
+pub const LEGACY_HEADER_OPERATION_ID: &str = "x-ironmesh-operation-id";
+pub const LEGACY_HEADER_CREDENTIAL_FINGERPRINT: &str = "x-ironmesh-credential-fingerprint";
+pub const LEGACY_HEADER_AUTH_TIMESTAMP: &str = "x-ironmesh-auth-timestamp";
+pub const LEGACY_HEADER_AUTH_NONCE: &str = "x-ironmesh-auth-nonce";
+pub const LEGACY_HEADER_AUTH_SIGNATURE: &str = "x-ironmesh-auth-signature";
 
-const REQUEST_AUTH_CONTEXT: &str = "ironmesh-client-request-v1";
+const REQUEST_AUTH_CONTEXT: &str = "berrykeep-client-request-v1";
+const LEGACY_REQUEST_AUTH_CONTEXT: &str = "ironmesh-client-request-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedRequestHeaders {
@@ -68,27 +77,64 @@ impl SignedRequestHeaders {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let cluster_id = lookup(HEADER_CLUSTER_ID)
-            .context("missing cluster_id request header")?
-            .parse()
-            .context("invalid cluster_id request header")?;
-        let timestamp_unix = lookup(HEADER_AUTH_TIMESTAMP)
-            .context("missing auth timestamp request header")?
-            .parse::<u64>()
-            .context("invalid auth timestamp request header")?;
+        let cluster_id = lookup_canonical_or_legacy_header(
+            &mut lookup,
+            HEADER_CLUSTER_ID,
+            LEGACY_HEADER_CLUSTER_ID,
+        )
+        .context("missing cluster_id request header")?
+        .parse()
+        .context("invalid cluster_id request header")?;
+        let timestamp_unix = lookup_canonical_or_legacy_header(
+            &mut lookup,
+            HEADER_AUTH_TIMESTAMP,
+            LEGACY_HEADER_AUTH_TIMESTAMP,
+        )
+        .context("missing auth timestamp request header")?
+        .parse::<u64>()
+        .context("invalid auth timestamp request header")?;
         let headers = Self {
             cluster_id,
-            device_id: lookup(HEADER_DEVICE_ID).context("missing device_id request header")?,
-            credential_fingerprint: lookup(HEADER_CREDENTIAL_FINGERPRINT)
-                .context("missing credential_fingerprint request header")?,
+            device_id: lookup_canonical_or_legacy_header(
+                &mut lookup,
+                HEADER_DEVICE_ID,
+                LEGACY_HEADER_DEVICE_ID,
+            )
+            .context("missing device_id request header")?,
+            credential_fingerprint: lookup_canonical_or_legacy_header(
+                &mut lookup,
+                HEADER_CREDENTIAL_FINGERPRINT,
+                LEGACY_HEADER_CREDENTIAL_FINGERPRINT,
+            )
+            .context("missing credential_fingerprint request header")?,
             timestamp_unix,
-            nonce: lookup(HEADER_AUTH_NONCE).context("missing auth nonce request header")?,
-            signature_base64: lookup(HEADER_AUTH_SIGNATURE)
-                .context("missing auth signature request header")?,
+            nonce: lookup_canonical_or_legacy_header(
+                &mut lookup,
+                HEADER_AUTH_NONCE,
+                LEGACY_HEADER_AUTH_NONCE,
+            )
+            .context("missing auth nonce request header")?,
+            signature_base64: lookup_canonical_or_legacy_header(
+                &mut lookup,
+                HEADER_AUTH_SIGNATURE,
+                LEGACY_HEADER_AUTH_SIGNATURE,
+            )
+            .context("missing auth signature request header")?,
         };
         headers.validate()?;
         Ok(headers)
     }
+}
+
+fn lookup_canonical_or_legacy_header<F>(
+    lookup: &mut F,
+    canonical_name: &str,
+    legacy_name: &str,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    lookup(canonical_name).or_else(|| lookup(legacy_name))
 }
 
 pub fn next_auth_nonce() -> String {
@@ -118,6 +164,24 @@ pub fn build_signed_request_headers(
     timestamp_unix: u64,
     nonce: Option<String>,
 ) -> Result<SignedRequestHeaders> {
+    build_signed_request_headers_with_context(
+        identity,
+        method,
+        path_and_query,
+        timestamp_unix,
+        nonce,
+        REQUEST_AUTH_CONTEXT,
+    )
+}
+
+fn build_signed_request_headers_with_context(
+    identity: &ClientIdentityMaterial,
+    method: &str,
+    path_and_query: &str,
+    timestamp_unix: u64,
+    nonce: Option<String>,
+    request_auth_context: &str,
+) -> Result<SignedRequestHeaders> {
     identity.validate()?;
     let credential_pem = identity
         .credential_pem
@@ -134,7 +198,7 @@ pub fn build_signed_request_headers(
         nonce,
         signature_base64: String::new(),
     };
-    let message = canonical_request_message(&headers, method, path_and_query);
+    let message = canonical_request_message(&headers, method, path_and_query, request_auth_context);
     let signature = signing_key.sign(message.as_bytes());
     Ok(SignedRequestHeaders {
         signature_base64: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
@@ -159,21 +223,32 @@ pub fn verify_signed_request_headers(
         .context("failed to decode request signature")?;
     let signature = Signature::try_from(signature_bytes.as_slice())
         .context("request signature had invalid length")?;
-    let message = canonical_request_message(headers, method, path_and_query);
+    let canonical_message =
+        canonical_request_message(headers, method, path_and_query, REQUEST_AUTH_CONTEXT);
+    if verifying_key
+        .verify(canonical_message.as_bytes(), &signature)
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    let legacy_message =
+        canonical_request_message(headers, method, path_and_query, LEGACY_REQUEST_AUTH_CONTEXT);
     verifying_key
-        .verify(message.as_bytes(), &signature)
-        .context("request signature verification failed")
+        .verify(legacy_message.as_bytes(), &signature)
+        .context("request signature verification failed for canonical or legacy request context")
 }
 
 fn canonical_request_message(
     headers: &SignedRequestHeaders,
     method: &str,
     path_and_query: &str,
+    request_auth_context: &str,
 ) -> String {
     let method = method.trim().to_ascii_uppercase();
     let path_and_query = normalize_path_and_query(path_and_query);
     format!(
-        "{REQUEST_AUTH_CONTEXT}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{request_auth_context}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         headers.cluster_id,
         headers.device_id.trim(),
         headers.credential_fingerprint.trim(),
@@ -251,6 +326,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("verification failed"));
+    }
+
+    #[test]
+    fn signed_request_headers_accept_legacy_header_names_and_context() {
+        let mut identity =
+            ClientIdentityMaterial::generate(uuid::Uuid::now_v7(), None, None).unwrap();
+        identity.credential_pem = Some("issued-credential".to_string());
+        let signed_headers = build_signed_request_headers_with_context(
+            &identity,
+            "GET",
+            "/store/index",
+            1_730_000_000,
+            Some("legacy-nonce".to_string()),
+            LEGACY_REQUEST_AUTH_CONTEXT,
+        )
+        .unwrap();
+        let values = std::collections::HashMap::from([
+            (
+                LEGACY_HEADER_CLUSTER_ID,
+                signed_headers.cluster_id.to_string(),
+            ),
+            (LEGACY_HEADER_DEVICE_ID, signed_headers.device_id.clone()),
+            (
+                LEGACY_HEADER_CREDENTIAL_FINGERPRINT,
+                signed_headers.credential_fingerprint.clone(),
+            ),
+            (
+                LEGACY_HEADER_AUTH_TIMESTAMP,
+                signed_headers.timestamp_unix.to_string(),
+            ),
+            (LEGACY_HEADER_AUTH_NONCE, signed_headers.nonce.clone()),
+            (
+                LEGACY_HEADER_AUTH_SIGNATURE,
+                signed_headers.signature_base64.clone(),
+            ),
+        ]);
+
+        let parsed = SignedRequestHeaders::from_header_lookup(|name| values.get(name).cloned())
+            .expect("legacy headers should parse");
+        verify_signed_request_headers(&parsed, &identity.public_key_pem, "GET", "/store/index")
+            .expect("legacy request signature should verify");
     }
 
     #[test]

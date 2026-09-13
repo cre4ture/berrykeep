@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "io.ironmesh.android.macrobenchmark"
+    namespace = "io.berrykeep.android.macrobenchmark"
     compileSdk = 34
 
     defaultConfig {

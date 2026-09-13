@@ -35,11 +35,7 @@ const LONG_VERSION: &str = git_version::git_version!(
 pub struct RendezvousServiceCliConfig {
     #[arg(long = "bind-addr", value_name = "ADDR")]
     pub bind_addr: Option<SocketAddr>,
-    #[arg(
-        long = "failover-package",
-        env = "IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE",
-        value_name = "FILE"
-    )]
+    #[arg(long = "failover-package", value_name = "FILE")]
     pub failover_package_path: Option<PathBuf>,
 }
 
@@ -66,7 +62,22 @@ pub struct RendezvousServiceConfig {
 
 impl RendezvousServiceCliConfig {
     pub fn from_env_args() -> Result<Self> {
-        Self::parse().validate()
+        Self::parse()
+            .with_environment_defaults_from(|key| {
+                common::legacy_compatibility::var_os(key).map(PathBuf::from)
+            })
+            .validate()
+    }
+
+    fn with_environment_defaults_from<F>(mut self, lookup_env: F) -> Self
+    where
+        F: Fn(&str) -> Option<PathBuf>,
+    {
+        if self.failover_package_path.is_none() {
+            self.failover_package_path = lookup_env("BERRYKEEP_RENDEZVOUS_FAILOVER_PACKAGE");
+        }
+
+        self
     }
 
     fn validate(self) -> Result<Self> {
@@ -85,18 +96,18 @@ impl RendezvousServiceConfig {
     }
 
     pub fn from_env_and_args(args: &RendezvousServiceCliConfig) -> Result<Self> {
-        Self::from_lookup(args, |key| std::env::var(key).ok())
+        Self::from_lookup(args, |key| common::legacy_compatibility::var(key).ok())
     }
 
     fn from_lookup<F>(args: &RendezvousServiceCliConfig, lookup_env: F) -> Result<Self>
     where
         F: Fn(&str) -> Option<String>,
     {
-        let failover_passphrase = lookup_env("IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE");
+        let failover_passphrase = lookup_env("BERRYKEEP_RENDEZVOUS_FAILOVER_PASSPHRASE");
 
         if args.failover_package_path.is_none() && failover_passphrase.is_some() {
             bail!(
-                "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE requires IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE to be set"
+                "BERRYKEEP_RENDEZVOUS_FAILOVER_PASSPHRASE requires BERRYKEEP_RENDEZVOUS_FAILOVER_PACKAGE to be set"
             );
         }
 
@@ -106,15 +117,15 @@ impl RendezvousServiceConfig {
 
         let bind_addr = match args.bind_addr {
             Some(bind_addr) => bind_addr,
-            None => lookup_env("IRONMESH_RENDEZVOUS_BIND")
+            None => lookup_env("BERRYKEEP_RENDEZVOUS_BIND")
                 .unwrap_or_else(|| "127.0.0.1:19090".to_string())
                 .parse()
-                .context("invalid IRONMESH_RENDEZVOUS_BIND")?,
+                .context("invalid BERRYKEEP_RENDEZVOUS_BIND")?,
         };
 
         if args.failover_package_path.is_some() && failover_passphrase.is_none() {
             bail!(
-                "IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE requires IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE"
+                "BERRYKEEP_RENDEZVOUS_FAILOVER_PACKAGE requires BERRYKEEP_RENDEZVOUS_FAILOVER_PASSPHRASE"
             );
         }
 
@@ -131,14 +142,14 @@ impl RendezvousServiceConfig {
             })
             .transpose()?;
 
-        let configured_public_url = lookup_env("IRONMESH_RENDEZVOUS_PUBLIC_URL");
+        let configured_public_url = lookup_env("BERRYKEEP_RENDEZVOUS_PUBLIC_URL");
         let public_url = match (configured_public_url, failover_package.as_ref()) {
             (Some(configured), Some(package)) => {
                 if normalize_public_url(&configured)
                     != normalize_public_url(&package.package.public_url)
                 {
                     bail!(
-                        "IRONMESH_RENDEZVOUS_PUBLIC_URL {} does not match failover package public_url {}",
+                        "BERRYKEEP_RENDEZVOUS_PUBLIC_URL {} does not match failover package public_url {}",
                         configured,
                         package.package.public_url
                     );
@@ -150,7 +161,7 @@ impl RendezvousServiceConfig {
             (None, None) => format!("http://{bind_addr}"),
         };
 
-        let relay_public_urls = lookup_env("IRONMESH_RELAY_PUBLIC_URLS")
+        let relay_public_urls = lookup_env("BERRYKEEP_RELAY_PUBLIC_URLS")
             .map(|value| {
                 value
                     .split(',')
@@ -161,7 +172,7 @@ impl RendezvousServiceConfig {
             })
             .filter(|urls| !urls.is_empty())
             .unwrap_or_else(|| vec![public_url.clone()]);
-        let peer_rendezvous_urls = lookup_env("IRONMESH_RENDEZVOUS_PEER_URLS")
+        let peer_rendezvous_urls = lookup_env("BERRYKEEP_RENDEZVOUS_PEER_URLS")
             .map(|value| {
                 value
                     .split(',')
@@ -173,25 +184,25 @@ impl RendezvousServiceConfig {
             .filter(|urls| !urls.is_empty())
             .unwrap_or_default();
 
-        let client_ca_cert_path = lookup_env("IRONMESH_RENDEZVOUS_CLIENT_CA_CERT");
-        let cert_path = lookup_env("IRONMESH_RENDEZVOUS_TLS_CERT");
-        let key_path = lookup_env("IRONMESH_RENDEZVOUS_TLS_KEY");
-        let allow_insecure_http = lookup_env("IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP")
+        let client_ca_cert_path = lookup_env("BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT");
+        let cert_path = lookup_env("BERRYKEEP_RENDEZVOUS_TLS_CERT");
+        let key_path = lookup_env("BERRYKEEP_RENDEZVOUS_TLS_KEY");
+        let allow_insecure_http = lookup_env("BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP")
             .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false);
         let global_registration_enabled =
-            lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED")
+            lookup_env("BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED")
                 .map(|value| {
-                    parse_bool_env("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED", &value)
+                    parse_bool_env("BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED", &value)
                 })
                 .transpose()?
                 .unwrap_or(false);
-        let global_registry_path = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY");
-        let global_admin_token = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN");
+        let global_registry_path = lookup_env("BERRYKEEP_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY");
+        let global_admin_token = lookup_env("BERRYKEEP_RENDEZVOUS_GLOBAL_ADMIN_TOKEN");
         let global_rate_limit =
-            lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE");
-        let global_challenge_ttl = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS");
-        let global_max_pending = lookup_env("IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES");
+            lookup_env("BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE");
+        let global_challenge_ttl = lookup_env("BERRYKEEP_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS");
+        let global_max_pending = lookup_env("BERRYKEEP_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES");
         let global_settings_present = global_registration_enabled
             || global_registry_path.is_some()
             || global_admin_token.is_some()
@@ -231,25 +242,25 @@ impl RendezvousServiceConfig {
         )?;
         let admission_defaults = RendezvousAdmissionConfig::default();
         let max_connections = parse_positive_env_usize(
-            "IRONMESH_RENDEZVOUS_MAX_CONNECTIONS",
-            lookup_env("IRONMESH_RENDEZVOUS_MAX_CONNECTIONS"),
+            "BERRYKEEP_RENDEZVOUS_MAX_CONNECTIONS",
+            lookup_env("BERRYKEEP_RENDEZVOUS_MAX_CONNECTIONS"),
             admission_defaults.max_connections,
         )?;
         let admission = RendezvousAdmissionConfig {
             max_connections,
             max_tls_handshakes: parse_positive_env_usize(
-                "IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES",
-                lookup_env("IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES"),
+                "BERRYKEEP_RENDEZVOUS_MAX_TLS_HANDSHAKES",
+                lookup_env("BERRYKEEP_RENDEZVOUS_MAX_TLS_HANDSHAKES"),
                 admission_defaults.max_tls_handshakes.min(max_connections),
             )?,
             max_relay_tickets_per_client: parse_positive_env_usize(
-                "IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT",
-                lookup_env("IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT"),
+                "BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT",
+                lookup_env("BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT"),
                 admission_defaults.max_relay_tickets_per_client,
             )?,
             max_relay_ticket_issues_per_minute: parse_positive_env_usize(
-                "IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE",
-                lookup_env("IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE"),
+                "BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE",
+                lookup_env("BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE"),
                 admission_defaults.max_relay_ticket_issues_per_minute,
             )?,
         };
@@ -285,7 +296,7 @@ impl RendezvousServiceConfig {
         {
             if self.allow_insecure_http {
                 bail!(
-                    "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP cannot be enabled for global rendezvous registration"
+                    "BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP cannot be enabled for global rendezvous registration"
                 );
             }
             if self.failover_package.is_some() {
@@ -304,7 +315,7 @@ impl RendezvousServiceConfig {
         }
 
         anyhow::bail!(
-            "berrykeep-rendezvous-service refuses insecure HTTP startup without mTLS; configure IRONMESH_RENDEZVOUS_CLIENT_CA_CERT plus IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY, or use a failover package with IRONMESH_RENDEZVOUS_FAILOVER_PACKAGE and IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE, or set IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true for local development/testing only"
+            "berrykeep-rendezvous-service refuses insecure HTTP startup without mTLS; configure BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT plus BERRYKEEP_RENDEZVOUS_TLS_CERT and BERRYKEEP_RENDEZVOUS_TLS_KEY, or use a failover package with BERRYKEEP_RENDEZVOUS_FAILOVER_PACKAGE and BERRYKEEP_RENDEZVOUS_FAILOVER_PASSPHRASE, or set BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP=true for local development/testing only"
         )
     }
 
@@ -329,17 +340,17 @@ fn build_embedded_iroh_relay_config<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    const ENABLED_ENV: &str = "IRONMESH_IROH_RELAY_ENABLED";
-    const TICKET_TTL_ENV: &str = "IRONMESH_IROH_RELAY_TICKET_TTL_SECS";
-    const RATE_ENV: &str = "IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND";
-    const BURST_ENV: &str = "IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES";
-    const MAX_LEASES_ENV: &str = "IRONMESH_IROH_RELAY_MAX_TICKET_LEASES_PER_CLIENT";
-    const MAX_CONNECTIONS_ENV: &str = "IRONMESH_IROH_RELAY_MAX_ACTIVE_CONNECTIONS_PER_CLIENT";
-    const ISSUE_RATE_ENV: &str = "IRONMESH_IROH_RELAY_MAX_TICKET_ISSUES_PER_MINUTE";
-    const QUIC_BIND_ENV: &str = "IRONMESH_IROH_RELAY_QUIC_BIND";
-    const QUIC_PUBLIC_PORT_ENV: &str = "IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT";
-    const QUIC_CERT_ENV: &str = "IRONMESH_IROH_RELAY_QUIC_TLS_CERT";
-    const QUIC_KEY_ENV: &str = "IRONMESH_IROH_RELAY_QUIC_TLS_KEY";
+    const ENABLED_ENV: &str = "BERRYKEEP_IROH_RELAY_ENABLED";
+    const TICKET_TTL_ENV: &str = "BERRYKEEP_IROH_RELAY_TICKET_TTL_SECS";
+    const RATE_ENV: &str = "BERRYKEEP_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND";
+    const BURST_ENV: &str = "BERRYKEEP_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES";
+    const MAX_LEASES_ENV: &str = "BERRYKEEP_IROH_RELAY_MAX_TICKET_LEASES_PER_CLIENT";
+    const MAX_CONNECTIONS_ENV: &str = "BERRYKEEP_IROH_RELAY_MAX_ACTIVE_CONNECTIONS_PER_CLIENT";
+    const ISSUE_RATE_ENV: &str = "BERRYKEEP_IROH_RELAY_MAX_TICKET_ISSUES_PER_MINUTE";
+    const QUIC_BIND_ENV: &str = "BERRYKEEP_IROH_RELAY_QUIC_BIND";
+    const QUIC_PUBLIC_PORT_ENV: &str = "BERRYKEEP_IROH_RELAY_QUIC_PUBLIC_PORT";
+    const QUIC_CERT_ENV: &str = "BERRYKEEP_IROH_RELAY_QUIC_TLS_CERT";
+    const QUIC_KEY_ENV: &str = "BERRYKEEP_IROH_RELAY_QUIC_TLS_KEY";
 
     let enabled = lookup_env(ENABLED_ENV)
         .map(|value| parse_bool_env(ENABLED_ENV, &value))
@@ -443,7 +454,7 @@ fn validate_iroh_relay_public_url(value: &str, allow_insecure_http: bool) -> Res
         || allow_insecure_http && scheme.eq_ignore_ascii_case("http"))
     {
         bail!(
-            "iroh relay public URL must use HTTPS; plain HTTP is allowed only with IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true"
+            "iroh relay public URL must use HTTPS; plain HTTP is allowed only with BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP=true"
         );
     }
     if uri.path() != "/" && !uri.path().is_empty() {
@@ -473,12 +484,12 @@ fn build_global_mtls_config(
 ) -> Result<Option<RendezvousMtlsConfig>> {
     if !enabled {
         bail!(
-            "global rendezvous settings require IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED=true"
+            "global rendezvous settings require BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED=true"
         );
     }
     if client_ca_cert_path.is_some() {
         bail!(
-            "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT cannot be combined with global rendezvous registration"
+            "BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT cannot be combined with global rendezvous registration"
         );
     }
     if failover_package.is_some() {
@@ -486,7 +497,7 @@ fn build_global_mtls_config(
     }
     if allow_insecure_http {
         bail!(
-            "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP cannot be enabled for global rendezvous registration"
+            "BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP cannot be enabled for global rendezvous registration"
         );
     }
     if !is_https_url(public_url) || relay_public_urls.iter().any(|url| !is_https_url(url)) {
@@ -496,30 +507,30 @@ fn build_global_mtls_config(
     let registry_path = registry_path
         .filter(|value| !value.trim().is_empty())
         .context(
-            "global rendezvous registration requires IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY",
+            "global rendezvous registration requires BERRYKEEP_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY",
         )?;
     let admin_token = admin_token
         .filter(|value| !value.trim().is_empty())
-        .context("global rendezvous registration requires a non-empty IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN")?;
+        .context("global rendezvous registration requires a non-empty BERRYKEEP_RENDEZVOUS_GLOBAL_ADMIN_TOKEN")?;
     let rate_limit_per_minute = parse_positive_env_u32(
-        "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE",
+        "BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE",
         rate_limit_per_minute,
         10,
     )?;
     let challenge_ttl_secs = parse_positive_env_u64(
-        "IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS",
+        "BERRYKEEP_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS",
         challenge_ttl_secs,
         300,
     )?;
     let max_pending_challenges = parse_positive_env_usize(
-        "IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES",
+        "BERRYKEEP_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES",
         max_pending_challenges,
         1_024,
     )?;
     let (cert_path, key_path) = match (cert_path, key_path) {
         (Some(cert_path), Some(key_path)) => (cert_path, key_path),
         _ => bail!(
-            "global rendezvous registration requires IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY"
+            "global rendezvous registration requires BERRYKEEP_RENDEZVOUS_TLS_CERT and BERRYKEEP_RENDEZVOUS_TLS_KEY"
         ),
     };
 
@@ -602,7 +613,7 @@ fn build_mtls_config(
     if let Some(package) = failover_package {
         if cert_path.is_some() || key_path.is_some() {
             bail!(
-                "IRONMESH_RENDEZVOUS_TLS_CERT and IRONMESH_RENDEZVOUS_TLS_KEY cannot be combined with a failover package"
+                "BERRYKEEP_RENDEZVOUS_TLS_CERT and BERRYKEEP_RENDEZVOUS_TLS_KEY cannot be combined with a failover package"
             );
         }
 
@@ -616,7 +627,7 @@ fn build_mtls_config(
             }
         } else {
             bail!(
-                "legacy failover packages require IRONMESH_RENDEZVOUS_CLIENT_CA_CERT because they do not embed the client CA"
+                "legacy failover packages require BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT because they do not embed the client CA"
             );
         };
 
@@ -643,7 +654,7 @@ fn build_mtls_config(
         }
         (None, None, None) => Ok(None),
         _ => bail!(
-            "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT, IRONMESH_RENDEZVOUS_TLS_CERT, and IRONMESH_RENDEZVOUS_TLS_KEY must be set together"
+            "BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT, BERRYKEEP_RENDEZVOUS_TLS_CERT, and BERRYKEEP_RENDEZVOUS_TLS_KEY must be set together"
         ),
     }
 }
@@ -714,23 +725,23 @@ mod tests {
         let cli = RendezvousServiceCliConfig::default();
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
+                "BERRYKEEP_RENDEZVOUS_PUBLIC_URL".to_string(),
                 "https://rendezvous.example".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_TLS_CERT".to_string(),
+                "BERRYKEEP_RENDEZVOUS_TLS_CERT".to_string(),
                 "/tmp/rendezvous.pem".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_TLS_KEY".to_string(),
+                "BERRYKEEP_RENDEZVOUS_TLS_KEY".to_string(),
                 "/tmp/rendezvous.key".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
+                "BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
                 "/tmp/client-ca.pem".to_string(),
             ),
             (
-                "IRONMESH_IROH_RELAY_TICKET_TTL_SECS".to_string(),
+                "BERRYKEEP_IROH_RELAY_TICKET_TTL_SECS".to_string(),
                 "7200".to_string(),
             ),
         ]);
@@ -771,27 +782,27 @@ mod tests {
         let cli = RendezvousServiceCliConfig::default();
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
                 "true".to_string(),
             ),
             (
-                "IRONMESH_IROH_RELAY_ENABLED".to_string(),
+                "BERRYKEEP_IROH_RELAY_ENABLED".to_string(),
                 "false".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_MAX_CONNECTIONS".to_string(),
+                "BERRYKEEP_RENDEZVOUS_MAX_CONNECTIONS".to_string(),
                 "120".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES".to_string(),
+                "BERRYKEEP_RENDEZVOUS_MAX_TLS_HANDSHAKES".to_string(),
                 "12".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT".to_string(),
+                "BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT".to_string(),
                 "10".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE".to_string(),
+                "BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE".to_string(),
                 "20".to_string(),
             ),
         ]);
@@ -814,19 +825,19 @@ mod tests {
         let cli = RendezvousServiceCliConfig::default();
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
                 "true".to_string(),
             ),
             (
-                "IRONMESH_IROH_RELAY_ENABLED".to_string(),
+                "BERRYKEEP_IROH_RELAY_ENABLED".to_string(),
                 "false".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_MAX_CONNECTIONS".to_string(),
+                "BERRYKEEP_RENDEZVOUS_MAX_CONNECTIONS".to_string(),
                 "10".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES".to_string(),
+                "BERRYKEEP_RENDEZVOUS_MAX_TLS_HANDSHAKES".to_string(),
                 "11".to_string(),
             ),
         ]);
@@ -841,11 +852,11 @@ mod tests {
         let cli = RendezvousServiceCliConfig::default();
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
                 "true".to_string(),
             ),
             (
-                "IRONMESH_IROH_RELAY_ENABLED".to_string(),
+                "BERRYKEEP_IROH_RELAY_ENABLED".to_string(),
                 "false".to_string(),
             ),
         ]);
@@ -859,23 +870,23 @@ mod tests {
         let cli = RendezvousServiceCliConfig::default();
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
                 "true".to_string(),
             ),
             (
-                "IRONMESH_IROH_RELAY_QUIC_BIND".to_string(),
+                "BERRYKEEP_IROH_RELAY_QUIC_BIND".to_string(),
                 "0.0.0.0:17842".to_string(),
             ),
             (
-                "IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT".to_string(),
+                "BERRYKEEP_IROH_RELAY_QUIC_PUBLIC_PORT".to_string(),
                 "27842".to_string(),
             ),
             (
-                "IRONMESH_IROH_RELAY_QUIC_TLS_CERT".to_string(),
+                "BERRYKEEP_IROH_RELAY_QUIC_TLS_CERT".to_string(),
                 "/tmp/qad.pem".to_string(),
             ),
             (
-                "IRONMESH_IROH_RELAY_QUIC_TLS_KEY".to_string(),
+                "BERRYKEEP_IROH_RELAY_QUIC_TLS_KEY".to_string(),
                 "/tmp/qad.key".to_string(),
             ),
         ]);
@@ -902,11 +913,11 @@ mod tests {
         let cli = RendezvousServiceCliConfig::default();
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
                 "true".to_string(),
             ),
             (
-                "IRONMESH_IROH_RELAY_TICKET_TTL_SECS".to_string(),
+                "BERRYKEEP_IROH_RELAY_TICKET_TTL_SECS".to_string(),
                 "299".to_string(),
             ),
         ]);
@@ -915,7 +926,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("IRONMESH_IROH_RELAY_TICKET_TTL_SECS")
+                .contains("BERRYKEEP_IROH_RELAY_TICKET_TTL_SECS")
         );
     }
 
@@ -942,6 +953,35 @@ mod tests {
     }
 
     #[test]
+    fn cli_config_falls_back_to_legacy_failover_package_environment() {
+        let cli = RendezvousServiceCliConfig::default().with_environment_defaults_from(|key| {
+            (key == "BERRYKEEP_RENDEZVOUS_FAILOVER_PACKAGE")
+                .then(|| PathBuf::from("/tmp/legacy-failover.json"))
+        });
+
+        assert_eq!(
+            cli.failover_package_path,
+            Some(PathBuf::from("/tmp/legacy-failover.json"))
+        );
+    }
+
+    #[test]
+    fn cli_failover_package_takes_precedence_over_environment() {
+        let cli = RendezvousServiceCliConfig {
+            bind_addr: None,
+            failover_package_path: Some(PathBuf::from("/tmp/cli-failover.json")),
+        }
+        .with_environment_defaults_from(|_| {
+            panic!("the environment must not override an explicit CLI argument")
+        });
+
+        assert_eq!(
+            cli.failover_package_path,
+            Some(PathBuf::from("/tmp/cli-failover.json"))
+        );
+    }
+
+    #[test]
     fn cli_config_rejects_failover_passphrase_flag() {
         let err = RendezvousServiceCliConfig::try_parse_from([
             "berrykeep-rendezvous-service",
@@ -954,7 +994,7 @@ mod tests {
     #[test]
     fn from_lookup_uses_failover_package_public_url_and_inline_identity() {
         let dir = std::env::temp_dir().join(format!(
-            "ironmesh-rendezvous-config-{}",
+            "berrykeep-rendezvous-config-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should create");
@@ -975,7 +1015,7 @@ mod tests {
             failover_package_path: Some(package_path.clone()),
         };
         let env = HashMap::<String, String>::from([(
-            "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
+            "BERRYKEEP_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
             "correct horse battery staple".to_string(),
         )]);
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
@@ -1023,7 +1063,7 @@ mod tests {
     #[test]
     fn from_lookup_accepts_standalone_labeled_failover_package() {
         let dir = std::env::temp_dir().join(format!(
-            "ironmesh-rendezvous-config-{}",
+            "berrykeep-rendezvous-config-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should create");
@@ -1044,7 +1084,7 @@ mod tests {
             failover_package_path: Some(package_path),
         };
         let env = HashMap::<String, String>::from([(
-            "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
+            "BERRYKEEP_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
             "correct horse battery staple".to_string(),
         )]);
         let config = RendezvousServiceConfig::from_lookup(&cli, |key| env.get(key).cloned())
@@ -1063,7 +1103,7 @@ mod tests {
     #[test]
     fn from_lookup_rejects_failover_public_url_mismatch() {
         let dir = std::env::temp_dir().join(format!(
-            "ironmesh-rendezvous-config-{}",
+            "berrykeep-rendezvous-config-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should create");
@@ -1085,11 +1125,11 @@ mod tests {
         };
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
+                "BERRYKEEP_RENDEZVOUS_PUBLIC_URL".to_string(),
                 "https://other.example:44042".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
+                "BERRYKEEP_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
                 "correct horse battery staple".to_string(),
             ),
         ]);
@@ -1106,7 +1146,7 @@ mod tests {
     #[test]
     fn from_lookup_legacy_failover_package_uses_env_client_ca() {
         let dir = std::env::temp_dir().join(format!(
-            "ironmesh-rendezvous-config-{}",
+            "berrykeep-rendezvous-config-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should create");
@@ -1128,11 +1168,11 @@ mod tests {
         };
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
+                "BERRYKEEP_RENDEZVOUS_FAILOVER_PASSPHRASE".to_string(),
                 "correct horse battery staple".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
+                "BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
                 "/tmp/cluster-ca.pem".to_string(),
             ),
         ]);
@@ -1164,11 +1204,11 @@ mod tests {
         let cli = RendezvousServiceCliConfig::default();
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+                "BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
                 "true".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_PEER_URLS".to_string(),
+                "BERRYKEEP_RENDEZVOUS_PEER_URLS".to_string(),
                 " https://peer-a.example ,https://peer-b.example/ ".to_string(),
             ),
         ]);
@@ -1188,41 +1228,41 @@ mod tests {
     #[test]
     fn from_lookup_uses_the_exact_global_registration_rate_limit_env_name() {
         let registry_path = std::env::temp_dir().join(format!(
-            "ironmesh-global-rendezvous-config-{}.json",
+            "berrykeep-global-rendezvous-config-{}.json",
             uuid::Uuid::now_v7()
         ));
         let cli = RendezvousServiceCliConfig::default();
         let env = HashMap::from([
             (
-                "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
+                "BERRYKEEP_RENDEZVOUS_PUBLIC_URL".to_string(),
                 "https://rendezvous.example".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_TLS_CERT".to_string(),
+                "BERRYKEEP_RENDEZVOUS_TLS_CERT".to_string(),
                 "/tmp/rendezvous.pem".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_TLS_KEY".to_string(),
+                "BERRYKEEP_RENDEZVOUS_TLS_KEY".to_string(),
                 "/tmp/rendezvous.key".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED".to_string(),
+                "BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED".to_string(),
                 "true".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY".to_string(),
+                "BERRYKEEP_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY".to_string(),
                 registry_path.display().to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN".to_string(),
+                "BERRYKEEP_RENDEZVOUS_GLOBAL_ADMIN_TOKEN".to_string(),
                 "operator-secret".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE".to_string(),
+                "BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE".to_string(),
                 "7".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_GLOBAL_RATE_LIMIT_PER_MINUTE".to_string(),
+                "BERRYKEEP_RENDEZVOUS_GLOBAL_RATE_LIMIT_PER_MINUTE".to_string(),
                 "0".to_string(),
             ),
         ]);
@@ -1248,7 +1288,7 @@ mod tests {
         }
 
         let mut wrong_name_only = env;
-        wrong_name_only.remove("IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE");
+        wrong_name_only.remove("BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE");
         let config =
             RendezvousServiceConfig::from_lookup(&cli, |key| wrong_name_only.get(key).cloned())
                 .expect("the obsolete rate limit variable must not be used as an alias");
@@ -1264,54 +1304,54 @@ mod tests {
     #[test]
     fn global_registration_rate_limit_validation_names_the_public_contract() {
         let error = parse_positive_env_u32(
-            "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE",
+            "BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE",
             Some("0".to_string()),
             10,
         )
         .expect_err("zero global registration rate limit must be rejected");
         assert_eq!(
             error.to_string(),
-            "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE must be greater than zero"
+            "BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE must be greater than zero"
         );
     }
 
     #[test]
     fn from_lookup_rejects_insecure_or_static_ca_global_registration() {
         let registry_path = std::env::temp_dir().join(format!(
-            "ironmesh-global-rendezvous-config-{}.json",
+            "berrykeep-global-rendezvous-config-{}.json",
             uuid::Uuid::now_v7()
         ));
         let cli = RendezvousServiceCliConfig::default();
         let base = [
             (
-                "IRONMESH_RENDEZVOUS_PUBLIC_URL".to_string(),
+                "BERRYKEEP_RENDEZVOUS_PUBLIC_URL".to_string(),
                 "https://rendezvous.example".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_TLS_CERT".to_string(),
+                "BERRYKEEP_RENDEZVOUS_TLS_CERT".to_string(),
                 "/tmp/rendezvous.pem".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_TLS_KEY".to_string(),
+                "BERRYKEEP_RENDEZVOUS_TLS_KEY".to_string(),
                 "/tmp/rendezvous.key".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED".to_string(),
+                "BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED".to_string(),
                 "true".to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY".to_string(),
+                "BERRYKEEP_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY".to_string(),
                 registry_path.display().to_string(),
             ),
             (
-                "IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN".to_string(),
+                "BERRYKEEP_RENDEZVOUS_GLOBAL_ADMIN_TOKEN".to_string(),
                 "operator-secret".to_string(),
             ),
         ];
 
         let mut insecure = HashMap::from(base.clone());
         insecure.insert(
-            "IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
+            "BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP".to_string(),
             "true".to_string(),
         );
         let error = RendezvousServiceConfig::from_lookup(&cli, |key| insecure.get(key).cloned())
@@ -1320,7 +1360,7 @@ mod tests {
 
         let mut static_ca = HashMap::from(base);
         static_ca.insert(
-            "IRONMESH_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
+            "BERRYKEEP_RENDEZVOUS_CLIENT_CA_CERT".to_string(),
             "/tmp/client-ca.pem".to_string(),
         );
         let error = RendezvousServiceConfig::from_lookup(&cli, |key| static_ca.get(key).cloned())

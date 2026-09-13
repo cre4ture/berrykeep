@@ -1,6 +1,6 @@
-# Ironmesh Android (initial MVP)
+# BerryKeep Android (initial MVP)
 
-This is the IronMesh Android app.
+This is the BerryKeep Android app.
 
 ## Features (MVP)
 
@@ -58,18 +58,18 @@ host resources and are not representative of phone UI performance.
 
 `assembleRelease` uses a dedicated internal release key when these environment variables are set:
 
-- `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE`
-- `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD`
-- `IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS`
-- `IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD`
+- `BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_FILE`
+- `BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD`
+- `BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_ALIAS`
+- `BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD`
 
-In GitHub Actions, store the keystore itself as base64 in `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64`, decode it to a file, then export `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE` for Gradle before running `:app:assembleRelease`.
+In GitHub Actions, store the keystore itself as base64 in `BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_B64`, decode it to a file, then export `BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_FILE` for Gradle before running `:app:assembleRelease`.
 
 ## Rust bridge notes
 
-- JNI bridge class: `io.ironmesh.android.data.RustClientBridge`
+- JNI bridge class: `io.berrykeep.android.data.RustClientBridge`
 - Rust exports implemented in: `apps/android-app/src/lib.rs`
-- `IronmeshApplication` initializes the process-wide Rust bridges with the
+- `BerryKeepApplication` initializes the process-wide Rust bridges with the
   Android application context before Iroh can construct its system DNS resolver.
 - Native connection diagnostics feed a process-wide Kotlin `StateFlow`; the UI observes that
   in-memory source directly. Durable connection-status snapshots are conflated on an IO worker and

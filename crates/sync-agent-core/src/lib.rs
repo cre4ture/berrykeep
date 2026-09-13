@@ -14,7 +14,7 @@ pub use folder_agent_ui::*;
 
 use anyhow::{Context, Result, anyhow};
 use client_sdk::{
-    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, ManagedClientOptions,
+    BerryKeepClient, ClientIdentityMaterial, ConnectionBootstrap, ManagedClientOptions,
     build_http_client_from_pem, build_http_client_with_identity_from_pem,
     normalize_server_base_url,
 };
@@ -67,7 +67,7 @@ pub fn build_configured_client(
     client_bootstrap_json: Option<&str>,
     server_ca_pem: Option<&str>,
     client_identity_json: Option<&str>,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     let server_ca_pem = normalized_optional_string(server_ca_pem);
     let client_bootstrap_json = normalized_optional_string(client_bootstrap_json);
     let client_identity_json = normalized_optional_string(client_identity_json);
@@ -204,7 +204,7 @@ where
             progress.pending_directory_count = pending.len().try_into().unwrap_or(u64::MAX);
             on_progress(&progress);
 
-            if is_ironmesh_internal_relative_path(&relative) {
+            if is_berrykeep_internal_relative_path(&relative) {
                 continue;
             }
 
@@ -219,38 +219,86 @@ where
     Ok(state)
 }
 
-fn is_ironmesh_internal_relative_path(relative_path: &str) -> bool {
+fn is_berrykeep_internal_relative_path(relative_path: &str) -> bool {
     relative_path.split('/').any(|segment| {
-        segment == ".ironmesh"
+        segment == ".berrykeep"
+            || segment == ".berrykeep-conflicts"
+            || segment.contains(".berrykeep-part-")
+            || segment == ".ironmesh"
             || segment == ".ironmesh-conflicts"
             || segment.contains(".ironmesh-part-")
     })
 }
 
-pub(crate) fn transfer_state_root(root_dir: &Path) -> PathBuf {
-    root_dir.join(".ironmesh").join("transfers")
+pub(crate) fn transfer_state_root(root_dir: &Path) -> Result<PathBuf> {
+    let canonical_path = root_dir.join(".berrykeep").join("transfers");
+    let legacy_path = root_dir.join(".ironmesh").join("transfers");
+    migrate_legacy_transfer_state_root(&canonical_path, &legacy_path)
+}
+
+fn migrate_legacy_transfer_state_root(
+    canonical_path: &Path,
+    legacy_path: &Path,
+) -> Result<PathBuf> {
+    if canonical_path.exists() || !legacy_path.exists() {
+        return Ok(canonical_path.to_path_buf());
+    }
+
+    let parent = canonical_path.parent().ok_or_else(|| {
+        anyhow!(
+            "canonical transfer state path has no parent: {}",
+            canonical_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create transfer state parent {}",
+            parent.display()
+        )
+    })?;
+
+    match fs::rename(legacy_path, canonical_path) {
+        Ok(()) => Ok(canonical_path.to_path_buf()),
+        Err(_) if canonical_path.exists() || !legacy_path.exists() => {
+            Ok(canonical_path.to_path_buf())
+        }
+        Err(error) => {
+            tracing::warn!(
+                "failed to migrate legacy transfer state from {} to {}: {error}; using the legacy location",
+                legacy_path.display(),
+                canonical_path.display(),
+            );
+            Ok(legacy_path.to_path_buf())
+        }
+    }
 }
 
 pub(crate) fn transfer_path_stem(remote_key: &str) -> String {
     blake3::hash(remote_key.as_bytes()).to_hex().to_string()
 }
 
-pub(crate) fn upload_transfer_state_path(root_dir: &Path, remote_key: &str) -> PathBuf {
-    transfer_state_root(root_dir)
-        .join("uploads")
-        .join(format!("{}.json", transfer_path_stem(remote_key)))
+pub(crate) fn upload_transfer_state_path(root_dir: &Path, remote_key: &str) -> Result<PathBuf> {
+    transfer_state_root(root_dir).map(|state_root| {
+        state_root
+            .join("uploads")
+            .join(format!("{}.json", transfer_path_stem(remote_key)))
+    })
 }
 
-pub(crate) fn download_transfer_state_path(root_dir: &Path, remote_key: &str) -> PathBuf {
-    transfer_state_root(root_dir)
-        .join("downloads")
-        .join(format!("{}.json", transfer_path_stem(remote_key)))
+pub(crate) fn download_transfer_state_path(root_dir: &Path, remote_key: &str) -> Result<PathBuf> {
+    transfer_state_root(root_dir).map(|state_root| {
+        state_root
+            .join("downloads")
+            .join(format!("{}.json", transfer_path_stem(remote_key)))
+    })
 }
 
-pub(crate) fn download_transfer_temp_path(root_dir: &Path, remote_key: &str) -> PathBuf {
-    transfer_state_root(root_dir)
-        .join("downloads")
-        .join(format!("{}.part", transfer_path_stem(remote_key)))
+pub(crate) fn download_transfer_temp_path(root_dir: &Path, remote_key: &str) -> Result<PathBuf> {
+    transfer_state_root(root_dir).map(|state_root| {
+        state_root
+            .join("downloads")
+            .join(format!("{}.part", transfer_path_stem(remote_key)))
+    })
 }
 
 pub fn local_entry_state_for_path(
@@ -456,17 +504,39 @@ mod tests {
     }
 
     #[test]
-    fn scan_local_tree_ignores_ironmesh_internal_artifacts() {
+    fn scan_local_tree_ignores_berrykeep_internal_artifacts() {
         let root = test_root();
-        fs::create_dir_all(root.join(".ironmesh-conflicts/remote/nested"))
+        fs::create_dir_all(root.join(".berrykeep-conflicts/remote/nested"))
             .expect("internal directory should be created");
         fs::write(
-            root.join(".ironmesh-conflicts/remote/nested/conflict.txt"),
+            root.join(".berrykeep-conflicts/remote/nested/conflict.txt"),
             b"do-not-sync",
         )
         .expect("internal file should be written");
-        fs::write(root.join(".file.ironmesh-part-123"), b"partial")
+        fs::write(root.join(".file.berrykeep-part-123"), b"partial")
             .expect("partial file should be written");
+        fs::write(root.join("keep.txt"), b"keep").expect("regular file should be written");
+
+        let state = scan_local_tree(&root).expect("scan should succeed");
+
+        assert!(state.contains_key("keep.txt"));
+        assert!(!state.contains_key(".file.berrykeep-part-123"));
+        assert!(
+            !state
+                .keys()
+                .any(|path| path.starts_with(".berrykeep-conflicts"))
+        );
+
+        fs::remove_dir_all(root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn scan_local_tree_ignores_legacy_internal_artifacts() {
+        let root = test_root();
+        fs::create_dir_all(root.join(".ironmesh-conflicts/remote"))
+            .expect("legacy internal directory should be created");
+        fs::write(root.join(".file.ironmesh-part-123"), b"partial")
+            .expect("legacy partial file should be written");
         fs::write(root.join("keep.txt"), b"keep").expect("regular file should be written");
 
         let state = scan_local_tree(&root).expect("scan should succeed");
@@ -519,6 +589,26 @@ mod tests {
         fs::remove_dir_all(root).expect("temp root should be removed");
     }
 
+    #[test]
+    fn transfer_state_root_migrates_legacy_state_to_canonical_location() {
+        let root = test_root();
+        let legacy = root.join(".ironmesh/transfers/uploads");
+        fs::create_dir_all(&legacy).expect("legacy transfer state should create");
+        fs::write(legacy.join("upload.json"), b"legacy transfer")
+            .expect("legacy transfer state should write");
+
+        let resolved = transfer_state_root(&root).expect("transfer state should migrate");
+
+        assert_eq!(resolved, root.join(".berrykeep/transfers"));
+        assert_eq!(
+            fs::read(resolved.join("uploads/upload.json")).expect("migrated state should read"),
+            b"legacy transfer"
+        );
+        assert!(!root.join(".ironmesh/transfers").exists());
+
+        fs::remove_dir_all(root).expect("temp root should be removed");
+    }
+
     fn test_root() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -526,7 +616,7 @@ mod tests {
             .as_nanos();
         let mut root = std::env::temp_dir();
         root.push(format!(
-            "ironmesh-sync-agent-core-test-{}-{}",
+            "berrykeep-sync-agent-core-test-{}-{}",
             std::process::id(),
             nonce
         ));

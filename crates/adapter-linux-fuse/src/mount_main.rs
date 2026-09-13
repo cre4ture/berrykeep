@@ -10,21 +10,21 @@ use crate::gnome::{
     starting_mount_sync_facet, stopped_mount_sync_facet,
 };
 use crate::runtime::{
-    DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, IronmeshFuseFs, Uploader,
+    BerryKeepFuseFs, DemoHydrator, DemoUploader, FuseMountConfig, Hydrator, Uploader,
     mount_action_plan_until_shutdown, mount_fs_until_shutdown,
 };
 use crate::{FuseAction, FuseActionPlan, LinuxFuseAdapter};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use client_sdk::ironmesh_client::{DownloadProgress, DownloadRangeRequest};
+use client_sdk::berrykeep_client::{DownloadProgress, DownloadRangeRequest};
 use client_sdk::{
-    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, ManagedClientOptions,
-    ManagedIronMeshClient, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
+    BerryKeepClient, ClientIdentityMaterial, ConnectionBootstrap, ManagedBerryKeepClient,
+    ManagedClientOptions, RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope,
     RequestedRange, build_http_client_from_pem, build_http_client_with_identity_from_pem,
     normalize_server_base_url,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -69,7 +69,7 @@ struct Args {
     allow_empty_initial_namespace: bool,
     #[arg(long)]
     mountpoint: PathBuf,
-    #[arg(long, default_value = "ironmesh")]
+    #[arg(long, default_value = "berrykeep")]
     fs_name: String,
     #[arg(long, default_value_t = false)]
     allow_other: bool,
@@ -92,8 +92,8 @@ struct Args {
 }
 
 struct ResolvedUpstreamTarget {
-    client: IronMeshClient,
-    managed_client: Option<ManagedIronMeshClient>,
+    client: BerryKeepClient,
+    managed_client: Option<ManagedBerryKeepClient>,
     connection_target: String,
 }
 
@@ -360,7 +360,7 @@ fn run_mount_inner(
         download_stage_root,
         Arc::clone(&client_edge_state),
     );
-    let mut fs = IronmeshFuseFs::from_action_plan(
+    let mut fs = BerryKeepFuseFs::from_action_plan(
         &action_plan,
         Box::new(io.clone()),
         Box::new(io),
@@ -382,7 +382,7 @@ fn run_mount_inner(
 fn start_gnome_status(
     args: &Args,
     connection_target: String,
-    client: Option<IronMeshClient>,
+    client: Option<BerryKeepClient>,
 ) -> Result<GnomeStatusRuntime> {
     let status_file = match args.gnome_status_file.as_ref() {
         Some(path) => path.clone(),
@@ -438,7 +438,11 @@ fn effective_client_edge_state_dir(args: &Args) -> Result<PathBuf> {
 
 fn default_client_edge_state_dir(args: &Args) -> Result<PathBuf> {
     let state_home = xdg_state_home().unwrap_or_else(std::env::temp_dir);
-    let mut path = state_home
+    let mut canonical_path = state_home
+        .join("berrykeep")
+        .join("os-integration")
+        .join("client-rights-edge");
+    let mut legacy_path = state_home
         .join("ironmesh")
         .join("os-integration")
         .join("client-rights-edge");
@@ -446,16 +450,19 @@ fn default_client_edge_state_dir(args: &Args) -> Result<PathBuf> {
     if scope.is_empty() {
         anyhow::bail!("failed to derive client-rights edge storage scope");
     }
-    path.push(scope);
-    Ok(path)
+    canonical_path.push(&scope);
+    legacy_path.push(scope);
+    migrate_legacy_state_dir(&canonical_path, &legacy_path)
 }
 
 fn xdg_state_home() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+    if let Some(path) =
+        common::legacy_compatibility::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty())
+    {
         return Some(PathBuf::from(path));
     }
 
-    std::env::var_os("HOME")
+    common::legacy_compatibility::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|home| home.join(".local").join("state"))
@@ -479,14 +486,55 @@ fn client_edge_scope_label(args: &Args) -> String {
 
 fn download_stage_root(args: &Args) -> Result<PathBuf> {
     let state_home = xdg_state_home().unwrap_or_else(std::env::temp_dir);
-    let path = state_home
+    let scope = download_scope_label(args);
+    let canonical_path = state_home
+        .join("berrykeep")
+        .join("os-integration")
+        .join("downloads")
+        .join(&scope);
+    let legacy_path = state_home
         .join("ironmesh")
         .join("os-integration")
         .join("downloads")
-        .join(download_scope_label(args));
+        .join(scope);
+    let path = migrate_legacy_state_dir(&canonical_path, &legacy_path)?;
     fs::create_dir_all(&path)
         .with_context(|| format!("failed to create download stage root {}", path.display()))?;
     Ok(path)
+}
+
+fn migrate_legacy_state_dir(canonical_path: &Path, legacy_path: &Path) -> Result<PathBuf> {
+    if canonical_path.exists() || !legacy_path.exists() {
+        return Ok(canonical_path.to_path_buf());
+    }
+
+    let parent = canonical_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "canonical state path has no parent: {}",
+            canonical_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create canonical state parent {}",
+            parent.display()
+        )
+    })?;
+
+    match fs::rename(legacy_path, canonical_path) {
+        Ok(()) => Ok(canonical_path.to_path_buf()),
+        Err(_) if canonical_path.exists() || !legacy_path.exists() => {
+            Ok(canonical_path.to_path_buf())
+        }
+        Err(error) => {
+            tracing::warn!(
+                "failed to migrate legacy Linux FUSE state from {} to {}: {error}; using the legacy location",
+                legacy_path.display(),
+                canonical_path.display(),
+            );
+            Ok(legacy_path.to_path_buf())
+        }
+    }
 }
 
 fn download_scope_label(args: &Args) -> String {
@@ -556,7 +604,7 @@ fn default_client_identity_path(bootstrap_path: &std::path::Path) -> PathBuf {
         file_name.push(".client-identity.json");
         return bootstrap_path.with_file_name(file_name);
     }
-    bootstrap_path.with_file_name("ironmesh-client-identity.json")
+    bootstrap_path.with_file_name("berrykeep-client-identity.json")
 }
 
 fn resolve_client_identity(args: &Args) -> Result<Option<ClientIdentityMaterial>> {
@@ -735,14 +783,14 @@ fn filter_refresh_action_plan(
 
 #[derive(Clone)]
 struct ClientRightsEdgeIo {
-    sdk: IronMeshClient,
+    sdk: BerryKeepClient,
     download_stage_root: PathBuf,
     edge_state: Arc<ClientRightsEdgeState>,
 }
 
 impl ClientRightsEdgeIo {
     fn with_client(
-        sdk: IronMeshClient,
+        sdk: BerryKeepClient,
         download_stage_root: PathBuf,
         edge_state: Arc<ClientRightsEdgeState>,
     ) -> Self {
@@ -978,7 +1026,7 @@ fn build_configured_client(
     server_base_url: &str,
     server_ca_pem: Option<&str>,
     client_identity: Option<&ClientIdentityMaterial>,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     match client_identity {
         Some(identity) => {
             build_http_client_with_identity_from_pem(server_ca_pem, server_base_url, identity)
@@ -1021,7 +1069,7 @@ mod tests {
             offline_object_cache: CliOfflineObjectCacheMode::On,
             allow_empty_initial_namespace: false,
             mountpoint: PathBuf::from("/tmp/mount"),
-            fs_name: "ironmesh".to_string(),
+            fs_name: "berrykeep".to_string(),
             allow_other: false,
             prefix: None,
             depth: 64,
@@ -1038,7 +1086,7 @@ mod tests {
             .expect("system time should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "ironmesh-adapter-linux-fuse-{label}-{}-{nonce}",
+            "berrykeep-adapter-linux-fuse-{label}-{}-{nonce}",
             std::process::id()
         ))
     }
@@ -1077,7 +1125,7 @@ mod tests {
                 concat!(
                     "HTTP/1.1 200 OK\r\n",
                     "Content-Length: 22\r\n",
-                    "x-ironmesh-object-size: 22\r\n",
+                    "x-berrykeep-object-size: 22\r\n",
                     "ETag: \"etag-v1\"\r\n",
                     "Accept-Ranges: bytes\r\n",
                     "Connection: close\r\n",
@@ -1090,7 +1138,7 @@ mod tests {
                         "HTTP/1.1 206 Partial Content\r\n",
                         "Content-Length: 22\r\n",
                         "Content-Range: bytes 0-21/22\r\n",
-                        "x-ironmesh-object-size: 22\r\n",
+                        "x-berrykeep-object-size: 22\r\n",
                         "ETag: \"etag-v1\"\r\n",
                         "Accept-Ranges: bytes\r\n",
                         "Connection: close\r\n",
@@ -1122,7 +1170,7 @@ mod tests {
                 .expect("edge state create should succeed"),
         );
         let io = ClientRightsEdgeIo::with_client(
-            IronMeshClient::from_direct_base_url(format!("http://{server_addr}")),
+            BerryKeepClient::from_direct_base_url(format!("http://{server_addr}")),
             stage_dir.clone(),
             edge_state,
         );
@@ -1304,6 +1352,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_linux_fuse_state_directory_migrates_to_canonical_location() {
+        let root = unique_temp_dir("legacy-state-migration");
+        let canonical = root.join("berrykeep/os-integration/client-rights-edge/scope");
+        let legacy = root.join("ironmesh/os-integration/client-rights-edge/scope");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("snapshot.json"), b"legacy snapshot").unwrap();
+
+        let resolved = migrate_legacy_state_dir(&canonical, &legacy).unwrap();
+
+        assert_eq!(resolved, canonical);
+        assert_eq!(
+            fs::read(resolved.join("snapshot.json")).unwrap(),
+            b"legacy snapshot"
+        );
+        assert!(!legacy.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn initial_snapshot_error_without_cache_refuses_empty_namespace() {
         let state_dir = unique_temp_dir("initial-snapshot-no-cache");
         let state = ClientRightsEdgeState::new(&state_dir, OfflineObjectCacheMode::On)
@@ -1380,11 +1448,11 @@ mod tests {
     #[test]
     fn default_client_identity_path_uses_bootstrap_stem() {
         let path = default_client_identity_path(std::path::Path::new(
-            "/tmp/ironmesh-client-bootstrap.json",
+            "/tmp/berrykeep-client-bootstrap.json",
         ));
         assert_eq!(
             path,
-            PathBuf::from("/tmp/ironmesh-client-bootstrap.client-identity.json")
+            PathBuf::from("/tmp/berrykeep-client-bootstrap.client-identity.json")
         );
     }
 
@@ -1453,7 +1521,7 @@ mod tests {
                 concat!(
                     "HTTP/1.1 200 OK\r\n",
                     "Content-Length: 22\r\n",
-                    "x-ironmesh-object-size: 22\r\n",
+                    "x-berrykeep-object-size: 22\r\n",
                     "ETag: \"etag-v1\"\r\n",
                     "Accept-Ranges: bytes\r\n",
                     "Connection: close\r\n",
@@ -1466,7 +1534,7 @@ mod tests {
                         "HTTP/1.1 206 Partial Content\r\n",
                         "Content-Length: 22\r\n",
                         "Content-Range: bytes 0-21/22\r\n",
-                        "x-ironmesh-object-size: 22\r\n",
+                        "x-berrykeep-object-size: 22\r\n",
                         "ETag: \"etag-v1\"\r\n",
                         "Accept-Ranges: bytes\r\n",
                         "Connection: close\r\n",
@@ -1498,7 +1566,7 @@ mod tests {
                 .expect("edge state create should succeed"),
         );
         let io = ClientRightsEdgeIo::with_client(
-            IronMeshClient::from_direct_base_url(format!("http://{server_addr}")),
+            BerryKeepClient::from_direct_base_url(format!("http://{server_addr}")),
             stage_dir.clone(),
             edge_state,
         );
@@ -1560,7 +1628,7 @@ mod tests {
                 .expect("edge state create should succeed"),
         );
         let io = ClientRightsEdgeIo::with_client(
-            IronMeshClient::from_direct_base_url(format!("http://{server_addr}")),
+            BerryKeepClient::from_direct_base_url(format!("http://{server_addr}")),
             stage_dir.clone(),
             edge_state.clone(),
         );
@@ -1599,7 +1667,7 @@ mod tests {
                 .expect("edge state create should succeed"),
         );
         let io = ClientRightsEdgeIo::with_client(
-            IronMeshClient::from_direct_base_url("http://127.0.0.1:9"),
+            BerryKeepClient::from_direct_base_url("http://127.0.0.1:9"),
             stage_dir.clone(),
             edge_state.clone(),
         );

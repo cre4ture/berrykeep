@@ -1,6 +1,8 @@
-name: IronmeshAppleFileProvider
+name: BerryKeepAppleFileProvider
 
 options:
+  # These are installed application identities. Retaining them lets existing
+  # users receive the rebranded app as an update.
   bundleIdPrefix: dev.ironmesh
 
 settings:
@@ -20,11 +22,11 @@ packages:
     path: .
 
 targets:
-  IronmeshMacApp:
+  BerryKeepMacApp:
     type: application
     platform: macOS
     sources:
-      - path: Sources/IronmeshMacApp
+      - path: Sources/BerryKeepMacApp
       - path: Sources/AppleAppSupport
       - path: Sources/AppleNativeBridge
       - path: Sources/AppleFileProviderRuntime
@@ -42,20 +44,20 @@ targets:
           "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
     settings:
       base:
-        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAccess.entitlements
-        INFOPLIST_FILE: Resources/Info/IronmeshMacApp-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/BerryKeepSharedAccess.entitlements
+        INFOPLIST_FILE: Resources/Info/BerryKeepMacApp-Info.plist
         HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         MACOSX_DEPLOYMENT_TARGET: 14.0
         OTHER_LDFLAGS: $(inherited) -lios_app
         PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.macapp
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
 
-  IronmeshMacFileProviderExtension:
+  BerryKeepMacFileProviderExtension:
     type: app-extension
     platform: macOS
     sources:
-      - path: Sources/IronmeshMacFileProviderExtension
+      - path: Sources/BerryKeepMacFileProviderExtension
       - path: Sources/AppleNativeBridge
       - path: Sources/AppleFileProviderRuntime
     dependencies:
@@ -73,25 +75,25 @@ targets:
           "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
     settings:
       base:
-        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAccess.entitlements
-        INFOPLIST_FILE: Resources/Info/IronmeshMacFileProviderExtension-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/BerryKeepSharedAccess.entitlements
+        INFOPLIST_FILE: Resources/Info/BerryKeepMacFileProviderExtension-Info.plist
         HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         MACOSX_DEPLOYMENT_TARGET: 14.0
         OTHER_LDFLAGS: $(inherited) -lios_app
         PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.macfileprovider
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
 
-  IronmeshIosApp:
+  BerryKeepIosApp:
     type: application
     platform: iOS
     sources:
-      - path: Sources/IronmeshIosApp
+      - path: Sources/BerryKeepIosApp
       - path: Sources/AppleAppSupport
       - path: Sources/AppleNativeBridge
       - path: Sources/AppleFileProviderRuntime
     dependencies:
-      - target: IronmeshIosFileProviderExtension
+      - target: BerryKeepIosFileProviderExtension
         embed: true
       - package: AppleFileProviderPackage
         product: AppleCore
@@ -108,14 +110,14 @@ targets:
           "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
     settings:
       base:
-        INFOPLIST_FILE: Resources/Info/IronmeshIosApp-Info.plist
+        INFOPLIST_FILE: Resources/Info/BerryKeepIosApp-Info.plist
         HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
         IPHONEOS_DEPLOYMENT_TARGET: 16.0
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         OTHER_LDFLAGS: $(inherited) -lios_app -framework Network -framework SystemConfiguration
-        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAccess.entitlements
+        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/BerryKeepSharedAccess.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosapp
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: 1,2
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
@@ -123,11 +125,11 @@ targets:
         CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]: YES
         CODE_SIGN_IDENTITY[sdk=iphonesimulator*]: "-"
 
-  IronmeshIosFileProviderExtension:
+  BerryKeepIosFileProviderExtension:
     type: app-extension
     platform: iOS
     sources:
-      - path: Sources/IronmeshIosFileProviderExtension
+      - path: Sources/BerryKeepIosFileProviderExtension
       - path: Sources/AppleNativeBridge
       - path: Sources/AppleFileProviderRuntime
     dependencies:
@@ -146,14 +148,14 @@ targets:
           "$PROJECT_DIR/scripts/build-rust-apple-ffi.sh" "$PLATFORM_NAME" "$CONFIGURATION"
     settings:
       base:
-        INFOPLIST_FILE: Resources/Info/IronmeshIosFileProviderExtension-Info.plist
+        INFOPLIST_FILE: Resources/Info/BerryKeepIosFileProviderExtension-Info.plist
         HEADER_SEARCH_PATHS: $(PROJECT_DIR)/../ios-app/include
         IPHONEOS_DEPLOYMENT_TARGET: 16.0
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         OTHER_LDFLAGS: $(inherited) -lios_app -framework Network -framework SystemConfiguration
-        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/IronmeshSharedAccess.entitlements
+        CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/BerryKeepSharedAccess.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosapp.fileprovider
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/IronmeshAppleFFI-Bridging-Header.h
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: 1,2
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
@@ -161,32 +163,32 @@ targets:
         CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]: YES
         CODE_SIGN_IDENTITY[sdk=iphonesimulator*]: "-"
 
-  IronmeshAppleProjectTests:
+  BerryKeepAppleProjectTests:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - path: Tests/IronmeshAppleProjectTests
+      - path: Tests/BerryKeepAppleProjectTests
     dependencies:
-      - target: IronmeshMacApp
+      - target: BerryKeepMacApp
       - package: AppleFileProviderPackage
         product: AppleCore
       - package: AppleFileProviderPackage
         product: AppleFileProviderShared
     settings:
       base:
-        INFOPLIST_FILE: Resources/Info/IronmeshAppleProjectTests-Info.plist
+        INFOPLIST_FILE: Resources/Info/BerryKeepAppleProjectTests-Info.plist
         MACOSX_DEPLOYMENT_TARGET: 14.0
-        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.tests
+        PRODUCT_BUNDLE_IDENTIFIER: dev.berrykeep.apple.tests
         CODE_SIGNING_ALLOWED: YES
         CODE_SIGNING_REQUIRED: YES
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "-"
 
-  IronmeshIosProjectTests:
+  BerryKeepIosProjectTests:
     type: bundle.unit-test
     platform: iOS
     sources:
-      - path: Tests/IronmeshIosProjectTests
+      - path: Tests/BerryKeepIosProjectTests
     dependencies:
       - package: AppleFileProviderPackage
         product: AppleCore
@@ -194,75 +196,75 @@ targets:
         product: AppleFileProviderShared
     settings:
       base:
-        INFOPLIST_FILE: Resources/Info/IronmeshIosProjectTests-Info.plist
+        INFOPLIST_FILE: Resources/Info/BerryKeepIosProjectTests-Info.plist
         IPHONEOS_DEPLOYMENT_TARGET: 16.0
-        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.ios.tests
+        PRODUCT_BUNDLE_IDENTIFIER: dev.berrykeep.apple.ios.tests
         TARGETED_DEVICE_FAMILY: 1,2
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
         BUNDLE_LOADER: ""
         TEST_HOST: ""
 
-  IronmeshIosUiTests:
+  BerryKeepIosUiTests:
     type: bundle.ui-testing
     platform: iOS
     sources:
-      - path: Tests/IronmeshIosUiTests
+      - path: Tests/BerryKeepIosUiTests
     dependencies:
-      - target: IronmeshIosApp
+      - target: BerryKeepIosApp
     settings:
       base:
         IPHONEOS_DEPLOYMENT_TARGET: 16.0
-        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.ios.uitests
+        PRODUCT_BUNDLE_IDENTIFIER: dev.berrykeep.apple.ios.uitests
         TARGETED_DEVICE_FAMILY: 1,2
 
 schemes:
-  IronmeshIosApp:
+  BerryKeepIosApp:
     build:
       targets:
-        IronmeshIosApp: all
-        IronmeshIosFileProviderExtension: all
+        BerryKeepIosApp: all
+        BerryKeepIosFileProviderExtension: all
     run:
       config: Debug
-      executable: IronmeshIosApp
+      executable: BerryKeepIosApp
     test:
       gatherCoverageData: false
       targets:
-        - IronmeshIosProjectTests
-        - IronmeshIosUiTests
-  IronmeshMacApp:
+        - BerryKeepIosProjectTests
+        - BerryKeepIosUiTests
+  BerryKeepMacApp:
     build:
       targets:
-        IronmeshMacApp: all
-        IronmeshMacFileProviderExtension: all
+        BerryKeepMacApp: all
+        BerryKeepMacFileProviderExtension: all
     run:
       config: Debug
-      executable: IronmeshMacApp
+      executable: BerryKeepMacApp
     test:
       gatherCoverageData: false
       targets:
-        - IronmeshAppleProjectTests
-  IronmeshAppleProject:
+        - BerryKeepAppleProjectTests
+  BerryKeepAppleProject:
     build:
       targets:
-        IronmeshMacApp: all
-        IronmeshMacFileProviderExtension: all
-        IronmeshIosApp: all
-        IronmeshIosFileProviderExtension: all
-  IronmeshMacProject:
+        BerryKeepMacApp: all
+        BerryKeepMacFileProviderExtension: all
+        BerryKeepIosApp: all
+        BerryKeepIosFileProviderExtension: all
+  BerryKeepMacProject:
     build:
       targets:
-        IronmeshMacApp: all
-        IronmeshMacFileProviderExtension: all
+        BerryKeepMacApp: all
+        BerryKeepMacFileProviderExtension: all
     test:
       gatherCoverageData: false
       targets:
-        - IronmeshAppleProjectTests
-  IronmeshIosProject:
+        - BerryKeepAppleProjectTests
+  BerryKeepIosProject:
     build:
       targets:
-        IronmeshIosProjectTests: all
+        BerryKeepIosProjectTests: all
     test:
       gatherCoverageData: false
       targets:
-        - IronmeshIosProjectTests
+        - BerryKeepIosProjectTests

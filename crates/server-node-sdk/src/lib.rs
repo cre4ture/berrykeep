@@ -134,12 +134,12 @@ const LARGE_RELAY_HTTP_RESPONSE_LOG_THRESHOLD_BYTES: usize = 512 * 1024;
 const CLIENT_MUTATION_OPERATION_TTL_SECS: u64 = 15 * 60;
 const DIRECT_QUIC_FIRST_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 10;
 const GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED_ENV: &str =
-    "IRONMESH_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED";
+    "BERRYKEEP_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED";
 /// Comma-separated iroh-compatible relay URLs used by this node's Direct QUIC
-/// endpoint. The existing IronMesh HTTP relay is intentionally not substituted
+/// endpoint. The existing BerryKeep HTTP relay is intentionally not substituted
 /// here; it remains the independent fallback transport.
-const DIRECT_QUIC_RELAY_URLS_ENV: &str = "IRONMESH_DIRECT_QUIC_RELAY_URLS";
-const DIRECT_QUIC_RELAY_AUTH_TOKEN_ENV: &str = "IRONMESH_DIRECT_QUIC_RELAY_AUTH_TOKEN";
+const DIRECT_QUIC_RELAY_URLS_ENV: &str = "BERRYKEEP_DIRECT_QUIC_RELAY_URLS";
+const DIRECT_QUIC_RELAY_AUTH_TOKEN_ENV: &str = "BERRYKEEP_DIRECT_QUIC_RELAY_AUTH_TOKEN";
 const GLOBAL_RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 10;
 const GLOBAL_RENDEZVOUS_REGISTRATION_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 use x509_parser::extensions::ParsedExtension;
@@ -246,12 +246,12 @@ const MAX_LATENCY_DIAGNOSTIC_SERVER_DELAY_MS: u64 = 5_000;
 pub(crate) const PUBLIC_API_V1_PREFIX: &str = "/api/v1";
 const PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/media/thumbnail";
 const PUBLIC_API_V1_ADMIN_MEDIA_THUMBNAIL_ROUTE: &str = "/api/v1/auth/media/thumbnail";
-const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP";
-const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS";
-const REQUIRE_CLIENT_AUTH_ENV: &str = "IRONMESH_REQUIRE_CLIENT_AUTH";
-const METADATA_BACKEND_ENV: &str = "IRONMESH_METADATA_BACKEND";
+const ALLOW_INSECURE_PUBLIC_HTTP_ENV: &str = "BERRYKEEP_ALLOW_INSECURE_PUBLIC_HTTP";
+const ALLOW_UNAUTHENTICATED_CLIENTS_ENV: &str = "BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS";
+const REQUIRE_CLIENT_AUTH_ENV: &str = "BERRYKEEP_REQUIRE_CLIENT_AUTH";
+const METADATA_BACKEND_ENV: &str = "BERRYKEEP_METADATA_BACKEND";
 const TEST_SEED_PROCESS_TEMPERATURE_STATS_ENV: &str =
-    "IRONMESH_TEST_SEED_PROCESS_TEMPERATURE_STATS";
+    "BERRYKEEP_TEST_SEED_PROCESS_TEMPERATURE_STATS";
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_LIMIT: usize = 100;
 const CLIENT_BOOTSTRAP_CLAIM_HISTORY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const CLIENT_CREDENTIAL_EXPORT_PATH: &str = "/cluster/client-credentials/export";
@@ -1425,21 +1425,19 @@ fn expected_upload_chunk_size(
 }
 
 fn request_device_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(transport_sdk::HEADER_DEVICE_ID)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+    request_header_value(
+        headers,
+        transport_sdk::HEADER_DEVICE_ID,
+        transport_sdk::LEGACY_HEADER_DEVICE_ID,
+    )
 }
 
 fn request_operation_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(transport_sdk::HEADER_OPERATION_ID)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+    request_header_value(
+        headers,
+        transport_sdk::HEADER_OPERATION_ID,
+        transport_sdk::LEGACY_HEADER_OPERATION_ID,
+    )
 }
 
 fn client_mutation_operation_payload_hash(payload: &[u8]) -> String {
@@ -1602,8 +1600,21 @@ where
 }
 
 fn request_connection_name(headers: &HeaderMap) -> Option<String> {
+    request_header_value(
+        headers,
+        transport_sdk::HEADER_CONNECTION_NAME,
+        transport_sdk::LEGACY_HEADER_CONNECTION_NAME,
+    )
+}
+
+fn request_header_value(
+    headers: &HeaderMap,
+    canonical_header_name: &str,
+    legacy_header_name: &str,
+) -> Option<String> {
     headers
-        .get(transport_sdk::HEADER_CONNECTION_NAME)
+        .get(canonical_header_name)
+        .or_else(|| headers.get(legacy_header_name))
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -2041,14 +2052,7 @@ async fn request_has_admin_auth(state: &ServerState, headers: &HeaderMap) -> boo
         .admin_control
         .admin_token
         .as_deref()
-        .map(|expected| {
-            token_matches(
-                expected,
-                headers
-                    .get(ADMIN_TOKEN_HEADER)
-                    .and_then(|value| value.to_str().ok()),
-            )
-        })
+        .map(|expected| token_matches(expected, admin_token_header_value(headers)))
         .unwrap_or(false)
         || current_admin_session_expiry(state, headers).await.is_some()
 }
@@ -2088,7 +2092,7 @@ fn generate_client_credential_pem(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "never".to_string());
     format!(
-        "-----BEGIN IRONMESH CLIENT CREDENTIAL-----\ncluster_id={cluster_id}\ndevice_id={device_id}\nissued_at_unix={issued_at_unix}\nexpires_at_unix={expires_at_unix}\npublic_key_fingerprint={public_key_fingerprint}\n-----END IRONMESH CLIENT CREDENTIAL-----\n"
+        "-----BEGIN BERRYKEEP CLIENT CREDENTIAL-----\ncluster_id={cluster_id}\ndevice_id={device_id}\nissued_at_unix={issued_at_unix}\nexpires_at_unix={expires_at_unix}\npublic_key_fingerprint={public_key_fingerprint}\n-----END BERRYKEEP CLIENT CREDENTIAL-----\n"
     )
 }
 
@@ -2169,7 +2173,7 @@ fn issue_client_rendezvous_identity_pem(
     params.distinguished_name = DistinguishedName::new();
     params
         .distinguished_name
-        .push(DnType::CommonName, format!("ironmesh-device-{device_id}"));
+        .push(DnType::CommonName, format!("berrykeep-device-{device_id}"));
     params.is_ca = IsCa::NoCa;
     params.not_before = OffsetDateTime::from_unix_timestamp(issued_at_unix as i64)
         .context("invalid rendezvous client cert not_before timestamp")?;
@@ -2178,14 +2182,24 @@ fn issue_client_rendezvous_identity_pem(
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     params.subject_alt_names = vec![
         SanType::URI(
-            format!("urn:ironmesh:device:{device_id}")
+            format!("urn:berrykeep:device:{device_id}")
                 .try_into()
                 .context("invalid rendezvous client device SAN URI")?,
         ),
         SanType::URI(
-            format!("urn:ironmesh:cluster:{}", state.cluster_id)
+            format!("urn:berrykeep:cluster:{}", state.cluster_id)
                 .try_into()
                 .context("invalid rendezvous client cluster SAN URI")?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:device:{device_id}")
+                .try_into()
+                .context("invalid legacy rendezvous client device SAN URI")?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:cluster:{}", state.cluster_id)
+                .try_into()
+                .context("invalid legacy rendezvous client cluster SAN URI")?,
         ),
     ];
 
@@ -2286,7 +2300,7 @@ fn internal_caller_from_tls_stream<T>(
     let identity = parse_peer_certificate_identity(cert)?;
     let cluster_id = identity
         .cluster_id
-        .context("missing urn:ironmesh:cluster:<uuid> SAN URI in peer certificate")?;
+        .context("missing urn:berrykeep:cluster:<uuid> SAN URI in peer certificate")?;
     Ok(InternalCaller {
         node_id: identity.node_id,
         cluster_id,
@@ -2317,7 +2331,7 @@ fn parse_peer_certificate_identity(cert: &CertificateDer<'_>) -> Result<PeerCert
     }
 
     let node_id =
-        node_id.context("missing urn:ironmesh:node:<uuid> SAN URI in peer certificate")?;
+        node_id.context("missing urn:berrykeep:node:<uuid> SAN URI in peer certificate")?;
 
     Ok(PeerCertificateIdentity {
         node_id,
@@ -2341,7 +2355,7 @@ fn validate_expected_peer_certificate_identity(
 
     let presented_cluster_id = identity
         .cluster_id
-        .context("missing urn:ironmesh:cluster:<uuid> SAN URI in peer certificate")?;
+        .context("missing urn:berrykeep:cluster:<uuid> SAN URI in peer certificate")?;
     if presented_cluster_id != expected_cluster_id {
         bail!(
             "peer certificate presented cluster_id {} but expected {}",
@@ -2354,14 +2368,17 @@ fn validate_expected_peer_certificate_identity(
 }
 
 fn parse_node_id_from_san_uri(uri: &str) -> Option<NodeId> {
-    let prefix = "urn:ironmesh:node:";
-    uri.strip_prefix(prefix)
+    uri.strip_prefix("urn:berrykeep:node:")
+        // Certificates issued before the rename remain valid during the
+        // compatibility window; all newly issued certificates use the
+        // canonical BerryKeep namespace above.
+        .or_else(|| uri.strip_prefix("urn:ironmesh:node:"))
         .and_then(|rest| rest.trim().parse::<NodeId>().ok())
 }
 
 fn parse_cluster_id_from_san_uri(uri: &str) -> Option<ClusterId> {
-    let prefix = "urn:ironmesh:cluster:";
-    uri.strip_prefix(prefix)
+    uri.strip_prefix("urn:berrykeep:cluster:")
+        .or_else(|| uri.strip_prefix("urn:ironmesh:cluster:"))
         .and_then(|rest| rest.trim().parse::<ClusterId>().ok())
 }
 
@@ -3164,7 +3181,7 @@ pub struct LocalNodeHandle {
 }
 
 fn env_flag_enabled(name: &str) -> bool {
-    std::env::var(name)
+    common::legacy_compatibility::var(name)
         .ok()
         .map(|value| parse_env_flag_enabled(Some(value.as_str())))
         .unwrap_or_else(|| parse_env_flag_enabled(None))
@@ -3177,7 +3194,7 @@ fn parse_env_flag_enabled(value: Option<&str>) -> bool {
 }
 
 fn parse_require_client_auth_env(allow_unauthenticated_clients: bool) -> bool {
-    std::env::var(REQUIRE_CLIENT_AUTH_ENV)
+    common::legacy_compatibility::var(REQUIRE_CLIENT_AUTH_ENV)
         .ok()
         .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
         .unwrap_or(!allow_unauthenticated_clients)
@@ -3187,17 +3204,17 @@ fn parse_require_client_auth_env(allow_unauthenticated_clients: bool) -> bool {
 /// Unset by default; when set, must be a loopback address since the listener
 /// serves `/health` and cluster status without any authentication.
 fn parse_local_status_bind_addr() -> Result<Option<SocketAddr>> {
-    let Some(raw) = std::env::var("IRONMESH_LOCAL_STATUS_BIND")
+    let Some(raw) = common::legacy_compatibility::var("BERRYKEEP_LOCAL_STATUS_BIND")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     else {
         return Ok(None);
     };
-    let addr: SocketAddr = raw.parse().context("invalid IRONMESH_LOCAL_STATUS_BIND")?;
+    let addr: SocketAddr = raw.parse().context("invalid BERRYKEEP_LOCAL_STATUS_BIND")?;
     if !addr.ip().is_loopback() {
         bail!(
-            "IRONMESH_LOCAL_STATUS_BIND must bind to a loopback address (127.0.0.1 or ::1) \
+            "BERRYKEEP_LOCAL_STATUS_BIND must bind to a loopback address (127.0.0.1 or ::1) \
              since it serves health/cluster status without authentication; got {addr}"
         );
     }
@@ -3810,7 +3827,7 @@ impl MetadataCommitMode {
             "local" => Ok(Self::Local),
             "quorum" => Ok(Self::Quorum),
             _ => Err(anyhow::anyhow!(
-                "invalid IRONMESH_METADATA_COMMIT_MODE '{raw}', expected 'local' or 'quorum'"
+                "invalid BERRYKEEP_METADATA_COMMIT_MODE '{raw}', expected 'local' or 'quorum'"
             )),
         }
     }
@@ -3823,7 +3840,7 @@ fn parse_relay_mode(raw: &str) -> Result<RelayMode> {
         "preferred" => Ok(RelayMode::Preferred),
         "required" => Ok(RelayMode::Required),
         other => bail!(
-            "invalid IRONMESH_RELAY_MODE '{other}', expected disabled, fallback, preferred, or required"
+            "invalid BERRYKEEP_RELAY_MODE '{other}', expected disabled, fallback, preferred, or required"
         ),
     }
 }
@@ -3839,12 +3856,12 @@ fn parse_metadata_backend(raw: &str) -> Result<MetadataBackendKind> {
             #[cfg(not(feature = "turso-metadata"))]
             {
                 bail!(
-                    "IRONMESH_METADATA_BACKEND='turso' requires rebuilding server-node-sdk with the 'turso-metadata' feature enabled"
+                    "BERRYKEEP_METADATA_BACKEND='turso' requires rebuilding server-node-sdk with the 'turso-metadata' feature enabled"
                 )
             }
         }
         other => bail!(
-            "invalid IRONMESH_METADATA_BACKEND '{other}', expected 'sqlite'{}",
+            "invalid BERRYKEEP_METADATA_BACKEND '{other}', expected 'sqlite'{}",
             if cfg!(feature = "turso-metadata") {
                 " or 'turso'"
             } else {
@@ -3856,7 +3873,7 @@ fn parse_metadata_backend(raw: &str) -> Result<MetadataBackendKind> {
 
 fn metadata_backend_from_env() -> Result<MetadataBackendKind> {
     parse_metadata_backend(
-        std::env::var(METADATA_BACKEND_ENV)
+        common::legacy_compatibility::var(METADATA_BACKEND_ENV)
             .unwrap_or_else(|_| "sqlite".to_string())
             .as_str(),
     )
@@ -3941,7 +3958,7 @@ fn existing_tls_metadata_sidecar_path(cert_path: &FsPath) -> Option<PathBuf> {
 }
 
 fn env_flag_is_truthy(name: &str) -> bool {
-    std::env::var(name)
+    common::legacy_compatibility::var(name)
         .ok()
         .map(|value| {
             matches!(
@@ -3953,7 +3970,7 @@ fn env_flag_is_truthy(name: &str) -> bool {
 }
 
 fn env_flag_or(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
+    match common::legacy_compatibility::var(name) {
         Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -3963,7 +3980,7 @@ fn env_flag_or(name: &str, default: bool) -> bool {
 }
 
 fn env_u64_or(name: &str, default: u64) -> u64 {
-    match std::env::var(name) {
+    match common::legacy_compatibility::var(name) {
         Ok(value) => match value.trim().parse::<u64>() {
             Ok(parsed) if parsed > 0 => parsed,
             _ => {
@@ -4112,8 +4129,10 @@ fn certificate_has_expected_node_identity_uri_sans(
         .context("failed parsing TLS certificate PEM for node identity SAN migration")?;
     let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert_der.as_ref())
         .context("failed parsing TLS certificate DER for node identity SAN migration")?;
-    let expected_node_uri = format!("urn:ironmesh:node:{expected_node_id}");
-    let expected_cluster_uri = format!("urn:ironmesh:cluster:{expected_cluster_id}");
+    let expected_node_uri = format!("urn:berrykeep:node:{expected_node_id}");
+    let expected_cluster_uri = format!("urn:berrykeep:cluster:{expected_cluster_id}");
+    let legacy_node_uri = format!("urn:ironmesh:node:{expected_node_id}");
+    let legacy_cluster_uri = format!("urn:ironmesh:cluster:{expected_cluster_id}");
     let mut has_node_uri = false;
     let mut has_cluster_uri = false;
 
@@ -4121,8 +4140,8 @@ fn certificate_has_expected_node_identity_uri_sans(
         if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
             for name in &san.general_names {
                 if let x509_parser::extensions::GeneralName::URI(uri) = name {
-                    has_node_uri |= *uri == expected_node_uri;
-                    has_cluster_uri |= *uri == expected_cluster_uri;
+                    has_node_uri |= *uri == expected_node_uri || *uri == legacy_node_uri;
+                    has_cluster_uri |= *uri == expected_cluster_uri || *uri == legacy_cluster_uri;
                 }
             }
         }
@@ -4772,10 +4791,11 @@ async fn try_start_direct_quic_runtime(
 
     let mut endpoint_config = DirectQuicEndpointConfig::new(secret_key);
     endpoint_config.relay_urls = direct_quic_relay_urls_from_env();
-    endpoint_config.relay_auth_token = std::env::var(DIRECT_QUIC_RELAY_AUTH_TOKEN_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    endpoint_config.relay_auth_token =
+        common::legacy_compatibility::var(DIRECT_QUIC_RELAY_AUTH_TOKEN_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
     endpoint_config.relay_ca_pem = match direct_quic_relay_ca_pem(config) {
         Ok(ca_pem) => ca_pem,
         Err(error) => {
@@ -4844,7 +4864,11 @@ fn direct_quic_relay_ca_pem(config: &ServerNodeConfig) -> Result<Option<String>>
 }
 
 fn direct_quic_relay_urls_from_env() -> Vec<String> {
-    parse_direct_quic_relay_urls(std::env::var(DIRECT_QUIC_RELAY_URLS_ENV).ok().as_deref())
+    parse_direct_quic_relay_urls(
+        common::legacy_compatibility::var(DIRECT_QUIC_RELAY_URLS_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn parse_direct_quic_relay_urls(raw: Option<&str>) -> Vec<String> {
@@ -5873,7 +5897,7 @@ fn materialize_node_enrollment_package(
 }
 
 fn parse_enrollment_auto_renew_enabled(default_enabled: bool) -> bool {
-    std::env::var("IRONMESH_NODE_ENROLLMENT_AUTO_RENEW_ENABLED")
+    common::legacy_compatibility::var("BERRYKEEP_NODE_ENROLLMENT_AUTO_RENEW_ENABLED")
         .ok()
         .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
         .unwrap_or(default_enabled)
@@ -5890,7 +5914,7 @@ fn default_node_enrollment_auto_renew_enabled(config: &ServerNodeConfig) -> bool
 }
 
 fn node_enrollment_auto_renew_check_secs() -> u64 {
-    std::env::var("IRONMESH_NODE_ENROLLMENT_RENEWAL_CHECK_SECS")
+    common::legacy_compatibility::var("BERRYKEEP_NODE_ENROLLMENT_RENEWAL_CHECK_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -6015,11 +6039,11 @@ impl ServerNodeConfig {
             metadata_backend,
             bind_addr,
             public_url: bootstrap.public_url,
-            s3_bind_addr: std::env::var("IRONMESH_S3_BIND")
+            s3_bind_addr: common::legacy_compatibility::var("BERRYKEEP_S3_BIND")
                 .ok()
-                .map(|value| value.parse().context("invalid IRONMESH_S3_BIND"))
+                .map(|value| value.parse().context("invalid BERRYKEEP_S3_BIND"))
                 .transpose()?,
-            s3_public_url: std::env::var("IRONMESH_S3_PUBLIC_URL").ok(),
+            s3_public_url: common::legacy_compatibility::var("BERRYKEEP_S3_PUBLIC_URL").ok(),
             labels: bootstrap.labels,
             public_tls,
             allow_insecure_public_http,
@@ -6044,96 +6068,114 @@ impl ServerNodeConfig {
             node_enrollment_path: None,
             node_enrollment_auto_renew_enabled: false,
             node_enrollment_auto_renew_check_secs: node_enrollment_auto_renew_check_secs(),
-            heartbeat_timeout_secs: std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(90),
-            audit_interval_secs: std::env::var("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(3600),
-            replica_view_sync_interval_secs: std::env::var(
-                "IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS",
+            heartbeat_timeout_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_HEARTBEAT_TIMEOUT_SECS",
+            )
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(90),
+            audit_interval_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS",
+            )
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(3600),
+            replica_view_sync_interval_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS",
             )
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS),
-            replication_factor: std::env::var("IRONMESH_REPLICATION_FACTOR")
+            replication_factor: common::legacy_compatibility::var("BERRYKEEP_REPLICATION_FACTOR")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(3),
-            accepted_over_replication_items: std::env::var(
-                "IRONMESH_ACCEPTED_OVER_REPLICATION_ITEMS",
+            accepted_over_replication_items: common::legacy_compatibility::var(
+                "BERRYKEEP_ACCEPTED_OVER_REPLICATION_ITEMS",
             )
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0),
             metadata_commit_mode: MetadataCommitMode::parse(
-                std::env::var("IRONMESH_METADATA_COMMIT_MODE")
+                common::legacy_compatibility::var("BERRYKEEP_METADATA_COMMIT_MODE")
                     .unwrap_or_else(|_| "local".to_string())
                     .as_str(),
             )?,
-            autonomous_replication_on_put_enabled: std::env::var(
-                "IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED",
+            autonomous_replication_on_put_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED",
             )
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
             .unwrap_or(true),
-            replication_repair_enabled: std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
-            replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(256),
-            replication_repair_max_retries: std::env::var(
-                "IRONMESH_REPLICATION_REPAIR_MAX_RETRIES",
+            replication_repair_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            replication_repair_batch_size: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_BATCH_SIZE",
+            )
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(256),
+            replication_repair_max_retries: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_MAX_RETRIES",
             )
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(3),
-            replication_repair_backoff_secs: std::env::var(
-                "IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS",
+            replication_repair_backoff_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_BACKOFF_SECS",
             )
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30),
-            repair_busy_throttle_enabled: std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
-            repair_busy_inflight_threshold: std::env::var(
-                "IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD",
+            repair_busy_throttle_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_REPAIR_BUSY_THROTTLE_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            repair_busy_inflight_threshold: common::legacy_compatibility::var(
+                "BERRYKEEP_REPAIR_BUSY_INFLIGHT_THRESHOLD",
             )
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(32),
-            repair_busy_wait_millis: std::env::var("IRONMESH_REPAIR_BUSY_WAIT_MILLIS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(100),
-            startup_repair_enabled: std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
-            startup_repair_delay_secs: std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(5),
-            peer_heartbeat_enabled: std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
-            peer_heartbeat_interval_secs: std::env::var(
-                "IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS",
+            repair_busy_wait_millis: common::legacy_compatibility::var(
+                "BERRYKEEP_REPAIR_BUSY_WAIT_MILLIS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(100),
+            startup_repair_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_STARTUP_REPAIR_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            startup_repair_delay_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_STARTUP_REPAIR_DELAY_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5),
+            peer_heartbeat_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            peer_heartbeat_interval_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS",
             )
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(15),
-            admin_token: std::env::var("IRONMESH_ADMIN_TOKEN")
+            admin_token: common::legacy_compatibility::var("BERRYKEEP_ADMIN_TOKEN")
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
@@ -6143,7 +6185,7 @@ impl ServerNodeConfig {
     }
 
     pub fn from_env() -> Result<Self> {
-        if let Some(path) = std::env::var("IRONMESH_NODE_ENROLLMENT_FILE")
+        if let Some(path) = common::legacy_compatibility::var("BERRYKEEP_NODE_ENROLLMENT_FILE")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -6151,7 +6193,7 @@ impl ServerNodeConfig {
             return Self::from_enrollment_path(path);
         }
 
-        if let Some(path) = std::env::var("IRONMESH_NODE_BOOTSTRAP_FILE")
+        if let Some(path) = common::legacy_compatibility::var("BERRYKEEP_NODE_BOOTSTRAP_FILE")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -6164,26 +6206,27 @@ impl ServerNodeConfig {
         let allow_unauthenticated_clients = env_flag_enabled(ALLOW_UNAUTHENTICATED_CLIENTS_ENV);
         let require_client_auth = parse_require_client_auth_env(allow_unauthenticated_clients);
 
-        let node_id = std::env::var("IRONMESH_NODE_ID")
+        let node_id = common::legacy_compatibility::var("BERRYKEEP_NODE_ID")
             .ok()
             .and_then(|value| value.parse::<NodeId>().ok())
             .unwrap_or_else(NodeId::new_v4);
-        let cluster_id = std::env::var("IRONMESH_CLUSTER_ID")
+        let cluster_id = common::legacy_compatibility::var("BERRYKEEP_CLUSTER_ID")
             .ok()
             .and_then(|value| value.parse::<ClusterId>().ok())
             .unwrap_or_else(Uuid::now_v7);
 
         let data_dir = PathBuf::from(
-            std::env::var("IRONMESH_DATA_DIR").unwrap_or_else(|_| "./data/server-node".to_string()),
+            common::legacy_compatibility::var("BERRYKEEP_DATA_DIR")
+                .unwrap_or_else(|_| "./data/server-node".to_string()),
         );
-        let bind_addr: SocketAddr = std::env::var("IRONMESH_SERVER_BIND")
+        let bind_addr: SocketAddr = common::legacy_compatibility::var("BERRYKEEP_SERVER_BIND")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse()
-            .context("invalid IRONMESH_SERVER_BIND")?;
+            .context("invalid BERRYKEEP_SERVER_BIND")?;
 
         let public_tls = match (
-            std::env::var("IRONMESH_PUBLIC_TLS_CERT").ok(),
-            std::env::var("IRONMESH_PUBLIC_TLS_KEY").ok(),
+            common::legacy_compatibility::var("BERRYKEEP_PUBLIC_TLS_CERT").ok(),
+            common::legacy_compatibility::var("BERRYKEEP_PUBLIC_TLS_KEY").ok(),
         ) {
             (Some(cert), Some(key)) => {
                 let cert_path = PathBuf::from(cert);
@@ -6196,36 +6239,42 @@ impl ServerNodeConfig {
             }
             (None, None) => None,
             _ => {
-                bail!("IRONMESH_PUBLIC_TLS_CERT and IRONMESH_PUBLIC_TLS_KEY must be set together")
+                bail!("BERRYKEEP_PUBLIC_TLS_CERT and BERRYKEEP_PUBLIC_TLS_KEY must be set together")
             }
         };
 
-        let public_url = std::env::var("IRONMESH_PUBLIC_URL").ok().or_else(|| {
-            let scheme = if public_tls.is_some() {
-                "https"
-            } else {
-                "http"
-            };
-            Some(format!("{scheme}://{bind_addr}"))
-        });
-        let s3_bind_addr: Option<SocketAddr> = std::env::var("IRONMESH_S3_BIND")
+        let public_url = common::legacy_compatibility::var("BERRYKEEP_PUBLIC_URL")
             .ok()
-            .map(|value| value.parse().context("invalid IRONMESH_S3_BIND"))
-            .transpose()?;
-        let s3_public_url = std::env::var("IRONMESH_S3_PUBLIC_URL").ok().or_else(|| {
-            s3_bind_addr.map(|addr| default_public_url(&addr.to_string(), public_tls.is_some()))
-        });
-        let explicit_rendezvous_urls = std::env::var("IRONMESH_RENDEZVOUS_URLS")
+            .or_else(|| {
+                let scheme = if public_tls.is_some() {
+                    "https"
+                } else {
+                    "http"
+                };
+                Some(format!("{scheme}://{bind_addr}"))
+            });
+        let s3_bind_addr: Option<SocketAddr> =
+            common::legacy_compatibility::var("BERRYKEEP_S3_BIND")
+                .ok()
+                .map(|value| value.parse().context("invalid BERRYKEEP_S3_BIND"))
+                .transpose()?;
+        let s3_public_url = common::legacy_compatibility::var("BERRYKEEP_S3_PUBLIC_URL")
             .ok()
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|urls| !urls.is_empty());
+            .or_else(|| {
+                s3_bind_addr.map(|addr| default_public_url(&addr.to_string(), public_tls.is_some()))
+            });
+        let explicit_rendezvous_urls =
+            common::legacy_compatibility::var("BERRYKEEP_RENDEZVOUS_URLS")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|urls| !urls.is_empty());
         let rendezvous_registration_enabled = explicit_rendezvous_urls.is_some();
         let global_rendezvous_registration_enabled =
             env_flag_enabled(GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED_ENV);
@@ -6233,38 +6282,41 @@ impl ServerNodeConfig {
             .clone()
             .or_else(|| public_url.as_ref().map(|url| vec![url.clone()]))
             .unwrap_or_default();
-        let rendezvous_ca_cert_path = std::env::var("IRONMESH_RENDEZVOUS_CA_CERT")
-            .ok()
-            .map(PathBuf::from);
-        let rendezvous_mtls_required = std::env::var("IRONMESH_RENDEZVOUS_MTLS_REQUIRED")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(false);
+        let rendezvous_ca_cert_path =
+            common::legacy_compatibility::var("BERRYKEEP_RENDEZVOUS_CA_CERT")
+                .ok()
+                .map(PathBuf::from);
+        let rendezvous_mtls_required =
+            common::legacy_compatibility::var("BERRYKEEP_RENDEZVOUS_MTLS_REQUIRED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(false);
         let relay_mode = parse_relay_mode(
-            std::env::var("IRONMESH_RELAY_MODE")
+            common::legacy_compatibility::var("BERRYKEEP_RELAY_MODE")
                 .unwrap_or_else(|_| "fallback".to_string())
                 .as_str(),
         )?;
 
-        let internal_bind_addr: SocketAddr = std::env::var("IRONMESH_INTERNAL_BIND")
-            .unwrap_or_else(|_| "127.0.0.1:18080".to_string())
-            .parse()
-            .context("invalid IRONMESH_INTERNAL_BIND")?;
+        let internal_bind_addr: SocketAddr =
+            common::legacy_compatibility::var("BERRYKEEP_INTERNAL_BIND")
+                .unwrap_or_else(|_| "127.0.0.1:18080".to_string())
+                .parse()
+                .context("invalid BERRYKEEP_INTERNAL_BIND")?;
         let ca_cert_path = PathBuf::from(
-            std::env::var("IRONMESH_INTERNAL_TLS_CA_CERT")
-                .context("missing IRONMESH_INTERNAL_TLS_CA_CERT")?,
+            common::legacy_compatibility::var("BERRYKEEP_INTERNAL_TLS_CA_CERT")
+                .context("missing BERRYKEEP_INTERNAL_TLS_CA_CERT")?,
         );
         let cert_path = PathBuf::from(
-            std::env::var("IRONMESH_INTERNAL_TLS_CERT")
-                .context("missing IRONMESH_INTERNAL_TLS_CERT")?,
+            common::legacy_compatibility::var("BERRYKEEP_INTERNAL_TLS_CERT")
+                .context("missing BERRYKEEP_INTERNAL_TLS_CERT")?,
         );
         let key_path = PathBuf::from(
-            std::env::var("IRONMESH_INTERNAL_TLS_KEY")
-                .context("missing IRONMESH_INTERNAL_TLS_KEY")?,
+            common::legacy_compatibility::var("BERRYKEEP_INTERNAL_TLS_KEY")
+                .context("missing BERRYKEEP_INTERNAL_TLS_KEY")?,
         );
         let internal_tls = Some(InternalTlsConfig {
             bind_addr: internal_bind_addr,
-            internal_url: std::env::var("IRONMESH_INTERNAL_URL")
+            internal_url: common::legacy_compatibility::var("BERRYKEEP_INTERNAL_URL")
                 .ok()
                 .or_else(|| Some(format!("https://{internal_bind_addr}"))),
             metadata_path: existing_tls_metadata_sidecar_path(&cert_path),
@@ -6276,26 +6328,30 @@ impl ServerNodeConfig {
         let mut labels = HashMap::new();
         labels.insert(
             "region".to_string(),
-            std::env::var("IRONMESH_REGION").unwrap_or_else(|_| "local".to_string()),
+            common::legacy_compatibility::var("BERRYKEEP_REGION")
+                .unwrap_or_else(|_| "local".to_string()),
         );
         labels.insert(
             "dc".to_string(),
-            std::env::var("IRONMESH_DC").unwrap_or_else(|_| "local-dc".to_string()),
+            common::legacy_compatibility::var("BERRYKEEP_DC")
+                .unwrap_or_else(|_| "local-dc".to_string()),
         );
         labels.insert(
             "rack".to_string(),
-            std::env::var("IRONMESH_RACK").unwrap_or_else(|_| "local-rack".to_string()),
+            common::legacy_compatibility::var("BERRYKEEP_RACK")
+                .unwrap_or_else(|_| "local-rack".to_string()),
         );
-        if let Some(raw_priority) = std::env::var("IRONMESH_NODE_CONNECTION_PRIORITY")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        if let Some(raw_priority) =
+            common::legacy_compatibility::var("BERRYKEEP_NODE_CONNECTION_PRIORITY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
         {
             let priority = raw_priority
                 .parse::<i16>()
-                .context("invalid IRONMESH_NODE_CONNECTION_PRIORITY")?;
+                .context("invalid BERRYKEEP_NODE_CONNECTION_PRIORITY")?;
             transport_sdk::validate_node_connection_priority(priority)
-                .context("invalid IRONMESH_NODE_CONNECTION_PRIORITY")?;
+                .context("invalid BERRYKEEP_NODE_CONNECTION_PRIORITY")?;
             if priority != 0 {
                 labels.insert(
                     transport_sdk::NODE_CONNECTION_PRIORITY_LABEL.to_string(),
@@ -6305,10 +6361,11 @@ impl ServerNodeConfig {
         }
 
         let default_replication_factor = 3;
-        let public_peer_api_enabled = std::env::var("IRONMESH_PUBLIC_PEER_API_ENABLED")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-            .unwrap_or(false);
+        let public_peer_api_enabled =
+            common::legacy_compatibility::var("BERRYKEEP_PUBLIC_PEER_API_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+                .unwrap_or(false);
         let advertised_direct_endpoints = effective_direct_endpoints(
             public_url.as_deref(),
             internal_tls
@@ -6333,19 +6390,21 @@ impl ServerNodeConfig {
             labels,
             public_tls,
             allow_insecure_public_http,
-            public_ca_cert_path: std::env::var("IRONMESH_PUBLIC_TLS_CA_CERT")
+            public_ca_cert_path: common::legacy_compatibility::var("BERRYKEEP_PUBLIC_TLS_CA_CERT")
                 .ok()
                 .map(PathBuf::from),
-            public_ca_key_path: std::env::var("IRONMESH_PUBLIC_TLS_CA_KEY")
+            public_ca_key_path: common::legacy_compatibility::var("BERRYKEEP_PUBLIC_TLS_CA_KEY")
                 .ok()
                 .map(PathBuf::from),
             bootstrap_trust_roots: None,
             advertised_direct_endpoints,
             public_peer_api_enabled,
             internal_tls,
-            internal_ca_key_path: std::env::var("IRONMESH_INTERNAL_TLS_CA_KEY")
-                .ok()
-                .map(PathBuf::from),
+            internal_ca_key_path: common::legacy_compatibility::var(
+                "BERRYKEEP_INTERNAL_TLS_CA_KEY",
+            )
+            .ok()
+            .map(PathBuf::from),
             local_status_bind_addr: parse_local_status_bind_addr()?,
             rendezvous_ca_cert_path,
             rendezvous_urls,
@@ -6358,96 +6417,114 @@ impl ServerNodeConfig {
             node_enrollment_path: None,
             node_enrollment_auto_renew_enabled: false,
             node_enrollment_auto_renew_check_secs: node_enrollment_auto_renew_check_secs(),
-            heartbeat_timeout_secs: std::env::var("IRONMESH_HEARTBEAT_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(90),
-            audit_interval_secs: std::env::var("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(default_audit_interval_secs),
-            replica_view_sync_interval_secs: std::env::var(
-                "IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS",
+            heartbeat_timeout_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_HEARTBEAT_TIMEOUT_SECS",
+            )
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(90),
+            audit_interval_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS",
+            )
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(default_audit_interval_secs),
+            replica_view_sync_interval_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS",
             )
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(DEFAULT_REPLICA_VIEW_SYNC_INTERVAL_SECS),
-            replication_factor: std::env::var("IRONMESH_REPLICATION_FACTOR")
+            replication_factor: common::legacy_compatibility::var("BERRYKEEP_REPLICATION_FACTOR")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(default_replication_factor),
-            accepted_over_replication_items: std::env::var(
-                "IRONMESH_ACCEPTED_OVER_REPLICATION_ITEMS",
+            accepted_over_replication_items: common::legacy_compatibility::var(
+                "BERRYKEEP_ACCEPTED_OVER_REPLICATION_ITEMS",
             )
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0),
             metadata_commit_mode: MetadataCommitMode::parse(
-                std::env::var("IRONMESH_METADATA_COMMIT_MODE")
+                common::legacy_compatibility::var("BERRYKEEP_METADATA_COMMIT_MODE")
                     .unwrap_or_else(|_| "local".to_string())
                     .as_str(),
             )?,
-            autonomous_replication_on_put_enabled: std::env::var(
-                "IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED",
+            autonomous_replication_on_put_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED",
             )
             .ok()
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
             .unwrap_or(true),
-            replication_repair_enabled: std::env::var("IRONMESH_REPLICATION_REPAIR_ENABLED")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
-            replication_repair_batch_size: std::env::var("IRONMESH_REPLICATION_REPAIR_BATCH_SIZE")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(256),
-            replication_repair_max_retries: std::env::var(
-                "IRONMESH_REPLICATION_REPAIR_MAX_RETRIES",
+            replication_repair_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            replication_repair_batch_size: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_BATCH_SIZE",
+            )
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(256),
+            replication_repair_max_retries: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_MAX_RETRIES",
             )
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(3),
-            replication_repair_backoff_secs: std::env::var(
-                "IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS",
+            replication_repair_backoff_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_BACKOFF_SECS",
             )
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(default_replication_repair_backoff_secs),
-            repair_busy_throttle_enabled: std::env::var("IRONMESH_REPAIR_BUSY_THROTTLE_ENABLED")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
-            repair_busy_inflight_threshold: std::env::var(
-                "IRONMESH_REPAIR_BUSY_INFLIGHT_THRESHOLD",
+            repair_busy_throttle_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_REPAIR_BUSY_THROTTLE_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            repair_busy_inflight_threshold: common::legacy_compatibility::var(
+                "BERRYKEEP_REPAIR_BUSY_INFLIGHT_THRESHOLD",
             )
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(32),
-            repair_busy_wait_millis: std::env::var("IRONMESH_REPAIR_BUSY_WAIT_MILLIS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(100),
-            startup_repair_enabled: std::env::var("IRONMESH_STARTUP_REPAIR_ENABLED")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
-            startup_repair_delay_secs: std::env::var("IRONMESH_STARTUP_REPAIR_DELAY_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(5),
-            peer_heartbeat_enabled: std::env::var("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED")
-                .ok()
-                .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true),
-            peer_heartbeat_interval_secs: std::env::var(
-                "IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS",
+            repair_busy_wait_millis: common::legacy_compatibility::var(
+                "BERRYKEEP_REPAIR_BUSY_WAIT_MILLIS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(100),
+            startup_repair_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_STARTUP_REPAIR_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            startup_repair_delay_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_STARTUP_REPAIR_DELAY_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5),
+            peer_heartbeat_enabled: common::legacy_compatibility::var(
+                "BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED",
+            )
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
+            .unwrap_or(true),
+            peer_heartbeat_interval_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS",
             )
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(15),
-            admin_token: std::env::var("IRONMESH_ADMIN_TOKEN")
+            admin_token: common::legacy_compatibility::var("BERRYKEEP_ADMIN_TOKEN")
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
@@ -6462,7 +6539,7 @@ impl ServerNodeConfig {
         }
 
         bail!(
-            "berrykeep-server-node refuses insecure public HTTP startup without TLS; configure IRONMESH_PUBLIC_TLS_CERT plus IRONMESH_PUBLIC_TLS_KEY, or set {ALLOW_INSECURE_PUBLIC_HTTP_ENV}=true for local development/testing only"
+            "berrykeep-server-node refuses insecure public HTTP startup without TLS; configure BERRYKEEP_PUBLIC_TLS_CERT plus BERRYKEEP_PUBLIC_TLS_KEY, or set {ALLOW_INSECURE_PUBLIC_HTTP_ENV}=true for local development/testing only"
         )
     }
 
@@ -6614,7 +6691,7 @@ fn wait_for_local_node_ready(
 }
 
 fn runtime_log_filter_from_env(default_directive: &str) -> (EnvFilter, String) {
-    match std::env::var(EnvFilter::DEFAULT_ENV) {
+    match common::legacy_compatibility::var(EnvFilter::DEFAULT_ENV) {
         Ok(value) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -7229,7 +7306,7 @@ async fn run_inner(
         .map(|path| {
             std::fs::read_to_string(&path).with_context(|| {
                 format!(
-                    "failed reading IRONMESH_PUBLIC_TLS_CA_CERT from {}",
+                    "failed reading BERRYKEEP_PUBLIC_TLS_CA_CERT from {}",
                     path.display()
                 )
             })
@@ -7370,12 +7447,12 @@ async fn run_inner(
         load_map_dataset_import_phase_started_at,
     );
 
-    let map_perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
+    let map_perf_logging_enabled = env_flag_is_truthy("BERRYKEEP_MAP_PERF_LOG");
     if map_perf_logging_enabled {
-        info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
+        info!("map performance logging enabled via BERRYKEEP_MAP_PERF_LOG");
     }
     let storage_stats_history_retention_secs = env_u64_or(
-        "IRONMESH_STORAGE_STATS_HISTORY_RETENTION_SECS",
+        "BERRYKEEP_STORAGE_STATS_HISTORY_RETENTION_SECS",
         STORAGE_STATS_HISTORY_RETENTION_SECS,
     );
     if storage_stats_history_retention_secs != STORAGE_STATS_HISTORY_RETENTION_SECS {
@@ -7384,9 +7461,9 @@ async fn run_inner(
             "storage stats history retention override enabled"
         );
     }
-    let data_scrub_enabled = env_flag_or("IRONMESH_DATA_SCRUB_ENABLED", true);
+    let data_scrub_enabled = env_flag_or("BERRYKEEP_DATA_SCRUB_ENABLED", true);
     let data_scrub_interval_secs = env_u64_or(
-        "IRONMESH_DATA_SCRUB_INTERVAL_SECS",
+        "BERRYKEEP_DATA_SCRUB_INTERVAL_SECS",
         DATA_SCRUB_INTERVAL_SECS,
     );
     if data_scrub_interval_secs != DATA_SCRUB_INTERVAL_SECS {
@@ -7396,7 +7473,7 @@ async fn run_inner(
         );
     }
     let data_scrub_history_retention_secs = env_u64_or(
-        "IRONMESH_DATA_SCRUB_HISTORY_RETENTION_SECS",
+        "BERRYKEEP_DATA_SCRUB_HISTORY_RETENTION_SECS",
         DATA_SCRUB_HISTORY_RETENTION_SECS,
     );
     if data_scrub_history_retention_secs != DATA_SCRUB_HISTORY_RETENTION_SECS {
@@ -7406,10 +7483,10 @@ async fn run_inner(
         );
     }
     if !data_scrub_enabled {
-        info!("background data scrubbing disabled via IRONMESH_DATA_SCRUB_ENABLED");
+        info!("background data scrubbing disabled via BERRYKEEP_DATA_SCRUB_ENABLED");
     }
     let repair_run_history_retention_secs = env_u64_or(
-        "IRONMESH_REPAIR_RUN_HISTORY_RETENTION_SECS",
+        "BERRYKEEP_REPAIR_RUN_HISTORY_RETENTION_SECS",
         REPAIR_RUN_HISTORY_RETENTION_SECS,
     );
     if repair_run_history_retention_secs != REPAIR_RUN_HISTORY_RETENTION_SECS {
@@ -8190,7 +8267,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
 
     let public_app = Router::new()
         .route("/", get(ui::index))
-        .route("/ironmesh-favicon.svg", get(ui::favicon))
+        .route("/berrykeep-favicon.svg", get(ui::favicon))
         .route("/assets/{*path}", get(ui::static_asset))
         .route("/ui/assets/{*path}", get(ui::static_asset))
         .route("/ui/app.css", get(ui::app_css))
@@ -13057,22 +13134,22 @@ async fn latency_diagnostic(
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
     headers.insert(
-        "x-ironmesh-latency-node-id",
+        "x-berrykeep-latency-node-id",
         HeaderValue::from_str(&state.node_id.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
     );
     headers.insert(
-        "x-ironmesh-latency-response-bytes",
+        "x-berrykeep-latency-response-bytes",
         HeaderValue::from_str(&response_bytes.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
     headers.insert(
-        "x-ironmesh-latency-server-duration-ms",
+        "x-berrykeep-latency-server-duration-ms",
         HeaderValue::from_str(&server_duration_ms.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
     headers.insert(
-        "x-ironmesh-latency-started-unix-ms",
+        "x-berrykeep-latency-started-unix-ms",
         HeaderValue::from_str(&started_unix_ms.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
@@ -17771,12 +17848,12 @@ fn with_store_index_response_headers(
     if let Ok(header_value) = HeaderValue::from_str(&namespace_change_sequence.to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-change-sequence", header_value);
+            .insert("x-berrykeep-change-sequence", header_value);
     }
     if let Ok(header_value) = HeaderValue::from_str(&request_id.to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-store-index-request-id", header_value);
+            .insert("x-berrykeep-store-index-request-id", header_value);
     }
     if let Ok(header_value) = HeaderValue::from_str(&server_timing) {
         response.headers_mut().insert("server-timing", header_value);
@@ -17784,17 +17861,17 @@ fn with_store_index_response_headers(
     if let Ok(header_value) = HeaderValue::from_str(&matching_key_count.to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-store-index-matching-keys", header_value);
+            .insert("x-berrykeep-store-index-matching-keys", header_value);
     }
     if let Ok(header_value) = HeaderValue::from_str(&visible_file_count.to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-store-index-visible-files", header_value);
+            .insert("x-berrykeep-store-index-visible-files", header_value);
     }
     if let Ok(header_value) = HeaderValue::from_str(&materialized_entry_count.to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-store-index-materialized-entries", header_value);
+            .insert("x-berrykeep-store-index-materialized-entries", header_value);
     }
     response
 }
@@ -18949,12 +19026,12 @@ async fn list_store_index_response_cursor_mode(
     if let Ok(header_value) = HeaderValue::from_str(&change_sequence.to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-change-sequence", header_value);
+            .insert("x-berrykeep-change-sequence", header_value);
     }
     if let Ok(header_value) = HeaderValue::from_str(&request_id.to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-store-index-request-id", header_value);
+            .insert("x-berrykeep-store-index-request-id", header_value);
     }
     let server_timing = format!(
         "snapshot-scan;dur={snapshot_scan_ms}, entry-plan;dur=0, content-summary-lookup;dur={content_summary_lookup_ms}, modified-time-lookup;dur={modified_time_lookup_ms}, metadata-lookup;dur={metadata_lookup_ms}, media-lookup;dur={media_lookup_ms}, gps-projection-lookup;dur={gps_lookup_ms}, tree-collapse;dur=0, filter;dur=0, sort;dur=0, paginate;dur={pagination_ms}, total;dur={total_ms}"
@@ -18965,12 +19042,12 @@ async fn list_store_index_response_cursor_mode(
     if let Ok(header_value) = HeaderValue::from_str(&keys.len().to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-store-index-matching-keys", header_value);
+            .insert("x-berrykeep-store-index-matching-keys", header_value);
     }
     if let Ok(header_value) = HeaderValue::from_str(&visible_file_paths.len().to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-store-index-visible-files", header_value);
+            .insert("x-berrykeep-store-index-visible-files", header_value);
     }
     response
 }
@@ -19786,7 +19863,7 @@ fn add_object_common_headers(
     if let Ok(value) = HeaderValue::from_str(&total_size_bytes.to_string()) {
         response
             .headers_mut()
-            .insert("x-ironmesh-object-size", value);
+            .insert("x-berrykeep-object-size", value);
     }
     if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
         response.headers_mut().insert(header::CONTENT_LENGTH, value);
@@ -23613,14 +23690,24 @@ fn build_internal_node_subject_alt_names(
 ) -> Result<Vec<SanType>> {
     Ok(vec![
         SanType::URI(
-            format!("urn:ironmesh:node:{}", bootstrap.node_id)
+            format!("urn:berrykeep:node:{}", bootstrap.node_id)
                 .try_into()
                 .context("invalid node identity URI SAN")?,
         ),
         SanType::URI(
-            format!("urn:ironmesh:cluster:{}", bootstrap.cluster_id)
+            format!("urn:berrykeep:cluster:{}", bootstrap.cluster_id)
                 .try_into()
                 .context("invalid cluster identity URI SAN")?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:node:{}", bootstrap.node_id)
+                .try_into()
+                .context("invalid legacy node identity URI SAN")?,
+        ),
+        SanType::URI(
+            format!("urn:ironmesh:cluster:{}", bootstrap.cluster_id)
+                .try_into()
+                .context("invalid legacy cluster identity URI SAN")?,
         ),
     ])
 }
@@ -23697,7 +23784,7 @@ fn extract_public_node_subject_alt_names_from_cert_pem(cert_pem: &str) -> Result
                             subject_alt_names.push(SanType::IpAddress(ip_addr));
                         }
                     }
-                    // Public node certificates also carry IronMesh node and cluster URI
+                    // Public node certificates also carry BerryKeep node and cluster URI
                     // SANs.  They are reconstructed from the authenticated enrollment
                     // identity below rather than copied from an old certificate.
                     x509_parser::extensions::GeneralName::URI(_) => {}
@@ -23741,7 +23828,7 @@ fn issue_internal_node_tls_material_for_identity(
     params.distinguished_name = DistinguishedName::new();
     params
         .distinguished_name
-        .push(DnType::CommonName, format!("ironmesh-node-{node_id}"));
+        .push(DnType::CommonName, format!("berrykeep-node-{node_id}"));
     params.is_ca = IsCa::NoCa;
     params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -23752,6 +23839,16 @@ fn issue_internal_node_tls_material_for_identity(
         ExtendedKeyUsagePurpose::ServerAuth,
     ];
     params.subject_alt_names = vec![
+        SanType::URI(
+            format!("urn:berrykeep:node:{node_id}")
+                .try_into()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        ),
+        SanType::URI(
+            format!("urn:berrykeep:cluster:{cluster_id}")
+                .try_into()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        ),
         SanType::URI(
             format!("urn:ironmesh:node:{node_id}")
                 .try_into()
@@ -23812,16 +23909,26 @@ fn issue_public_node_tls_material_with_subject_alt_names(
     params.distinguished_name = DistinguishedName::new();
     params
         .distinguished_name
-        .push(DnType::CommonName, format!("ironmesh-public-{node_id}"));
+        .push(DnType::CommonName, format!("berrykeep-public-{node_id}"));
     params.is_ca = IsCa::NoCa;
     params.not_before = OffsetDateTime::from_unix_timestamp(policy.not_before_unix as i64)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     params.not_after = OffsetDateTime::from_unix_timestamp(policy.not_after_unix as i64)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    // URLs are mutable reachability locators.  IronMesh direct clients bind the
+    // URLs are mutable reachability locators.  BerryKeep direct clients bind the
     // connection to these immutable URI SANs, while ordinary HTTPS clients can
     // continue to use any DNS/IP SANs supplied above.
+    subject_alt_names.push(SanType::URI(
+        format!("urn:berrykeep:node:{node_id}")
+            .try_into()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+    ));
+    subject_alt_names.push(SanType::URI(
+        format!("urn:berrykeep:cluster:{}", state.cluster_id)
+            .try_into()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+    ));
     subject_alt_names.push(SanType::URI(
         format!("urn:ironmesh:node:{node_id}")
             .try_into()
@@ -30900,15 +31007,23 @@ fn jittered_backoff_secs(base_backoff_secs: u64, transfer_key: &str, attempts: u
     base_backoff_secs.saturating_add(jitter)
 }
 
-const ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
-const ADMIN_ACTOR_HEADER: &str = "x-ironmesh-admin-actor";
-const ADMIN_SOURCE_NODE_HEADER: &str = "x-ironmesh-node-id";
-const ADMIN_SESSION_COOKIE_PREFIX: &str = "ironmesh_admin_session";
+const ADMIN_TOKEN_HEADER: &str = "x-berrykeep-admin-token";
+const LEGACY_ADMIN_TOKEN_HEADER: &str = "x-ironmesh-admin-token";
+const ADMIN_ACTOR_HEADER: &str = "x-berrykeep-admin-actor";
+const ADMIN_SOURCE_NODE_HEADER: &str = "x-berrykeep-node-id";
+const ADMIN_SESSION_COOKIE_PREFIX: &str = "berrykeep_admin_session";
 
 #[derive(Debug, Clone)]
 struct AdminRequestMetadata {
     actor: Option<String>,
     source_node: Option<String>,
+}
+
+fn admin_token_header_value(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(ADMIN_TOKEN_HEADER)
+        .or_else(|| headers.get(LEGACY_ADMIN_TOKEN_HEADER))
+        .and_then(|value| value.to_str().ok())
 }
 
 fn admin_request_metadata(headers: &HeaderMap) -> AdminRequestMetadata {
@@ -31078,14 +31193,7 @@ async fn get_admin_session_status(
         .admin_control
         .admin_token
         .as_deref()
-        .map(|expected| {
-            token_matches(
-                expected,
-                headers
-                    .get(ADMIN_TOKEN_HEADER)
-                    .and_then(|value| value.to_str().ok()),
-            )
-        })
+        .map(|expected| token_matches(expected, admin_token_header_value(&headers)))
         .unwrap_or(false);
     let session_expires_at_unix = current_admin_session_expiry(&state, &headers).await;
     let authenticated = token_valid || session_expires_at_unix.is_some();
@@ -31461,14 +31569,7 @@ async fn authorize_admin_request(
         .admin_control
         .admin_token
         .as_deref()
-        .map(|expected| {
-            token_matches(
-                expected,
-                headers
-                    .get(ADMIN_TOKEN_HEADER)
-                    .and_then(|value| value.to_str().ok()),
-            )
-        })
+        .map(|expected| token_matches(expected, admin_token_header_value(headers)))
         .unwrap_or(false);
     let session_expires_at_unix = current_admin_session_expiry(state, headers).await;
 

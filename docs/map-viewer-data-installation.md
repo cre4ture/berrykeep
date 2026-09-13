@@ -1,6 +1,6 @@
 # Gallery Map Packages
 
-IronMesh keeps gallery map selection in the cluster object
+BerryKeep keeps gallery map selection in the cluster object
 `sys/maps/gallery-map-config.json`. The selected map and its artifact keys are
 therefore identical regardless of which server node an administrator or client
 uses. The object is confirmed, replicated, versioned, and published using the
@@ -115,7 +115,7 @@ be replaced while other imported profiles remain available. The wizard shows
 the current or most recently completed job below the steps.
 
 The importer requires HTTP range requests. It streams the source directly into
-IronMesh chunks, checkpoints after at most 64 MiB of input, and resumes an
+BerryKeep chunks, checkpoints after at most 64 MiB of input, and resumes an
 unfinished job after the server node restarts. It publishes the generated
 split-file manifest only after all parts are complete.
 
@@ -142,7 +142,7 @@ parts are stored.
 This automatic path has no administrator-provided URL or converter arguments.
 It requires `unzip`, `gdal_rasterize`, `gdalwarp`, `gdal_translate`, and
 `gdaladdo` on the server `PATH`. On Debian-family systems, install
-`ironmesh-server-node-map-tools` to add `unzip` and `gdal-bin`; other
+`berrykeep-server-node-map-tools` to add `unzip` and `gdal-bin`; other
 deployments must provide the same tools. The existing manual import remains
 appropriate for a custom physical rendering or data from another provider.
 
@@ -218,7 +218,7 @@ the import wizard and paste the authorized HTTP(S) MBTiles URL or copied
 `wget -c ...` command from [MapTiler](https://www.maptiler.com/). The server then downloads,
 resumes, validates, and publishes the package through the normal background
 import job, with the configured `openmaptiles-street` vector artifact selected
-automatically. Provider URLs are account- and license-specific, so IronMesh
+automatically. Provider URLs are account- and license-specific, so BerryKeep
 does not embed a shared download token.
 
 MapTiler satellite MBTiles are supported too: select **An existing MBTiles

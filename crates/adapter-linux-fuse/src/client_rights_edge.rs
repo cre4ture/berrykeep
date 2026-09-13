@@ -2,7 +2,7 @@
 
 use crate::runtime::ReplayAction;
 use anyhow::{Context, Result, anyhow};
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use common::range_chunk_cache::RangeChunkCache;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -461,7 +461,7 @@ impl ClientRightsEdgeState {
     pub fn spawn_sync_loop(
         self: &Arc<Self>,
         running: Arc<AtomicBool>,
-        client: IronMeshClient,
+        client: BerryKeepClient,
         retry_interval: Duration,
     ) -> JoinHandle<()> {
         let state = Arc::clone(self);
@@ -487,7 +487,7 @@ impl ClientRightsEdgeState {
         })
     }
 
-    pub fn try_apply_queued_mutation_now(&self, client: &IronMeshClient, id: u64) -> Result<bool> {
+    pub fn try_apply_queued_mutation_now(&self, client: &BerryKeepClient, id: u64) -> Result<bool> {
         let _apply_guard = self
             .apply_lock
             .lock()
@@ -519,7 +519,7 @@ impl ClientRightsEdgeState {
 
     fn apply_next_pending_mutation(
         &self,
-        client: &IronMeshClient,
+        client: &BerryKeepClient,
     ) -> Result<Option<ApplyMutationResult>> {
         let _apply_guard = self
             .apply_lock
@@ -572,7 +572,7 @@ impl ClientRightsEdgeState {
 
     fn apply_mutation(
         &self,
-        client: &IronMeshClient,
+        client: &BerryKeepClient,
         mutation: &PendingMutation,
     ) -> Result<ApplyMutationResult> {
         match &mutation.op {
@@ -1012,7 +1012,7 @@ mod tests {
 
     fn temp_state_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "ironmesh-client-rights-edge-test-{label}-{}",
+            "berrykeep-client-rights-edge-test-{label}-{}",
             unix_ms()
         ));
         fs::create_dir_all(&path).expect("failed to create temp state dir");

@@ -1,13 +1,13 @@
 # NAT Traversal, Rendezvous, and Relay Strategy
 
-Status: Implemented pre-release architecture direction for Ironmesh connectivity across NATed clients and server nodes
+Status: Implemented pre-release architecture direction for BerryKeep connectivity across NATed clients and server nodes
 
 Implementation checklist: `docs/nat-traversal-implementation-checklist.md`
 Direct QUIC + hole punching follow-up: `docs/iroh-direct-quic-integration-plan.md`
 
 ## 1. Problem
 
-Ironmesh needs reliable communication between:
+BerryKeep needs reliable communication between:
 
 - server-node <-> server-node,
 - client/device <-> server-node,
@@ -26,7 +26,7 @@ Requirements:
 
 A rendezvous service is necessary, but not sufficient on its own.
 
-Because Ironmesh is still pre-release, this document describes the target architecture directly.
+Because BerryKeep is still pre-release, this document describes the target architecture directly.
 It does not optimize for backward compatibility, mixed-version clusters, or staged rollout.
 
 Recommended design:
@@ -49,7 +49,7 @@ Use a three-layer connectivity architecture:
 
 ### 3.1 Enrollment and identity layer
 
-Keep the current Ironmesh security direction:
+Keep the current BerryKeep security direction:
 
 - node identities are certificate-backed,
 - clients/devices enroll via pairing/bootstrap,
@@ -101,10 +101,10 @@ But QUIC will not always succeed. Relay fallback is mandatory for guaranteed con
 Current implementation note:
 
 - the relay fallback is now an authenticated WebSocket tunnel that bridges opaque byte streams between peers,
-- Ironmesh currently serializes HTTP/1.1 requests and responses onto that tunnel, so existing APIs and auth flows continue to work without rendezvous parsing per-feature payloads,
+- BerryKeep currently serializes HTTP/1.1 requests and responses onto that tunnel, so existing APIs and auth flows continue to work without rendezvous parsing per-feature payloads,
 - this is intentionally closer to a generic SOCKS-style relay than the earlier JSON/base64 relay envelope.
 
-## 4. Proposed Ironmesh components
+## 4. Proposed BerryKeep components
 
 ### 4.1 Endpoint transport agent
 
@@ -114,7 +114,7 @@ Each server node and client-facing runtime gets a transport agent responsible fo
 - gathering connectivity candidates,
 - selecting the best path,
 - retrying failed paths,
-- exposing a logical "connect to peer" API to the rest of Ironmesh.
+- exposing a logical "connect to peer" API to the rest of BerryKeep.
 
 This agent should hide whether the final path is:
 
@@ -157,8 +157,8 @@ Follow-up design note:
 - That proposal is not implemented yet; the current runtime still models direct peer reachability partly through `public_url` plus the optional public peer API path.
 
 - each node has a Node-CA-signed certificate,
-- SAN contains `urn:ironmesh:node:<uuid>`,
-- optionally also `urn:ironmesh:cluster:<uuid>`,
+- SAN contains `urn:berrykeep:node:<uuid>`,
+- optionally also `urn:berrykeep:cluster:<uuid>`,
 - authorization continues to bind the authenticated identity to URL/path-level node semantics.
 
 Direct mode:
@@ -189,7 +189,7 @@ Current implementation note:
 
 - client-to-node relay traffic also uses the same rendezvous tunnel,
 - rendezvous may authenticate the client connection itself when rendezvous mTLS is enabled,
-- regardless of rendezvous mTLS, request authorization still happens at the Ironmesh endpoint using the existing signed client request model.
+- regardless of rendezvous mTLS, request authorization still happens at the BerryKeep endpoint using the existing signed client request model.
 
 ### 5.3 Relay trust boundary
 
@@ -200,7 +200,7 @@ That means:
 - outer TLS protects endpoint-to-relay transport,
 - inner peer TLS or endpoint-authenticated HTTP semantics protect endpoint-to-endpoint payloads,
 - relay operators cannot impersonate peers without the peer private keys,
-- authorization decisions remain at Ironmesh endpoints, not the relay.
+- authorization decisions remain at BerryKeep endpoints, not the relay.
 
 ## 6. Connection flows
 
@@ -351,7 +351,7 @@ Integration path:
 
 ## 9. Design recommendation
 
-For Ironmesh, the best overall solution is:
+For BerryKeep, the best overall solution is:
 
 - outbound-friendly rendezvous connectivity for reliability,
 - relay support as a built-in transport mode,

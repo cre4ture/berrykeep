@@ -191,7 +191,7 @@ public enum AppleConflictCopyNaming {
         let stem = url.deletingPathExtension().lastPathComponent
         let suffix = stableFingerprint("\(normalized)\n\(expectedRevision)\n\(currentRevision)")
         let extensionSuffix = pathExtension.isEmpty ? "" : ".\(pathExtension)"
-        let copyName = "\(stem) (IronMesh conflict \(suffix))\(extensionSuffix)"
+        let copyName = "\(stem) (BerryKeep conflict \(suffix))\(extensionSuffix)"
         return parent.isEmpty ? copyName : "\(parent)/\(copyName)"
     }
 

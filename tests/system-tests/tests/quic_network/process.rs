@@ -89,25 +89,25 @@ pub(super) fn spawn_rendezvous(
     isolate_network_environment(&mut command);
     command
         .env(
-            "IRONMESH_RENDEZVOUS_BIND",
+            "BERRYKEEP_RENDEZVOUS_BIND",
             format!("0.0.0.0:{RENDEZVOUS_PORT}"),
         )
-        .env("IRONMESH_RENDEZVOUS_PUBLIC_URL", public_url)
-        .env("IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP", "true")
+        .env("BERRYKEEP_RENDEZVOUS_PUBLIC_URL", public_url)
+        .env("BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP", "true")
         .env(
-            "IRONMESH_IROH_RELAY_ENABLED",
+            "BERRYKEEP_IROH_RELAY_ENABLED",
             if iroh_relay_enabled { "true" } else { "false" },
         )
         .env(
-            "IRONMESH_IROH_RELAY_QUIC_BIND",
+            "BERRYKEEP_IROH_RELAY_QUIC_BIND",
             format!("0.0.0.0:{IROH_QAD_PORT}"),
         )
         .env(
-            "IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT",
+            "BERRYKEEP_IROH_RELAY_QUIC_PUBLIC_PORT",
             IROH_QAD_PORT.to_string(),
         )
-        .env("IRONMESH_IROH_RELAY_QUIC_TLS_CERT", &tls.node_cert)
-        .env("IRONMESH_IROH_RELAY_QUIC_TLS_KEY", &tls.node_key)
+        .env("BERRYKEEP_IROH_RELAY_QUIC_TLS_CERT", &tls.node_cert)
+        .env("BERRYKEEP_IROH_RELAY_QUIC_TLS_KEY", &tls.node_key)
         .env("RUST_LOG", "info")
         .stdout(Stdio::from(fs::File::create(&stdout_path)?))
         .stderr(Stdio::from(fs::File::create(&stderr_path)?));
@@ -135,38 +135,38 @@ pub(super) fn spawn_node(
     isolate_network_environment(&mut command);
     command
         .env(
-            "IRONMESH_SERVER_BIND",
+            "BERRYKEEP_SERVER_BIND",
             format!("0.0.0.0:{NODE_PUBLIC_PORT}"),
         )
         .env(
-            "IRONMESH_PUBLIC_URL",
+            "BERRYKEEP_PUBLIC_URL",
             format!("http://{node_ip}:{NODE_PUBLIC_PORT}"),
         )
-        .env("IRONMESH_DATA_DIR", data_dir)
-        .env("IRONMESH_CLUSTER_ID", cluster_id.to_string())
-        .env("IRONMESH_NODE_ID", node_id.to_string())
+        .env("BERRYKEEP_DATA_DIR", data_dir)
+        .env("BERRYKEEP_CLUSTER_ID", cluster_id.to_string())
+        .env("BERRYKEEP_NODE_ID", node_id.to_string())
         .env(
-            "IRONMESH_INTERNAL_BIND",
+            "BERRYKEEP_INTERNAL_BIND",
             format!("0.0.0.0:{NODE_INTERNAL_PORT}"),
         )
         .env(
-            "IRONMESH_INTERNAL_URL",
+            "BERRYKEEP_INTERNAL_URL",
             format!("https://{node_ip}:{NODE_INTERNAL_PORT}"),
         )
-        .env("IRONMESH_INTERNAL_TLS_CA_CERT", &tls.ca_cert)
-        .env("IRONMESH_INTERNAL_TLS_CA_KEY", &tls.ca_key)
-        .env("IRONMESH_INTERNAL_TLS_CERT", &tls.node_cert)
-        .env("IRONMESH_INTERNAL_TLS_KEY", &tls.node_key)
-        .env("IRONMESH_RENDEZVOUS_URLS", rendezvous_url)
-        .env("IRONMESH_RELAY_MODE", "fallback")
-        .env("IRONMESH_PUBLIC_PEER_API_ENABLED", "true")
-        .env("IRONMESH_REQUIRE_CLIENT_AUTH", "true")
-        .env("IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS", "true")
-        .env("IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP", "true")
-        .env("IRONMESH_ADMIN_TOKEN", ADMIN_TOKEN)
-        .env("IRONMESH_REPLICATION_FACTOR", "1")
-        .env("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "false")
-        .env("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "false")
+        .env("BERRYKEEP_INTERNAL_TLS_CA_CERT", &tls.ca_cert)
+        .env("BERRYKEEP_INTERNAL_TLS_CA_KEY", &tls.ca_key)
+        .env("BERRYKEEP_INTERNAL_TLS_CERT", &tls.node_cert)
+        .env("BERRYKEEP_INTERNAL_TLS_KEY", &tls.node_key)
+        .env("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url)
+        .env("BERRYKEEP_RELAY_MODE", "fallback")
+        .env("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true")
+        .env("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true")
+        .env("BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS", "true")
+        .env("BERRYKEEP_ALLOW_INSECURE_PUBLIC_HTTP", "true")
+        .env("BERRYKEEP_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("BERRYKEEP_REPLICATION_FACTOR", "1")
+        .env("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "false")
+        .env("BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "false")
         .env("RUST_LOG", "info")
         .stdout(Stdio::from(fs::File::create(&stdout_path)?))
         .stderr(Stdio::from(fs::File::create(&stderr_path)?));
@@ -233,9 +233,9 @@ pub(super) fn spawn_cli_web(
 }
 
 pub(super) fn artifact_dir(scenario: &str) -> Result<PathBuf> {
-    let root = std::env::var_os("IRONMESH_QUIC_TEST_ARTIFACT_DIR")
+    let root = std::env::var_os("BERRYKEEP_QUIC_TEST_ARTIFACT_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("ironmesh-quic-network-tests"));
+        .unwrap_or_else(|| std::env::temp_dir().join("berrykeep-quic-network-tests"));
     let path = root.join(format!("{scenario}-{}", Uuid::new_v4()));
     fs::create_dir_all(&path)
         .with_context(|| format!("failed creating artifact directory {}", path.display()))?;

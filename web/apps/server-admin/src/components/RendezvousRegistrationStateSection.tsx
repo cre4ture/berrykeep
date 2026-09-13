@@ -1,4 +1,4 @@
-import type { RendezvousConfigView } from "@ironmesh/api";
+import type { RendezvousConfigView } from "@berrykeep/api";
 import { Badge, Card, Group, Stack, Text } from "@mantine/core";
 
 function formatUnixTimestamp(value: number | null): string {

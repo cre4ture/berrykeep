@@ -653,7 +653,7 @@ mod tests {
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params
             .distinguished_name
-            .push(DnType::CommonName, "ironmesh-relay-security-test-ca");
+            .push(DnType::CommonName, "berrykeep-relay-security-test-ca");
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::CrlSign,
@@ -673,15 +673,15 @@ mod tests {
         let mut params = CertificateParams::default();
         params
             .distinguished_name
-            .push(DnType::CommonName, format!("ironmesh-node-{node_id}"));
+            .push(DnType::CommonName, format!("berrykeep-node-{node_id}"));
         params.subject_alt_names = vec![
             SanType::URI(
-                format!("urn:ironmesh:node:{node_id}")
+                format!("urn:berrykeep:node:{node_id}")
                     .try_into()
                     .expect("node URI SAN should be valid"),
             ),
             SanType::URI(
-                format!("urn:ironmesh:cluster:{cluster_id}")
+                format!("urn:berrykeep:cluster:{cluster_id}")
                     .try_into()
                     .expect("cluster URI SAN should be valid"),
             ),
@@ -701,9 +701,9 @@ mod tests {
         let mut params = CertificateParams::default();
         params
             .distinguished_name
-            .push(DnType::CommonName, format!("ironmesh-device-{device_id}"));
+            .push(DnType::CommonName, format!("berrykeep-device-{device_id}"));
         params.subject_alt_names = vec![SanType::URI(
-            format!("urn:ironmesh:device:{device_id}")
+            format!("urn:berrykeep:device:{device_id}")
                 .try_into()
                 .expect("device URI SAN should be valid"),
         )];

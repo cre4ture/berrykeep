@@ -169,7 +169,7 @@ function Get-NodeFileCount {
         throw "Node '$NodeLabel' not found in manifest."
     }
 
-    $headers = @{ "x-ironmesh-admin-token" = $Manifest.admin_token }
+    $headers = @{ "x-berrykeep-admin-token" = $Manifest.admin_token }
     $uri = "$($node.public_base_url)/api/v1/auth/store/index?depth=8&synthesize_missing_folder_markers=false"
     $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
     $files = @($response.entries | Where-Object { -not $_.path.EndsWith('/') })

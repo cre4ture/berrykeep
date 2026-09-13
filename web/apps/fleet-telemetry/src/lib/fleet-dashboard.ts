@@ -1,4 +1,4 @@
-import { fetchJson } from "@ironmesh/api";
+import { fetchJson } from "@berrykeep/api";
 
 export type FleetProfileCount = {
   hardware_profile_id: string;

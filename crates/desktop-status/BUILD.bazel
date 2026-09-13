@@ -13,6 +13,7 @@ rust_library(
     visibility = ["//crates:__subpackages__"],
     deps = all_crate_deps(normal = True) + [
         "//crates/client-sdk:client_sdk",
+        "//crates/common:common",
     ],
 )
 

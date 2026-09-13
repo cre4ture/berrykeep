@@ -395,7 +395,7 @@ mod tests {
         for _ in 0..120 {
             if let Ok(response) = http
                 .get(format!("{base_url}/auth/s3/status"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await
                 && let Ok(ok_response) = response.error_for_status()
@@ -471,7 +471,7 @@ mod tests {
         let config_file = root.join("aws-config");
         let credentials_file = root.join("aws-credentials");
 
-        // Force path-style addressing so the CLI can target the local IronMesh endpoint.
+        // Force path-style addressing so the CLI can target the local BerryKeep endpoint.
         fs::write(
             &config_file,
             "[default]\nregion = us-east-1\noutput = json\ns3 =\n  addressing_style = path\n",
@@ -872,7 +872,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -885,7 +885,7 @@ mod tests {
         let result: Result<()> = async {
             let status_response = http
                 .get(format!("{public_base}/auth/s3/status"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?;
@@ -896,7 +896,7 @@ mod tests {
 
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "photos.example",
                     "root_prefix": "tenant/photos",
@@ -909,7 +909,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-listener",
                     "bucket_scope": ["photos.example"],
@@ -1138,8 +1138,8 @@ mod tests {
             None,
             None,
             &[
-                ("IRONMESH_S3_BIND", s3_bind),
-                ("IRONMESH_S3_PUBLIC_URL", s3_public_url),
+                ("BERRYKEEP_S3_BIND", s3_bind),
+                ("BERRYKEEP_S3_PUBLIC_URL", s3_public_url),
             ],
         )
         .await?;
@@ -1153,7 +1153,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "photos.example",
                     "root_prefix": "tenant/photos",
@@ -1166,7 +1166,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-virtual-hosted",
                     "bucket_scope": ["photos.example"],
@@ -1295,7 +1295,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -1306,7 +1306,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "sdk-listener.example",
                     "root_prefix": "tenant/sdk-listener",
@@ -1319,7 +1319,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-listener-aws-sdk",
                     "bucket_scope": ["sdk-listener.example"],
@@ -1372,7 +1372,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -1383,7 +1383,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "cli-listener.example",
                     "root_prefix": "tenant/cli-listener",
@@ -1396,7 +1396,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-listener-aws-cli",
                     "bucket_scope": ["cli-listener.example"],
@@ -1460,7 +1460,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -1473,7 +1473,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "media.example",
                     "root_prefix": "tenant/media",
@@ -1486,7 +1486,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-multipart",
                     "bucket_scope": ["media.example"],
@@ -1739,7 +1739,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -1752,7 +1752,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "versions.example",
                     "root_prefix": "tenant/versions",
@@ -1765,7 +1765,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-versioning",
                     "bucket_scope": ["versions.example"],
@@ -1972,7 +1972,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -1985,7 +1985,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "photos.example",
                     "root_prefix": "tenant/photos",
@@ -1998,7 +1998,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-presigned",
                     "bucket_scope": ["photos.example"],
@@ -2138,7 +2138,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -2151,7 +2151,7 @@ mod tests {
         let result: Result<()> = async {
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-bucket-manage",
                     "bucket_scope": ["managed.example", "managed-body.example"],
@@ -2345,7 +2345,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -2362,7 +2362,7 @@ mod tests {
             ] {
                 let create_bucket_response = http
                     .post(format!("{public_base}/auth/s3/buckets"))
-                    .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                    .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                     .json(&serde_json::json!({
                         "bucket_name": bucket_name,
                         "root_prefix": root_prefix,
@@ -2376,7 +2376,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-copy",
                     "bucket_scope": ["source.example", "dest.example"],
@@ -2574,7 +2574,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -2587,7 +2587,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "batch.example",
                     "root_prefix": "tenant/batch",
@@ -2600,7 +2600,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-delete-objects",
                     "bucket_scope": ["batch.example"],
@@ -2783,7 +2783,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -2796,7 +2796,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "photos.example",
                     "root_prefix": "tenant/photos",
@@ -2809,7 +2809,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-folder-marker",
                     "bucket_scope": ["photos.example"],
@@ -2891,7 +2891,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -2904,7 +2904,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "photos.example",
                     "root_prefix": "tenant/photos",
@@ -2917,7 +2917,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-continuation",
                     "bucket_scope": ["photos.example"],
@@ -3016,7 +3016,7 @@ mod tests {
             1,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind)],
+            &[("BERRYKEEP_S3_BIND", s3_bind)],
         )
         .await?;
 
@@ -3029,7 +3029,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{public_base}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "versions.example",
                     "root_prefix": "tenant/versions",
@@ -3042,7 +3042,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{public_base}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-version-delimiter",
                     "bucket_scope": ["versions.example"],
@@ -3206,7 +3206,7 @@ mod tests {
             2,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind_a)],
+            &[("BERRYKEEP_S3_BIND", s3_bind_a)],
         )
         .await?;
         let mut node_b = start_authenticated_server_with_env_options(
@@ -3216,7 +3216,7 @@ mod tests {
             2,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind_b)],
+            &[("BERRYKEEP_S3_BIND", s3_bind_b)],
         )
         .await?;
 
@@ -3234,7 +3234,7 @@ mod tests {
 
             let create_bucket_response = http
                 .post(format!("{base_a}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "fanout.example",
                     "root_prefix": "tenant/fanout",
@@ -3247,7 +3247,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{base_a}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-fanout",
                     "bucket_scope": ["fanout.example"],
@@ -3341,7 +3341,7 @@ mod tests {
             2,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind_a)],
+            &[("BERRYKEEP_S3_BIND", s3_bind_a)],
         )
         .await?;
         let mut node_b = start_authenticated_server_with_env_options(
@@ -3351,7 +3351,7 @@ mod tests {
             2,
             None,
             None,
-            &[("IRONMESH_S3_BIND", s3_bind_b)],
+            &[("BERRYKEEP_S3_BIND", s3_bind_b)],
         )
         .await?;
 
@@ -3369,7 +3369,7 @@ mod tests {
 
             let create_bucket_response = http
                 .post(format!("{base_a}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "revoke.example",
                     "root_prefix": "tenant/revoke",
@@ -3382,7 +3382,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{base_a}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-peer-revoke",
                     "bucket_scope": ["revoke.example"],
@@ -3420,7 +3420,7 @@ mod tests {
                 .post(format!(
                     "{base_b}/auth/s3/access-keys/{access_key_id}/revoke"
                 ))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?;
             assert_eq!(revoke_access_key_response.status(), StatusCode::NO_CONTENT);
@@ -3494,7 +3494,7 @@ mod tests {
         let result: Result<()> = async {
             let create_bucket_response = http
                 .post(format!("{base_url}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "gateway.example",
                     "root_prefix": "tenant/gateway",
@@ -3507,7 +3507,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{base_url}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-gateway",
                     "bucket_scope": ["gateway.example"],
@@ -3644,9 +3644,9 @@ mod tests {
         let data_dir = fresh_data_dir("s3-gateway-relay-server");
         let client_dir = fresh_data_dir("s3-gateway-relay-client");
         let node_env = [
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -3670,7 +3670,7 @@ mod tests {
 
             let create_bucket_response = http
                 .post(format!("{base_url}/auth/s3/buckets"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "bucket_name": "relay-gateway.example",
                     "root_prefix": "tenant/relay-gateway",
@@ -3683,7 +3683,7 @@ mod tests {
 
             let create_access_key_response = http
                 .post(format!("{base_url}/auth/s3/access-keys"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .json(&serde_json::json!({
                     "description": "system-test-s3-gateway-relay",
                     "bucket_scope": ["relay-gateway.example"],

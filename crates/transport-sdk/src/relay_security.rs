@@ -18,7 +18,7 @@ use x509_parser::prelude::FromDer;
 
 use crate::peer::PeerIdentity;
 
-const RELAY_TLS_SERVER_NAME: &str = "relay-tunnel.ironmesh.invalid";
+const RELAY_TLS_SERVER_NAME: &str = "relay-tunnel.berrykeep.invalid";
 
 /// PEM certificate-chain and private-key material for an inner relay TLS endpoint.
 ///
@@ -331,12 +331,18 @@ fn verify_target_certificate_sans(
     expected_cluster_id: ClusterId,
 ) -> Result<()> {
     let san_uris = certificate_san_uris(certificate)?;
-    let expected_node = node_san_uri(expected_node_id);
-    let expected_cluster = cluster_san_uri(expected_cluster_id);
-    if !san_uris.iter().any(|uri| uri == &expected_node) {
+    let expected_nodes = node_san_uris(expected_node_id);
+    let expected_clusters = cluster_san_uris(expected_cluster_id);
+    if !san_uris
+        .iter()
+        .any(|uri| expected_nodes.iter().any(|expected| uri == expected))
+    {
         bail!("relay TLS server certificate does not contain expected node URI SAN");
     }
-    if !san_uris.iter().any(|uri| uri == &expected_cluster) {
+    if !san_uris
+        .iter()
+        .any(|uri| expected_clusters.iter().any(|expected| uri == expected))
+    {
         bail!("relay TLS server certificate does not contain expected cluster URI SAN");
     }
     Ok(())
@@ -346,10 +352,10 @@ fn verify_peer_certificate_san(
     certificate: &CertificateDer<'_>,
     expected_peer: &PeerIdentity,
 ) -> Result<()> {
-    let expected = peer_san_uri(expected_peer);
+    let expected = peer_san_uris(expected_peer);
     if certificate_san_uris(certificate)?
         .iter()
-        .any(|uri| uri == &expected)
+        .any(|uri| expected.iter().any(|expected| uri == expected))
     {
         Ok(())
     } else {
@@ -373,17 +379,26 @@ fn certificate_san_uris(certificate: &CertificateDer<'_>) -> Result<Vec<String>>
     Ok(uris)
 }
 
-fn node_san_uri(node_id: NodeId) -> String {
-    format!("urn:ironmesh:node:{node_id}")
+fn node_san_uris(node_id: NodeId) -> [String; 2] {
+    [
+        format!("urn:berrykeep:node:{node_id}"),
+        format!("urn:ironmesh:node:{node_id}"),
+    ]
 }
 
-fn cluster_san_uri(cluster_id: ClusterId) -> String {
-    format!("urn:ironmesh:cluster:{cluster_id}")
+fn cluster_san_uris(cluster_id: ClusterId) -> [String; 2] {
+    [
+        format!("urn:berrykeep:cluster:{cluster_id}"),
+        format!("urn:ironmesh:cluster:{cluster_id}"),
+    ]
 }
 
-fn peer_san_uri(peer: &PeerIdentity) -> String {
+fn peer_san_uris(peer: &PeerIdentity) -> [String; 2] {
     match peer {
-        PeerIdentity::Node(node_id) => node_san_uri(*node_id),
-        PeerIdentity::Device(device_id) => format!("urn:ironmesh:device:{device_id}"),
+        PeerIdentity::Node(node_id) => node_san_uris(*node_id),
+        PeerIdentity::Device(device_id) => [
+            format!("urn:berrykeep:device:{device_id}"),
+            format!("urn:ironmesh:device:{device_id}"),
+        ],
     }
 }

@@ -17,6 +17,7 @@ bundled-country-db = ["dep:iptocc"]
 anyhow.workspace = true
 axum.workspace = true
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+common = { path = "../common" }
 iptocc = { version = "1", optional = true }
 percent-encoding = "2"
 # No dependency already in this crate provides a CSPRNG (see `registration.rs`); `rand` is a

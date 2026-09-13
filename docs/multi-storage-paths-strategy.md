@@ -8,7 +8,7 @@ Dateisysteme verteilen. Das betrifft ausschließlich Content-Addressed-Daten:
 - Chunks unter `chunks/`,
 - Objekt-Manifeste unter `manifests/`.
 
-Die Node-Steuerdaten bleiben bewusst an einem Ort unter `IRONMESH_DATA_DIR`:
+Die Node-Steuerdaten bleiben bewusst an einem Ort unter `BERRYKEEP_DATA_DIR`:
 Metadaten-Datenbank, Identität, TLS-Material, Snapshots, Caches und die
 Storage-Pool-Konfiguration. Damit bleiben ein Node und seine administrativen
 Metadaten als Einheit portierbar, ohne dass ein Enrollment-Paket
@@ -21,16 +21,16 @@ weiterhin durch die bestehende Replikation erreicht.
 ## Konfiguration
 
 Ohne Konfiguration bleibt das bisherige Verhalten vollständig erhalten:
-`IRONMESH_DATA_DIR` ist der einzige, aktive Pfad für Chunks und Manifeste.
+`BERRYKEEP_DATA_DIR` ist der einzige, aktive Pfad für Chunks und Manifeste.
 
 Für mehrere Pfade wird beim Node eine JSON-Datei abgelegt:
 
 ```text
-${IRONMESH_DATA_DIR}/state/storage-pool.json
+${BERRYKEEP_DATA_DIR}/state/storage-pool.json
 ```
 
 Für getrennte Betriebs- und Konfigurationspfade kann sie mit
-`IRONMESH_STORAGE_CONFIG=/etc/ironmesh/storage-pool.json` überschrieben
+`BERRYKEEP_STORAGE_CONFIG=/etc/berrykeep/storage-pool.json` überschrieben
 werden. Änderungen werden beim Node-Start eingelesen; für eine geänderte
 Konfiguration ist daher ein geordneter Neustart nötig.
 
@@ -42,14 +42,14 @@ Beispiel für einen neu eingerichteten Node:
   "paths": [
     {
       "id": "ssd-a",
-      "path": "/srv/ironmesh-a",
+      "path": "/srv/berrykeep-a",
       "state": "active",
       "weight": 1,
       "reserve_bytes": 21474836480
     },
     {
       "id": "ssd-b",
-      "path": "/srv/ironmesh-b",
+      "path": "/srv/berrykeep-b",
       "state": "active",
       "weight": 1,
       "reserve_bytes": 21474836480
@@ -70,7 +70,7 @@ Beispiel für einen neu eingerichteten Node:
   verwendet werden.
 
 Beim ersten Einsatz wird in jedem Pfad ein Marker
-`.ironmesh-storage-path.json` angelegt. Er bindet den Pfad an Node und
+`.berrykeep-storage-path.json` angelegt. Er bindet den Pfad an Node und
 Pfad-ID, damit versehentlich gemeinsam verwendete oder vertauschte Mounts beim
 Start auffallen.
 
@@ -116,12 +116,12 @@ bestehende Kennung `legacy-primary` beibehalten werden:
   "paths": [
     {
       "id": "legacy-primary",
-      "path": "/var/lib/ironmesh/server-node",
+      "path": "/var/lib/berrykeep/server-node",
       "state": "active"
     },
     {
       "id": "ssd-b",
-      "path": "/srv/ironmesh-b",
+      "path": "/srv/berrykeep-b",
       "state": "active"
     }
   ]

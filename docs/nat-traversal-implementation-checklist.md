@@ -48,11 +48,11 @@ Follow-up for the additive `iroh` direct QUIC + hole punching migration:
 Use this section as the current source of truth for remaining work. The detailed checklist below still contains older task wording and should be reconciled over time.
 
 1. Client transport target model and relay-capable client sessions. Status: substantially implemented.
-   The first slices are now in place: client bootstrap can plan ordered direct-vs-relay targets, direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction, issued bootstrap endpoints now carry the owning `node_id` so relay-planned client targets are identity-bound rather than anonymous URLs, `IronMeshClient` can execute relay-backed requests through rendezvous for the non-mTLS client path, enrolled client devices can now use relay against an mTLS-required rendezvous service when enrollment provided a rendezvous client TLS identity, the shared sync-agent plus Linux FUSE startup paths can now build clients directly from bootstrap artifacts instead of collapsing them to one direct URL up front, Windows CFAPI now preserves bootstrap metadata and builds its runtime fetcher/hydrator/uploader from a bootstrap-aware client rather than re-resolving everything to a direct URL, Android now persists bootstrap plus client identity material and uses bootstrap-aware clients for object operations, folder sync, SAF access, and the embedded web UI, the iOS wrapper now accepts the same bootstrap-or-direct connection input shape, normal CLI data plus read-only commands use the shared bootstrap-aware client transport instead of raw direct `reqwest` calls, the embedded web UI backend now runs on top of `IronMeshClient` so CLI and Android `serve-web` flows can use relay-capable client transport too, and the remaining `client-sdk` convenience types like remote snapshot fetchers and content-addressed caches now also have bootstrap-aware constructors instead of only `base_url` entry points.
+   The first slices are now in place: client bootstrap can plan ordered direct-vs-relay targets, direct-only callers use an explicit `resolve_direct_http_target_blocking()` helper instead of treating `resolve_blocking()` as the primary abstraction, issued bootstrap endpoints now carry the owning `node_id` so relay-planned client targets are identity-bound rather than anonymous URLs, `BerryKeepClient` can execute relay-backed requests through rendezvous for the non-mTLS client path, enrolled client devices can now use relay against an mTLS-required rendezvous service when enrollment provided a rendezvous client TLS identity, the shared sync-agent plus Linux FUSE startup paths can now build clients directly from bootstrap artifacts instead of collapsing them to one direct URL up front, Windows CFAPI now preserves bootstrap metadata and builds its runtime fetcher/hydrator/uploader from a bootstrap-aware client rather than re-resolving everything to a direct URL, Android now persists bootstrap plus client identity material and uses bootstrap-aware clients for object operations, folder sync, SAF access, and the embedded web UI, the iOS wrapper now accepts the same bootstrap-or-direct connection input shape, normal CLI data plus read-only commands use the shared bootstrap-aware client transport instead of raw direct `reqwest` calls, the embedded web UI backend now runs on top of `BerryKeepClient` so CLI and Android `serve-web` flows can use relay-capable client transport too, and the remaining `client-sdk` convenience types like remote snapshot fetchers and content-addressed caches now also have bootstrap-aware constructors instead of only `base_url` entry points.
    New relay transport milestone: the primary relay path now uses an authenticated rendezvous WebSocket tunnel that carries opaque HTTP bytes instead of the older JSON/base64 HTTP envelope. Enrolled-client and server-node relay sessions now add fail-closed TLS 1.3 mTLS inside that tunnel, bound to the expected node/device and cluster SANs; the rendezvous operator can broker control metadata but cannot read or modify application bytes without detection. Pre-enrollment bootstrap-claim relay remains an explicit legacy exception tracked by issue #120. Server-node peer relay requests use the same tunnel model, and relay-only web UI coverage now includes map tile and glyph routes.
-   Remaining work: reduce the remaining direct-resolution compatibility paths and helper APIs in `client-sdk` and the smaller direct-only convenience layers that still exist outside the main app/runtime flows. The old `resolve_blocking()` bootstrap shim is gone, and the remaining direct-only convenience constructors in `client-sdk`, including `IronMeshClient`, now use explicit `from_direct_*` naming instead of looking like the primary API shape.
+   Remaining work: reduce the remaining direct-resolution compatibility paths and helper APIs in `client-sdk` and the smaller direct-only convenience layers that still exist outside the main app/runtime flows. The old `resolve_blocking()` bootstrap shim is gone, and the remaining direct-only convenience constructors in `client-sdk`, including `BerryKeepClient`, now use explicit `from_direct_*` naming instead of looking like the primary API shape.
 2. Remove the legacy direct-upstream path from server-node. Status: completed.
-   `IRONMESH_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, `refresh_upstream_peer(...)`, and the old embedded upstream helper flow are gone. Rendezvous-first discovery is now the supported peer discovery model, and Linux FUSE no longer tries to smuggle a remote upstream URL through a local server-node helper path.
+   `BERRYKEEP_UPSTREAM_PUBLIC_URL`, `upstream_public_url`, `refresh_upstream_peer(...)`, and the old embedded upstream helper flow are gone. Rendezvous-first discovery is now the supported peer discovery model, and Linux FUSE no longer tries to smuggle a remote upstream URL through a local server-node helper path.
 3. Finish removing `base_url` plus `device_token`-shaped app models.
    Remaining work: mostly naming and compatibility cleanup now. Persisted client state is identity-first rather than URL-plus-token-first, Android/Windows/iOS are on bootstrap-aware connection inputs, the client enrollment / direct-client path no longer carries `device_token` or bearer-token auth compatibility in the main Rust stack, and the server-side admin/listing surface now uses client-credential naming with explicit fingerprint metadata rather than the older enrolled-device wording.
 4. Replace the old reachability model in cluster state. Status: completed.
@@ -86,7 +86,7 @@ Keep existing `rustls`, `tokio`, `serde`, `bytes`, and `uuid` usage.
 
 The current codebase assumes:
 
-- `client-sdk::IronMeshClient` talks to one `server_base_url`
+- `client-sdk::BerryKeepClient` talks to one `server_base_url`
 - peer traffic uses `reqwest::Client`
 - bootstrap resolution chooses one direct endpoint up front
 
@@ -108,7 +108,7 @@ In practice, this means the peer/client transport work should land before large 
 | `crates/client-sdk/src/bootstrap.rs` | `ResolvedConnectionBootstrap` | Remove; replace with dynamic session setup in `transport-sdk` | Resolution is now path selection plus session establishment, not one URL probe. |
 | `crates/client-sdk/src/bootstrap.rs` | `BootstrapEnrollmentResult` | `EnrolledClientIdentity` | Enrollment should return key-bound identity material, not a bearer token plus URL. |
 | `crates/client-sdk/src/device_auth.rs` | `DeviceEnrollmentRequest` / `DeviceEnrollmentResponse` | CSR or public-key enrollment request and signed credential response | Pairing remains enrollment-only. |
-| `crates/client-sdk/src/ironmesh_client.rs` | `IronMeshClient { transport, auth }` | tighten target abstraction and eliminate remaining direct-helper seams | The client now chooses direct or relay paths per session; the remaining work is cleanup, not a bearer-token rewrite. |
+| `crates/client-sdk/src/berrykeep_client.rs` | `BerryKeepClient { transport, auth }` | tighten target abstraction and eliminate remaining direct-helper seams | The client now chooses direct or relay paths per session; the remaining work is cleanup, not a bearer-token rewrite. |
 | `crates/client-sdk/src/client_node.rs` | `ClientNode::from_direct_base_url(server_base_url)` | `ClientNode::new(transport_handle, target)` | High-level API can stay, constructor contract changes. |
 | `crates/server-node-sdk/src/lib.rs` | `ServerNodeConfig` | `ServerNodeConfig` with rendezvous, relay, cluster, and node-identity settings | Static upstream URL is replaced by control-plane connectivity. |
 | `crates/server-node-sdk/src/lib.rs` | `ServerState::internal_http: reqwest::Client` | `ServerState::peer_transport: transport_sdk::peer::PeerTransportClient` | Peer traffic must run over direct or relayed sessions. |
@@ -208,14 +208,14 @@ Recommended responsibilities:
 - [x] Replace `crates/client-sdk/src/device_auth.rs` token enrollment with keypair-based enrollment.
 - [x] Replace `BootstrapEnrollmentResult.device_token` with signed credential material or credential references.
 - [ ] Refactor `crates/client-sdk/src/connection.rs` so it creates transport-aware clients instead of direct `reqwest` clients from one base URL.
-- [x] Refactor `crates/client-sdk/src/ironmesh_client.rs` so relay-backed requests use the rendezvous tunnel transport rather than the legacy JSON/base64 relay envelope.
+- [x] Refactor `crates/client-sdk/src/berrykeep_client.rs` so relay-backed requests use the rendezvous tunnel transport rather than the legacy JSON/base64 relay envelope.
 - [ ] Refactor `crates/client-sdk/src/client_node.rs` constructors to take the new transport-aware client setup.
 - [ ] Re-export transport bootstrap and identity types from `crates/client-sdk/src/lib.rs` only if that keeps app code simpler.
 
 ### `crates/server-node-sdk`
 
 - [ ] Extend `crates/server-node-sdk/src/lib.rs::ServerNodeConfig` with `cluster_id`, rendezvous URLs, relay policy, and node-identity configuration.
-- [x] Replace `IRONMESH_UPSTREAM_PUBLIC_URL`-driven logic with rendezvous registration and peer discovery.
+- [x] Replace `BERRYKEEP_UPSTREAM_PUBLIC_URL`-driven logic with rendezvous registration and peer discovery.
 - [ ] Replace `ServerState::internal_http` with a transport-aware peer client.
 - [x] Replace `refresh_upstream_peer`, `spawn_upstream_peer_bootstrap`, and related direct-upstream refresh logic with persistent rendezvous presence and peer session management.
 - [x] Replace `RegisterNodeRequest` in `crates/server-node-sdk/src/lib.rs` so admin registration manages policy/labels, not direct reachability coordinates.
@@ -265,7 +265,7 @@ Recommended responsibilities:
 
 - [x] Replace `apps/android-app/src/lib.rs` JNI APIs that currently take `base_url`, `server_ca_pem`, and `auth_token` with bootstrap- or identity-based configuration.
 - [x] Replace `BootstrapEnrollmentResult` handling so Android persists client identity material, not a device token.
-- [x] Update `apps/android-app/app/src/main/java/io/ironmesh/android/data/IronmeshRepository.kt` data models to store rendezvous/bootstrap identity state instead of `server_base_url + device_token`.
+- [x] Update `apps/android-app/app/src/main/java/io/berrykeep/android/data/BerryKeepRepository.kt` data models to store rendezvous/bootstrap identity state instead of `server_base_url + device_token`.
 
 ### `crates/server-node-sdk/src/ui`
 
@@ -273,26 +273,26 @@ Recommended responsibilities:
 
 ### `crates/web-ui-backend`
 
-- [x] Refactor `crates/web-ui-backend/src/lib.rs` so it can run on top of a prepared `IronMeshClient` instead of requiring a direct-only resolved server URL.
+- [x] Refactor `crates/web-ui-backend/src/lib.rs` so it can run on top of a prepared `BerryKeepClient` instead of requiring a direct-only resolved server URL.
 
 ## 7. Environment variable changes
 
 Add to `crates/server-node-sdk/src/lib.rs::ServerNodeConfig::from_env()`:
 
-- `IRONMESH_CLUSTER_ID`
-- `IRONMESH_CLUSTER_CA_CERT`
-- `IRONMESH_RENDEZVOUS_URLS`
-- `IRONMESH_RELAY_MODE`
-- `IRONMESH_NODE_CERT`
-- `IRONMESH_NODE_KEY`
+- `BERRYKEEP_CLUSTER_ID`
+- `BERRYKEEP_CLUSTER_CA_CERT`
+- `BERRYKEEP_RENDEZVOUS_URLS`
+- `BERRYKEEP_RELAY_MODE`
+- `BERRYKEEP_NODE_CERT`
+- `BERRYKEEP_NODE_KEY`
 
 Keep only if still useful:
 
-- `IRONMESH_SERVER_BIND`
-- `IRONMESH_PUBLIC_URL`
-- `IRONMESH_PUBLIC_TLS_CERT`
-- `IRONMESH_PUBLIC_TLS_KEY`
-- `IRONMESH_PUBLIC_TLS_CA_CERT`
+- `BERRYKEEP_SERVER_BIND`
+- `BERRYKEEP_PUBLIC_URL`
+- `BERRYKEEP_PUBLIC_TLS_CERT`
+- `BERRYKEEP_PUBLIC_TLS_KEY`
+- `BERRYKEEP_PUBLIC_TLS_CA_CERT`
 
 ### Phase 2 global rendezvous contract
 
@@ -302,22 +302,22 @@ merge.
 
 Global rendezvous service:
 
-- `IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY`: persistent path for the
+- `BERRYKEEP_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY`: persistent path for the
   Option-1 cluster registry.
-- `IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED`: explicit operator gate
+- `BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED`: explicit operator gate
   for self-service cluster registration.
-- `IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN`: secret used for global registry
+- `BERRYKEEP_RENDEZVOUS_GLOBAL_ADMIN_TOKEN`: secret used for global registry
   administration, including suspend and resume actions.
-- `IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE`: maximum
+- `BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE`: maximum
   self-registration attempts accepted per minute.
-- `IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS`: lifetime of a registration
+- `BERRYKEEP_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS`: lifetime of a registration
   challenge before a proof must be rejected.
-- `IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES`: bound on outstanding
+- `BERRYKEEP_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES`: bound on outstanding
   in-memory registration challenges.
 
 Server node:
 
-- `IRONMESH_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED`: explicit node opt-in for
+- `BERRYKEEP_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED`: explicit node opt-in for
   automatic registration against a global rendezvous. It must not override a
   disabled service-side registration gate.
 
@@ -328,7 +328,7 @@ active P-256 CA per cluster and is not a private-key store. See
 
 Delete or replace:
 
-- `IRONMESH_UPSTREAM_PUBLIC_URL`
+- `BERRYKEEP_UPSTREAM_PUBLIC_URL`
   removed; rendezvous registration and discovery are now the supported peer discovery path
 - any env whose only purpose is direct one-upstream peering
 
@@ -340,7 +340,7 @@ This is implementation order, not product rollout order.
 2. Create `apps/rendezvous-service` with authenticated presence plus relay tickets.
 3. Replace node registration and peer transport in `server-node-sdk`.
 4. Replace client bootstrap and enrollment in `client-sdk`.
-5. Refactor `IronMeshClient` and peer callers away from raw `base_url` assumptions.
+5. Refactor `BerryKeepClient` and peer callers away from raw `base_url` assumptions.
 6. Update Windows adapter, Android bindings, and CLI to use the new stack.
 7. Update server-node UI to issue and explain the new bootstrap.
 8. Replace tests and fixtures that still assume direct URL plus bearer token startup.

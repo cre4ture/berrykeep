@@ -6,8 +6,9 @@
 
 use anyhow::{Context, Result};
 use client_sdk::{
-    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, IronMeshClient, ManagedClientOptions,
-    ManagedIronMeshClient, TitleLatencyMonitor, TitleLatencyProbeConfig, TitleLatencyProbeStatus,
+    BerryKeepClient, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
+    ManagedBerryKeepClient, ManagedClientOptions, TitleLatencyMonitor, TitleLatencyProbeConfig,
+    TitleLatencyProbeStatus,
 };
 use common::logging::LogBuffer;
 use serde::{Deserialize, Serialize};
@@ -216,7 +217,7 @@ impl MobileClientOptions {
         Self {
             managed_client: ManagedClientOptions::default(),
             identity_persistence: None,
-            web_ui_service_name: format!("ironmesh-{platform}"),
+            web_ui_service_name: format!("berrykeep-{platform}"),
             web_ui_connection_name: format!("{platform} web ui"),
             web_ui_bootstrap_persistence: None,
             web_ui_log_buffer: None,
@@ -228,9 +229,9 @@ struct MobileClientSessionInner {
     id: Uuid,
     runtime: Arc<Runtime>,
     configuration: MobileClientConfiguration,
-    client: IronMeshClient,
+    client: BerryKeepClient,
     client_node: ClientNode,
-    managed_client: Option<ManagedIronMeshClient>,
+    managed_client: Option<ManagedBerryKeepClient>,
     client_identity: Option<ClientIdentityMaterial>,
 }
 
@@ -257,14 +258,14 @@ impl MobileClientSession {
         &self.inner.configuration
     }
 
-    pub fn client(&self, connection_name: impl Into<String>) -> IronMeshClient {
+    pub fn client(&self, connection_name: impl Into<String>) -> BerryKeepClient {
         self.inner
             .client
             .clone()
             .with_connection_name(connection_name.into())
     }
 
-    pub fn base_client(&self) -> IronMeshClient {
+    pub fn base_client(&self) -> BerryKeepClient {
         self.inner.client.clone()
     }
 
@@ -286,7 +287,7 @@ impl MobileClientSession {
         self.inner.client_node.clone()
     }
 
-    pub fn managed_client(&self) -> Option<ManagedIronMeshClient> {
+    pub fn managed_client(&self) -> Option<ManagedBerryKeepClient> {
         self.inner.managed_client.clone()
     }
 
@@ -298,14 +299,14 @@ impl MobileClientSession {
         self.inner
             .managed_client
             .as_ref()
-            .and_then(ManagedIronMeshClient::take_identity_update)
+            .and_then(ManagedBerryKeepClient::take_identity_update)
     }
 
     pub fn take_connection_bootstrap_update(&self) -> Option<ConnectionBootstrap> {
         self.inner
             .managed_client
             .as_ref()
-            .and_then(ManagedIronMeshClient::take_connection_bootstrap_update)
+            .and_then(ManagedBerryKeepClient::take_connection_bootstrap_update)
     }
 }
 
@@ -604,7 +605,7 @@ impl MobileClient {
     pub fn new(options: MobileClientOptions) -> Result<Self> {
         let runtime = Builder::new_multi_thread()
             .enable_all()
-            .thread_name("ironmesh-mobile-client")
+            .thread_name("berrykeep-mobile-client")
             .build()
             .context("failed to create mobile client runtime")?;
         Ok(Self::with_runtime(Arc::new(runtime), options))

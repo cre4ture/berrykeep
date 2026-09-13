@@ -1,5 +1,5 @@
 [graph]
-# Limit checks to the targets IronMesh actually builds in CI and distribution flows.
+# Limit checks to the targets BerryKeep actually builds in CI and distribution flows.
 # This keeps wasm-only browser relay dependencies from polluting the native/mobile graph.
 targets = [
   "x86_64-unknown-linux-gnu",

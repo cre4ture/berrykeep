@@ -14,7 +14,7 @@ mod tests {
     use crate::framework::*;
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
-    use client_sdk::{ClientIdentityMaterial, IronMeshClient, build_signed_request_headers};
+    use client_sdk::{ClientIdentityMaterial, BerryKeepClient, build_signed_request_headers};
     use rcgen::{
         CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
         KeyPair, SanType,
@@ -100,7 +100,7 @@ mod tests {
         server: ChildGuard,
         data_dir: PathBuf,
         client_dir: PathBuf,
-        sdk: IronMeshClient,
+        sdk: BerryKeepClient,
         http: AuthenticatedTestHttp,
     }
 
@@ -823,7 +823,7 @@ mod tests {
         params.distinguished_name = DistinguishedName::new();
         params.distinguished_name.push(
             DnType::CommonName,
-            format!("ironmesh-node-{}", package.bootstrap.node_id),
+            format!("berrykeep-node-{}", package.bootstrap.node_id),
         );
         params.is_ca = IsCa::NoCa;
         params.not_before = OffsetDateTime::from_unix_timestamp(not_before_unix as i64)
@@ -836,12 +836,12 @@ mod tests {
         ];
         params.subject_alt_names = vec![
             SanType::URI(
-                format!("urn:ironmesh:node:{}", package.bootstrap.node_id)
+                format!("urn:berrykeep:node:{}", package.bootstrap.node_id)
                     .try_into()
                     .context("invalid expired internal TLS node URI SAN")?,
             ),
             SanType::URI(
-                format!("urn:ironmesh:cluster:{}", package.bootstrap.cluster_id)
+                format!("urn:berrykeep:cluster:{}", package.bootstrap.cluster_id)
                     .try_into()
                     .context("invalid expired internal TLS cluster URI SAN")?,
             ),
@@ -1718,8 +1718,8 @@ mod tests {
         let data_b = fresh_data_dir("autonomous-heartbeat-b");
 
         let heartbeat_env = [
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
         let mut node_a = start_open_server_with_env_options(
@@ -1778,7 +1778,7 @@ mod tests {
         for _ in 0..retries {
             let nodes_a = match client
                 .get(format!("{base_a}/cluster/nodes"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await
             {
@@ -1803,7 +1803,7 @@ mod tests {
 
             let nodes_b = match client
                 .get(format!("{base_b}/cluster/nodes"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await
             {
@@ -1902,7 +1902,7 @@ mod tests {
         for _ in 0..retries {
             if let Ok(response) = client
                 .get(format!("{base_url}/cluster/nodes"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await
                 && let Ok(response) = response.error_for_status()
@@ -2024,8 +2024,8 @@ mod tests {
         let data_b = fresh_data_dir("autonomous-storage-b");
 
         let heartbeat_env = [
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
         let mut node_a = start_open_server_with_env_options(
@@ -2096,12 +2096,12 @@ mod tests {
         let data_e = fresh_data_dir("read-through-five-node-e");
 
         let node_env = [
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
-            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "1"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
         ];
 
         let mut node_a =
@@ -2234,13 +2234,13 @@ mod tests {
         let data_b = fresh_data_dir("media-artifact-restart-b");
 
         let node_env = [
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
-            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "1"),
-            ("IRONMESH_STARTUP_REPAIR_ENABLED", "false"),
-            ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
-            ("IRONMESH_MEDIA_CACHE_INCOMPLETE_RETRY_SECS", "20"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_STARTUP_REPAIR_ENABLED", "false"),
+            ("BERRYKEEP_REPLICATION_REPAIR_ENABLED", "false"),
+            ("BERRYKEEP_MEDIA_CACHE_INCOMPLETE_RETRY_SECS", "20"),
         ];
 
         let mut node_a = start_open_server_with_env_options(
@@ -2511,8 +2511,8 @@ mod tests {
         let data_b = fresh_data_dir("autonomous-heartbeat-recovery-b");
 
         let heartbeat_env = [
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
         let mut node_a = start_open_server_with_env_options(
@@ -2594,9 +2594,9 @@ mod tests {
         let client_dir = fresh_data_dir("client-credential-fanout-client");
 
         let node_env = [
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "1"),
         ];
 
         let mut node_a = start_authenticated_server_with_env_options(
@@ -2713,7 +2713,7 @@ mod tests {
                 "{base_a}/auth/client-credentials/{}?reason=system-test-tombstone",
                 enrolled.identity.device_id
             ))
-            .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+            .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
             .send()
             .await?
             .error_for_status()?;
@@ -2775,8 +2775,8 @@ mod tests {
         let data_b = fresh_data_dir("autonomous-heartbeat-flap-b");
 
         let heartbeat_env = [
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
-            ("IRONMESH_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "true"),
+            ("BERRYKEEP_AUTONOMOUS_HEARTBEAT_INTERVAL_SECS", "1"),
         ];
 
         let mut node_a = start_open_server_with_env_options(
@@ -2955,7 +2955,7 @@ mod tests {
             &data_dir,
             local_node_id,
             2,
-            &[("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN)],
+            &[("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN)],
         )
         .await?;
 
@@ -2989,7 +2989,7 @@ mod tests {
 
             let remove_response = http
                 .delete(format!("{base_url}/cluster/nodes/{remove_node_id}"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?;
             assert_eq!(remove_response.status(), StatusCode::NO_CONTENT);
@@ -3018,14 +3018,14 @@ mod tests {
 
             let not_found = http
                 .delete(format!("{base_url}/cluster/nodes/{remove_node_id}"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?;
             assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
 
             let local_conflict = http
                 .delete(format!("{base_url}/cluster/nodes/{local_node_id}"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?;
             assert_eq!(local_conflict.status(), StatusCode::CONFLICT);
@@ -3093,7 +3093,7 @@ mod tests {
 
             let repair_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3201,7 +3201,7 @@ mod tests {
 
             let repair_report: serde_json::Value = http
                 .post(format!("{base_c}/cluster/replication/repair?scope=cluster"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3279,7 +3279,7 @@ mod tests {
             2,
             None,
             None,
-            &[("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true")],
+            &[("BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true")],
         )
         .await?;
         let mut node_b = start_authenticated_server_with_env_options(
@@ -3289,7 +3289,7 @@ mod tests {
             2,
             None,
             None,
-            &[("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true")],
+            &[("BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true")],
         )
         .await?;
 
@@ -3379,7 +3379,7 @@ mod tests {
 
             let report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair?batch_size=1"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3460,7 +3460,7 @@ mod tests {
 
             let repair_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3566,7 +3566,7 @@ mod tests {
                 .error_for_status()?;
 
             http.post(format!("{base_a}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?;
@@ -3586,7 +3586,7 @@ mod tests {
                 .error_for_status()?;
 
             http.post(format!("{base_a}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?;
@@ -3644,9 +3644,9 @@ mod tests {
         let data_b = fresh_data_dir("repair-delete-b");
 
         let extra_env = [
-            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
-            ("IRONMESH_STARTUP_REPAIR_ENABLED", "false"),
-            ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
+            ("BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
+            ("BERRYKEEP_STARTUP_REPAIR_ENABLED", "false"),
+            ("BERRYKEEP_REPLICATION_REPAIR_ENABLED", "false"),
         ];
 
         let mut node_a =
@@ -3656,8 +3656,8 @@ mod tests {
 
         let base_a = format!("http://{bind_a}");
         let base_b = format!("http://{bind_b}");
-        let sdk_a = IronMeshClient::from_direct_base_url(&base_a);
-        let sdk_b = IronMeshClient::from_direct_base_url(&base_b);
+        let sdk_a = BerryKeepClient::from_direct_base_url(&base_a);
+        let sdk_b = BerryKeepClient::from_direct_base_url(&base_b);
         let http = reqwest::Client::new();
 
         let result = async {
@@ -3675,7 +3675,7 @@ mod tests {
 
             let initial_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3715,7 +3715,7 @@ mod tests {
 
             let delete_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3812,9 +3812,9 @@ mod tests {
         let data_c = fresh_data_dir("repair-perf-c");
 
         let env = [
-            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "false"),
-            ("IRONMESH_STARTUP_REPAIR_ENABLED", "false"),
-            ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
+            ("BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "false"),
+            ("BERRYKEEP_STARTUP_REPAIR_ENABLED", "false"),
+            ("BERRYKEEP_REPLICATION_REPAIR_ENABLED", "false"),
         ];
 
         let mut node_a = start_authenticated_server_with_env_options(
@@ -3868,7 +3868,7 @@ mod tests {
             let start = Instant::now();
             let repair_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -3975,7 +3975,7 @@ mod tests {
         let data_a = fresh_data_dir("internal-mtls-heartbeat-a");
         let data_b = fresh_data_dir("internal-mtls-heartbeat-b");
 
-        let admin_env = [("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN)];
+        let admin_env = [("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN)];
         let mut node_a =
             start_open_server_with_env(bind_a, &data_a, node_id_a, 2, &admin_env).await?;
         let mut node_b =
@@ -4067,7 +4067,7 @@ mod tests {
 
             let reconcile = http
                 .post(format!("{base_a}/cluster/reconcile/{node_id_b}"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?;
@@ -4185,7 +4185,7 @@ mod tests {
 
             let first_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/reconcile/{node_id_b}"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -4214,7 +4214,7 @@ mod tests {
 
             let second_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/reconcile/{node_id_b}"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -4286,15 +4286,15 @@ mod tests {
         let client_dir = fresh_data_dir("relay-rendezvous-client");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "required"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "required"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -4311,7 +4311,7 @@ mod tests {
                     for _ in 0..120 {
                         if let Ok(response) = http
                             .get(format!("{base_url}/cluster/nodes"))
-                            .header("x-ironmesh-admin-token", admin_token)
+                            .header("x-berrykeep-admin-token", admin_token)
                             .send()
                             .await
                             && let Ok(response) = response.error_for_status()
@@ -4402,7 +4402,7 @@ mod tests {
 
             for _ in 0..120 {
                 http.post(format!("{base_a}/cluster/replication/repair"))
-                    .header("x-ironmesh-admin-token", admin_token)
+                    .header("x-berrykeep-admin-token", admin_token)
                     .send()
                     .await?
                     .error_for_status()?;
@@ -4555,15 +4555,15 @@ mod tests {
         let client_dir = fresh_data_dir("relay-client-unreachable-direct-client");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -4662,15 +4662,15 @@ mod tests {
         let client_dir = fresh_data_dir("relay-session-reuse-client");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -4764,15 +4764,15 @@ mod tests {
         let client_dir = fresh_data_dir("relay-client-direct-then-relay-client");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -4878,13 +4878,13 @@ mod tests {
         let data_b = fresh_data_dir("relay-restart-repl-node-b");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "required"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "required"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -4907,7 +4907,7 @@ mod tests {
                     for _ in 0..120 {
                         if let Ok(response) =
                             http.get(format!("{base_url}/cluster/nodes"))
-                                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                                 .send()
                                 .await
                             && let Ok(response) = response.error_for_status()
@@ -4944,7 +4944,7 @@ mod tests {
 
             let repair_report: serde_json::Value = http
                 .post(format!("{base_a}/cluster/replication/repair"))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?
@@ -5387,7 +5387,7 @@ mod tests {
                     "{}/maintenance/cleanup?retention_secs=0&dry_run=false&approve=true",
                     fixture.http.base_url
                 ))
-                .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                 .send()
                 .await?
                 .error_for_status()?;
@@ -5454,12 +5454,12 @@ mod tests {
         let client_dir = fresh_data_dir("bootstrap-claim-relay-auth-client");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -5533,12 +5533,12 @@ mod tests {
         let client_dir = fresh_data_dir("bootstrap-claim-roundtrip-auth-client");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -5601,12 +5601,12 @@ mod tests {
         let client_dir = fresh_data_dir("bootstrap-claim-offline-client");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_ADMIN_TOKEN", admin_token),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_ADMIN_TOKEN", admin_token),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -5691,12 +5691,12 @@ mod tests {
         let localhost_internal_url = localhost_internal_base_url_from_public_bind(bind)?;
         let expected_reflexive_endpoint = internal_base_url_from_public_bind(bind)?;
 
-        let rendezvous_a_env = [("IRONMESH_RENDEZVOUS_PEER_URLS", rendezvous_url_b.as_str())];
-        let rendezvous_b_env = [("IRONMESH_RENDEZVOUS_PEER_URLS", rendezvous_url_a.as_str())];
+        let rendezvous_a_env = [("BERRYKEEP_RENDEZVOUS_PEER_URLS", rendezvous_url_b.as_str())];
+        let rendezvous_b_env = [("BERRYKEEP_RENDEZVOUS_PEER_URLS", rendezvous_url_a.as_str())];
         let node_env = [
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url_a.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_INTERNAL_URL", localhost_internal_url.as_str()),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url_a.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_INTERNAL_URL", localhost_internal_url.as_str()),
         ];
 
         let mut rendezvous_a =

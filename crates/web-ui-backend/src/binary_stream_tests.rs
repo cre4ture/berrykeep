@@ -5,7 +5,7 @@ use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RAN
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::get;
 use bytes::Bytes;
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,7 +43,7 @@ fn binary_upstream_response_headers(
     }
     headers.insert(ETAG, "\"binary-test-etag\"".parse().expect("valid header"));
     headers.insert(
-        "x-ironmesh-object-size",
+        "x-berrykeep-object-size",
         payload_len.to_string().parse().expect("valid header"),
     );
     let content_length = selection
@@ -157,7 +157,7 @@ async fn start_binary_test_servers(
         .local_addr()
         .expect("web UI listener should have an address");
     let app = router(WebUiConfig::from_client(
-        IronMeshClient::from_direct_base_url(format!("http://{upstream_address}")),
+        BerryKeepClient::from_direct_base_url(format!("http://{upstream_address}")),
     ));
     let web = tokio::spawn(async move {
         let _ = axum::serve(web_listener, app).await;

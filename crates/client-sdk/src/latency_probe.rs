@@ -7,14 +7,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    ClientConnectionRouteEndpointSnapshot, ClientConnectionRouteSnapshot, IronMeshClient,
+    BerryKeepClient, ClientConnectionRouteEndpointSnapshot, ClientConnectionRouteSnapshot,
     TransportSessionPoolSnapshot,
 };
 
 const LATENCY_PROBE_ROUTE: &str = "/api/v1/diagnostics/latency";
-const LATENCY_PROBE_HEADER_NODE_ID: &str = "x-ironmesh-latency-node-id";
-const LATENCY_PROBE_HEADER_RESPONSE_BYTES: &str = "x-ironmesh-latency-response-bytes";
-const LATENCY_PROBE_HEADER_SERVER_DURATION_MS: &str = "x-ironmesh-latency-server-duration-ms";
+const LATENCY_PROBE_HEADER_NODE_ID: &str = "x-berrykeep-latency-node-id";
+const LATENCY_PROBE_HEADER_RESPONSE_BYTES: &str = "x-berrykeep-latency-response-bytes";
+const LATENCY_PROBE_HEADER_SERVER_DURATION_MS: &str = "x-berrykeep-latency-server-duration-ms";
 const MAX_LATENCY_PROBE_SAMPLES: usize = 64;
 const MAX_LATENCY_PROBE_WARMUP_SAMPLES: usize = 16;
 const MAX_LATENCY_PROBE_RESPONSE_BYTES: usize = 256 * 1024;
@@ -269,7 +269,7 @@ impl TitleLatencyMonitor {
         }
     }
 
-    pub fn start(client: IronMeshClient, config: TitleLatencyProbeConfig) -> Result<Self> {
+    pub fn start(client: BerryKeepClient, config: TitleLatencyProbeConfig) -> Result<Self> {
         config.validate()?;
         if !config.enabled {
             return Ok(Self::disabled());
@@ -280,7 +280,7 @@ impl TitleLatencyMonitor {
         let (stop_tx, stop_rx) = mpsc::channel();
         let period = Duration::from_secs(config.period_seconds);
         let worker = thread::Builder::new()
-            .name("ironmesh-title-latency".to_string())
+            .name("berrykeep-title-latency".to_string())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -350,7 +350,7 @@ fn replace_title_latency_status(
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_status;
 }
 
-fn title_latency_connection_type(client: &IronMeshClient) -> TitleLatencyConnectionType {
+fn title_latency_connection_type(client: &BerryKeepClient) -> TitleLatencyConnectionType {
     let snapshot = client.connection_route_snapshot();
     let used = most_recently_used_endpoint(&snapshot).or_else(|| {
         snapshot.ranked_indices.first().and_then(|index| {
@@ -430,7 +430,7 @@ impl std::fmt::Display for TitleLatencyRouteLog {
     }
 }
 
-fn title_latency_route_log(client: &IronMeshClient) -> TitleLatencyRouteLog {
+fn title_latency_route_log(client: &BerryKeepClient) -> TitleLatencyRouteLog {
     let snapshot = client.connection_route_snapshot();
     let preferred_index = snapshot.ranked_indices.first().copied();
     let preferred = preferred_index.and_then(|index| {
@@ -449,14 +449,14 @@ fn title_latency_route_log(client: &IronMeshClient) -> TitleLatencyRouteLog {
 }
 
 fn log_title_latency_probe_result(
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     probe_id: u64,
     route_before: &TitleLatencyRouteLog,
     status: &TitleLatencyProbeStatus,
 ) {
     let route_after = title_latency_route_log(client);
     tracing::debug!(
-        target: "ironmesh_title_latency",
+        target: "berrykeep_title_latency",
         runtime_id = %client.connection_runtime_id(),
         probe_id,
         state = ?status.state,
@@ -482,7 +482,7 @@ pub struct LatencyProbeComparison {
     pub observations: Vec<String>,
 }
 
-impl IronMeshClient {
+impl BerryKeepClient {
     pub async fn run_latency_probe(
         &self,
         config: LatencyProbeConfig,
@@ -641,7 +641,7 @@ impl IronMeshClient {
         let probe_id = TITLE_LATENCY_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let route_before = title_latency_route_log(self);
         tracing::debug!(
-            target: "ironmesh_title_latency",
+            target: "berrykeep_title_latency",
             runtime_id = %self.connection_runtime_id(),
             probe_id,
             route_before = %route_before,
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[test]
     fn title_latency_status_marks_a_direct_quic_candidate_distinctly() {
-        let client = IronMeshClient::from_direct_quic_candidate_with_target_node_id(
+        let client = BerryKeepClient::from_direct_quic_candidate_with_target_node_id(
             ConnectionCandidate {
                 kind: CandidateKind::DirectQuic,
                 endpoint: "iroh://direct-quic-endpoint".to_string(),
@@ -1162,7 +1162,7 @@ mod tests {
     async fn title_latency_monitor_reports_current_direct_probe_result() {
         let (base_url, server) = spawn_probe_server().await;
         let monitor = TitleLatencyMonitor::start(
-            IronMeshClient::from_direct_base_url(base_url),
+            BerryKeepClient::from_direct_base_url(base_url),
             TitleLatencyProbeConfig {
                 enabled: true,
                 period_seconds: TITLE_LATENCY_PROBE_MIN_PERIOD_SECONDS,
@@ -1196,7 +1196,7 @@ mod tests {
     #[tokio::test]
     async fn title_latency_probe_only_labels_a_successful_route() {
         let (base_url, server) = spawn_failed_probe_server().await;
-        let client = IronMeshClient::from_direct_base_url(base_url);
+        let client = BerryKeepClient::from_direct_base_url(base_url);
 
         let status = client.run_title_latency_probe().await;
 
@@ -1212,7 +1212,7 @@ mod tests {
     #[tokio::test]
     async fn latency_probe_collects_samples_and_summary() {
         let (base_url, server) = spawn_probe_server().await;
-        let client = IronMeshClient::from_direct_base_url(base_url);
+        let client = BerryKeepClient::from_direct_base_url(base_url);
 
         let result = client
             .run_latency_probe(LatencyProbeConfig {
@@ -1247,7 +1247,7 @@ mod tests {
     #[tokio::test]
     async fn latency_probe_times_out_slow_requests_and_reports_error() {
         let (base_url, server) = spawn_slow_probe_server(Duration::from_secs(5)).await;
-        let client = IronMeshClient::from_direct_base_url(base_url);
+        let client = BerryKeepClient::from_direct_base_url(base_url);
 
         let started_at = Instant::now();
         let result = client

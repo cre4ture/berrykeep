@@ -438,7 +438,7 @@ final class AppleCFacadeBridgeTests: XCTestCase {
 
 private func remoteUnavailableError() -> NSError {
     NSError(
-        domain: "dev.ironmesh.rust",
+        domain: "dev.berrykeep.rust",
         code: 1,
         userInfo: [
             NSLocalizedDescriptionKey:
@@ -449,7 +449,7 @@ private func remoteUnavailableError() -> NSError {
 
 private func assertRemoteUnavailable(_ error: Error) {
     let nsError = error as NSError
-    XCTAssertEqual(nsError.domain, "dev.ironmesh.rust")
+    XCTAssertEqual(nsError.domain, "dev.berrykeep.rust")
     XCTAssertEqual(nsError.code, 1)
     XCTAssertEqual(
         nsError.localizedDescription,

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use client_sdk::ironmesh_client::DownloadRangeRequest;
+use client_sdk::berrykeep_client::DownloadRangeRequest;
 use client_sdk::{
     ClientConnectionAttempt, ClientConnectionDiagnostics, ClientConnectionRouteSnapshot,
-    ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ManagedIronMeshClient,
+    ClientEndpointDiagnostics, ClientIdentityMaterial, ClientNode, ManagedBerryKeepClient,
     ObjectHeadInfo, RequestedRange, StoreIndexEntry, StoreIndexMediaFilter,
     StoreIndexRequestOptions, StoreIndexResponse, StoreIndexSortOrder, StoreIndexView,
     TitleLatencyMonitor, TitleLatencyProbeConfig, TitleLatencyProbeStatus, VersionGraphSummary,
@@ -57,8 +57,8 @@ fn init_ios_tracing() {
 pub struct IosStorageApp {
     runtime: Option<Runtime>,
     _mobile_session: Option<MobileClientSession>,
-    sdk: client_sdk::IronMeshClient,
-    managed_client: Option<ManagedIronMeshClient>,
+    sdk: client_sdk::BerryKeepClient,
+    managed_client: Option<ManagedBerryKeepClient>,
     client: ClientNode,
     connection_name: Option<String>,
     fallback_title_latency_monitor: Option<Mutex<TitleLatencyMonitor>>,
@@ -262,11 +262,15 @@ impl AppleConnectionDiagnosticsResponse {
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct IronmeshIosBytes {
+pub struct BerryKeepIosBytes {
     pub data: *mut u8,
     pub len: usize,
     pub capacity: usize,
 }
+
+/// Compatibility type alias for clients compiled against the former Rust API.
+#[deprecated(note = "use BerryKeepIosBytes")]
+pub type IronmeshIosBytes = BerryKeepIosBytes;
 
 impl IosStorageApp {
     pub fn new(connection_input: impl Into<String>) -> Result<Self> {
@@ -309,7 +313,7 @@ impl IosStorageApp {
     }
 
     pub fn with_sdk(
-        sdk: client_sdk::IronMeshClient,
+        sdk: client_sdk::BerryKeepClient,
         _client_identity: Option<ClientIdentityMaterial>,
         connection_name: Option<String>,
     ) -> Result<Self> {
@@ -318,9 +322,9 @@ impl IosStorageApp {
 
     fn with_configured_sdk(
         runtime: Option<Runtime>,
-        sdk: client_sdk::IronMeshClient,
+        sdk: client_sdk::BerryKeepClient,
         connection_name: Option<String>,
-        managed_client: Option<ManagedIronMeshClient>,
+        managed_client: Option<ManagedBerryKeepClient>,
         mobile_session: Option<MobileClientSession>,
     ) -> Result<Self> {
         let client = match (mobile_session.as_ref(), connection_name.as_ref()) {
@@ -520,7 +524,7 @@ impl IosStorageApp {
     pub fn take_client_identity_update_json(&self) -> Result<Option<String>> {
         self.managed_client
             .as_ref()
-            .and_then(ManagedIronMeshClient::take_identity_update)
+            .and_then(ManagedBerryKeepClient::take_identity_update)
             .map(|identity| identity.to_json_pretty())
             .transpose()
     }
@@ -531,7 +535,7 @@ impl IosStorageApp {
     pub fn take_connection_bootstrap_update_json(&self) -> Result<Option<String>> {
         self.managed_client
             .as_ref()
-            .and_then(ManagedIronMeshClient::take_connection_bootstrap_update)
+            .and_then(ManagedBerryKeepClient::take_connection_bootstrap_update)
             .map(|bootstrap| bootstrap.to_json_pretty())
             .transpose()
     }
@@ -1010,13 +1014,13 @@ pub fn web_gui_html() -> String {
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_create(
+pub extern "C" fn berrykeep_ios_facade_create(
     connection_input: *const c_char,
     server_ca_pem: *const c_char,
     client_identity_json: *const c_char,
     out_error: *mut *mut c_char,
 ) -> *mut c_void {
-    ironmesh_ios_facade_create_named(
+    berrykeep_ios_facade_create_named(
         connection_input,
         server_ca_pem,
         client_identity_json,
@@ -1027,7 +1031,7 @@ pub extern "C" fn ironmesh_ios_facade_create(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_create_named(
+pub extern "C" fn berrykeep_ios_facade_create_named(
     connection_input: *const c_char,
     server_ca_pem: *const c_char,
     client_identity_json: *const c_char,
@@ -1060,7 +1064,7 @@ pub extern "C" fn ironmesh_ios_facade_create_named(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_free(handle: *mut c_void) {
+pub extern "C" fn berrykeep_ios_facade_free(handle: *mut c_void) {
     free_handle(handle);
 }
 
@@ -1070,7 +1074,7 @@ pub extern "C" fn ironmesh_ios_facade_free(handle: *mut c_void) {
 /// `CString::into_raw`, and it must not be freed more than once.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ironmesh_ios_string_free(value: *mut c_char) {
+pub unsafe extern "C" fn berrykeep_ios_string_free(value: *mut c_char) {
     if value.is_null() {
         return;
     }
@@ -1082,7 +1086,7 @@ pub unsafe extern "C" fn ironmesh_ios_string_free(value: *mut c_char) {
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_bytes_free(value: IronmeshIosBytes) {
+pub extern "C" fn berrykeep_ios_bytes_free(value: BerryKeepIosBytes) {
     if value.data.is_null() && value.len == 0 && value.capacity == 0 {
         return;
     }
@@ -1094,7 +1098,7 @@ pub extern "C" fn ironmesh_ios_bytes_free(value: IronmeshIosBytes) {
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_diagnostic_log(
+pub extern "C" fn berrykeep_ios_diagnostic_log(
     out_log: *mut *mut c_char,
     out_error: *mut *mut c_char,
 ) -> c_int {
@@ -1108,7 +1112,7 @@ pub extern "C" fn ironmesh_ios_diagnostic_log(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_list_json(
+pub extern "C" fn berrykeep_ios_facade_list_json(
     handle: *mut c_void,
     prefix: *const c_char,
     depth: usize,
@@ -1127,7 +1131,7 @@ pub extern "C" fn ironmesh_ios_facade_list_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_metadata_json(
+pub extern "C" fn berrykeep_ios_facade_metadata_json(
     handle: *mut c_void,
     key: *const c_char,
     out_json: *mut *mut c_char,
@@ -1142,7 +1146,7 @@ pub extern "C" fn ironmesh_ios_facade_metadata_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
+pub extern "C" fn berrykeep_ios_facade_store_index_with_options_json(
     handle: *mut c_void,
     prefix: *const c_char,
     depth: usize,
@@ -1213,7 +1217,7 @@ pub extern "C" fn ironmesh_ios_facade_store_index_with_options_json(
 /// `labels_json` must each point to valid, NUL-terminated UTF-8 strings for
 /// the duration of the call. When non-null, `out_error` must point to writable
 /// storage for a C string pointer owned by this facade.
-pub unsafe extern "C" fn ironmesh_ios_facade_set_media_labels_json(
+pub unsafe extern "C" fn berrykeep_ios_facade_set_media_labels_json(
     handle: *mut c_void,
     key: *const c_char,
     labels_json: *const c_char,
@@ -1232,7 +1236,7 @@ pub unsafe extern "C" fn ironmesh_ios_facade_set_media_labels_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_connection_diagnostics_json(
+pub extern "C" fn berrykeep_ios_facade_connection_diagnostics_json(
     handle: *mut c_void,
     out_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
@@ -1244,7 +1248,7 @@ pub extern "C" fn ironmesh_ios_facade_connection_diagnostics_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_connection_route_snapshot_json(
+pub extern "C" fn berrykeep_ios_facade_connection_route_snapshot_json(
     handle: *mut c_void,
     refresh: c_int,
     out_json: *mut *mut c_char,
@@ -1261,7 +1265,7 @@ pub extern "C" fn ironmesh_ios_facade_connection_route_snapshot_json(
 /// app returns to the foreground. It does not create a permanent background task.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_notify_foregrounded(
+pub extern "C" fn berrykeep_ios_facade_notify_foregrounded(
     handle: *mut c_void,
     out_error: *mut *mut c_char,
 ) -> c_int {
@@ -1280,7 +1284,7 @@ pub extern "C" fn ironmesh_ios_facade_notify_foregrounded(
 /// call; the in-memory managed client remains usable either way.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_take_client_identity_update_json(
+pub extern "C" fn berrykeep_ios_facade_take_client_identity_update_json(
     handle: *mut c_void,
     out_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
@@ -1297,7 +1301,7 @@ pub extern "C" fn ironmesh_ios_facade_take_client_identity_update_json(
 /// an empty string means that no new version has been learned.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_take_connection_bootstrap_update_json(
+pub extern "C" fn berrykeep_ios_facade_take_connection_bootstrap_update_json(
     handle: *mut c_void,
     out_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
@@ -1311,7 +1315,7 @@ pub extern "C" fn ironmesh_ios_facade_take_connection_bootstrap_update_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_configure_title_latency_monitor_json(
+pub extern "C" fn berrykeep_ios_facade_configure_title_latency_monitor_json(
     handle: *mut c_void,
     enabled: c_int,
     period_seconds: u64,
@@ -1327,7 +1331,7 @@ pub extern "C" fn ironmesh_ios_facade_configure_title_latency_monitor_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_title_latency_status_json(
+pub extern "C" fn berrykeep_ios_facade_title_latency_status_json(
     handle: *mut c_void,
     out_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
@@ -1339,7 +1343,7 @@ pub extern "C" fn ironmesh_ios_facade_title_latency_status_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_stop_title_latency_monitor(
+pub extern "C" fn berrykeep_ios_facade_stop_title_latency_monitor(
     out_error: *mut *mut c_char,
 ) -> c_int {
     clear_error(out_error);
@@ -1348,10 +1352,10 @@ pub extern "C" fn ironmesh_ios_facade_stop_title_latency_monitor(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_fetch_bytes(
+pub extern "C" fn berrykeep_ios_facade_fetch_bytes(
     handle: *mut c_void,
     key: *const c_char,
-    out_bytes: *mut IronmeshIosBytes,
+    out_bytes: *mut BerryKeepIosBytes,
     out_error: *mut *mut c_char,
 ) -> c_int {
     clear_bytes_out(out_bytes);
@@ -1364,7 +1368,7 @@ pub extern "C" fn ironmesh_ios_facade_fetch_bytes(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_object_size(
+pub extern "C" fn berrykeep_ios_facade_object_size(
     handle: *mut c_void,
     key: *const c_char,
     snapshot: *const c_char,
@@ -1399,14 +1403,14 @@ pub extern "C" fn ironmesh_ios_facade_object_size(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_fetch_range_bytes(
+pub extern "C" fn berrykeep_ios_facade_fetch_range_bytes(
     handle: *mut c_void,
     key: *const c_char,
     offset: u64,
     length: usize,
     snapshot: *const c_char,
     version: *const c_char,
-    out_bytes: *mut IronmeshIosBytes,
+    out_bytes: *mut BerryKeepIosBytes,
     out_error: *mut *mut c_char,
 ) -> c_int {
     clear_bytes_out(out_bytes);
@@ -1427,10 +1431,10 @@ pub extern "C" fn ironmesh_ios_facade_fetch_range_bytes(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_fetch_relative_bytes(
+pub extern "C" fn berrykeep_ios_facade_fetch_relative_bytes(
     handle: *mut c_void,
     path: *const c_char,
-    out_bytes: *mut IronmeshIosBytes,
+    out_bytes: *mut BerryKeepIosBytes,
     out_error: *mut *mut c_char,
 ) -> c_int {
     clear_bytes_out(out_bytes);
@@ -1442,7 +1446,7 @@ pub extern "C" fn ironmesh_ios_facade_fetch_relative_bytes(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_put_bytes(
+pub extern "C" fn berrykeep_ios_facade_put_bytes(
     handle: *mut c_void,
     key: *const c_char,
     data: *const u8,
@@ -1461,7 +1465,7 @@ pub extern "C" fn ironmesh_ios_facade_put_bytes(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_put_bytes_with_expected_revision(
+pub extern "C" fn berrykeep_ios_facade_put_bytes_with_expected_revision(
     handle: *mut c_void,
     key: *const c_char,
     data: *const u8,
@@ -1482,7 +1486,7 @@ pub extern "C" fn ironmesh_ios_facade_put_bytes_with_expected_revision(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_delete_path_with_expected_revision(
+pub extern "C" fn berrykeep_ios_facade_delete_path_with_expected_revision(
     handle: *mut c_void,
     key: *const c_char,
     expected_revision: *const c_char,
@@ -1500,7 +1504,7 @@ pub extern "C" fn ironmesh_ios_facade_delete_path_with_expected_revision(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_enroll_with_bootstrap(
+pub extern "C" fn berrykeep_ios_facade_enroll_with_bootstrap(
     connection_input: *const c_char,
     device_id_override: *const c_char,
     device_label_override: *const c_char,
@@ -1523,7 +1527,7 @@ pub extern "C" fn ironmesh_ios_facade_enroll_with_bootstrap(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_delete_path(
+pub extern "C" fn berrykeep_ios_facade_delete_path(
     handle: *mut c_void,
     key: *const c_char,
     out_error: *mut *mut c_char,
@@ -1536,7 +1540,7 @@ pub extern "C" fn ironmesh_ios_facade_delete_path(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_move_path(
+pub extern "C" fn berrykeep_ios_facade_move_path(
     handle: *mut c_void,
     from_path: *const c_char,
     to_path: *const c_char,
@@ -1556,7 +1560,7 @@ pub extern "C" fn ironmesh_ios_facade_move_path(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_move_path_with_expected_revision(
+pub extern "C" fn berrykeep_ios_facade_move_path_with_expected_revision(
     handle: *mut c_void,
     from_path: *const c_char,
     to_path: *const c_char,
@@ -1579,7 +1583,7 @@ pub extern "C" fn ironmesh_ios_facade_move_path_with_expected_revision(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_start_web_ui(
+pub extern "C" fn berrykeep_ios_facade_start_web_ui(
     connection_input: *const c_char,
     server_ca_pem: *const c_char,
     client_identity_json: *const c_char,
@@ -1603,7 +1607,7 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_start_web_ui_for_surface(
+pub extern "C" fn berrykeep_ios_facade_start_web_ui_for_surface(
     connection_input: *const c_char,
     server_ca_pem: *const c_char,
     client_identity_json: *const c_char,
@@ -1629,7 +1633,7 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui_for_surface(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_start_web_ui_for_surface_result_json(
+pub extern "C" fn berrykeep_ios_facade_start_web_ui_for_surface_result_json(
     connection_input: *const c_char,
     server_ca_pem: *const c_char,
     client_identity_json: *const c_char,
@@ -1655,14 +1659,14 @@ pub extern "C" fn ironmesh_ios_facade_start_web_ui_for_surface_result_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_stop_web_ui(out_error: *mut *mut c_char) -> c_int {
+pub extern "C" fn berrykeep_ios_facade_stop_web_ui(out_error: *mut *mut c_char) -> c_int {
     clear_error(out_error);
     run_ffi_unit_result(out_error, || stop_embedded_web_ui().map(drop))
 }
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_stop_web_ui_surface(
+pub extern "C" fn berrykeep_ios_facade_stop_web_ui_surface(
     surface: *const c_char,
     out_error: *mut *mut c_char,
 ) -> c_int {
@@ -1675,7 +1679,7 @@ pub extern "C" fn ironmesh_ios_facade_stop_web_ui_surface(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_stop_web_ui_surface_result_json(
+pub extern "C" fn berrykeep_ios_facade_stop_web_ui_surface_result_json(
     surface: *const c_char,
     out_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
@@ -1693,14 +1697,14 @@ pub extern "C" fn ironmesh_ios_facade_stop_web_ui_surface_result_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_abort_web_ui(out_error: *mut *mut c_char) -> c_int {
+pub extern "C" fn berrykeep_ios_facade_abort_web_ui(out_error: *mut *mut c_char) -> c_int {
     clear_error(out_error);
     run_ffi_unit_result(out_error, || abort_embedded_web_ui().map(drop))
 }
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_abort_web_ui_result_json(
+pub extern "C" fn berrykeep_ios_facade_abort_web_ui_result_json(
     out_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
 ) -> c_int {
@@ -1714,7 +1718,7 @@ pub extern "C" fn ironmesh_ios_facade_abort_web_ui_result_json(
 
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub extern "C" fn ironmesh_ios_facade_web_ui_state_json(
+pub extern "C" fn berrykeep_ios_facade_web_ui_state_json(
     out_json: *mut *mut c_char,
     out_error: *mut *mut c_char,
 ) -> c_int {
@@ -1908,13 +1912,13 @@ fn clear_string_out(out_value: *mut *mut c_char) {
 }
 
 #[allow(unsafe_code)]
-fn clear_bytes_out(out_value: *mut IronmeshIosBytes) {
+fn clear_bytes_out(out_value: *mut BerryKeepIosBytes) {
     if out_value.is_null() {
         return;
     }
 
     unsafe {
-        *out_value = IronmeshIosBytes {
+        *out_value = BerryKeepIosBytes {
             data: ptr::null_mut(),
             len: 0,
             capacity: 0,
@@ -1946,13 +1950,13 @@ fn write_string(out_value: *mut *mut c_char, value: String) -> Result<()> {
 }
 
 #[allow(unsafe_code)]
-fn write_bytes(out_value: *mut IronmeshIosBytes, bytes: Vec<u8>) -> Result<()> {
+fn write_bytes(out_value: *mut BerryKeepIosBytes, bytes: Vec<u8>) -> Result<()> {
     if out_value.is_null() {
         bail!("output byte buffer pointer must not be null");
     }
 
     let mut bytes = bytes;
-    let value = IronmeshIosBytes {
+    let value = BerryKeepIosBytes {
         data: bytes.as_mut_ptr(),
         len: bytes.len(),
         capacity: bytes.capacity(),
@@ -1996,7 +2000,7 @@ where
 }
 
 fn run_ffi_bytes_result<F>(
-    out_value: *mut IronmeshIosBytes,
+    out_value: *mut BerryKeepIosBytes,
     out_error: *mut *mut c_char,
     f: F,
 ) -> c_int
@@ -2194,7 +2198,7 @@ mod tests {
         match objects.get(&key) {
             Some(object) => axum::response::Response::builder()
                 .status(StatusCode::OK)
-                .header("x-ironmesh-object-size", object.bytes.len().to_string())
+                .header("x-berrykeep-object-size", object.bytes.len().to_string())
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CONTENT_LENGTH, object.bytes.len().to_string())
                 .body(axum::body::Body::empty())
@@ -2405,10 +2409,10 @@ mod tests {
         let bootstrap = CString::new(bootstrap).expect("bootstrap should be valid");
         let mut error = ptr::null_mut();
         let handle =
-            ironmesh_ios_facade_create(bootstrap.as_ptr(), ptr::null(), ptr::null(), &mut error);
+            berrykeep_ios_facade_create(bootstrap.as_ptr(), ptr::null(), ptr::null(), &mut error);
         if !error.is_null() {
             let message = unsafe { CStr::from_ptr(error).to_string_lossy().into_owned() };
-            unsafe { ironmesh_ios_string_free(error) };
+            unsafe { berrykeep_ios_string_free(error) };
             panic!("failed to create facade: {message}");
         }
         handle
@@ -2417,15 +2421,15 @@ mod tests {
     fn read_string(ptr: *mut c_char) -> String {
         unsafe {
             let value = CStr::from_ptr(ptr).to_string_lossy().into_owned();
-            ironmesh_ios_string_free(ptr);
+            berrykeep_ios_string_free(ptr);
             value
         }
     }
 
-    fn read_bytes(value: IronmeshIosBytes) -> Vec<u8> {
+    fn read_bytes(value: BerryKeepIosBytes) -> Vec<u8> {
         unsafe {
             let bytes = std::slice::from_raw_parts(value.data, value.len).to_vec();
-            ironmesh_ios_bytes_free(value);
+            berrykeep_ios_bytes_free(value);
             bytes
         }
     }
@@ -2516,7 +2520,7 @@ mod tests {
         let bootstrap_json = CString::new(bootstrap_json).expect("bootstrap json should be valid");
         let mut json_out = ptr::null_mut();
         let mut error_out = ptr::null_mut();
-        let status = ironmesh_ios_facade_enroll_with_bootstrap(
+        let status = berrykeep_ios_facade_enroll_with_bootstrap(
             bootstrap_json.as_ptr(),
             ptr::null(),
             ptr::null(),
@@ -2562,7 +2566,7 @@ mod tests {
         let mut json_out = ptr::null_mut();
         let mut error_out = ptr::null_mut();
 
-        let status = ironmesh_ios_facade_connection_route_snapshot_json(
+        let status = berrykeep_ios_facade_connection_route_snapshot_json(
             handle,
             0,
             &mut json_out,
@@ -2599,7 +2603,7 @@ mod tests {
             assert!(endpoint.get(field).is_some(), "missing JSON field {field}");
         }
 
-        ironmesh_ios_facade_free(handle);
+        berrykeep_ios_facade_free(handle);
     }
 
     #[test]
@@ -2610,7 +2614,7 @@ mod tests {
         let mut error_out = ptr::null_mut();
 
         let status =
-            ironmesh_ios_facade_connection_diagnostics_json(handle, &mut json_out, &mut error_out);
+            berrykeep_ios_facade_connection_diagnostics_json(handle, &mut json_out, &mut error_out);
 
         assert_eq!(status, FFI_OK);
         assert!(error_out.is_null());
@@ -2618,7 +2622,7 @@ mod tests {
             .expect("connection diagnostics response should parse");
         assert!(snapshot["generated_at_unix_ms"].as_u64().is_some());
 
-        ironmesh_ios_facade_free(handle);
+        berrykeep_ios_facade_free(handle);
     }
 
     #[test]
@@ -2628,7 +2632,7 @@ mod tests {
         let mut json_out = ptr::null_mut();
         let mut error_out = ptr::null_mut();
 
-        let status = ironmesh_ios_facade_configure_title_latency_monitor_json(
+        let status = berrykeep_ios_facade_configure_title_latency_monitor_json(
             handle,
             0,
             client_sdk::TITLE_LATENCY_PROBE_DEFAULT_PERIOD_SECONDS,
@@ -2646,7 +2650,7 @@ mod tests {
             client_sdk::TitleLatencyConnectionType::Unknown
         );
 
-        ironmesh_ios_facade_free(handle);
+        berrykeep_ios_facade_free(handle);
     }
 
     #[test]
@@ -2661,7 +2665,7 @@ mod tests {
         let media_filter = CString::new("image").expect("filter should be valid");
         let mut json_out = ptr::null_mut();
         let mut index_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_store_index_with_options_json(
+        let status = berrykeep_ios_facade_store_index_with_options_json(
             handle,
             prefix.as_ptr(),
             64,
@@ -2696,13 +2700,13 @@ mod tests {
 
         let relative_path = CString::new("/media/thumbnail?key=photos%2Fcat%20one.jpg")
             .expect("relative path should be valid");
-        let mut bytes_out = IronmeshIosBytes {
+        let mut bytes_out = BerryKeepIosBytes {
             data: ptr::null_mut(),
             len: 0,
             capacity: 0,
         };
         let mut relative_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_fetch_relative_bytes(
+        let status = berrykeep_ios_facade_fetch_relative_bytes(
             handle,
             relative_path.as_ptr(),
             &mut bytes_out,
@@ -2722,13 +2726,13 @@ mod tests {
         );
 
         let missing_path = CString::new("/media/missing").expect("path should be valid");
-        let mut missing_bytes = IronmeshIosBytes {
+        let mut missing_bytes = BerryKeepIosBytes {
             data: ptr::null_mut(),
             len: 0,
             capacity: 0,
         };
         let mut missing_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_fetch_relative_bytes(
+        let status = berrykeep_ios_facade_fetch_relative_bytes(
             handle,
             missing_path.as_ptr(),
             &mut missing_bytes,
@@ -2736,9 +2740,9 @@ mod tests {
         );
         assert_eq!(status, FFI_ERR);
         assert!(!missing_error.is_null());
-        unsafe { ironmesh_ios_string_free(missing_error) };
+        unsafe { berrykeep_ios_string_free(missing_error) };
 
-        ironmesh_ios_facade_free(handle);
+        berrykeep_ios_facade_free(handle);
     }
 
     #[test]
@@ -2750,7 +2754,7 @@ mod tests {
         let key = CString::new("docs/readme.txt").expect("key should be valid");
         let mut json_out = ptr::null_mut();
         let mut error_out = ptr::null_mut();
-        let status = ironmesh_ios_facade_put_bytes(
+        let status = berrykeep_ios_facade_put_bytes(
             handle,
             key.as_ptr(),
             payload.as_ptr(),
@@ -2770,7 +2774,7 @@ mod tests {
         let mut list_error = ptr::null_mut();
         let prefix = CString::new("docs/").expect("prefix should be valid");
         let snapshot = CString::new("").expect("empty snapshot is valid");
-        let status = ironmesh_ios_facade_list_json(
+        let status = berrykeep_ios_facade_list_json(
             handle,
             prefix.as_ptr(),
             1,
@@ -2797,7 +2801,7 @@ mod tests {
 
         let mut metadata_json = ptr::null_mut();
         let mut metadata_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_metadata_json(
+        let status = berrykeep_ios_facade_metadata_json(
             handle,
             key.as_ptr(),
             &mut metadata_json,
@@ -2810,21 +2814,25 @@ mod tests {
         assert!(metadata.version_graph.is_some());
         assert!(metadata.head_object.is_some());
 
-        let mut bytes_out = IronmeshIosBytes {
+        let mut bytes_out = BerryKeepIosBytes {
             data: ptr::null_mut(),
             len: 0,
             capacity: 0,
         };
         let mut fetch_error = ptr::null_mut();
-        let status =
-            ironmesh_ios_facade_fetch_bytes(handle, key.as_ptr(), &mut bytes_out, &mut fetch_error);
+        let status = berrykeep_ios_facade_fetch_bytes(
+            handle,
+            key.as_ptr(),
+            &mut bytes_out,
+            &mut fetch_error,
+        );
         assert_eq!(status, FFI_OK);
         assert!(fetch_error.is_null());
         assert_eq!(read_bytes(bytes_out), payload);
 
         let mut object_size = 0;
         let mut size_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_object_size(
+        let status = berrykeep_ios_facade_object_size(
             handle,
             key.as_ptr(),
             ptr::null(),
@@ -2836,13 +2844,13 @@ mod tests {
         assert!(size_error.is_null());
         assert_eq!(object_size, payload.len() as u64);
 
-        let mut range_bytes = IronmeshIosBytes {
+        let mut range_bytes = BerryKeepIosBytes {
             data: ptr::null_mut(),
             len: 0,
             capacity: 0,
         };
         let mut range_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_fetch_range_bytes(
+        let status = berrykeep_ios_facade_fetch_range_bytes(
             handle,
             key.as_ptr(),
             6,
@@ -2856,13 +2864,13 @@ mod tests {
         assert!(range_error.is_null());
         assert_eq!(read_bytes(range_bytes), b"apple");
 
-        let mut oversized_range = IronmeshIosBytes {
+        let mut oversized_range = BerryKeepIosBytes {
             data: ptr::null_mut(),
             len: 0,
             capacity: 0,
         };
         let mut oversized_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_fetch_range_bytes(
+        let status = berrykeep_ios_facade_fetch_range_bytes(
             handle,
             key.as_ptr(),
             0,
@@ -2875,11 +2883,11 @@ mod tests {
         assert_eq!(status, FFI_ERR);
         assert!(oversized_range.data.is_null());
         assert!(!oversized_error.is_null());
-        unsafe { ironmesh_ios_string_free(oversized_error) };
+        unsafe { berrykeep_ios_string_free(oversized_error) };
 
         let new_key = CString::new("docs/guide.txt").expect("new key should be valid");
         let mut move_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_move_path(
+        let status = berrykeep_ios_facade_move_path(
             handle,
             key.as_ptr(),
             new_key.as_ptr(),
@@ -2889,13 +2897,13 @@ mod tests {
         assert_eq!(status, FFI_OK);
         assert!(move_error.is_null());
 
-        let mut moved_bytes = IronmeshIosBytes {
+        let mut moved_bytes = BerryKeepIosBytes {
             data: ptr::null_mut(),
             len: 0,
             capacity: 0,
         };
         let mut moved_fetch_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_fetch_bytes(
+        let status = berrykeep_ios_facade_fetch_bytes(
             handle,
             new_key.as_ptr(),
             &mut moved_bytes,
@@ -2905,17 +2913,17 @@ mod tests {
         assert_eq!(read_bytes(moved_bytes), payload);
 
         let mut delete_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_delete_path(handle, new_key.as_ptr(), &mut delete_error);
+        let status = berrykeep_ios_facade_delete_path(handle, new_key.as_ptr(), &mut delete_error);
         assert_eq!(status, FFI_OK);
         assert!(delete_error.is_null());
 
         let mut post_delete_error = ptr::null_mut();
-        let mut post_delete_bytes = IronmeshIosBytes {
+        let mut post_delete_bytes = BerryKeepIosBytes {
             data: ptr::null_mut(),
             len: 0,
             capacity: 0,
         };
-        let status = ironmesh_ios_facade_fetch_bytes(
+        let status = berrykeep_ios_facade_fetch_bytes(
             handle,
             new_key.as_ptr(),
             &mut post_delete_bytes,
@@ -2923,8 +2931,8 @@ mod tests {
         );
         assert_eq!(status, FFI_ERR);
         assert!(!post_delete_error.is_null());
-        unsafe { ironmesh_ios_string_free(post_delete_error) };
+        unsafe { berrykeep_ios_string_free(post_delete_error) };
 
-        ironmesh_ios_facade_free(handle);
+        berrykeep_ios_facade_free(handle);
     }
 }

@@ -11,8 +11,8 @@ Target outcome:
 
 - Facet no longer treats its own `photos.thumbnail` BLOB as the authoritative
   photo thumbnail source.
-- IronMesh becomes the authoritative provider for shared photo thumbnails.
-- IronMesh exposes a second, higher-resolution thumbnail profile for analysis
+- BerryKeep becomes the authoritative provider for shared photo thumbnails.
+- BerryKeep exposes a second, higher-resolution thumbnail profile for analysis
   workloads in addition to the current `grid` profile.
 - Facet keeps local fallbacks only where they remain necessary during migration
   or for unsupported/offline cases.
@@ -23,7 +23,7 @@ viewing, EXIF, and several model pipelines.
 
 ## Current Baseline
 
-### IronMesh today
+### BerryKeep today
 
 Current media-cache behavior:
 
@@ -70,11 +70,11 @@ Relevant code:
 
 In scope:
 
-- add an IronMesh `analysis` thumbnail profile
+- add a BerryKeep `analysis` thumbnail profile
 - add profile-aware thumbnail requests and metadata
-- create a Facet thumbnail backend abstraction that supports IronMesh-backed
+- create a Facet thumbnail backend abstraction that supports BerryKeep-backed
   fetches
-- introduce path/key mapping between Facet paths and IronMesh keys
+- introduce path/key mapping between Facet paths and BerryKeep keys
 - migrate Facet viewer and recompute code off direct `photos.thumbnail` reads
 - update export code that currently assumes local thumbnail BLOBs
 - define cutover, fallback, and rollback behavior
@@ -83,15 +83,15 @@ Out of scope for this plan:
 
 - replacing Facet's full local-file access for originals
 - replacing face embeddings, CLIP embeddings, or other non-thumbnail BLOBs
-- moving Facet's live SQLite database into IronMesh
-- importing all Facet relational state into IronMesh
+- moving Facet's live SQLite database into BerryKeep
+- importing all Facet relational state into BerryKeep
 
 ## Assumptions
 
 1. A dedicated Facet worker continues to exist.
 2. The worker has local access to original photo files for full scans and RAW
    decode.
-3. IronMesh and Facet can both run on the same machine or at least inside the
+3. BerryKeep and Facet can both run on the same machine or at least inside the
    same low-latency environment for thumbnail fetches.
 4. The migration may require coordinated changes in both repos before a clean
    cutover is possible.
@@ -101,21 +101,21 @@ Out of scope for this plan:
 
 The migration is complete when all of these are true:
 
-1. Facet gallery thumbnails are fetched from IronMesh by default.
+1. Facet gallery thumbnails are fetched from BerryKeep by default.
 2. Facet analysis paths that currently rely on `photos.thumbnail` can instead
-   consume IronMesh `analysis` thumbnails with no material quality regression.
+   consume BerryKeep `analysis` thumbnails with no material quality regression.
 3. Path rename or copy events do not duplicate thumbnails unnecessarily because
-   IronMesh thumbnail storage remains keyed by `content_fingerprint`.
+   BerryKeep thumbnail storage remains keyed by `content_fingerprint`.
 4. Facet export paths no longer require the thumbnail BLOB to exist locally in
    SQLite.
-5. A degraded or unavailable IronMesh thumbnail service has a bounded fallback
+5. A degraded or unavailable BerryKeep thumbnail service has a bounded fallback
    path and does not silently corrupt Facet state.
 
 ## Major Design Decisions
 
-### 1. Two thumbnail profiles in IronMesh
+### 1. Two thumbnail profiles in BerryKeep
 
-IronMesh should expose at least:
+BerryKeep should expose at least:
 
 - `grid`
   - current UI-oriented low-cost profile
@@ -133,7 +133,7 @@ Why:
 
 ### 2. Facet should migrate to a fetch abstraction, not to ad hoc HTTP calls
 
-Do not patch individual call sites one by one to hit IronMesh directly.
+Do not patch individual call sites one by one to hit BerryKeep directly.
 
 Instead:
 
@@ -141,17 +141,17 @@ Instead:
 - route viewer reads, recompute reads, and export reads through that interface
 - allow provider implementations:
   - SQLite/local legacy provider
-  - IronMesh remote provider
+  - BerryKeep remote provider
   - hybrid provider with fallback
 
 ### 3. Facet should stop using path text as the thumbnail-storage identity
 
 Path remains important in Facet, but thumbnail lookup needs a stable bridge to
-IronMesh identity.
+BerryKeep identity.
 
 Required bridge data per photo:
 
-- `ironmesh_key`
+- `berrykeep_key`
 - `content_fingerprint`
 - optionally `version_id`
 - thumbnail freshness marker or last-known manifest hash if needed
@@ -168,11 +168,11 @@ Recommended first shape:
 
 ## Workstreams
 
-### Workstream A: IronMesh thumbnail-profile expansion
+### Workstream A: BerryKeep thumbnail-profile expansion
 
 Goal:
 
-- make IronMesh capable of serving both `grid` and `analysis` thumbnails.
+- make BerryKeep capable of serving both `grid` and `analysis` thumbnails.
 
 Tasks:
 
@@ -203,7 +203,7 @@ Acceptance criteria:
 - `grid` behavior remains unchanged for existing clients
 - cached profile files coexist under one content fingerprint without conflict
 
-### Workstream B: IronMesh thumbnail-generation policy and backfill
+### Workstream B: BerryKeep thumbnail-generation policy and backfill
 
 Goal:
 
@@ -239,7 +239,7 @@ Tasks:
    - `get_face_base_thumbnail(path)`
 2. Add provider implementations:
    - legacy SQLite/local provider
-   - IronMesh provider
+   - BerryKeep provider
    - hybrid provider with fallback
 3. Migrate viewer thumbnail endpoint code to the provider.
 4. Migrate face-crop fallback code to the provider.
@@ -261,42 +261,42 @@ Acceptance criteria:
 
 Goal:
 
-- let Facet resolve a photo path to the correct IronMesh thumbnail identity.
+- let Facet resolve a photo path to the correct BerryKeep thumbnail identity.
 
 Tasks:
 
 1. Define a mapping table, for example:
-   - `photo_transport_map(photo_path, ironmesh_key, content_fingerprint, version_id, updated_at)`
+   - `photo_transport_map(photo_path, berrykeep_key, content_fingerprint, version_id, updated_at)`
 2. Define population rules:
    - at scan/import time,
    - via a separate sync task,
-   - or via an exported IronMesh index snapshot
+   - or via an exported BerryKeep index snapshot
 3. Define invalidation rules:
    - when Facet path no longer resolves,
    - when content fingerprint changes,
    - when the local file is replaced in place
 4. Decide whether version pinning is necessary for thumbnail correctness or
    whether current head is sufficient.
-5. Implement lookup helpers used by the IronMesh provider.
+5. Implement lookup helpers used by the BerryKeep provider.
 
 Recommended principle:
 
 - resolve by `content_fingerprint` when possible for reuse
-- retain `ironmesh_key` for request routing
+- retain `berrykeep_key` for request routing
 - retain optional version or manifest hash only when correctness requires
   pinning
 
 Acceptance criteria:
 
 - given a Facet photo path, the provider can reliably request the matching
-  IronMesh thumbnail
+  BerryKeep thumbnail
 - rename and copy scenarios behave predictably
 
 ### Workstream E: Facet recompute and analysis migration
 
 Goal:
 
-- make analysis paths consume IronMesh `analysis` thumbnails rather than local
+- make analysis paths consume BerryKeep `analysis` thumbnails rather than local
   thumbnail BLOBs.
 
 Tasks:
@@ -308,7 +308,7 @@ Tasks:
 4. Update RAM++ thumbnail-driven tagging.
 5. Update caption-generation paths that currently prefer stored thumbnails.
 6. Update thumbnail-rotation tools or explicitly retire them if they become
-   obsolete under IronMesh-provided normalized thumbnails.
+   obsolete under BerryKeep-provided normalized thumbnails.
 7. Decide whether any analysis path still needs a local cached copy for
    performance.
 
@@ -319,7 +319,7 @@ Primary migration targets:
 
 Important semantic choice:
 
-- if IronMesh thumbnails are already orientation-corrected, Facet paths that
+- if BerryKeep thumbnails are already orientation-corrected, Facet paths that
   assume raw stored thumbnail orientation may need to stop doing their own fixup
   work.
 
@@ -341,9 +341,9 @@ Tasks:
 1. Add a feature flag or config switch for thumbnail authority:
    - `legacy_local`
    - `hybrid`
-   - `ironmesh`
+   - `berrykeep`
 2. In hybrid mode, continue writing local thumbnails for rollback safety.
-3. In IronMesh-authoritative mode:
+3. In BerryKeep-authoritative mode:
    - stop treating `photos.thumbnail` as required
    - optionally stop generating local photo thumbnail BLOBs altogether
 4. Preserve face-thumbnail generation if still needed locally.
@@ -379,7 +379,7 @@ Tasks:
    thumbnails or store URLs/references.
 3. Update maintenance scripts that migrate local thumbnail storage.
 4. Update any JSON/CSV export path that implies local thumbnail availability.
-5. Add explicit behavior for offline export when IronMesh is unavailable.
+5. Add explicit behavior for offline export when BerryKeep is unavailable.
 
 Important code areas:
 
@@ -399,7 +399,7 @@ Goal:
 
 Tasks:
 
-1. Add IronMesh tests for:
+1. Add BerryKeep tests for:
    - multiple thumbnail profiles
    - profile-specific cache persistence
    - profile query handling
@@ -413,7 +413,7 @@ Tasks:
    - stage 0: legacy
    - stage 1: hybrid read
    - stage 2: hybrid read/write
-   - stage 3: IronMesh-authoritative read
+   - stage 3: BerryKeep-authoritative read
    - stage 4: optional local-write disable
 4. Define rollback:
    - switch provider back to local
@@ -440,17 +440,17 @@ Exit criteria:
 - no open ambiguity about profile names, dimensions, identity fields, or
   fallback behavior
 
-### Phase 1: IronMesh profile support
+### Phase 1: BerryKeep profile support
 
 Deliverables:
 
-- `analysis` profile generation in IronMesh
+- `analysis` profile generation in BerryKeep
 - profile-aware media-thumbnail requests
 - tests for multi-profile cache behavior
 
 Exit criteria:
 
-- IronMesh can generate and serve `grid` and `analysis` correctly
+- BerryKeep can generate and serve `grid` and `analysis` correctly
 
 ### Phase 2: Facet read-path abstraction
 
@@ -462,7 +462,7 @@ Deliverables:
 
 Exit criteria:
 
-- Facet can browse using IronMesh-backed thumbnails while legacy local fallback
+- Facet can browse using BerryKeep-backed thumbnails while legacy local fallback
   still works
 
 ### Phase 3: mapping and recompute migration
@@ -493,21 +493,21 @@ Exit criteria:
 
 Deliverables:
 
-- production-ready IronMesh-authoritative mode
+- production-ready BerryKeep-authoritative mode
 - clear rollback instructions
 - optional schema deprecation plan for local photo-thumbnail BLOBs
 
 Exit criteria:
 
-- the system is stable in IronMesh-authoritative mode across a representative
+- the system is stable in BerryKeep-authoritative mode across a representative
   library
 
 ## Fallback And Failure Policy
 
 During migration, Facet should follow this order:
 
-1. Try IronMesh `analysis` thumbnail if the path is in a migrated library.
-2. If mapping exists but IronMesh request fails transiently, fall back to local
+1. Try BerryKeep `analysis` thumbnail if the path is in a migrated library.
+2. If mapping exists but BerryKeep request fails transiently, fall back to local
    thumbnail when present.
 3. If local thumbnail is absent but local original file is available, optionally
    regenerate a local emergency thumbnail for the specific task.
@@ -541,7 +541,7 @@ Remote or HTTP-mediated thumbnail fetches may be slower than SQLite BLOB reads.
 
 Mitigation:
 
-- colocate worker and IronMesh endpoint where possible
+- colocate worker and BerryKeep endpoint where possible
 - add local provider-level caching in Facet
 - benchmark recompute commands before cutover
 
@@ -564,14 +564,14 @@ Mitigation:
 
 ## Suggested Milestones
 
-1. `M1`: IronMesh serves `analysis` thumbnails behind a profile parameter.
+1. `M1`: BerryKeep serves `analysis` thumbnails behind a profile parameter.
 2. `M2`: Facet viewer reads thumbnails through a provider abstraction.
-3. `M3`: Facet path-to-IronMesh mapping table is populated reliably.
+3. `M3`: Facet path-to-BerryKeep mapping table is populated reliably.
 4. `M4`: IQA/composition/RAM++ recompute paths succeed on provider-backed
    thumbnails.
 5. `M5`: Viewer DB export and maintenance tools work without local thumbnail
    authority.
-6. `M6`: IronMesh-authoritative mode is validated on a real library.
+6. `M6`: BerryKeep-authoritative mode is validated on a real library.
 
 ## Rough Effort
 
@@ -581,7 +581,7 @@ medium-to-large project than a single feature branch.
 Ballpark:
 
 - design and contract work: `2-4 days`
-- IronMesh multi-profile support: `4-7 days`
+- BerryKeep multi-profile support: `4-7 days`
 - Facet provider abstraction and viewer migration: `4-7 days`
 - path/key mapping plus recompute migration: `5-10 days`
 - export/tooling/cutover/testing: `4-8 days`
@@ -602,7 +602,7 @@ Before committing to this full swap, the team should still complete a cheaper
 intermediate milestone:
 
 - implement the Facet thumbnail provider abstraction first,
-- wire it to IronMesh for viewer reads,
+- wire it to BerryKeep for viewer reads,
 - benchmark a prototype `analysis` profile,
 - then decide whether the recompute and export migration earns its complexity.
 

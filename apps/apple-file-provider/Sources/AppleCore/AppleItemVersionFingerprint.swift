@@ -3,7 +3,7 @@ import Foundation
 
 public enum AppleItemVersionFingerprint {
     public static func metadataVersion(for item: AppleBridgeItem) -> Data {
-        var payload = Data("ironmesh-item-metadata-v1".utf8)
+        var payload = Data("berrykeep-item-metadata-v1".utf8)
         append(item.identifier.serialized, to: &payload)
         append(normalizedPath(item.path), to: &payload)
         append(item.displayName, to: &payload)

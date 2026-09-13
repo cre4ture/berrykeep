@@ -1,5 +1,5 @@
+use crate::berrykeep_client::{BerryKeepClient, namespace_entry_from_store_index_entry};
 use crate::bootstrap::ConnectionBootstrap;
-use crate::ironmesh_client::{IronMeshClient, namespace_entry_from_store_index_entry};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -156,12 +156,12 @@ impl RemoteSnapshotScope {
 
 #[derive(Clone)]
 pub struct RemoteSnapshotFetcher {
-    client: IronMeshClient,
+    client: BerryKeepClient,
     scope: RemoteSnapshotScope,
 }
 
 impl RemoteSnapshotFetcher {
-    pub fn new(client: IronMeshClient, scope: RemoteSnapshotScope) -> Self {
+    pub fn new(client: BerryKeepClient, scope: RemoteSnapshotScope) -> Self {
         Self { client, scope }
     }
 
@@ -183,7 +183,7 @@ impl RemoteSnapshotFetcher {
         depth: usize,
         snapshot: Option<String>,
     ) -> Self {
-        let client = IronMeshClient::from_direct_base_url(base_url);
+        let client = BerryKeepClient::from_direct_base_url(base_url);
         let scope = RemoteSnapshotScope::new(prefix, depth, snapshot);
         Self::new(client, scope)
     }
@@ -246,7 +246,7 @@ impl RemoteSnapshotFetcher {
 }
 
 fn snapshot_from_store_index_entries_with_progress<F>(
-    entries: Vec<crate::ironmesh_client::StoreIndexEntry>,
+    entries: Vec<crate::berrykeep_client::StoreIndexEntry>,
     mut on_progress: F,
 ) -> SyncSnapshot
 where
@@ -1075,7 +1075,7 @@ mod tests {
     #[test]
     fn snapshot_preserves_directory_marker_identity_and_revision() {
         let snapshot = snapshot_from_store_index_entries_with_progress(
-            vec![crate::ironmesh_client::StoreIndexEntry {
+            vec![crate::berrykeep_client::StoreIndexEntry {
                 path: "docs/".to_string(),
                 entry_type: "prefix".to_string(),
                 object_id: Some("obj-directory".to_string()),
@@ -1104,7 +1104,7 @@ mod tests {
     #[test]
     fn snapshot_omits_object_identity_when_store_index_lacks_revision() {
         let snapshot = snapshot_from_store_index_entries_with_progress(
-            vec![crate::ironmesh_client::StoreIndexEntry {
+            vec![crate::berrykeep_client::StoreIndexEntry {
                 path: "docs/readme.txt".to_string(),
                 entry_type: "key".to_string(),
                 object_id: Some("obj-readme".to_string()),
@@ -2036,8 +2036,8 @@ mod tests {
             Json(serde_json::json!({ "ok": true }))
         }
 
-        async fn store_index() -> Json<crate::ironmesh_client::StoreIndexResponse> {
-            Json(crate::ironmesh_client::StoreIndexResponse {
+        async fn store_index() -> Json<crate::berrykeep_client::StoreIndexResponse> {
+            Json(crate::berrykeep_client::StoreIndexResponse {
                 prefix: String::new(),
                 depth: 1,
                 entry_count: 0,
@@ -2048,7 +2048,7 @@ mod tests {
                 next_cursor: None,
                 sync_token: None,
                 consistency_token: None,
-                media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
+                media_summary: crate::berrykeep_client::StoreIndexMediaSummary::default(),
                 entries: Vec::new(),
             })
         }
@@ -2099,8 +2099,8 @@ mod tests {
             Json(serde_json::json!({ "ok": true }))
         }
 
-        async fn store_index() -> Json<crate::ironmesh_client::StoreIndexResponse> {
-            Json(crate::ironmesh_client::StoreIndexResponse {
+        async fn store_index() -> Json<crate::berrykeep_client::StoreIndexResponse> {
+            Json(crate::berrykeep_client::StoreIndexResponse {
                 prefix: String::new(),
                 depth: 1,
                 entry_count: 1,
@@ -2111,8 +2111,8 @@ mod tests {
                 next_cursor: None,
                 sync_token: None,
                 consistency_token: None,
-                media_summary: crate::ironmesh_client::StoreIndexMediaSummary::default(),
-                entries: vec![crate::ironmesh_client::StoreIndexEntry {
+                media_summary: crate::berrykeep_client::StoreIndexMediaSummary::default(),
+                entries: vec![crate::berrykeep_client::StoreIndexEntry {
                     path: "docs/readme.txt".to_string(),
                     entry_type: "key".to_string(),
                     object_id: Some("obj-readme".to_string()),

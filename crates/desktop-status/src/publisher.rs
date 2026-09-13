@@ -3,7 +3,7 @@ use crate::{
     poll_remote_status, sleep_with_stop, starting_snapshot, write_status_document,
 };
 use anyhow::{Context, Result, anyhow};
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -119,7 +119,7 @@ impl DesktopStatusPublisher {
 pub fn spawn_remote_status_thread(
     running: Arc<AtomicBool>,
     publisher: Arc<DesktopStatusPublisher>,
-    client: IronMeshClient,
+    client: BerryKeepClient,
     remote_status_poll_interval_ms: u64,
     thread_name: impl Into<String>,
 ) -> Result<thread::JoinHandle<()>> {

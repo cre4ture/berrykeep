@@ -31,7 +31,7 @@ mod tests {
     use client_sdk::{
         BootstrapEndpointUse, ClientConnectionDiagnosticImpact, ClientNode,
         ClientRouteMaintenancePolicy, ConnectionBootstrap, ContentAddressedClientCache,
-        IronMeshClient, LatencyProbeConfig,
+        BerryKeepClient, LatencyProbeConfig,
         PlannedConnectionBootstrapTarget, UploadMode, UploadSessionChunkRef,
         build_http_client_from_planned_targets,
         build_http_client_with_identity_from_planned_targets, enroll_connection_input_blocking,
@@ -62,7 +62,7 @@ mod tests {
         params.not_before = now - time::Duration::days(1);
         params.not_after = now + time::Duration::days(30);
         params.subject_alt_names = vec![SanType::URI(
-            format!("urn:ironmesh:device:{}", Uuid::now_v7())
+            format!("urn:berrykeep:device:{}", Uuid::now_v7())
                 .try_into()
                 .expect("legacy device SAN should parse"),
         )];
@@ -247,12 +247,12 @@ mod tests {
         let data_b = fresh_data_dir("android-style-claim-node-b");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -479,12 +479,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ironmesh_client_upload_modes_and_reader_writer_paths_work() -> Result<()> {
+    async fn berrykeep_client_upload_modes_and_reader_writer_paths_work() -> Result<()> {
         let bind = "127.0.0.1:19233";
         let (mut server, enrolled) = start_authenticated_test_client(
             bind,
-            "ironmesh-client-upload-modes-server",
-            "ironmesh-client-upload-modes-client",
+            "berrykeep-client-upload-modes-server",
+            "berrykeep-client-upload-modes-client",
         )
         .await?;
 
@@ -569,13 +569,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ironmesh_client_put_large_aware_covers_small_and_large_bytes_and_reader_uploads()
+    async fn berrykeep_client_put_large_aware_covers_small_and_large_bytes_and_reader_uploads()
     -> Result<()> {
         let bind = "127.0.0.1:19237";
         let (mut server, enrolled) = start_authenticated_test_client(
             bind,
-            "ironmesh-client-large-aware-server",
-            "ironmesh-client-large-aware-client",
+            "berrykeep-client-large-aware-server",
+            "berrykeep-client-large-aware-client",
         )
         .await?;
 
@@ -680,12 +680,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ironmesh_client_snapshot_store_index_and_snapshot_loading_work() -> Result<()> {
+    async fn berrykeep_client_snapshot_store_index_and_snapshot_loading_work() -> Result<()> {
         let bind = "127.0.0.1:19234";
         let (mut server, enrolled) = start_authenticated_test_client(
             bind,
-            "ironmesh-client-snapshots-server",
-            "ironmesh-client-snapshots-client",
+            "berrykeep-client-snapshots-server",
+            "berrykeep-client-snapshots-client",
         )
         .await?;
 
@@ -782,12 +782,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ironmesh_client_missing_object_returns_errors() -> Result<()> {
+    async fn berrykeep_client_missing_object_returns_errors() -> Result<()> {
         let bind = "127.0.0.1:19235";
         let (mut server, enrolled) = start_authenticated_test_client(
             bind,
-            "ironmesh-client-missing-object-server",
-            "ironmesh-client-missing-object-client",
+            "berrykeep-client-missing-object-server",
+            "berrykeep-client-missing-object-client",
         )
         .await?;
 
@@ -957,7 +957,7 @@ mod tests {
             .await?;
         assert_eq!(complete_response.status(), reqwest::StatusCode::OK);
 
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let sdk = BerryKeepClient::from_direct_base_url(&base_url);
         let fetched = sdk.get("resumable/upload.bin").await?;
         assert_eq!(fetched, Bytes::from(payload));
 
@@ -1020,7 +1020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ironmesh_client_resumable_file_helpers_roundtrip_large_files() -> Result<()> {
+    async fn berrykeep_client_resumable_file_helpers_roundtrip_large_files() -> Result<()> {
         let bind = "127.0.0.1:19253";
         let (mut server, enrolled) = start_authenticated_test_client(
             bind,
@@ -1113,15 +1113,15 @@ mod tests {
         let rendezvous_url = format!("http://{rendezvous_bind}");
         let base_url = format!("http://{bind}");
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -1263,15 +1263,15 @@ mod tests {
         let rendezvous_url = format!("http://{rendezvous_bind}");
         let base_url = format!("http://{bind}");
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
-            ("IRONMESH_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
-            ("IRONMESH_STARTUP_REPAIR_DELAY_SECS", "1"),
-            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_REPLICA_VIEW_SYNC_INTERVAL_SECS", "2"),
+            ("BERRYKEEP_STARTUP_REPAIR_DELAY_SECS", "1"),
+            ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
         let mut rendezvous = start_rendezvous_service(rendezvous_bind).await?;
@@ -1355,7 +1355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ironmesh_client_staged_writer_download_roundtrip() -> Result<()> {
+    async fn berrykeep_client_staged_writer_download_roundtrip() -> Result<()> {
         let bind = "127.0.0.1:19240";
         let (mut server, enrolled) = start_authenticated_test_client(
             bind,
@@ -1394,7 +1394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ironmesh_client_keeps_small_requests_responsive_during_large_download_end_to_end()
+    async fn berrykeep_client_keeps_small_requests_responsive_during_large_download_end_to_end()
     -> Result<()> {
         let bind = "127.0.0.1:19241";
         let (mut server, enrolled) = start_authenticated_test_client(
@@ -1442,7 +1442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ironmesh_client_latency_probe_reports_cold_connect_and_session_reuse_end_to_end()
+    async fn berrykeep_client_latency_probe_reports_cold_connect_and_session_reuse_end_to_end()
     -> Result<()> {
         let bind = "127.0.0.1:19242";
         let (mut server, enrolled) =
@@ -1489,10 +1489,10 @@ mod tests {
         let base_url = format!("http://{bind}");
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-            ("IRONMESH_RENDEZVOUS_MTLS_REQUIRED", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_RENDEZVOUS_MTLS_REQUIRED", "true"),
         ];
 
         let mut server =
@@ -1513,7 +1513,7 @@ mod tests {
 
             assert!(
                 enrolled.identity.rendezvous_client_identity_pem.is_some(),
-                "enrollment should issue a rendezvous client identity when IRONMESH_RENDEZVOUS_MTLS_REQUIRED=true"
+                "enrollment should issue a rendezvous client identity when BERRYKEEP_RENDEZVOUS_MTLS_REQUIRED=true"
             );
 
             let mut identity = enrolled.identity.clone();
@@ -1615,12 +1615,12 @@ mod tests {
         let expected_reflexive_target = format!("{expected_reflexive_endpoint}/");
         let expected_localhost_target = format!("{localhost_internal_url}/");
 
-        let rendezvous_a_env = [("IRONMESH_RENDEZVOUS_PEER_URLS", rendezvous_url_b.as_str())];
-        let rendezvous_b_env = [("IRONMESH_RENDEZVOUS_PEER_URLS", rendezvous_url_a.as_str())];
+        let rendezvous_a_env = [("BERRYKEEP_RENDEZVOUS_PEER_URLS", rendezvous_url_b.as_str())];
+        let rendezvous_b_env = [("BERRYKEEP_RENDEZVOUS_PEER_URLS", rendezvous_url_a.as_str())];
         let node_env = [
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url_a.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_INTERNAL_URL", localhost_internal_url.as_str()),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url_a.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_INTERNAL_URL", localhost_internal_url.as_str()),
         ];
 
         let mut rendezvous_a =
@@ -1884,12 +1884,12 @@ mod tests {
         fs::create_dir_all(&client_dir)?;
 
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
-            ("IRONMESH_RELAY_MODE", "fallback"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_urls.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "fallback"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
         ];
 
         let mut rendezvous_a = start_rendezvous_service(rendezvous_bind_a).await?;

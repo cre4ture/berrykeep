@@ -4,8 +4,8 @@ import {
   renewNodeCertificatesNow,
   type NodeCertificateStatus,
   type NodeCertificateStatusResponse
-} from "@ironmesh/api";
-import { ironmeshPrimaryColor, JsonBlock, StatCard } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { berrykeepPrimaryColor, JsonBlock, StatCard } from "@berrykeep/ui";
 import { Alert, Badge, Button, Card, Grid, Group, Stack, Text } from "@mantine/core";
 import { useCallback, useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
@@ -33,7 +33,7 @@ function CertificateDetailCard({
       <Stack gap="sm">
         <Group justify="space-between">
           <Text fw={700}>{title}</Text>
-          <Badge variant="light" color={status.state === "healthy" ? ironmeshPrimaryColor : status.state === "expired" ? "red" : "yellow"}>
+          <Badge variant="light" color={status.state === "healthy" ? berrykeepPrimaryColor : status.state === "expired" ? "red" : "yellow"}>
             {status.state}
           </Badge>
         </Group>
@@ -117,7 +117,7 @@ export function CertificatesPage() {
         </Text>
         <Group gap="sm">
           <Button
-            color={ironmeshPrimaryColor}
+            color={berrykeepPrimaryColor}
             onClick={() => void renewNow()}
             loading={renewing}
             disabled={loading || !canRenewNow}
@@ -170,7 +170,7 @@ export function CertificatesPage() {
         <Stack gap="sm">
           <Group justify="space-between">
             <Text fw={700}>Auto-renew detail</Text>
-            <Badge color={status?.auto_renew.restart_required ? "yellow" : ironmeshPrimaryColor} variant="light">
+            <Badge color={status?.auto_renew.restart_required ? "yellow" : berrykeepPrimaryColor} variant="light">
               {status?.auto_renew.restart_required ? "restart required" : "live state current"}
             </Badge>
           </Group>

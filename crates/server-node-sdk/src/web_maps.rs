@@ -498,7 +498,7 @@ pub(crate) fn resolve_map_glyphs_root(explicit: Option<PathBuf>) -> Option<PathB
         return Some(path);
     }
 
-    if let Ok(value) = std::env::var("IRONMESH_MAP_GLYPHS_DIR") {
+    if let Ok(value) = common::legacy_compatibility::var("BERRYKEEP_MAP_GLYPHS_DIR") {
         let path = PathBuf::from(value);
         if path.is_dir() {
             return Some(path);

@@ -5,7 +5,7 @@
 Server nodes should report enough hardware and runtime health information to:
 
 - detect likely hardware problems early,
-- correlate IronMesh runtime failures with exact hardware builds,
+- correlate BerryKeep runtime failures with exact hardware builds,
 - compare long-term robustness across hardware profiles and firmware combinations,
 - avoid sending any user payload data, logical object names, paths, or ownership metadata.
 
@@ -18,7 +18,7 @@ This slice adds node-local hardware health reporting with:
 - stable reporter identity via the existing node id,
 - normalized hardware inventory,
 - lifecycle and age signals for the node and individual components,
-- structured findings from both host signals and IronMesh runtime signals,
+- structured findings from both host signals and BerryKeep runtime signals,
 - generated human-readable health notes derived only from structured fields,
 - an admin API endpoint and server-admin page for inspection and export.
 
@@ -36,7 +36,7 @@ The report is **not anonymous**. The reporting node may be identified. The priva
 ### Allowed
 
 - node id,
-- IronMesh version and revision,
+- BerryKeep version and revision,
 - operating system, kernel, architecture,
 - board/system vendor and model,
 - BIOS/UEFI version,
@@ -78,8 +78,8 @@ The node produces one structured `hardware_health_report` with:
 
 - `reporting_node_id`
 - `generated_at_unix`
-- `ironmesh_version`
-- `ironmesh_revision`
+- `berrykeep_version`
+- `berrykeep_revision`
 - `hardware_profile_id`
 - `inventory`
 - `node_lifecycle`
@@ -157,7 +157,7 @@ The first slice uses:
 
 The implementation must degrade gracefully when optional sources are unavailable.
 
-### IronMesh Runtime Sources
+### BerryKeep Runtime Sources
 
 The first slice also derives findings from:
 
@@ -166,7 +166,7 @@ The first slice also derives findings from:
 - recent in-memory runtime logs, but only via pattern classification,
 - sampler runtime failures such as storage stats or process stats collector failure.
 
-These sources are important because IronMesh may observe corruption or I/O instability before host tooling
+These sources are important because BerryKeep may observe corruption or I/O instability before host tooling
 reports a hard failure.
 
 ## Notes Generation
@@ -204,7 +204,7 @@ The page should make export easy by exposing the exact JSON payload.
 
 1. Add backend report structs, lifecycle-state persistence, and collection runtime.
 2. Add Linux inventory collection plus optional `smartctl` enrichment.
-3. Derive host findings and IronMesh runtime findings without leaking user data.
+3. Derive host findings and BerryKeep runtime findings without leaking user data.
 4. Expose the report through a new admin API route and typed frontend client.
 5. Add a server-admin Hardware page for inspection and JSON export.
 6. Add focused tests for lifecycle persistence, finding sanitization, and optional `smartctl` parsing.

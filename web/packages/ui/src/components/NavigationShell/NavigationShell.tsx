@@ -9,7 +9,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { type ComponentType, type ReactNode, useEffect } from "react";
-import { IronmeshBrand } from "../IronmeshBrand/IronmeshBrand";
+import { BerryKeepBrand } from "../BerryKeepBrand/BerryKeepBrand";
 
 type NavigationShellIcon = ComponentType<{ size?: number | string }>;
 
@@ -89,7 +89,7 @@ export function NavigationShell<ItemId extends string = string>({
                   />
                 </>
               ) : null}
-              <IronmeshBrand surfaceLabel={surfaceLabel} />
+              <BerryKeepBrand surfaceLabel={surfaceLabel} />
             </Group>
 
             {headerActions ? <Group gap="sm">{headerActions}</Group> : null}

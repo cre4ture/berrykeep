@@ -4,7 +4,7 @@ Status: Reference note captured from `nextcloud/desktop` `master` on April 3, 20
 
 ## Scope
 
-This note summarizes how Nextcloud Desktop currently uses Windows CFAPI for hydration, pinning, and dehydration so we can compare IronMesh behavior against a production implementation later.
+This note summarizes how Nextcloud Desktop currently uses Windows CFAPI for hydration, pinning, and dehydration so we can compare BerryKeep behavior against a production implementation later.
 
 Repository:
 
@@ -137,9 +137,9 @@ There is also a Nextcloud PR discussing a `free up space` flow as something that
 
 That matches the source-code behavior above.
 
-## Why this matters for IronMesh
+## Why this matters for BerryKeep
 
-If IronMesh continues to see:
+If BerryKeep continues to see:
 
 - Explorer sets `FILE_ATTRIBUTE_UNPINNED`
 - the file remains hydrated

@@ -8,9 +8,9 @@ use axum::routing::any;
 use bytes::Bytes;
 use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{
-    ClientIdentityMaterial, ClientNode, ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets,
-    IronMeshClient, LatencyProbeComparison, LatencyProbeConfig, LatencyProbeResult,
-    ManagedBootstrapPersistence, ManagedClientOptions, ManagedIronMeshClient,
+    BerryKeepClient, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
+    ConnectionBootstrapDiagnosticTargets, LatencyProbeComparison, LatencyProbeConfig,
+    LatencyProbeResult, ManagedBerryKeepClient, ManagedBootstrapPersistence, ManagedClientOptions,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     enroll_connection_input_blocking, normalize_server_base_url,
@@ -74,16 +74,16 @@ struct LatencyTestSuiteResult {
 
 #[derive(Clone)]
 struct S3GatewayState {
-    client: IronMeshClient,
+    client: BerryKeepClient,
 }
 
 struct CliClientHolder {
-    client: IronMeshClient,
+    client: BerryKeepClient,
     _managed_client: Option<ManagedCliClient>,
 }
 
 struct ManagedCliClient {
-    _client: ManagedIronMeshClient,
+    _client: ManagedBerryKeepClient,
     _runtime: ManagedCliRuntime,
 }
 
@@ -115,14 +115,14 @@ impl Drop for ManagedCliRuntime {
 }
 
 impl CliClientHolder {
-    fn unmanaged(client: IronMeshClient) -> Self {
+    fn unmanaged(client: BerryKeepClient) -> Self {
         Self {
             client,
             _managed_client: None,
         }
     }
 
-    fn managed(managed_client: ManagedIronMeshClient, runtime: ManagedCliRuntime) -> Self {
+    fn managed(managed_client: ManagedBerryKeepClient, runtime: ManagedCliRuntime) -> Self {
         Self {
             client: managed_client.client(),
             _managed_client: Some(ManagedCliClient {
@@ -132,7 +132,7 @@ impl CliClientHolder {
         }
     }
 
-    fn client(&self) -> &IronMeshClient {
+    fn client(&self) -> &BerryKeepClient {
         &self.client
     }
 }
@@ -141,11 +141,11 @@ fn build_managed_cli_client(
     bootstrap: ConnectionBootstrap,
     identity: ClientIdentityMaterial,
     options: ManagedClientOptions,
-) -> Result<(ManagedIronMeshClient, ManagedCliRuntime)> {
+) -> Result<(ManagedBerryKeepClient, ManagedCliRuntime)> {
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let thread = std::thread::Builder::new()
-        .name("ironmesh-cli-managed-runtime".to_string())
+        .name("berrykeep-cli-managed-runtime".to_string())
         .stack_size(CLI_RUNTIME_STACK_SIZE)
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -284,12 +284,12 @@ enum Commands {
 
 fn main() -> Result<()> {
     let thread = std::thread::Builder::new()
-        .name("ironmesh-cli-runtime".to_string())
+        .name("berrykeep-cli-runtime".to_string())
         .stack_size(CLI_RUNTIME_STACK_SIZE)
         .spawn(|| -> Result<()> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .thread_name("ironmesh-cli-worker")
+                .thread_name("berrykeep-cli-worker")
                 .thread_stack_size(CLI_RUNTIME_STACK_SIZE)
                 .build()
                 .context("failed to build CLI runtime")?;
@@ -616,7 +616,7 @@ fn s3_transport_proxy_path(uri: &axum::http::Uri) -> String {
 }
 
 fn init_cli_tracing() {
-    let perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
+    let perf_logging_enabled = env_flag_is_truthy("BERRYKEEP_MAP_PERF_LOG");
     let mut env_filter = common::logging::env_filter_from_default_env("warn");
     for directive in [
         "cli_client=info",
@@ -651,7 +651,7 @@ fn init_cli_tracing() {
             .try_init();
     });
     if perf_logging_enabled {
-        info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
+        info!("map performance logging enabled via BERRYKEEP_MAP_PERF_LOG");
     }
 }
 
@@ -666,7 +666,7 @@ fn cli_web_log_buffer() -> std::sync::Arc<common::logging::LogBuffer> {
 }
 
 fn env_flag_is_truthy(name: &str) -> bool {
-    std::env::var(name)
+    common::legacy_compatibility::var(name)
         .ok()
         .map(|value| {
             matches!(
@@ -812,7 +812,7 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
     Ok(CliClientHolder::unmanaged(client))
 }
 
-async fn print_json_endpoint(client: &IronMeshClient, path: &str) -> Result<()> {
+async fn print_json_endpoint(client: &BerryKeepClient, path: &str) -> Result<()> {
     let value = client.get_json_path(path).await?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
@@ -969,7 +969,7 @@ async fn print_latency_test_targets(cli: &Cli) -> Result<()> {
 }
 
 async fn probe_current_latency_target(
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     config: &LatencyProbeConfig,
 ) -> LatencyTestPathResult {
     probe_latency_client(
@@ -988,7 +988,7 @@ async fn probe_current_latency_target(
 // silently reuses the already-established `current_client` connection whenever that happens to be
 // direct already, which would ignore the explicitly requested node.
 async fn probe_direct_latency_target(
-    current_client: &IronMeshClient,
+    current_client: &BerryKeepClient,
     diagnostic_targets: &ConnectionBootstrapDiagnosticTargets,
     identity: Option<&ClientIdentityMaterial>,
     config: &LatencyProbeConfig,
@@ -1045,7 +1045,7 @@ async fn probe_direct_latency_target(
 }
 
 async fn probe_relay_latency_targets(
-    current_client: &IronMeshClient,
+    current_client: &BerryKeepClient,
     diagnostic_targets: &ConnectionBootstrapDiagnosticTargets,
     identity: Option<&ClientIdentityMaterial>,
     config: &LatencyProbeConfig,
@@ -1134,7 +1134,7 @@ async fn probe_latency_client(
     transport_mode: String,
     uses_current_runtime: bool,
     target: Option<String>,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     config: &LatencyProbeConfig,
 ) -> LatencyTestPathResult {
     match client.run_latency_probe(config.clone()).await {
@@ -1211,7 +1211,7 @@ fn select_direct_and_relay_results(
     Some((direct, relay))
 }
 
-fn current_transport_mode(client: &IronMeshClient) -> &'static str {
+fn current_transport_mode(client: &BerryKeepClient) -> &'static str {
     if client.uses_relay_transport() {
         "relay"
     } else {
@@ -1219,7 +1219,7 @@ fn current_transport_mode(client: &IronMeshClient) -> &'static str {
     }
 }
 
-fn describe_current_target(client: &IronMeshClient) -> Option<String> {
+fn describe_current_target(client: &BerryKeepClient) -> Option<String> {
     if client.uses_relay_transport() {
         let rendezvous_hint = client
             .rendezvous_client()
@@ -1376,7 +1376,7 @@ fn path_for_log(path: Option<&Path>) -> String {
         .unwrap_or_else(|| "<none>".to_string())
 }
 
-fn log_client_transport_ready(context: &str, client: &IronMeshClient) {
+fn log_client_transport_ready(context: &str, client: &BerryKeepClient) {
     let session_pool = client.transport_session_pool_snapshot();
     let target = describe_current_target(client).unwrap_or_else(|| "<unknown>".to_string());
     if let Some(rendezvous) = client.rendezvous_client() {
@@ -1476,7 +1476,7 @@ fn default_client_identity_path(bootstrap_path: &Path) -> PathBuf {
         file_name.push(".client-identity.json");
         return bootstrap_path.with_file_name(file_name);
     }
-    bootstrap_path.with_file_name("ironmesh-client-identity.json")
+    bootstrap_path.with_file_name("berrykeep-client-identity.json")
 }
 
 fn unix_ts_ms() -> u64 {
@@ -1781,7 +1781,7 @@ mod tests {
         ca_params.distinguished_name = DistinguishedName::new();
         ca_params
             .distinguished_name
-            .push(DnType::CommonName, "ironmesh-cli-relay-test-ca");
+            .push(DnType::CommonName, "berrykeep-cli-relay-test-ca");
         ca_params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::CrlSign,
@@ -1797,9 +1797,9 @@ mod tests {
         let mut source_params = CertificateParams::default();
         source_params
             .distinguished_name
-            .push(DnType::CommonName, format!("ironmesh-device-{device_id}"));
+            .push(DnType::CommonName, format!("berrykeep-device-{device_id}"));
         source_params.subject_alt_names = vec![SanType::URI(
-            format!("urn:ironmesh:device:{device_id}")
+            format!("urn:berrykeep:device:{device_id}")
                 .try_into()
                 .expect("gateway relay device SAN should parse"),
         )];
@@ -1812,16 +1812,16 @@ mod tests {
         let mut target_params = CertificateParams::default();
         target_params.distinguished_name.push(
             DnType::CommonName,
-            format!("ironmesh-node-{target_node_id}"),
+            format!("berrykeep-node-{target_node_id}"),
         );
         target_params.subject_alt_names = vec![
             SanType::URI(
-                format!("urn:ironmesh:node:{target_node_id}")
+                format!("urn:berrykeep:node:{target_node_id}")
                     .try_into()
                     .expect("gateway relay node SAN should parse"),
             ),
             SanType::URI(
-                format!("urn:ironmesh:cluster:{cluster_id}")
+                format!("urn:berrykeep:cluster:{cluster_id}")
                     .try_into()
                     .expect("gateway relay cluster SAN should parse"),
             ),
@@ -2005,7 +2005,7 @@ mod tests {
         )
     }
 
-    fn relay_gateway_test_client(state: &RelayGatewayState) -> IronMeshClient {
+    fn relay_gateway_test_client(state: &RelayGatewayState) -> BerryKeepClient {
         let rendezvous = RendezvousControlClient::new(
             RendezvousClientConfig {
                 cluster_id: state.cluster_id,
@@ -2016,7 +2016,7 @@ mod tests {
             None,
         )
         .expect("gateway relay rendezvous client should build");
-        IronMeshClient::with_relay_transport(
+        BerryKeepClient::with_relay_transport(
             "https://relay.invalid/",
             rendezvous,
             state.target_node_id,
@@ -2028,7 +2028,7 @@ mod tests {
     #[test]
     fn renewed_rendezvous_identity_is_persisted_to_the_configured_file() {
         let test_dir = std::env::temp_dir().join(format!(
-            "ironmesh-cli-rendezvous-persistence-{}",
+            "berrykeep-cli-rendezvous-persistence-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&test_dir).expect("test directory should be created");
@@ -2140,7 +2140,7 @@ mod tests {
             .route("/", any(s3_gateway_proxy))
             .route("/{*path}", any(s3_gateway_proxy))
             .with_state(S3GatewayState {
-                client: IronMeshClient::from_direct_base_url(target_base_url),
+                client: BerryKeepClient::from_direct_base_url(target_base_url),
             });
         let proxy_handle = tokio::spawn(async move {
             axum::serve(proxy_listener, proxy_app)

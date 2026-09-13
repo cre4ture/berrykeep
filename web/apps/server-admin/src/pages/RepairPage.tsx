@@ -15,7 +15,7 @@ import {
   type RepairLogEntry,
   type RepairRunRecord,
   type ReplicationPlan
-} from "@ironmesh/api";
+} from "@berrykeep/api";
 import { IconPlayerPlay, IconSearch } from "@tabler/icons-react";
 import {
   Alert,
@@ -34,7 +34,7 @@ import {
   Tabs,
   Text
 } from "@mantine/core";
-import { ironmeshPrimaryColor, JsonBlock, StatCard } from "@ironmesh/ui";
+import { berrykeepPrimaryColor, JsonBlock, StatCard } from "@berrykeep/ui";
 import { useCallback, useEffect, useState } from "react";
 import { formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
@@ -364,7 +364,7 @@ export function RepairPage() {
             </Button>
             <Button
               variant="default"
-              color={ironmeshPrimaryColor}
+              color={berrykeepPrimaryColor}
               onClick={() => void scrubMutation.mutateAsync()}
               loading={scrubMutation.isPending}
               disabled={!canInspectRepair}
@@ -492,7 +492,7 @@ export function RepairPage() {
                                     Live progress log
                                   </Text>
                                   <Group gap="xs">
-                                    <Badge variant="light" color={ironmeshPrimaryColor}>
+                                    <Badge variant="light" color={berrykeepPrimaryColor}>
                                       {activeRun.live_log.length} event
                                       {activeRun.live_log.length === 1 ? "" : "s"}
                                     </Badge>
@@ -615,7 +615,7 @@ export function RepairPage() {
                               </Badge>
                             </Table.Td>
                             <Table.Td>
-                              <Badge color={run.scope === "cluster" ? ironmeshPrimaryColor : "gray"} variant="light">
+                              <Badge color={run.scope === "cluster" ? berrykeepPrimaryColor : "gray"} variant="light">
                                 {run.scope}
                               </Badge>
                             </Table.Td>
@@ -669,7 +669,7 @@ export function RepairPage() {
                     </Badge>
                     <Badge
                       variant="light"
-                      color={!replicationPlan ? "gray" : replicationPlanEntries.length === 0 ? ironmeshPrimaryColor : "orange"}
+                      color={!replicationPlan ? "gray" : replicationPlanEntries.length === 0 ? berrykeepPrimaryColor : "orange"}
                     >
                       {replicationPlan
                         ? `${replicationPlanEntries.length} attention item${replicationPlanEntries.length === 1 ? "" : "s"}`
@@ -687,7 +687,7 @@ export function RepairPage() {
                     <Group gap="xs">
                       <Badge
                         variant="light"
-                        color={replicationPlan.under_replicated > 0 ? "orange" : ironmeshPrimaryColor}
+                        color={replicationPlan.under_replicated > 0 ? "orange" : berrykeepPrimaryColor}
                       >
                         {replicationPlan.under_replicated} under-replicated
                       </Badge>
@@ -766,7 +766,7 @@ export function RepairPage() {
                                   {renderNodeBadges(item.desired_nodes, "blue", "none planned")}
                                 </Table.Td>
                                 <Table.Td miw={220}>
-                                  {renderNodeBadges(item.current_nodes, ironmeshPrimaryColor, "not stored anywhere")}
+                                  {renderNodeBadges(item.current_nodes, berrykeepPrimaryColor, "not stored anywhere")}
                                 </Table.Td>
                                 <Table.Td miw={220}>
                                   <Stack gap={6}>
@@ -799,7 +799,7 @@ export function RepairPage() {
                         </Table>
                       </Table.ScrollContainer>
                     ) : (
-                      <Alert color={ironmeshPrimaryColor} variant="light" title="Replication plan is healthy">
+                      <Alert color={berrykeepPrimaryColor} variant="light" title="Replication plan is healthy">
                         The planner does not currently report any subjects that need repair or cleanup.
                       </Alert>
                     )}
@@ -878,7 +878,7 @@ export function RepairPage() {
                                       dry run
                                     </Badge>
                                   ) : null}
-                                  <Badge variant="light" color={action.destructive ? "red" : ironmeshPrimaryColor}>
+                                  <Badge variant="light" color={action.destructive ? "red" : berrykeepPrimaryColor}>
                                     {action.destructive ? "destructive" : "metadata"}
                                   </Badge>
                                 </Group>
@@ -941,7 +941,7 @@ export function RepairPage() {
                                   </Button>
                                   <Button
                                     size="xs"
-                                    color={action.destructive ? "red" : ironmeshPrimaryColor}
+                                    color={action.destructive ? "red" : berrykeepPrimaryColor}
                                     variant="light"
                                     disabled={!canInspectRepair || hasActiveManualRepairRun}
                                     loading={
@@ -1076,7 +1076,7 @@ export function RepairPage() {
                                 </Stack>
                               </Table.Td>
                               <Table.Td>
-                                <Badge color={run.dry_run ? "blue" : ironmeshPrimaryColor} variant="light">
+                                <Badge color={run.dry_run ? "blue" : berrykeepPrimaryColor} variant="light">
                                   {run.dry_run ? "dry run" : "live run"}
                                 </Badge>
                               </Table.Td>
@@ -1090,7 +1090,7 @@ export function RepairPage() {
                                   </Badge>
                                   {run.status !== "failed" ? (
                                     <Badge
-                                      color={run.changed ? ironmeshPrimaryColor : "gray"}
+                                      color={run.changed ? berrykeepPrimaryColor : "gray"}
                                       variant="light"
                                     >
                                       {run.changed ? "changed state" : "no changes"}
@@ -1174,7 +1174,7 @@ export function RepairPage() {
                   </Stack>
                   <Stack gap="xs" align="flex-end">
                     <Badge variant="light">retention {scrubRetentionLabel}</Badge>
-                    <Badge variant="light" color={scrubNodes.length > 0 ? ironmeshPrimaryColor : "gray"}>
+                    <Badge variant="light" color={scrubNodes.length > 0 ? berrykeepPrimaryColor : "gray"}>
                       {scrubNodes.length} reachable node{scrubNodes.length === 1 ? "" : "s"}
                     </Badge>
                     <TablePageControls
@@ -1215,7 +1215,7 @@ export function RepairPage() {
                               </Badge>
                             </Group>
                             <Group gap="xs">
-                              <Badge variant="light" color={node.enabled ? ironmeshPrimaryColor : "gray"}>
+                              <Badge variant="light" color={node.enabled ? berrykeepPrimaryColor : "gray"}>
                                 {node.enabled ? "scheduled" : "manual only"}
                               </Badge>
                               <Badge variant="light">retention {formatRetentionWindow(node.retention_secs)}</Badge>
@@ -1354,7 +1354,7 @@ export function RepairPage() {
                             <Table.Td miw={180}>
                               {relatedRepairRuns.length > 0 ? (
                                 <Stack gap={6}>
-                                  <Badge color={ironmeshPrimaryColor} variant="light">
+                                  <Badge color={berrykeepPrimaryColor} variant="light">
                                     {relatedRepairRuns.length} follow-on auto-repair
                                     {relatedRepairRuns.length === 1 ? "" : "s"}
                                   </Badge>
@@ -1404,7 +1404,7 @@ export function RepairPage() {
           {selectedManualRepairRun ? (
             <>
               <Group gap="xs">
-                <Badge color={selectedManualRepairRun.dry_run ? "blue" : ironmeshPrimaryColor} variant="light">
+                <Badge color={selectedManualRepairRun.dry_run ? "blue" : berrykeepPrimaryColor} variant="light">
                   {selectedManualRepairRun.dry_run ? "dry run" : "live run"}
                 </Badge>
                 <Badge
@@ -1415,7 +1415,7 @@ export function RepairPage() {
                 </Badge>
                 {selectedManualRepairRun.status !== "failed" ? (
                   <Badge
-                    color={selectedManualRepairRun.changed ? ironmeshPrimaryColor : "gray"}
+                    color={selectedManualRepairRun.changed ? berrykeepPrimaryColor : "gray"}
                     variant="light"
                   >
                     {selectedManualRepairRun.changed ? "changed state" : "no changes"}
@@ -1460,7 +1460,7 @@ export function RepairPage() {
                 <Badge color="blue" variant="light">
                   {formatRepairTrigger(selectedRun.trigger)}
                 </Badge>
-                <Badge color={selectedRun.scope === "cluster" ? ironmeshPrimaryColor : "gray"} variant="light">
+                <Badge color={selectedRun.scope === "cluster" ? berrykeepPrimaryColor : "gray"} variant="light">
                   {selectedRun.scope}
                 </Badge>
                 <Badge color={repairStatusColor(selectedRun.status)} variant="light">
@@ -1745,7 +1745,7 @@ function startupStatusColor(status: string | undefined): string {
     case "running":
       return "orange";
     case "completed":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "skipped_no_gaps":
       return "blue";
     case "scheduled":
@@ -1759,7 +1759,7 @@ function startupStatusColor(status: string | undefined): string {
 function repairStatusColor(status: string): string {
   switch (status) {
     case "completed":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "skipped_no_gaps":
       return "blue";
     default:
@@ -1790,7 +1790,7 @@ function manualRepairRunStatusColor(run: ManualRepairActionRunRecord): string {
   if (run.status === "failed") {
     return "red";
   }
-  return run.changed ? ironmeshPrimaryColor : "blue";
+  return run.changed ? berrykeepPrimaryColor : "blue";
 }
 
 function manualRepairRunAlertColor(run: ManualRepairActionRunRecord): string {
@@ -1872,7 +1872,7 @@ function dataScrubStateColor(state: string): string {
 function dataScrubStatusColor(status: string): string {
   switch (status) {
     case "clean":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "issues_detected":
       return "yellow";
     case "failed":
@@ -2040,7 +2040,7 @@ function getReplicationItemStatus(item: ReplicationPlanItem): ReplicationPlanEnt
 
   return {
     label: "healthy",
-    color: ironmeshPrimaryColor,
+    color: berrykeepPrimaryColor,
     detail: "Desired placement is fully satisfied",
     severity: 4
   };

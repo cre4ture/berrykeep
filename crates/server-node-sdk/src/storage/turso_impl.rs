@@ -1916,7 +1916,7 @@ impl MetadataStore for TursoMetadataStore {
         let mut rows = self
             .connection
             .query(
-                "SELECT ironmesh_key, etag, multipart_part_count, created_at_unix
+                "SELECT berrykeep_key, etag, multipart_part_count, created_at_unix
                  FROM s3_object_versions
                  WHERE bucket_name = ?1 AND version_id = ?2",
                 (bucket_name, version_id),
@@ -1928,7 +1928,7 @@ impl MetadataStore for TursoMetadataStore {
 
         Ok(Some(S3ObjectVersionRecord {
             bucket_name: bucket_name.to_string(),
-            ironmesh_key: row_string(&row, 0, "s3_object_versions.ironmesh_key")?,
+            berrykeep_key: row_string(&row, 0, "s3_object_versions.berrykeep_key")?,
             version_id: version_id.to_string(),
             etag: row_string(&row, 1, "s3_object_versions.etag")?,
             multipart_part_count: row_opt_u32(&row, 2, "s3_object_versions.multipart_part_count")?,
@@ -1939,23 +1939,23 @@ impl MetadataStore for TursoMetadataStore {
     async fn list_s3_object_versions_for_key(
         &self,
         bucket_name: &str,
-        ironmesh_key: &str,
+        berrykeep_key: &str,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
         let mut rows = self
             .connection
             .query(
                 "SELECT version_id, etag, multipart_part_count, created_at_unix
                  FROM s3_object_versions
-                 WHERE bucket_name = ?1 AND ironmesh_key = ?2
+                 WHERE bucket_name = ?1 AND berrykeep_key = ?2
                  ORDER BY created_at_unix DESC, version_id DESC",
-                (bucket_name, ironmesh_key),
+                (bucket_name, berrykeep_key),
             )
             .await?;
         let mut records = Vec::new();
         while let Some(row) = rows.next().await? {
             records.push(S3ObjectVersionRecord {
                 bucket_name: bucket_name.to_string(),
-                ironmesh_key: ironmesh_key.to_string(),
+                berrykeep_key: berrykeep_key.to_string(),
                 version_id: row_string(&row, 0, "s3_object_versions.version_id")?,
                 etag: row_string(&row, 1, "s3_object_versions.etag")?,
                 multipart_part_count: row_opt_u32(
@@ -1972,27 +1972,27 @@ impl MetadataStore for TursoMetadataStore {
     async fn list_s3_object_versions(
         &self,
         bucket_name: &str,
-        ironmesh_key_prefix: Option<&str>,
+        berrykeep_key_prefix: Option<&str>,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
         let mut records = Vec::new();
-        let mut rows = if let Some(prefix) = ironmesh_key_prefix {
+        let mut rows = if let Some(prefix) = berrykeep_key_prefix {
             let like_pattern = super::sqlite_like_prefix_pattern(prefix);
             self.connection
                 .query(
-                    "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                    "SELECT berrykeep_key, version_id, etag, multipart_part_count, created_at_unix
                      FROM s3_object_versions
-                     WHERE bucket_name = ?1 AND ironmesh_key LIKE ?2 ESCAPE '\\'
-                     ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+                     WHERE bucket_name = ?1 AND berrykeep_key LIKE ?2 ESCAPE '\\'
+                     ORDER BY berrykeep_key ASC, created_at_unix DESC, version_id DESC",
                     (bucket_name, like_pattern.as_str()),
                 )
                 .await?
         } else {
             self.connection
                 .query(
-                    "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                    "SELECT berrykeep_key, version_id, etag, multipart_part_count, created_at_unix
                      FROM s3_object_versions
                      WHERE bucket_name = ?1
-                     ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+                     ORDER BY berrykeep_key ASC, created_at_unix DESC, version_id DESC",
                     (bucket_name,),
                 )
                 .await?
@@ -2001,7 +2001,7 @@ impl MetadataStore for TursoMetadataStore {
         while let Some(row) = rows.next().await? {
             records.push(S3ObjectVersionRecord {
                 bucket_name: bucket_name.to_string(),
-                ironmesh_key: row_string(&row, 0, "s3_object_versions.ironmesh_key")?,
+                berrykeep_key: row_string(&row, 0, "s3_object_versions.berrykeep_key")?,
                 version_id: row_string(&row, 1, "s3_object_versions.version_id")?,
                 etag: row_string(&row, 2, "s3_object_versions.etag")?,
                 multipart_part_count: row_opt_u32(
@@ -2021,20 +2021,20 @@ impl MetadataStore for TursoMetadataStore {
             .execute(
                 "INSERT INTO s3_object_versions (
                      bucket_name,
-                     ironmesh_key,
+                     berrykeep_key,
                      version_id,
                      etag,
                      multipart_part_count,
                      created_at_unix
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(bucket_name, version_id) DO UPDATE
-                 SET ironmesh_key = excluded.ironmesh_key,
+                 SET berrykeep_key = excluded.berrykeep_key,
                      etag = excluded.etag,
                      multipart_part_count = excluded.multipart_part_count,
                      created_at_unix = excluded.created_at_unix",
                 (
                     record.bucket_name.as_str(),
-                    record.ironmesh_key.as_str(),
+                    record.berrykeep_key.as_str(),
                     record.version_id.as_str(),
                     record.etag.as_str(),
                     record.multipart_part_count.map(i64::from),
@@ -3287,7 +3287,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
 
             CREATE TABLE IF NOT EXISTS s3_object_versions (
                 bucket_name TEXT NOT NULL,
-                ironmesh_key TEXT NOT NULL,
+                berrykeep_key TEXT NOT NULL,
                 version_id TEXT NOT NULL,
                 etag TEXT NOT NULL,
                 multipart_part_count INTEGER,
@@ -3385,7 +3385,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject
                 ON cluster_replicas(subject);
             CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
-                ON s3_object_versions(bucket_name, ironmesh_key, created_at_unix DESC, version_id DESC);
+                ON s3_object_versions(bucket_name, berrykeep_key, created_at_unix DESC, version_id DESC);
             ",
         )
         .await?;
@@ -3547,7 +3547,7 @@ fn turso_test_db_path(name: &str) -> PathBuf {
         .expect("system clock should be after epoch")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "ironmesh-{name}-{}-{stamp}.turso.db",
+        "berrykeep-{name}-{}-{stamp}.turso.db",
         std::process::id()
     ))
 }

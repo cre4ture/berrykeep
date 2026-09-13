@@ -61,7 +61,7 @@ impl WindowsConfigTrayHandle {
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread = match thread::Builder::new()
-            .name("ironmesh-config-windows-tray".to_string())
+            .name("berrykeep-config-windows-tray".to_string())
             .spawn(move || {
                 let result = tray_thread_main(ready_tx);
                 if let Err(error) = result {
@@ -114,7 +114,7 @@ struct TraySharedState {
 }
 
 fn tray_thread_main(ready_tx: mpsc::Sender<Result<()>>) -> Result<()> {
-    let class_name = utf16_null("IronMeshConfigTrayStatus");
+    let class_name = utf16_null("BerryKeepConfigTrayStatus");
     let instance = unsafe { GetModuleHandleW(null()) };
     if instance.is_null() {
         let error = anyhow!("failed to load current module handle for config tray window");

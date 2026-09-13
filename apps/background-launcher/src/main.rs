@@ -3,8 +3,7 @@
 use anyhow::{Context, Result};
 use desktop_client_config::{
     CONFIG_APP_EXE, ManagedInstanceStore, default_instance_store_path, default_launch_report_path,
-    launch_enabled_instances, migrate_legacy_state_paths, package_root_from_current_exe,
-    save_launch_report,
+    launch_enabled_instances, package_root_from_current_exe, save_launch_report,
 };
 use std::process::{Command, Stdio};
 use std::thread;
@@ -12,7 +11,6 @@ use std::time::Duration;
 
 fn main() -> Result<()> {
     let package_root = package_root_from_current_exe()?;
-    migrate_legacy_state_paths()?;
     let instance_store_path = default_instance_store_path();
     let launch_report_path = default_launch_report_path();
 
@@ -108,7 +106,7 @@ fn is_windows_apps_package_root(path: &std::path::Path) -> bool {
 
 #[cfg(windows)]
 fn windows_app_execution_alias_path(executable_name: &str) -> Option<std::path::PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
+    common::legacy_compatibility::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
         .map(|path| {

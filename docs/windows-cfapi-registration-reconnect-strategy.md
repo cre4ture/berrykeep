@@ -12,18 +12,18 @@ This note proposes a stricter lifecycle for the Windows CFAPI provider:
 - stop implicitly adopting pre-existing local content during plain registration,
 - use Windows-persisted sync-root registration metadata as the primary ownership check,
 - move restart reconciliation metadata into per-item `FileIdentity`,
-- remove `.ironmesh-remote-snapshot.json` from the correctness path.
+- remove `.berrykeep-remote-snapshot.json` from the correctness path.
 
 The main goal is to make the local/cloud relationship predictable and reviewable. A folder should be in one of two states:
 
-- not an IronMesh sync root, or
-- an IronMesh sync root with explicit persisted ownership metadata.
+- not a BerryKeep sync root, or
+- a BerryKeep sync root with explicit persisted ownership metadata.
 
 We should avoid the ambiguous middle ground where an ordinary populated folder can silently become cloud-managed just because the provider was started on it.
 
 The key update to the earlier version of this note is:
 
-- a separate `.ironmesh-root.json` file is not required for the new strategy,
+- a separate `.berrykeep-root.json` file is not required for the new strategy,
 - we should first ask Windows whether the folder is already registered and, if so, read the persisted sync-root identity from the registration itself,
 - `SyncRootIdentity` should hold the root-level ownership/configuration identity,
 - per-item `FileIdentity` should hold the file-level reconciliation identity,
@@ -79,9 +79,9 @@ Implications:
 - runtime caches should be removed or invalidated,
 - any provider-owned reconnect metadata that survives outside Windows registration should be removed or invalidated so a future plain `register` treats the folder as unmanaged.
 
-### 3.4 Reconnect is only for matching IronMesh-managed roots
+### 3.4 Reconnect is only for matching BerryKeep-managed roots
 
-A non-empty folder should only be reconnectable when Windows already knows it as an IronMesh-managed sync root and the persisted registration identity matches the requested identity.
+A non-empty folder should only be reconnectable when Windows already knows it as a BerryKeep-managed sync root and the persisted registration identity matches the requested identity.
 
 This should not rely on incidental files like the connection bootstrap or runtime snapshot cache alone.
 
@@ -93,16 +93,16 @@ Provider startup should follow this order:
 2. If Windows says the folder is not registered:
    - require the folder to be empty,
    - perform first-time registration,
-   - store IronMesh root identity inside the Windows sync-root registration.
+   - store BerryKeep root identity inside the Windows sync-root registration.
 3. If Windows says the folder is already registered:
    - read the persisted sync-root identity from Windows,
-   - verify that it matches the expected IronMesh identity,
+   - verify that it matches the expected BerryKeep identity,
    - if it matches, connect and serve,
    - if it does not match, fail loudly and require manual resolution.
 
 We should not automatically unregister and replace an existing registration during normal startup.
 
-## 5. What Counts As "Matching IronMesh Metadata"
+## 5. What Counts As "Matching BerryKeep Metadata"
 
 The primary ownership record should be the Windows-persisted sync-root identity from the CFAPI registration itself.
 
@@ -114,7 +114,7 @@ Recommended contents of the sync-root identity blob:
 - `prefix`
 - optional schema version
 
-This Windows-persisted blob should be the source of truth for "does this folder belong to this IronMesh root?" during normal provider startup.
+This Windows-persisted blob should be the source of truth for "does this folder belong to this BerryKeep root?" during normal provider startup.
 
 A reconnect should require at least:
 
@@ -131,15 +131,15 @@ We should keep the initial implementation minimal and avoid adding mirrored meta
 
 Current on-disk metadata is not sufficient to make this decision reliably:
 
-- `%LocalAppData%\Ironmesh\sync-roots\...\connection-bootstrap.json`
+- `%LocalAppData%\BerryKeep\sync-roots\...\connection-bootstrap.json`
   - useful for connectivity,
   - not a strong ownership marker,
   - can also be stored outside the sync root when `--bootstrap-file` is used.
-- `%LocalAppData%\Ironmesh\sync-roots\...\client-identity.json`
+- `%LocalAppData%\BerryKeep\sync-roots\...\client-identity.json`
   - identifies the device,
   - not the local root ownership,
   - can also live outside the sync root.
-- `.ironmesh-remote-snapshot.json`
+- `.berrykeep-remote-snapshot.json`
   - current runtime reconciliation cache,
   - should not be part of the new correctness design,
   - the root-wide remote snapshot is the wrong storage shape for per-item reconciliation data.
@@ -158,7 +158,7 @@ Recommended usage:
 
 - `SyncRootIdentity`
   - use as the primary Windows-persisted root ownership metadata,
-  - query it at startup to decide whether an existing registration matches the requested IronMesh root.
+  - query it at startup to decide whether an existing registration matches the requested BerryKeep root.
 - `FileIdentity`
   - use it for provider-owned per-file metadata such as normalized path, remote version, remote hash, and last-known clean local hash,
   - make it the primary place for file-level restart reconciliation state.
@@ -223,9 +223,9 @@ The dominant variable is `p`, the normalized relative path. That path is already
 
 In practice this should fit comfortably inside the 4 KB `FileIdentity` budget for normal path lengths. If we later want more margin, we should keep the encoding compact or switch to a binary encoding instead of JSON.
 
-### 7.3 What remains for `.ironmesh-remote-snapshot.json`
+### 7.3 What remains for `.berrykeep-remote-snapshot.json`
 
-For the new strategy, nothing needs to remain in `.ironmesh-remote-snapshot.json` for correctness.
+For the new strategy, nothing needs to remain in `.berrykeep-remote-snapshot.json` for correctness.
 
 The intended end state is:
 
@@ -235,7 +235,7 @@ The intended end state is:
   - per-item reconciliation identity.
 - no required root-wide snapshot JSON file.
 
-If we keep `.ironmesh-remote-snapshot.json` at all, it should be treated as optional diagnostics only, not as part of the provider's required restart logic.
+If we keep `.berrykeep-remote-snapshot.json` at all, it should be treated as optional diagnostics only, not as part of the provider's required restart logic.
 
 ### 7.4 Clean baseline strategy
 
@@ -304,7 +304,7 @@ Recommended usage:
 
 ### 9.2 Rejected
 
-- Non-empty folder that is not already a matching IronMesh root.
+- Non-empty folder that is not already a matching BerryKeep root.
 - Folder already registered to some other provider/root identity.
 - Folder whose Windows sync-root identity is stale or mismatched.
 
@@ -313,7 +313,7 @@ Recommended usage:
 When unregistering a root, the provider should:
 
 - disconnect from Windows CFAPI registration,
-- remove runtime-only caches such as `.ironmesh-remote-snapshot.json`,
+- remove runtime-only caches such as `.berrykeep-remote-snapshot.json`,
 - leave ordinary user files alone unless a separate destructive cleanup flow is explicitly requested.
 
 This preserves the meaning:
@@ -329,16 +329,16 @@ This preserves the meaning:
 - Add startup validation helpers:
   - query Windows registration state for the folder,
   - read and validate the Windows-persisted sync-root identity,
-  - detect whether the folder is empty except for explicitly internal IronMesh files.
+  - detect whether the folder is empty except for explicitly internal BerryKeep files.
 - Change provider startup so it no longer blindly unregisters and re-registers an existing root.
-- Remove `.ironmesh-remote-snapshot.json` from the required startup path.
+- Remove `.berrykeep-remote-snapshot.json` from the required startup path.
 
 ### Phase 2
 
 - Enforce empty-folder-only registration by default.
 - Make mismatches fail with actionable error messages.
 - Extend per-item `FileIdentity` to include remote version, remote hash, remote size, last-known clean local hash, and provider instance id.
-- Make remote-delete reconciliation consult per-item `FileIdentity` instead of `.ironmesh-remote-snapshot.json`.
+- Make remote-delete reconciliation consult per-item `FileIdentity` instead of `.berrykeep-remote-snapshot.json`.
 - Make `unregister` clean up runtime cache.
 
 ## 12. Resolved Decisions
@@ -368,6 +368,6 @@ Recommended baseline:
 - `FileIdentity` uses a compact text encoding,
 - unregister means explicit disconnect,
 - no implicit re-adoption of populated folders,
-- no required `.ironmesh-remote-snapshot.json`.
+- no required `.berrykeep-remote-snapshot.json`.
 
 This is the simplest model for users and the safest model for data ownership.

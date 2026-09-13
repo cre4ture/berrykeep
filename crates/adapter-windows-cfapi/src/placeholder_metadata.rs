@@ -1747,11 +1747,11 @@ mod tests {
         let registration_lock = crate::lock_sync_root_registration_tests();
         let unique = Uuid::new_v4();
         let root_path = std::env::temp_dir().join(format!(
-            "ironmesh-placeholder-metadata-{test_name}-{unique}"
+            "berrykeep-placeholder-metadata-{test_name}-{unique}"
         ));
         let registration = SyncRootRegistration::new(
             format!("test-placeholder-metadata-{test_name}-{unique}"),
-            "Ironmesh Placeholder Metadata Test",
+            "BerryKeep Placeholder Metadata Test",
             &root_path,
             Uuid::new_v4(),
             None,
@@ -1919,7 +1919,7 @@ mod tests {
     #[test]
     fn remote_metadata_comparison_detects_stale_timestamp_and_size() {
         let root =
-            std::env::temp_dir().join(format!("ironmesh-placeholder-meta-{}", Uuid::now_v7()));
+            std::env::temp_dir().join(format!("berrykeep-placeholder-meta-{}", Uuid::now_v7()));
         fs::create_dir_all(&root).expect("test directory should exist");
         let path = root.join("photo.jpg");
         fs::write(&path, vec![0_u8; 42]).expect("test file should be written");
@@ -3044,7 +3044,7 @@ mod tests {
     #[test]
     fn reconcile_remote_delete_preserves_local_only_plain_files() {
         let sync_root =
-            std::env::temp_dir().join(format!("ironmesh-placeholder-meta-{}", Uuid::now_v7()));
+            std::env::temp_dir().join(format!("berrykeep-placeholder-meta-{}", Uuid::now_v7()));
         fs::create_dir_all(&sync_root).expect("sync root should exist");
         let full_path = sync_root.join("notes.txt");
         fs::write(&full_path, b"offline local").expect("local file should exist");

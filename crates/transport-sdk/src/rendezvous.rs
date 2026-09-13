@@ -1643,7 +1643,8 @@ pub fn rendezvous_client_identity_has_expected_cluster_uri_san(
     let certificate_der = rendezvous_client_identity_certificate_der(client_identity_pem)?;
     let (_, certificate) = parse_x509_certificate(certificate_der.as_ref())
         .map_err(|error| anyhow!("failed parsing rendezvous client certificate: {error}"))?;
-    let expected_cluster_uri = format!("urn:ironmesh:cluster:{expected_cluster_id}");
+    let expected_cluster_uri = format!("urn:berrykeep:cluster:{expected_cluster_id}");
+    let legacy_expected_cluster_uri = format!("urn:ironmesh:cluster:{expected_cluster_id}");
 
     Ok(certificate.extensions().iter().any(|extension| {
         matches!(
@@ -1653,7 +1654,7 @@ pub fn rendezvous_client_identity_has_expected_cluster_uri_san(
                     matches!(
                         name,
                         x509_parser::extensions::GeneralName::URI(uri)
-                            if *uri == expected_cluster_uri
+                            if *uri == expected_cluster_uri || *uri == legacy_expected_cluster_uri
                     )
                 })
         )
@@ -1818,10 +1819,17 @@ mod tests {
     }
 
     fn rendezvous_identity_pem_with_cluster_san(cluster_id: ClusterId) -> String {
+        rendezvous_identity_pem_with_cluster_san_namespace(cluster_id, "berrykeep")
+    }
+
+    fn rendezvous_identity_pem_with_cluster_san_namespace(
+        cluster_id: ClusterId,
+        namespace: &str,
+    ) -> String {
         let key_pair = KeyPair::generate().expect("test identity key should generate");
         let mut params = CertificateParams::new(Vec::new()).expect("test certificate params");
         params.subject_alt_names = vec![SanType::URI(
-            format!("urn:ironmesh:cluster:{cluster_id}")
+            format!("urn:{namespace}:cluster:{cluster_id}")
                 .try_into()
                 .expect("test cluster SAN should parse"),
         )];
@@ -2893,6 +2901,8 @@ mod tests {
     fn rendezvous_identity_cluster_san_check_distinguishes_current_and_legacy_certificates() {
         let expected_cluster_id = ClusterId::now_v7();
         let correct_identity = rendezvous_identity_pem_with_cluster_san(expected_cluster_id);
+        let legacy_identity =
+            rendezvous_identity_pem_with_cluster_san_namespace(expected_cluster_id, "ironmesh");
         let wrong_identity = rendezvous_identity_pem_with_cluster_san(ClusterId::now_v7());
 
         assert!(
@@ -2901,6 +2911,13 @@ mod tests {
                 expected_cluster_id,
             )
             .expect("current identity should parse")
+        );
+        assert!(
+            rendezvous_client_identity_has_expected_cluster_uri_san(
+                legacy_identity.as_bytes(),
+                expected_cluster_id,
+            )
+            .expect("legacy branded identity should parse")
         );
         assert!(
             !rendezvous_client_identity_has_expected_cluster_uri_san(

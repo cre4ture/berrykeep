@@ -2,18 +2,18 @@
 
 set -euo pipefail
 
-readonly LABEL="io.ironmesh.server-node"
-readonly SERVICE_USER="_ironmesh"
+readonly LABEL="io.berrykeep.server-node"
+readonly SERVICE_USER="_berrykeep"
 readonly SERVICE_GROUP="staff"
-readonly SERVICE_ROOT="/Library/Application Support/Ironmesh"
+readonly SERVICE_ROOT="/Library/Application Support/BerryKeep"
 readonly DATA_DIR="${SERVICE_ROOT}/server-node"
 readonly CONFIG_PATH="${SERVICE_ROOT}/server-node.env"
 readonly CONFIG_TEMPLATE_PATH="${SERVICE_ROOT}/server-node.env.example"
-readonly LOG_DIR="/Library/Logs/Ironmesh"
+readonly LOG_DIR="/Library/Logs/BerryKeep"
 readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
 
 fail() {
-  printf 'ironmesh-server-node installer: %s\n' "$*" >&2
+  printf 'berrykeep-server-node installer: %s\n' "$*" >&2
   exit 1
 }
 
@@ -43,7 +43,7 @@ create_service_user() {
   ((uid >= 300)) || fail "could not allocate a system UID for ${SERVICE_USER}"
 
   dscl . -create "/Users/${SERVICE_USER}"
-  dscl . -create "/Users/${SERVICE_USER}" RealName "Ironmesh Server Node"
+  dscl . -create "/Users/${SERVICE_USER}" RealName "BerryKeep Server Node"
   dscl . -create "/Users/${SERVICE_USER}" UniqueID "${uid}"
   dscl . -create "/Users/${SERVICE_USER}" PrimaryGroupID 20
   dscl . -create "/Users/${SERVICE_USER}" NFSHomeDirectory /var/empty
@@ -68,13 +68,11 @@ fi
 
 chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${DATA_DIR}"
 chown root:wheel "${SERVICE_ROOT}/bin/berrykeep-server-node" \
-  "${SERVICE_ROOT}/bin/ironmesh-server-node" \
-  "${SERVICE_ROOT}/bin/ironmesh-server-node-launcher" \
+  "${SERVICE_ROOT}/bin/berrykeep-server-node-launcher" \
   "${CONFIG_TEMPLATE_PATH}" \
   "${PLIST_PATH}"
 chmod 0755 "${SERVICE_ROOT}/bin/berrykeep-server-node" \
-  "${SERVICE_ROOT}/bin/ironmesh-server-node" \
-  "${SERVICE_ROOT}/bin/ironmesh-server-node-launcher"
+  "${SERVICE_ROOT}/bin/berrykeep-server-node-launcher"
 chmod 0644 "${CONFIG_TEMPLATE_PATH}" "${PLIST_PATH}"
 chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_PATH}"
 chmod 0600 "${CONFIG_PATH}"

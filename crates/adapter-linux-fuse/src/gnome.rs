@@ -1,7 +1,7 @@
 #![cfg(not(windows))]
 
 use anyhow::Result;
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use desktop_status::{
     DesktopStatusPublisher, DesktopStatusPublisherOptions, StatusFacet,
     default_gnome_status_file_path, install_gnome_extension_from, spawn_remote_status_thread,
@@ -30,7 +30,7 @@ pub struct GnomeStatusRuntime {
 }
 
 impl GnomeStatusRuntime {
-    pub fn start(options: &GnomeStatusOptions, client: Option<IronMeshClient>) -> Result<Self> {
+    pub fn start(options: &GnomeStatusOptions, client: Option<BerryKeepClient>) -> Result<Self> {
         let publisher = Arc::new(DesktopStatusPublisher::new(
             &DesktopStatusPublisherOptions {
                 profile_label: options.profile_label.clone(),
@@ -46,7 +46,7 @@ impl GnomeStatusRuntime {
                 publisher.clone(),
                 client,
                 options.remote_status_poll_interval_ms,
-                "ironmesh-linux-fuse-gnome-status",
+                "berrykeep-linux-fuse-gnome-status",
             )?),
             None => None,
         };

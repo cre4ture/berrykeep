@@ -63,7 +63,7 @@ It also obscures the real security question:
 - the important property is not "does this certificate match the IP I dialed?"
 - the important property is "did I reach the node I intended to reach?"
 
-Those are related in ordinary web PKI, but they do not need to be the same in Ironmesh.
+Those are related in ordinary web PKI, but they do not need to be the same in BerryKeep.
 
 ## 4. Proposed model
 
@@ -71,8 +71,8 @@ Those are related in ordinary web PKI, but they do not need to be the same in Ir
 
 Node certificates should carry stable identity claims only:
 
-- `urn:ironmesh:node:<node_id>`
-- optionally `urn:ironmesh:cluster:<cluster_id>`
+- `urn:berrykeep:node:<node_id>`
+- optionally `urn:berrykeep:cluster:<cluster_id>`
 
 The certificate proves logical identity.
 It should not need to prove the node's current public IP address.
@@ -115,7 +115,7 @@ When node A wants to connect directly to node B:
 1. node A resolves node B's current candidate addresses from rendezvous or bootstrap metadata,
 2. node A dials one candidate,
 3. the TLS handshake validates that the certificate chains to the cluster CA,
-4. node A extracts `urn:ironmesh:node:<node_id>` from the peer certificate,
+4. node A extracts `urn:berrykeep:node:<node_id>` from the peer certificate,
 5. node A verifies that the presented `node_id` is exactly the expected node B identity.
 
 The dialed address is then treated as a mutable routing hint.
@@ -131,9 +131,9 @@ Address or DNS SAN validation answers:
 
 That is the normal web-PKI model.
 
-### 5.2 What Ironmesh actually needs
+### 5.2 What BerryKeep actually needs
 
-Ironmesh node-to-node transport really needs:
+BerryKeep node-to-node transport really needs:
 
 - cluster CA validation,
 - expected peer identity validation,
@@ -232,7 +232,7 @@ Based on the current review discussion, the following defaults should be treated
   - `crates/server-node-sdk/src/main_tests.rs`: `server_node_config_loads_from_node_bootstrap_file`
   - `crates/server-node-sdk/src/main_tests.rs`: `issue_node_bootstrap_includes_runtime_and_rendezvous_metadata`
 
-  System tests that explicitly enable `IRONMESH_PUBLIC_PEER_API_ENABLED` or depend on bootstrap-issued direct endpoints with usage `PublicApi` for direct-vs-relay behavior:
+  System tests that explicitly enable `BERRYKEEP_PUBLIC_PEER_API_ENABLED` or depend on bootstrap-issued direct endpoints with usage `PublicApi` for direct-vs-relay behavior:
 
   Client-side direct-vs-relay tests in this group are only conditionally affected. If bootstrap continues to publish a public client/API endpoint, those tests should keep working because bootstrap issuance and client traffic remain on the public listener. They only need updates if the bootstrap artifact shape or endpoint-usage modeling changes.
 

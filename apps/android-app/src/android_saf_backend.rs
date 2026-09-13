@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use anyhow::{Context, Result};
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use common::content_fingerprint::FingerprintingReader;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
@@ -111,7 +111,7 @@ fn notify_android_saf_tree_changed(tree_uri: &str) {
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustSafBridge_notifyTreeChanged(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustSafBridge_notifyTreeChanged(
     mut env: JNIEnv,
     _class: JClass,
     tree_uri: JString,
@@ -143,7 +143,7 @@ pub(crate) fn initialize_backend_bridge(env: &mut JNIEnv) -> Result<()> {
         .get_java_vm()
         .context("failed to capture Java VM for SAF bridge")?;
     let class = env
-        .find_class("io/ironmesh/android/data/RustSafBridge")
+        .find_class("io/berrykeep/android/data/RustSafBridge")
         .context("failed to find RustSafBridge class")?;
     let global = env
         .new_global_ref(class)
@@ -433,7 +433,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
         let operation_tree_uri = poll_tree_uri.clone();
         let (result_tx, result_rx) = mpsc::sync_channel::<Result<LocalTreeState>>(1);
         let worker = thread::Builder::new()
-            .name("ironmesh-saf-tree-scan".to_string())
+            .name("berrykeep-saf-tree-scan".to_string())
             .spawn(move || {
                 let _ = result_tx.send(scan_saf_tree(operation_tree_uri.as_str()));
             })
@@ -527,7 +527,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
     fn upload_local_file(
         &mut self,
         _options: &FolderAgentRuntimeOptions,
-        client: &IronMeshClient,
+        client: &BerryKeepClient,
         scope: &PathScope,
         relative_path: &str,
         size_bytes: u64,
@@ -538,7 +538,7 @@ impl FolderAgentLocalBackend for AndroidSafBackend {
     fn download_remote_file(
         &mut self,
         _options: &FolderAgentRuntimeOptions,
-        client: &IronMeshClient,
+        client: &BerryKeepClient,
         local_relative_path: &str,
         remote_key: &str,
     ) -> Result<()> {
@@ -918,7 +918,7 @@ fn jni_output_error(env: &mut JNIEnv<'_>, error: jni::errors::Error) -> std::io:
 
 fn upload_saf_file(
     tree_uri: &str,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     scope: &PathScope,
     relative_path: &str,
     size_bytes: u64,
@@ -964,7 +964,7 @@ fn saf_file_content_fingerprint(
 
 fn download_remote_file_to_saf(
     tree_uri: &str,
-    client: &IronMeshClient,
+    client: &BerryKeepClient,
     local_relative_path: &str,
     remote_key: &str,
 ) -> Result<()> {
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[test]
     fn saf_change_subscriptions_fan_out_and_unregister() {
-        let tree_uri = "content://ironmesh.test/tree/callbacks".to_string();
+        let tree_uri = "content://berrykeep.test/tree/callbacks".to_string();
         let first_count = Arc::new(AtomicUsize::new(0));
         let second_count = Arc::new(AtomicUsize::new(0));
         let first_subscription = AndroidSafChangeSubscription::new(tree_uri.clone(), {

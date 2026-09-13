@@ -10,7 +10,7 @@ const INDEX_HTML_TEMPLATE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/server_admin_index.html"));
 const INDEX_CSS: &str = include_str!(concat!(env!("OUT_DIR"), "/server_admin_app.css"));
 const INDEX_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/server_admin_app.js"));
-const FAVICON_SVG: &str = include_str!("../../../docs/assets/ironmesh-favicon.svg");
+const FAVICON_SVG: &str = include_str!("../../../docs/assets/berrykeep-favicon.svg");
 
 pub(crate) async fn index() -> Html<&'static str> {
     Html(INDEX_HTML_TEMPLATE)

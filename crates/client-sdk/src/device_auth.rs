@@ -7,8 +7,8 @@ use std::fs;
 use std::path::Path;
 use transport_sdk::IssuedClientIdentity;
 
-use crate::IronMeshClient;
-use crate::ironmesh_client::CLIENT_API_V1_PREFIX;
+use crate::BerryKeepClient;
+use crate::berrykeep_client::CLIENT_API_V1_PREFIX;
 
 use crate::connection::{
     build_blocking_http_client, build_blocking_reqwest_client_from_pem_for_url,
@@ -175,7 +175,7 @@ pub struct RenewRendezvousIdentityResponse {
     pub rendezvous_client_identity_pem: String,
 }
 
-pub async fn renew_rendezvous_identity(client: &IronMeshClient) -> Result<String> {
+pub async fn renew_rendezvous_identity(client: &BerryKeepClient) -> Result<String> {
     let path = format!("{CLIENT_API_V1_PREFIX}/auth/device/renew-rendezvous-identity");
     let response = client
         .post_relative_path(&path)
@@ -211,7 +211,7 @@ fn response_error_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::IronMeshClient;
+    use crate::BerryKeepClient;
     use axum::{Json, Router, routing::post};
     use uuid::Uuid;
 
@@ -395,7 +395,7 @@ mod tests {
         }))
         .await;
 
-        let client = IronMeshClient::from_direct_base_url(url);
+        let client = BerryKeepClient::from_direct_base_url(url);
         let result = renew_rendezvous_identity(&client)
             .await
             .expect("renewal should succeed");
@@ -416,7 +416,7 @@ mod tests {
         }))
         .await;
 
-        let client = IronMeshClient::from_direct_base_url(url);
+        let client = BerryKeepClient::from_direct_base_url(url);
         let error = renew_rendezvous_identity(&client)
             .await
             .expect_err("HTTP 500 should fail");
@@ -440,7 +440,7 @@ mod tests {
         }))
         .await;
 
-        let client = IronMeshClient::from_direct_base_url(url);
+        let client = BerryKeepClient::from_direct_base_url(url);
         let error = renew_rendezvous_identity(&client)
             .await
             .expect_err("empty PEM should fail");
@@ -461,7 +461,7 @@ mod tests {
         }))
         .await;
 
-        let client = IronMeshClient::from_direct_base_url(url);
+        let client = BerryKeepClient::from_direct_base_url(url);
         let error = renew_rendezvous_identity(&client)
             .await
             .expect_err("invalid JSON should fail");

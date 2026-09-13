@@ -3,7 +3,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 # Crate Universe supplies the platform-selected third-party dependencies.
 # First-party workspace dependencies stay native so Bazel can invalidate only
-# the affected portion of the IronMesh graph.
+# the affected portion of the BerryKeep graph.
 rust_library(
     name = "adapter_linux_fuse",
     srcs = glob(["src/**/*.rs"]),

@@ -8,7 +8,7 @@ opportunistic background quality refresh are implemented.
 ## Context
 
 The current client bootstrap already carries multiple direct public API endpoints and relay
-targets, but `client-sdk` collapses that set to a single `IronMeshClient` transport during
+targets, but `client-sdk` collapses that set to a single `BerryKeepClient` transport during
 construction. Once that single target is selected, request retries only reset that target's
 local session pool.
 
@@ -31,10 +31,10 @@ not as a prerequisite gap.
 
 ## Goals
 
-- Keep multiple server-node targets active inside one `IronMeshClient`.
+- Keep multiple server-node targets active inside one `BerryKeepClient`.
 - Isolate failures per target so one failing connection never blocks other targets.
 - Automatically route requests to the best currently known target.
-- Preserve the existing public `IronMeshClient` API for callers.
+- Preserve the existing public `BerryKeepClient` API for callers.
 - Keep direct and relay paths to the same logical node independent.
 - Seed route quality at construction time and keep adapting during runtime.
 
@@ -85,7 +85,7 @@ Bootstrap construction should no longer stop after the first reachable target.
 Instead it should:
 
 1. build all syntactically valid endpoint transports,
-2. combine them into one `IronMeshClient`,
+2. combine them into one `BerryKeepClient`,
 3. run a focused connection-quality probe across all built endpoints,
 4. choose the best successful endpoint as the initial active route,
 5. return an error only if no endpoint can be built or no endpoint can complete the startup probe.

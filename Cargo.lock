@@ -606,6 +606,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "berrykeep-background-launcher"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "common",
+ "desktop-client-config",
+ "winres",
+]
+
+[[package]]
+name = "berrykeep-config-app"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "axum",
+ "blake3",
+ "clap",
+ "client-sdk",
+ "common",
+ "desktop-client-config",
+ "desktop-status",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "windows-sys 0.61.2",
+ "winres",
+]
+
+[[package]]
+name = "berrykeep-folder-agent"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "client-sdk",
+ "common",
+ "desktop-status",
+ "git-version",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sync-agent-core",
+ "sync-core",
+ "tracing",
+ "winres",
+]
+
+[[package]]
 name = "bigdecimal"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1545,6 +1596,7 @@ version = "1.2.0"
 dependencies = [
  "anyhow",
  "client-sdk",
+ "common",
  "serde",
  "serde_json",
  "tracing",
@@ -3120,55 +3172,6 @@ dependencies = [
  "url",
  "webpki-roots",
  "ws_stream_wasm",
-]
-
-[[package]]
-name = "ironmesh-background-launcher"
-version = "1.2.0"
-dependencies = [
- "anyhow",
- "desktop-client-config",
- "winres",
-]
-
-[[package]]
-name = "ironmesh-config-app"
-version = "1.2.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "axum",
- "blake3",
- "clap",
- "client-sdk",
- "desktop-client-config",
- "desktop-status",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "windows-sys 0.61.2",
- "winres",
-]
-
-[[package]]
-name = "ironmesh-folder-agent"
-version = "1.2.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "clap",
- "client-sdk",
- "common",
- "desktop-status",
- "git-version",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sync-agent-core",
- "sync-core",
- "tracing",
- "winres",
 ]
 
 [[package]]
@@ -5612,6 +5615,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
+ "common",
  "git-version",
  "server-node-sdk",
  "tokio",
@@ -5964,6 +5968,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-server",
+ "common",
  "fs2",
  "iptocc",
  "percent-encoding",
@@ -7767,6 +7772,7 @@ dependencies = [
  "adapter-windows-cfapi",
  "anyhow",
  "client-sdk",
+ "common",
  "git-version",
  "image",
  "reqwest 0.12.28",

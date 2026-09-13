@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <script>
       try {
-        const storageKey = "ironmesh-color-scheme";
-        const accentStorageKey = "ironmesh-accent-color";
+        const storageKey = "berrykeep-color-scheme";
+        const accentStorageKey = "berrykeep-accent-color";
         const accentQueryParameter = "accent_color";
         const embeddedClientQueryParameter = "embedded_client";
         const storedColorScheme = window.localStorage.getItem(storageKey);
@@ -46,14 +46,14 @@
         const blue = Number.parseInt(normalizedAccent.slice(5, 7), 16);
         const mixChannel = (value, target, amount) => Math.round(value + (target - value) * amount);
         const toRgb = (r, g, b) => `${r}, ${g}, ${b}`;
-        document.documentElement.style.setProperty("--ironmesh-accent-rgb", toRgb(red, green, blue));
+        document.documentElement.style.setProperty("--berrykeep-accent-rgb", toRgb(red, green, blue));
         document.documentElement.style.setProperty(
-          "--ironmesh-accent-soft-rgb",
+          "--berrykeep-accent-soft-rgb",
           toRgb(mixChannel(red, 255, 0.52), mixChannel(green, 255, 0.52), mixChannel(blue, 255, 0.52))
         );
       } catch {}
     </script>
-    <link rel="icon" type="image/svg+xml" href="/ironmesh-favicon.svg" />
+    <link rel="icon" type="image/svg+xml" href="/berrykeep-favicon.svg" />
     <title>BerryKeep Client UI</title>
   </head>
   <body>

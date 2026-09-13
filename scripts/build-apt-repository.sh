@@ -48,8 +48,8 @@ Options:
                        before updating it, for example
                        creature@creax.de:/home/creature/html/apt/berrykeep.
   --sign-key KEY       GPG key ID or fingerprint used for Release signing.
-  --server-node-only   Publish berrykeep-server-node and its Ironmesh
-                       transition package. With no explicit .deb path,
+  --server-node-only   Publish berrykeep-server-node and its IronMesh
+                       transition package. With no explicit .deb paths,
                        expects both packages.
   --server-node-matrix FILE
                        Sign each server-node-only matrix row. Each non-comment
@@ -599,13 +599,13 @@ prune_server_node_versions() {
   local architecture="$1"
   local package_path package_name package_architecture package_version depends required_version retained
   local retained_version
-  local -a retained_berrykeep_versions=()
   local -a retained_ironmesh_versions=()
+  local -a retained_berrykeep_versions=()
   local -a retained_transition_versions=()
   local -a retained_versions=()
 
   # Keep the BerryKeep Server Node version being published. An exact legacy
-  # Map Tools dependency protects only the matching Ironmesh Server Node while
+  # Map Tools dependency protects only the matching BerryKeep Server Node while
   # it is still needed; the compatibility rebuild removes that dependency.
   for package_path in "${DEB_PATHS[@]}"; do
     package_name="$(dpkg-deb -f "${package_path}" Package)"

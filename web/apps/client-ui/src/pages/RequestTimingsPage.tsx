@@ -14,8 +14,8 @@ import {
   type ClientConnectionAttempt,
   type ClientConnectionRouteEndpointSnapshot,
   type ClientConnectionRouteSnapshot
-} from "@ironmesh/api";
-import { PageHeader, StatCard } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { PageHeader, StatCard } from "@berrykeep/ui";
 import { useEffect, useMemo, useState } from "react";
 
 const SNAPSHOT_POLL_MS = 2_000;

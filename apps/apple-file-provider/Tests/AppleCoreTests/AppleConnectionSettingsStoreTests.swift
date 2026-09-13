@@ -49,7 +49,7 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
 
     func testConnectionDraftEncodingNeverPersistsClientIdentity() throws {
         let identity = #"{"private_key_pem":"sensitive"}"#
-        let draft = IronmeshConnectionDraft(
+        let draft = BerryKeepConnectionDraft(
             bootstrapInput: #"{"version":1}"#,
             clientIdentityJSON: identity
         )
@@ -62,7 +62,7 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
         XCTAssertNil(object["clientIdentityJSON"])
         XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("private_key_pem"))
         let decodedDraft = try JSONDecoder().decode(
-            IronmeshConnectionDraft.self,
+            BerryKeepConnectionDraft.self,
             from: data
         )
         XCTAssertEqual(decodedDraft.clientIdentityJSON, "")
@@ -110,6 +110,31 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
             defaults: draftDefaults.defaults,
             stateKey: AppleConnectionSettingsStore.defaultLegacyDraftStateKey,
             secret: draftIdentity
+        )
+    }
+
+    func testLoadMigratesTheFormerConnectionStateKey() throws {
+        let testDefaults = try IsolatedDefaults(label: "FormerStateKey")
+        defer { testDefaults.clear() }
+        let state = AppleStoredConnectionState(
+            connectionInput: "storage.example.test:443",
+            deviceID: "device-1"
+        )
+        testDefaults.defaults.set(
+            try JSONEncoder().encode(state),
+            forKey: AppleConnectionSettingsStore.legacyStateKey
+        )
+        let store = AppleConnectionSettingsStore(
+            defaults: testDefaults.defaults,
+            secretStore: InMemorySecretStore()
+        )
+
+        XCTAssertEqual(try store.load(), state)
+        XCTAssertNotNil(
+            testDefaults.defaults.data(forKey: AppleConnectionSettingsStore.defaultStateKey)
+        )
+        XCTAssertNil(
+            testDefaults.defaults.data(forKey: AppleConnectionSettingsStore.legacyStateKey)
         )
     }
 

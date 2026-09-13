@@ -47,13 +47,13 @@ for this plan — no action needed there.
 
 ## Architecture note: custom FUSE driver vs. a generic S3-FUSE gateway (2026-07-06)
 
-With an S3 API for ironmesh in progress (separate PR), it's worth recording why this plan
+With an S3 API for berrykeep in progress (separate PR), it's worth recording why this plan
 keeps investing in the custom `adapter-linux-fuse` driver rather than dropping it in favor
 of an existing FUSE-to-S3 mapping driver (s3fs-fuse, rclone mount, goofys, AWS's
 `mountpoint-s3`):
 
 - **Rename semantics.** S3 has no native rename; every generic S3-FUSE driver implements
-  it as copy-then-delete, which is expensive and non-atomic for large files. Ironmesh's
+  it as copy-then-delete, which is expensive and non-atomic for large files. BerryKeep's
   own metadata store can do a metadata-only rename (no data movement), which
   `adapter-linux-fuse` relies on today.
 - **Placeholder/hydration/pinning UX.** The custom driver's placeholder-with-lazy-hydration
@@ -62,7 +62,7 @@ of an existing FUSE-to-S3 mapping driver (s3fs-fuse, rclone mount, goofys, AWS's
   object store with no concept of this; it either caches everything locally (unbounded, the
   same problem this plan is fixing) or has no offline-availability story at all.
 - **Manifest/version awareness.** Rename tracking, provisional-version reconciliation,
-  tombstones, and chunk-level dedup all live in ironmesh's manifest model, which a generic
+  tombstones, and chunk-level dedup all live in berrykeep's manifest model, which a generic
   driver talking to a bare S3 API has no visibility into.
 - **Counterpoint worth tracking.** AWS's `mountpoint-s3` (Rust, open source) has already
   solved a meaningful chunk of what Slice 1 is building here — bounded-memory streaming
@@ -71,7 +71,7 @@ of an existing FUSE-to-S3 mapping driver (s3fs-fuse, rclone mount, goofys, AWS's
   given the rename/versioning gap above.
 
 Conclusion: keep the custom driver; this plan's FUSE slices remain worth doing. Revisit
-only if the S3 API PR reveals ironmesh doesn't actually need rename/version semantics for
+only if the S3 API PR reveals berrykeep doesn't actually need rename/version semantics for
 some class of mounts (e.g. a read-only archive mirror), in which case a generic gateway
 could be offered as an additional, simpler mount mode alongside the custom driver — not a
 replacement for it.
@@ -108,7 +108,7 @@ Additive, low-risk change with no effect on GC/cleanup behavior; the dashboard n
 attribution for the two implemented hotspot fixes (Slices 2b and 3) and for in-flight
 upload memory. Verified via `cargo test -p server-node-sdk` (300 tests) and
 `--features turso-metadata` (439 tests), `cargo clippy` clean on both, and
-`pnpm --filter @ironmesh/server-admin typecheck && build` clean.
+`pnpm --filter @berrykeep/server-admin typecheck && build` clean.
 
 ## Slice 1: Bound FUSE hydrated memory
 
@@ -124,8 +124,8 @@ not "introduce range-based hydration for the first time."
 
 ### 1a — Global byte budget with eviction (low risk, do first) — implemented (2026-07-06)
 
-- `IronmeshFuseFs` now tracks a `hydration_byte_budget: u64` (default 256 MiB, overridable
-  via `IRONMESH_FUSE_HYDRATION_BUDGET_BYTES`), and `resident_hydrated_bytes()` sums
+- `BerryKeepFuseFs` now tracks a `hydration_byte_budget: u64` (default 256 MiB, overridable
+  via `BERRYKEEP_FUSE_HYDRATION_BUDGET_BYTES`), and `resident_hydrated_bytes()` sums
   `FsNode.data.len()` across all nodes on demand (computed only at hydration time, not
   incrementally — avoids a counter that could silently desync from direct `.data` writes in
   tests/other code paths).
@@ -201,7 +201,7 @@ is gone. In its place:
 - `PersistentStore` holds `current_objects_cache: std::sync::Mutex<RangeChunkCache<String,
   CurrentObjectEntry>>` — the same bounded LRU already used by the Windows CFAPI adapter
   (`crates/common/src/range_chunk_cache.rs`, which gained a `remove` method for this use).
-  Default capacity 100,000 entries, overridable via `IRONMESH_CURRENT_OBJECTS_CACHE_CAPACITY`.
+  Default capacity 100,000 entries, overridable via `BERRYKEEP_CURRENT_OBJECTS_CACHE_CAPACITY`.
 - Startup no longer bulk-loads the table into memory; the cache starts empty and fills
   lazily on first touch per key, same per-key cost every other point-lookup metadata table
   already pays.
@@ -321,7 +321,7 @@ manifest in the store) is gone. `PersistentStore::cleanup_unreferenced`
 - ~~FUSE process RSS stays within the configured hydration budget regardless of how much
   total data is synced~~ — done for the write-hydration path (1a): `hydrate_if_needed`
   proactively evicts LRU clean resident data before exceeding
-  `IRONMESH_FUSE_HYDRATION_BUDGET_BYTES` (default 256 MiB), verified by the synthetic
+  `BERRYKEEP_FUSE_HYDRATION_BUDGET_BYTES` (default 256 MiB), verified by the synthetic
   eviction test. Not yet true for every byte a mount touches — 1b/1c (still open) would
   extend the same bound to large-file staging and range-hydrated writes.
 - ~~Server steady-state RSS attributable to `current_state` is measurably reduced at

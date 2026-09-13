@@ -218,7 +218,7 @@ def default_event_state_file(repo: dict[str, str], number: int) -> Path:
     identity = event_state_identity(repo, number)
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     state_key = hashlib.sha256(encoded).hexdigest()
-    return state_home / "ironmesh" / "pr-followup" / f"{state_key}.json"
+    return state_home / "berrykeep" / "pr-followup" / f"{state_key}.json"
 
 
 def empty_seen_events() -> dict[str, set[str]]:

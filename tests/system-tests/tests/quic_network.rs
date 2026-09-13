@@ -45,7 +45,7 @@ struct Scenario {
     name: &'static str,
     network: NetworkProfile,
     iroh_relay_enabled: bool,
-    ironmesh_relay_enabled: bool,
+    berrykeep_relay_enabled: bool,
     stall_first_iroh_ticket: bool,
     expected: ExpectedRoute,
 }
@@ -55,7 +55,7 @@ impl Scenario {
         name: "home-direct",
         network: NetworkProfile::HolePunchableHomeNat,
         iroh_relay_enabled: true,
-        ironmesh_relay_enabled: false,
+        berrykeep_relay_enabled: false,
         stall_first_iroh_ticket: false,
         expected: ExpectedRoute::DirectQuic("direct"),
     };
@@ -64,16 +64,16 @@ impl Scenario {
         name: "hotel-iroh-relay",
         network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: true,
-        ironmesh_relay_enabled: false,
+        berrykeep_relay_enabled: false,
         stall_first_iroh_ticket: false,
         expected: ExpectedRoute::DirectQuic("relay"),
     };
 
-    const HOTEL_IRONMESH_RELAY: Self = Self {
-        name: "hotel-ironmesh-relay",
+    const HOTEL_BERRYKEEP_RELAY: Self = Self {
+        name: "hotel-berrykeep-relay",
         network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: false,
-        ironmesh_relay_enabled: true,
+        berrykeep_relay_enabled: true,
         stall_first_iroh_ticket: false,
         expected: ExpectedRoute::RelayTunnel,
     };
@@ -82,7 +82,7 @@ impl Scenario {
         name: "ticket-race-healthy-second",
         network: NetworkProfile::HotelBlockedUdp,
         iroh_relay_enabled: true,
-        ironmesh_relay_enabled: false,
+        berrykeep_relay_enabled: false,
         stall_first_iroh_ticket: true,
         expected: ExpectedRoute::DirectQuic("relay"),
     };
@@ -99,8 +99,8 @@ async fn udp_blocked_uses_iroh_relay_for_direct_quic() -> Result<()> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn udp_blocked_without_iroh_relay_falls_back_to_ironmesh_relay() -> Result<()> {
-    run_with_timeout(Scenario::HOTEL_IRONMESH_RELAY).await
+async fn udp_blocked_without_iroh_relay_falls_back_to_berrykeep_relay() -> Result<()> {
+    run_with_timeout(Scenario::HOTEL_BERRYKEEP_RELAY).await
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -10,8 +10,8 @@ import {
   useMantineColorScheme
 } from "@mantine/core";
 import { IconCheck, IconChevronDown, IconDeviceDesktop, IconMoonStars, IconSunHigh } from "@tabler/icons-react";
-import { useIronmeshAccentColor } from "../../theme/ironmesh-provider";
-import { defaultIronmeshAccentColor } from "../../theme/ironmesh-theme";
+import { useBerryKeepAccentColor } from "../../theme/berrykeep-provider";
+import { defaultBerryKeepAccentColor } from "../../theme/berrykeep-theme";
 
 const colorSchemeOptions = [
   {
@@ -43,7 +43,7 @@ const accentColorSwatches = [
 export function ColorSchemeControl() {
   const { colorScheme, setColorScheme } = useMantineColorScheme();
   const { accentColor, setAccentColor, resetAccentColor, accentColorHost } =
-    useIronmeshAccentColor();
+    useBerryKeepAccentColor();
   const computedColorScheme = useComputedColorScheme("light", {
     getInitialValueInEffect: false
   });
@@ -130,7 +130,7 @@ export function ColorSchemeControl() {
                 variant="subtle"
                 size="compact-xs"
                 onClick={resetAccentColor}
-                disabled={accentColor === defaultIronmeshAccentColor}
+                disabled={accentColor === defaultBerryKeepAccentColor}
               >
                 Reset
               </Button>

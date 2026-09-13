@@ -2,7 +2,7 @@ mod gnome;
 mod publisher;
 
 use anyhow::{Context, Result, anyhow};
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -205,7 +205,7 @@ pub fn write_status_document(path: &Path, document: &DesktopStatusDocument) -> R
     })
 }
 
-pub fn poll_remote_status(client: &IronMeshClient) -> Result<RemoteStatusUpdate> {
+pub fn poll_remote_status(client: &BerryKeepClient) -> Result<RemoteStatusUpdate> {
     let cluster_status = client
         .get_json_path_blocking("/cluster/status")
         .and_then(|value| serde_json::from_value::<ClusterSummaryView>(value).map_err(Into::into));
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn derive_profile_label_prefers_prefix() {
         assert_eq!(
-            derive_profile_label(Some("team/docs"), Path::new("/tmp/ironmesh-root")),
+            derive_profile_label(Some("team/docs"), Path::new("/tmp/berrykeep-root")),
             "team/docs"
         );
     }
@@ -459,8 +459,8 @@ mod tests {
     #[test]
     fn derive_profile_label_falls_back_to_root_name() {
         assert_eq!(
-            derive_profile_label(None, Path::new("/tmp/ironmesh-root")),
-            "ironmesh-root"
+            derive_profile_label(None, Path::new("/tmp/berrykeep-root")),
+            "berrykeep-root"
         );
     }
 

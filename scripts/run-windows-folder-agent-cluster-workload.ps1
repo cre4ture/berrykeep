@@ -41,15 +41,15 @@ if ($ReplicationTimeoutMinutes -le 0) {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
-$env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_FILE_COUNT = [string]$FileCount
-$env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MIN_BYTES = [string]($MinSizeMiB * 1MB)
-$env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_BYTES = [string]($MaxSizeMiB * 1MB)
-$env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_VERIFY_SAMPLE_COUNT = [string]$VerifySampleCount
-$env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_SUBDIR_COUNT = [string]$SubdirCount
-$env:IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_DIR_DEPTH = [string]$MaxDirDepth
-$env:IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE = $StartMode
-$env:IRONMESH_WINDOWS_FOLDER_AGENT_UPLOAD_TIMEOUT_SECS = [string]($UploadTimeoutMinutes * 60)
-$env:IRONMESH_WINDOWS_FOLDER_AGENT_REPLICATION_TIMEOUT_SECS = [string]($ReplicationTimeoutMinutes * 60)
+$env:BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_FILE_COUNT = [string]$FileCount
+$env:BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_MIN_BYTES = [string]($MinSizeMiB * 1MB)
+$env:BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_MAX_BYTES = [string]($MaxSizeMiB * 1MB)
+$env:BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_VERIFY_SAMPLE_COUNT = [string]$VerifySampleCount
+$env:BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_SUBDIR_COUNT = [string]$SubdirCount
+$env:BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_MAX_DIR_DEPTH = [string]$MaxDirDepth
+$env:BERRYKEEP_WINDOWS_FOLDER_AGENT_START_MODE = $StartMode
+$env:BERRYKEEP_WINDOWS_FOLDER_AGENT_UPLOAD_TIMEOUT_SECS = [string]($UploadTimeoutMinutes * 60)
+$env:BERRYKEEP_WINDOWS_FOLDER_AGENT_REPLICATION_TIMEOUT_SECS = [string]($ReplicationTimeoutMinutes * 60)
 
 Write-Host "Running Windows Folder Agent cluster workload"
 Write-Host "  files          : $FileCount"

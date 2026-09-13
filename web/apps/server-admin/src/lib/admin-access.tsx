@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { AdminSessionStatus } from "@ironmesh/api";
-import { getAdminSessionStatus, loginAdmin, logoutAdmin } from "@ironmesh/api";
+import type { AdminSessionStatus } from "@berrykeep/api";
+import { getAdminSessionStatus, loginAdmin, logoutAdmin } from "@berrykeep/api";
 import {
   createContext,
   useCallback,
@@ -10,7 +10,7 @@ import {
   type ReactNode
 } from "react";
 
-const ADMIN_TOKEN_STORAGE_KEY = "ironmesh.server-admin.admin-token-override";
+const ADMIN_TOKEN_STORAGE_KEY = "berrykeep.server-admin.admin-token-override";
 const ADMIN_SESSION_CONFIRMATION_ATTEMPTS = 8;
 const ADMIN_SESSION_CONFIRMATION_DELAY_MS = 100;
 

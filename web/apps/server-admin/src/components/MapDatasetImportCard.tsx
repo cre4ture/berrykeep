@@ -7,12 +7,12 @@ import {
   type AdminMapDatasetImportJobView,
   type NaturalEarthImportJobView,
   type NaturalEarthImportProfile
-} from "@ironmesh/api";
+} from "@berrykeep/api";
 import {
   galleryMapConfigurationQueryPolicy,
   galleryQueryKeys,
-  ironmeshPrimaryColor
-} from "@ironmesh/ui";
+  berrykeepPrimaryColor
+} from "@berrykeep/ui";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -329,7 +329,7 @@ function MapDatasetImportStateBadge({ job }: { job: AdminMapDatasetImportJobView
     <Badge
       color={
         job.state === "completed"
-          ? ironmeshPrimaryColor
+          ? berrykeepPrimaryColor
           : job.state === "failed"
             ? "red"
             : "blue"
@@ -344,7 +344,7 @@ function MapDatasetImportStateBadge({ job }: { job: AdminMapDatasetImportJobView
 function NaturalEarthImportStateBadge({ job }: { job: NaturalEarthImportJobView }) {
   return (
     <Badge
-      color={job.state === "ready" ? ironmeshPrimaryColor : job.state === "failed" ? "red" : "blue"}
+      color={job.state === "ready" ? berrykeepPrimaryColor : job.state === "failed" ? "red" : "blue"}
       variant="light"
     >
       Natural Earth: {job.state}
@@ -526,7 +526,7 @@ function MapDatasetImportProgress({ job }: { job: AdminMapDatasetImportJobView }
               {formatProgressPercent(job.progress_percent)}
             </Text>
           </Group>
-          <Progress value={job.progress_percent} color={ironmeshPrimaryColor} />
+          <Progress value={job.progress_percent} color={berrykeepPrimaryColor} />
         </div>
 
         {job.current_part_key ? (

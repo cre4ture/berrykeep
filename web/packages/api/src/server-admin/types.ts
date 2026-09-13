@@ -727,8 +727,8 @@ export type HardwareHealthFinding = {
 export type HardwareHealthReport = {
   reporting_node_id: string;
   generated_at_unix: number;
-  ironmesh_version: string;
-  ironmesh_revision: string;
+  berrykeep_version: string;
+  berrykeep_revision: string;
   hardware_profile_id: string;
   inventory: HardwareInventory;
   node_lifecycle: HardwareNodeLifecycle;

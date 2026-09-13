@@ -11,8 +11,8 @@ import {
   restoreStoreHistoryEntries,
   restoreStoreVersion,
   restoreStorePathFromSnapshot
-} from "@ironmesh/api";
-import { ExplorerSurface, PageHeader, type ExplorerLoadEntriesOptions } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { ExplorerSurface, PageHeader, type ExplorerLoadEntriesOptions } from "@berrykeep/ui";
 import { useCallback } from "react";
 
 type ExplorerPageProps = {

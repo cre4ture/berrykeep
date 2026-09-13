@@ -28,7 +28,7 @@ pub trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T> AsyncIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
-/// Stable IronMesh identity expected from a directly-connected server node.
+/// Stable BerryKeep identity expected from a directly-connected server node.
 ///
 /// A direct URL is only a locator and may therefore change when a node moves,
 /// receives a new address, or is reached through NAT port forwarding.  When
@@ -230,7 +230,7 @@ fn validate_expected_node_server_identity(
 
     let certificate_der = certificate_der.to_vec();
     std::thread::Builder::new()
-        .name("ironmesh-x509-parser".to_owned())
+        .name("berrykeep-x509-parser".to_owned())
         .stack_size(SERVER_CERTIFICATE_PARSER_STACK_BYTES)
         .spawn(move || {
             validate_expected_node_server_identity_on_parser_stack(&certificate_der, expected)
@@ -246,8 +246,10 @@ fn validate_expected_node_server_identity_on_parser_stack(
 ) -> Result<()> {
     let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
         .context("failed parsing server certificate")?;
-    let expected_node_uri = format!("urn:ironmesh:node:{}", expected.node_id);
-    let expected_cluster_uri = format!("urn:ironmesh:cluster:{}", expected.cluster_id);
+    let expected_node_uri = format!("urn:berrykeep:node:{}", expected.node_id);
+    let legacy_expected_node_uri = format!("urn:ironmesh:node:{}", expected.node_id);
+    let expected_cluster_uri = format!("urn:berrykeep:cluster:{}", expected.cluster_id);
+    let legacy_expected_cluster_uri = format!("urn:ironmesh:cluster:{}", expected.cluster_id);
     let mut saw_node = false;
     let mut saw_cluster = false;
 
@@ -257,8 +259,9 @@ fn validate_expected_node_server_identity_on_parser_stack(
         {
             for name in &san.general_names {
                 if let x509_parser::extensions::GeneralName::URI(uri) = name {
-                    saw_node |= *uri == expected_node_uri;
-                    saw_cluster |= *uri == expected_cluster_uri;
+                    saw_node |= *uri == expected_node_uri || *uri == legacy_expected_node_uri;
+                    saw_cluster |=
+                        *uri == expected_cluster_uri || *uri == legacy_expected_cluster_uri;
                 }
             }
         }
@@ -509,7 +512,7 @@ mod tests {
         let cert_der = server_certificate_with_identity(expected);
 
         validate_expected_node_server_identity(&cert_der, expected)
-            .expect("IronMesh identity should not depend on the locator DNS SAN");
+            .expect("BerryKeep identity should not depend on the locator DNS SAN");
         assert!(
             validate_expected_node_server_identity(
                 &cert_der,
@@ -521,6 +524,18 @@ mod tests {
             .is_err(),
             "a mismatched cluster identity must still be rejected"
         );
+    }
+
+    #[test]
+    fn expected_node_identity_accepts_legacy_uri_sans() {
+        let expected = ExpectedNodeServerIdentity {
+            node_id: NodeId::new_v4(),
+            cluster_id: ClusterId::new_v4(),
+        };
+        let cert_der = server_certificate_with_uri_namespace(expected, "ironmesh");
+
+        validate_expected_node_server_identity(&cert_der, expected)
+            .expect("legacy identity should remain accepted during migration");
     }
 
     #[test]
@@ -580,12 +595,12 @@ mod tests {
         server_params.subject_alt_names = vec![
             SanType::DnsName("stale-locator.example".try_into().expect("DNS SAN")),
             SanType::URI(
-                format!("urn:ironmesh:node:{}", expected.node_id)
+                format!("urn:berrykeep:node:{}", expected.node_id)
                     .try_into()
                     .expect("node URI SAN"),
             ),
             SanType::URI(
-                format!("urn:ironmesh:cluster:{}", expected.cluster_id)
+                format!("urn:berrykeep:cluster:{}", expected.cluster_id)
                     .try_into()
                     .expect("cluster URI SAN"),
             ),
@@ -606,7 +621,7 @@ mod tests {
 
         verifier
             .verify_server_cert(&server_der, &[], &changed_locator, &[], UnixTime::now())
-            .expect("CA-signed server certificate should be accepted by its stable IronMesh ID");
+            .expect("CA-signed server certificate should be accepted by its stable BerryKeep ID");
 
         let wrong_cluster_verifier = ExpectedNodeServerCertVerifier::new(
             Arc::clone(&verifier.roots),
@@ -639,17 +654,24 @@ mod tests {
     fn server_certificate_with_identity(
         expected: ExpectedNodeServerIdentity,
     ) -> CertificateDer<'static> {
+        server_certificate_with_uri_namespace(expected, "berrykeep")
+    }
+
+    fn server_certificate_with_uri_namespace(
+        expected: ExpectedNodeServerIdentity,
+        namespace: &str,
+    ) -> CertificateDer<'static> {
         let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.subject_alt_names = vec![
             SanType::DnsName("old-address.example".try_into().expect("DNS SAN")),
             SanType::URI(
-                format!("urn:ironmesh:node:{}", expected.node_id)
+                format!("urn:{namespace}:node:{}", expected.node_id)
                     .try_into()
                     .expect("node URI SAN"),
             ),
             SanType::URI(
-                format!("urn:ironmesh:cluster:{}", expected.cluster_id)
+                format!("urn:{namespace}:cluster:{}", expected.cluster_id)
                     .try_into()
                     .expect("cluster URI SAN"),
             ),

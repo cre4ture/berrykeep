@@ -13,7 +13,7 @@ Related documents:
 
 ## 1. Goal and scope
 
-Integrate `iroh` as IronMesh's first real `DirectQuic` transport so that:
+Integrate `iroh` as BerryKeep's first real `DirectQuic` transport so that:
 
 - rendezvous stays the authenticated control plane,
 - peers use direct QUIC plus hole punching whenever possible,
@@ -32,7 +32,7 @@ Unlike the older replacement-style NAT plan, this work should be rolled out in m
 The design decision in this document is:
 
 - use `iroh` for direct point-to-point connectivity and hole punching,
-- do **not** replace IronMesh's rendezvous/auth/discovery model with `rust-libp2p`,
+- do **not** replace BerryKeep's rendezvous/auth/discovery model with `rust-libp2p`,
 - do **not** redesign the application protocol in the first implementation slice.
 
 ## 2. Current repo state recap
@@ -59,7 +59,7 @@ The missing piece is the actual direct QUIC transport runtime.
   - transport control handshake,
   - buffered HTTP request/response framing over a generic stream session.
 - `crates/server-node-sdk/src/transport_service.rs` already executes buffered transport requests against existing server-node routes.
-- `crates/client-sdk/src/session_pool.rs` and `src/ironmesh_client.rs` already support relay-backed multiplexed sessions and bootstrap-driven target planning.
+- `crates/client-sdk/src/session_pool.rs` and `src/berrykeep_client.rs` already support relay-backed multiplexed sessions and bootstrap-driven target planning.
 - `apps/rendezvous-service` and `crates/server-node-sdk/src/embedded_rendezvous.rs` already provide:
   - standalone rendezvous deployment,
   - embedded managed rendezvous on the first node,
@@ -80,7 +80,7 @@ The missing piece is the actual direct QUIC transport runtime.
 
 The current relay tunnel transport already proved a key point:
 
-- IronMesh does **not** need a new application protocol to move off HTTP listeners.
+- BerryKeep does **not** need a new application protocol to move off HTTP listeners.
 
 The existing buffered transport framing in `crates/transport-sdk/src/multiplex_transport.rs` can be reused on top of iroh bi-streams.
 That keeps the first implementation slice narrow:
@@ -111,16 +111,16 @@ Its job is coordination, not bulk forwarding.
 Each node, and later each enrolled client runtime, starts one long-lived `iroh::Endpoint` with:
 
 - a persisted endpoint secret,
-- one or more IronMesh ALPNs,
+- one or more BerryKeep ALPNs,
 - a configured relay set,
-- address publication backed by IronMesh rendezvous,
+- address publication backed by BerryKeep rendezvous,
 - accept and dial support for direct QUIC streams.
 
-Direct IronMesh traffic then flows as:
+Direct BerryKeep traffic then flows as:
 
 1. peer resolves target transport metadata from rendezvous,
 2. peer constructs `iroh::EndpointAddr`,
-3. peer dials target `EndpointId` over the IronMesh ALPN,
+3. peer dials target `EndpointId` over the BerryKeep ALPN,
 4. first bi-stream performs the existing transport-session handshake,
 5. subsequent streams carry the existing buffered request/response framing,
 6. relay tunnel is used only if direct QUIC fails or is unavailable.
@@ -163,7 +163,7 @@ Recommended shape:
 pub struct ConnectionCandidateTransportHints {
     pub transport_id: Option<String>, // iroh EndpointId
     pub relay_url: Option<String>,    // companion relay for this endpoint
-    pub alpn: Option<String>,         // e.g. ironmesh/transport/1
+    pub alpn: Option<String>,         // e.g. berrykeep/transport/1
     pub direct_addrs: Vec<String>,    // SocketAddr strings or canonical URI form
     pub observed_addrs: Vec<String>,  // addr watcher + rendezvous-observed view
 }
@@ -211,15 +211,15 @@ It only needs enough data for initial connectivity before rendezvous can provide
 
 ### 4.4 Persisted runtime identity
 
-Nodes and clients need a second persisted identity alongside their existing IronMesh certificate or credential state:
+Nodes and clients need a second persisted identity alongside their existing BerryKeep certificate or credential state:
 
-- IronMesh identity:
+- BerryKeep identity:
   - cluster-scoped node or device identity,
   - existing certificate or signed credential model,
 - iroh identity:
   - endpoint secret key,
   - stable `EndpointId`,
-  - bound in metadata to the IronMesh identity.
+  - bound in metadata to the BerryKeep identity.
 
 That binding should be stored and revalidated at registration time so that a node cannot publish arbitrary transport IDs for another logical identity.
 
@@ -351,7 +351,7 @@ Use an iroh relay **sidecar or companion service** per rendezvous deployment.
 
 That means each control-plane deployment consists of:
 
-- the existing IronMesh rendezvous service for auth, discovery, policy, and wakeups,
+- the existing BerryKeep rendezvous service for auth, discovery, policy, and wakeups,
 - one co-located or explicitly configured iroh relay companion for NAT traversal assistance and relay fallback.
 
 ### 6.2 Why sidecar first
@@ -360,9 +360,9 @@ Sidecar is the lowest-risk operational model because it:
 
 - keeps heavy UDP and fallback relay traffic out of the Axum control-plane process,
 - allows the relay component to scale separately later,
-- minimizes IronMesh-specific patches to upstream iroh behavior,
+- minimizes BerryKeep-specific patches to upstream iroh behavior,
 - works for both standalone rendezvous and embedded managed rendezvous,
-- lets IronMesh keep its own control-plane authentication and policy boundaries.
+- lets BerryKeep keep its own control-plane authentication and policy boundaries.
 
 ### 6.3 Interaction with the current relay tunnel
 
@@ -533,16 +533,16 @@ Implementation direction:
 
 Minimum metrics:
 
-- `ironmesh_direct_quic_connect_total`
-- `ironmesh_direct_quic_connect_fail_total`
-- `ironmesh_direct_quic_fallback_total`
-- `ironmesh_relay_tunnel_session_total`
-- `ironmesh_relay_tunnel_bytes_total`
-- `ironmesh_iroh_relay_bytes_total`
-- `ironmesh_peer_session_path_current`
-- `ironmesh_rendezvous_direct_capable_endpoints`
-- `ironmesh_rendezvous_relay_only_endpoints`
-- `ironmesh_transport_connect_latency_ms`
+- `berrykeep_direct_quic_connect_total`
+- `berrykeep_direct_quic_connect_fail_total`
+- `berrykeep_direct_quic_fallback_total`
+- `berrykeep_relay_tunnel_session_total`
+- `berrykeep_relay_tunnel_bytes_total`
+- `berrykeep_iroh_relay_bytes_total`
+- `berrykeep_peer_session_path_current`
+- `berrykeep_rendezvous_direct_capable_endpoints`
+- `berrykeep_rendezvous_relay_only_endpoints`
+- `berrykeep_transport_connect_latency_ms`
 
 ### 9.2 Operator-facing ratios
 
@@ -639,7 +639,7 @@ Scope:
 ### 11.3 Non-goals for the first slice
 
 - replacing the existing rendezvous control plane,
-- rewriting IronMesh's public API to a custom QUIC-native RPC protocol,
+- rewriting BerryKeep's public API to a custom QUIC-native RPC protocol,
 - deleting the current relay tunnel before mixed rollout is proven,
 - introducing a broader `rust-libp2p` swarm architecture.
 

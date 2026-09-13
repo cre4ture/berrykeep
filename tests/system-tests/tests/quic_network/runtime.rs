@@ -119,7 +119,7 @@ impl ScenarioRuntime {
         fs::create_dir_all(&client_dir)?;
         let bootstrap_path = client_dir.join("connection.bootstrap.json");
         issue_bootstrap(&node_device, &node_url, &bootstrap_path).await?;
-        configure_ironmesh_relay(&bootstrap_path, scenario.ironmesh_relay_enabled)?;
+        configure_berrykeep_relay(&bootstrap_path, scenario.berrykeep_relay_enabled)?;
         let identity_path = client_dir.join("connection.bootstrap.client-identity.json");
         enroll_cli(&node_device, &bootstrap_path, &identity_path).await?;
 
@@ -257,7 +257,7 @@ async fn issue_bootstrap(device: &Device, node_url: &str, output: &Path) -> Resu
         .spawn(move |_device| async move {
             let bootstrap = isolated_http_client()?
                 .post(format!("{node_url}/auth/bootstrap-bundles/issue"))
-                .header("x-ironmesh-admin-token", ADMIN_TOKEN)
+                .header("x-berrykeep-admin-token", ADMIN_TOKEN)
                 .json(&json!({
                     "label": "quic-network-cli",
                     "expires_in_secs": 3600
@@ -274,7 +274,7 @@ async fn issue_bootstrap(device: &Device, node_url: &str, output: &Path) -> Resu
         .context("bootstrap issue task panicked")?
 }
 
-fn configure_ironmesh_relay(path: &Path, enabled: bool) -> Result<()> {
+fn configure_berrykeep_relay(path: &Path, enabled: bool) -> Result<()> {
     let mut bootstrap = ConnectionBootstrap::from_path(path)?;
     bootstrap.relay_mode = if enabled {
         RelayMode::Fallback

@@ -566,7 +566,7 @@ impl AccessControl for TicketAccess {
     async fn on_connect(&self, request: &ClientRequest) -> Access {
         let Some(token) = request.auth_token() else {
             return Access::Deny {
-                reason: Some("missing IronMesh relay ticket".to_string()),
+                reason: Some("missing BerryKeep relay ticket".to_string()),
             };
         };
         match self

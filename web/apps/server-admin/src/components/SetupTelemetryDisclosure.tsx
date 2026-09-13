@@ -1,4 +1,4 @@
-import { JsonBlock } from "@ironmesh/ui";
+import { JsonBlock } from "@berrykeep/ui";
 import { Anchor, Card, List, Stack, Switch, Text } from "@mantine/core";
 
 const TELEMETRY_STRATEGY_DOC_URL =
@@ -16,7 +16,7 @@ const REPRESENTATIVE_PAYLOAD_EXAMPLE = {
   schema_version: 1,
   telemetry_subject_id: "<generated locally after setup, never this node's real identity>",
   generated_at_unix: 1752912000,
-  ironmesh_version: "1.0.38",
+  berrykeep_version: "1.0.38",
   hardware_profile_id: "hp-<hash of normalized hardware inventory>",
   node_lifecycle: {
     uptime_seconds: 431200,
@@ -69,7 +69,7 @@ export function SetupTelemetryDisclosure({ enabled, onChange }: SetupTelemetryDi
         </Text>
         <Text size="sm" c="dimmed">
           Once set up, this node can periodically send a small, pseudonymized summary of hardware
-          reliability signals to the IronMesh project&apos;s central collector, so hardware/firmware
+          reliability signals to the BerryKeep project&apos;s central collector, so hardware/firmware
           models with above-average failure rates can be spotted across the whole fleet. This is
           enabled by default (opt-out) — review what that means below before continuing.
         </Text>

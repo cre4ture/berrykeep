@@ -9,8 +9,8 @@ import {
   type ClientConnectionSummary,
   type ClientConnectionTransport,
   type NodeDescriptor
-} from "@ironmesh/api";
-import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { berrykeepPrimaryColor, StatCard } from "@berrykeep/ui";
 import {
   Alert,
   Badge,
@@ -470,7 +470,7 @@ function transportBadgeColor(transport: ClientConnectionTransport): string {
     case "http_request":
       return "blue";
     case "direct_transport":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "relay_transport":
       return "grape";
   }
@@ -502,7 +502,7 @@ function describeServerNodeConnectionPath(node: NodeDescriptor): {
   if (peerEndpoints(node).length > 0) {
     return {
       label: "direct preferred",
-      color: ironmeshPrimaryColor,
+      color: berrykeepPrimaryColor,
       detail: "A direct peer endpoint is advertised."
     };
   }

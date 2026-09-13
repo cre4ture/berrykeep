@@ -12,7 +12,7 @@ The core of this strategy is implemented across the node and a new central colle
   pseudonymized batch. No raw struct passthrough, so new hardware-health fields cannot silently
   leak into telemetry.
 - **Pseudonymization & opt-out** (Section 3, 4.1): HMAC-derived `telemetry_subject_id` with a
-  locally persisted salt; `IRONMESH_RELIABILITY_TELEMETRY_ENABLED` env default plus a persisted
+  locally persisted salt; `BERRYKEEP_RELIABILITY_TELEMETRY_ENABLED` env default plus a persisted
   admin override.
 - **Transparency endpoints** (Section 3.3): admin-authenticated
   `GET/PUT /api/v1/auth/telemetry/settings` and `GET /api/v1/auth/telemetry/preview`, surfaced in
@@ -70,7 +70,7 @@ The core of this strategy is implemented across the node and a new central colle
   `telemetry_subject_id` — a table never joined into `admin_raw_records`/`StoredRecord`, since the
   token is a bearer secret, not telemetry content. The node
   (`crates/server-node-sdk/src/reliability_telemetry.rs`) persists the issued token alongside the
-  rest of its reliability-telemetry state and attaches it as an `X-Ironmesh-Ingestion-Token` header
+  rest of its reliability-telemetry state and attaches it as an `X-BerryKeep-Ingestion-Token` header
   (deliberately a header, not a payload field, so it never ends up inside the stored
   `raw_payload_json` blob) on every subsequent ingest request. `ingest_hardware_reliability`
   rejects (401) a request whose token doesn't match what's on file for that subject id (a
@@ -93,7 +93,7 @@ The core of this strategy is implemented across the node and a new central colle
   so the dashboard and its public `/v1/stats/dashboard` API share an HTTPS origin without CORS,
   browser credentials, or a separate static-file upload. The primary
   `scripts/deploy-strato-stats-collector-service.sh` wrapper fixes the intended
-  `root@217.160.159.105`, `/root/ironmesh/telemetry`, and
+  `root@217.160.159.105`, `/root/berrykeep/telemetry`, and
   `https://217.160.159.105:9444` layout; its root path is the publicly accessible Fleet
   Reliability dashboard. It expects the automatically renewed, short-lived
   Let's Encrypt IP certificate at `/etc/letsencrypt/live/217.160.159.105`; Certbot 5.4 or newer can
@@ -132,7 +132,7 @@ Related documents:
 - `docs/security-architecture.md` — trust boundaries, mTLS node identity, admin plane model.
 - `docs/multi-node-strategy.md` — cluster metadata model and the only existing "many nodes talk to
   one central service" precedent (rendezvous).
-- `docs/data-scrub-auto-repair-strategy.md` — existing IronMesh-runtime-derived reliability findings.
+- `docs/data-scrub-auto-repair-strategy.md` — existing BerryKeep-runtime-derived reliability findings.
 - `docs/node-memory-footprint-reduction-plan.md` — precedent for resource-conscious background work.
 - `docs/zero-touch-cluster-setup-strategy.md` — precedent for guided, low-friction admin UX, and the
   anchor point for the bootstrap-time consent step described in Section 4.4.
@@ -208,7 +208,7 @@ need to be selected, not newly collected.
 | `boot_id` change rate | derivable from persisted state | low | reboot/crash frequency per hardware profile |
 | `hardware_profile_id` | already collected (deterministic hash over normalized inventory) | none | grouping key for fleet comparison, without exposing raw data |
 
-### 2.3 IronMesh Runtime Reliability (partially implemented)
+### 2.3 BerryKeep Runtime Reliability (partially implemented)
 
 | Metric | Collectability | Effort | Benefit |
 | --- | --- | --- | --- |
@@ -263,9 +263,9 @@ code is never persisted, logged, or forwarded — only the resulting country cod
 ### 3.1 Default Behavior
 
 Transmission is **enabled by default** ("opt-out", not "opt-in"), consistent with the existing pattern
-for other background features on the node (`IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED`,
-`IRONMESH_REPLICATION_REPAIR_ENABLED`, `IRONMESH_STARTUP_REPAIR_ENABLED`,
-`IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED` — all in `crates/server-node-sdk/src/lib.rs`, implemented with
+for other background features on the node (`BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED`,
+`BERRYKEEP_REPLICATION_REPAIR_ENABLED`, `BERRYKEEP_STARTUP_REPAIR_ENABLED`,
+`BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED` — all in `crates/server-node-sdk/src/lib.rs`, implemented with
 `.unwrap_or(true)` and the same `"0" | "false" | "no"` parsing convention).
 
 However, as described in Section 4.4, the *primary* rollout plan pairs this default-on toggle with a
@@ -275,7 +275,7 @@ background default alone.
 Proposed new environment variable, in the exact existing style:
 
 ```rust
-telemetry_enabled: std::env::var("IRONMESH_RELIABILITY_TELEMETRY_ENABLED")
+telemetry_enabled: std::env::var("BERRYKEEP_RELIABILITY_TELEMETRY_ENABLED")
     .ok()
     .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
     .unwrap_or(true),
@@ -284,7 +284,7 @@ telemetry_enabled: std::env::var("IRONMESH_RELIABILITY_TELEMETRY_ENABLED")
 ### 3.2 Ways to Disable
 
 - **Env var / config** (primary, consistent with all existing feature toggles on the node):
-  `IRONMESH_RELIABILITY_TELEMETRY_ENABLED=0`.
+  `BERRYKEEP_RELIABILITY_TELEMETRY_ENABLED=0`.
 - **Admin UI toggle** (for operators who don't want to work with config files/environment variables
   directly): a switch on the existing `HardwarePage` in `server-admin`
   (`web/apps/server-admin/src/pages/HardwarePage.tsx`), right next to the existing hardware-health
@@ -332,7 +332,7 @@ for operator infrastructure over time.
 Instead: a locally derived **telemetry pseudonym key**
 
 ```text
-telemetry_subject_id = HMAC-SHA256(local_random_salt, "ironmesh-telemetry-v1" || node_id)
+telemetry_subject_id = HMAC-SHA256(local_random_salt, "berrykeep-telemetry-v1" || node_id)
 ```
 
 - `local_random_salt` is generated once locally and persisted (e.g. in the same state file as the
@@ -360,7 +360,7 @@ telemetry_subject_id = HMAC-SHA256(local_random_salt, "ironmesh-telemetry-v1" ||
 
 Unlike a strict "no location data at all" stance, this document includes an **opt-out-covered, coarse,
 country-level** location signal, per explicit project-owner feedback: seeing roughly where in the world
-IronMesh is deployed (as other open-source projects with telemetry/usage maps do) is considered
+BerryKeep is deployed (as other open-source projects with telemetry/usage maps do) is considered
 valuable enough to include, as long as it cannot be used to narrow down a specific installation.
 
 - **What is collected:** only an ISO-3166-1 alpha-2 **country code** (e.g. `"DE"`, `"US"`), nothing
@@ -372,7 +372,7 @@ valuable enough to include, as long as it cannot be used to narrow down a specif
 - **What is *not* persisted:** the raw source IP address is used only in-memory to resolve the country
   code and is discarded immediately afterwards — it is never logged, stored, or forwarded, consistent
   with the "no IP addresses" rule in Section 2.6.
-- **Aggregation safeguard:** the public "where in the world is IronMesh used" view only ever shows
+- **Aggregation safeguard:** the public "where in the world is BerryKeep used" view only ever shows
   counts per country (e.g. on a world map), never a per-`telemetry_subject_id` breakdown. Section 4.3's
   k-anonymity threshold applies to any cross-tabulation of `country_code` with `hardware_profile_id` as
   well, so that a rare hardware profile in a low-population country cannot be used to single out one
@@ -482,7 +482,7 @@ telemetry would unnecessarily complicate their security boundaries.
 
 - **Hosting assumption (per project owner):** the central service is hosted directly at
   `217.160.159.105`, port `9444`.
-- Protocol: HTTPS (TLS 1.3), consistent with all other IronMesh HTTP services.
+- Protocol: HTTPS (TLS 1.3), consistent with all other BerryKeep HTTP services.
 - Auth: deliberately **no** per-node mTLS as in the cluster-internal case — the collector should
   specifically *not* know which cluster/operator a given record belongs to. Instead:
   - no client identity proof beyond the `telemetry_subject_id` that is already part of the payload,
@@ -496,7 +496,7 @@ telemetry would unnecessarily complicate their security boundaries.
     one) issues a random 256-bit token that proves only "this caller previously completed the
     registration handshake for this specific pseudonymous subject id" — it is never derived from,
     or linkable to, any real node/cluster/operator identity. The node attaches it as an
-    `X-Ironmesh-Ingestion-Token` header (not a payload field, so it never lands in stored
+    `X-BerryKeep-Ingestion-Token` header (not a payload field, so it never lands in stored
     `raw_payload_json`) on ingest requests. A request presenting a token that doesn't match what's
     on file for that subject id (including "nothing on file at all") is rejected with 401 as a
     forgery signal; a request presenting *no* token is still accepted (tolerance-first, Section 7:
@@ -526,7 +526,7 @@ telemetry would unnecessarily complicate their security boundaries.
 - Access control:
   - Raw data (including `telemetry_subject_id` mapping over time): project maintainers/operators of
     the collector service only, admin-authenticated analogous to the existing
-    `IRONMESH_ADMIN_TOKEN`/RBAC model from `docs/security-architecture.md`.
+    `BERRYKEEP_ADMIN_TOKEN`/RBAC model from `docs/security-architecture.md`.
   - Aggregated, k-anonymous processed statistics: publicly viewable at the collector's root Fleet
     Reliability dashboard and via `GET /v1/stats/dashboard`. This versioned API includes only the
     k-anonymized current participant, country, and hardware-profile counts plus generation/build
@@ -562,7 +562,7 @@ timer and event-driven, debounced updates):
   conservative "detect-only first" approach from `docs/data-scrub-auto-repair-strategy.md`); an
   optional accelerated send on new `critical` findings could be a later expansion stage.
 - Retry/backoff on send failures, analogous to the existing replication-repair pattern
-  (`IRONMESH_REPLICATION_REPAIR_BACKOFF_SECS` as a model): failed batches are dropped or retried a
+  (`BERRYKEEP_REPLICATION_REPAIR_BACKOFF_SECS` as a model): failed batches are dropped or retried a
   limited number of times, never queued unboundedly (no unbounded growing send buffer).
 - Deduplication: if nothing material has changed since the last successful send (no new finding, no
   SMART value change above a noise threshold), the send can be skipped to reduce baseline load — the
@@ -586,7 +586,7 @@ timer and event-driven, debounced updates):
   "schema_version": 1,
   "telemetry_subject_id": "hex-hmac...",
   "generated_at_unix": 1752912000,
-  "ironmesh_version": "1.0.33",
+  "berrykeep_version": "1.0.33",
   "hardware_profile_id": "hp-...",   // as in the existing hardware_health_report
   "country_code": "DE",              // derived server-side from source IP, see Section 4.2; optional
   "node_lifecycle": {
@@ -679,7 +679,7 @@ Resolved based on project-owner feedback on the initial draft:
   replacement for it and not pure rate limiting alone: `POST /v1/register/{telemetry_subject_id}`
   (idempotent) issues a random 256-bit token proving only "this caller previously completed the
   registration handshake for this pseudonymous subject id" — never anything linkable to a real
-  node/cluster/operator. The node attaches it as an `X-Ironmesh-Ingestion-Token` header (kept out
+  node/cluster/operator. The node attaches it as an `X-BerryKeep-Ingestion-Token` header (kept out
   of the stored payload). A mismatched/unregistered token is rejected (401) as a forgery signal; a
   *missing* token is still accepted, per Section 7's tolerance-first stance toward
   older/non-upgraded nodes, but is held to a stricter, dedicated per-subject rate limit than

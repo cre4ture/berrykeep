@@ -197,7 +197,7 @@ fn try_get_sync_root_info(root_path: &Path) -> Result<Option<(String, Vec<u8>)>>
     let clamped_length = identity_length.min(available);
     if clamped_length == 0 {
         bail!(
-            "sync root at {} is missing IronMesh registration metadata",
+            "sync root at {} is missing BerryKeep registration metadata",
             root_path.display()
         );
     }
@@ -244,7 +244,7 @@ mod tests {
         let identity = SyncRootIdentity::new(
             Uuid::parse_str("0195ff90-a273-7ef4-9ea5-b2c6e6b99539").unwrap(),
             Uuid::parse_str("0195ff90-a57d-7680-b9d9-5a7d5714957b").unwrap(),
-            "ironmesh.sync.root",
+            "berrykeep.sync.root",
             "/docs/team/",
         );
 

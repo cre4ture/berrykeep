@@ -29,14 +29,14 @@ if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($adminToken)) {
-    $adminToken = $env:IRONMESH_ADMIN_TOKEN
+    $adminToken = $env:BERRYKEEP_ADMIN_TOKEN
 }
 if ([string]::IsNullOrWhiteSpace($adminToken)) {
-    throw "Admin token is required. Provide ManifestPath or set IRONMESH_ADMIN_TOKEN."
+    throw "Admin token is required. Provide ManifestPath or set BERRYKEEP_ADMIN_TOKEN."
 }
 
 $uri = "$BaseUrl/api/v1/auth/logging/config"
-$headers = @{ "x-ironmesh-admin-token" = $adminToken }
+$headers = @{ "x-berrykeep-admin-token" = $adminToken }
 
 if ([string]::IsNullOrWhiteSpace($FilterExpression)) {
     $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
