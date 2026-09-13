@@ -78,35 +78,20 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
     };
 
     let mount_units = direct_mount_units_from_service_properties(&service_dependencies);
-    let mut mounts = Vec::with_capacity(mount_units.len());
-    for unit in mount_units {
-        let where_output = match run_systemctl(
-            &systemctl,
-            [
-                "show",
-                "--all",
-                "--property=Where",
-                "--value",
-                unit.as_str(),
-            ],
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(reason) => {
-                return SystemdMountProtectionInspection::QueryFailed { service, reason };
-            }
+    if mount_units.is_empty() {
+        return SystemdMountProtectionInspection::Dependencies {
+            service,
+            mounts: Vec::new(),
         };
-        let Some(where_path) = where_output
-            .lines()
-            .map(str::trim)
-            .find(|value| !value.is_empty() && *value != "-")
-            .map(PathBuf::from)
-        else {
-            continue;
-        };
-        mounts.push(SystemdMountDependency { unit, where_path });
     }
+    let mut where_arguments = Vec::with_capacity(mount_units.len() + 5);
+    where_arguments.extend(["show", "--all", "--property=Where", "--value"]);
+    where_arguments.extend(mount_units.iter().map(String::as_str));
+    let where_output = match run_systemctl(&systemctl, where_arguments).await {
+        Ok(output) => output,
+        Err(reason) => return SystemdMountProtectionInspection::QueryFailed { service, reason },
+    };
+    let mounts = mount_dependencies_from_where_values(&mount_units, &where_output);
 
     SystemdMountProtectionInspection::Dependencies { service, mounts }
 }
@@ -128,14 +113,32 @@ fn systemd_service_from_cgroups(cgroups: &str) -> Option<String> {
     cgroups
         .lines()
         .filter_map(|line| line.rsplit_once(':').map(|(_, path)| path))
-        .filter_map(|path| path.rsplit('/').find(|component| !component.is_empty()))
-        .find(|unit| is_systemd_service_unit(unit))
-        .map(str::to_string)
+        .find_map(systemd_service_from_cgroup_path)
+}
+
+fn systemd_service_from_cgroup_path(path: &str) -> Option<String> {
+    for unit in path.rsplit('/').filter(|component| !component.is_empty()) {
+        // A scope contains processes started outside a service unit (such as a
+        // login session). Do not mistake its user manager ancestor for the
+        // BerryKeep server service.
+        if unit.ends_with(".scope") {
+            return None;
+        }
+        if is_systemd_service_unit(unit) && !is_systemd_user_manager_service(unit) {
+            return Some(unit.to_string());
+        }
+    }
+    None
 }
 
 fn is_systemd_service_unit(unit: &str) -> bool {
     unit.strip_suffix(".service")
         .is_some_and(|name| !name.is_empty())
+}
+
+fn is_systemd_user_manager_service(unit: &str) -> bool {
+    unit.strip_suffix(".service")
+        .is_some_and(|name| name.starts_with("user@"))
 }
 
 async fn run_systemctl<'a>(
@@ -184,6 +187,23 @@ fn direct_mount_units_from_service_properties(output: &str) -> Vec<String> {
 
 fn mount_unit_from_token(token: &str) -> Option<String> {
     token.ends_with(".mount").then(|| token.to_string())
+}
+
+fn mount_dependencies_from_where_values(
+    mount_units: &[String],
+    where_values: &str,
+) -> Vec<SystemdMountDependency> {
+    mount_units
+        .iter()
+        .zip(where_values.split('\n'))
+        .filter_map(|(unit, where_value)| {
+            let where_value = where_value.trim();
+            (!where_value.is_empty() && where_value != "-").then(|| SystemdMountDependency {
+                unit: unit.clone(),
+                where_path: PathBuf::from(where_value),
+            })
+        })
+        .collect()
 }
 
 fn mount_protection_targets(
@@ -368,6 +388,14 @@ mod tests {
     }
 
     #[test]
+    fn detects_a_service_from_a_nested_service_cgroup() {
+        let service =
+            systemd_service_from_cgroups("0::/system.slice/berrykeep-server-node.service/worker\n");
+
+        assert_eq!(service.as_deref(), Some("berrykeep-server-node.service"));
+    }
+
+    #[test]
     fn does_not_treat_a_non_service_systemd_scope_as_a_managed_server_service() {
         let service = systemd_service_from_cgroups(
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/session-4.scope\n",
@@ -481,6 +509,26 @@ mod tests {
         );
 
         assert_eq!(units, vec!["mnt-primary.mount", "var-lib-berrykeep.mount"]);
+    }
+
+    #[test]
+    fn where_values_are_matched_to_mount_units_in_one_systemctl_response() {
+        let mounts = mount_dependencies_from_where_values(
+            &[
+                "mnt-primary.mount".to_string(),
+                "mnt-archive.mount".to_string(),
+                "missing.mount".to_string(),
+            ],
+            "/mnt/primary\n/mnt/archive\n-\n",
+        );
+
+        assert_eq!(
+            mounts,
+            vec![
+                systemd_mount("mnt-primary.mount", "/mnt/primary"),
+                systemd_mount("mnt-archive.mount", "/mnt/archive"),
+            ]
+        );
     }
 
     #[test]
