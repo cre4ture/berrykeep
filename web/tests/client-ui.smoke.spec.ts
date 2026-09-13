@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { gzipSync } from "node:zlib";
+import { HttpError, fetchJson } from "@ironmesh/api";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import {
   createInitialOverviewGalleryEntries,
@@ -43,6 +44,44 @@ test("client-ui store-index mock excludes the queried marker only for children",
   expect(projectMockStoreChildrenEntries(entries, "docs", 1).map((entry) => entry.path)).toEqual([
     "docs/readme.txt"
   ]);
+});
+
+test("shared fetch helper bounds plain-text error payloads", async () => {
+  const omittedTail = "proxy-error-body-tail-must-not-reach-the-ui";
+  const errorBody = `unknown variant \`children\`: ${"x".repeat(600)}${omittedTail}`;
+  const server = createServer((_request, response) => {
+    response
+      .writeHead(400, { "content-type": "text/plain; charset=utf-8" })
+      .end(errorBody);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("listener address is unavailable");
+    }
+    let error: unknown;
+    try {
+      await fetchJson(`http://127.0.0.1:${address.port}/failure`);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(HttpError);
+    const httpError = error as HttpError;
+    const excerpt = `${errorBody.slice(0, 512)}…`;
+    expect(httpError.payload).toBe(excerpt);
+    expect(httpError.message).toContain("unknown variant `children`");
+    expect(httpError.message).not.toContain(omittedTail);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
 });
 
 function createDeferred(): { promise: Promise<void>; resolve: () => void } {

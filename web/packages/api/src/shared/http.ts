@@ -12,6 +12,8 @@ export class HttpError extends Error {
   }
 }
 
+const NON_JSON_ERROR_PAYLOAD_MAX_LENGTH = 512;
+
 export function isHttpErrorStatus(
   error: unknown,
   ...statuses: number[]
@@ -30,7 +32,12 @@ export async function fetchJson<T>(
     try {
       payload = JSON.parse(text);
     } catch {
-      payload = text;
+      // Preserve enough plain-text detail for narrow compatibility probes,
+      // without rendering a complete proxy error page in a UI error banner.
+      payload =
+        text.length > NON_JSON_ERROR_PAYLOAD_MAX_LENGTH
+          ? `${text.slice(0, NON_JSON_ERROR_PAYLOAD_MAX_LENGTH)}…`
+          : text;
     }
   }
 
