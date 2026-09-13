@@ -14450,8 +14450,7 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
     let version_old = "ver-local-reg-v1".to_string();
     let version_new = "ver-local-reg-v2".to_string();
 
-    // Write both versions to the local store. v2 is a child of v1, making v1 a non-head version
-    // that list_replication_subjects() will not surface in availability syncs.
+    // Write both versions. Availability must surface v1 even though it is no longer a head.
     seed_subject_version(
         &state,
         &key,
@@ -14510,12 +14509,14 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
     assert_eq!(report.failed_transfers, 0);
     assert_eq!(report.skipped_items, 0);
     assert!(
-        report.detailed_log.iter().any(|entry| {
-            entry.event == "local_replica_registered"
-                && entry.subject.as_deref() == Some(old_version_subject.as_str())
-        }),
-        "repair should emit local_replica_registered for the old version, log={:?}",
-        report.detailed_log
+        state
+            .cluster
+            .lock()
+            .await
+            .available_nodes_for_subject(&old_version_subject)
+            .iter()
+            .any(|node| node.node_id == state.node_id),
+        "the real availability refresh must recognize complete historical content before repair planning"
     );
 
     // After repair the cluster plan should no longer list v1 as a gap.
@@ -16936,13 +16937,17 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
             .unwrap()
     };
 
-    apply_data_scrub_corruption_to_subject(
-        &state,
-        "docs/report.txt",
-        None,
-        DataScrubAutoRepairCorruptionKind::ManifestInvalid,
-    )
-    .await;
+    // Change the referenced identity as well, so this exercises a listing cache
+    // miss. Byte-repair fixtures deliberately preserve the authoritative hash.
+    lock_store(&state, "tests.invalid_manifest_listing")
+        .await
+        .replace_manifest_bytes_for_subject_for_test(
+            "docs/report.txt",
+            None,
+            br#"{invalid-manifest-json"#,
+        )
+        .await
+        .unwrap();
 
     let response = axum::response::IntoResponse::into_response(
         super::list_store_index(
@@ -18722,22 +18727,22 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(after_payload["subject_count"].as_u64().unwrap(), 2);
+    assert_eq!(after_payload["subject_count"].as_u64().unwrap(), 0);
     let after_subject_list = after_payload["subjects"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|value| value.as_str())
         .collect::<Vec<_>>();
-    assert!(after_subject_list.contains(&"photos/cat.png"));
-    assert!(after_subject_list.contains(&format!("photos/cat.png@{}", put.version_id).as_str()));
+    assert!(
+        after_subject_list.is_empty(),
+        "a complete read-through cache is not a durable replica"
+    );
 
     {
         let cluster = target.cluster.lock().await;
         let cluster_subjects = cluster.subjects_for_node(target.node_id);
-        assert_eq!(cluster_subjects.len(), 2);
-        assert!(cluster_subjects.contains(&"photos/cat.png".to_string()));
-        assert!(cluster_subjects.contains(&format!("photos/cat.png@{}", put.version_id)));
+        assert!(cluster_subjects.is_empty());
     }
 
     handle.abort();
@@ -20040,6 +20045,8 @@ async fn build_test_state(
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+            content_repair_lock: Arc::new(Mutex::new(())),
+            content_repair_notify: Arc::new(tokio::sync::Notify::new()),
             repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
             manual_repair_activity: Arc::new(Mutex::new(
                 super::ManualRepairActionActivityRuntime::default(),
@@ -20630,6 +20637,9 @@ async fn seed_subject_version(
         .expect("test subject version should store");
 }
 
+#[path = "content_recovery_tests.rs"]
+mod content_recovery_tests;
+
 async fn spawn_internal_peer_api_server(
     state: ServerState,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -20766,12 +20776,7 @@ async fn apply_data_scrub_corruption_to_subject(
             fs::create_dir(&manifest_path).await.unwrap();
         }
         DataScrubAutoRepairCorruptionKind::ManifestInvalid => {
-            store
-                .replace_manifest_bytes_for_subject_for_test(
-                    key,
-                    version_id,
-                    br#"{invalid-manifest-json"#,
-                )
+            fs::write(&manifest_path, br#"{invalid-manifest-json"#)
                 .await
                 .unwrap();
         }
@@ -20796,10 +20801,7 @@ async fn apply_data_scrub_corruption_to_subject(
                 .expect("manifest should expose total_size_bytes");
             mutated["total_size_bytes"] = serde_json::Value::from(current_total + 7);
             let payload = serde_json::to_vec(&mutated).unwrap();
-            store
-                .replace_manifest_bytes_for_subject_for_test(key, version_id, &payload)
-                .await
-                .unwrap();
+            fs::write(&manifest_path, payload).await.unwrap();
         }
         DataScrubAutoRepairCorruptionKind::ChunkMissing => {
             fs::remove_file(&chunk_path).await.unwrap();
@@ -21099,13 +21101,8 @@ async fn data_scrub_auto_repair_repairs_exact_historical_version_subject_impl(
         vec![version_a.clone()],
     )
     .await;
-    note_subject_replicas(
-        &target,
-        source.node_id,
-        &key,
-        &[version_a.clone(), version_b.clone()],
-    )
-    .await;
+    super::refresh_local_availability_view_once(&source).await;
+    super::sync_availability_views_once(&target).await;
 
     let baseline_repair_history_len = repair_run_history(&target).await.len();
     apply_data_scrub_corruption_to_subject(

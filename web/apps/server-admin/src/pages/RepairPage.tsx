@@ -1689,6 +1689,10 @@ function formatRepairTrigger(trigger: string): string {
 
 function formatRepairStatus(status: string): string {
   switch (status) {
+    case "partially_repaired":
+      return "partially repaired";
+    case "waiting_for_source":
+      return "waiting for source";
     case "completed":
       return "completed";
     case "skipped_no_gaps":
@@ -1758,6 +1762,11 @@ function startupStatusColor(status: string | undefined): string {
 
 function repairStatusColor(status: string): string {
   switch (status) {
+    case "partially_repaired":
+    case "waiting_for_source":
+      return "yellow";
+    case "unresolved":
+      return "red";
     case "completed":
       return berrykeepPrimaryColor;
     case "skipped_no_gaps":

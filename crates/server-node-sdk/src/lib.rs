@@ -146,6 +146,7 @@ use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
 mod cluster;
+mod content_recovery;
 mod embedded_rendezvous;
 mod gallery_map;
 mod gallery_sync;
@@ -423,6 +424,8 @@ struct ServerNetworkRuntime {
 
 #[derive(Clone)]
 struct ServerMaintenanceRuntime {
+    content_repair_lock: Arc<Mutex<()>>,
+    content_repair_notify: Arc<Notify>,
     inflight_requests: Arc<AtomicUsize>,
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
@@ -3289,6 +3292,9 @@ enum RepairRunTrigger {
 #[serde(rename_all = "snake_case")]
 enum RepairRunStatus {
     Completed,
+    PartiallyRepaired,
+    WaitingForSource,
+    Unresolved,
     SkippedNoGaps,
 }
 
@@ -7613,6 +7619,8 @@ async fn run_inner(
             inflight_requests: Arc::new(AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+            content_repair_lock: Arc::new(Mutex::new(())),
+            content_repair_notify: Arc::new(Notify::new()),
             repair_activity: Arc::new(Mutex::new(RepairActivityRuntime::default())),
             manual_repair_activity: Arc::new(Mutex::new(
                 ManualRepairActionActivityRuntime::default(),
@@ -7695,6 +7703,7 @@ async fn start_background_runtimes(
     hardware_health::spawn_hardware_health_sampler(state.clone());
     reliability_telemetry::spawn_reliability_telemetry_sender(state.clone());
     spawn_data_scrubber(state.clone());
+    content_recovery::spawn_worker(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
     spawn_history_head_projection_backfill(state.clone());
     spawn_direct_quic_multiplex_agent(state.clone());
@@ -9682,6 +9691,10 @@ pub(crate) fn build_internal_peer_api() -> Router<ServerState> {
             get(get_replication_chunk),
         )
         .route(
+            "/cluster/v2/replication/manifest/{hash}",
+            get(content_recovery::get_manifest),
+        )
+        .route(
             "/cluster/v2/replication/push/chunk/{hash}",
             post(push_replication_chunk),
         )
@@ -11667,6 +11680,12 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
         loop {
             ticker.tick().await;
 
+            if state.repair_config.enabled
+                && let Err(error) = content_recovery::audit_assigned(&state).await
+            {
+                warn!(error = %error, "failed to audit retained content assignments");
+            }
+
             let keys = planning_replication_subjects(&state).await;
 
             let (node_transitioned_offline, plan) = {
@@ -12194,6 +12213,11 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
     let mut subjects = BTreeSet::new();
     subjects.extend(local_subjects);
     subjects.extend(cluster_subjects);
+    let store = read_store(state, "replication.retained_subjects").await;
+    match store.retained_content().await {
+        Ok(retained) => subjects.extend(retained.subjects()),
+        Err(error) => warn!(error = %error, "failed to enumerate retained replication obligations"),
+    }
     subjects.into_iter().collect()
 }
 
@@ -12643,10 +12667,7 @@ async fn execute_data_scrub_follow_on_repair(
 
 async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker) {
     info!(run_id = %tracker.run_id, trigger = ?tracker.trigger, "data scrub run started");
-    let scrubber = {
-        let store = read_store(&state, "data_scrub.clone_worker").await;
-        store.data_scrubber().await
-    };
+    let scrubber = content_recovery::scrubber(&state).await;
     let result = match scrubber {
         Ok(scrubber) => scrubber.run_with_repair_subjects().await,
         Err(err) => Err(err),
@@ -12654,6 +12675,24 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
 
     match result {
         Ok(output) => {
+            // Persist integrity findings before publishing scrub completion.
+            // A zero execution budget enqueues all intent without fetching bytes,
+            // including when automatic repair is disabled. It also prevents a
+            // later availability refresh from undoing the degraded state.
+            let enqueue_error = if output.repair_subjects.is_empty() {
+                None
+            } else {
+                content_recovery::repair_subjects(
+                    &state,
+                    output.repair_subjects.iter().cloned().collect(),
+                    Some(0),
+                )
+                .await
+                .last_error
+            };
+            if let Some(error) = &enqueue_error {
+                warn!(error, "failed persisting scrub repair intent");
+            }
             let summary = output.report;
             let status = if summary.issue_count > 0 {
                 DataScrubRunStatus::IssuesDetected
@@ -12670,7 +12709,8 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
                 "data scrub run finished"
             );
             let record =
-                finish_data_scrub_run_tracking(&state, tracker, status, summary, None).await;
+                finish_data_scrub_run_tracking(&state, tracker, status, summary, enqueue_error)
+                    .await;
             if !output.repair_subjects.is_empty() {
                 let state_clone = state.clone();
                 tokio::spawn(async move {
@@ -12775,7 +12815,7 @@ async fn execute_tracked_local_replication_repair(
         state,
         tracker,
         plan_summary,
-        RepairRunStatus::Completed,
+        report.run_status(),
         Some(RepairRunSummary::from_local_report(&report)),
         serialize_repair_run_report(&report),
     )
@@ -12812,7 +12852,7 @@ async fn execute_tracked_targeted_local_replication_repair(
         state,
         tracker,
         plan_summary,
-        RepairRunStatus::Completed,
+        report.run_status(),
         Some(RepairRunSummary::from_local_report(&report)),
         serialize_repair_run_report(&report),
     )
@@ -12841,7 +12881,7 @@ async fn execute_tracked_targeted_replication_repair(
         state,
         tracker,
         RepairPlanSummary::from_plan(&plan),
-        RepairRunStatus::Completed,
+        report.run_status(),
         Some(RepairRunSummary::from_local_report(&report)),
         serialize_repair_run_report(&report),
     )
@@ -12875,7 +12915,7 @@ async fn execute_tracked_cluster_replication_repair(
         state,
         tracker,
         plan_summary,
-        RepairRunStatus::Completed,
+        report.totals.run_status(),
         Some(RepairRunSummary::from_cluster_report(&report)),
         serialize_repair_run_report(&report),
     )
@@ -12941,7 +12981,7 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
             &state,
             tracker,
             plan_summary,
-            RepairRunStatus::Completed,
+            report.run_status(),
             Some(RepairRunSummary::from_local_report(&report)),
             serialize_repair_run_report(&report),
         )
@@ -20051,15 +20091,6 @@ fn read_through_replication_subject(
     Some(key.to_string())
 }
 
-async fn read_through_source_nodes(state: &ServerState, subject: &str) -> Vec<NodeDescriptor> {
-    let cluster = state.cluster.lock().await;
-    cluster
-        .available_nodes_for_subject(subject)
-        .into_iter()
-        .filter(|node| node.node_id != state.node_id)
-        .collect()
-}
-
 async fn media_artifact_source_nodes(
     state: &ServerState,
     subject_hint: Option<&str>,
@@ -20316,64 +20347,13 @@ async fn hydrate_missing_chunks_for_range(
     subject: &str,
     missing_chunks: &[ReplicationChunkInfo],
 ) -> Result<()> {
-    let sources = read_through_source_nodes(state, subject).await;
-    if sources.is_empty() {
-        bail!("no readable replica source available for subject={subject}");
+    let result = content_recovery::recover_chunks(state, subject, missing_chunks, None, true).await;
+    if !result.remaining.is_empty() {
+        bail!(
+            "failed read-through chunk recovery for subject={subject}: {}",
+            result.errors.join("; ")
+        );
     }
-
-    for chunk in missing_chunks {
-        let mut fetched = false;
-        let chunk_path = format!("/cluster/v2/replication/chunk/{}", chunk.hash);
-
-        for source in &sources {
-            let response = match execute_peer_request(
-                state,
-                source,
-                reqwest::Method::GET,
-                &chunk_path,
-                Vec::new(),
-                Vec::new(),
-            )
-            .await
-            {
-                Ok(response) if response.is_success() => response,
-                Ok(_) => continue,
-                Err(err) => {
-                    tracing::debug!(
-                        node_id = %source.node_id,
-                        chunk_hash = %chunk.hash,
-                        error = %err,
-                        "failed read-through chunk fetch"
-                    );
-                    continue;
-                }
-            };
-
-            {
-                let store = lock_store(state, "object_read.hydrate_missing_chunk").await;
-                store
-                    .ingest_chunk(&chunk.hash, response.body.as_ref())
-                    .await?;
-                store
-                    .note_cached_chunk_fetch(
-                        &chunk.hash,
-                        chunk.size_bytes,
-                        Some(&source.node_id.to_string()),
-                    )
-                    .await?;
-            }
-            fetched = true;
-            break;
-        }
-
-        if !fetched {
-            bail!(
-                "failed read-through chunk fetch for subject={subject} chunk_hash={}",
-                chunk.hash
-            );
-        }
-    }
-
     Ok(())
 }
 

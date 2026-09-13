@@ -53,7 +53,7 @@ async fn persist_snapshot_fixture(
 }
 
 async fn snapshot_ids_chronological(store: &PersistentStore) -> Vec<String> {
-    let mut snapshots = store.load_all_snapshots().await.unwrap();
+    let mut snapshots = store.metadata_store.load_all_snapshots().await.unwrap();
     snapshots.sort_by(|a, b| {
         a.created_at_unix
             .cmp(&b.created_at_unix)
@@ -9452,9 +9452,7 @@ run_on_all_metadata_backends!(
     put_object_from_chunks_rejects_corrupt_chunk_payload_turso
 );
 
-async fn data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_impl(
-    backend: StorageTestBackend,
-) {
+async fn data_scrub_only_requires_assigned_or_owned_chunks_impl(backend: StorageTestBackend) {
     let (source_root, mut source) = backend
         .init_store("scrub-metadata-only-incomplete-source")
         .await;
@@ -9491,21 +9489,34 @@ async fn data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_i
     );
 
     let report = target.run_data_scrub().await.unwrap();
+    assert_eq!(
+        report.issue_count, 0,
+        "unassigned cache misses are expected"
+    );
+    assert!(report.chunks_not_required_locally > 0);
+    let required = bundle
+        .manifests
+        .iter()
+        .map(|m| m.manifest_hash.clone())
+        .collect();
+    let assigned = target
+        .data_scrubber()
+        .await
+        .unwrap()
+        .with_required_manifests(required)
+        .run_with_repair_subjects()
+        .await
+        .unwrap();
     assert!(
-        report
+        assigned
+            .report
             .issues
             .iter()
-            .any(|issue| issue.kind == super::DataScrubIssueKind::ReplicaIncomplete),
-        "metadata-only replica gaps should be reported as replica_incomplete, issues={:?}",
-        report.issues
+            .any(|issue| issue.kind == super::DataScrubIssueKind::ChunkMissing)
     );
     assert!(
-        !report
-            .issues
-            .iter()
-            .any(|issue| issue.kind == super::DataScrubIssueKind::ChunkMissing),
-        "metadata-only replica gaps should not be reported as chunk_missing, issues={:?}",
-        report.issues
+        !assigned.repair_subjects.is_empty(),
+        "an assigned but never hydrated replica must be repaired"
     );
 
     let _ = fs::remove_dir_all(source_root).await;
@@ -9513,9 +9524,9 @@ async fn data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_i
 }
 
 run_on_all_metadata_backends!(
-    data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_impl,
-    data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete,
-    data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_turso
+    data_scrub_only_requires_assigned_or_owned_chunks_impl,
+    data_scrub_only_requires_assigned_or_owned_chunks,
+    data_scrub_only_requires_assigned_or_owned_chunks_turso
 );
 
 async fn importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl(
@@ -10054,6 +10065,7 @@ async fn data_scrub_history_roundtrip_and_prune_impl(backend: StorageTestBackend
         finished_at_unix: 1_000,
         duration_ms: 100,
         summary: super::DataScrubReport {
+            chunks_not_required_locally: 0,
             current_keys_scanned: 1,
             version_indexes_scanned: 1,
             version_records_scanned: 1,
@@ -10084,6 +10096,7 @@ async fn data_scrub_history_roundtrip_and_prune_impl(backend: StorageTestBackend
         finished_at_unix: 2_000,
         duration_ms: 200,
         summary: super::DataScrubReport {
+            chunks_not_required_locally: 0,
             current_keys_scanned: 2,
             version_indexes_scanned: 2,
             version_records_scanned: 2,
@@ -12103,3 +12116,6 @@ run_on_all_metadata_backends!(
     media_labels_reject_a_sidecar_key,
     media_labels_reject_a_sidecar_key_turso
 );
+
+#[path = "retained_content_tests.rs"]
+mod retained_content_tests;
