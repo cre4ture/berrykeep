@@ -75,6 +75,9 @@ disabled. The background worker resumes tasks after restart without another scru
 Retries use capped exponential backoff (maximum one hour), not permanent abandonment when the
 legacy transfer retry budget is exhausted. A changed online source set or peer address allows
 an earlier retry; ordinary heartbeat timestamp changes do not defeat backoff.
+The legacy `max_retries` setting continues to bound legacy metadata-bundle transfer attempts;
+retained content uses its durable retry record instead, so a retained repair is never silently
+abandoned. Before each retained transfer, the existing foreground-load throttle is honored.
 
 A durable task pins its manifest and chunks. A shared GC gate serializes pin registration/release
 against cleanup snapshots; network waits do not hold that gate. Already recovered chunks remain

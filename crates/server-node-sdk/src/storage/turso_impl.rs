@@ -21,17 +21,18 @@ const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
 const DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT: usize = 1;
 
 use super::{
-    ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
-    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
-    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaCursorError, GalleryDeltaPage,
-    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, GalleryMapClusterEntriesQuery,
-    GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache,
-    HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY, HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
-    HistoryHeadProjectionBackfillState, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
-    ManualRepairActionRunRecord, MediaGpsCoordinates, MetadataDbLogicalProgress,
-    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
-    OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
+    ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT,
+    CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentObjectEntry,
+    CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
+    GALLERY_SIDECAR_GPS_BACKFILL_KEY, GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaCursorError,
+    GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery,
+    GalleryMapClusterEntriesQuery, GalleryMapClusterPage, GalleryMapClusterQuery,
+    GallerySummaryCache, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
+    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
+    METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
+    MediaGpsCoordinates, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
+    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
+    ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
     RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
     RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
     S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
@@ -504,9 +505,98 @@ impl MetadataStore for TursoMetadataStore {
         Ok(tasks)
     }
 
+    async fn load_content_repair_tasks_for_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<Vec<ContentRepairTask>> {
+        if manifest_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..manifest_hashes.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut rows = self
+            .connection
+            .query(
+                &format!(
+                    "SELECT task_json FROM content_repair_tasks \
+                     WHERE manifest_hash IN ({placeholders}) ORDER BY manifest_hash"
+                ),
+                params_from_iter(manifest_hashes.iter().cloned()),
+            )
+            .await?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next().await? {
+            tasks.push(serde_json::from_slice(&row_blob(
+                &row,
+                0,
+                "content_repair_tasks.task_json",
+            )?)?);
+        }
+        Ok(tasks)
+    }
+
+    async fn content_repair_task_hashes(&self) -> Result<Vec<String>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT manifest_hash FROM content_repair_tasks ORDER BY manifest_hash",
+                (),
+            )
+            .await?;
+        let mut hashes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            hashes.push(row_string(&row, 0, "content_repair_tasks.manifest_hash")?);
+        }
+        Ok(hashes)
+    }
+
+    async fn due_content_repair_task_hashes(
+        &self,
+        now_unix: u64,
+        source_fingerprint: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let now_unix = i64::try_from(now_unix).context("repair task due timestamp overflow")?;
+        let limit = i64::try_from(limit.max(1)).context("repair task query limit overflow")?;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT manifest_hash FROM content_repair_tasks
+                 WHERE next_attempt_unix <= ?1 OR source_fingerprint != ?2
+                 ORDER BY next_attempt_unix ASC, manifest_hash ASC
+                 LIMIT ?3",
+                (now_unix, source_fingerprint, limit),
+            )
+            .await?;
+        let mut hashes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            hashes.push(row_string(&row, 0, "content_repair_tasks.manifest_hash")?);
+        }
+        Ok(hashes)
+    }
+
     async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {
         let _writer = self.writer_lock.lock().await;
-        self.connection.execute("INSERT INTO content_repair_tasks (manifest_hash, task_json) VALUES (?1, ?2) ON CONFLICT(manifest_hash) DO UPDATE SET task_json=excluded.task_json", (task.reference.manifest_hash.as_str(), serde_json::to_vec(task)?)).await?;
+        self.connection
+            .execute(
+                "INSERT INTO content_repair_tasks (
+                 manifest_hash, next_attempt_unix, source_fingerprint, task_json
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(manifest_hash) DO UPDATE SET
+                 next_attempt_unix=excluded.next_attempt_unix,
+                 source_fingerprint=excluded.source_fingerprint,
+                 task_json=excluded.task_json",
+                (
+                    task.reference.manifest_hash.as_str(),
+                    i64::try_from(task.next_attempt_unix)
+                        .context("repair task timestamp overflow")?,
+                    task.source_fingerprint.as_str(),
+                    serde_json::to_vec(task)?,
+                ),
+            )
+            .await?;
         Ok(())
     }
 
@@ -3075,6 +3165,44 @@ pub(super) async fn add_column_if_missing(
     Ok(())
 }
 
+async fn backfill_content_repair_task_schedule(connection: &turso::Connection) -> Result<()> {
+    let mut rows = connection
+        .query(
+            "SELECT manifest_hash, task_json FROM content_repair_tasks
+             WHERE source_fingerprint = ?1",
+            (CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT,),
+        )
+        .await?;
+    let mut tasks = Vec::new();
+    while let Some(row) = rows.next().await? {
+        tasks.push((
+            row_string(&row, 0, "content_repair_tasks.manifest_hash")?,
+            serde_json::from_slice::<ContentRepairTask>(&row_blob(
+                &row,
+                1,
+                "content_repair_tasks.task_json",
+            )?)?,
+        ));
+    }
+    drop(rows);
+    for (manifest_hash, task) in tasks {
+        connection
+            .execute(
+                "UPDATE content_repair_tasks
+                 SET next_attempt_unix = ?1, source_fingerprint = ?2
+                 WHERE manifest_hash = ?3",
+                (
+                    i64::try_from(task.next_attempt_unix)
+                        .context("repair task backfill timestamp overflow")?,
+                    task.source_fingerprint.as_str(),
+                    manifest_hash.as_str(),
+                ),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn upsert_version_index_head_projection(
     connection: &turso::Connection,
     projection: &VersionIndexHeadProjection,
@@ -3242,6 +3370,8 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
 
             CREATE TABLE IF NOT EXISTS content_repair_tasks (
                 manifest_hash TEXT PRIMARY KEY,
+                next_attempt_unix INTEGER NOT NULL DEFAULT 0,
+                source_fingerprint TEXT NOT NULL DEFAULT '__legacy__',
                 task_json BLOB NOT NULL
             );
 
@@ -3477,6 +3607,28 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_operation_runs_status_finished
              ON operation_runs(status, finished_at_unix DESC, run_id DESC)",
+            (),
+        )
+        .await?;
+    add_column_if_missing(
+        connection,
+        "content_repair_tasks",
+        "next_attempt_unix",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        connection,
+        "content_repair_tasks",
+        "source_fingerprint",
+        "TEXT NOT NULL DEFAULT '__legacy__'",
+    )
+    .await?;
+    backfill_content_repair_task_schedule(connection).await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_due
+             ON content_repair_tasks(next_attempt_unix, source_fingerprint, manifest_hash)",
             (),
         )
         .await?;

@@ -21,14 +21,14 @@ use crate::operations::{OperationPriority, OperationProgress};
 use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 
 use super::{
-    ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
-    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
-    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
-    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange, GalleryDeltaCursorError,
-    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
-    GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery,
-    GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
+    ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT,
+    CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentObjectEntry,
+    CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
+    GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY, GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION,
+    GALLERY_SIDECAR_GPS_BACKFILL_KEY, GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange,
+    GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope,
+    GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage,
+    GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
     GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue, GallerySummaryMiss,
     GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
     GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
@@ -2549,13 +2549,93 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn load_content_repair_tasks_for_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<Vec<ContentRepairTask>> {
+        if manifest_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let hashes = manifest_hashes.to_vec();
+        self.read(move |db| {
+            let placeholders = std::iter::repeat_n("?", hashes.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let statement = format!(
+                "SELECT task_json FROM content_repair_tasks \
+                 WHERE manifest_hash IN ({placeholders}) ORDER BY manifest_hash"
+            );
+            let mut statement = db.prepare(&statement)?;
+            let mut rows = statement.query(params_from_iter(hashes.iter()))?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                tasks.push(serde_json::from_slice(&row.get::<_, Vec<u8>>(0)?)?);
+            }
+            Ok(tasks)
+        })
+        .await
+    }
+
+    async fn content_repair_task_hashes(&self) -> Result<Vec<String>> {
+        self.read(|db| {
+            let mut statement = db
+                .prepare("SELECT manifest_hash FROM content_repair_tasks ORDER BY manifest_hash")?;
+            let mut rows = statement.query([])?;
+            let mut hashes = Vec::new();
+            while let Some(row) = rows.next()? {
+                hashes.push(row.get(0)?);
+            }
+            Ok(hashes)
+        })
+        .await
+    }
+
+    async fn due_content_repair_task_hashes(
+        &self,
+        now_unix: u64,
+        source_fingerprint: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let now_unix = i64::try_from(now_unix).context("repair task due timestamp overflow")?;
+        let source_fingerprint = source_fingerprint.to_string();
+        let limit = i64::try_from(limit.max(1)).context("repair task query limit overflow")?;
+        self.read(move |db| {
+            let mut statement = db.prepare(
+                "SELECT manifest_hash FROM content_repair_tasks
+                 WHERE next_attempt_unix <= ?1 OR source_fingerprint != ?2
+                 ORDER BY next_attempt_unix ASC, manifest_hash ASC
+                 LIMIT ?3",
+            )?;
+            let mut rows = statement.query(params![now_unix, source_fingerprint, limit])?;
+            let mut hashes = Vec::new();
+            while let Some(row) = rows.next()? {
+                hashes.push(row.get(0)?);
+            }
+            Ok(hashes)
+        })
+        .await
+    }
+
     async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {
         let hash = task.reference.manifest_hash.clone();
+        let next_attempt_unix =
+            i64::try_from(task.next_attempt_unix).context("repair task timestamp overflow")?;
+        let source_fingerprint = task.source_fingerprint.clone();
         let payload = serde_json::to_vec(task)?;
         self.write_tx(move |db| {
-            db.execute("INSERT INTO content_repair_tasks (manifest_hash, task_json) VALUES (?1, ?2) ON CONFLICT(manifest_hash) DO UPDATE SET task_json=excluded.task_json", params![hash, payload])?;
+            db.execute(
+                "INSERT INTO content_repair_tasks (
+                     manifest_hash, next_attempt_unix, source_fingerprint, task_json
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(manifest_hash) DO UPDATE SET
+                     next_attempt_unix=excluded.next_attempt_unix,
+                     source_fingerprint=excluded.source_fingerprint,
+                     task_json=excluded.task_json",
+                params![hash, next_attempt_unix, source_fingerprint, payload],
+            )?;
             Ok(())
-        }).await
+        })
+        .await
     }
 
     async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()> {
@@ -5372,6 +5452,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS content_repair_tasks (
             manifest_hash TEXT PRIMARY KEY,
+            next_attempt_unix INTEGER NOT NULL DEFAULT 0,
+            source_fingerprint TEXT NOT NULL DEFAULT '__legacy__',
             task_json BLOB NOT NULL
         );
 
@@ -5691,6 +5773,24 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             return Err(err).context("failed to migrate sqlite s3_access_keys.allow_manage");
         }
     }
+    add_sqlite_column_if_missing(
+        db,
+        "content_repair_tasks",
+        "next_attempt_unix",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_sqlite_column_if_missing(
+        db,
+        "content_repair_tasks",
+        "source_fingerprint",
+        "TEXT NOT NULL DEFAULT '__legacy__'",
+    )?;
+    backfill_content_repair_task_schedule(db)?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_due
+         ON content_repair_tasks(next_attempt_unix, source_fingerprint, manifest_hash)",
+        [],
+    )?;
 
     let stored_version = db
         .query_row(
@@ -5740,6 +5840,38 @@ fn add_sqlite_column_if_missing(
         && !err.to_string().contains("duplicate column name")
     {
         return Err(err).with_context(|| format!("failed to add {table}.{column}"));
+    }
+    Ok(())
+}
+
+fn backfill_content_repair_task_schedule(db: &Connection) -> Result<()> {
+    let tasks = {
+        let mut statement = db.prepare(
+            "SELECT manifest_hash, task_json FROM content_repair_tasks
+             WHERE source_fingerprint = ?1",
+        )?;
+        let mut rows = statement.query([CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT])?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next()? {
+            tasks.push((
+                row.get::<_, String>(0)?,
+                serde_json::from_slice::<ContentRepairTask>(&row.get::<_, Vec<u8>>(1)?)?,
+            ));
+        }
+        tasks
+    };
+    for (manifest_hash, task) in tasks {
+        db.execute(
+            "UPDATE content_repair_tasks
+             SET next_attempt_unix = ?1, source_fingerprint = ?2
+             WHERE manifest_hash = ?3",
+            params![
+                i64::try_from(task.next_attempt_unix)
+                    .context("repair task backfill timestamp overflow")?,
+                task.source_fingerprint,
+                manifest_hash,
+            ],
+        )?;
     }
     Ok(())
 }
