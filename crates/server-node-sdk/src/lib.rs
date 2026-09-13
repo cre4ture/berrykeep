@@ -278,8 +278,8 @@ use storage::{
     ClientCredentialRecord, ClientCredentialState, CurrentObjectsCacheStats, DataChangeAction,
     DataChangeActorKind, DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery,
     DataChangeUploadMode, DataScrubReport, HistoryHeadProjectionBackfillState,
-    HostDependencyReport, HostDependencyStatus, MediaCacheLookup, MediaCacheStatus,
-    MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
+    HostDependencyReport, HostDependencySeverity, HostDependencyStatus, MediaCacheLookup,
+    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, ObjectVersionMetadataRecord,
     PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
@@ -13389,7 +13389,10 @@ async fn host_dependency_status(
     let missing_count = report
         .checks
         .iter()
-        .filter(|check| check.status == HostDependencyStatus::Missing)
+        .filter(|check| {
+            check.status == HostDependencyStatus::Missing
+                && check.severity != HostDependencySeverity::Info
+        })
         .count();
 
     append_admin_audit(

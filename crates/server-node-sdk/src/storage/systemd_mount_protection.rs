@@ -893,9 +893,13 @@ fn checks_for_inspection(
             .iter()
             .map(|target| {
                 let expected_host_mount = expected_host_mount_point(target, &host_mount_points);
-                let target_is_on_expected_host_mount = expected_host_mount
-                    .map(|mount_point| target.mount_point.as_deref() == Some(mount_point.as_path()))
-                    .unwrap_or(true);
+                let target_is_on_expected_host_mount = match (
+                    target.mount_point.as_deref(),
+                    expected_host_mount.map(PathBuf::as_path),
+                ) {
+                    (Some(actual), Some(expected)) => actual == expected,
+                    _ => true,
+                };
                 let protecting_mount = (!target.path_resolution_failed
                     && target_is_on_expected_host_mount)
                     .then(|| protecting_mount_dependency(target, &mounts))
