@@ -955,9 +955,26 @@ fn checks_for_inspection(
                     (Some(actual), Some(expected)) => actual.starts_with(expected),
                     _ => true,
                 };
+                let can_use_backing_mount_dependency = match (
+                    target.mount_point.as_deref(),
+                    expected_host_mount.map(PathBuf::as_path),
+                ) {
+                    // A host bind mount has its own loaded mount unit. Its backing
+                    // filesystem cannot protect the target when that bind mount fails.
+                    (Some(actual), Some(expected)) => actual != expected,
+                    // A bind mount created inside the service namespace has no host
+                    // mount unit at its target, so its backing source is authoritative.
+                    _ => true,
+                };
                 let protecting_mount = (target.path_resolution_error.is_none()
                     && target_is_on_expected_host_mount)
-                    .then(|| protecting_mount_dependency(target, &mounts))
+                    .then(|| {
+                        protecting_mount_dependency(
+                            target,
+                            &mounts,
+                            can_use_backing_mount_dependency,
+                        )
+                    })
                     .flatten();
                 match protecting_mount {
                     Some(mount) => HostDependencyCheck {
@@ -1096,12 +1113,16 @@ fn checks_for_inspection(
 fn protecting_mount_dependency<'a>(
     target: &MountProtectionTarget,
     mounts: &'a [SystemdMountDependency],
+    can_use_backing_mount_dependency: bool,
 ) -> Option<&'a SystemdMountDependency> {
     match target.mount_point.as_deref() {
         Some(mount_point) if mount_point == Path::new("/") => None,
         Some(mount_point) => {
             let direct_mount = mounts.iter().find(|mount| mount.where_path == mount_point);
-            if direct_mount.is_some() || !target.mount_point_is_bind {
+            if direct_mount.is_some()
+                || !target.mount_point_is_bind
+                || !can_use_backing_mount_dependency
+            {
                 return direct_mount;
             }
             target
@@ -1659,6 +1680,30 @@ mod tests {
             ),
         );
         assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+    }
+
+    #[test]
+    fn host_bind_mount_cannot_use_its_backing_source_dependency() {
+        let target = MountProtectionTarget {
+            id: "systemd-mount-data-dir".to_string(),
+            feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+            path: PathBuf::from("/srv/berrykeep"),
+            mount_point: Some(PathBuf::from("/srv/berrykeep")),
+            mount_point_is_bind: true,
+            backing_mount_points: vec![PathBuf::from("/mnt/data")],
+            path_resolution_error: None,
+            missing_severity: HostDependencySeverity::Critical,
+        };
+        let checks = checks_for_inspection(
+            &[target],
+            dependencies_with_host_mount_points(
+                vec![systemd_mount("mnt-data.mount", "/mnt/data")],
+                &["/srv/berrykeep", "/mnt/data"],
+            ),
+        );
+
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Critical);
     }
 
     #[test]
