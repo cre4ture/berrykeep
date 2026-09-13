@@ -3560,17 +3560,12 @@ function buildAdminStoreIndexResponse(
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
   const view = searchParams.get("view");
-  const isDirectoryNavigationRequest =
-    ["tree", "children"].includes(view ?? "") &&
-    !searchParams.has("offset") &&
-    !searchParams.has("limit") &&
-    !searchParams.has("sort") &&
-    !mediaFilter;
-  const scopedEntries = isDirectoryNavigationRequest
-    ? view === "children"
+  const scopedEntries =
+    view === "children"
       ? projectMockStoreChildrenEntries(entries, prefix, depth)
-      : projectMockStoreTreeEntries(entries, prefix, depth)
-    : filterMockStoreEntriesToPrefix(entries, prefix);
+      : view === "tree"
+        ? projectMockStoreTreeEntries(entries, prefix, depth)
+        : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter
     ? scopedEntries.filter((entry) => matchesAdminMediaFilter(entry, mediaFilter))
     : scopedEntries;

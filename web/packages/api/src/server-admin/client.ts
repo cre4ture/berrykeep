@@ -1,7 +1,9 @@
-import { HttpError, fetchJson, isHttpErrorStatus } from "../shared/http";
+import { fetchJson, isHttpErrorStatus } from "../shared/http";
 import {
   galleryMapClusterCellSizeParameter,
-  galleryMapClusterZoomParameters
+  galleryMapClusterZoomParameters,
+  projectStoreIndexChildren,
+  storeIndexViewWasRejected
 } from "../shared/store-index";
 import type {
   GalleryMapClusterEntriesResponse,
@@ -381,18 +383,8 @@ export async function listAdminStoreEntries(
       "tree",
       false
     );
-    return projectAdminStoreIndexChildren(treeResponse, prefix, options);
+    return projectStoreIndexChildren(treeResponse, prefix, options);
   }
-}
-
-function storeIndexViewWasRejected(error: unknown, requestedView: StoreListView): boolean {
-  if (!(error instanceof HttpError) || error.status !== 400) {
-    return false;
-  }
-
-  const payload =
-    typeof error.payload === "string" ? error.payload : JSON.stringify(error.payload ?? null);
-  return payload.includes("unknown variant") && payload.includes(requestedView);
 }
 
 async function fetchAdminStoreEntries(
@@ -453,60 +445,6 @@ async function fetchAdminStoreEntries(
   return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
     adminTokenOverride
   });
-}
-
-function projectAdminStoreIndexChildren(
-  response: AdminStoreListResponse,
-  prefix: string | undefined,
-  options: StoreListRequestOptions
-): AdminStoreListResponse {
-  const normalizedPrefix = prefix ? normalizeStoreIndexPath(prefix) : "";
-  const entries = normalizedPrefix
-    ? response.entries.filter(
-        (entry) => normalizeStoreIndexPath(entry.path) !== normalizedPrefix
-      )
-    : response.entries;
-  const totalEntryCount = entries.length;
-  const offset = normalizedStoreIndexOffset(options.offset);
-  const limit = normalizedStoreIndexLimit(options.limit);
-  const pageEnd = limit === null ? totalEntryCount : Math.min(totalEntryCount, offset + limit);
-  const pageEntries = entries.slice(offset, pageEnd);
-
-  return {
-    ...response,
-    entries: pageEntries,
-    entry_count: pageEntries.length,
-    total_entry_count: totalEntryCount,
-    offset,
-    limit,
-    has_more: pageEnd < totalEntryCount,
-    next_cursor: null
-  };
-}
-
-function normalizeStoreIndexPath(path: string): string {
-  const trimmed = path.trim();
-  let start = 0;
-  let end = trimmed.length;
-  while (start < end && trimmed.charCodeAt(start) === 47) {
-    start += 1;
-  }
-  while (end > start && trimmed.charCodeAt(end - 1) === 47) {
-    end -= 1;
-  }
-  return trimmed.slice(start, end);
-}
-
-function normalizedStoreIndexOffset(offset: number | undefined): number {
-  return typeof offset === "number" && Number.isFinite(offset) && offset >= 0
-    ? Math.floor(offset)
-    : 0;
-}
-
-function normalizedStoreIndexLimit(limit: number | undefined): number | null {
-  return typeof limit === "number" && Number.isFinite(limit) && limit > 0
-    ? Math.max(1, Math.floor(limit))
-    : null;
 }
 
 export async function listAdminStoreHistoryEntries(
