@@ -251,7 +251,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
         };
     }
 
-    let Some(systemctl) = resolve_host_dependency_path(Path::new("systemctl")) else {
+    let Some(systemctl) = resolve_mount_protection_tool(Path::new("systemctl")).await else {
         return SystemdMountProtectionInspection::SystemctlMissing {
             service: service.name,
         };
@@ -737,7 +737,7 @@ struct ResolvedMountProtectionPath {
 
 #[cfg(any(target_os = "linux", test))]
 async fn usable_path_canonicalizer() -> Result<PathBuf, String> {
-    let Some(canonicalizer) = resolve_host_dependency_path(Path::new("readlink")) else {
+    let Some(canonicalizer) = resolve_mount_protection_tool(Path::new("readlink")).await else {
         return Err("the `readlink` program is unavailable".to_string());
     };
     let resolved_root = resolve_mount_protection_path(Path::new("/"), &canonicalizer).await;
@@ -748,6 +748,18 @@ async fn usable_path_canonicalizer() -> Result<PathBuf, String> {
         )),
         None => Ok(canonicalizer),
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+async fn resolve_mount_protection_tool(configured_path: &Path) -> Option<PathBuf> {
+    // Searching PATH uses synchronous filesystem metadata probes. Keep those
+    // probes off the async runtime because an unavailable network-backed PATH
+    // entry can otherwise stall a Tokio worker.
+    let configured_path = configured_path.to_path_buf();
+    tokio::task::spawn_blocking(move || resolve_host_dependency_path(&configured_path))
+        .await
+        .ok()
+        .flatten()
 }
 
 #[cfg(any(target_os = "linux", test))]
