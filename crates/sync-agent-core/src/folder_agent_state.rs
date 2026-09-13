@@ -1025,12 +1025,29 @@ pub fn cleanup_berrykeep_part_files(root_dir: &Path, dry_run: bool) -> Result<us
 }
 
 pub fn conflict_copy_dir(root_dir: &Path, side: &str, relative_path: &str) -> PathBuf {
+    conflict_copy_dir_in_root(root_dir, ".berrykeep-conflicts", side, relative_path)
+}
+
+fn legacy_conflict_copy_dir(root_dir: &Path, side: &str, relative_path: &str) -> PathBuf {
+    conflict_copy_dir_in_root(root_dir, ".ironmesh-conflicts", side, relative_path)
+}
+
+fn conflict_copy_dir_in_root(
+    root_dir: &Path,
+    conflict_root_name: &str,
+    side: &str,
+    relative_path: &str,
+) -> PathBuf {
     let rel = Path::new(relative_path);
     let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-    root_dir
-        .join(".berrykeep-conflicts")
-        .join(side)
-        .join(parent)
+    root_dir.join(conflict_root_name).join(side).join(parent)
+}
+
+fn conflict_copy_dirs(root_dir: &Path, side: &str, relative_path: &str) -> [PathBuf; 2] {
+    [
+        conflict_copy_dir(root_dir, side, relative_path),
+        legacy_conflict_copy_dir(root_dir, side, relative_path),
+    ]
 }
 
 pub fn newest_remote_conflict_copy(root_dir: &Path, relative_path: &str) -> Result<PathBuf> {
@@ -1039,39 +1056,44 @@ pub fn newest_remote_conflict_copy(root_dir: &Path, relative_path: &str) -> Resu
         bail!("conflicts: invalid path (expected file): {relative_path}");
     };
 
-    let dir = conflict_copy_dir(root_dir, "remote", relative_path);
-    if !dir.is_dir() {
+    let dirs = conflict_copy_dirs(root_dir, "remote", relative_path);
+    if !dirs.iter().any(|dir| dir.is_dir()) {
         bail!(
-            "conflicts: no remote conflict copies found for {relative_path} (missing directory {})",
-            dir.display()
+            "conflicts: no remote conflict copies found for {relative_path} (missing directories {} and {})",
+            dirs[0].display(),
+            dirs[1].display(),
         );
     }
 
     let prefix = format!("{file_name}.remote-conflict-");
     let mut best: Option<(u128, PathBuf)> = None;
 
-    for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
+    for dir in dirs.iter().filter(|dir| dir.is_dir()) {
+        for entry in
+            fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
 
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
 
-        let Some(rest) = name.strip_prefix(prefix.as_str()) else {
-            continue;
-        };
-        let Ok(timestamp) = rest.parse::<u128>() else {
-            continue;
-        };
+            let Some(rest) = name.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            let Ok(timestamp) = rest.parse::<u128>() else {
+                continue;
+            };
 
-        match &best {
-            None => best = Some((timestamp, path)),
-            Some((best_ts, _)) if timestamp > *best_ts => best = Some((timestamp, path)),
-            _ => {}
+            match &best {
+                None => best = Some((timestamp, path)),
+                Some((best_ts, _)) if timestamp > *best_ts => best = Some((timestamp, path)),
+                _ => {}
+            }
         }
     }
 
@@ -1091,27 +1113,28 @@ pub fn delete_conflict_copies(root_dir: &Path, relative_path: &str) -> Result<us
         ("remote", format!("{file_name}.remote-conflict-")),
         ("local", format!("{file_name}.local-conflict-")),
     ] {
-        let dir = conflict_copy_dir(root_dir, side, relative_path);
-        if !dir.is_dir() {
-            continue;
-        }
+        for dir in conflict_copy_dirs(root_dir, side, relative_path) {
+            if !dir.is_dir() {
+                continue;
+            }
 
-        for entry in
-            fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if !name.starts_with(prefix.as_str()) {
-                continue;
-            }
-            if fs::remove_file(&path).is_ok() {
-                removed += 1;
+            for entry in
+                fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with(prefix.as_str()) {
+                    continue;
+                }
+                if fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
             }
         }
     }
@@ -1574,21 +1597,48 @@ mod tests {
     }
 
     #[test]
+    fn newest_remote_conflict_copy_reads_legacy_conflict_root() {
+        let root = test_root();
+        let remote_dir = legacy_conflict_copy_dir(&root, "remote", "docs/report.txt");
+        fs::create_dir_all(&remote_dir).unwrap();
+        let legacy = remote_dir.join("report.txt.remote-conflict-100");
+        fs::write(&legacy, b"legacy").unwrap();
+
+        let selected = newest_remote_conflict_copy(&root, "docs/report.txt").unwrap();
+
+        assert_eq!(selected, legacy);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn delete_conflict_copies_removes_matching_local_and_remote_backups_only() {
         let root = test_root();
         let remote_dir = conflict_copy_dir(&root, "remote", "docs/report.txt");
         let local_dir = conflict_copy_dir(&root, "local", "docs/report.txt");
+        let legacy_remote_dir = legacy_conflict_copy_dir(&root, "remote", "docs/report.txt");
         fs::create_dir_all(&remote_dir).unwrap();
         fs::create_dir_all(&local_dir).unwrap();
+        fs::create_dir_all(&legacy_remote_dir).unwrap();
         fs::write(remote_dir.join("report.txt.remote-conflict-100"), b"remote").unwrap();
         fs::write(local_dir.join("report.txt.local-conflict-200"), b"local").unwrap();
+        fs::write(
+            legacy_remote_dir.join("report.txt.remote-conflict-300"),
+            b"legacy remote",
+        )
+        .unwrap();
         fs::write(remote_dir.join("other.txt.remote-conflict-300"), b"keep").unwrap();
 
         let removed = delete_conflict_copies(&root, "docs/report.txt").unwrap();
 
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         assert!(!remote_dir.join("report.txt.remote-conflict-100").exists());
         assert!(!local_dir.join("report.txt.local-conflict-200").exists());
+        assert!(
+            !legacy_remote_dir
+                .join("report.txt.remote-conflict-300")
+                .exists()
+        );
         assert!(remote_dir.join("other.txt.remote-conflict-300").exists());
 
         fs::remove_dir_all(root).unwrap();

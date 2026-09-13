@@ -328,8 +328,12 @@ fi
 
 # The legacy endpoint continues to serve the same signing key under its former
 # filename so existing signed-by and key-download instructions remain valid.
-cp -f "${REPO_DIR}/berrykeep-archive-keyring.asc" \
-  "${REPO_DIR}/ironmesh-archive-keyring.asc"
+if [[ "${DRY_RUN}" == true ]]; then
+  log "would prepare the legacy archive signing-key filename"
+else
+  cp -f "${REPO_DIR}/berrykeep-archive-keyring.asc" \
+    "${REPO_DIR}/ironmesh-archive-keyring.asc"
+fi
 
 for suite in "${SUITES[@]}"; do
   if [[ ! -f "${REPO_DIR}/dists/${suite}/InRelease" ]]; then
@@ -402,7 +406,7 @@ ensure_remote_suite_directories() {
   local target_dists_dir="${target_dir%/}/dists"
   local suite remote_suite_dir
 
-  [[ "${DRY_RUN}" == false ]] || return
+  [[ "${DRY_RUN}" == false ]] || return 0
   for suite in "${SUITES[@]}"; do
     remote_suite_dir="${target_dists_dir}/${suite}"
     log "ensuring ${repository_label} mirror ${REMOTE}:${target_dir}/dists/${suite} exists"

@@ -837,7 +837,7 @@ pub fn migrate_legacy_state_paths() -> Result<()> {
             &current_state_dir,
         )?;
         migrate_legacy_state_directory(
-            &local_appdata_root().join(LEGACY_WINDOWS_CONFIG_SUBDIR),
+            &local_appdata_base_dir().join(LEGACY_WINDOWS_CONFIG_SUBDIR),
             &current_state_dir,
         )?;
     }
@@ -1527,7 +1527,7 @@ fn is_windows_apps_package_root(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn windows_app_execution_alias_path(executable_name: &str) -> Option<PathBuf> {
-    common::legacy_compatibility::var_os("LOCALAPPDATA")
+    std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|path| {
@@ -1687,6 +1687,10 @@ fn migrate_legacy_state_directory(legacy_path: &Path, current_path: &Path) -> Re
 fn migrate_legacy_state_entry(source: &Path, target: &Path) -> Result<()> {
     if !target.exists() {
         return move_or_copy_state_path(source, target);
+    }
+
+    if source.is_dir() && target.is_dir() {
+        return migrate_legacy_state_directory(source, target);
     }
 
     if source.is_file()
@@ -1992,11 +1996,14 @@ mod tests {
         let current_dir = root.join("current");
         let legacy_instance_store = legacy_dir.join(INSTANCE_STORE_FILE_NAME);
         let legacy_log = legacy_dir.join("logs").join("folder-agent.log");
+        let current_log = current_dir.join("logs").join("launcher.log");
         let current_report = current_dir.join(LAST_LAUNCH_REPORT_FILE_NAME);
 
         std::fs::create_dir_all(legacy_log.parent().expect("log should have a parent"))
             .expect("legacy log directory should create");
         std::fs::create_dir_all(&current_dir).expect("current state directory should create");
+        std::fs::create_dir_all(current_log.parent().expect("log should have a parent"))
+            .expect("current log directory should create");
         std::fs::write(
             &legacy_instance_store,
             r#"{
@@ -2018,6 +2025,7 @@ mod tests {
         )
         .expect("current instance store should write");
         std::fs::write(&legacy_log, "legacy log").expect("legacy log should write");
+        std::fs::write(&current_log, "current log").expect("current log should write");
         std::fs::write(&current_report, "current report").expect("current report should write");
 
         migrate_legacy_state_directory(&legacy_dir, &current_dir)
@@ -2047,6 +2055,10 @@ mod tests {
             std::fs::read_to_string(current_dir.join("logs").join("folder-agent.log"))
                 .expect("migrated log should read"),
             "legacy log"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&current_log).expect("current log should still read"),
+            "current log"
         );
         assert_eq!(
             std::fs::read_to_string(&current_report).expect("current report should still read"),

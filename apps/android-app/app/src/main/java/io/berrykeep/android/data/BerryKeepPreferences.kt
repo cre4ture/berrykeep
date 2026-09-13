@@ -56,6 +56,11 @@ object BerryKeepPreferences {
     private fun legacyDeviceAuthPrefs(context: Context) =
         context.getSharedPreferences(LEGACY_DEVICE_AUTH_PREFS_NAME, Context.MODE_PRIVATE)
 
+    private fun legacyAppPreferenceStores(context: Context) = listOf(
+        legacyAppPrefs(context),
+        legacyDeviceAuthPrefs(context),
+    )
+
     private fun deviceAuthPersistence(context: Context): DeviceAuthStatePersistence {
         deviceAuthPersistence?.let { return it }
         return synchronized(this) {
@@ -78,12 +83,14 @@ object BerryKeepPreferences {
         key: String,
     ): String? {
         appPrefs(context).getString(key, null)?.let { return it }
-        val legacyPrefs = legacyAppPrefs(context)
-        val legacyValue = legacyPrefs.getString(key, null) ?: return null
-        if (appPrefs(context).edit().putString(key, legacyValue).commit()) {
-            legacyPrefs.edit().remove(key).apply()
+        for (legacyPrefs in legacyAppPreferenceStores(context)) {
+            val legacyValue = legacyPrefs.getString(key, null) ?: continue
+            if (appPrefs(context).edit().putString(key, legacyValue).commit()) {
+                legacyPrefs.edit().remove(key).apply()
+            }
+            return legacyValue
         }
-        return legacyValue
+        return null
     }
 
     private fun writeAppPreference(
@@ -98,7 +105,9 @@ object BerryKeepPreferences {
             editor.putString(key, value)
         }
         editor.apply()
-        legacyAppPrefs(context).edit().remove(key).apply()
+        legacyAppPreferenceStores(context).forEach { legacyPrefs ->
+            legacyPrefs.edit().remove(key).apply()
+        }
     }
 
     fun getFolderSyncConfigs(context: Context): List<FolderSyncConfig> {
