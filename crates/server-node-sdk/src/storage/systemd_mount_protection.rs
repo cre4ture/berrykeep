@@ -1,6 +1,8 @@
 #[cfg(any(target_os = "linux", test))]
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "linux", test))]
+use std::path::{Component, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
 #[cfg(target_os = "linux")]
@@ -11,10 +13,12 @@ use tokio::process::Command;
 #[cfg(target_os = "linux")]
 use tokio::time::timeout;
 
+use super::StoragePathConfig;
+#[cfg(any(target_os = "linux", test))]
+use super::StoragePathState;
 #[cfg(target_os = "linux")]
 use super::media_tools::resolve_host_dependency_path;
 use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDependencyStatus};
-use super::{StoragePathConfig, StoragePathState};
 
 #[cfg(target_os = "linux")]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,6 +63,7 @@ enum SystemdServiceManager {
     User,
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone)]
 struct MountProtectionTarget {
     id: String,
@@ -70,6 +75,37 @@ struct MountProtectionTarget {
 }
 
 pub(super) async fn mount_protection_checks(
+    data_dir: &Path,
+    storage_paths: &[StoragePathConfig],
+) -> Vec<HostDependencyCheck> {
+    #[cfg(any(target_os = "linux", test))]
+    {
+        return mount_protection_checks_for_current_process(data_dir, storage_paths).await;
+    }
+
+    #[cfg(not(any(target_os = "linux", test)))]
+    {
+        let _ = (data_dir, storage_paths);
+        vec![not_managed_by_systemd_check()]
+    }
+}
+
+fn not_managed_by_systemd_check() -> HostDependencyCheck {
+    HostDependencyCheck {
+        id: "systemd-mount-protection".to_string(),
+        feature: "Systemd mount protection".to_string(),
+        status: HostDependencyStatus::NotApplicable,
+        severity: HostDependencySeverity::Info,
+        summary: "This server process is not managed by a systemd service".to_string(),
+        detail: "Mount protection is checked only for a BerryKeep server node running inside a systemd service cgroup. The availability of Linux or systemctl alone does not make this check applicable.".to_string(),
+        configured_path: None,
+        resolved_path: None,
+        install_hint: None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+async fn mount_protection_checks_for_current_process(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
 ) -> Vec<HostDependencyCheck> {
@@ -147,7 +183,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), test))]
 async fn inspect_current_process() -> SystemdMountProtectionInspection {
     SystemdMountProtectionInspection::NotManagedBySystemd
 }
@@ -360,6 +396,7 @@ fn finish_mount_dependency(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn mount_protection_targets(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
@@ -401,10 +438,12 @@ fn mount_protection_targets(
     targets
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn resolved_mount_protection_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| absolutize_mount_protection_path(path))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn absolutize_mount_protection_path(path: &Path) -> PathBuf {
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -428,6 +467,7 @@ fn absolutize_mount_protection_path(path: &Path) -> PathBuf {
     normalized
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn path_is_on_root_filesystem(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -481,6 +521,7 @@ fn mount_point_for_path(path: &Path, mount_points: &[PathBuf]) -> Option<PathBuf
         .cloned()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn storage_path_state_label(state: StoragePathState) -> &'static str {
     match state {
         StoragePathState::Active => "active",
@@ -489,23 +530,14 @@ fn storage_path_state_label(state: StoragePathState) -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn checks_for_inspection(
     targets: &[MountProtectionTarget],
     inspection: SystemdMountProtectionInspection,
 ) -> Vec<HostDependencyCheck> {
     match inspection {
         SystemdMountProtectionInspection::NotManagedBySystemd => {
-            vec![HostDependencyCheck {
-                id: "systemd-mount-protection".to_string(),
-                feature: "Systemd mount protection".to_string(),
-                status: HostDependencyStatus::NotApplicable,
-                severity: HostDependencySeverity::Info,
-                summary: "This server process is not managed by a systemd service".to_string(),
-                detail: "Mount protection is checked only for a BerryKeep server node running inside a systemd service cgroup. The availability of Linux or systemctl alone does not make this check applicable.".to_string(),
-                configured_path: None,
-                resolved_path: None,
-                install_hint: None,
-            }]
+            vec![not_managed_by_systemd_check()]
         }
         #[cfg(target_os = "linux")]
         SystemdMountProtectionInspection::SystemctlMissing { service } => {
