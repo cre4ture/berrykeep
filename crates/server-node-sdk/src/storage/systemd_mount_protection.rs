@@ -155,6 +155,17 @@ async fn cached_mount_protection_checks(
         storage_paths: storage_paths.to_vec(),
     };
     let cache = MOUNT_PROTECTION_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    {
+        let cache = cache.lock().await;
+        if let Some(entry) = cache.as_ref()
+            && entry.key == key
+            && entry.checked_at.elapsed() <= MOUNT_PROTECTION_CACHE_TTL
+        {
+            return entry.checks.clone();
+        }
+    }
+
+    let checks = mount_protection_checks_for_current_process(data_dir, storage_paths).await;
     let mut cache = cache.lock().await;
     if let Some(entry) = cache.as_ref()
         && entry.key == key
@@ -162,8 +173,6 @@ async fn cached_mount_protection_checks(
     {
         return entry.checks.clone();
     }
-
-    let checks = mount_protection_checks_for_current_process(data_dir, storage_paths).await;
     *cache = Some(MountProtectionCacheEntry {
         key,
         checked_at: Instant::now(),
@@ -488,22 +497,17 @@ fn mount_dependencies_from_properties(
         }
     }
 
-    if dependencies.len() != expected_units.len() {
-        return Err("systemctl did not report every requested mount unit".to_string());
-    }
-
-    mount_units
+    Ok(mount_units
         .iter()
-        .map(|unit| {
+        .filter_map(|unit| {
             dependencies
                 .remove(unit)
                 .map(|where_path| SystemdMountDependency {
                     unit: unit.clone(),
                     where_path,
                 })
-                .ok_or_else(|| format!("systemctl did not report mount unit `{unit}`"))
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -592,11 +596,11 @@ fn finish_mount_dependency(
     let Some(where_path) = where_path.take() else {
         return Err(format!("systemctl did not report Where for `{unit}`"));
     };
-    if where_path.as_os_str().is_empty() || where_path == Path::new("-") {
-        return Err(format!("systemctl reported an invalid Where for `{unit}`"));
-    }
     if !expected_units.contains(&unit) {
         return Err(format!("systemctl reported unexpected mount unit `{unit}`"));
+    }
+    if where_path.as_os_str().is_empty() || where_path == Path::new("-") {
+        return Ok(());
     }
     if dependencies.insert(unit.clone(), where_path).is_some() {
         return Err(format!("systemctl reported `{unit}` more than once"));
@@ -1557,6 +1561,23 @@ mod tests {
                 systemd_mount("mnt-primary.mount", "/mnt/primary"),
                 systemd_mount("mnt-archive.mount", "/mnt/archive"),
             ]
+        );
+    }
+
+    #[test]
+    fn unavailable_mount_units_are_ignored_without_discarding_other_dependencies() {
+        let mounts = mount_dependencies_from_properties(
+            &[
+                "mnt-gone.mount".to_string(),
+                "mnt-primary.mount".to_string(),
+            ],
+            "Id=mnt-gone.mount\nWhere=\n\nId=mnt-primary.mount\nWhere=/mnt/primary\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            mounts,
+            vec![systemd_mount("mnt-primary.mount", "/mnt/primary")]
         );
     }
 
