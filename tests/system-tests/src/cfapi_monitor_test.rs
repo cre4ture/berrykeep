@@ -2317,6 +2317,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cfapi_remote_file_rename_keeps_never_hydrated_placeholder_cold() {
+        let sync_root = fresh_data_dir("cfapi-server-file-rename-cold-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture = start_authenticated_cfapi_fixture(
+            "127.0.0.1:19158",
+            &sync_root,
+            "cfapi-server-file-rename-cold",
+        )
+        .await
+        .expect("failed to start authenticated CFAPI fixture");
+        let old_key = "remote-file-move/original.bin";
+        let new_key = "remote-file-move/renamed.bin";
+        let payload = vec![b'r'; 3 * 1024 * 1024];
+        fixture
+            .sdk
+            .put_large_aware(old_key, Bytes::from(payload))
+            .await
+            .expect("failed to seed remote file");
+        let old_versions = fixture
+            .sdk
+            .list_versions(old_key)
+            .await
+            .expect("failed to fetch original version graph")
+            .expect("original object should have a version graph");
+
+        let _adapter = start_cfapi_adapter_with_bootstrap(
+            "ironmesh.systemtest.remote.file.rename.cold",
+            "ironmesh System Test Remote Cold File Rename",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+        let old_path = sync_root.join(old_key.replace('/', "\\"));
+        let new_path = sync_root.join(new_key.replace('/', "\\"));
+        wait_for_path(&old_path, 220).await;
+        wait_for_placeholder_in_sync(&old_path, 220).await;
+        request_online_only_via_attrib(&old_path)
+            .expect("failed to request online-only state before remote rename");
+        wait_for_file_attribute_unpinned(&old_path, 220).await;
+        wait_for_placeholder_dehydrated(&old_path, 220).await;
+
+        fixture
+            .sdk
+            .rename_path(old_key, new_key, false)
+            .await
+            .expect("failed to rename remote file");
+        wait_for_path(&new_path, 260).await;
+        assert_placeholder_stays_dehydrated(
+            &new_path,
+            Duration::from_secs(8),
+            Duration::from_millis(50),
+        )
+        .await;
+        wait_for_path_absence(&old_path, 260).await;
+        wait_for_placeholder_in_sync(&new_path, 220).await;
+        let new_versions = fixture
+            .sdk
+            .list_versions(new_key)
+            .await
+            .expect("failed to fetch renamed version graph")
+            .expect("renamed object should have a version graph");
+        assert_eq!(new_versions.object_id, old_versions.object_id);
+
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
+    #[tokio::test]
     async fn test_cfapi_remote_folder_rename_refresh_does_not_resurrect_original() {
         run_cfapi_remote_folder_rename_refresh_case("127.0.0.1:19156").await;
     }
