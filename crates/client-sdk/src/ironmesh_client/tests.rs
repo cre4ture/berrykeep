@@ -171,6 +171,118 @@ async fn store_index_children_retries_the_tree_view_on_an_older_node() {
     server.abort();
 }
 
+#[tokio::test]
+async fn store_index_children_does_not_retry_unrelated_bad_requests() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose its address");
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let route_queries = Arc::clone(&queries);
+    let router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let route_queries = Arc::clone(&route_queries);
+            async move {
+                route_queries.lock().await.push(query.unwrap_or_default());
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "label filters are unavailable with cursor pagination"
+                    })),
+                )
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .expect("bad-request test server should run");
+    });
+
+    let client = IronMeshClient::from_direct_base_url(format!("http://{address}"));
+    let error = client
+        .store_index_with_options(
+            Some("docs"),
+            1,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                require_labels: vec!["favorite".to_string()],
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect_err("unrelated bad requests must not trigger a tree retry");
+
+    assert!(error.to_string().contains("400 Bad Request"));
+    let queries = queries.lock().await.clone();
+    assert_eq!(queries.len(), 1);
+    assert!(queries[0].contains("view=children"));
+    assert!(queries[0].contains("require_labels=favorite"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn store_index_children_does_not_retry_cursor_pagination_on_older_nodes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose its address");
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let route_queries = Arc::clone(&queries);
+    let router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let route_queries = Arc::clone(&route_queries);
+            async move {
+                route_queries.lock().await.push(query.unwrap_or_default());
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "unknown variant `children`" })),
+                )
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .expect("cursor-pagination test server should run");
+    });
+
+    let client = IronMeshClient::from_direct_base_url(format!("http://{address}"));
+    let error = client
+        .store_index_with_options(
+            Some("docs"),
+            1,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                cursor: Some("cursor-1".to_string()),
+                page_size: Some(20),
+                require_labels: vec!["favorite".to_string()],
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect_err("cursor pagination must not be replaced with an unpaged tree request");
+
+    assert!(error.to_string().contains("400 Bad Request"));
+    let queries = queries.lock().await.clone();
+    assert_eq!(queries.len(), 1);
+    assert!(queries[0].contains("view=children"));
+    assert!(queries[0].contains("cursor=cursor-1"));
+    assert!(queries[0].contains("page_size=20"));
+    assert!(queries[0].contains("require_labels=favorite"));
+
+    server.abort();
+}
+
 #[test]
 fn gallery_map_zoom_request_validation_preserves_fractional_zoom() {
     assert_eq!(gallery_map_zoom_for_request(3.75).unwrap(), 3.75);

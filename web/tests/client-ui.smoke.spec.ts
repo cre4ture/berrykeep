@@ -10,6 +10,7 @@ import {
 import { GalleryMapMockSession } from "./gallery-map.mock";
 import {
   filterMockStoreEntriesToPrefix,
+  projectMockStoreChildrenEntries,
   projectMockStoreTreeEntries
 } from "./store-index.mock";
 
@@ -27,6 +28,22 @@ const CONCURRENT_WEB_SERVICE_NODE_IDS = [
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
 }
+
+test("client-ui store-index mock excludes the queried marker only for children", () => {
+  const entries = [
+    { path: "docs/", entry_type: "prefix" as const },
+    { path: "docs/", entry_type: "key" as const },
+    { path: "docs/readme.txt", entry_type: "key" as const }
+  ];
+
+  expect(projectMockStoreTreeEntries(entries, "docs", 1).map((entry) => entry.path)).toEqual([
+    "docs/",
+    "docs/readme.txt"
+  ]);
+  expect(projectMockStoreChildrenEntries(entries, "docs", 1).map((entry) => entry.path)).toEqual([
+    "docs/readme.txt"
+  ]);
+});
 
 function createDeferred(): { promise: Promise<void>; resolve: () => void } {
   let resolvePromise!: () => void;
@@ -3334,14 +3351,17 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
+  const view = searchParams.get("view");
   const isDirectoryNavigationRequest =
-    ["tree", "children"].includes(searchParams.get("view") ?? "") &&
+    ["tree", "children"].includes(view ?? "") &&
     !searchParams.has("offset") &&
     !searchParams.has("limit") &&
     !searchParams.has("sort") &&
     !mediaFilter;
   const scopedEntries = isDirectoryNavigationRequest
-    ? projectMockStoreTreeEntries(entries, prefix, depth)
+    ? view === "children"
+      ? projectMockStoreChildrenEntries(entries, prefix, depth)
+      : projectMockStoreTreeEntries(entries, prefix, depth)
     : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter
     ? scopedEntries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter))

@@ -202,10 +202,18 @@ fn android_test_store_index_response(request_path: &str) -> StoreIndexResponse {
     } else {
         ""
     };
-    let is_tree_shaped_view = android_test_query_matches(request_path, "view", "tree")
-        || android_test_query_matches(request_path, "view", "children");
+    let is_children_view = android_test_query_matches(request_path, "view", "children");
+    let is_tree_shaped_view =
+        android_test_query_matches(request_path, "view", "tree") || is_children_view;
     let entries = if prefix == "docs" {
-        vec![android_test_document_entry()]
+        let mut entries = vec![
+            android_test_folder_entry("docs/", "prefix"),
+            android_test_document_entry(),
+        ];
+        if is_children_view {
+            entries.retain(|entry| entry.path != "docs/");
+        }
+        entries
     } else {
         let mut entries = android_test_folder_entries();
         if is_tree_shaped_view {

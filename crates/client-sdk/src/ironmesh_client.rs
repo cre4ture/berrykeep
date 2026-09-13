@@ -5797,7 +5797,9 @@ impl IronMeshClient {
         // server must apply the children projection before pagination for its
         // offset and total to remain meaningful.
         if options.view == Some(StoreIndexView::Children)
-            && response.status == StatusCode::BAD_REQUEST
+            && options.cursor.is_none()
+            && options.page_size.is_none()
+            && store_index_view_was_rejected(&response, StoreIndexView::Children)
         {
             let mut fallback_options = options.clone();
             fallback_options.view = Some(StoreIndexView::Tree);
@@ -9943,6 +9945,18 @@ fn decode_store_index_response(
         .context("failed to parse /store/index response")?;
     synthesize_missing_folder_markers_for_page(&mut response, options);
     Ok(response)
+}
+
+fn store_index_view_was_rejected(
+    response: &BufferedTransportResponse,
+    requested_view: StoreIndexView,
+) -> bool {
+    if response.status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+
+    let body = String::from_utf8_lossy(&response.body);
+    body.contains("unknown variant") && body.contains(requested_view.as_query_value())
 }
 
 fn project_store_index_children_response(

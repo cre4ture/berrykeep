@@ -24,7 +24,15 @@ export async function fetchJson<T>(
   init?: RequestInit
 ): Promise<T> {
   const response = await fetch(input, init);
-  const payload = await response.json().catch(() => null);
+  const text = await response.text();
+  let payload: unknown = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = text;
+    }
+  }
 
   if (!response.ok) {
     throw new HttpError(response.status, payload);

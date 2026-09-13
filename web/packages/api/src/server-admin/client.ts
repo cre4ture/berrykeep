@@ -1,4 +1,4 @@
-import { fetchJson, isHttpErrorStatus } from "../shared/http";
+import { HttpError, fetchJson, isHttpErrorStatus } from "../shared/http";
 import {
   galleryMapClusterCellSizeParameter,
   galleryMapClusterZoomParameters
@@ -365,7 +365,7 @@ export async function listAdminStoreEntries(
       true
     );
   } catch (error) {
-    if (view !== "children" || !isHttpErrorStatus(error, 400)) {
+    if (view !== "children" || !storeIndexViewWasRejected(error, view)) {
       throw error;
     }
 
@@ -383,6 +383,16 @@ export async function listAdminStoreEntries(
     );
     return projectAdminStoreIndexChildren(treeResponse, prefix, options);
   }
+}
+
+function storeIndexViewWasRejected(error: unknown, requestedView: StoreListView): boolean {
+  if (!(error instanceof HttpError) || error.status !== 400) {
+    return false;
+  }
+
+  const payload =
+    typeof error.payload === "string" ? error.payload : JSON.stringify(error.payload ?? null);
+  return payload.includes("unknown variant") && payload.includes(requestedView);
 }
 
 async function fetchAdminStoreEntries(

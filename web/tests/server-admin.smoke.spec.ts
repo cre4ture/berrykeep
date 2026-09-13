@@ -10,6 +10,7 @@ import {
 import { GalleryMapMockSession } from "./gallery-map.mock";
 import {
   filterMockStoreEntriesToPrefix,
+  projectMockStoreChildrenEntries,
   projectMockStoreTreeEntries
 } from "./store-index.mock";
 
@@ -3558,14 +3559,17 @@ function buildAdminStoreIndexResponse(
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
+  const view = searchParams.get("view");
   const isDirectoryNavigationRequest =
-    ["tree", "children"].includes(searchParams.get("view") ?? "") &&
+    ["tree", "children"].includes(view ?? "") &&
     !searchParams.has("offset") &&
     !searchParams.has("limit") &&
     !searchParams.has("sort") &&
     !mediaFilter;
   const scopedEntries = isDirectoryNavigationRequest
-    ? projectMockStoreTreeEntries(entries, prefix, depth)
+    ? view === "children"
+      ? projectMockStoreChildrenEntries(entries, prefix, depth)
+      : projectMockStoreTreeEntries(entries, prefix, depth)
     : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter
     ? scopedEntries.filter((entry) => matchesAdminMediaFilter(entry, mediaFilter))
