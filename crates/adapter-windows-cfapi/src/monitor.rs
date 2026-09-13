@@ -8,9 +8,9 @@ use crate::adapter::{CfapiAction, CfapiActionPlan};
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_dehydrate_placeholder_with_oplock, cf_get_placeholder_standard_info_with_identity,
-    cf_hydrate_placeholder, cf_set_in_sync, cf_set_in_sync_with_usn, cf_set_not_in_sync,
-    describe_path_state, open_sync_path, path_is_placeholder, path_placeholder_state,
-    try_convert_materialized_file,
+    cf_hydrate_placeholder, cf_set_in_sync_metadata_only, cf_set_in_sync_with_usn,
+    cf_set_not_in_sync, cf_set_not_in_sync_metadata_only, describe_path_state, open_sync_path,
+    path_is_placeholder, path_placeholder_state, try_convert_materialized_file,
 };
 use crate::cfapi_safe_wrap::local_file_identity_for_path;
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
@@ -1636,8 +1636,7 @@ fn repair_locally_renamed_object(
             None,
         )?;
         promote_remote_to_in_sync_content_baseline(sync_root, rel_path, provider_instance_id)?;
-        let file = open_sync_path(path, true)?;
-        cf_set_in_sync(&file)?;
+        cf_set_in_sync_metadata_only(path)?;
         return Ok(());
     }
 
@@ -1655,8 +1654,7 @@ fn repair_locally_renamed_object(
             None,
         )?;
         promote_remote_to_in_sync_content_baseline(sync_root, rel_path, provider_instance_id)?;
-        let file = open_sync_path(path, true)?;
-        cf_set_in_sync(&file)?;
+        cf_set_in_sync_metadata_only(path)?;
         tracing::info!(
             "monitor: repaired local renamed object {} mode=placeholder-metadata-only state_after={}",
             rel_path,
@@ -1676,8 +1674,7 @@ fn repair_locally_renamed_object(
         &receipt.remote_version,
         None,
     )?;
-    let file = open_sync_path(path, true)?;
-    cf_set_in_sync(&file)?;
+    cf_set_in_sync_metadata_only(path)?;
     record_in_sync_local_file_state(sync_root, rel_path, provider_instance_id)?;
     tracing::info!(
         "monitor: repaired local renamed file {} mode=materialized-convert-and-fingerprint state_after={}",
@@ -1688,11 +1685,7 @@ fn repair_locally_renamed_object(
 }
 
 fn mark_local_rename_conflict(path: &std::path::Path) {
-    let result = match open_sync_path(path, true) {
-        Ok(file) => cf_set_not_in_sync(&file).map(|_| ()),
-        Err(err) => Err(err.into()),
-    };
-    if let Err(err) = result {
+    if let Err(err) = cf_set_not_in_sync_metadata_only(path) {
         tracing::info!(
             "monitor: failed to mark conflicted local rename not-in-sync at {}: {:#}",
             path.display(),
@@ -1903,12 +1896,14 @@ mod tests {
         SyncRootRegistration, apply_action_plan, register_sync_root, unregister_sync_root,
     };
     use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use sync_core::{NamespaceEntry, SyncSnapshot};
     use windows_sys::Win32::Storage::CloudFilters::{
         CF_IN_SYNC_STATE_NOT_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNSPECIFIED,
     };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
 
     #[derive(Default)]
     struct MockUploader {
@@ -2768,6 +2763,11 @@ mod tests {
         .expect("rename target parent should be created");
         std::fs::rename(&old_full_path, &new_full_path)
             .expect("placeholder should be renamed locally");
+        let deny_read_handle = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&new_full_path)
+            .expect("test should hold a handle that denies shared data reads");
 
         repair_locally_renamed_object(
             &sync_root.root_path,
@@ -2781,11 +2781,18 @@ mod tests {
             },
         )
         .expect("successful rename should update placeholder metadata");
+        drop(deny_read_handle);
 
         let file = open_sync_path(&new_full_path, false)
             .expect("renamed placeholder should remain accessible");
         let info = cf_get_placeholder_standard_info_with_identity(&file)
             .expect("renamed placeholder identity should be readable");
+        assert_eq!(
+            info.info().OnDiskDataSize,
+            0,
+            "repairing a cold renamed placeholder must not hydrate its content"
+        );
+        assert_eq!(info.info().ModifiedDataSize, 0);
         let identity = decode_placeholder_file_identity(info.file_identity())
             .expect("renamed placeholder identity should decode");
         assert_eq!(identity.object_id.as_deref(), Some("test-object"));
@@ -2794,6 +2801,35 @@ mod tests {
             Some("revision-after-rename")
         );
         assert_eq!(identity.path, new_path);
+    }
+
+    #[test]
+    fn conflicted_local_placeholder_rename_does_not_hydrate_content() {
+        let (sync_root, provider_instance_id) =
+            registered_monitor_test_sync_root("rename-conflict-stays-cold");
+        let path = "docs/conflicted.txt";
+        create_clean_provider_placeholder(&sync_root.root_path, provider_instance_id, path);
+        let full_path = sync_root.root_path.join("docs\\conflicted.txt");
+        let deny_read_handle = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&full_path)
+            .expect("test should hold a handle that denies shared data reads");
+
+        mark_local_rename_conflict(&full_path);
+        drop(deny_read_handle);
+
+        let file = open_sync_path(&full_path, false)
+            .expect("conflicted placeholder should remain accessible");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("conflicted placeholder state should remain readable");
+        assert_eq!(info.info().InSyncState, CF_IN_SYNC_STATE_NOT_IN_SYNC);
+        assert_eq!(
+            info.info().OnDiskDataSize,
+            0,
+            "marking a rename conflict must not hydrate a cold placeholder"
+        );
+        assert_eq!(info.info().ModifiedDataSize, 0);
     }
 
     #[test]

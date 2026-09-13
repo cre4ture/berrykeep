@@ -3,8 +3,8 @@
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info_with_identity, cf_set_in_sync,
-    cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_metadata_only,
-    cf_update_placeholder_metadata_and_identity,
+    cf_set_in_sync_metadata_only, cf_update_placeholder_file_identity,
+    cf_update_placeholder_file_identity_metadata_only, cf_update_placeholder_metadata_and_identity,
     cf_update_placeholder_metadata_and_identity_metadata_only, open_sync_path, path_is_placeholder,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
@@ -1325,8 +1325,7 @@ fn move_remote_placeholder(
             ))),
         };
     }
-    let moved_file = open_sync_path(&target_path, true)?;
-    cf_set_in_sync(&moved_file)?;
+    cf_set_in_sync_metadata_only(&target_path)?;
     Ok(true)
 }
 
@@ -1618,9 +1617,11 @@ mod tests {
     use crate::runtime::{
         SyncRootRegistration, apply_action_plan, register_sync_root, unregister_sync_root,
     };
+    use std::os::windows::fs::OpenOptionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
     use sync_core::NamespaceEntry;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
 
     #[derive(Default)]
     struct StaticResolver {
@@ -2045,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_rename_moves_existing_placeholder_by_object_id() {
+    fn remote_rename_moves_cold_placeholder_without_content_read() {
         let (sync_root, provider_instance_id) = registered_test_sync_root("remote-rename");
         let old_path = "docs/old-name.txt";
         let new_path = "archive/new-name.txt";
@@ -2058,6 +2059,12 @@ mod tests {
             "rename-hash",
             1_725_100_001,
         );
+        let source_path = sync_root.root_path.join("docs\\old-name.txt");
+        let deny_read_handle = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&source_path)
+            .expect("test should hold a handle that denies shared data reads");
         let previous = remote_file(old_path, object_id, "revision-1", "rename-hash");
         let current = remote_file(new_path, object_id, "revision-2", "rename-hash");
         let resolver = StaticResolver {
@@ -2083,6 +2090,7 @@ mod tests {
             Some(&resolver),
         )
         .expect("remote rename should reconcile");
+        drop(deny_read_handle);
 
         assert_eq!(
             report.renamed_paths.get(old_path).map(String::as_str),
@@ -2093,6 +2101,8 @@ mod tests {
         let file = open_sync_path(&new_full_path, false).expect("renamed placeholder should exist");
         let info = cf_get_placeholder_standard_info_with_identity(&file)
             .expect("renamed placeholder identity should be readable");
+        assert_eq!(info.info().OnDiskDataSize, 0);
+        assert_eq!(info.info().ModifiedDataSize, 0);
         let identity = decode_placeholder_file_identity(info.file_identity())
             .expect("renamed placeholder identity should decode");
         assert_eq!(identity.object_id.as_deref(), Some(object_id));
