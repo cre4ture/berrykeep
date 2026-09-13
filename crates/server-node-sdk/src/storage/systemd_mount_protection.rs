@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -49,8 +49,7 @@ pub(super) async fn mount_protection_checks(
 ) -> Vec<HostDependencyCheck> {
     let inspection = inspect_current_process().await;
     let targets = mount_protection_targets(data_dir, storage_paths);
-    let mounted_at = mount_points_for_targets(&targets);
-    checks_for_inspection(&targets, &mounted_at, inspection)
+    checks_for_inspection(&targets, inspection)
 }
 
 async fn inspect_current_process() -> SystemdMountProtectionInspection {
@@ -62,13 +61,13 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
         return SystemdMountProtectionInspection::SystemctlMissing { service };
     };
 
-    let dependency_listing = match run_systemctl(
+    let service_dependencies = match run_systemctl(
         &systemctl,
         [
-            "list-dependencies",
+            "show",
             "--all",
-            "--plain",
-            "--no-pager",
+            "--property=Requires",
+            "--property=BindsTo",
             service.as_str(),
         ],
     )
@@ -78,7 +77,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
         Err(reason) => return SystemdMountProtectionInspection::QueryFailed { service, reason },
     };
 
-    let mount_units = mount_units_from_dependency_listing(&dependency_listing);
+    let mount_units = direct_mount_units_from_service_properties(&service_dependencies);
     let mut mounts = Vec::with_capacity(mount_units.len());
     for unit in mount_units {
         let where_output = match run_systemctl(
@@ -167,22 +166,24 @@ async fn run_systemctl<'a>(
     }
 }
 
-fn mount_units_from_dependency_listing(output: &str) -> Vec<String> {
-    output
+fn direct_mount_units_from_service_properties(output: &str) -> Vec<String> {
+    let mut units = BTreeSet::new();
+    for (_, dependencies) in output
         .lines()
-        .flat_map(str::split_whitespace)
-        .filter_map(mount_unit_from_token)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(property, _)| matches!(*property, "Requires" | "BindsTo"))
+    {
+        units.extend(
+            dependencies
+                .split_whitespace()
+                .filter_map(mount_unit_from_token),
+        );
+    }
+    units.into_iter().collect()
 }
 
 fn mount_unit_from_token(token: &str) -> Option<String> {
-    let unit_end = token.find(".mount")? + ".mount".len();
-    let unit = token[..unit_end].trim_start_matches(|character: char| {
-        !character.is_ascii_alphanumeric() && !matches!(character, '\\' | '_' | '-' | '.' | '@')
-    });
-    unit.ends_with(".mount").then(|| unit.to_string())
+    token.ends_with(".mount").then(|| token.to_string())
 }
 
 fn mount_protection_targets(
@@ -228,7 +229,6 @@ fn storage_path_state_label(state: StoragePathState) -> &'static str {
 
 fn checks_for_inspection(
     targets: &[MountProtectionTarget],
-    mounted_at: &BTreeMap<PathBuf, PathBuf>,
     inspection: SystemdMountProtectionInspection,
 ) -> Vec<HostDependencyCheck> {
     match inspection {
@@ -282,11 +282,7 @@ fn checks_for_inspection(
         SystemdMountProtectionInspection::Dependencies { service, mounts } => targets
             .iter()
             .map(|target| {
-                let protecting_mount = protecting_mount_dependency(
-                    &target.path,
-                    mounted_at.get(&target.path).map(PathBuf::as_path),
-                    &mounts,
-                );
+                let protecting_mount = protecting_mount_dependency(&target.path, &mounts);
                 match protecting_mount {
                     Some(mount) => HostDependencyCheck {
                         id: target.id.clone(),
@@ -298,7 +294,7 @@ fn checks_for_inspection(
                             mount.unit,
                             mount.where_path.display()
                         ),
-                        detail: "The live systemd dependency graph is used, so configured unit dependencies, drop-ins, and systemd-created implicit mount dependencies are all included.".to_string(),
+                        detail: "The live systemd dependency properties are used, so direct unit dependencies, drop-ins, and systemd-created implicit mount dependencies are all included without accepting unrelated transitive mounts.".to_string(),
                         configured_path: Some(target.path.display().to_string()),
                         resolved_path: Some(format!(
                             "{} ({})",
@@ -334,81 +330,12 @@ fn checks_for_inspection(
 
 fn protecting_mount_dependency<'a>(
     target: &Path,
-    mounted_at: Option<&Path>,
     mounts: &'a [SystemdMountDependency],
 ) -> Option<&'a SystemdMountDependency> {
-    let expected_mount = mounted_at.unwrap_or(target);
     mounts
         .iter()
-        .filter(|mount| mount.where_path == expected_mount)
+        .filter(|mount| mount.where_path != Path::new("/") && target.starts_with(&mount.where_path))
         .max_by_key(|mount| mount.where_path.components().count())
-        .or_else(|| {
-            mounted_at
-                .is_none()
-                .then(|| {
-                    mounts
-                        .iter()
-                        .filter(|mount| {
-                            mount.where_path != Path::new("/")
-                                && target.starts_with(&mount.where_path)
-                        })
-                        .max_by_key(|mount| mount.where_path.components().count())
-                })
-                .flatten()
-        })
-}
-
-fn mount_points_for_targets(targets: &[MountProtectionTarget]) -> BTreeMap<PathBuf, PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        let mount_points = std::fs::read_to_string("/proc/self/mountinfo")
-            .ok()
-            .map(|contents| mount_points_from_mountinfo(&contents))
-            .unwrap_or_default();
-        targets
-            .iter()
-            .filter_map(|target| {
-                mount_point_for_path(&target.path, &mount_points)
-                    .map(|mount_point| (target.path.clone(), mount_point))
-            })
-            .collect()
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        BTreeMap::new()
-    }
-}
-
-fn mount_points_from_mountinfo(mountinfo: &str) -> Vec<PathBuf> {
-    mountinfo
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let _mount_id = fields.next()?;
-            let _parent_id = fields.next()?;
-            let _major_minor = fields.next()?;
-            let _root = fields.next()?;
-            let mount_point = fields.next()?;
-            Some(PathBuf::from(unescape_mountinfo_path(mount_point)))
-        })
-        .collect()
-}
-
-fn unescape_mountinfo_path(value: &str) -> String {
-    value
-        .replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
-}
-
-fn mount_point_for_path(path: &Path, mount_points: &[PathBuf]) -> Option<PathBuf> {
-    mount_points
-        .iter()
-        .filter(|mount_point| path.starts_with(mount_point))
-        .max_by_key(|mount_point| mount_point.components().count())
-        .cloned()
 }
 
 #[cfg(test)]
@@ -461,7 +388,6 @@ mod tests {
         );
         let checks = checks_for_inspection(
             &targets,
-            &BTreeMap::new(),
             SystemdMountProtectionInspection::NotManagedBySystemd,
         );
 
@@ -480,13 +406,8 @@ mod tests {
                 StoragePathState::Active,
             )],
         );
-        let mounted_at = BTreeMap::from([
-            (PathBuf::from("/srv/berrykeep"), PathBuf::from("/srv")),
-            (PathBuf::from("/mnt/primary"), PathBuf::from("/mnt/primary")),
-        ]);
         let checks = checks_for_inspection(
             &targets,
-            &mounted_at,
             SystemdMountProtectionInspection::Dependencies {
                 service: "berrykeep-server-node.service".to_string(),
                 mounts: vec![
@@ -514,14 +435,8 @@ mod tests {
                 storage_path("retired", "/mnt/retired", StoragePathState::Disabled),
             ],
         );
-        let mounted_at = BTreeMap::from([
-            (PathBuf::from("/srv/berrykeep"), PathBuf::from("/srv")),
-            (PathBuf::from("/mnt/primary"), PathBuf::from("/mnt/primary")),
-            (PathBuf::from("/mnt/archive"), PathBuf::from("/mnt/archive")),
-        ]);
         let checks = checks_for_inspection(
             &targets,
-            &mounted_at,
             SystemdMountProtectionInspection::Dependencies {
                 service: "berrykeep-server-node.service".to_string(),
                 mounts: vec![
@@ -560,11 +475,41 @@ mod tests {
     }
 
     #[test]
-    fn dependency_listing_extracts_effective_mount_units() {
-        let units = mount_units_from_dependency_listing(
-            "berrykeep-server-node.service\n● ├─mnt-primary.mount\n● └─var-lib-berrykeep.mount\n",
+    fn direct_service_dependencies_extract_effective_mount_units() {
+        let units = direct_mount_units_from_service_properties(
+            "Requires=mnt-primary.mount sysinit.target\nBindsTo=var-lib-berrykeep.mount\nWants=unrelated.mount\nAfter=unrelated.mount\n",
         );
 
         assert_eq!(units, vec!["mnt-primary.mount", "var-lib-berrykeep.mount"]);
+    }
+
+    #[test]
+    fn root_mount_does_not_protect_a_missing_storage_mount() {
+        let targets = mount_protection_targets(
+            Path::new("/var/lib/berrykeep"),
+            &[storage_path(
+                "primary",
+                "/mnt/primary",
+                StoragePathState::Active,
+            )],
+        );
+        let checks = checks_for_inspection(
+            &targets,
+            SystemdMountProtectionInspection::Dependencies {
+                service: "berrykeep-server-node.service".to_string(),
+                mounts: vec![systemd_mount("-.mount", "/")],
+            },
+        );
+
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.status == HostDependencyStatus::Missing)
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.severity == HostDependencySeverity::Critical)
+        );
     }
 }
