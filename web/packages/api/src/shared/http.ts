@@ -26,6 +26,10 @@ export async function fetchJson<T>(
   init?: RequestInit
 ): Promise<T> {
   const response = await fetch(input, init);
+  if (response.ok) {
+    return (await response.json().catch(() => null)) as T;
+  }
+
   const text = await response.text();
   let payload: unknown = null;
   if (text) {
@@ -41,9 +45,5 @@ export async function fetchJson<T>(
     }
   }
 
-  if (!response.ok) {
-    throw new HttpError(response.status, payload);
-  }
-
-  return payload as T;
+  throw new HttpError(response.status, payload);
 }

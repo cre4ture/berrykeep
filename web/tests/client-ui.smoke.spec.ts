@@ -49,7 +49,13 @@ test("client-ui store-index mock excludes the queried marker only for children",
 test("shared fetch helper bounds plain-text error payloads", async () => {
   const omittedTail = "proxy-error-body-tail-must-not-reach-the-ui";
   const errorBody = `unknown variant \`children\`: ${"x".repeat(600)}${omittedTail}`;
-  const server = createServer((_request, response) => {
+  const server = createServer((request, response) => {
+    if (request.url === "/success") {
+      response
+        .writeHead(200, { "content-type": "text/plain; charset=utf-8" })
+        .end("a successful non-JSON response");
+      return;
+    }
     response
       .writeHead(400, { "content-type": "text/plain; charset=utf-8" })
       .end(errorBody);
@@ -64,6 +70,8 @@ test("shared fetch helper bounds plain-text error payloads", async () => {
     if (!address || typeof address === "string") {
       throw new Error("listener address is unavailable");
     }
+    await expect(fetchJson(`http://127.0.0.1:${address.port}/success`)).resolves.toBeNull();
+
     let error: unknown;
     try {
       await fetchJson(`http://127.0.0.1:${address.port}/failure`);
