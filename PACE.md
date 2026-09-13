@@ -32,3 +32,7 @@ Apply these rules to non-trivial changes.
 - Self-review the diff for unrelated churn, duplicated logic, unclear names, hidden side effects, and missing error handling.
 - Update tests and documentation when behavior or interfaces change.
 - Keep the commit single-purpose and reviewable.
+
+## Pull Requests
+
+- Pull Requests are merged by squash commit. Don't rebase when merging main to PR.
