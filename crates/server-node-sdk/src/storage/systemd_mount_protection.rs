@@ -23,7 +23,7 @@ use futures_util::future::join_all;
 use super::StoragePathConfig;
 #[cfg(any(target_os = "linux", test))]
 use super::StoragePathState;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use super::media_tools::resolve_host_dependency_path;
 use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDependencyStatus};
 
@@ -41,6 +41,11 @@ enum SystemdMountProtectionInspection {
     #[cfg(target_os = "linux")]
     SystemctlMissing {
         service: String,
+    },
+    #[cfg(any(target_os = "linux", test))]
+    PathCanonicalizerUnavailable {
+        service: String,
+        reason: String,
     },
     #[cfg(any(target_os = "linux", test))]
     QueryFailed {
@@ -189,7 +194,25 @@ async fn mount_protection_checks_for_current_process(
     let inspection = inspect_current_process().await;
     let targets = match &inspection {
         SystemdMountProtectionInspection::Dependencies { service, .. } => {
-            match mount_protection_targets_for_current_process(data_dir, storage_paths).await {
+            let canonicalizer = match usable_path_canonicalizer().await {
+                Ok(canonicalizer) => canonicalizer,
+                Err(reason) => {
+                    return checks_for_inspection(
+                        &[],
+                        SystemdMountProtectionInspection::PathCanonicalizerUnavailable {
+                            service: service.clone(),
+                            reason,
+                        },
+                    );
+                }
+            };
+            match mount_protection_targets_for_current_process(
+                data_dir,
+                storage_paths,
+                &canonicalizer,
+            )
+            .await
+            {
                 Ok(targets) => targets,
                 Err(reason) => {
                     return checks_for_inspection(
@@ -662,6 +685,7 @@ fn mount_protection_targets_with_path_resolution(
 async fn mount_protection_targets_for_current_process(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
+    canonicalizer: &Path,
 ) -> Result<Vec<MountProtectionTarget>, String> {
     let storage_path_futures = storage_paths
         .iter()
@@ -669,11 +693,11 @@ async fn mount_protection_targets_for_current_process(
         .map(|storage_path| async {
             (
                 storage_path.id.clone(),
-                resolve_mount_protection_path(&storage_path.path).await,
+                resolve_mount_protection_path(&storage_path.path, canonicalizer).await,
             )
         });
     let (data_dir, resolved_storage_paths) = tokio::join!(
-        resolve_mount_protection_path(data_dir),
+        resolve_mount_protection_path(data_dir, canonicalizer),
         join_all(storage_path_futures),
     );
     let resolved_storage_paths = resolved_storage_paths
@@ -710,9 +734,30 @@ struct ResolvedMountProtectionPath {
 }
 
 #[cfg(any(target_os = "linux", test))]
-async fn resolve_mount_protection_path(path: &Path) -> ResolvedMountProtectionPath {
+async fn usable_path_canonicalizer() -> Result<PathBuf, String> {
+    let Some(canonicalizer) = resolve_host_dependency_path(Path::new("readlink")) else {
+        return Err("the `readlink` program is unavailable".to_string());
+    };
+    let resolved_root = resolve_mount_protection_path(Path::new("/"), &canonicalizer).await;
+    match resolved_root.error {
+        Some(error) => Err(format!(
+            "`{}` cannot canonicalize paths: {error}",
+            canonicalizer.display()
+        )),
+        None => Ok(canonicalizer),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+async fn resolve_mount_protection_path(
+    path: &Path,
+    canonicalizer: &Path,
+) -> ResolvedMountProtectionPath {
     let lexical_path = absolutize_mount_protection_path(path);
-    let mut command = Command::new("readlink");
+    // Filesystem canonicalization can block indefinitely when a network mount is
+    // unavailable. A child process lets the report enforce a timeout and kill the
+    // blocked resolver instead of leaving a Tokio blocking thread behind.
+    let mut command = Command::new(canonicalizer);
     command
         .args(["--canonicalize-existing", "--"])
         .arg(path)
@@ -725,7 +770,10 @@ async fn resolve_mount_protection_path(path: &Path) -> ResolvedMountProtectionPa
             if path.is_empty() {
                 ResolvedMountProtectionPath {
                     path: lexical_path,
-                    error: Some("readlink returned an empty path".to_string()),
+                    error: Some(format!(
+                        "`{}` returned an empty path",
+                        canonicalizer.display()
+                    )),
                 }
             } else {
                 ResolvedMountProtectionPath {
@@ -739,19 +787,33 @@ async fn resolve_mount_protection_path(path: &Path) -> ResolvedMountProtectionPa
             ResolvedMountProtectionPath {
                 path: lexical_path,
                 error: Some(if detail.is_empty() {
-                    format!("readlink exited with {}", output.status)
+                    format!(
+                        "`{}` exited with {}",
+                        canonicalizer.display(),
+                        output.status
+                    )
                 } else {
-                    format!("readlink exited with {}: {detail}", output.status)
+                    format!(
+                        "`{}` exited with {}: {detail}",
+                        canonicalizer.display(),
+                        output.status
+                    )
                 }),
             }
         }
         Ok(Err(error)) => ResolvedMountProtectionPath {
             path: lexical_path,
-            error: Some(format!("failed to start readlink: {error}")),
+            error: Some(format!(
+                "failed to start `{}`: {error}",
+                canonicalizer.display()
+            )),
         },
         Err(_) => ResolvedMountProtectionPath {
             path: lexical_path,
-            error: Some("readlink did not resolve the path within one second".to_string()),
+            error: Some(format!(
+                "`{}` did not resolve the path within one second",
+                canonicalizer.display()
+            )),
         },
     }
 }
@@ -904,6 +966,24 @@ fn checks_for_inspection(
             }]
         }
         #[cfg(any(target_os = "linux", test))]
+        SystemdMountProtectionInspection::PathCanonicalizerUnavailable { service, reason } => {
+            vec![HostDependencyCheck {
+                id: "systemd-mount-protection".to_string(),
+                feature: "Systemd mount protection".to_string(),
+                status: HostDependencyStatus::Missing,
+                severity: HostDependencySeverity::Info,
+                summary: format!(
+                    "The running service `{service}` was detected, but storage paths cannot be canonicalized"
+                ),
+                detail: format!(
+                    "The server is managed by systemd, but mount protection cannot be inspected until storage paths can be resolved safely: {reason}."
+                ),
+                configured_path: Some("readlink".to_string()),
+                resolved_path: None,
+                install_hint: Some("Install or restore a `readlink` implementation that supports `--canonicalize-existing`, then refresh this report.".to_string()),
+            }]
+        }
+        #[cfg(any(target_os = "linux", test))]
         SystemdMountProtectionInspection::QueryFailed { service, reason } => {
             vec![HostDependencyCheck {
                 id: "systemd-mount-protection".to_string(),
@@ -1020,7 +1100,36 @@ fn checks_for_inspection(
                             requires_mounts_for_remedy(&service, &target.path)
                         )),
                     },
-                    None if !target_is_on_expected_host_mount => {
+                    None
+                        if target.mount_point.as_deref() == Some(Path::new("/"))
+                            && expected_host_mount.is_some() =>
+                    {
+                        HostDependencyCheck {
+                            id: target.id.clone(),
+                            feature: target.feature.clone(),
+                            status: HostDependencyStatus::Missing,
+                            severity: target.missing_severity,
+                            summary: format!(
+                                "{} is currently served by the root filesystem",
+                                target.path.display()
+                            ),
+                            detail: format!(
+                                "Systemd has a loaded mount unit below this path, but the configured storage path currently falls back to the root filesystem. `RequiresMountsFor={}` would otherwise only depend on the root filesystem and cannot protect the intended storage device.",
+                                target.path.display()
+                            ),
+                            configured_path: Some(target.path.display().to_string()),
+                            resolved_path: Some("/".to_string()),
+                            install_hint: Some(format!(
+                                "Mount the filesystem declared for {}. {}",
+                                target.path.display(),
+                                requires_mounts_for_remedy(&service, &target.path)
+                            )),
+                        }
+                    }
+                    None
+                        if !target_is_on_expected_host_mount
+                            && target.mount_point.as_deref() != Some(Path::new("/")) =>
+                    {
                         let expected_mount = expected_host_mount
                             .expect("an unexpected live mount requires an expected host mount");
                         let actual_mount = target
@@ -1065,27 +1174,6 @@ fn checks_for_inspection(
                         configured_path: Some(target.path.display().to_string()),
                         resolved_path: Some("/".to_string()),
                         install_hint: None,
-                    },
-                    None if target.mount_point.as_deref() == Some(Path::new("/")) => HostDependencyCheck {
-                        id: target.id.clone(),
-                        feature: target.feature.clone(),
-                        status: HostDependencyStatus::Missing,
-                        severity: target.missing_severity,
-                        summary: format!(
-                            "{} is currently served by the root filesystem",
-                            target.path.display()
-                        ),
-                        detail: format!(
-                            "This storage path is not currently on a separate mount, so `RequiresMountsFor={}` would only depend on the root filesystem and cannot protect the intended storage device.",
-                            target.path.display()
-                        ),
-                        configured_path: Some(target.path.display().to_string()),
-                        resolved_path: Some("/".to_string()),
-                        install_hint: Some(format!(
-                            "Mount the intended filesystem at {}. {}",
-                            target.path.display(),
-                            requires_mounts_for_remedy(&service, &target.path)
-                        )),
                     },
                     None => HostDependencyCheck {
                         id: target.id.clone(),
@@ -1262,6 +1350,21 @@ mod tests {
             &[],
             SystemdMountProtectionInspection::SystemctlMissing {
                 service: "berrykeep-server-node.service".to_string(),
+            },
+        );
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Info);
+    }
+
+    #[test]
+    fn unavailable_path_canonicalizer_remains_an_informational_host_tool_finding() {
+        let checks = checks_for_inspection(
+            &[],
+            SystemdMountProtectionInspection::PathCanonicalizerUnavailable {
+                service: "berrykeep-server-node.service".to_string(),
+                reason: "the `readlink` program is unavailable".to_string(),
             },
         );
 
@@ -1554,12 +1657,13 @@ mod tests {
             .unwrap();
         assert_eq!(root_storage.status, HostDependencyStatus::Missing);
         assert_eq!(root_storage.severity, HostDependencySeverity::Critical);
+        assert!(root_storage.summary.contains("root filesystem"));
         assert!(
             root_storage
                 .install_hint
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Restore the filesystem declared")
+                .contains("Mount the filesystem declared")
         );
     }
 
@@ -1750,7 +1854,8 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let resolved = resolve_mount_protection_path(&link).await;
+        let canonicalizer = usable_path_canonicalizer().await.unwrap();
+        let resolved = resolve_mount_protection_path(&link, &canonicalizer).await;
 
         assert_eq!(resolved.path, target);
         assert!(resolved.error.is_none());
@@ -1766,7 +1871,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&path);
 
-        let resolved = resolve_mount_protection_path(&path).await;
+        let canonicalizer = usable_path_canonicalizer().await.unwrap();
+        let resolved = resolve_mount_protection_path(&path, &canonicalizer).await;
 
         assert_eq!(resolved.path, path);
         assert!(resolved.error.is_some());
