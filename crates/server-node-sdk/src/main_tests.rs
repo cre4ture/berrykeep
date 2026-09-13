@@ -13753,6 +13753,16 @@ fn store_index_children_plan_excludes_the_queried_directory_marker() {
 }
 
 #[test]
+fn store_index_query_ignores_unknown_projection_views() {
+    let query: super::StoreIndexQuery = serde_json::from_value(serde_json::json!({
+        "view": "future_projection",
+    }))
+    .expect("unknown projection views should remain query-compatible");
+
+    assert_eq!(query.view, None);
+}
+
+#[test]
 fn store_index_object_map_filter_respects_prefix_boundaries() {
     let (hashes, object_ids) = super::filter_store_index_object_maps_for_prefix(
         HashMap::from([

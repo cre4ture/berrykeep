@@ -2245,7 +2245,7 @@ async function installServerAdminMocks(
     }
 
     if (pathname === apiV1("/auth/store/index") && method === "GET") {
-      expect(searchParams.get("view")).toBe("tree");
+      expect(["tree", "children"]).toContain(searchParams.get("view"));
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
     }
 
@@ -3558,13 +3558,13 @@ function buildAdminStoreIndexResponse(
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
-  const isTreeNavigationRequest =
-    searchParams.get("view") === "tree" &&
+  const isDirectoryNavigationRequest =
+    ["tree", "children"].includes(searchParams.get("view") ?? "") &&
     !searchParams.has("offset") &&
     !searchParams.has("limit") &&
     !searchParams.has("sort") &&
     !mediaFilter;
-  const scopedEntries = isTreeNavigationRequest
+  const scopedEntries = isDirectoryNavigationRequest
     ? projectMockStoreTreeEntries(entries, prefix, depth)
     : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter

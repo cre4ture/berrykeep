@@ -2360,8 +2360,8 @@ mod tests {
             })
             .map(|_| "docs".to_string())
             .unwrap_or_default();
-        if is_children_view {
-            entries.retain(|entry| entry.path.trim_matches('/') != "docs");
+        if is_children_view && !response_prefix.is_empty() {
+            entries.retain(|entry| entry.path.trim_matches('/') != response_prefix);
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let response = StoreIndexResponse {
@@ -2822,6 +2822,29 @@ mod tests {
                 .expect("lock poisoned")
                 .as_deref()
                 .is_some_and(|query| query.contains("view=children"))
+        );
+
+        let root_prefix = CString::new("").expect("empty prefix is valid");
+        let mut root_list_json = ptr::null_mut();
+        let mut root_list_error = ptr::null_mut();
+        let status = ironmesh_ios_facade_list_json(
+            handle,
+            root_prefix.as_ptr(),
+            1,
+            snapshot.as_ptr(),
+            &mut root_list_json,
+            &mut root_list_error,
+        );
+        assert_eq!(status, FFI_OK);
+        assert!(root_list_error.is_null());
+        let root_list_response: AppleListResponse =
+            serde_json::from_str(&read_string(root_list_json)).expect("root list should parse");
+        assert!(
+            root_list_response
+                .entries
+                .iter()
+                .any(|entry| entry.path == "docs/"),
+            "the root children projection must retain its child directories"
         );
 
         let mut metadata_json = ptr::null_mut();

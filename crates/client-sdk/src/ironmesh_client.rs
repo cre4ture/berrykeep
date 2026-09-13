@@ -5786,6 +5786,44 @@ impl IronMeshClient {
         snapshot: Option<&str>,
         options: StoreIndexRequestOptions,
     ) -> Result<StoreIndexResponse> {
+        let response = self
+            .request_store_index(prefix, depth, snapshot, &options)
+            .await?;
+
+        // `children` was introduced after the original tree projection. Older
+        // nodes reject unknown enum values while deserializing the query, so
+        // retry their established tree view and project the current marker out
+        // locally. The fallback deliberately fetches the unpaged tree: the
+        // server must apply the children projection before pagination for its
+        // offset and total to remain meaningful.
+        if options.view == Some(StoreIndexView::Children)
+            && response.status == StatusCode::BAD_REQUEST
+        {
+            let mut fallback_options = options.clone();
+            fallback_options.view = Some(StoreIndexView::Tree);
+            fallback_options.cursor = None;
+            fallback_options.page_size = None;
+            fallback_options.offset = None;
+            fallback_options.limit = None;
+
+            let fallback_response = self
+                .request_store_index(prefix, depth, snapshot, &fallback_options)
+                .await?;
+            let mut projected = decode_store_index_response(fallback_response, &fallback_options)?;
+            project_store_index_children_response(&mut projected, prefix, &options);
+            return Ok(projected);
+        }
+
+        decode_store_index_response(response, &options)
+    }
+
+    async fn request_store_index(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: &StoreIndexRequestOptions,
+    ) -> Result<BufferedTransportResponse> {
         let mut url = self.store_index_url()?;
         url.query_pairs_mut()
             .append_pair("depth", &depth.max(1).to_string());
@@ -5836,25 +5874,9 @@ impl IronMeshClient {
         append_comma_separated_labels(&mut url, "require_labels", &options.require_labels);
         append_comma_separated_labels(&mut url, "exclude_labels", &options.exclude_labels);
 
-        let response = self
-            .execute_buffered_request(Method::GET, url, Vec::new(), None)
+        self.execute_buffered_request(Method::GET, url, Vec::new(), None)
             .await
-            .context("failed to request /store/index")?;
-        if !response.status.is_success() {
-            bail!(
-                "/store/index returned non-success status: {}",
-                response.status
-            );
-        }
-
-        let mut result = serde_json::from_slice::<StoreIndexResponse>(&response.body)
-            .context("failed to parse /store/index response");
-
-        if let Ok(ref mut response) = result {
-            synthesize_missing_folder_markers_for_page(response, &options);
-        }
-
-        result
+            .context("failed to request /store/index")
     }
 
     pub fn store_index_blocking(
@@ -9904,6 +9926,58 @@ fn synthesize_missing_folder_markers_for_page(
     ensure_missing_folder_markers(&mut response.entries, &response.prefix);
     response.entry_count = response.entries.len();
     response.total_entry_count = response.total_entry_count.max(response.entry_count);
+}
+
+fn decode_store_index_response(
+    response: BufferedTransportResponse,
+    options: &StoreIndexRequestOptions,
+) -> Result<StoreIndexResponse> {
+    if !response.status.is_success() {
+        bail!(
+            "/store/index returned non-success status: {}",
+            response.status
+        );
+    }
+
+    let mut response = serde_json::from_slice::<StoreIndexResponse>(&response.body)
+        .context("failed to parse /store/index response")?;
+    synthesize_missing_folder_markers_for_page(&mut response, options);
+    Ok(response)
+}
+
+fn project_store_index_children_response(
+    response: &mut StoreIndexResponse,
+    prefix: Option<&str>,
+    requested_options: &StoreIndexRequestOptions,
+) {
+    let normalized_prefix = prefix
+        .map(str::trim)
+        .map(|value| value.trim_matches('/'))
+        .filter(|value| !value.is_empty());
+
+    if let Some(normalized_prefix) = normalized_prefix {
+        response
+            .entries
+            .retain(|entry| entry.path.trim().trim_matches('/') != normalized_prefix);
+    }
+
+    let total_entry_count = response.entries.len();
+    let offset = requested_options.offset.unwrap_or(0);
+    let limit = requested_options.limit.map(|limit| limit.max(1));
+    let page_end = limit
+        .map(|limit| offset.saturating_add(limit).min(total_entry_count))
+        .unwrap_or(total_entry_count);
+    response.entries = response
+        .entries
+        .get(offset..page_end)
+        .unwrap_or_default()
+        .to_vec();
+    response.entry_count = response.entries.len();
+    response.total_entry_count = total_entry_count;
+    response.offset = offset;
+    response.limit = limit;
+    response.has_more = page_end < total_entry_count;
+    response.next_cursor = None;
 }
 
 fn append_optional_query(url: &mut Url, key: &str, value: Option<&str>) {

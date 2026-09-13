@@ -354,6 +354,46 @@ export async function listAdminStoreEntries(
   options: StoreListRequestOptions = {}
 ): Promise<AdminStoreListResponse> {
   const view: StoreListView = options.view ?? "tree";
+  try {
+    return await fetchAdminStoreEntries(
+      prefix,
+      depth,
+      snapshot,
+      adminTokenOverride,
+      options,
+      view,
+      true
+    );
+  } catch (error) {
+    if (view !== "children" || !isHttpErrorStatus(error, 400)) {
+      throw error;
+    }
+
+    // Nodes predating `children` reject the new enum value during query
+    // deserialization. Fetch their established tree response without a page,
+    // then apply the projection before recreating the requested page locally.
+    const treeResponse = await fetchAdminStoreEntries(
+      prefix,
+      depth,
+      snapshot,
+      adminTokenOverride,
+      options,
+      "tree",
+      false
+    );
+    return projectAdminStoreIndexChildren(treeResponse, prefix, options);
+  }
+}
+
+async function fetchAdminStoreEntries(
+  prefix: string | undefined,
+  depth: number,
+  snapshot: string | null | undefined,
+  adminTokenOverride: string | undefined,
+  options: StoreListRequestOptions,
+  view: StoreListView,
+  includePagination: boolean
+): Promise<AdminStoreListResponse> {
   const query = new URLSearchParams({
     depth: String(Math.max(1, depth))
   });
@@ -364,10 +404,20 @@ export async function listAdminStoreEntries(
     query.set("snapshot", snapshot.trim());
   }
   query.set("view", view);
-  if (typeof options.offset === "number" && Number.isFinite(options.offset) && options.offset >= 0) {
+  if (
+    includePagination &&
+    typeof options.offset === "number" &&
+    Number.isFinite(options.offset) &&
+    options.offset >= 0
+  ) {
     query.set("offset", String(Math.floor(options.offset)));
   }
-  if (typeof options.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
+  if (
+    includePagination &&
+    typeof options.limit === "number" &&
+    Number.isFinite(options.limit) &&
+    options.limit > 0
+  ) {
     query.set("limit", String(Math.max(1, Math.floor(options.limit))));
   }
   if (options.sort) {
@@ -393,6 +443,47 @@ export async function listAdminStoreEntries(
   return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
     adminTokenOverride
   });
+}
+
+function projectAdminStoreIndexChildren(
+  response: AdminStoreListResponse,
+  prefix: string | undefined,
+  options: StoreListRequestOptions
+): AdminStoreListResponse {
+  const normalizedPrefix = prefix?.trim().replace(/^\/+|\/+$/g, "") ?? "";
+  const entries = normalizedPrefix
+    ? response.entries.filter(
+        (entry) => entry.path.trim().replace(/^\/+|\/+$/g, "") !== normalizedPrefix
+      )
+    : response.entries;
+  const totalEntryCount = entries.length;
+  const offset = normalizedStoreIndexOffset(options.offset);
+  const limit = normalizedStoreIndexLimit(options.limit);
+  const pageEnd = limit === null ? totalEntryCount : Math.min(totalEntryCount, offset + limit);
+  const pageEntries = entries.slice(offset, pageEnd);
+
+  return {
+    ...response,
+    entries: pageEntries,
+    entry_count: pageEntries.length,
+    total_entry_count: totalEntryCount,
+    offset,
+    limit,
+    has_more: pageEnd < totalEntryCount,
+    next_cursor: null
+  };
+}
+
+function normalizedStoreIndexOffset(offset: number | undefined): number {
+  return typeof offset === "number" && Number.isFinite(offset) && offset >= 0
+    ? Math.floor(offset)
+    : 0;
+}
+
+function normalizedStoreIndexLimit(limit: number | undefined): number | null {
+  return typeof limit === "number" && Number.isFinite(limit) && limit > 0
+    ? Math.max(1, Math.floor(limit))
+    : null;
 }
 
 export async function listAdminStoreHistoryEntries(
