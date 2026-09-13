@@ -1118,7 +1118,7 @@ fn checks_for_inspection(
                                 target.path.display()
                             ),
                             detail: format!(
-                                "Systemd has a loaded mount unit below this path, but the configured storage path currently falls back to the root filesystem. `RequiresMountsFor={}` would otherwise only depend on the root filesystem and cannot protect the intended storage device.",
+                                "Systemd has a loaded mount unit at or above this path, but the configured storage path currently falls back to the root filesystem. `RequiresMountsFor={}` would otherwise only depend on the root filesystem and cannot protect the intended storage device.",
                                 target.path.display()
                             ),
                             configured_path: Some(target.path.display().to_string()),
