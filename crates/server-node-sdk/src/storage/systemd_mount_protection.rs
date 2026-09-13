@@ -30,7 +30,7 @@ use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDepend
 #[cfg(target_os = "linux")]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(target_os = "linux", test))]
-const PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
+const PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(all(target_os = "linux", not(test)))]
 const MOUNT_PROTECTION_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -1084,13 +1084,13 @@ fn checks_for_inspection(
                         id: target.id.clone(),
                         feature: target.feature.clone(),
                         status: HostDependencyStatus::Missing,
-                        severity: target.missing_severity,
+                        severity: HostDependencySeverity::Info,
                         summary: format!(
                             "Could not resolve the filesystem path for {}",
                             target.path.display()
                         ),
                         detail: format!(
-                            "The storage path could not be resolved to its physical filesystem: {}. Mount protection has not been verified, so the path is not treated as root-backed.",
+                            "The storage path could not be resolved to its physical filesystem: {}. Mount protection has not been verified, so the path is not treated as root-backed or as a confirmed protection gap.",
                             target
                                 .path_resolution_error
                                 .as_deref()
@@ -1099,9 +1099,8 @@ fn checks_for_inspection(
                         configured_path: Some(target.path.display().to_string()),
                         resolved_path: None,
                         install_hint: Some(format!(
-                            "Confirm that {} resolves to the intended storage filesystem. {}",
+                            "Retry once {} is responsive. If this persists, confirm that the path resolves to the intended storage filesystem before changing its service dependencies.",
                             target.path.display(),
-                            requires_mounts_for_remedy(&service, &target.path)
                         )),
                     },
                     None
@@ -1710,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_path_is_not_treated_as_root_backed() {
+    fn unresolved_path_is_informational_and_not_treated_as_root_backed() {
         let target = MountProtectionTarget {
             id: "systemd-mount-storage-primary".to_string(),
             feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
@@ -1727,8 +1726,15 @@ mod tests {
         );
 
         assert_eq!(checks[0].status, HostDependencyStatus::Missing);
-        assert_eq!(checks[0].severity, HostDependencySeverity::Critical);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Info);
         assert!(checks[0].summary.contains("Could not resolve"));
+        assert!(
+            checks[0]
+                .install_hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Retry once")
+        );
     }
 
     #[test]
