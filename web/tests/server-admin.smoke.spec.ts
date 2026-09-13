@@ -810,6 +810,47 @@ test("server-admin Dependencies lists systemd mount findings and remedies per pr
   await expect(page.getByText(/RequiresMountsFor=\/mnt\/archive/)).toBeVisible();
 });
 
+test("server-admin Dependencies keeps informational tooling visible with mount-protection attention", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    hostDependencyChecks: [
+      {
+        id: "natural-earth-gdal",
+        feature: "Natural Earth map conversion (GDAL)",
+        status: "missing",
+        severity: "info",
+        summary: "Optional GDAL tooling unavailable",
+        detail: "This optional feature needs gdal-bin.",
+        configured_path: "gdal_rasterize",
+        resolved_path: null,
+        install_hint: "Install gdal-bin."
+      },
+      {
+        id: "systemd-mount-data-dir",
+        feature: "Systemd mount protection: IRONMESH_DATA_DIR",
+        status: "missing",
+        severity: "critical",
+        summary: "Data directory needs mount protection",
+        detail: "The node state must be protected.",
+        configured_path: "/srv/berrykeep",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/srv/berrykeep`."
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Dependencies", { exact: true }).click();
+  await expect(page.getByText("Storage mount protection needs attention", { exact: true })).toBeVisible();
+  await expect(page.getByText("Informational host tooling unavailable", { exact: true })).toBeVisible();
+  await expect(page.getByText("Optional GDAL tooling unavailable", { exact: true })).toBeVisible();
+});
+
 test("server-admin dashboard filters dependency findings by severity", async ({ page }) => {
   await installServerAdminMocks(page, {
     hostDependencyChecks: [

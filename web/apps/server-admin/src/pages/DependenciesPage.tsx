@@ -52,12 +52,14 @@ export function DependenciesPage() {
           {attentionChecks.length} mount-protection finding{attentionChecks.length === 1 ? " needs" : "s need"} action.
           Review the affected paths and remedies below before restarting or relying on this node.
         </Alert>
-      ) : informationalMissingCount > 0 ? (
+      ) : null}
+      {informationalMissingCount > 0 ? (
         <Alert color="blue" title="Informational host tooling unavailable">
           {informationalMissingCount} optional host tool{informationalMissingCount === 1 ? " is" : "s are"} unavailable.
           These checks describe affected optional features and do not indicate a storage mount-protection warning.
         </Alert>
-      ) : report ? (
+      ) : null}
+      {report && attentionChecks.length === 0 && informationalMissingCount === 0 ? (
         <Alert color={berrykeepPrimaryColor} title="Host dependency checks passed">
           No host dependency finding currently needs attention.
         </Alert>
@@ -171,7 +173,7 @@ export function DependenciesPage() {
                 </Table.Td>
                 <Table.Td>
                   {check.install_hint ? (
-                    <Text c={dependencyRemedyColor(check.severity)} size="xs">
+                    <Text c={dependencyRemedyColor(check.status, check.severity)} size="xs">
                       {check.install_hint}
                     </Text>
                   ) : (
@@ -200,7 +202,7 @@ function dependencyBadgeColor(status: HostDependencyStatus, severity?: HostDepen
     case "ready":
       return berrykeepPrimaryColor;
     case "missing":
-      return "blue";
+      return "yellow";
     case "builtin":
       return "blue";
     case "optional":
@@ -242,8 +244,11 @@ function dependencySeverityLabel(severity?: HostDependencySeverity | null): stri
   return severity ?? "info";
 }
 
-function dependencyRemedyColor(severity?: HostDependencySeverity | null): string {
-  return isAttentionSeverity(severity) ? (severity === "critical" ? "red" : "yellow") : "dimmed";
+function dependencyRemedyColor(status: HostDependencyStatus, severity?: HostDependencySeverity | null): string {
+  if (isAttentionSeverity(severity)) {
+    return severity === "critical" ? "red" : "yellow";
+  }
+  return status === "missing" ? "yellow" : "dimmed";
 }
 
 function isAttentionSeverity(severity?: HostDependencySeverity | null): boolean {
