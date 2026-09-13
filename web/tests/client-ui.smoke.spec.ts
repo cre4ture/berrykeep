@@ -1851,34 +1851,6 @@ test("client-ui explorer requests paged children instead of the complete index",
   expect(requestPages.every((request) => request.view === "children")).toBe(true);
 });
 
-test("client-ui explorer falls back to tree on older store nodes", async ({ page }) => {
-  const requests: URL[] = [];
-  page.on("request", (request) => {
-    const url = new URL(request.url());
-    if (url.pathname === apiV1("/store/list")) {
-      requests.push(url);
-    }
-  });
-
-  await installClientUiMocks(page, {
-    storeEntries: createGalleryPaginationMockStoreEntries(250),
-    rejectChildrenStoreIndex: true
-  });
-  await page.goto("/");
-  await page.getByText("Explorer", { exact: true }).click();
-  await page.getByRole("textbox", { name: "Depth" }).fill("64");
-  await page.getByRole("button", { name: "Load entries" }).click();
-
-  await expect(page.locator('[data-explorer-pagination="true"]')).toContainText("Showing 1–100 of");
-  await expect.poll(() => requests.some((request) => request.searchParams.get("view") === "tree")).toBe(
-    true
-  );
-  expect(requests.some((request) => request.searchParams.get("view") === "children")).toBe(true);
-  const fallback = requests.find((request) => request.searchParams.get("view") === "tree");
-  expect(fallback?.searchParams.has("offset")).toBe(false);
-  expect(fallback?.searchParams.has("limit")).toBe(false);
-});
-
 test("client-ui explorer refreshes history while paging current entries", async ({ page }) => {
   let historyRequestCount = 0;
   page.on("request", (request) => {
@@ -2226,7 +2198,6 @@ type InstallClientUiMocksOptions = {
   mapClusterRefreshDelayMs?: number;
   mapClusterEntriesDelayMs?: number;
   legacyGalleryMapApiOnly?: boolean;
-  rejectChildrenStoreIndex?: boolean;
 };
 
 type MockHistoryEntry = {
@@ -2906,14 +2877,6 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     if (pathname === apiV1("/store/list") && method === "GET") {
       expect(["tree", "children"]).toContain(searchParams.get("view"));
       galleryStoreListRequestCount += 1;
-      if (options?.rejectChildrenStoreIndex && searchParams.get("view") === "children") {
-        await route.fulfill({
-          status: 400,
-          contentType: "application/json",
-          body: JSON.stringify({ error: "unknown variant `children`" })
-        });
-        return;
-      }
       if (galleryOffline) {
         await route.fulfill({
           status: 503,

@@ -2,9 +2,7 @@ import { fetchJson, isHttpErrorStatus } from "../shared/http";
 import type { GalleryMapConfigurationResponse } from "../shared/map-config";
 import {
   galleryMapClusterCellSizeParameter,
-  galleryMapClusterZoomParameters,
-  projectStoreIndexChildren,
-  storeIndexViewWasRejected
+  galleryMapClusterZoomParameters
 } from "../shared/store-index";
 import type {
   GalleryMapClusterEntriesResponse,
@@ -300,29 +298,6 @@ export async function listStoreEntries(
   options: StoreListRequestOptions = {}
 ): Promise<StoreListResponse> {
   const view: StoreListView = options.view ?? "tree";
-  try {
-    return await fetchStoreEntries(prefix, depth, snapshot, options, view, true);
-  } catch (error) {
-    if (view !== "children" || !storeIndexViewWasRejected(error, view)) {
-      throw error;
-    }
-
-    // Nodes predating `children` reject the new enum value during query
-    // deserialization. Fetch their established tree response without a page,
-    // then apply the projection before recreating the requested page locally.
-    const treeResponse = await fetchStoreEntries(prefix, depth, snapshot, options, "tree", false);
-    return projectStoreIndexChildren(treeResponse, prefix, options);
-  }
-}
-
-async function fetchStoreEntries(
-  prefix: string | undefined,
-  depth: number,
-  snapshot: string | null | undefined,
-  options: StoreListRequestOptions,
-  view: StoreListView,
-  includePagination: boolean
-): Promise<StoreListResponse> {
   const query = new URLSearchParams({
     depth: String(Math.max(1, depth))
   });
@@ -333,20 +308,10 @@ async function fetchStoreEntries(
     query.set("snapshot", snapshot.trim());
   }
   query.set("view", view);
-  if (
-    includePagination &&
-    typeof options.offset === "number" &&
-    Number.isFinite(options.offset) &&
-    options.offset >= 0
-  ) {
+  if (typeof options.offset === "number" && Number.isFinite(options.offset) && options.offset >= 0) {
     query.set("offset", String(Math.floor(options.offset)));
   }
-  if (
-    includePagination &&
-    typeof options.limit === "number" &&
-    Number.isFinite(options.limit) &&
-    options.limit > 0
-  ) {
+  if (typeof options.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
     query.set("limit", String(Math.max(1, Math.floor(options.limit))));
   }
   if (options.sort) {
