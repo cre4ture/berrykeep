@@ -460,7 +460,10 @@ fn mount_protection_targets(
                     mount_point: mount_points
                         .as_deref()
                         .and_then(|mount_points| mount_point_for_path(&path, mount_points)),
-                    allows_root_filesystem: path == storage_data_dir || path == Path::new("/"),
+                    allows_root_filesystem: storage_path_allows_root_filesystem(
+                        &path,
+                        &storage_data_dir,
+                    ),
                     path,
                     missing_severity: match configured_path.state {
                         StoragePathState::Active => HostDependencySeverity::Critical,
@@ -471,6 +474,11 @@ fn mount_protection_targets(
             }),
     );
     targets
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn storage_path_allows_root_filesystem(path: &Path, data_dir: &Path) -> bool {
+    path.starts_with(data_dir) || path == Path::new("/")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -972,6 +980,14 @@ mod tests {
 
     #[test]
     fn root_filesystem_exemption_does_not_mask_a_distinct_storage_pool() {
+        assert!(storage_path_allows_root_filesystem(
+            Path::new("/var/lib/berrykeep/pool-a"),
+            Path::new("/var/lib/berrykeep"),
+        ));
+        assert!(!storage_path_allows_root_filesystem(
+            Path::new("/mnt/primary"),
+            Path::new("/var/lib/berrykeep"),
+        ));
         let targets = vec![
             MountProtectionTarget {
                 id: "systemd-mount-data-dir".to_string(),
@@ -986,6 +1002,14 @@ mod tests {
                 feature: "Systemd mount protection: storage pool `legacy-primary` (active)"
                     .to_string(),
                 path: PathBuf::from("/var/lib/berrykeep"),
+                mount_point: Some(PathBuf::from("/")),
+                allows_root_filesystem: true,
+                missing_severity: HostDependencySeverity::Critical,
+            },
+            MountProtectionTarget {
+                id: "systemd-mount-storage-data-child".to_string(),
+                feature: "Systemd mount protection: storage pool `data-child` (active)".to_string(),
+                path: PathBuf::from("/var/lib/berrykeep/pool-a"),
                 mount_point: Some(PathBuf::from("/")),
                 allows_root_filesystem: true,
                 missing_severity: HostDependencySeverity::Critical,
@@ -1022,6 +1046,16 @@ mod tests {
         assert_eq!(storage.status, HostDependencyStatus::NotApplicable);
         assert_eq!(storage.severity, HostDependencySeverity::Info);
         assert!(storage.install_hint.is_none());
+
+        let data_child_storage = checks
+            .iter()
+            .find(|check| check.id == "systemd-mount-storage-data-child")
+            .unwrap();
+        assert_eq!(
+            data_child_storage.status,
+            HostDependencyStatus::NotApplicable
+        );
+        assert_eq!(data_child_storage.severity, HostDependencySeverity::Info);
 
         let missing_storage = checks
             .iter()
