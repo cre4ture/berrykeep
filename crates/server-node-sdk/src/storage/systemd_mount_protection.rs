@@ -219,14 +219,15 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
         [
             "show",
             "--all",
-            "--type=mount",
             "--property=Id",
             "--property=Where",
+            "--",
+            "*.mount",
         ],
     )
     .await
     {
-        Ok(output) => match host_mount_points_from_properties(&output) {
+        Ok(output) => match nonempty_host_mount_points_from_properties(&output) {
             Ok(mount_points) => mount_points,
             Err(reason) => {
                 return SystemdMountProtectionInspection::QueryFailed {
@@ -452,6 +453,18 @@ fn host_mount_points_from_properties(properties: &str) -> Result<BTreeSet<PathBu
     }
 
     Ok(mount_points)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn nonempty_host_mount_points_from_properties(
+    properties: &str,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let mount_points = host_mount_points_from_properties(properties)?;
+    if mount_points.is_empty() {
+        Err("systemctl did not report any host mount units".to_string())
+    } else {
+        Ok(mount_points)
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1129,6 +1142,13 @@ mod tests {
             mount_points,
             BTreeSet::from([PathBuf::from("/srv"), PathBuf::from("/mnt/primary")])
         );
+    }
+
+    #[test]
+    fn empty_host_mount_properties_fail_closed() {
+        let error = nonempty_host_mount_points_from_properties("").unwrap_err();
+
+        assert!(error.contains("did not report any host mount units"));
     }
 
     #[test]
