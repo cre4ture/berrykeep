@@ -64,6 +64,7 @@ type StorageHistoryRangeKey = "24h" | "7d" | "30d" | "90d" | "1y" | "all";
 const STORAGE_HISTORY_MAX_POINTS = 360;
 const DASHBOARD_CHART_REFRESH_INTERVAL_MS = 3_000;
 const DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS = 30_000;
+const HOST_DEPENDENCY_REPORT_STALE_TIME_MS = 5 * 60_000;
 const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
   key: StorageHistoryRangeKey;
   label: string;
@@ -197,7 +198,7 @@ export function DashboardPage() {
     queryKey: ["dashboard", "host-dependencies", normalizedAdminTokenOverride],
     queryFn: () => getHostDependencyReport(normalizedAdminTokenOverride || undefined),
     enabled: canInspectCluster,
-    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
+    staleTime: HOST_DEPENDENCY_REPORT_STALE_TIME_MS
   });
 
   async function refresh() {

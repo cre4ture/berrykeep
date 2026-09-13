@@ -30,10 +30,14 @@ enum SystemdMountProtectionInspection {
     SystemctlMissing {
         service: String,
     },
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", test))]
     QueryFailed {
         service: String,
         reason: String,
+    },
+    #[cfg(any(target_os = "linux", test))]
+    UserManagedService {
+        service: String,
     },
     #[cfg(any(target_os = "linux", test))]
     Dependencies {
@@ -69,8 +73,7 @@ struct MountProtectionTarget {
     id: String,
     feature: String,
     path: PathBuf,
-    is_on_root_filesystem: bool,
-    allows_root_filesystem: bool,
+    mount_point: Option<PathBuf>,
     missing_severity: HostDependencySeverity,
 }
 
@@ -110,7 +113,23 @@ async fn mount_protection_checks_for_current_process(
     storage_paths: &[StoragePathConfig],
 ) -> Vec<HostDependencyCheck> {
     let inspection = inspect_current_process().await;
-    let targets = mount_protection_targets(data_dir, storage_paths);
+    let targets = match &inspection {
+        SystemdMountProtectionInspection::Dependencies { service, .. } => {
+            match mount_protection_targets_for_current_process(data_dir, storage_paths).await {
+                Ok(targets) => targets,
+                Err(reason) => {
+                    return checks_for_inspection(
+                        &[],
+                        SystemdMountProtectionInspection::QueryFailed {
+                            service: service.clone(),
+                            reason,
+                        },
+                    );
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
     checks_for_inspection(&targets, inspection)
 }
 
@@ -119,6 +138,12 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
     let Some(service) = current_systemd_service() else {
         return SystemdMountProtectionInspection::NotManagedBySystemd;
     };
+
+    if service.manager == SystemdServiceManager::User {
+        return SystemdMountProtectionInspection::UserManagedService {
+            service: service.name,
+        };
+    }
 
     let Some(systemctl) = resolve_host_dependency_path(Path::new("systemctl")) else {
         return SystemdMountProtectionInspection::SystemctlMissing {
@@ -156,6 +181,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
     }
     let mut where_arguments = Vec::with_capacity(mount_units.len() + 5);
     where_arguments.extend(["show", "--all", "--property=Id", "--property=Where"]);
+    where_arguments.push("--");
     where_arguments.extend(mount_units.iter().map(String::as_str));
     let where_output =
         match run_systemctl(&systemctl, service.systemctl_arguments(where_arguments)).await {
@@ -336,16 +362,16 @@ fn mount_dependencies_from_properties(
             return Err(format!("unexpected systemctl output line `{line}`"));
         };
         match property {
-            "Id" => {
-                finish_mount_dependency(
-                    &expected_units,
-                    &mut dependencies,
-                    &mut unit,
-                    &mut where_path,
-                )?;
-                unit = Some(value.to_string());
+            "Id" if unit.replace(value.to_string()).is_some() => {
+                return Err("systemctl reported Id more than once for one mount unit".to_string());
             }
-            "Where" => where_path = Some(PathBuf::from(value)),
+            "Id" => {}
+            "Where" if where_path.replace(PathBuf::from(value)).is_some() => {
+                return Err(
+                    "systemctl reported Where more than once for one mount unit".to_string()
+                );
+            }
+            "Where" => {}
             _ => return Err(format!("unexpected systemctl property `{property}`")),
         }
     }
@@ -401,12 +427,14 @@ fn mount_protection_targets(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
 ) -> Vec<MountProtectionTarget> {
+    let mount_points = mount_points_for_current_process();
     let data_dir = resolved_mount_protection_path(data_dir);
     let mut targets = vec![MountProtectionTarget {
         id: "systemd-mount-data-dir".to_string(),
         feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
-        is_on_root_filesystem: path_is_on_root_filesystem(&data_dir),
-        allows_root_filesystem: true,
+        mount_point: mount_points
+            .as_deref()
+            .and_then(|mount_points| mount_point_for_path(&data_dir, mount_points)),
         path: data_dir,
         missing_severity: HostDependencySeverity::Critical,
     }];
@@ -424,8 +452,9 @@ fn mount_protection_targets(
                         configured_path.id,
                         storage_path_state_label(configured_path.state)
                     ),
-                    is_on_root_filesystem: path_is_on_root_filesystem(&path),
-                    allows_root_filesystem: path == Path::new("/"),
+                    mount_point: mount_points
+                        .as_deref()
+                        .and_then(|mount_points| mount_point_for_path(&path, mount_points)),
                     path,
                     missing_severity: match configured_path.state {
                         StoragePathState::Active => HostDependencySeverity::Critical,
@@ -436,6 +465,18 @@ fn mount_protection_targets(
             }),
     );
     targets
+}
+
+#[cfg(any(target_os = "linux", test))]
+async fn mount_protection_targets_for_current_process(
+    data_dir: &Path,
+    storage_paths: &[StoragePathConfig],
+) -> Result<Vec<MountProtectionTarget>, String> {
+    let data_dir = data_dir.to_path_buf();
+    let storage_paths = storage_paths.to_vec();
+    tokio::task::spawn_blocking(move || mount_protection_targets(&data_dir, &storage_paths))
+        .await
+        .map_err(|error| format!("mount protection path inspection failed: {error}"))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -468,22 +509,17 @@ fn absolutize_mount_protection_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn path_is_on_root_filesystem(path: &Path) -> bool {
+fn mount_points_for_current_process() -> Option<Vec<PathBuf>> {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_to_string("/proc/self/mountinfo")
             .ok()
-            .and_then(|contents| {
-                mount_point_for_path(path, &mount_points_from_mountinfo(&contents))
-            })
-            .as_deref()
-            == Some(Path::new("/"))
+            .map(|contents| mount_points_from_mountinfo(&contents))
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = path;
-        false
+        None
     }
 }
 
@@ -512,7 +548,7 @@ fn unescape_mountinfo_path(value: &str) -> String {
         .replace("\\134", "\\")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn mount_point_for_path(path: &Path, mount_points: &[PathBuf]) -> Option<PathBuf> {
     mount_points
         .iter()
@@ -555,7 +591,7 @@ fn checks_for_inspection(
                 install_hint: Some("Install or restore the systemd client tools that provide `systemctl`, then refresh this report.".to_string()),
             }]
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", test))]
         SystemdMountProtectionInspection::QueryFailed { service, reason } => {
             vec![HostDependencyCheck {
                 id: "systemd-mount-protection".to_string(),
@@ -576,10 +612,26 @@ fn checks_for_inspection(
             }]
         }
         #[cfg(any(target_os = "linux", test))]
+        SystemdMountProtectionInspection::UserManagedService { service } => {
+            vec![HostDependencyCheck {
+                id: "systemd-mount-protection".to_string(),
+                feature: "Systemd mount protection".to_string(),
+                status: HostDependencyStatus::NotApplicable,
+                severity: HostDependencySeverity::Info,
+                summary: format!(
+                    "The running service `{service}` is managed by a systemd user manager"
+                ),
+                detail: "Systemd user managers do not manage mount units, so a user service cannot express the system-level mount protection checked for server nodes.".to_string(),
+                configured_path: Some(service),
+                resolved_path: None,
+                install_hint: None,
+            }]
+        }
+        #[cfg(any(target_os = "linux", test))]
         SystemdMountProtectionInspection::Dependencies { service, mounts } => targets
             .iter()
             .map(|target| {
-                let protecting_mount = protecting_mount_dependency(&target.path, &mounts);
+                let protecting_mount = protecting_mount_dependency(target, &mounts);
                 match protecting_mount {
                     Some(mount) => HostDependencyCheck {
                         id: target.id.clone(),
@@ -600,7 +652,7 @@ fn checks_for_inspection(
                         )),
                         install_hint: None,
                     },
-                    None if target.is_on_root_filesystem && target.allows_root_filesystem => HostDependencyCheck {
+                    None if target.mount_point.as_deref() == Some(Path::new("/")) => HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
                         status: HostDependencyStatus::NotApplicable,
@@ -641,13 +693,19 @@ fn checks_for_inspection(
 
 #[cfg(any(target_os = "linux", test))]
 fn protecting_mount_dependency<'a>(
-    target: &Path,
+    target: &MountProtectionTarget,
     mounts: &'a [SystemdMountDependency],
 ) -> Option<&'a SystemdMountDependency> {
-    mounts
-        .iter()
-        .filter(|mount| mount.where_path != Path::new("/") && target.starts_with(&mount.where_path))
-        .max_by_key(|mount| mount.where_path.components().count())
+    match target.mount_point.as_deref() {
+        Some(mount_point) if mount_point == Path::new("/") => None,
+        Some(mount_point) => mounts.iter().find(|mount| mount.where_path == mount_point),
+        None => mounts
+            .iter()
+            .filter(|mount| {
+                mount.where_path != Path::new("/") && target.path.starts_with(&mount.where_path)
+            })
+            .max_by_key(|mount| mount.where_path.components().count()),
+    }
 }
 
 #[cfg(test)]
@@ -671,9 +729,9 @@ mod tests {
         }
     }
 
-    fn targets_off_root_filesystem(targets: &mut [MountProtectionTarget]) {
+    fn targets_without_known_mount_point(targets: &mut [MountProtectionTarget]) {
         for target in targets {
-            target.is_on_root_filesystem = false;
+            target.mount_point = None;
         }
     }
 
@@ -708,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_a_user_managed_service_and_queries_its_user_manager() {
+    fn user_managed_service_is_not_applicable_for_mount_protection() {
         let service = systemd_service_from_cgroups(
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/berrykeep-server-node.service\n",
         )
@@ -716,10 +774,14 @@ mod tests {
 
         assert_eq!(service.name, "berrykeep-server-node.service");
         assert_eq!(service.manager, SystemdServiceManager::User);
-        assert_eq!(
-            service.systemctl_arguments(["show", "berrykeep-server-node.service"]),
-            vec!["--user", "show", "berrykeep-server-node.service"]
+        let checks = checks_for_inspection(
+            &[],
+            SystemdMountProtectionInspection::UserManagedService {
+                service: service.name,
+            },
         );
+        assert_eq!(checks[0].status, HostDependencyStatus::NotApplicable);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Info);
     }
 
     #[test]
@@ -741,7 +803,7 @@ mod tests {
                 StoragePathState::Active,
             )],
         );
-        targets_off_root_filesystem(&mut targets);
+        targets_without_known_mount_point(&mut targets);
         let checks = checks_for_inspection(
             &targets,
             SystemdMountProtectionInspection::NotManagedBySystemd,
@@ -762,7 +824,7 @@ mod tests {
                 StoragePathState::Active,
             )],
         );
-        targets_off_root_filesystem(&mut targets);
+        targets_without_known_mount_point(&mut targets);
         let checks = checks_for_inspection(
             &targets,
             SystemdMountProtectionInspection::Dependencies {
@@ -792,7 +854,7 @@ mod tests {
                 storage_path("retired", "/mnt/retired", StoragePathState::Disabled),
             ],
         );
-        targets_off_root_filesystem(&mut targets);
+        targets_without_known_mount_point(&mut targets);
         let checks = checks_for_inspection(
             &targets,
             SystemdMountProtectionInspection::Dependencies {
@@ -848,7 +910,7 @@ mod tests {
                 "mnt-primary.mount".to_string(),
                 "mnt-archive.mount".to_string(),
             ],
-            "Id=mnt-archive.mount\nWhere=/mnt/archive\n\nId=mnt-primary.mount\nWhere=/mnt/primary\n",
+            "Where=/mnt/archive\nId=mnt-archive.mount\n\nWhere=/mnt/primary\nId=mnt-primary.mount\n",
         )
         .unwrap();
 
@@ -873,22 +935,20 @@ mod tests {
     }
 
     #[test]
-    fn root_filesystem_target_is_informational_but_other_paths_stay_protected() {
+    fn root_filesystem_storage_and_data_targets_are_informational() {
         let targets = vec![
             MountProtectionTarget {
                 id: "systemd-mount-data-dir".to_string(),
                 feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
                 path: PathBuf::from("/var/lib/berrykeep"),
-                is_on_root_filesystem: true,
-                allows_root_filesystem: true,
+                mount_point: Some(PathBuf::from("/")),
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
                 id: "systemd-mount-storage-primary".to_string(),
                 feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
                 path: PathBuf::from("/mnt/primary"),
-                is_on_root_filesystem: true,
-                allows_root_filesystem: false,
+                mount_point: Some(PathBuf::from("/")),
                 missing_severity: HostDependencySeverity::Critical,
             },
         ];
@@ -912,8 +972,38 @@ mod tests {
             .iter()
             .find(|check| check.id == "systemd-mount-storage-primary")
             .unwrap();
-        assert_eq!(storage.status, HostDependencyStatus::Missing);
-        assert_eq!(storage.severity, HostDependencySeverity::Critical);
+        assert_eq!(storage.status, HostDependencyStatus::NotApplicable);
+        assert_eq!(storage.severity, HostDependencySeverity::Info);
+        assert!(storage.install_hint.is_none());
+    }
+
+    #[test]
+    fn nested_storage_mount_requires_its_exact_mount_dependency() {
+        let target = MountProtectionTarget {
+            id: "systemd-mount-storage-primary".to_string(),
+            feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
+            path: PathBuf::from("/srv/pool/media"),
+            mount_point: Some(PathBuf::from("/srv/pool")),
+            missing_severity: HostDependencySeverity::Critical,
+        };
+        let checks = checks_for_inspection(
+            std::slice::from_ref(&target),
+            SystemdMountProtectionInspection::Dependencies {
+                service: "berrykeep-server-node.service".to_string(),
+                mounts: vec![systemd_mount("srv.mount", "/srv")],
+            },
+        );
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Critical);
+
+        let checks = checks_for_inspection(
+            &[target],
+            SystemdMountProtectionInspection::Dependencies {
+                service: "berrykeep-server-node.service".to_string(),
+                mounts: vec![systemd_mount("srv-pool.mount", "/srv/pool")],
+            },
+        );
+        assert_eq!(checks[0].status, HostDependencyStatus::Ready);
     }
 
     #[test]
@@ -924,21 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_pool_explicitly_configured_at_root_allows_the_root_filesystem() {
-        let targets = mount_protection_targets(
-            Path::new("/var/lib/berrykeep"),
-            &[storage_path("primary", "/", StoragePathState::Active)],
-        );
-
-        let storage = targets
-            .iter()
-            .find(|target| target.id == "systemd-mount-storage-primary")
-            .unwrap();
-        assert!(storage.allows_root_filesystem);
-    }
-
     #[cfg(target_os = "linux")]
-    #[test]
     fn mountinfo_parser_reads_the_mount_point_field() {
         let mount_points = mount_points_from_mountinfo(
             "36 25 0:32 / /mnt/storage rw,nosuid,nodev - ext4 /dev/sda1 rw\n",
