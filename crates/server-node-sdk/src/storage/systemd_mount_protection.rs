@@ -53,6 +53,7 @@ struct MountProtectionTarget {
     feature: String,
     path: PathBuf,
     is_on_root_filesystem: bool,
+    allows_root_filesystem: bool,
     missing_severity: HostDependencySeverity,
 }
 
@@ -344,6 +345,7 @@ fn mount_protection_targets(
         id: "systemd-mount-data-dir".to_string(),
         feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
         is_on_root_filesystem: path_is_on_root_filesystem(&data_dir),
+        allows_root_filesystem: true,
         path: data_dir,
         missing_severity: HostDependencySeverity::Critical,
     }];
@@ -362,6 +364,7 @@ fn mount_protection_targets(
                         storage_path_state_label(configured_path.state)
                     ),
                     is_on_root_filesystem: path_is_on_root_filesystem(&path),
+                    allows_root_filesystem: path == Path::new("/"),
                     path,
                     missing_severity: match configured_path.state {
                         StoragePathState::Active => HostDependencySeverity::Critical,
@@ -537,7 +540,7 @@ fn checks_for_inspection(
                         )),
                         install_hint: None,
                     },
-                    None if target.is_on_root_filesystem => HostDependencyCheck {
+                    None if target.is_on_root_filesystem && target.allows_root_filesystem => HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
                         status: HostDependencyStatus::NotApplicable,
@@ -816,13 +819,15 @@ mod tests {
                 feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
                 path: PathBuf::from("/var/lib/berrykeep"),
                 is_on_root_filesystem: true,
+                allows_root_filesystem: true,
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
                 id: "systemd-mount-storage-primary".to_string(),
                 feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
                 path: PathBuf::from("/mnt/primary"),
-                is_on_root_filesystem: false,
+                is_on_root_filesystem: true,
+                allows_root_filesystem: false,
                 missing_severity: HostDependencySeverity::Critical,
             },
         ];
@@ -855,6 +860,20 @@ mod tests {
         let path = resolved_mount_protection_path(Path::new("./data/server-node"));
 
         assert!(path.is_absolute());
+    }
+
+    #[test]
+    fn storage_pool_explicitly_configured_at_root_allows_the_root_filesystem() {
+        let targets = mount_protection_targets(
+            Path::new("/var/lib/berrykeep"),
+            &[storage_path("primary", "/", StoragePathState::Active)],
+        );
+
+        let storage = targets
+            .iter()
+            .find(|target| target.id == "systemd-mount-storage-primary")
+            .unwrap();
+        assert!(storage.allows_root_filesystem);
     }
 
     #[cfg(target_os = "linux")]
