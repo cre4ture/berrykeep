@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGE_NAME="rendezvous-service"
 BINARY_NAME="berrykeep-rendezvous-service"
-LEGACY_BINARY_NAME="berrykeep-rendezvous-service"
+LEGACY_BINARY_NAME="ironmesh-rendezvous-service"
 MANIFEST_PATH="${ROOT_DIR}/apps/rendezvous-service/Cargo.toml"
 
 TARGET_TRIPLE="${BERRYKEEP_RENDEZVOUS_DEPLOY_TARGET:-${BERRYKEEP_RENDEZVOUS_TARGET:-x86_64-unknown-linux-musl}}"
@@ -111,7 +111,7 @@ Notes:
   script handles the backgrounding with nohup itself.
   If you provide a custom --remote-start-cmd, make it end in exec <binary> so
   the pid file tracks the service process rather than a wrapper shell.
-  Deployments also update a sibling berrykeep-rendezvous-service symlink and
+  Deployments also update a sibling ironmesh-rendezvous-service symlink and
   stop its former pid file, allowing existing service definitions to transition
   to the BerryKeep binary without a coordinated remote edit.
   Supplying --remote-match-pattern disables inferred legacy paths so the
