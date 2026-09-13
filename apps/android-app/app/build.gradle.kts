@@ -248,8 +248,9 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        // Retain the installed package identity so existing Android devices receive
-        // BerryKeep as an update and keep their private data and SAF grants.
+        // Retain the published package identity while the Android distribution
+        // channel is migrated. This does not preserve client state or SAF grants:
+        // the BerryKeep client requires a fresh installation.
         applicationId = "io.ironmesh.android"
         minSdk = 26
         targetSdk = 34
