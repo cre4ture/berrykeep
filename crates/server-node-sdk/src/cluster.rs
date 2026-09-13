@@ -633,15 +633,13 @@ impl ClusterService {
     fn current_replica_nodes_for_subject(&self, key: &str) -> HashSet<NodeId> {
         // Remembered historical claims remain useful for source discovery, but
         // only a current availability claim can satisfy a durability obligation.
+        // Keep that claim while its peer is temporarily offline: placement itself
+        // already excludes offline targets, and dropping the claim here would
+        // turn a restart into an immediate backfill/cleanup cycle.
         self.available_by_key
             .get(key)
             .into_iter()
             .flatten()
-            .filter(|id| {
-                self.nodes
-                    .get(id)
-                    .is_some_and(|node| node.status == NodeStatus::Online)
-            })
             .copied()
             .collect()
     }
@@ -1614,6 +1612,50 @@ mod tests {
                 .any(|n| n.node_id == node_b),
             "the stale claim is still useful for hash-level source discovery"
         );
+    }
+
+    #[test]
+    fn replication_plan_keeps_current_offline_availability_until_the_claim_is_removed() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 2,
+                ..ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+
+        let key = (0..10_000)
+            .map(|index| format!("offline-availability-{index}"))
+            .find(|candidate| {
+                let selected = svc.placement_for_key(candidate).selected_nodes;
+                selected.contains(&node_a) && selected.contains(&node_b)
+            })
+            .expect("failed to find a key initially placed on node_a and node_b");
+        svc.replace_node_available_view(node_a, std::slice::from_ref(&key));
+        svc.replace_node_available_view(node_b, std::slice::from_ref(&key));
+        svc.nodes.get_mut(&node_b).unwrap().status = NodeStatus::Offline;
+
+        let while_unreachable = svc.replication_plan(std::slice::from_ref(&key));
+        assert_eq!(while_unreachable.under_replicated, 0);
+        assert!(
+            while_unreachable.items.is_empty(),
+            "a temporarily unreachable node with a current availability claim must not trigger a backfill: {:#?}",
+            while_unreachable.items
+        );
+
+        svc.replace_node_available_view(node_b, &[]);
+        let after_claim_removed = svc.replication_plan(std::slice::from_ref(&key));
+        assert_eq!(after_claim_removed.under_replicated, 1);
+        assert_eq!(after_claim_removed.items[0].missing_nodes, vec![node_c]);
     }
 
     #[test]
