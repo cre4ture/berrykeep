@@ -356,7 +356,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/%69ronmesh-favicon.svg")
+                    .uri("/%62errykeep-favicon.svg")
                     .body(Body::empty())
                     .unwrap(),
             )
