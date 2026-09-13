@@ -16,10 +16,19 @@ printf '%s\n' \
   '-----END PGP SIGNATURE-----' \
   > "${REPO_DIR}/dists/test/InRelease"
 
-for command_name in rsync ssh curl gpg gpgv; do
+for command_name in ssh curl gpg gpgv; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "${MOCK_BIN_DIR}/${command_name}"
   chmod +x "${MOCK_BIN_DIR}/${command_name}"
 done
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'for argument in "$@"; do' \
+  '  [[ "${argument}" == -* || "${argument}" == *:* ]] && continue' \
+  '  [[ -e "${argument}" ]] || exit 23' \
+  'done' \
+  > "${MOCK_BIN_DIR}/rsync"
+chmod +x "${MOCK_BIN_DIR}/rsync"
 
 output="$(PATH="${MOCK_BIN_DIR}:${PATH}" \
   "${ROOT_DIR}/scripts/deploy-apt-repository.sh" \

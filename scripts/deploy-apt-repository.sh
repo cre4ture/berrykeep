@@ -420,6 +420,11 @@ sync_repository_mirror() {
   local target_dir="$1"
   local repository_label="$2"
   local suite package_namespace suite_pool_dir
+  local -a archive_key_sources=("${REPO_DIR%/}/berrykeep-archive-keyring.asc")
+
+  if [[ -s "${REPO_DIR}/ironmesh-archive-keyring.asc" ]]; then
+    archive_key_sources+=("${REPO_DIR%/}/ironmesh-archive-keyring.asc")
+  fi
 
   log "syncing ${repository_label} package pool additions"
   rsync "${RSYNC_ADDITION_ARGS[@]}" \
@@ -430,8 +435,7 @@ sync_repository_mirror() {
   log "syncing ${repository_label} archive signing keys"
   rsync "${RSYNC_ADDITION_ARGS[@]}" \
     --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-    "${REPO_DIR%/}/berrykeep-archive-keyring.asc" \
-    "${REPO_DIR%/}/ironmesh-archive-keyring.asc" \
+    "${archive_key_sources[@]}" \
     "${REMOTE}:${target_dir%/}/"
 
   for suite in "${SUITES[@]}"; do
