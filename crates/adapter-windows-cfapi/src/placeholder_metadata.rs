@@ -3,9 +3,9 @@
 use crate::auth::is_internal_client_identity_relative_path;
 use crate::cfapi::{
     cf_ensure_placeholder_identity, cf_get_placeholder_standard_info_with_identity, cf_set_in_sync,
-    cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_with_oplock,
+    cf_update_placeholder_file_identity, cf_update_placeholder_file_identity_metadata_only,
     cf_update_placeholder_metadata_and_identity,
-    cf_update_placeholder_metadata_and_identity_with_oplock, open_sync_path, path_is_placeholder,
+    cf_update_placeholder_metadata_and_identity_metadata_only, open_sync_path, path_is_placeholder,
 };
 use crate::connection_config::is_internal_connection_bootstrap_relative_path;
 use crate::content_fingerprint::file_content_fingerprint;
@@ -1560,19 +1560,19 @@ fn mutate_placeholder_identity_for_path(
     }
     let encoded = identity.encoded();
 
-    let oplock_result = match fs_metadata.as_ref() {
-        Some(metadata) => {
-            cf_update_placeholder_metadata_and_identity_with_oplock(&full_path, metadata, &encoded)
-        }
-        None => cf_update_placeholder_file_identity_with_oplock(&full_path, &encoded),
+    let metadata_update_result = match fs_metadata.as_ref() {
+        Some(metadata) => cf_update_placeholder_metadata_and_identity_metadata_only(
+            &full_path, metadata, &encoded,
+        ),
+        None => cf_update_placeholder_file_identity_metadata_only(&full_path, &encoded),
     };
-    match oplock_result {
+    match metadata_update_result {
         Ok(()) => Ok(()),
-        Err(oplock_err) => {
+        Err(metadata_update_err) => {
             if path_is_placeholder(&full_path) {
-                return Err(oplock_err).with_context(|| {
+                return Err(metadata_update_err).with_context(|| {
                     format!(
-                        "refusing to reopen existing placeholder {} with generic write access after oplock metadata update failed",
+                        "refusing to reopen existing placeholder {} with generic write access after metadata-only update failed",
                         full_path.display()
                     )
                 });
@@ -1988,6 +1988,60 @@ mod tests {
             .expect("modified identity should decode");
         assert_eq!(identity.object_id.as_deref(), Some(object_id));
         assert_eq!(identity.remote_version.as_deref(), Some("revision-2"));
+        assert_eq!(
+            info.info().OnDiskDataSize,
+            0,
+            "a remote metadata refresh must leave a cold placeholder dehydrated"
+        );
+        assert_eq!(info.info().ModifiedDataSize, 0);
+    }
+
+    #[test]
+    fn placeholder_metadata_update_rejects_a_local_dirty_change_after_its_probe() {
+        let (sync_root, provider_instance_id) =
+            registered_test_sync_root("metadata-update-dirty-race");
+        let path = "docs/raced.txt";
+        create_clean_provider_placeholder(
+            &sync_root.root_path,
+            provider_instance_id,
+            path,
+            "revision-1",
+            "raced-hash",
+            1_725_100_000,
+        );
+        let full_path = sync_root.root_path.join("docs\\raced.txt");
+        let writer = open_sync_path(&full_path, true).expect("placeholder should open for writing");
+
+        let update_result = mutate_placeholder_identity_for_path(
+            &sync_root.root_path,
+            path,
+            Some(CF_FS_METADATA {
+                BasicInfo: FILE_BASIC_INFO {
+                    LastWriteTime: unix_seconds_to_windows_file_time(1_725_100_001)
+                        .expect("test timestamp should convert"),
+                    ..Default::default()
+                },
+                FileSize: 1_024,
+            }),
+            false,
+            |identity| {
+                identity.remote_version = Some("revision-2".to_string());
+                crate::cfapi::cf_set_not_in_sync(&writer)
+                    .expect("concurrent local change should advance the placeholder USN");
+            },
+        );
+
+        assert!(
+            update_result.is_err(),
+            "the placeholder update must reject a local change made after its state probe"
+        );
+        let file = open_sync_path(&full_path, false).expect("placeholder should remain readable");
+        let info = cf_get_placeholder_standard_info_with_identity(&file)
+            .expect("placeholder identity should remain readable");
+        let identity = decode_placeholder_file_identity(info.file_identity())
+            .expect("placeholder identity should remain decodable");
+        assert_eq!(identity.remote_version.as_deref(), Some("revision-1"));
+        assert_ne!(info.info().InSyncState, CF_IN_SYNC_STATE_IN_SYNC);
     }
 
     #[test]

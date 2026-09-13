@@ -2,7 +2,7 @@ use crate::cfapi_safe_wrap::{
     convert_to_placeholder, hydrate_placeholder_hresult, open_read_attributes_file,
     path_placeholder_state_from_find, read_placeholder_standard_info, report_provider_progress2,
     set_in_sync_state, set_pin_state, update_placeholder, update_placeholder_hresult,
-    with_cf_oplock_handle,
+    with_cf_metadata_update_handle, with_cf_oplock_handle,
 };
 use crate::helpers::{
     decode_placeholder_file_identity, encode_placeholder_file_identity, hresult_nonneg,
@@ -74,19 +74,13 @@ pub fn cf_update_placeholder_file_identity(
     )
 }
 
-pub fn cf_update_placeholder_file_identity_with_oplock(
+pub fn cf_update_placeholder_file_identity_metadata_only(
     path: &Path,
     file_identity: &[u8],
 ) -> Result<()> {
-    use windows_sys::Win32::Storage::CloudFilters::{
-        CF_OPEN_FILE_FLAG_EXCLUSIVE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-    };
-
-    with_cf_oplock_handle(
-        path,
-        CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-        |handle| update_placeholder(handle, None, file_identity, None, 0),
-    )
+    with_cf_metadata_update_handle(path, |handle| {
+        update_placeholder(handle, None, file_identity, None, 0)
+    })
 }
 
 pub fn cf_update_placeholder_metadata_and_identity(
@@ -103,28 +97,20 @@ pub fn cf_update_placeholder_metadata_and_identity(
     )
 }
 
-pub fn cf_update_placeholder_metadata_and_identity_with_oplock(
+pub fn cf_update_placeholder_metadata_and_identity_metadata_only(
     path: &Path,
     metadata: &CF_FS_METADATA,
     file_identity: &[u8],
 ) -> Result<()> {
-    use windows_sys::Win32::Storage::CloudFilters::{
-        CF_OPEN_FILE_FLAG_EXCLUSIVE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-    };
-
-    with_cf_oplock_handle(
-        path,
-        CF_OPEN_FILE_FLAG_EXCLUSIVE | CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-        |handle| {
-            update_placeholder(
-                handle,
-                Some(metadata),
-                file_identity,
-                None,
-                CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_VERIFY_IN_SYNC,
-            )
-        },
-    )
+    with_cf_metadata_update_handle(path, |handle| {
+        update_placeholder(
+            handle,
+            Some(metadata),
+            file_identity,
+            None,
+            CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_VERIFY_IN_SYNC,
+        )
+    })
 }
 
 pub fn cf_ensure_placeholder_identity(file: &std::fs::File, relative_path: &str) -> Result<()> {

@@ -1975,6 +1975,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cfapi_remote_restore_does_not_auto_hydrate_never_hydrated_placeholder() {
+        let bind = "127.0.0.1:19158";
+        let key = "restore/never-hydrated.bin";
+        let current_payload = format!(
+            "{}{}",
+            "A".repeat(2 * 1024 * 1024),
+            "\nnever-hydrated-current"
+        );
+        let restored_payload = format!(
+            "{}{}",
+            "B".repeat(3 * 1024 * 1024),
+            "\nrestored-older-version"
+        );
+        let sync_root = fresh_data_dir("cfapi-remote-restore-cold-sync-root");
+        std::fs::create_dir_all(&sync_root).expect("failed to create sync root");
+        let mut fixture =
+            start_authenticated_cfapi_fixture(bind, &sync_root, "cfapi-remote-restore-cold")
+                .await
+                .expect("failed to start authenticated CFAPI fixture");
+
+        fixture
+            .sdk
+            .put_large_aware(key, Bytes::from(restored_payload.clone().into_bytes()))
+            .await
+            .expect("failed to seed the older remote version");
+        let older_versions = fixture
+            .sdk
+            .list_versions(key)
+            .await
+            .expect("failed to list the older remote version")
+            .expect("the older remote version graph should exist");
+        let older_version = older_versions
+            .preferred_head_version_id
+            .expect("the older remote version should have a preferred head");
+
+        fixture
+            .sdk
+            .put_large_aware(key, Bytes::from(current_payload.clone().into_bytes()))
+            .await
+            .expect("failed to seed the current remote version");
+
+        let sync_root_id = format!(
+            "ironmesh.systemtest.remote.restore.cold.{}",
+            bind.replace(['.', ':'], "_")
+        );
+        let mut adapter = start_cfapi_adapter_with_bootstrap(
+            &sync_root_id,
+            "ironmesh System Test Remote Restore Cold Root",
+            &sync_root,
+            500,
+            &fixture.bootstrap_file,
+        )
+        .await
+        .expect("failed to register and serve CFAPI adapter");
+
+        let local_file = sync_root.join(key.replace('/', "\\"));
+        wait_for_path(&local_file, 220).await;
+        wait_for_placeholder_present(&local_file, 220).await;
+        wait_for_placeholder_in_sync(&local_file, 220).await;
+        wait_for_placeholder_dehydrated(&local_file, 120).await;
+        assert_placeholder_stays_dehydrated(
+            &local_file,
+            Duration::from_secs(3),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        let restore = async {
+            fixture
+                .sdk
+                .restore_version_path(key, &older_version, key, false)
+                .await
+                .expect("failed to restore the older version at its original path");
+            wait_for_remote_payload(&fixture.sdk, key, restored_payload.as_bytes(), 220).await;
+        };
+        let observe_placeholder = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+            let mut metadata_applied_at = None;
+            loop {
+                let info = placeholder_standard_info(&local_file).unwrap_or_else(|err| {
+                    panic!(
+                        "failed to inspect placeholder during remote restore at {}: {err:#}",
+                        local_file.display()
+                    )
+                });
+                assert_eq!(
+                    (info.OnDiskDataSize, info.ModifiedDataSize),
+                    (0, 0),
+                    "never-hydrated placeholder gained local data during remote restore at {}: {}",
+                    local_file.display(),
+                    sync_item_state_summary(&local_file)
+                );
+
+                if std::fs::metadata(&local_file)
+                    .map(|metadata| metadata.len() == restored_payload.len() as u64)
+                    .unwrap_or(false)
+                {
+                    let applied_at =
+                        metadata_applied_at.get_or_insert_with(tokio::time::Instant::now);
+                    if applied_at.elapsed() >= Duration::from_secs(3) {
+                        return;
+                    }
+                }
+
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the running adapter did not apply the restored remote metadata"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        tokio::join!(restore, observe_placeholder);
+
+        stop_server(&mut adapter).await;
+        stop_server(&mut fixture.server).await;
+        let _ = std::fs::remove_dir_all(&fixture.server_data_dir);
+        let _ = std::fs::remove_dir_all(&sync_root);
+    }
+
+    #[tokio::test]
     #[ignore = "manual reproduction test for access-hydrated placeholder free-up-space dehydration"]
     async fn manual_cfapi_access_hydrated_placeholder_becomes_online_only_after_attrib_u() {
         let payload = format!(
