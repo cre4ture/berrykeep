@@ -124,6 +124,9 @@ const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
 const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
+/// Avoid rescanning every historical manifest on each five-second repair tick,
+/// while still detecting out-of-band disk loss without a namespace event.
+const LOCAL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_secs(30);
 const HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE: Duration = Duration::from_millis(25);
 const HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const GALLERY_MAX_DEPTH: usize = 64;
@@ -440,6 +443,21 @@ struct ServerMaintenanceRuntime {
     repair_run_history_retention_secs: u64,
     local_availability_refresh_lock: Arc<Mutex<()>>,
     local_availability_refresh_notify: Arc<Notify>,
+    local_availability_generation: Arc<AtomicU64>,
+    local_availability_cache: Arc<Mutex<Option<LocalAvailabilityCache>>>,
+}
+
+#[derive(Clone)]
+struct LocalAvailabilityCache {
+    generation: u64,
+    computed_at: Instant,
+    subjects: Arc<Vec<String>>,
+}
+
+impl LocalAvailabilityCache {
+    fn is_valid_for(&self, generation: u64) -> bool {
+        self.generation == generation && self.computed_at.elapsed() < LOCAL_AVAILABILITY_CACHE_TTL
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -724,7 +742,15 @@ fn log_server_startup_phase_end(
     }
 }
 
+pub(crate) fn invalidate_local_availability_cache(state: &ServerState) {
+    state
+        .maintenance
+        .local_availability_generation
+        .fetch_add(1, Ordering::SeqCst);
+}
+
 fn request_local_availability_refresh(state: &ServerState) {
+    invalidate_local_availability_cache(state);
     state
         .maintenance
         .local_availability_refresh_notify
@@ -953,6 +979,7 @@ pub(crate) fn publish_namespace_change(state: &ServerState) {
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
     let _ = state.storage.namespace_change_tx.send(sequence);
+    invalidate_local_availability_cache(state);
 }
 
 #[derive(Debug, Clone)]
@@ -7186,6 +7213,16 @@ async fn run_inner(
         startup_phase_anchor,
         load_cluster_replicas_phase_started_at,
     );
+    let persisted_cluster_availability = {
+        let store_guard = store.read("server.init.load_cluster_availability").await;
+        match store_guard.load_cluster_availability().await {
+            Ok(availability) => availability,
+            Err(err) => {
+                warn!(error = %err, "failed to load cluster availability state; starting empty");
+                HashMap::new()
+            }
+        }
+    };
     let persisted_cluster_nodes = backfill_cluster_nodes_from_replica_rows(
         persisted_cluster_nodes,
         &persisted_cluster_replicas,
@@ -7232,7 +7269,17 @@ async fn run_inner(
             (!nodes.is_empty()).then_some((subject, nodes))
         })
         .collect::<HashMap<_, _>>();
-    cluster.import_replicas_by_key(filtered_cluster_replicas);
+    let filtered_cluster_availability = persisted_cluster_availability
+        .into_iter()
+        .filter_map(|(subject, nodes)| {
+            let nodes = nodes
+                .into_iter()
+                .filter(|node_id| known_node_ids.contains(node_id))
+                .collect::<Vec<_>>();
+            (!nodes.is_empty()).then_some((subject, nodes))
+        })
+        .collect::<HashMap<_, _>>();
+    cluster.import_replica_views(filtered_cluster_replicas, filtered_cluster_availability);
 
     let load_client_credentials_phase_started_at =
         log_server_startup_phase_begin("load_client_credentials", startup_phase_anchor);
@@ -7638,6 +7685,8 @@ async fn run_inner(
             repair_run_history_retention_secs,
             local_availability_refresh_lock: Arc::new(Mutex::new(())),
             local_availability_refresh_notify: Arc::new(Notify::new()),
+            local_availability_generation: Arc::new(AtomicU64::new(0)),
+            local_availability_cache: Arc::new(Mutex::new(None)),
         },
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
@@ -12262,17 +12311,52 @@ async fn cached_local_cluster_available_subjects(state: &ServerState) -> Vec<Str
     cluster.available_subjects_for_node(state.node_id)
 }
 
+async fn cached_or_recompute_local_cluster_available_subjects(
+    state: &ServerState,
+) -> Arc<Vec<String>> {
+    let generation = state
+        .maintenance
+        .local_availability_generation
+        .load(Ordering::SeqCst);
+    if let Some(subjects) = state
+        .maintenance
+        .local_availability_cache
+        .lock()
+        .await
+        .as_ref()
+        .filter(|cache| cache.is_valid_for(generation))
+        .map(|cache| Arc::clone(&cache.subjects))
+    {
+        return subjects;
+    }
+
+    let subjects = Arc::new(recompute_local_cluster_available_subjects(state).await);
+    if state
+        .maintenance
+        .local_availability_generation
+        .load(Ordering::SeqCst)
+        == generation
+    {
+        *state.maintenance.local_availability_cache.lock().await = Some(LocalAvailabilityCache {
+            generation,
+            computed_at: Instant::now(),
+            subjects: Arc::clone(&subjects),
+        });
+    }
+    subjects
+}
+
 async fn refresh_local_availability_view_once(state: &ServerState) -> usize {
     let _refresh_guard = state
         .maintenance
         .local_availability_refresh_lock
         .lock()
         .await;
-    let local_subjects = recompute_local_cluster_available_subjects(state).await;
+    let local_subjects = cached_or_recompute_local_cluster_available_subjects(state).await;
     let subject_count = local_subjects.len();
     let replicas_changed = {
         let mut cluster = state.cluster.lock().await;
-        cluster.reconcile_node_subjects(state.node_id, &local_subjects)
+        cluster.reconcile_node_subjects(state.node_id, local_subjects.as_slice())
     };
 
     if replicas_changed && let Err(err) = persist_cluster_replicas_state(state).await {
@@ -30817,16 +30901,25 @@ async fn persist_repair_state(state: &ServerState) -> Result<()> {
 }
 
 async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
-    let replicas = {
+    // Cluster membership can change through imports and remote availability
+    // syncs without a namespace mutation. Force the next local view to use a
+    // fresh snapshot instead of replaying an older cached subject set.
+    invalidate_local_availability_cache(state);
+    let (replicas, available) = {
         let cluster = state.cluster.lock().await;
-        cluster.export_replicas_by_key()
+        (
+            cluster.export_replicas_by_key(),
+            cluster.export_available_by_key(),
+        )
     };
 
     let persister = {
         let store = read_store(state, "cluster_replicas.clone_persister").await;
         store.cluster_replicas_persister()
     };
-    persister.persist_cluster_replicas(&replicas).await
+    persister
+        .persist_cluster_replica_views(&replicas, &available)
+        .await
 }
 
 async fn persist_cluster_nodes_state(state: &ServerState) -> Result<()> {
@@ -30843,9 +30936,13 @@ async fn persist_cluster_nodes_state(state: &ServerState) -> Result<()> {
 }
 
 async fn persist_cluster_topology_state(state: &ServerState) -> Result<()> {
-    let (nodes, replicas) = {
+    let (nodes, replicas, available) = {
         let cluster = state.cluster.lock().await;
-        (cluster.export_nodes(), cluster.export_replicas_by_key())
+        (
+            cluster.export_nodes(),
+            cluster.export_replicas_by_key(),
+            cluster.export_available_by_key(),
+        )
     };
 
     let (node_persister, replica_persister) = {
@@ -30856,7 +30953,9 @@ async fn persist_cluster_topology_state(state: &ServerState) -> Result<()> {
         )
     };
     node_persister.persist_cluster_nodes(&nodes).await?;
-    replica_persister.persist_cluster_replicas(&replicas).await
+    replica_persister
+        .persist_cluster_replica_views(&replicas, &available)
+        .await
 }
 
 #[cfg(test)]

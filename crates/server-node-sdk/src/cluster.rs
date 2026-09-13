@@ -582,7 +582,14 @@ impl ClusterService {
         changed
     }
 
-    pub fn import_replicas_by_key(&mut self, replicas: HashMap<String, Vec<NodeId>>) {
+    /// Restores durable source hints separately from the last advertised
+    /// availability view. Historical source hints must survive restart without
+    /// becoming current durability claims again.
+    pub fn import_replica_views(
+        &mut self,
+        replicas: HashMap<String, Vec<NodeId>>,
+        available: HashMap<String, Vec<NodeId>>,
+    ) {
         self.replicas_by_key.clear();
         self.available_by_key.clear();
         self.replica_subjects_by_node.clear();
@@ -596,6 +603,10 @@ impl ClusterService {
                     key.clone(),
                     node_id,
                 );
+            }
+        }
+        for (key, nodes) in available {
+            for node_id in nodes {
                 Self::insert_subject_membership(
                     &mut self.available_by_key,
                     &mut self.available_subjects_by_node,
@@ -608,6 +619,17 @@ impl ClusterService {
 
     pub fn export_replicas_by_key(&self) -> HashMap<String, Vec<NodeId>> {
         self.replicas_by_key
+            .iter()
+            .map(|(key, nodes)| {
+                let mut ordered: Vec<NodeId> = nodes.iter().copied().collect();
+                ordered.sort();
+                (key.clone(), ordered)
+            })
+            .collect()
+    }
+
+    pub fn export_available_by_key(&self) -> HashMap<String, Vec<NodeId>> {
+        self.available_by_key
             .iter()
             .map(|(key, nodes)| {
                 let mut ordered: Vec<NodeId> = nodes.iter().copied().collect();
@@ -1331,7 +1353,7 @@ mod tests {
         let mut replicas = HashMap::new();
         replicas.insert("subject-a".to_string(), vec![node_b, node_a]);
 
-        svc.import_replicas_by_key(replicas);
+        svc.import_replica_views(replicas, HashMap::new());
         let exported = svc.export_replicas_by_key();
 
         assert_eq!(exported.get("subject-a").map(Vec::len), Some(2));
@@ -1341,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn import_replicas_rebuilds_node_subject_indexes() {
+    fn import_replica_views_rebuilds_node_subject_indexes() {
         let local = NodeId::new_v4();
         let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
 
@@ -1352,7 +1374,11 @@ mod tests {
         replicas.insert("subject-a".to_string(), vec![node_b, node_a]);
         replicas.insert("subject-b".to_string(), vec![node_a]);
 
-        svc.import_replicas_by_key(replicas);
+        let available = HashMap::from([
+            ("subject-a".to_string(), vec![node_a]),
+            ("subject-b".to_string(), vec![node_a]),
+        ]);
+        svc.import_replica_views(replicas, available);
 
         assert_eq!(
             svc.subjects_for_node(node_a),
@@ -1363,10 +1389,7 @@ mod tests {
             vec!["subject-a".to_string(), "subject-b".to_string()]
         );
         assert_eq!(svc.subjects_for_node(node_b), vec!["subject-a".to_string()]);
-        assert_eq!(
-            svc.available_subjects_for_node(node_b),
-            vec!["subject-a".to_string()]
-        );
+        assert!(svc.available_subjects_for_node(node_b).is_empty());
     }
 
     #[test]
@@ -1522,6 +1545,40 @@ mod tests {
             svc.current_replica_nodes_for_subject("subject-a@ver-old")
                 .is_empty(),
             "historical source hints must not count as currently healthy replicas"
+        );
+    }
+
+    #[test]
+    fn import_replica_views_keeps_historical_claims_out_of_current_availability() {
+        let local = NodeId::new_v4();
+        let node_a = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        svc.import_replica_views(
+            HashMap::from([
+                ("subject-a".to_string(), vec![node_a]),
+                ("subject-a@ver-old".to_string(), vec![node_a]),
+                ("subject-a@ver-new".to_string(), vec![node_a]),
+            ]),
+            HashMap::from([
+                ("subject-a".to_string(), vec![node_a]),
+                ("subject-a@ver-new".to_string(), vec![node_a]),
+            ]),
+        );
+
+        assert_eq!(
+            svc.export_replicas_by_key().get("subject-a@ver-old"),
+            Some(&vec![node_a]),
+            "the historical source hint survives restart"
+        );
+        assert!(
+            svc.current_replica_nodes_for_subject("subject-a@ver-old")
+                .is_empty(),
+            "the historical source hint must not become a current availability claim"
+        );
+        assert_eq!(
+            svc.current_replica_nodes_for_subject("subject-a@ver-new"),
+            HashSet::from([node_a])
         );
     }
 
