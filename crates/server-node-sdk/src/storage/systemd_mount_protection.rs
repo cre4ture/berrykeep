@@ -22,19 +22,23 @@ const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SystemdMountProtectionInspection {
     NotManagedBySystemd,
+    #[cfg(target_os = "linux")]
     SystemctlMissing {
         service: String,
     },
+    #[cfg(target_os = "linux")]
     QueryFailed {
         service: String,
         reason: String,
     },
+    #[cfg(any(target_os = "linux", test))]
     Dependencies {
         service: String,
         mounts: Vec<SystemdMountDependency>,
     },
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SystemdMountDependency {
     unit: String,
@@ -503,6 +507,7 @@ fn checks_for_inspection(
                 install_hint: None,
             }]
         }
+        #[cfg(target_os = "linux")]
         SystemdMountProtectionInspection::SystemctlMissing { service } => {
             vec![HostDependencyCheck {
                 id: "systemd-mount-protection".to_string(),
@@ -518,6 +523,7 @@ fn checks_for_inspection(
                 install_hint: Some("Install or restore the systemd client tools that provide `systemctl`, then refresh this report.".to_string()),
             }]
         }
+        #[cfg(target_os = "linux")]
         SystemdMountProtectionInspection::QueryFailed { service, reason } => {
             vec![HostDependencyCheck {
                 id: "systemd-mount-protection".to_string(),
@@ -537,6 +543,7 @@ fn checks_for_inspection(
                 )),
             }]
         }
+        #[cfg(any(target_os = "linux", test))]
         SystemdMountProtectionInspection::Dependencies { service, mounts } => targets
             .iter()
             .map(|target| {
@@ -600,6 +607,7 @@ fn checks_for_inspection(
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn protecting_mount_dependency<'a>(
     target: &Path,
     mounts: &'a [SystemdMountDependency],

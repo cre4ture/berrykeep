@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use super::media_tools::HostDependencySeverity;
 use super::*;
 #[cfg(unix)]
