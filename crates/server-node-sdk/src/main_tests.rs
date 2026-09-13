@@ -44,6 +44,28 @@ fn direct_quic_relay_urls_are_trimmed_and_deduplicated() {
 }
 
 #[test]
+fn node_identity_san_check_accepts_legacy_identity_uris() {
+    let node_id = NodeId::new_v4();
+    let cluster_id = ClusterId::new_v4();
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params.subject_alt_names = vec![
+        rcgen::SanType::URI(format!("urn:ironmesh:node:{node_id}").try_into().unwrap()),
+        rcgen::SanType::URI(
+            format!("urn:ironmesh:cluster:{cluster_id}")
+                .try_into()
+                .unwrap(),
+        ),
+    ];
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert_pem = params.self_signed(&key_pair).unwrap().pem();
+
+    assert!(
+        super::certificate_has_expected_node_identity_uri_sans(&cert_pem, node_id, cluster_id)
+            .unwrap()
+    );
+}
+
+#[test]
 fn reconciliation_object_paths_encode_store_keys_before_transport() {
     let path = super::build_reconciliation_object_path("map/clusters", "version/1");
 

@@ -4121,6 +4121,8 @@ fn certificate_has_expected_node_identity_uri_sans(
         .context("failed parsing TLS certificate DER for node identity SAN migration")?;
     let expected_node_uri = format!("urn:berrykeep:node:{expected_node_id}");
     let expected_cluster_uri = format!("urn:berrykeep:cluster:{expected_cluster_id}");
+    let legacy_node_uri = format!("urn:ironmesh:node:{expected_node_id}");
+    let legacy_cluster_uri = format!("urn:ironmesh:cluster:{expected_cluster_id}");
     let mut has_node_uri = false;
     let mut has_cluster_uri = false;
 
@@ -4128,8 +4130,8 @@ fn certificate_has_expected_node_identity_uri_sans(
         if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
             for name in &san.general_names {
                 if let x509_parser::extensions::GeneralName::URI(uri) = name {
-                    has_node_uri |= *uri == expected_node_uri;
-                    has_cluster_uri |= *uri == expected_cluster_uri;
+                    has_node_uri |= *uri == expected_node_uri || *uri == legacy_node_uri;
+                    has_cluster_uri |= *uri == expected_cluster_uri || *uri == legacy_cluster_uri;
                 }
             }
         }
