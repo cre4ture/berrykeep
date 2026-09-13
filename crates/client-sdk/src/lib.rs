@@ -77,11 +77,3 @@ pub use transport_sdk::{
     RendezvousRuntimeState, build_signed_request_headers, public_key_fingerprint,
     rendezvous_client_identity_not_after_unix,
 };
-
-/// Compatibility type alias for callers built against the former Rust API.
-#[deprecated(note = "use BerryKeepClient")]
-pub type IronMeshClient = BerryKeepClient;
-
-/// Compatibility type alias for callers built against the former Rust API.
-#[deprecated(note = "use ManagedBerryKeepClient")]
-pub type ManagedIronMeshClient = ManagedBerryKeepClient;

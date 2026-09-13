@@ -12543,34 +12543,6 @@ async fn authenticated_web_service_stream_reaches_only_the_configured_upstream()
         .await
         .unwrap();
     assert_eq!(response.status, StatusCode::OK.as_u16());
-    for (canonical, legacy) in [
-        (
-            super::web_service_proxy::HEADER_UPSTREAM_AUTHORITY,
-            "x-ironmesh-web-service-authority",
-        ),
-        (
-            super::web_service_proxy::HEADER_UPSTREAM_BASE_PATH,
-            "x-ironmesh-web-service-base-path",
-        ),
-        (
-            super::web_service_proxy::HEADER_UPSTREAM_SCHEME,
-            "x-ironmesh-web-service-scheme",
-        ),
-    ] {
-        let canonical_value = response
-            .headers
-            .iter()
-            .find(|header| header.name.eq_ignore_ascii_case(canonical))
-            .map(|header| header.value.as_str())
-            .expect("web service proxy response should include canonical metadata");
-        let legacy_value = response
-            .headers
-            .iter()
-            .find(|header| header.name.eq_ignore_ascii_case(legacy))
-            .map(|header| header.value.as_str())
-            .expect("web service proxy response should include legacy metadata during the compatibility window");
-        assert_eq!(legacy_value, canonical_value);
-    }
     client_io
         .write_all(b"GET /status HTTP/1.1\r\nHost: nas.test\r\nConnection: close\r\n\r\n")
         .await

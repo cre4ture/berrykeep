@@ -46,9 +46,6 @@ const WEB_SERVICE_CONNECT_SUFFIX: &str = "/connect";
 pub(crate) const HEADER_UPSTREAM_AUTHORITY: &str = "x-berrykeep-web-service-authority";
 pub(crate) const HEADER_UPSTREAM_BASE_PATH: &str = "x-berrykeep-web-service-base-path";
 pub(crate) const HEADER_UPSTREAM_SCHEME: &str = "x-berrykeep-web-service-scheme";
-const LEGACY_HEADER_UPSTREAM_AUTHORITY: &str = "x-ironmesh-web-service-authority";
-const LEGACY_HEADER_UPSTREAM_BASE_PATH: &str = "x-ironmesh-web-service-base-path";
-const LEGACY_HEADER_UPSTREAM_SCHEME: &str = "x-ironmesh-web-service-scheme";
 
 #[derive(Clone)]
 pub(crate) struct WebServiceRegistry {
@@ -694,9 +691,6 @@ where
             .await;
         }
     };
-    let authority = upstream_authority(&url)?;
-    let base_path = normalized_base_path(&url);
-    let scheme = url.scheme().to_string();
     write_transport_response_head(
         stream,
         &TransportResponseHead {
@@ -705,27 +699,15 @@ where
             headers: vec![
                 TransportHeader {
                     name: HEADER_UPSTREAM_AUTHORITY.to_string(),
-                    value: authority.clone(),
-                },
-                TransportHeader {
-                    name: LEGACY_HEADER_UPSTREAM_AUTHORITY.to_string(),
-                    value: authority,
+                    value: upstream_authority(&url)?,
                 },
                 TransportHeader {
                     name: HEADER_UPSTREAM_BASE_PATH.to_string(),
-                    value: base_path.clone(),
-                },
-                TransportHeader {
-                    name: LEGACY_HEADER_UPSTREAM_BASE_PATH.to_string(),
-                    value: base_path,
+                    value: normalized_base_path(&url),
                 },
                 TransportHeader {
                     name: HEADER_UPSTREAM_SCHEME.to_string(),
-                    value: scheme.clone(),
-                },
-                TransportHeader {
-                    name: LEGACY_HEADER_UPSTREAM_SCHEME.to_string(),
-                    value: scheme,
+                    value: url.scheme().to_string(),
                 },
             ],
         },

@@ -1584,7 +1584,6 @@ name = "desktop-client-config"
 version = "1.2.0"
 dependencies = [
  "anyhow",
- "common",
  "git-version",
  "serde",
  "serde_json",
