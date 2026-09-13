@@ -202,7 +202,7 @@ function dependencyBadgeColor(status: HostDependencyStatus, severity?: HostDepen
     case "ready":
       return berrykeepPrimaryColor;
     case "missing":
-      return "yellow";
+      return severity === "info" ? "gray" : "yellow";
     case "builtin":
       return "blue";
     case "optional":
