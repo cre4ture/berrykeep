@@ -48,6 +48,9 @@ The same chunk recovery implementation serves scrub repair, replication pulls an
 5. Try preferred/advertised sources, then remembered replicas and other online registered peers.
    A 404 or stale advertisement is not proof that another peer lacks the hash. Complementary
    partial peers can jointly recover a file even when no complete peer replica exists.
+   Foreground read-through additionally has a 30-second total recovery budget; it fails
+   within that bound even with many slow peers. Verified cache bytes remain reusable
+   on retry (including smaller range requests). Background repairs retain durable retries.
 6. Verify each response's BLAKE3 hash and expected size before atomic installation. An invalid
    response does not prevent trying another source.
 7. Reverify the repaired manifest and required chunks, establish ownership when appropriate,

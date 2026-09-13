@@ -7,6 +7,7 @@ use storage::retained_content::{MANIFEST_SUBJECT_PREFIX, RetainedContent, Retain
 
 const CHUNK_FETCH_CONCURRENCY: usize = 4;
 const PEER_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const READ_THROUGH_RECOVERY_BUDGET: Duration = Duration::from_secs(30);
 const MAX_RECOVERY_ERRORS: usize = 16;
 
 #[derive(Debug)]
@@ -196,6 +197,20 @@ pub(crate) async fn recover_chunks(
         }
     }
     result
+}
+
+pub(crate) async fn recover_chunks_for_read(
+    state: &ServerState,
+    subject: &str,
+    chunks: &[ReplicationChunkInfo],
+    budget: Duration,
+) -> Result<ChunkRecoveryResult> {
+    // Bound the entire foreground operation, not just each peer request. A
+    // larger cluster or missing range must not multiply request latency without
+    // limit. Cancellation keeps already verified cache bytes reusable on retry.
+    tokio::time::timeout(budget, recover_chunks(state, subject, chunks, None, true))
+        .await
+        .context("read-through recovery deadline exceeded")
 }
 
 async fn recover_manifest(state: &ServerState, reference: &RetainedReference) -> Result<Vec<u8>> {
