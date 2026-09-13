@@ -417,7 +417,6 @@ fn mount_protection_targets(
 ) -> Vec<MountProtectionTarget> {
     let mount_points = mount_points_for_current_process();
     let data_dir = resolved_mount_protection_path(data_dir);
-    let storage_data_dir = data_dir.clone();
     let mut targets = vec![MountProtectionTarget {
         id: "systemd-mount-data-dir".to_string(),
         feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
@@ -445,10 +444,7 @@ fn mount_protection_targets(
                     mount_point: mount_points
                         .as_deref()
                         .and_then(|mount_points| mount_point_for_path(&path, mount_points)),
-                    allows_root_filesystem: storage_path_allows_root_filesystem(
-                        &path,
-                        &storage_data_dir,
-                    ),
+                    allows_root_filesystem: true,
                     path,
                     missing_severity: match configured_path.state {
                         StoragePathState::Active => HostDependencySeverity::Critical,
@@ -459,11 +455,6 @@ fn mount_protection_targets(
             }),
     );
     targets
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn storage_path_allows_root_filesystem(path: &Path, data_dir: &Path) -> bool {
-    path.starts_with(data_dir) || path == Path::new("/")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -979,15 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn root_filesystem_exemption_does_not_mask_a_distinct_storage_pool() {
-        assert!(storage_path_allows_root_filesystem(
-            Path::new("/var/lib/berrykeep/pool-a"),
-            Path::new("/var/lib/berrykeep"),
-        ));
-        assert!(!storage_path_allows_root_filesystem(
-            Path::new("/mnt/primary"),
-            Path::new("/var/lib/berrykeep"),
-        ));
+    fn root_filesystem_is_not_applicable_for_data_and_storage_paths() {
         let targets = vec![
             MountProtectionTarget {
                 id: "systemd-mount-data-dir".to_string(),
@@ -1019,7 +1002,7 @@ mod tests {
                 feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
                 path: PathBuf::from("/mnt/primary"),
                 mount_point: Some(PathBuf::from("/")),
-                allows_root_filesystem: false,
+                allows_root_filesystem: true,
                 missing_severity: HostDependencySeverity::Critical,
             },
         ];
@@ -1057,19 +1040,13 @@ mod tests {
         );
         assert_eq!(data_child_storage.severity, HostDependencySeverity::Info);
 
-        let missing_storage = checks
+        let root_storage = checks
             .iter()
             .find(|check| check.id == "systemd-mount-storage-primary")
             .unwrap();
-        assert_eq!(missing_storage.status, HostDependencyStatus::Missing);
-        assert_eq!(missing_storage.severity, HostDependencySeverity::Critical);
-        assert!(
-            missing_storage
-                .install_hint
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Mount the intended filesystem")
-        );
+        assert_eq!(root_storage.status, HostDependencyStatus::NotApplicable);
+        assert_eq!(root_storage.severity, HostDependencySeverity::Info);
+        assert!(root_storage.install_hint.is_none());
     }
 
     #[test]
