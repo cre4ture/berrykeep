@@ -68,6 +68,96 @@ run_on_all_metadata_backends!(
     retained_content_source_presence_is_not_a_second_scrub_turso
 );
 
+async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("repair-task-schedule").await;
+    let first = store
+        .put_object_versioned(
+            "deferred-a.bin",
+            Bytes::from_static(b"deferred a"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let second = store
+        .put_object_versioned(
+            "deferred-b.bin",
+            Bytes::from_static(b"deferred b"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let retained = store.retained_content().await.unwrap();
+    let mut first_task = content_recovery::ContentRepairTask::new(
+        retained
+            .reference_for_subject("deferred-a.bin")
+            .unwrap()
+            .clone(),
+        true,
+    );
+    first_task.next_attempt_unix = 100;
+    first_task.source_fingerprint = "same-sources".to_string();
+    let mut second_task = content_recovery::ContentRepairTask::new(
+        retained
+            .reference_for_subject("deferred-b.bin")
+            .unwrap()
+            .clone(),
+        true,
+    );
+    second_task.next_attempt_unix = 200;
+    second_task.source_fingerprint = "changed-sources".to_string();
+    // Keep a large pin list in the inactive task. Scheduling must inspect its
+    // indexed deadline/fingerprint rather than deserialize this payload.
+    second_task.chunks = vec![
+        ReplicationChunkInfo {
+            hash: hash_hex(b"deferred b"),
+            size_bytes: 10,
+        };
+        4_096
+    ];
+    store
+        .persist_content_repair_task(&first_task)
+        .await
+        .unwrap();
+    store
+        .persist_content_repair_task(&second_task)
+        .await
+        .unwrap();
+
+    let mut hashes = store.content_repair_task_hashes().await.unwrap();
+    hashes.sort();
+    assert_eq!(hashes, {
+        let mut expected = vec![first.manifest_hash.clone(), second.manifest_hash.clone()];
+        expected.sort();
+        expected
+    });
+    assert_eq!(
+        store
+            .due_content_repair_task_hashes(50, "same-sources", 1)
+            .await
+            .unwrap(),
+        vec![second.manifest_hash.clone()],
+        "a changed source fingerprint is due without loading every task"
+    );
+    let selected = store
+        .content_repair_tasks_for_manifests(std::slice::from_ref(&first.manifest_hash))
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].reference.manifest_hash, first.manifest_hash);
+    assert!(selected[0].chunks.is_empty());
+
+    drop(store);
+    fs::remove_dir_all(root).await.unwrap();
+}
+
+run_on_all_metadata_backends!(
+    retained_content_repair_task_schedule_uses_indexed_summaries_impl,
+    retained_content_repair_task_schedule_uses_indexed_summaries,
+    retained_content_repair_task_schedule_uses_indexed_summaries_turso
+);
+
 #[test]
 fn retained_content_identity_does_not_require_a_path() {
     let reference = retained_content::RetainedReference {

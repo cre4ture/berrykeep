@@ -61,6 +61,50 @@ run_on_main_metadata_backends!(
     recovery_read_budget_bounds_slow_unadvertised_peers_turso
 );
 
+async fn recovery_targeted_repair_respects_busy_throttle_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.repair_config.busy_throttle_enabled = true;
+    target.repair_config.busy_inflight_threshold = 1;
+    target.repair_config.busy_wait_millis = 5;
+    let key = "busy-targeted-recovery.bin";
+    let version = "v1";
+    for state in [&source, &target] {
+        seed_subject_version(state, key, version, b"busy repair payload".to_vec(), vec![]).await;
+    }
+    let manifest = bundle(&target, key, version).await;
+    remove_chunks(&target, &manifest, &[0]).await;
+    let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &url).await;
+    let inflight = Arc::clone(&target.maintenance.inflight_requests);
+    inflight.store(2, std::sync::atomic::Ordering::Relaxed);
+    let repair = crate::replication::execute_targeted_replication_repair_inner(
+        &target,
+        vec![format!("{key}@{version}")],
+        None,
+    );
+    tokio::pin!(repair);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut repair)
+            .await
+            .is_err(),
+        "targeted retained-content recovery ignored the busy throttle"
+    );
+    inflight.store(0, std::sync::atomic::Ordering::Relaxed);
+    let report = repair.await;
+    assert_eq!(report.successful_transfers, 1, "{report:?}");
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_targeted_repair_respects_busy_throttle_impl,
+    recovery_targeted_repair_respects_busy_throttle,
+    recovery_targeted_repair_respects_busy_throttle_turso
+);
+
 async fn recovery_scrub_persists_intent_when_execution_is_disabled_impl(backend: MainTestBackend) {
     let mut target = build_test_state(1, false, backend).await;
     target.repair_config.enabled = false;

@@ -129,8 +129,43 @@ pub(super) async fn manifest_is_fully_local(
 }
 
 impl PersistentStore {
+    #[cfg(test)]
     pub(crate) async fn content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
         self.metadata_store.load_content_repair_tasks().await
+    }
+
+    pub(crate) async fn content_repair_tasks_for_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<Vec<ContentRepairTask>> {
+        self.metadata_store
+            .load_content_repair_tasks_for_manifests(manifest_hashes)
+            .await
+    }
+
+    pub(crate) async fn content_repair_task_hashes(&self) -> Result<Vec<String>> {
+        self.metadata_store.content_repair_task_hashes().await
+    }
+
+    pub(crate) async fn due_content_repair_task_hashes(
+        &self,
+        now_unix: u64,
+        source_fingerprint: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        self.metadata_store
+            .due_content_repair_task_hashes(now_unix, source_fingerprint, limit)
+            .await
+    }
+
+    /// A cache-repair task only needs to decide whether a chunk entry exists.
+    /// Hashing and size validation happen once in `recover_chunks`, where an
+    /// invalid local entry is replaced from a verified peer response.
+    pub(crate) async fn chunk_path_exists(&self, hash: &str) -> Result<bool> {
+        let path = self
+            .storage_pool
+            .content_path(StorageContentKind::Chunk, hash)?;
+        Ok(fs::try_exists(path).await?)
     }
 
     pub(crate) async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {

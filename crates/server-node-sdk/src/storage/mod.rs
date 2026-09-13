@@ -12,6 +12,7 @@ const STORE_INDEX_VERSION_LOOKUP_CONCURRENCY: usize = 32;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID + 1;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION;
+pub(super) const CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT: &str = "__legacy__";
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
@@ -2815,6 +2816,17 @@ struct ArchivedTombstoneIndexRecord {
 #[async_trait]
 trait MetadataStore: Send + Sync {
     async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>>;
+    async fn load_content_repair_tasks_for_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<Vec<ContentRepairTask>>;
+    async fn content_repair_task_hashes(&self) -> Result<Vec<String>>;
+    async fn due_content_repair_task_hashes(
+        &self,
+        now_unix: u64,
+        source_fingerprint: &str,
+        limit: usize,
+    ) -> Result<Vec<String>>;
     async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()>;
     async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()>;
     async fn content_repair_pending(&self, manifest_hash: &str) -> Result<bool>;
@@ -4168,10 +4180,9 @@ impl ReplicationSubjectInspector {
             .await?;
         let pending = self
             .metadata_store
-            .load_content_repair_tasks()
+            .content_repair_task_hashes()
             .await?
             .into_iter()
-            .map(|task| task.reference.manifest_hash)
             .collect::<HashSet<_>>();
         for (hash, references) in retained.manifests {
             if pending.contains(&hash) {

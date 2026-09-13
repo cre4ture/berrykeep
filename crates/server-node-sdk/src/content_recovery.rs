@@ -261,9 +261,10 @@ async fn recover_task(state: &ServerState, task: &mut ContentRepairTask) -> Resu
         task.chunks.clear();
         for chunk in manifest.chunks {
             // Metadata-only nodes repair damaged cached bytes without hydrating
-            // absent cache entries or acquiring replica ownership.
+            // absent cache entries or acquiring replica ownership. Do not hash
+            // here: `recover_chunks` validates every included local entry once.
             if task.repair_chunks
-                || !matches!(store.read_chunk_payload(&chunk.hash).await, Ok(None))
+                || !matches!(store.chunk_path_exists(&chunk.hash).await, Ok(false))
             {
                 task.chunks.push(chunk);
             }
@@ -349,20 +350,13 @@ async fn repair_subjects_inner(
     limit: Option<usize>,
     report: &mut replication::ReplicationRepairReport,
 ) -> Result<()> {
-    let (retained, pending) = {
+    let retained = {
         let store = read_store(state, "content_recovery.catalog").await;
-        (
-            store.retained_content().await?,
-            store.content_repair_tasks().await?,
-        )
+        store.retained_content().await?
     };
     let required = required_manifests(state, &retained).await;
     let fingerprint = source_fingerprint(state).await;
-    let pending: HashMap<_, _> = pending
-        .into_iter()
-        .map(|t| (t.reference.manifest_hash.clone(), t))
-        .collect();
-    let mut tasks = BTreeMap::new();
+    let mut references = BTreeMap::new();
     for subject in subjects {
         let reference = retained.reference_for_subject(&subject).or_else(|| {
             subject
@@ -382,6 +376,18 @@ async fn repair_subjects_inner(
             }
             continue;
         };
+        references.insert(reference.manifest_hash.clone(), reference);
+    }
+    let requested_hashes = references.keys().cloned().collect::<Vec<_>>();
+    let pending: HashMap<_, _> = read_store(state, "content_recovery.selected_pending")
+        .await
+        .content_repair_tasks_for_manifests(&requested_hashes)
+        .await?
+        .into_iter()
+        .map(|task| (task.reference.manifest_hash.clone(), task))
+        .collect();
+    let mut tasks = BTreeMap::new();
+    for reference in references.into_values() {
         let owned = read_store(state, "content_recovery.ownership")
             .await
             .manifest_is_owned(&reference.manifest_hash)
@@ -439,6 +445,7 @@ async fn repair_subjects_inner(
         }
         task.source_fingerprint = fingerprint.clone();
         report.attempted_transfers += 1;
+        await_repair_busy_threshold(state).await;
         match recover_task(state, &mut task).await {
             Ok(recovered) => {
                 report.successful_transfers += 1;
@@ -501,15 +508,17 @@ pub(crate) fn spawn_worker(state: ServerState) {
 
 pub(crate) async fn resume_pending(state: &ServerState) -> Result<()> {
     let fingerprint = source_fingerprint(state).await;
-    let tasks = read_store(state, "content_recovery.pending")
+    let hashes = read_store(state, "content_recovery.pending_schedule")
         .await
-        .content_repair_tasks()
+        .due_content_repair_task_hashes(
+            unix_ts(),
+            &fingerprint,
+            state.repair_config.batch_size.max(1),
+        )
         .await?;
-    let subjects = tasks
+    let subjects = hashes
         .into_iter()
-        .filter(|t| t.next_attempt_unix <= unix_ts() || t.source_fingerprint != fingerprint)
-        .take(state.repair_config.batch_size.max(1))
-        .map(|t| format!("{MANIFEST_SUBJECT_PREFIX}{}", t.reference.manifest_hash))
+        .map(|hash| format!("{MANIFEST_SUBJECT_PREFIX}{hash}"))
         .collect::<Vec<_>>();
     if !subjects.is_empty() {
         execute_tracked_targeted_local_replication_repair(
@@ -530,7 +539,7 @@ pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
         let store = read_store(state, "content_recovery.audit").await;
         (
             store.retained_content().await?,
-            store.content_repair_tasks().await?,
+            store.content_repair_task_hashes().await?,
         )
     };
     let required = required_manifests(state, &retained).await;
@@ -538,10 +547,7 @@ pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
         .await
         .into_iter()
         .collect::<HashSet<_>>();
-    let pending = pending
-        .into_iter()
-        .map(|task| task.reference.manifest_hash)
-        .collect::<HashSet<_>>();
+    let pending = pending.into_iter().collect::<HashSet<_>>();
     for (hash, references) in retained.manifests {
         if hash == storage::TOMBSTONE_MANIFEST_HASH
             || !required.contains(&hash)
