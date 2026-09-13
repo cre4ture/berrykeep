@@ -1706,7 +1706,16 @@ fn migrate_legacy_state_entry(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn merge_legacy_managed_instance_store(legacy_path: &Path, current_path: &Path) -> Result<()> {
-    let legacy_store = ManagedInstanceStore::load_or_default(legacy_path)?;
+    let legacy_store = match ManagedInstanceStore::load_or_default(legacy_path) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!(
+                "warning: skipping unreadable legacy managed instance store {}: {error:#}",
+                legacy_path.display(),
+            );
+            return Ok(());
+        }
+    };
     let mut current_store = ManagedInstanceStore::load_or_default(current_path)?;
 
     for identity in legacy_store.client_identities {
@@ -2065,6 +2074,40 @@ mod tests {
             "current report"
         );
         assert!(!legacy_dir.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_state_directory_migration_skips_an_unreadable_legacy_instance_store() {
+        let path = temp_path("legacy-state-directory-corrupt-store");
+        let root = path.parent().expect("temp path should have a parent");
+        let legacy_dir = root.join("legacy");
+        let current_dir = root.join("current");
+        let legacy_store = legacy_dir.join(INSTANCE_STORE_FILE_NAME);
+        let current_store = current_dir.join(INSTANCE_STORE_FILE_NAME);
+
+        std::fs::create_dir_all(&legacy_dir).expect("legacy state directory should create");
+        std::fs::create_dir_all(&current_dir).expect("current state directory should create");
+        std::fs::write(&legacy_store, "not valid JSON").expect("legacy store should write");
+        std::fs::write(
+            &current_store,
+            r#"{ "client_cli_instances": [{ "id": "canonical", "label": "Canonical" }] }"#,
+        )
+        .expect("current store should write");
+
+        migrate_legacy_state_directory(&legacy_dir, &current_dir)
+            .expect("unreadable legacy state should not block migration");
+
+        let store = ManagedInstanceStore::load_or_default(&current_store)
+            .expect("current store should remain readable");
+        assert!(
+            store
+                .client_cli_instances
+                .iter()
+                .any(|instance| instance.id == "canonical")
+        );
+        assert!(legacy_store.exists());
 
         let _ = std::fs::remove_dir_all(root);
     }
