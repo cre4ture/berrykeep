@@ -9,6 +9,7 @@ use common::xmp::XmpGeoLocation;
 use tracing::warn;
 use turso::params_from_iter;
 
+use super::content_recovery::ContentRepairTask;
 use crate::cluster::NodeDescriptor;
 #[cfg(test)]
 use crate::operations::{OperationPriority, OperationProgress};
@@ -471,6 +472,42 @@ impl MetadataStore for TursoMetadataStore {
             keys.push(row_string(&row, 0, "current_objects.key")?);
         }
         Ok(keys)
+    }
+
+    async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT task_json FROM content_repair_tasks ORDER BY manifest_hash",
+                (),
+            )
+            .await?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next().await? {
+            tasks.push(serde_json::from_slice(&row_blob(
+                &row,
+                0,
+                "content_repair_tasks.task_json",
+            )?)?);
+        }
+        Ok(tasks)
+    }
+
+    async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection.execute("INSERT INTO content_repair_tasks (manifest_hash, task_json) VALUES (?1, ?2) ON CONFLICT(manifest_hash) DO UPDATE SET task_json=excluded.task_json", (task.reference.manifest_hash.as_str(), serde_json::to_vec(task)?)).await?;
+        Ok(())
+    }
+
+    async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "DELETE FROM content_repair_tasks WHERE manifest_hash=?1",
+                [manifest_hash],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
@@ -3190,6 +3227,11 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 subject TEXT PRIMARY KEY,
                 attempts INTEGER NOT NULL,
                 last_failure_unix INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS content_repair_tasks (
+                manifest_hash TEXT PRIMARY KEY,
+                task_json BLOB NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS repair_run_history (

@@ -14,6 +14,7 @@ use tokio_rusqlite::Connection as TokioConnection;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::content_recovery::ContentRepairTask;
 use crate::cluster::NodeDescriptor;
 #[cfg(test)]
 use crate::operations::{OperationPriority, OperationProgress};
@@ -2522,6 +2523,37 @@ impl MetadataStore for SqliteMetadataStore {
                 keys.push(row?);
             }
             Ok(keys)
+        })
+        .await
+    }
+
+    async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
+        self.read(|db| {
+            let mut statement =
+                db.prepare("SELECT task_json FROM content_repair_tasks ORDER BY manifest_hash")?;
+            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            rows.map(|row| Ok(serde_json::from_slice(&row?)?)).collect()
+        })
+        .await
+    }
+
+    async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {
+        let hash = task.reference.manifest_hash.clone();
+        let payload = serde_json::to_vec(task)?;
+        self.write_tx(move |db| {
+            db.execute("INSERT INTO content_repair_tasks (manifest_hash, task_json) VALUES (?1, ?2) ON CONFLICT(manifest_hash) DO UPDATE SET task_json=excluded.task_json", params![hash, payload])?;
+            Ok(())
+        }).await
+    }
+
+    async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()> {
+        let hash = manifest_hash.to_string();
+        self.write_tx(move |db| {
+            db.execute(
+                "DELETE FROM content_repair_tasks WHERE manifest_hash=?1",
+                params![hash],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -5324,6 +5356,11 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             subject TEXT PRIMARY KEY,
             attempts INTEGER NOT NULL,
             last_failure_unix INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS content_repair_tasks (
+            manifest_hash TEXT PRIMARY KEY,
+            task_json BLOB NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS repair_run_history (

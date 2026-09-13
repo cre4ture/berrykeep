@@ -97,6 +97,7 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+pub(crate) mod content_recovery;
 pub(super) mod data_scrub;
 mod gallery_capture_time;
 mod gallery_labels;
@@ -104,11 +105,13 @@ mod gallery_summary_cache;
 pub(super) mod manifest_reader;
 pub(super) mod media_cache;
 pub(super) mod media_tools;
+pub(crate) mod retained_content;
 mod sqlite_impl;
 mod systemd_mount_protection;
 #[cfg(feature = "turso-metadata")]
 mod turso_impl;
 
+use self::content_recovery::ContentRepairTask;
 use self::gallery_summary_cache::GallerySummaryCache;
 pub(crate) use self::gallery_summary_cache::{
     GalleryCaptureSummaryBusyError, GallerySummaryCacheValue, GallerySummaryMiss,
@@ -2572,6 +2575,10 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["subject"],
     },
     MetadataDbLogicalTableSpec {
+        table: "content_repair_tasks",
+        tracked_columns: &["manifest_hash", "task_json"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "repair_run_history",
         tracked_columns: &["run_id", "record_json"],
     },
@@ -2710,6 +2717,7 @@ pub(super) fn metadata_db_logical_summary_query(spec: MetadataDbLogicalTableSpec
 }
 
 pub struct PersistentStore {
+    content_gc_gate: Arc<tokio::sync::RwLock<()>>,
     root_dir: PathBuf,
     storage_pool: StoragePool,
     metadata_backend_kind: MetadataBackendKind,
@@ -2730,6 +2738,7 @@ pub struct PersistentStore {
 
 #[derive(Clone)]
 pub(crate) struct ChunkIngestor {
+    content_gc_gate: Arc<tokio::sync::RwLock<()>>,
     storage_pool: StoragePool,
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
@@ -2805,6 +2814,9 @@ struct ArchivedTombstoneIndexRecord {
 
 #[async_trait]
 trait MetadataStore: Send + Sync {
+    async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>>;
+    async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()>;
+    async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()>;
     /// Whether legacy current rows, snapshots, and version payloads still need
     /// their one-time stable object identity backfill.
     async fn object_id_backfill_needed(&self) -> Result<bool>;
@@ -3110,8 +3122,10 @@ impl ChunkIngestor {
         storage_pool: StoragePool,
         metadata_store: Arc<dyn MetadataStore>,
         storage_stats_lock: Arc<AsyncMutex<()>>,
+        content_gc_gate: Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
         Self {
+            content_gc_gate,
             storage_pool,
             metadata_store,
             storage_stats_lock,
@@ -3119,6 +3133,8 @@ impl ChunkIngestor {
     }
 
     pub(crate) async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
+        // GC must not inspect or remove the temporary file of an active install.
+        let _guard = self.content_gc_gate.read().await;
         let actual_hash = hash_hex(payload);
         if actual_hash != hash {
             bail!("chunk hash mismatch: expected={hash} actual={actual_hash}");
@@ -4138,54 +4154,39 @@ impl ReplicationSubjectInspector {
     }
 
     pub(crate) async fn list_replication_subjects(&self) -> Result<Vec<String>> {
-        let mut subjects: HashSet<String> = HashSet::new();
-        let mut indexed_object_ids = HashSet::new();
-
-        for (key, manifest_hash) in &self.current_state.objects {
-            if self.manifest_is_fully_local(manifest_hash).await? {
-                subjects.insert(key.clone());
-            }
-        }
-
-        for (path, object_id) in &self.current_state.object_ids {
-            if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
-                indexed_object_ids.insert(object_id.clone());
-                for head_version_id in &index.head_version_ids {
-                    let Some(record) = index.versions.get(head_version_id) else {
-                        continue;
-                    };
-                    if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
-                        || self.manifest_is_fully_local(&record.manifest_hash).await?
-                    {
-                        subjects.insert(format!("{path}@{head_version_id}"));
-                    }
-                }
-            }
-        }
-
-        for index in self.load_all_version_indexes().await? {
-            if indexed_object_ids.contains(&index.object_id) {
+        let retained = retained_content::RetainedContent::load(
+            self.metadata_store.as_ref(),
+            &self.current_state,
+        )
+        .await?;
+        let mut subjects = BTreeSet::new();
+        let hashes = retained.manifests.keys().cloned().collect::<Vec<_>>();
+        let owned = self
+            .metadata_store
+            .filter_locally_owned_manifests(&hashes)
+            .await?;
+        let pending = self
+            .metadata_store
+            .load_content_repair_tasks()
+            .await?
+            .into_iter()
+            .map(|task| task.reference.manifest_hash)
+            .collect::<HashSet<_>>();
+        for (hash, references) in retained.manifests {
+            if pending.contains(&hash) {
                 continue;
             }
-
-            for head_version_id in &index.head_version_ids {
-                let Some(record) = index.versions.get(head_version_id) else {
-                    continue;
-                };
-                let Some(key) = self.resolve_key_for_version_record(&index, record).await? else {
-                    continue;
-                };
-                if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
-                    || self.manifest_is_fully_local(&record.manifest_hash).await?
-                {
-                    subjects.insert(format!("{key}@{head_version_id}"));
-                }
+            if hash == TOMBSTONE_MANIFEST_HASH
+                || (owned.contains(&hash) && self.manifest_is_fully_local(&hash).await?)
+            {
+                subjects.extend(
+                    references
+                        .iter()
+                        .filter_map(retained_content::RetainedReference::subject),
+                );
             }
         }
-
-        let mut output: Vec<String> = subjects.into_iter().collect();
-        output.sort();
-        Ok(output)
+        Ok(subjects.into_iter().collect())
     }
 
     pub(crate) fn current_keys(&self) -> Vec<String> {
@@ -4246,94 +4247,10 @@ impl ReplicationSubjectInspector {
         }
 
         let payload = fs::read(&manifest_path).await?;
+        content_recovery::validate_manifest(manifest_hash, &payload)?;
         let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
             .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
         Ok(Some(manifest))
-    }
-
-    async fn load_version_index_by_object_id(
-        &self,
-        object_id: &str,
-    ) -> Result<Option<FileVersionIndex>> {
-        self.metadata_store
-            .load_version_index_by_object_id(object_id)
-            .await
-    }
-
-    async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
-        self.metadata_store.load_all_version_indexes().await
-    }
-
-    async fn resolve_key_for_version_index(
-        &self,
-        index: &FileVersionIndex,
-    ) -> Result<Option<String>> {
-        if let Some(preferred_head) = index
-            .preferred_head_version_id
-            .as_ref()
-            .and_then(|version_id| index.versions.get(version_id))
-            .and_then(|record| record.logical_path.clone())
-        {
-            return Ok(Some(preferred_head));
-        }
-
-        if let Some(any_logical_path) = index
-            .versions
-            .values()
-            .find_map(|record| record.logical_path.clone())
-        {
-            return Ok(Some(any_logical_path));
-        }
-
-        for record in index.versions.values() {
-            if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-                continue;
-            }
-
-            match self.load_manifest_by_hash(&record.manifest_hash).await {
-                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
-                Ok(None) => continue,
-                Err(err) => {
-                    warn!(
-                        manifest_hash = %record.manifest_hash,
-                        object_id = %index.object_id,
-                        version_id = %record.version_id,
-                        error = %err,
-                        "manifest unreadable or invalid while resolving replication subject key; skipping record"
-                    );
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn resolve_key_for_version_record(
-        &self,
-        index: &FileVersionIndex,
-        record: &FileVersionRecord,
-    ) -> Result<Option<String>> {
-        if let Some(logical_path) = record.logical_path.clone() {
-            return Ok(Some(logical_path));
-        }
-
-        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
-            match self.load_manifest_by_hash(&record.manifest_hash).await {
-                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(
-                        manifest_hash = %record.manifest_hash,
-                        object_id = %index.object_id,
-                        version_id = %record.version_id,
-                        error = %err,
-                        "manifest unreadable or invalid while resolving replication subject key; falling back to index lookup"
-                    );
-                }
-            }
-        }
-
-        self.resolve_key_for_version_index(index).await
     }
 }
 
@@ -4396,6 +4313,7 @@ impl PersistentStore {
             std::sync::Mutex::new(RangeChunkCache::new(current_objects_cache_capacity()));
         let snapshot_batch = metadata_store.load_snapshot_batch_state().await?;
         let storage_stats_lock = Arc::new(AsyncMutex::new(()));
+        let content_gc_gate = Arc::new(tokio::sync::RwLock::new(()));
         let media_cache_build_config = MediaCacheBuildConfig::default();
         let media_cache_build_permits = Arc::new(Semaphore::new(
             media_cache_build_config.total_permits as usize,
@@ -4404,9 +4322,11 @@ impl PersistentStore {
             storage_pool.clone(),
             metadata_store.clone(),
             storage_stats_lock.clone(),
+            content_gc_gate.clone(),
         );
 
         let store = Self {
+            content_gc_gate,
             root_dir,
             storage_pool,
             metadata_backend_kind: backend,
@@ -5888,55 +5808,10 @@ impl PersistentStore {
 
     #[cfg(test)]
     pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
-        let snapshot = self.metadata_store.load_current_state().await?;
-        let mut subjects: HashSet<String> = HashSet::new();
-        let mut indexed_object_ids = HashSet::new();
-
-        for (key, manifest_hash) in &snapshot.objects {
-            if self.manifest_is_fully_local(manifest_hash).await? {
-                subjects.insert(key.clone());
-            }
-        }
-
-        for (path, object_id) in &snapshot.object_ids {
-            if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
-                indexed_object_ids.insert(object_id.clone());
-                for head_version_id in &index.head_version_ids {
-                    let Some(record) = index.versions.get(head_version_id) else {
-                        continue;
-                    };
-                    if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
-                        || self.manifest_is_fully_local(&record.manifest_hash).await?
-                    {
-                        subjects.insert(format!("{path}@{head_version_id}"));
-                    }
-                }
-            }
-        }
-
-        for index in self.load_all_version_indexes().await? {
-            if indexed_object_ids.contains(&index.object_id) {
-                continue;
-            }
-
-            for head_version_id in &index.head_version_ids {
-                let Some(record) = index.versions.get(head_version_id) else {
-                    continue;
-                };
-                let Some(key) = self.resolve_key_for_version_record(&index, record).await? else {
-                    continue;
-                };
-                if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
-                    || self.manifest_is_fully_local(&record.manifest_hash).await?
-                {
-                    subjects.insert(format!("{key}@{head_version_id}"));
-                }
-            }
-        }
-
-        let mut output: Vec<String> = subjects.into_iter().collect();
-        output.sort();
-        Ok(output)
+        self.replication_subject_inspector()
+            .await?
+            .list_replication_subjects()
+            .await
     }
 
     pub async fn put_object_versioned(
@@ -8061,44 +7936,6 @@ impl PersistentStore {
         ))
     }
 
-    #[cfg(test)]
-    async fn manifest_is_fully_local(&self, manifest_hash: &str) -> Result<bool> {
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(true);
-        }
-
-        let manifest = match self.load_manifest_by_hash(manifest_hash).await {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => return Ok(false),
-            Err(err) => {
-                warn!(
-                    manifest_hash = %manifest_hash,
-                    error = %err,
-                    "manifest unreadable or invalid; treating as not locally available"
-                );
-                return Ok(false);
-            }
-        };
-
-        for chunk in &manifest.chunks {
-            if !matches!(
-                validate_chunk_path_integrity(
-                    &self
-                        .storage_pool
-                        .content_path(StorageContentKind::Chunk, &chunk.hash)?,
-                    &chunk.hash,
-                    chunk.size_bytes,
-                )
-                .await?,
-                LocalChunkIntegrity::Valid
-            ) {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
     async fn clone_manifest_for_key(&self, manifest_hash: &str, key: &str) -> Result<String> {
         let Some(mut manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
             bail!("missing manifest for hash={manifest_hash}");
@@ -9387,6 +9224,8 @@ impl PersistentStore {
         retention_secs: u64,
         dry_run: bool,
     ) -> Result<CleanupReport> {
+        let _gc_guard = self.content_gc_gate.write().await;
+        let recovery_tasks = self.metadata_store.load_content_repair_tasks().await?;
         let now = unix_ts();
         let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
         let owned_referenced_manifests = self.collect_owned_referenced_manifest_hashes().await?;
@@ -9398,7 +9237,14 @@ impl PersistentStore {
             .map(|record| record.hash.clone())
             .collect::<HashSet<_>>();
 
-        let mut retained_manifests = referenced_manifests.clone();
+        let recovery_manifests: HashSet<_> = recovery_tasks
+            .iter()
+            .map(|task| task.reference.manifest_hash.clone())
+            .collect();
+        let mut retained_manifests = referenced_manifests
+            .union(&recovery_manifests)
+            .cloned()
+            .collect::<HashSet<_>>();
         let mut skipped_recent_manifests = 0usize;
         let mut deleted_manifests = 0usize;
 
@@ -9407,7 +9253,9 @@ impl PersistentStore {
             else {
                 continue;
             };
-            if referenced_manifests.contains(manifest_hash) {
+            if referenced_manifests.contains(manifest_hash)
+                || recovery_manifests.contains(manifest_hash)
+            {
                 continue;
             }
 
@@ -9453,7 +9301,10 @@ impl PersistentStore {
         // content inspected, and even that is read one bounded batch at a time so peak
         // resident manifest data stays flat as the store grows instead of scaling with
         // total manifest count (see docs/node-memory-footprint-reduction-plan.md Slice 3).
-        let mut protected_chunks = HashSet::<String>::new();
+        let mut protected_chunks: HashSet<String> = recovery_tasks
+            .iter()
+            .flat_map(|task| task.chunks.iter().map(|chunk| chunk.hash.clone()))
+            .collect();
         let mut protected_media_fingerprints = HashSet::<String>::new();
         let mut peak_manifest_batch_size = 0usize;
         let retained_manifest_hashes: Vec<&String> = retained_manifests.iter().collect();
@@ -11353,31 +11204,12 @@ impl PersistentStore {
     }
 
     async fn collect_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
-        let mut referenced = HashSet::<String>::new();
-
-        for manifest_hash in self
-            .metadata_store
-            .load_current_state()
+        Ok(self
+            .retained_content()
             .await?
-            .objects
-            .values()
-        {
-            referenced.insert(manifest_hash.clone());
-        }
-
-        for snapshot in self.load_all_snapshots().await? {
-            for manifest_hash in snapshot.objects.values() {
-                referenced.insert(manifest_hash.clone());
-            }
-        }
-
-        for index in self.load_all_version_indexes().await? {
-            for version in index.versions.values() {
-                referenced.insert(version.manifest_hash.clone());
-            }
-        }
-
-        Ok(referenced)
+            .manifests
+            .into_keys()
+            .collect())
     }
 
     /// Lists manifest files present in the manifest store without parsing their
@@ -11454,10 +11286,6 @@ impl PersistentStore {
 
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
         self.metadata_store.load_all_version_indexes().await
-    }
-
-    async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
-        self.metadata_store.load_all_snapshots().await
     }
 
     async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()> {

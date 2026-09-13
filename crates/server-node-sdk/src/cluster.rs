@@ -631,11 +631,19 @@ impl ClusterService {
     }
 
     fn current_replica_nodes_for_subject(&self, key: &str) -> HashSet<NodeId> {
-        let mut current = self.replicas_by_key.get(key).cloned().unwrap_or_default();
-        if let Some(available) = self.available_by_key.get(key) {
-            current.extend(available.iter().copied());
-        }
-        current
+        // Remembered historical claims remain useful for source discovery, but
+        // only a current availability claim can satisfy a durability obligation.
+        self.available_by_key
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|id| {
+                self.nodes
+                    .get(id)
+                    .is_some_and(|node| node.status == NodeStatus::Online)
+            })
+            .copied()
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -1290,6 +1298,8 @@ mod tests {
         let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
 
         let node_a = NodeId::new_v4();
+        svc.register_node(mk_node(local, "dc-local", "rack-1", 1000));
+        svc.register_node(mk_node(node_a, "dc-a", "rack-2", 900));
         svc.note_replica("subject-a", node_a);
 
         let before = svc.replication_plan(&["subject-a".to_string()]);
@@ -1308,7 +1318,8 @@ mod tests {
         svc.remove_available("subject-a", node_a);
 
         let after_availability_removal = svc.replication_plan(&["subject-a".to_string()]);
-        assert!(after_availability_removal.items.is_empty());
+        assert!(after_availability_removal.items[0].current_nodes.is_empty());
+        assert_eq!(after_availability_removal.items[0].missing_nodes.len(), 2);
     }
 
     #[test]
@@ -1509,6 +1520,11 @@ mod tests {
             svc.available_subjects_for_node(node_a),
             vec!["subject-a".to_string(), "subject-a@ver-new".to_string()]
         );
+        assert!(
+            svc.current_replica_nodes_for_subject("subject-a@ver-old")
+                .is_empty(),
+            "historical source hints must not count as currently healthy replicas"
+        );
     }
 
     #[test]
@@ -1557,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn replication_plan_unions_available_and_persisted_version_replicas() {
+    fn replication_plan_does_not_count_unadvertised_historical_claims() {
         let local = NodeId::new_v4();
         let mut svc = ClusterService::new(
             local,
@@ -1589,11 +1605,15 @@ mod tests {
         );
 
         let plan = svc.replication_plan(&["subject-a@ver-old".to_string()]);
+        assert_eq!(plan.under_replicated, 1);
+        assert_eq!(plan.items[0].current_nodes, vec![node_a]);
+        assert_eq!(plan.items[0].missing_nodes, vec![node_b]);
         assert!(
-            plan.items.is_empty(),
-            "historical version subject should not remain under-replicated once both nodes are known to store it"
+            svc.replica_nodes_for_subject("subject-a@ver-old")
+                .iter()
+                .any(|n| n.node_id == node_b),
+            "the stale claim is still useful for hash-level source discovery"
         );
-        assert_eq!(plan.under_replicated, 0);
     }
 
     #[test]
