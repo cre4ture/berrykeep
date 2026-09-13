@@ -712,6 +712,7 @@ fn host_dependency_report_marks_ready_and_missing_video_tools() {
         .find(|check| check.id == "video-thumbnails")
         .unwrap();
     assert_eq!(ffmpeg_check.status, HostDependencyStatus::Missing);
+    assert_eq!(ffmpeg_check.severity, HostDependencySeverity::Info);
     assert_eq!(
         ffmpeg_check.configured_path.as_deref(),
         Some(missing_ffmpeg_path.to_string_lossy().as_ref())

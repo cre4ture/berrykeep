@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
-import type { GalleryMapConfiguration } from "@berrykeep/api";
+import type { GalleryMapConfiguration, HostDependencyCheck } from "@berrykeep/api";
 import { expect, test, type Page, type Route } from "@playwright/test";
 import {
   createInitialOverviewGalleryEntries,
@@ -754,6 +754,113 @@ test("server-admin Dependencies reports a detected Cockpit installation", async 
   await expect(
     page.getByRole("row").filter({ hasText: "Cockpit host administration" }).getByText("ready", { exact: true })
   ).toBeVisible();
+});
+
+test("server-admin Dependencies lists systemd mount findings and remedies per protected path", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    hostDependencyChecks: [
+      {
+        id: "systemd-mount-data-dir",
+        feature: "Systemd mount protection: IRONMESH_DATA_DIR",
+        status: "ready",
+        severity: "info",
+        summary: "Effective dependencies include srv.mount",
+        detail: "The live dependency graph includes implicit and drop-in dependencies.",
+        configured_path: "/srv/berrykeep",
+        resolved_path: "srv.mount (/srv)",
+        install_hint: null
+      },
+      {
+        id: "systemd-mount-storage-primary",
+        feature: "Systemd mount protection: storage pool `primary` (active)",
+        status: "missing",
+        severity: "critical",
+        summary: "No effective systemd mount dependency protects /mnt/primary",
+        detail: "An active storage path needs mount protection.",
+        configured_path: "/mnt/primary",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/mnt/primary` to the service drop-in."
+      },
+      {
+        id: "systemd-mount-storage-archive",
+        feature: "Systemd mount protection: storage pool `archive` (draining)",
+        status: "missing",
+        severity: "warning",
+        summary: "No effective systemd mount dependency protects /mnt/archive",
+        detail: "A draining storage path still needs mount protection.",
+        configured_path: "/mnt/archive",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/mnt/archive` to the service drop-in."
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Dependencies", { exact: true }).click();
+  await expect(page.getByText("Systemd mount protection: IRONMESH_DATA_DIR", { exact: true })).toBeVisible();
+  await expect(page.getByText("Systemd mount protection: storage pool `primary` (active)", { exact: true })).toBeVisible();
+  await expect(page.getByText("Systemd mount protection: storage pool `archive` (draining)", { exact: true })).toBeVisible();
+  await expect(page.getByText(/RequiresMountsFor=\/mnt\/primary/)).toBeVisible();
+  await expect(page.getByText(/RequiresMountsFor=\/mnt\/archive/)).toBeVisible();
+});
+
+test("server-admin dashboard filters dependency findings by severity", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    hostDependencyChecks: [
+      {
+        id: "natural-earth-gdal",
+        feature: "Natural Earth map conversion (GDAL)",
+        status: "missing",
+        severity: "info",
+        summary: "Optional GDAL tooling unavailable",
+        detail: "This optional feature needs gdal-bin.",
+        configured_path: "gdal_rasterize",
+        resolved_path: null,
+        install_hint: "Install gdal-bin."
+      },
+      {
+        id: "systemd-mount-storage-archive",
+        feature: "Systemd mount protection: storage pool `archive` (draining)",
+        status: "missing",
+        severity: "warning",
+        summary: "Draining storage needs mount protection",
+        detail: "The path is still readable while draining.",
+        configured_path: "/mnt/archive",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/mnt/archive`."
+      },
+      {
+        id: "systemd-mount-data-dir",
+        feature: "Systemd mount protection: IRONMESH_DATA_DIR",
+        status: "missing",
+        severity: "critical",
+        summary: "Data directory needs mount protection",
+        detail: "The node state must be protected.",
+        configured_path: "/srv/berrykeep",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/srv/berrykeep`."
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByText("Storage mount protection needs attention", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Draining storage needs mount protection/)).toBeVisible();
+  await expect(page.getByText(/Data directory needs mount protection/)).toBeVisible();
+  await expect(page.getByText("Optional GDAL tooling unavailable", { exact: true })).toHaveCount(0);
 });
 
 test("server-admin explorer loads version history with thumbnails", async ({ page }) => {
@@ -1855,6 +1962,7 @@ async function installServerAdminMocks(
     protectDashboardAdminRoutesUntilSessionConfirmed?: boolean;
     galleryEntries?: AdminMockStoreEntry[];
     cockpitStatus?: "ready" | "optional";
+    hostDependencyChecks?: HostDependencyCheck[];
     mapMetadataCenter?: [number, number, number];
     mapConfiguration?: GalleryMapConfiguration;
     mapConfigurationStatus?: number;
@@ -2132,11 +2240,12 @@ async function installServerAdminMocks(
       return json(route, {
         host_os: "linux",
         generated_at_unix: 1_900_000_333,
-        checks: [
+        checks: options?.hostDependencyChecks ?? [
           {
             id: "image-thumbnails",
             feature: "Image thumbnails and metadata",
             status: "builtin",
+            severity: "info",
             summary: "Ready without extra host packages",
             detail: "Built into the test node.",
             configured_path: null,
@@ -2147,6 +2256,7 @@ async function installServerAdminMocks(
             id: "cockpit",
             feature: "Cockpit host administration",
             status: cockpitReady ? "ready" : "optional",
+            severity: "info",
             summary: cockpitReady
               ? "Cockpit web service found at /usr/lib/cockpit/cockpit-ws"
               : "Cockpit web service was not found on this host",
@@ -2159,6 +2269,7 @@ async function installServerAdminMocks(
             id: "natural-earth-unzip",
             feature: "Natural Earth archive extraction (unzip)",
             status: "ready",
+            severity: "info",
             summary: "Resolved on host at /usr/bin/unzip",
             detail: "Automatic Natural Earth map imports need unzip to extract the official source archive.",
             configured_path: "unzip",
@@ -2169,6 +2280,7 @@ async function installServerAdminMocks(
             id: "natural-earth-gdal",
             feature: "Natural Earth map conversion (GDAL)",
             status: "missing",
+            severity: "info",
             summary: "Required GDAL command(s) not found on PATH: gdal_rasterize",
             detail: "Automatic Natural Earth map imports need GDAL to rasterize source layers, project them to Web Mercator, and create MBTiles overviews.",
             configured_path: "gdal_rasterize, gdalwarp, gdal_translate, gdaladdo",

@@ -105,6 +105,7 @@ pub(super) mod manifest_reader;
 pub(super) mod media_cache;
 pub(super) mod media_tools;
 mod sqlite_impl;
+mod systemd_mount_protection;
 #[cfg(feature = "turso-metadata")]
 mod turso_impl;
 
@@ -127,7 +128,16 @@ pub use media_cache::{
     CachedMediaMetadata, MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates,
     media_cache_retry_due, promote_cached_media_metadata_to_incomplete,
 };
-pub use media_tools::{HostDependencyReport, HostDependencyStatus};
+#[cfg(test)]
+pub(crate) use media_tools::HostDependencySeverity;
+pub use media_tools::{HostDependencyCheck, HostDependencyReport, HostDependencyStatus};
+
+pub(crate) async fn systemd_mount_protection_checks(
+    data_dir: &Path,
+    storage_paths: &[StoragePathConfig],
+) -> Vec<HostDependencyCheck> {
+    systemd_mount_protection::mount_protection_checks(data_dir, storage_paths).await
+}
 
 pub(crate) use data_scrub::DataScrubber;
 #[cfg(test)]
@@ -5019,6 +5029,10 @@ impl PersistentStore {
 
     pub(crate) fn host_dependency_report(&self) -> HostDependencyReport {
         self.media_tools.host_dependency_report()
+    }
+
+    pub(crate) fn mount_protection_paths(&self) -> (PathBuf, Vec<StoragePathConfig>) {
+        (self.root_dir.clone(), self.storage_pool.config().paths)
     }
 
     #[cfg(all(test, unix))]

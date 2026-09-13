@@ -286,7 +286,7 @@ use storage::{
     PutOptions, ReconcileVersionEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
     RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
     S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
-    StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
+    StoragePathConfig, StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
     TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, grid_thumbnail_profile,
     media_cache_retry_due, metadata_db_logical_table_count,
     promote_cached_media_metadata_to_incomplete, thumbnail_profile_from_query,
@@ -13374,10 +13374,18 @@ async fn host_dependency_status(
         Err(status) => return status.into_response(),
     };
 
-    let report: HostDependencyReport = {
+    let (mut report, data_dir, storage_paths): (
+        HostDependencyReport,
+        PathBuf,
+        Vec<StoragePathConfig>,
+    ) = {
         let store = read_store(&state, "host_dependency_report").await;
-        store.host_dependency_report()
+        let (data_dir, storage_paths) = store.mount_protection_paths();
+        (store.host_dependency_report(), data_dir, storage_paths)
     };
+    report
+        .checks
+        .extend(storage::systemd_mount_protection_checks(&data_dir, &storage_paths).await);
     let missing_count = report
         .checks
         .iter()
