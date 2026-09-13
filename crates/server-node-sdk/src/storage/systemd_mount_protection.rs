@@ -522,7 +522,7 @@ fn mount_protection_targets(
     storage_paths: &[StoragePathConfig],
 ) -> Vec<MountProtectionTarget> {
     let mount_points = mount_points_for_current_process();
-    let data_dir = resolved_mount_protection_path(data_dir);
+    let data_dir = normalized_mount_protection_path(data_dir);
     let data_dir_mount_point = mount_points
         .as_deref()
         .and_then(|mount_points| mount_point_for_path(&data_dir, mount_points));
@@ -541,7 +541,7 @@ fn mount_protection_targets(
             .iter()
             .filter(|path| !matches!(path.state, StoragePathState::Disabled))
             .map(|configured_path| {
-                let path = resolved_mount_protection_path(&configured_path.path);
+                let path = normalized_mount_protection_path(&configured_path.path);
                 let mount_point = mount_points
                     .as_deref()
                     .and_then(|mount_points| mount_point_for_path(&path, mount_points));
@@ -580,8 +580,8 @@ async fn mount_protection_targets_for_current_process(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn resolved_mount_protection_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| absolutize_mount_protection_path(path))
+fn normalized_mount_protection_path(path: &Path) -> PathBuf {
+    absolutize_mount_protection_path(path)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1301,10 +1301,11 @@ mod tests {
     }
 
     #[test]
-    fn relative_mount_protection_paths_are_absolutized() {
-        let path = resolved_mount_protection_path(Path::new("./data/server-node"));
+    fn mount_protection_paths_are_normalized_without_filesystem_access() {
+        let path = normalized_mount_protection_path(Path::new("./data/server-node/../pool"));
 
         assert!(path.is_absolute());
+        assert!(path.ends_with("data/pool"));
     }
 
     #[test]
