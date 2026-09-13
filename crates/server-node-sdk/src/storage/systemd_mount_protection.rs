@@ -871,6 +871,14 @@ fn storage_path_state_label(state: StoragePathState) -> &'static str {
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn requires_mounts_for_remedy(service: &str, path: &Path) -> String {
+    format!(
+        "Ensure the filesystem is declared in /etc/fstab or by a native .mount unit, then add `RequiresMountsFor={}` to the [Unit] section of a drop-in for `{service}`, run `sudo systemctl daemon-reload`, and restart the service.",
+        path.display()
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn checks_for_inspection(
     targets: &[MountProtectionTarget],
     inspection: SystemdMountProtectionInspection,
@@ -990,11 +998,43 @@ fn checks_for_inspection(
                         configured_path: Some(target.path.display().to_string()),
                         resolved_path: None,
                         install_hint: Some(format!(
-                            "Confirm that {} resolves to the intended storage filesystem, then add `RequiresMountsFor={}` to the [Unit] section of a drop-in for `{service}`, run `sudo systemctl daemon-reload`, and restart the service.",
+                            "Confirm that {} resolves to the intended storage filesystem. {}",
                             target.path.display(),
-                            target.path.display()
+                            requires_mounts_for_remedy(&service, &target.path)
                         )),
                     },
+                    None if !target_is_on_expected_host_mount => {
+                        let expected_mount = expected_host_mount
+                            .expect("an unexpected live mount requires an expected host mount");
+                        let actual_mount = target
+                            .mount_point
+                            .as_deref()
+                            .expect("a live mount is required to detect an unexpected mount");
+                        HostDependencyCheck {
+                            id: target.id.clone(),
+                            feature: target.feature.clone(),
+                            status: HostDependencyStatus::Missing,
+                            severity: target.missing_severity,
+                            summary: format!(
+                                "{} is currently served by {} instead of {}",
+                                target.path.display(),
+                                actual_mount.display(),
+                                expected_mount.display()
+                            ),
+                            detail: format!(
+                                "Systemd has a loaded mount unit for {}, but the configured storage path is currently falling back to {}. Its mount protection cannot be verified until the expected filesystem is mounted.",
+                                expected_mount.display(),
+                                actual_mount.display()
+                            ),
+                            configured_path: Some(target.path.display().to_string()),
+                            resolved_path: Some(actual_mount.display().to_string()),
+                            install_hint: Some(format!(
+                                "Restore the filesystem declared for {}, ensure the drop-in for `{service}` contains `RequiresMountsFor={}`, run `sudo systemctl daemon-reload`, and restart the service.",
+                                expected_mount.display(),
+                                target.path.display()
+                            )),
+                        }
+                    }
                     None if target.mount_point.as_deref() == Some(Path::new("/")) && expected_host_mount.is_none() => HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
@@ -1025,9 +1065,9 @@ fn checks_for_inspection(
                         configured_path: Some(target.path.display().to_string()),
                         resolved_path: Some("/".to_string()),
                         install_hint: Some(format!(
-                            "Mount the intended filesystem at {}, then add `RequiresMountsFor={}` to the [Unit] section of a drop-in for `{service}`, run `sudo systemctl daemon-reload`, and restart the service.",
+                            "Mount the intended filesystem at {}. {}",
                             target.path.display(),
-                            target.path.display()
+                            requires_mounts_for_remedy(&service, &target.path)
                         )),
                     },
                     None => HostDependencyCheck {
@@ -1044,10 +1084,7 @@ fn checks_for_inspection(
                         ),
                         configured_path: Some(target.path.display().to_string()),
                         resolved_path: None,
-                        install_hint: Some(format!(
-                            "Add `RequiresMountsFor={}` to the [Unit] section of a drop-in for `{service}`, then run `sudo systemctl daemon-reload` and restart the service.",
-                            target.path.display()
-                        )),
+                        install_hint: Some(requires_mounts_for_remedy(&service, &target.path)),
                     },
                 }
             })
@@ -1501,7 +1538,7 @@ mod tests {
                 .install_hint
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Mount the intended filesystem")
+                .contains("Restore the filesystem declared")
         );
     }
 
@@ -1578,6 +1615,15 @@ mod tests {
 
         assert_eq!(checks[0].status, HostDependencyStatus::Missing);
         assert_eq!(checks[0].severity, HostDependencySeverity::Critical);
+        assert!(checks[0].summary.contains("instead of"));
+        assert_eq!(checks[0].resolved_path.as_deref(), Some("/srv"));
+        assert!(
+            checks[0]
+                .install_hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Restore the filesystem declared")
+        );
     }
 
     #[test]

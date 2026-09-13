@@ -168,7 +168,7 @@ export function DependenciesPage() {
                 </Table.Td>
                 <Table.Td>
                   <Text size="xs" ff="monospace">
-                    {check.resolved_path || "not applicable"}
+                    {check.resolved_path || (check.status === "not_applicable" ? "not applicable" : "not resolved")}
                   </Text>
                 </Table.Td>
                 <Table.Td>
