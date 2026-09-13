@@ -166,12 +166,12 @@ override_dh_auto_install:
 		$(CURDIR)/debian/berrykeep-server-node/usr/bin/berrykeep-server-node
 	ln -sf berrykeep-server-node \
 		$(CURDIR)/debian/berrykeep-server-node/usr/bin/ironmesh-server-node
+	# The transitional package retains the enabled legacy unit, user, and
+	# configuration path. Its executable is the compatibility symlink above.
 	install -d $(CURDIR)/debian/ironmesh-server-node/etc/ironmesh
 	install -m0644 debian/ironmesh-server-node.env \
 		$(CURDIR)/debian/ironmesh-server-node/etc/ironmesh/server-node.env
 
-	# The transitional package retains the enabled legacy unit, user, and
-	# configuration path. Its executable is the compatibility symlink above.
 	install -d $(CURDIR)/debian/berrykeep-server-node/etc/berrykeep
 	install -m0644 debian/berrykeep-server-node.env \
 		$(CURDIR)/debian/berrykeep-server-node/etc/berrykeep/server-node.env
@@ -229,6 +229,7 @@ ifeq ($(SERVER_NODE_ONLY),)
 	sed 's/"uuid": "berrykeep-status@berrykeep.io"/"uuid": "ironmesh-status@ironmesh.io"/' \
 		apps/folder-agent/gnome-shell-extension/berrykeep-status@berrykeep.io/metadata.json \
 		> $(LEGACY_CLIENT_EXTENSION_ROOT)/metadata.json
+	chmod 0644 $(LEGACY_CLIENT_EXTENSION_ROOT)/metadata.json
 	install -m0644 apps/folder-agent/gnome-shell-extension/berrykeep-status@berrykeep.io/stylesheet.css \
 		$(LEGACY_CLIENT_EXTENSION_ROOT)/stylesheet.css
 	install -d $(LEGACY_CLIENT_EXTENSION_ROOT)/icons

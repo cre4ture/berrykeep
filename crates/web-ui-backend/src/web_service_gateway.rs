@@ -32,6 +32,7 @@ use super::{WebRuntime, WebState, cookie_values, current_sdk, error_response};
 const SERVICE_HOST_SUFFIX: &str = ".localhost";
 const OPEN_PATH: &str = "/_berrykeep/open";
 const GATEWAY_SESSION_COOKIE: &str = "berrykeep_service_gateway_session";
+const LEGACY_GATEWAY_SESSION_COOKIE: &str = "ironmesh_service_gateway_session";
 const LAUNCH_TOKEN_TTL: Duration = Duration::from_secs(60);
 const SERVICE_SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_PENDING_LAUNCHES: usize = 1_024;
@@ -934,7 +935,9 @@ fn remove_gateway_cookie(value: &str) -> String {
         .map(str::trim)
         .filter(|part| {
             part.split_once('=')
-                .map(|(name, _)| name != GATEWAY_SESSION_COOKIE)
+                .map(|(name, _)| {
+                    name != GATEWAY_SESSION_COOKIE && name != LEGACY_GATEWAY_SESSION_COOKIE
+                })
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>()
@@ -1420,7 +1423,9 @@ mod tests {
     #[test]
     fn gateway_cookie_is_never_forwarded_upstream() {
         assert_eq!(
-            remove_gateway_cookie("nas=one; berrykeep_service_gateway_session=secret; theme=dark"),
+            remove_gateway_cookie(
+                "nas=one; berrykeep_service_gateway_session=secret; ironmesh_service_gateway_session=legacy; theme=dark",
+            ),
             "nas=one; theme=dark"
         );
     }

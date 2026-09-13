@@ -11,7 +11,7 @@ fail() {
 }
 
 is_supported_key() {
-  [[ "$1" =~ ^BERRYKEEP_[A-Z0-9_]+$ || "$1" == "RUST_LOG" ]]
+  [[ "$1" =~ ^(BERRYKEEP|IRONMESH)_[A-Z0-9_]+$ || "$1" == "RUST_LOG" ]]
 }
 
 load_configuration() {

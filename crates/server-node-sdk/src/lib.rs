@@ -1425,21 +1425,19 @@ fn expected_upload_chunk_size(
 }
 
 fn request_device_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(transport_sdk::HEADER_DEVICE_ID)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+    request_header_value(
+        headers,
+        transport_sdk::HEADER_DEVICE_ID,
+        transport_sdk::LEGACY_HEADER_DEVICE_ID,
+    )
 }
 
 fn request_operation_id(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(transport_sdk::HEADER_OPERATION_ID)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+    request_header_value(
+        headers,
+        transport_sdk::HEADER_OPERATION_ID,
+        transport_sdk::LEGACY_HEADER_OPERATION_ID,
+    )
 }
 
 fn client_mutation_operation_payload_hash(payload: &[u8]) -> String {
@@ -1602,8 +1600,21 @@ where
 }
 
 fn request_connection_name(headers: &HeaderMap) -> Option<String> {
+    request_header_value(
+        headers,
+        transport_sdk::HEADER_CONNECTION_NAME,
+        transport_sdk::LEGACY_HEADER_CONNECTION_NAME,
+    )
+}
+
+fn request_header_value(
+    headers: &HeaderMap,
+    canonical_header_name: &str,
+    legacy_header_name: &str,
+) -> Option<String> {
     headers
-        .get(transport_sdk::HEADER_CONNECTION_NAME)
+        .get(canonical_header_name)
+        .or_else(|| headers.get(legacy_header_name))
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())

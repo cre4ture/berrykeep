@@ -58,7 +58,7 @@ The prototype package root should contain at least:
 - `Assets/SmallLogo.png`
 - `Assets/StoreLogo.png`
 
-The manifest now exposes the packaged `berrykeep-config-app.exe` as the visible user-facing entry point, registers `berrykeep-background-launcher.exe` as the login-time startup task, and keeps `berrykeep.exe`, `berrykeep-os-integration.exe`, plus `berrykeep-folder-agent.exe` as hidden packaged full-trust entry points. Legacy BerryKeep execution aliases remain available during the transition.
+The manifest now exposes the packaged `berrykeep-config-app.exe` as the visible user-facing entry point, registers `berrykeep-background-launcher.exe` as the login-time startup task, and keeps `berrykeep.exe`, `berrykeep-os-integration.exe`, plus `berrykeep-folder-agent.exe` as hidden packaged full-trust entry points. Legacy execution aliases remain available during the transition.
 
 For normal packaged-client testing, start BerryKeep through the packaged config app and define instances there first. The direct `berrykeep-os-integration.exe serve ...` flow below remains useful when you need low-level CFAPI or thumbnail-provider verification.
 
@@ -70,19 +70,19 @@ For normal packaged-client testing, start BerryKeep through the packaged config 
    - `cargo build -p os-integration`
 3. Copy the outputs into a package staging folder next to `AppxManifest.xml`.
 4. Register/install the package using your normal Windows packaging workflow.
-5. Unregister any existing unpackaged BerryKeep sync root registration for the test root.
+5. Unregister any existing unpackaged sync root registration for the test root.
 6. Re-register and serve the sync root using the packaged `berrykeep-os-integration.exe` from the installed package location, not the repo-local `target\debug\berrykeep-os-integration.exe`.
    - Example PowerShell:
-   - `$pkg = Get-AppxPackage UlrichHornung.BerryKeep`
+   - `$pkg = Get-AppxPackage | Where-Object { Test-Path (Join-Path $_.InstallLocation 'berrykeep-os-integration.exe') }`
    - `$exe = Join-Path $pkg.InstallLocation 'berrykeep-os-integration.exe'`
      - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
    - The first run uses `--bootstrap-file` to seed `%LocalAppData%\BerryKeep\sync-roots\...`.
    - Later runs for the same sync root can omit `--bootstrap-file`.
 7. Restart Explorer.
-8. Open an BerryKeep sync root in large-icon view and confirm that dehydrated placeholders use the real server thumbnail when available.
+8. Open a BerryKeep sync root in large-icon view and confirm that dehydrated placeholders use the real server thumbnail when available.
 9. Switch to Details view, add the relevant media columns such as `Date taken`, `Dimensions`, `Length`, `Frame rate`, or `Camera model`, and confirm the values appear without hydrating the file.
 10. Confirm the Explorer `Date modified` column matches the remote object modification time.
-11. If a file type has no generated thumbnail yet, expect Explorer's normal file-type icon rather than an BerryKeep-branded fallback image.
+11. If a file type has no generated thumbnail yet, expect Explorer's normal file-type icon rather than a BerryKeep-branded fallback image.
 12. If you intentionally trigger a long-running hydration for testing, right-click the active placeholder and use `Cancel Hydration`.
 
 Why this matters:
@@ -213,23 +213,26 @@ Packages produced by the prototype and Store upload helpers are signed with a lo
 
 For test installs, copy both files from the build output folder to the client PC:
 
-- `UlrichHornung.BerryKeep_<version>_x64.msix`
-- `UlrichHornung.BerryKeep_<version>_x64.cer`
+- the generated `.msix` package
+- its matching `.cer` certificate
 
 Then run this from an elevated PowerShell on the client PC:
 
 ```powershell
-Import-Certificate -FilePath .\UlrichHornung.BerryKeep_1.0.3.0_x64.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
-Add-AppxPackage -Path .\UlrichHornung.BerryKeep_1.0.3.0_x64.msix
+$package = Get-ChildItem -Filter '*.msix' | Select-Object -First 1
+$certificate = Get-ChildItem -Filter '*.cer' | Select-Object -First 1
+Import-Certificate -FilePath $certificate.FullName -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+Add-AppxPackage -Path $package.FullName
 ```
 
 If the certificate file was not copied separately, extract the signer certificate from the package and import it:
 
 ```powershell
-$cert = (Get-AuthenticodeSignature -FilePath .\UlrichHornung.BerryKeep_1.0.3.0_x64.msix).SignerCertificate
+$package = Get-ChildItem -Filter '*.msix' | Select-Object -First 1
+$cert = (Get-AuthenticodeSignature -FilePath $package.FullName).SignerCertificate
 Export-Certificate -Cert $cert -FilePath .\BerryKeep.cer
 Import-Certificate -FilePath .\BerryKeep.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
-Add-AppxPackage -Path .\UlrichHornung.BerryKeep_1.0.3.0_x64.msix
+Add-AppxPackage -Path $package.FullName
 ```
 
 This trust step is only for direct sideload testing. Partner Center distribution should use the `.msixupload`; after Microsoft Store processing, end users should not need to import this development certificate manually.
@@ -241,7 +244,7 @@ Use this when iterating on the thumbnail provider DLL, the manifest, or the pack
 1. Build, pack, sign, and install from an elevated PowerShell:
    - `powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -Install`
 2. The helper starts the packaged background launcher after install. To inspect or start the Explorer host manually from the installed package location:
-   - `$pkg = Get-AppxPackage UlrichHornung.BerryKeep`
+   - `$pkg = Get-AppxPackage | Where-Object { Test-Path (Join-Path $_.InstallLocation 'berrykeep-os-integration.exe') }`
    - `$exe = Join-Path $pkg.InstallLocation 'berrykeep-os-integration.exe'`
    - `& $exe serve --sync-root-id <id> --display-name <name> --root-path <path> --bootstrap-file <bootstrap-json>`
    - After that first successful run, the packaged host will reuse the canonical `%LocalAppData%\BerryKeep\sync-roots\...` bootstrap and client identity for the same sync root.

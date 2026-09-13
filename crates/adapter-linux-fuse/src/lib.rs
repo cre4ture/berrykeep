@@ -159,6 +159,12 @@ pub mod runtime {
     const XATTR_CONFLICT_REASON: &str = "user.berrykeep.conflict_reason";
     const XATTR_CONFLICT_COPY: &str = "user.berrykeep.conflict_copy";
     const XATTR_SOURCE_PATH: &str = "user.berrykeep.source_path";
+    const LEGACY_XATTR_STATE: &str = "user.ironmesh.state";
+    const LEGACY_XATTR_LOCAL_VERSION: &str = "user.ironmesh.local_version";
+    const LEGACY_XATTR_REMOTE_VERSION: &str = "user.ironmesh.remote_version";
+    const LEGACY_XATTR_CONFLICT_REASON: &str = "user.ironmesh.conflict_reason";
+    const LEGACY_XATTR_CONFLICT_COPY: &str = "user.ironmesh.conflict_copy";
+    const LEGACY_XATTR_SOURCE_PATH: &str = "user.ironmesh.source_path";
     /// Default global budget for resident `FsNode.data` bytes across the mount, before
     /// least-recently-hydrated clean files get proactively re-placeholdered. Overridable
     /// via `BERRYKEEP_FUSE_HYDRATION_BUDGET_BYTES` (see
@@ -1193,10 +1199,11 @@ pub mod runtime {
         }
 
         fn xattr_value_for_inode(&self, inode: u64, name: &str) -> Result<Option<Vec<u8>>> {
+            let canonical_name = Self::canonical_xattr_name(name);
             Ok(self
                 .xattr_entries_for_inode(inode)?
                 .into_iter()
-                .find_map(|(entry_name, value)| (entry_name == name).then_some(value)))
+                .find_map(|(entry_name, value)| (entry_name == canonical_name).then_some(value)))
         }
 
         fn xattr_name_list_for_inode(&self, inode: u64) -> Result<Vec<u8>> {
@@ -1220,6 +1227,18 @@ pub mod runtime {
             }
 
             reply.data(payload);
+        }
+
+        fn canonical_xattr_name(name: &str) -> &str {
+            match name {
+                LEGACY_XATTR_STATE => XATTR_STATE,
+                LEGACY_XATTR_LOCAL_VERSION => XATTR_LOCAL_VERSION,
+                LEGACY_XATTR_REMOTE_VERSION => XATTR_REMOTE_VERSION,
+                LEGACY_XATTR_CONFLICT_REASON => XATTR_CONFLICT_REASON,
+                LEGACY_XATTR_CONFLICT_COPY => XATTR_CONFLICT_COPY,
+                LEGACY_XATTR_SOURCE_PATH => XATTR_SOURCE_PATH,
+                _ => name,
+            }
         }
 
         fn parent_allows_mutation(&self, parent: u64, name: &str) -> bool {
@@ -3376,6 +3395,11 @@ pub mod runtime {
             assert_eq!(
                 fs.xattr_value_for_inode(user_inode, XATTR_STATE)
                     .expect("xattr lookup should work"),
+                Some(b"placeholder,conflict".to_vec())
+            );
+            assert_eq!(
+                fs.xattr_value_for_inode(user_inode, LEGACY_XATTR_STATE)
+                    .expect("legacy xattr lookup should work"),
                 Some(b"placeholder,conflict".to_vec())
             );
             assert_eq!(

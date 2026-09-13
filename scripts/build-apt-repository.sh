@@ -928,7 +928,7 @@ if [[ "${SIGN_REPO}" == true ]]; then
     exit 1
   fi
   cp -f "${REPO_DIR}/berrykeep-archive-keyring.asc" \
-    "${REPO_DIR}/berrykeep-archive-keyring.asc"
+    "${REPO_DIR}/ironmesh-archive-keyring.asc"
 
   log "signing Release metadata with ${SIGNING_KEY}"
   sign_release clearsign "${SUITE_DIR}/InRelease" "${SUITE_DIR}/Release"

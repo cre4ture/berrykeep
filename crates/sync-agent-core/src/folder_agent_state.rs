@@ -14,6 +14,7 @@ use crate::{LocalEntryKind, LocalEntryState, LocalTreeState, normalize_relative_
 pub(crate) const FOLDER_AGENT_BASELINE_FILE_NAME: &str = "baseline.sqlite";
 pub(crate) const FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME: &str = "modification-log.sqlite";
 const FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN: &str = "berrykeep-folder-agent-profile-v1";
+const LEGACY_FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN: &str = "ironmesh-folder-agent-profile-v1";
 
 #[derive(Debug, Clone)]
 pub struct PathScope {
@@ -76,10 +77,29 @@ pub(crate) struct FolderAgentProfilePaths {
 }
 
 pub(crate) fn default_folder_agent_state_root() -> PathBuf {
-    xdg_state_home()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("berrykeep")
-        .join("folder-agent")
+    folder_agent_state_root_in(xdg_state_home().unwrap_or_else(std::env::temp_dir))
+}
+
+fn folder_agent_state_root_in(state_home: PathBuf) -> PathBuf {
+    let canonical_root = state_home.join("berrykeep").join("folder-agent");
+    let legacy_root = state_home.join("ironmesh").join("folder-agent");
+    if canonical_root.exists() || !legacy_root.exists() {
+        return canonical_root;
+    }
+
+    let Some(canonical_parent) = canonical_root.parent() else {
+        return legacy_root;
+    };
+    if fs::create_dir_all(canonical_parent).is_ok()
+        && fs::rename(&legacy_root, &canonical_root).is_ok()
+    {
+        canonical_root
+    } else {
+        // Do not strand an existing profile if an unusual filesystem prevents
+        // the one-shot migration. The caller can keep using it until the next
+        // run can move it into the canonical state root.
+        legacy_root
+    }
 }
 
 pub(crate) fn folder_agent_profile_paths(
@@ -111,8 +131,22 @@ fn stable_scope_fingerprint(
     scope: &PathScope,
     connection_target: &str,
 ) -> String {
+    stable_scope_fingerprint_with_domain(
+        FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN,
+        identity_root,
+        scope,
+        connection_target,
+    )
+}
+
+fn stable_scope_fingerprint_with_domain(
+    domain: &str,
+    identity_root: &Path,
+    scope: &PathScope,
+    connection_target: &str,
+) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN.as_bytes());
+    hasher.update(domain.as_bytes());
     hasher.update(&[0]);
     hasher.update(identity_root.to_string_lossy().as_bytes());
     hasher.update(&[0]);
@@ -141,13 +175,22 @@ pub(crate) fn legacy_folder_agent_profile_dir(
     state_root_dir: &Path,
     current_scope_fingerprint: &str,
 ) -> Option<PathBuf> {
-    let legacy_scope_fingerprint =
-        legacy_scope_fingerprint(identity_root, scope, connection_target);
-    (legacy_scope_fingerprint != current_scope_fingerprint).then(|| {
-        state_root_dir
-            .join("profiles")
-            .join(legacy_scope_fingerprint)
-    })
+    let legacy_brand_fingerprint = stable_scope_fingerprint_with_domain(
+        LEGACY_FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN,
+        identity_root,
+        scope,
+        connection_target,
+    );
+    let legacy_brand_dir = state_root_dir
+        .join("profiles")
+        .join(&legacy_brand_fingerprint);
+    if legacy_brand_fingerprint != current_scope_fingerprint && legacy_brand_dir.exists() {
+        return Some(legacy_brand_dir);
+    }
+
+    let legacy_fingerprint = legacy_scope_fingerprint(identity_root, scope, connection_target);
+    (legacy_fingerprint != current_scope_fingerprint)
+        .then(|| state_root_dir.join("profiles").join(legacy_fingerprint))
 }
 
 pub(crate) fn migrate_legacy_folder_agent_profile_dir(
@@ -292,13 +335,11 @@ fn rewrite_scope_fingerprint_metadata(
 }
 
 fn xdg_state_home() -> Option<PathBuf> {
-    if let Some(path) =
-        common::legacy_compatibility::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty())
-    {
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(path));
     }
 
-    common::legacy_compatibility::var_os("HOME")
+    std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|home| home.join(".local").join("state"))
@@ -1140,7 +1181,11 @@ fn is_berrykeep_part_file_name(file_name: &str) -> bool {
         return false;
     }
 
-    let Some((_, suffix)) = file_name.rsplit_once(".berrykeep-part-") else {
+    let suffix = file_name
+        .rsplit_once(".berrykeep-part-")
+        .or_else(|| file_name.rsplit_once(".ironmesh-part-"))
+        .map(|(_, suffix)| suffix);
+    let Some(suffix) = suffix else {
         return false;
     };
 
@@ -1357,6 +1402,62 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_agent_state_root_migrates_the_legacy_root() {
+        let root = test_root();
+        let legacy_root = root.join("ironmesh").join("folder-agent");
+        fs::create_dir_all(&legacy_root).unwrap();
+        fs::write(legacy_root.join("state-marker"), b"existing state").unwrap();
+
+        let state_root = folder_agent_state_root_in(root.clone());
+
+        assert_eq!(state_root, root.join("berrykeep").join("folder-agent"));
+        assert_eq!(
+            fs::read(state_root.join("state-marker")).unwrap(),
+            b"existing state"
+        );
+        assert!(!legacy_root.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_brand_profile_digest_is_migrated_when_present() {
+        let root = test_root();
+        let state_root = root.join("state-root");
+        let identity_root = root.join("identity-root");
+        let scope = PathScope::new(Some("photos/camera".to_string()));
+        let connection_target = "http://127.0.0.1:8080";
+        let current_fingerprint =
+            stable_scope_fingerprint(&identity_root, &scope, connection_target);
+        let legacy_fingerprint = stable_scope_fingerprint_with_domain(
+            LEGACY_FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN,
+            &identity_root,
+            &scope,
+            connection_target,
+        );
+        let legacy_profile_dir = state_root.join("profiles").join(&legacy_fingerprint);
+        fs::create_dir_all(&legacy_profile_dir).unwrap();
+
+        let discovered = legacy_folder_agent_profile_dir(
+            &identity_root,
+            &scope,
+            connection_target,
+            &state_root,
+            &current_fingerprint,
+        );
+
+        assert_eq!(discovered, Some(legacy_profile_dir));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_file_cleanup_recognizes_canonical_and_legacy_names() {
+        assert!(is_berrykeep_part_file_name(".report.berrykeep-part-123"));
+        assert!(is_berrykeep_part_file_name(".report.ironmesh-part-456"));
+        assert!(!is_berrykeep_part_file_name("report.ironmesh-part-456"));
     }
 
     #[test]

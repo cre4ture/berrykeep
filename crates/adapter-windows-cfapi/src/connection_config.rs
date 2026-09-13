@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".berrykeep-connection.json";
+const LEGACY_CONNECTION_BOOTSTRAP_FILE_NAME: &str = ".ironmesh-connection.json";
 
 #[derive(Debug, Clone)]
 pub struct ResolvedConnectionConfig {
@@ -30,8 +31,12 @@ pub struct ResolvedConnectionConfig {
 
 pub fn is_internal_connection_bootstrap_relative_path(path: &str) -> bool {
     let normalized = path.trim().trim_matches(['/', '\\']).replace('\\', "/");
-    normalized == DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME
-        || normalized.ends_with(&format!("/{DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME}"))
+    [
+        DEFAULT_CONNECTION_BOOTSTRAP_FILE_NAME,
+        LEGACY_CONNECTION_BOOTSTRAP_FILE_NAME,
+    ]
+    .into_iter()
+    .any(|file_name| normalized == file_name || normalized.ends_with(&format!("/{file_name}")))
 }
 
 pub fn resolve_connection_config(
@@ -218,6 +223,12 @@ mod tests {
         ));
         assert!(is_internal_connection_bootstrap_relative_path(
             "nested/.berrykeep-connection.json"
+        ));
+        assert!(is_internal_connection_bootstrap_relative_path(
+            ".ironmesh-connection.json"
+        ));
+        assert!(is_internal_connection_bootstrap_relative_path(
+            "nested/.ironmesh-connection.json"
         ));
         assert!(!is_internal_connection_bootstrap_relative_path(
             "nested/not-connection.json"

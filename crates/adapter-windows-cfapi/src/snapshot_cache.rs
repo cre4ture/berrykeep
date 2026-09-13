@@ -1,11 +1,16 @@
 #![cfg(windows)]
 
 const DEFAULT_REMOTE_SNAPSHOT_CACHE_FILE_NAME: &str = ".berrykeep-remote-snapshot.json";
+const LEGACY_REMOTE_SNAPSHOT_CACHE_FILE_NAME: &str = ".ironmesh-remote-snapshot.json";
 
 pub fn is_internal_remote_snapshot_relative_path(path: &str) -> bool {
     let normalized = path.trim().trim_matches(['/', '\\']).replace('\\', "/");
-    normalized == DEFAULT_REMOTE_SNAPSHOT_CACHE_FILE_NAME
-        || normalized.ends_with(&format!("/{DEFAULT_REMOTE_SNAPSHOT_CACHE_FILE_NAME}"))
+    [
+        DEFAULT_REMOTE_SNAPSHOT_CACHE_FILE_NAME,
+        LEGACY_REMOTE_SNAPSHOT_CACHE_FILE_NAME,
+    ]
+    .into_iter()
+    .any(|file_name| normalized == file_name || normalized.ends_with(&format!("/{file_name}")))
 }
 
 #[cfg(test)]
@@ -19,6 +24,12 @@ mod tests {
         ));
         assert!(is_internal_remote_snapshot_relative_path(
             "nested/.berrykeep-remote-snapshot.json"
+        ));
+        assert!(is_internal_remote_snapshot_relative_path(
+            ".ironmesh-remote-snapshot.json"
+        ));
+        assert!(is_internal_remote_snapshot_relative_path(
+            "nested/.ironmesh-remote-snapshot.json"
         ));
         assert!(!is_internal_remote_snapshot_relative_path(
             "nested/not-remote-snapshot.json"

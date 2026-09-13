@@ -4,7 +4,10 @@ use std::io::Read;
 use std::path::Path;
 
 pub const CONTENT_FINGERPRINT_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
-const CONTENT_FINGERPRINT_PREFIX: &[u8] = b"berrykeep-content-fingerprint-v1";
+// Content fingerprints are persisted as cache keys, so this opaque v1 domain
+// remains stable across the product rename. New code uses the canonical
+// fingerprint APIs without exposing the historical storage prefix.
+const CONTENT_FINGERPRINT_PREFIX: &[u8] = b"ironmesh-content-fingerprint-v1";
 
 #[derive(Debug, Clone)]
 pub struct ContentFingerprintBuilder {

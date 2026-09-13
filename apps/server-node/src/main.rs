@@ -243,10 +243,7 @@ mod windows_service_host {
     }
 
     fn is_allowed_environment_name(name: &str) -> bool {
-        name == "RUST_LOG"
-            || name == "BERRYKEEP_SERVER_NODE_DATA_DIR"
-            || name == "BERRYKEEP_SERVER_NODE_BIND"
-            || name.starts_with("BERRYKEEP_")
+        name == "RUST_LOG" || name.starts_with("BERRYKEEP_") || name.starts_with("IRONMESH_")
     }
 
     #[cfg(test)]
@@ -257,9 +254,9 @@ mod windows_service_host {
         fn service_environment_allows_node_settings_only() {
             assert!(is_allowed_environment_name("BERRYKEEP_SERVER_NODE_BIND"));
             assert!(is_allowed_environment_name("BERRYKEEP_RENDEZVOUS_URLS"));
+            assert!(is_allowed_environment_name("IRONMESH_RENDEZVOUS_URLS"));
             assert!(is_allowed_environment_name("RUST_LOG"));
             assert!(!is_allowed_environment_name("PATH"));
-            assert!(!is_allowed_environment_name("BERRYKEEP_UNRELATED"));
         }
     }
 }

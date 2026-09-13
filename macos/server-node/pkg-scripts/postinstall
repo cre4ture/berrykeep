@@ -11,6 +11,10 @@ readonly CONFIG_PATH="${SERVICE_ROOT}/server-node.env"
 readonly CONFIG_TEMPLATE_PATH="${SERVICE_ROOT}/server-node.env.example"
 readonly LOG_DIR="/Library/Logs/BerryKeep"
 readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
+readonly LEGACY_SERVICE_ROOT="/Library/Application Support/Ironmesh"
+readonly LEGACY_DATA_DIR="${LEGACY_SERVICE_ROOT}/server-node"
+readonly LEGACY_CONFIG_PATH="${LEGACY_SERVICE_ROOT}/server-node.env"
+readonly LEGACY_LOG_DIR="/Library/Logs/Ironmesh"
 
 fail() {
   printf 'berrykeep-server-node installer: %s\n' "$*" >&2
@@ -52,9 +56,25 @@ create_service_user() {
   dscl . -create "/Users/${SERVICE_USER}" Password '*'
 }
 
+migrate_legacy_path_if_absent() {
+  local legacy_path="$1"
+  local canonical_path="$2"
+
+  [[ -e "${legacy_path}" && ! -e "${canonical_path}" ]] || return
+  install -d -o root -g wheel -m 0755 "$(dirname "${canonical_path}")"
+  mv "${legacy_path}" "${canonical_path}"
+}
+
 if [[ "${3:-/}" != "/" ]]; then
   exit 0
 fi
+
+# Package payload files already establish the canonical root. Move only the
+# mutable paths that must survive an upgrade; never overwrite state created by
+# a prior canonical installation.
+migrate_legacy_path_if_absent "${LEGACY_DATA_DIR}" "${DATA_DIR}"
+migrate_legacy_path_if_absent "${LEGACY_CONFIG_PATH}" "${CONFIG_PATH}"
+migrate_legacy_path_if_absent "${LEGACY_LOG_DIR}" "${LOG_DIR}"
 
 create_service_user
 

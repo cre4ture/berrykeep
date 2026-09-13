@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const DEFAULT_CLIENT_IDENTITY_FILE_NAME: &str = ".berrykeep-client-identity.json";
+const LEGACY_CLIENT_IDENTITY_FILE_NAME: &str = ".ironmesh-client-identity.json";
 
 #[derive(Debug, Clone)]
 pub struct ClientEnrollmentOptions {
@@ -110,8 +111,12 @@ fn sibling_client_identity_path(bootstrap_path: &Path) -> PathBuf {
 
 pub fn is_internal_client_identity_relative_path(path: &str) -> bool {
     let normalized = path.trim().trim_matches(['/', '\\']).replace('\\', "/");
-    normalized == DEFAULT_CLIENT_IDENTITY_FILE_NAME
-        || normalized.ends_with(&format!("/{DEFAULT_CLIENT_IDENTITY_FILE_NAME}"))
+    [
+        DEFAULT_CLIENT_IDENTITY_FILE_NAME,
+        LEGACY_CLIENT_IDENTITY_FILE_NAME,
+    ]
+    .into_iter()
+    .any(|file_name| normalized == file_name || normalized.ends_with(&format!("/{file_name}")))
 }
 
 fn enroll_client_identity(
@@ -258,6 +263,12 @@ mod tests {
         ));
         assert!(is_internal_client_identity_relative_path(
             "nested/.berrykeep-client-identity.json"
+        ));
+        assert!(is_internal_client_identity_relative_path(
+            ".ironmesh-client-identity.json"
+        ));
+        assert!(is_internal_client_identity_relative_path(
+            "nested/.ironmesh-client-identity.json"
         ));
         assert!(!is_internal_client_identity_relative_path(
             "nested/not-client-identity.json"

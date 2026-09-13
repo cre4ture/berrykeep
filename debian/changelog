@@ -4,7 +4,7 @@ berrykeep (1.2.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
     gallery discovery across desktop and mobile clients.
   * Publish signed Windows client MSIX sideload assets and portable Server Node
     packages for AMD64 and ARM64.
-  * Complete the BerryKeep package transition while retaining safe BerryKeep
+  * Complete the BerryKeep package transition while retaining safe Ironmesh
     compatibility paths for deployed systems.
   * Roll the workspace release to 1.2.0.
 
@@ -12,7 +12,7 @@ berrykeep (1.2.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
 berrykeep (1.1.0-3~repo1~ubuntu24.04.1) noble; urgency=medium
 
-  * Preserve legacy desktop integration during the BerryKeep-to-BerryKeep
+  * Preserve legacy desktop integration during the Ironmesh-to-BerryKeep
     transition without starting duplicate background config apps.
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 08 Sep 2026 00:15:00 +0200
@@ -29,13 +29,13 @@ berrykeep (1.1.0-2~repo1~ubuntu24.04.1) noble; urgency=medium
     production client routing.
   * Roll the workspace release to 1.1.0.
   * Rename release binaries and Debian packages to BerryKeep, with
-    transitional BerryKeep packages for existing installations.
-  * Raise the Debian revision so deployed BerryKeep packages receive the
+    transitional Ironmesh packages for existing installations.
+  * Raise the Debian revision so deployed Ironmesh packages receive the
     transition on their next normal apt upgrade.
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 29 Aug 2026 16:10:03 +0200
 
-berrykeep (1.0.46-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.46-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Bound per-client rendezvous tickets and global connection and handshake
     admission to prevent resource storms.
@@ -47,7 +47,7 @@ berrykeep (1.0.46-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 13 Aug 2026 07:20:34 +0200
 
-berrykeep (1.0.45-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.45-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Improve client connection diagnostics and Android diagnostic handling.
   * Preserve upload-session routing across route refreshes and project gallery
@@ -57,7 +57,7 @@ berrykeep (1.0.45-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 03 Aug 2026 22:35:37 +0200
 
-berrykeep (1.0.44-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.44-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Harden direct QUIC relay ticket rollover and prioritize validated client routes.
   * Switch reliability telemetry storage to Turso and improve its operational diagnostics.
@@ -66,14 +66,14 @@ berrykeep (1.0.44-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 02 Aug 2026 13:00:00 +0200
 
-berrykeep (1.0.43-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.43-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Re-apply the rendezvous contact list on metadata import changes.
   * Roll the workspace release to 1.0.43.
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 01 Aug 2026 17:46:22 +0200
 
-berrykeep (1.0.42-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.42-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Strengthen managed QUIC route handling, relay fallback, and diagnostics.
   * Add a fast SQLite gallery-index path and share gallery data adapters.
@@ -82,7 +82,7 @@ berrykeep (1.0.42-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 30 Jul 2026 10:44:42 +0200
 
-berrykeep (1.0.41-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.41-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Extend managed QUIC route diagnostics and connection lifecycle logs across
     desktop and mobile clients.
@@ -92,7 +92,7 @@ berrykeep (1.0.41-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 29 Jul 2026 14:57:58 +0200
 
-berrykeep (1.0.40-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.40-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Embed an authenticated Iroh relay on the Rendezvous endpoint and port.
   * Add anonymous reliability-telemetry ingestion tokens with node registration
@@ -102,7 +102,7 @@ berrykeep (1.0.40-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 28 Jul 2026 17:22:03 +0200
 
-berrykeep (1.0.39-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.39-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add managed mobile Rendezvous routes and direct QUIC connection status.
   * Extend server-node telemetry, storage administration, and Windows/macOS
@@ -112,7 +112,7 @@ berrykeep (1.0.39-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 27 Jul 2026 23:10:11 +0200
 
-berrykeep (1.0.38-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.38-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Improve client route selection and recovery diagnostics, including
     exportable correlated client logs.
@@ -122,7 +122,7 @@ berrykeep (1.0.38-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 26 Jul 2026 18:46:38 +0200
 
-berrykeep (1.0.37-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.37-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add Natural Earth map variants, dataset import workflows, and explorer
     pagination improvements.
@@ -134,7 +134,7 @@ berrykeep (1.0.37-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 24 Jul 2026 23:03:50 +0200
 
-berrykeep (1.0.36-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.36-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Harden global rendezvous registration, relay security, and legacy client
     identity migration paths.
@@ -146,7 +146,7 @@ berrykeep (1.0.36-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 22 Jul 2026 12:16:10 +0200
 
-berrykeep (1.0.35-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.35-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add global rendezvous control-plane registration, relay security hardening,
     and direct QUIC transport capabilities.
@@ -161,7 +161,7 @@ berrykeep (1.0.35-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 20 Jul 2026 03:01:13 +0200
 
-berrykeep (1.0.34-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.34-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add S3 frontend support with replicated control-plane APIs, relay-capable
     object streaming, versioned bucket operations, admin UI, and AWS
@@ -180,7 +180,7 @@ berrykeep (1.0.34-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 14 Jul 2026 12:28:11 +0200
 
-berrykeep (1.0.33-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.33-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Move sqlite metadata reads onto tokio-rusqlite and harden media cache
     cleanup against stale rewrites.
@@ -197,7 +197,7 @@ berrykeep (1.0.33-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 13 Jul 2026 08:45:04 +0200
 
-berrykeep (1.0.32-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.32-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add cluster node state persistence across restarts, backfill from legacy
     replica state, and ignore offline replicas in over-replication planning.
@@ -223,7 +223,7 @@ berrykeep (1.0.32-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 11 Jul 2026 01:40:38 +0200
 
-berrykeep (1.0.31-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.31-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add Android folder sync network rules for metered and Wi-Fi policy
     handling.
@@ -235,7 +235,7 @@ berrykeep (1.0.31-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 03 Jul 2026 12:35:40 +0200
 
-berrykeep (1.0.30-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.30-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Fix video thumbnail generation failure on large files by replacing
     concatf: protocol with a local HTTP Range server, avoiding the OS
@@ -246,7 +246,7 @@ berrykeep (1.0.30-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 29 Jun 2026 02:45:00 +0200
 
-berrykeep (1.0.29-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.29-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add Android server node app with foreground service, Web UI activity, and
     network-origins APIs.
@@ -263,7 +263,7 @@ berrykeep (1.0.29-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 28 Jun 2026 03:45:30 +0200
 
-berrykeep (1.0.28-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.28-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Stream manual repair actions one record at a time so that large databases
     do not exhaust RAM; adds load_snapshot_by_id, list_uncompressed_snapshot_ids,
@@ -273,7 +273,7 @@ berrykeep (1.0.28-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 26 Jun 2026 10:29:08 +0200
 
-berrykeep (1.0.27-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.27-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Store snapshot manifests as zstd-compressed JSON in the metadata database;
     reads transparently decompress legacy plain-JSON entries.
@@ -283,7 +283,7 @@ berrykeep (1.0.27-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 26 Jun 2026 02:13:15 +0200
 
-berrykeep (1.0.26-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.26-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Keep retained manual repair action runs visible in server-admin with
     inspectable stored results, including dry runs and very fast completions.
@@ -291,7 +291,7 @@ berrykeep (1.0.26-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 25 Jun 2026 21:30:26 +0200
 
-berrykeep (1.0.25-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.25-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Persist manual repair action status across server-admin navigation and
     surface progress for background repair runs.
@@ -301,7 +301,7 @@ berrykeep (1.0.25-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 25 Jun 2026 01:52:11 +0200
 
-berrykeep (1.0.24-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.24-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Batch live snapshot creation by non-overlapping path changes, with a
     two-hour maximum batch window.
@@ -311,7 +311,7 @@ berrykeep (1.0.24-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 24 Jun 2026 21:49:12 +0200
 
-berrykeep (1.0.23-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.23-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Load metadata DB logical distribution on demand in server-admin and add
     progress feedback for the analysis.
@@ -321,7 +321,7 @@ berrykeep (1.0.23-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 23 Jun 2026 23:09:47 +0200
 
-berrykeep (1.0.22-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.22-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add Logs page and shared UI components for viewing recent client-side
     backend logs.
@@ -334,7 +334,7 @@ berrykeep (1.0.22-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 23 Jun 2026 17:51:06 +0200
 
-berrykeep (1.0.21-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.21-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add config-app managed identity auto-renewal for rendezvous client
     certificates, including startup reconciliation and dependent service
@@ -345,7 +345,7 @@ berrykeep (1.0.21-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 20 Jun 2026 21:26:47 +0200
 
-berrykeep (1.0.20-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.20-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add automatic renewal of rendezvous client identity cert before expiry,
     with support for both relay and direct renewal paths.
@@ -356,7 +356,7 @@ berrykeep (1.0.20-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 20 Jun 2026 00:56:08 +0200
 
-berrykeep (1.0.19-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.19-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add Windows folder-agent cluster workload harness with live CFAPI driver,
     nested workload staging, and start-before-copy default; fix disk-full
@@ -372,7 +372,7 @@ berrykeep (1.0.19-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 14 Jun 2026 23:31:28 +0200
 
-berrykeep (1.0.18-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.18-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add a Metadata Footprint admin page with logical metadata table
     breakdowns and interactive footprint charts.
@@ -385,7 +385,7 @@ berrykeep (1.0.18-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Thu, 28 May 2026 06:57:38 +0200
 
-berrykeep (1.0.17-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.17-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Preserve replication repair lineage across nodes and stop replayed
     tombstones from re-deleting repaired content.
@@ -396,20 +396,20 @@ berrykeep (1.0.17-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 24 May 2026 10:57:05 +0200
 
-berrykeep (1.0.16-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.16-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Expose live repair progress tails in the admin Repair page and deepen
     replication repair logging.
   * Add automatic latency feature tests, polish the latency page, and close
     the shared gallery grid pagination gap.
   * Add a copy-to-clipboard action for JSON blocks and fix missing
-    berrykeep.exe packaging in the Windows MSIX manifests.
+    ironmesh.exe packaging in the Windows MSIX manifests.
   * Stabilize Turso media-cache cleanup under CI coverage and roll the
     workspace release to 1.0.16.
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 22 May 2026 22:29:57 +0200
 
-berrykeep (1.0.15-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.15-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add admin explorer move, rename, and restore actions plus a right-side
     gallery version-history drawer.
@@ -422,7 +422,7 @@ berrykeep (1.0.15-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 20 May 2026 07:30:28 +0200
 
-berrykeep (1.0.14-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.14-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add per-item gallery poster retry, cluster dense gallery map markers,
     and virtualize grid page loading to keep large media scopes responsive.
@@ -435,7 +435,7 @@ berrykeep (1.0.14-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 16 May 2026 18:55:09 +0200
 
-berrykeep (1.0.13-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.13-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Pin each file upload to a single server node and reject incomplete chunk
     sets before completion.
@@ -447,7 +447,7 @@ berrykeep (1.0.13-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 16 May 2026 06:09:19 +0200
 
-berrykeep (1.0.12-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.12-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add an admin Connections page, a dependency diagnostics page, and
     connection-name reporting improvements.
@@ -459,7 +459,7 @@ berrykeep (1.0.12-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 15 May 2026 00:56:30 +0200
 
-berrykeep (1.0.11-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.11-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add a paginated admin Data Changes feed with upload, rename, copy, and
     delete history plus client identity attribution.
@@ -469,7 +469,7 @@ berrykeep (1.0.11-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 13 May 2026 08:47:35 +0200
 
-berrykeep (1.0.10-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.10-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Limit media cache build concurrency to avoid file descriptor exhaustion.
   * Fix autonomous post-write targeted replication so fresh local writes can
@@ -478,7 +478,7 @@ berrykeep (1.0.10-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 12 May 2026 09:05:48 +0200
 
-berrykeep (1.0.9-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.9-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Handle temporary walk-scan errors correctly in the Windows CFAPI adapter.
   * Hide the bootstrap Setup page from the server-admin navigation in normal
@@ -489,7 +489,7 @@ berrykeep (1.0.9-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 11 May 2026 01:20:49 +0200
 
-berrykeep (1.0.8-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.8-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add remote media metadata and thumbnail import so nodes can serve gallery
     artifacts even when local chunks are incomplete.
@@ -501,13 +501,13 @@ berrykeep (1.0.8-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 10 May 2026 06:24:18 +0200
 
-berrykeep (1.0.7-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.7-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Roll the workspace release to 1.0.7.
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 09 May 2026 15:51:18 +0200
 
-berrykeep (1.0.6-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.6-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Keep gallery image previews on the lazy thumbnail route when a node has
     cached media metadata but has not generated local thumbnails yet.
@@ -517,7 +517,7 @@ berrykeep (1.0.6-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Tue, 05 May 2026 00:40:44 +0200
 
-berrykeep (1.0.5-1~repo1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.5-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Persist resumable upload-session chunk metadata before acknowledging
     uploads so server restarts retain received chunk indexes.
@@ -529,13 +529,13 @@ berrykeep (1.0.5-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Sun, 03 May 2026 17:35:50 +0200
 
-berrykeep (1.0.0~beta.1-1~ppa2~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.0~beta.1-1~ppa2~ubuntu24.04.1) noble; urgency=medium
 
   * Preserve vendored Cargo checksum files in Launchpad source builds.
 
  -- Ulrich Hornung <hornunguli@gmx.de>  Fri, 01 May 2026 00:00:00 +0000
 
-berrykeep (1.0.0~beta.1-1~ppa1~ubuntu24.04.1) noble; urgency=medium
+ironmesh (1.0.0~beta.1-1~ppa1~ubuntu24.04.1) noble; urgency=medium
 
   * Prepare first 1.0.0 beta package build.
 

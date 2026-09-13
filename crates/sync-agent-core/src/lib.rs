@@ -224,6 +224,9 @@ fn is_berrykeep_internal_relative_path(relative_path: &str) -> bool {
         segment == ".berrykeep"
             || segment == ".berrykeep-conflicts"
             || segment.contains(".berrykeep-part-")
+            || segment == ".ironmesh"
+            || segment == ".ironmesh-conflicts"
+            || segment.contains(".ironmesh-part-")
     })
 }
 
@@ -477,6 +480,28 @@ mod tests {
             !state
                 .keys()
                 .any(|path| path.starts_with(".berrykeep-conflicts"))
+        );
+
+        fs::remove_dir_all(root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn scan_local_tree_ignores_legacy_internal_artifacts() {
+        let root = test_root();
+        fs::create_dir_all(root.join(".ironmesh-conflicts/remote"))
+            .expect("legacy internal directory should be created");
+        fs::write(root.join(".file.ironmesh-part-123"), b"partial")
+            .expect("legacy partial file should be written");
+        fs::write(root.join("keep.txt"), b"keep").expect("regular file should be written");
+
+        let state = scan_local_tree(&root).expect("scan should succeed");
+
+        assert!(state.contains_key("keep.txt"));
+        assert!(!state.contains_key(".file.ironmesh-part-123"));
+        assert!(
+            !state
+                .keys()
+                .any(|path| path.starts_with(".ironmesh-conflicts"))
         );
 
         fs::remove_dir_all(root).expect("temp root should be removed");
