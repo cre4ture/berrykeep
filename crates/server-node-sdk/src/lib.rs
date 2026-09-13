@@ -13389,6 +13389,11 @@ async fn host_dependency_status(
     let missing_count = report
         .checks
         .iter()
+        .filter(|check| check.status == HostDependencyStatus::Missing)
+        .count();
+    let attention_count = report
+        .checks
+        .iter()
         .filter(|check| {
             check.status == HostDependencyStatus::Missing
                 && check.severity != HostDependencySeverity::Info
@@ -13407,6 +13412,7 @@ async fn host_dependency_status(
             "host_os": report.host_os,
             "dependency_count": report.checks.len(),
             "missing_count": missing_count,
+            "attention_count": attention_count,
         }),
     )
     .await;
