@@ -892,7 +892,10 @@ fn rewrite_request_headers(
     remove_hop_by_hop_headers(headers, websocket);
     let private_headers = headers
         .keys()
-        .filter(|name| name.as_str().starts_with("x-berrykeep-"))
+        .filter(|name| {
+            let name = name.as_str();
+            name.starts_with("x-berrykeep-") || name.starts_with("x-ironmesh-")
+        })
         .cloned()
         .collect::<Vec<_>>();
     for name in private_headers {
@@ -1427,6 +1430,36 @@ mod tests {
                 "nas=one; berrykeep_service_gateway_session=secret; ironmesh_service_gateway_session=legacy; theme=dark",
             ),
             "nas=one; theme=dark"
+        );
+    }
+
+    #[test]
+    fn request_rewrite_removes_canonical_and_legacy_private_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-berrykeep-service-token",
+            HeaderValue::from_static("canonical"),
+        );
+        headers.insert(
+            "x-ironmesh-service-token",
+            HeaderValue::from_static("legacy"),
+        );
+        headers.insert("x-unrelated-header", HeaderValue::from_static("keep"));
+
+        rewrite_request_headers(
+            &mut headers,
+            "nas.home",
+            "https://nas.home",
+            "http://home-nas.localhost:4100",
+            false,
+        )
+        .unwrap();
+
+        assert!(!headers.contains_key("x-berrykeep-service-token"));
+        assert!(!headers.contains_key("x-ironmesh-service-token"));
+        assert_eq!(
+            headers.get("x-unrelated-header"),
+            Some(&HeaderValue::from_static("keep"))
         );
     }
 
