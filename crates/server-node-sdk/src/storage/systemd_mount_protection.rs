@@ -1,5 +1,5 @@
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -35,11 +35,24 @@ struct SystemdMountDependency {
     where_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SystemdService {
+    name: String,
+    manager: SystemdServiceManager,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdServiceManager {
+    System,
+    User,
+}
+
 #[derive(Debug, Clone)]
 struct MountProtectionTarget {
     id: String,
     feature: String,
     path: PathBuf,
+    is_on_root_filesystem: bool,
     missing_severity: HostDependencySeverity,
 }
 
@@ -58,45 +71,82 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
     };
 
     let Some(systemctl) = resolve_host_dependency_path(Path::new("systemctl")) else {
-        return SystemdMountProtectionInspection::SystemctlMissing { service };
+        return SystemdMountProtectionInspection::SystemctlMissing {
+            service: service.name,
+        };
     };
 
     let service_dependencies = match run_systemctl(
         &systemctl,
-        [
+        service.systemctl_arguments([
             "show",
             "--all",
             "--property=Requires",
             "--property=BindsTo",
-            service.as_str(),
-        ],
+            service.name.as_str(),
+        ]),
     )
     .await
     {
         Ok(output) => output,
-        Err(reason) => return SystemdMountProtectionInspection::QueryFailed { service, reason },
+        Err(reason) => {
+            return SystemdMountProtectionInspection::QueryFailed {
+                service: service.name,
+                reason,
+            };
+        }
     };
 
     let mount_units = direct_mount_units_from_service_properties(&service_dependencies);
     if mount_units.is_empty() {
         return SystemdMountProtectionInspection::Dependencies {
-            service,
+            service: service.name,
             mounts: Vec::new(),
         };
     }
     let mut where_arguments = Vec::with_capacity(mount_units.len() + 5);
-    where_arguments.extend(["show", "--all", "--property=Where", "--value"]);
+    where_arguments.extend(["show", "--all", "--property=Id", "--property=Where"]);
     where_arguments.extend(mount_units.iter().map(String::as_str));
-    let where_output = match run_systemctl(&systemctl, where_arguments).await {
-        Ok(output) => output,
-        Err(reason) => return SystemdMountProtectionInspection::QueryFailed { service, reason },
+    let where_output =
+        match run_systemctl(&systemctl, service.systemctl_arguments(where_arguments)).await {
+            Ok(output) => output,
+            Err(reason) => {
+                return SystemdMountProtectionInspection::QueryFailed {
+                    service: service.name,
+                    reason,
+                };
+            }
+        };
+    let mounts = match mount_dependencies_from_properties(&mount_units, &where_output) {
+        Ok(mounts) => mounts,
+        Err(reason) => {
+            return SystemdMountProtectionInspection::QueryFailed {
+                service: service.name,
+                reason,
+            };
+        }
     };
-    let mounts = mount_dependencies_from_where_values(&mount_units, &where_output);
 
-    SystemdMountProtectionInspection::Dependencies { service, mounts }
+    SystemdMountProtectionInspection::Dependencies {
+        service: service.name,
+        mounts,
+    }
 }
 
-fn current_systemd_service() -> Option<String> {
+impl SystemdService {
+    fn systemctl_arguments<'a>(
+        &self,
+        arguments: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<&'a str> {
+        let mut arguments = arguments.into_iter().collect::<Vec<_>>();
+        if self.manager == SystemdServiceManager::User {
+            arguments.insert(0, "--user");
+        }
+        arguments
+    }
+}
+
+fn current_systemd_service() -> Option<SystemdService> {
     #[cfg(target_os = "linux")]
     {
         let cgroups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
@@ -109,15 +159,25 @@ fn current_systemd_service() -> Option<String> {
     }
 }
 
-fn systemd_service_from_cgroups(cgroups: &str) -> Option<String> {
+fn systemd_service_from_cgroups(cgroups: &str) -> Option<SystemdService> {
     cgroups
         .lines()
         .filter_map(|line| line.rsplit_once(':').map(|(_, path)| path))
         .find_map(systemd_service_from_cgroup_path)
 }
 
-fn systemd_service_from_cgroup_path(path: &str) -> Option<String> {
-    for unit in path.rsplit('/').filter(|component| !component.is_empty()) {
+fn systemd_service_from_cgroup_path(path: &str) -> Option<SystemdService> {
+    let units = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    let manager = units
+        .iter()
+        .any(|unit| is_systemd_user_manager_service(unit))
+        .then_some(SystemdServiceManager::User)
+        .unwrap_or(SystemdServiceManager::System);
+
+    for unit in units.iter().rev() {
         // A scope contains processes started outside a service unit (such as a
         // login session). Do not mistake its user manager ancestor for the
         // BerryKeep server service.
@@ -125,7 +185,10 @@ fn systemd_service_from_cgroup_path(path: &str) -> Option<String> {
             return None;
         }
         if is_systemd_service_unit(unit) && !is_systemd_user_manager_service(unit) {
-            return Some(unit.to_string());
+            return Some(SystemdService {
+                name: (*unit).to_string(),
+                manager,
+            });
         }
     }
     None
@@ -189,31 +252,99 @@ fn mount_unit_from_token(token: &str) -> Option<String> {
     token.ends_with(".mount").then(|| token.to_string())
 }
 
-fn mount_dependencies_from_where_values(
+fn mount_dependencies_from_properties(
     mount_units: &[String],
-    where_values: &str,
-) -> Vec<SystemdMountDependency> {
+    properties: &str,
+) -> Result<Vec<SystemdMountDependency>, String> {
+    let expected_units = mount_units.iter().cloned().collect::<BTreeSet<_>>();
+    let mut dependencies = BTreeMap::new();
+    let mut unit = None;
+    let mut where_path = None;
+
+    for line in properties.lines().chain(std::iter::once("")) {
+        let line = line.trim();
+        if line.is_empty() {
+            finish_mount_dependency(
+                &expected_units,
+                &mut dependencies,
+                &mut unit,
+                &mut where_path,
+            )?;
+            continue;
+        }
+        let Some((property, value)) = line.split_once('=') else {
+            return Err(format!("unexpected systemctl output line `{line}`"));
+        };
+        match property {
+            "Id" => {
+                finish_mount_dependency(
+                    &expected_units,
+                    &mut dependencies,
+                    &mut unit,
+                    &mut where_path,
+                )?;
+                unit = Some(value.to_string());
+            }
+            "Where" => where_path = Some(PathBuf::from(value)),
+            _ => return Err(format!("unexpected systemctl property `{property}`")),
+        }
+    }
+
+    if dependencies.len() != expected_units.len() {
+        return Err("systemctl did not report every requested mount unit".to_string());
+    }
+
     mount_units
         .iter()
-        .zip(where_values.split('\n'))
-        .filter_map(|(unit, where_value)| {
-            let where_value = where_value.trim();
-            (!where_value.is_empty() && where_value != "-").then(|| SystemdMountDependency {
-                unit: unit.clone(),
-                where_path: PathBuf::from(where_value),
-            })
+        .map(|unit| {
+            dependencies
+                .remove(unit)
+                .map(|where_path| SystemdMountDependency {
+                    unit: unit.clone(),
+                    where_path,
+                })
+                .ok_or_else(|| format!("systemctl did not report mount unit `{unit}`"))
         })
         .collect()
+}
+
+fn finish_mount_dependency(
+    expected_units: &BTreeSet<String>,
+    dependencies: &mut BTreeMap<String, PathBuf>,
+    unit: &mut Option<String>,
+    where_path: &mut Option<PathBuf>,
+) -> Result<(), String> {
+    let Some(unit) = unit.take() else {
+        if where_path.take().is_some() {
+            return Err("systemctl reported Where without Id".to_string());
+        }
+        return Ok(());
+    };
+    let Some(where_path) = where_path.take() else {
+        return Err(format!("systemctl did not report Where for `{unit}`"));
+    };
+    if where_path.as_os_str().is_empty() || where_path == Path::new("-") {
+        return Err(format!("systemctl reported an invalid Where for `{unit}`"));
+    }
+    if !expected_units.contains(&unit) {
+        return Err(format!("systemctl reported unexpected mount unit `{unit}`"));
+    }
+    if dependencies.insert(unit.clone(), where_path).is_some() {
+        return Err(format!("systemctl reported `{unit}` more than once"));
+    }
+    Ok(())
 }
 
 fn mount_protection_targets(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
 ) -> Vec<MountProtectionTarget> {
+    let data_dir = resolved_mount_protection_path(data_dir);
     let mut targets = vec![MountProtectionTarget {
         id: "systemd-mount-data-dir".to_string(),
         feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
-        path: data_dir.to_path_buf(),
+        is_on_root_filesystem: path_is_on_root_filesystem(&data_dir),
+        path: data_dir,
         missing_severity: HostDependencySeverity::Critical,
     }];
 
@@ -221,22 +352,105 @@ fn mount_protection_targets(
         storage_paths
             .iter()
             .filter(|path| !matches!(path.state, StoragePathState::Disabled))
-            .map(|path| MountProtectionTarget {
-                id: format!("systemd-mount-storage-{}", path.id),
-                feature: format!(
-                    "Systemd mount protection: storage pool `{}` ({})",
-                    path.id,
-                    storage_path_state_label(path.state)
-                ),
-                path: path.path.clone(),
-                missing_severity: match path.state {
-                    StoragePathState::Active => HostDependencySeverity::Critical,
-                    StoragePathState::Draining => HostDependencySeverity::Warning,
-                    StoragePathState::Disabled => HostDependencySeverity::Info,
-                },
+            .map(|configured_path| {
+                let path = resolved_mount_protection_path(&configured_path.path);
+                MountProtectionTarget {
+                    id: format!("systemd-mount-storage-{}", configured_path.id),
+                    feature: format!(
+                        "Systemd mount protection: storage pool `{}` ({})",
+                        configured_path.id,
+                        storage_path_state_label(configured_path.state)
+                    ),
+                    is_on_root_filesystem: path_is_on_root_filesystem(&path),
+                    path,
+                    missing_severity: match configured_path.state {
+                        StoragePathState::Active => HostDependencySeverity::Critical,
+                        StoragePathState::Draining => HostDependencySeverity::Warning,
+                        StoragePathState::Disabled => HostDependencySeverity::Info,
+                    },
+                }
             }),
     );
     targets
+}
+
+fn resolved_mount_protection_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| absolutize_mount_protection_path(path))
+}
+
+fn absolutize_mount_protection_path(path: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn path_is_on_root_filesystem(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|contents| {
+                mount_point_for_path(path, &mount_points_from_mountinfo(&contents))
+            })
+            .as_deref()
+            == Some(Path::new("/"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mount_points_from_mountinfo(mountinfo: &str) -> Vec<PathBuf> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _mount_id = fields.next()?;
+            let _parent_id = fields.next()?;
+            let _major_minor = fields.next()?;
+            let _root = fields.next()?;
+            let mount_point = fields.next()?;
+            Some(PathBuf::from(unescape_mountinfo_path(mount_point)))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo_path(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+#[cfg(target_os = "linux")]
+fn mount_point_for_path(path: &Path, mount_points: &[PathBuf]) -> Option<PathBuf> {
+    mount_points
+        .iter()
+        .filter(|mount_point| path.starts_with(mount_point))
+        .max_by_key(|mount_point| mount_point.components().count())
+        .cloned()
 }
 
 fn storage_path_state_label(state: StoragePathState) -> &'static str {
@@ -323,6 +537,20 @@ fn checks_for_inspection(
                         )),
                         install_hint: None,
                     },
+                    None if target.is_on_root_filesystem => HostDependencyCheck {
+                        id: target.id.clone(),
+                        feature: target.feature.clone(),
+                        status: HostDependencyStatus::NotApplicable,
+                        severity: HostDependencySeverity::Info,
+                        summary: format!(
+                            "{} resides on the root filesystem",
+                            target.path.display()
+                        ),
+                        detail: "No separate mount needs systemd protection because the path currently resolves to the root filesystem, which is required for the service to run.".to_string(),
+                        configured_path: Some(target.path.display().to_string()),
+                        resolved_path: Some("/".to_string()),
+                        install_hint: None,
+                    },
                     None => HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
@@ -379,12 +607,25 @@ mod tests {
         }
     }
 
+    fn targets_off_root_filesystem(targets: &mut [MountProtectionTarget]) {
+        for target in targets {
+            target.is_on_root_filesystem = false;
+        }
+    }
+
     #[test]
     fn detects_the_actual_systemd_service_from_the_process_cgroup() {
         let service =
             systemd_service_from_cgroups("0::/system.slice/berrykeep-server-node.service\n");
 
-        assert_eq!(service.as_deref(), Some("berrykeep-server-node.service"));
+        assert_eq!(
+            service.as_ref().map(|service| service.name.as_str()),
+            Some("berrykeep-server-node.service")
+        );
+        assert_eq!(
+            service.map(|service| service.manager),
+            Some(SystemdServiceManager::System)
+        );
     }
 
     #[test]
@@ -392,7 +633,29 @@ mod tests {
         let service =
             systemd_service_from_cgroups("0::/system.slice/berrykeep-server-node.service/worker\n");
 
-        assert_eq!(service.as_deref(), Some("berrykeep-server-node.service"));
+        assert_eq!(
+            service.as_ref().map(|service| service.name.as_str()),
+            Some("berrykeep-server-node.service")
+        );
+        assert_eq!(
+            service.map(|service| service.manager),
+            Some(SystemdServiceManager::System)
+        );
+    }
+
+    #[test]
+    fn detects_a_user_managed_service_and_queries_its_user_manager() {
+        let service = systemd_service_from_cgroups(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/berrykeep-server-node.service\n",
+        )
+        .unwrap();
+
+        assert_eq!(service.name, "berrykeep-server-node.service");
+        assert_eq!(service.manager, SystemdServiceManager::User);
+        assert_eq!(
+            service.systemctl_arguments(["show", "berrykeep-server-node.service"]),
+            vec!["--user", "show", "berrykeep-server-node.service"]
+        );
     }
 
     #[test]
@@ -406,7 +669,7 @@ mod tests {
 
     #[test]
     fn non_systemd_startup_is_not_applicable_and_never_warns() {
-        let targets = mount_protection_targets(
+        let mut targets = mount_protection_targets(
             Path::new("/srv/berrykeep"),
             &[storage_path(
                 "primary",
@@ -414,6 +677,7 @@ mod tests {
                 StoragePathState::Active,
             )],
         );
+        targets_off_root_filesystem(&mut targets);
         let checks = checks_for_inspection(
             &targets,
             SystemdMountProtectionInspection::NotManagedBySystemd,
@@ -426,7 +690,7 @@ mod tests {
 
     #[test]
     fn systemd_checks_a_single_active_storage_path() {
-        let targets = mount_protection_targets(
+        let mut targets = mount_protection_targets(
             Path::new("/srv/berrykeep"),
             &[storage_path(
                 "primary",
@@ -434,6 +698,7 @@ mod tests {
                 StoragePathState::Active,
             )],
         );
+        targets_off_root_filesystem(&mut targets);
         let checks = checks_for_inspection(
             &targets,
             SystemdMountProtectionInspection::Dependencies {
@@ -455,7 +720,7 @@ mod tests {
 
     #[test]
     fn systemd_checks_data_dir_and_active_or_draining_storage_paths() {
-        let targets = mount_protection_targets(
+        let mut targets = mount_protection_targets(
             Path::new("/srv/berrykeep"),
             &[
                 storage_path("primary", "/mnt/primary", StoragePathState::Active),
@@ -463,6 +728,7 @@ mod tests {
                 storage_path("retired", "/mnt/retired", StoragePathState::Disabled),
             ],
         );
+        targets_off_root_filesystem(&mut targets);
         let checks = checks_for_inspection(
             &targets,
             SystemdMountProtectionInspection::Dependencies {
@@ -512,15 +778,15 @@ mod tests {
     }
 
     #[test]
-    fn where_values_are_matched_to_mount_units_in_one_systemctl_response() {
-        let mounts = mount_dependencies_from_where_values(
+    fn mount_properties_are_matched_by_unit_id_in_one_systemctl_response() {
+        let mounts = mount_dependencies_from_properties(
             &[
                 "mnt-primary.mount".to_string(),
                 "mnt-archive.mount".to_string(),
-                "missing.mount".to_string(),
             ],
-            "/mnt/primary\n/mnt/archive\n-\n",
-        );
+            "Id=mnt-archive.mount\nWhere=/mnt/archive\n\nId=mnt-primary.mount\nWhere=/mnt/primary\n",
+        )
+        .unwrap();
 
         assert_eq!(
             mounts,
@@ -532,15 +798,34 @@ mod tests {
     }
 
     #[test]
-    fn root_mount_does_not_protect_a_missing_storage_mount() {
-        let targets = mount_protection_targets(
-            Path::new("/var/lib/berrykeep"),
-            &[storage_path(
-                "primary",
-                "/mnt/primary",
-                StoragePathState::Active,
-            )],
-        );
+    fn missing_mount_properties_fail_closed() {
+        let error = mount_dependencies_from_properties(
+            &["mnt-primary.mount".to_string()],
+            "Id=mnt-primary.mount\n\n",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Where"));
+    }
+
+    #[test]
+    fn root_filesystem_target_is_informational_but_other_paths_stay_protected() {
+        let targets = vec![
+            MountProtectionTarget {
+                id: "systemd-mount-data-dir".to_string(),
+                feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+                path: PathBuf::from("/var/lib/berrykeep"),
+                is_on_root_filesystem: true,
+                missing_severity: HostDependencySeverity::Critical,
+            },
+            MountProtectionTarget {
+                id: "systemd-mount-storage-primary".to_string(),
+                feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
+                path: PathBuf::from("/mnt/primary"),
+                is_on_root_filesystem: false,
+                missing_severity: HostDependencySeverity::Critical,
+            },
+        ];
         let checks = checks_for_inspection(
             &targets,
             SystemdMountProtectionInspection::Dependencies {
@@ -549,15 +834,36 @@ mod tests {
             },
         );
 
-        assert!(
-            checks
-                .iter()
-                .all(|check| check.status == HostDependencyStatus::Missing)
+        let root = checks
+            .iter()
+            .find(|check| check.id == "systemd-mount-data-dir")
+            .unwrap();
+        assert_eq!(root.status, HostDependencyStatus::NotApplicable);
+        assert_eq!(root.severity, HostDependencySeverity::Info);
+        assert!(root.install_hint.is_none());
+
+        let storage = checks
+            .iter()
+            .find(|check| check.id == "systemd-mount-storage-primary")
+            .unwrap();
+        assert_eq!(storage.status, HostDependencyStatus::Missing);
+        assert_eq!(storage.severity, HostDependencySeverity::Critical);
+    }
+
+    #[test]
+    fn relative_mount_protection_paths_are_absolutized() {
+        let path = resolved_mount_protection_path(Path::new("./data/server-node"));
+
+        assert!(path.is_absolute());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_parser_reads_the_mount_point_field() {
+        let mount_points = mount_points_from_mountinfo(
+            "36 25 0:32 / /mnt/storage rw,nosuid,nodev - ext4 /dev/sda1 rw\n",
         );
-        assert!(
-            checks
-                .iter()
-                .all(|check| check.severity == HostDependencySeverity::Critical)
-        );
+
+        assert_eq!(mount_points, vec![PathBuf::from("/mnt/storage")]);
     }
 }
