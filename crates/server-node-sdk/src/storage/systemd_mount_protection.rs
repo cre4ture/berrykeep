@@ -155,14 +155,14 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
 
     let service_dependencies = match run_systemctl(
         &systemctl,
-        service.systemctl_arguments([
+        [
             "show",
             "--all",
             "--property=Requires",
             "--property=BindsTo",
             "--property=After",
             service.name.as_str(),
-        ]),
+        ],
     )
     .await
     {
@@ -186,16 +186,15 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
     where_arguments.extend(["show", "--all", "--property=Id", "--property=Where"]);
     where_arguments.push("--");
     where_arguments.extend(mount_units.iter().map(String::as_str));
-    let where_output =
-        match run_systemctl(&systemctl, service.systemctl_arguments(where_arguments)).await {
-            Ok(output) => output,
-            Err(reason) => {
-                return SystemdMountProtectionInspection::QueryFailed {
-                    service: service.name,
-                    reason,
-                };
-            }
-        };
+    let where_output = match run_systemctl(&systemctl, where_arguments).await {
+        Ok(output) => output,
+        Err(reason) => {
+            return SystemdMountProtectionInspection::QueryFailed {
+                service: service.name,
+                reason,
+            };
+        }
+    };
     let mounts = match mount_dependencies_from_properties(&mount_units, &where_output) {
         Ok(mounts) => mounts,
         Err(reason) => {
@@ -215,20 +214,6 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
 #[cfg(all(not(target_os = "linux"), test))]
 async fn inspect_current_process() -> SystemdMountProtectionInspection {
     SystemdMountProtectionInspection::NotManagedBySystemd
-}
-
-#[cfg(target_os = "linux")]
-impl SystemdService {
-    fn systemctl_arguments<'a>(
-        &self,
-        arguments: impl IntoIterator<Item = &'a str>,
-    ) -> Vec<&'a str> {
-        let mut arguments = arguments.into_iter().collect::<Vec<_>>();
-        if self.manager == SystemdServiceManager::User {
-            arguments.insert(0, "--user");
-        }
-        arguments
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -816,6 +801,21 @@ mod tests {
             },
         );
         assert_eq!(checks[0].status, HostDependencyStatus::NotApplicable);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Info);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn missing_systemctl_remains_an_informational_host_tool_finding() {
+        let checks = checks_for_inspection(
+            &[],
+            SystemdMountProtectionInspection::SystemctlMissing {
+                service: "berrykeep-server-node.service".to_string(),
+            },
+        );
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
         assert_eq!(checks[0].severity, HostDependencySeverity::Info);
     }
 

@@ -54,9 +54,9 @@ export function DependenciesPage() {
         </Alert>
       ) : null}
       {informationalMissingCount > 0 ? (
-        <Alert color="blue" title="Informational host tooling unavailable">
-          {informationalMissingCount} optional host tool{informationalMissingCount === 1 ? " is" : "s are"} unavailable.
-          These checks describe affected optional features and do not indicate a storage mount-protection warning.
+        <Alert color="blue" title="Informational host dependency findings">
+          {informationalMissingCount} informational host dependency finding{informationalMissingCount === 1 ? " is" : "s are"} reported.
+          Review the affected feature or host inspection below; informational findings do not count as dashboard attention.
         </Alert>
       ) : null}
       {report && attentionChecks.length === 0 && informationalMissingCount === 0 ? (

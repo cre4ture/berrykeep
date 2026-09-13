@@ -847,7 +847,7 @@ test("server-admin Dependencies keeps informational tooling visible with mount-p
 
   await page.getByText("Dependencies", { exact: true }).click();
   await expect(page.getByText("Storage mount protection needs attention", { exact: true })).toBeVisible();
-  await expect(page.getByText("Informational host tooling unavailable", { exact: true })).toBeVisible();
+  await expect(page.getByText("Informational host dependency findings", { exact: true })).toBeVisible();
   await expect(page.getByText("Optional GDAL tooling unavailable", { exact: true })).toBeVisible();
 });
 
