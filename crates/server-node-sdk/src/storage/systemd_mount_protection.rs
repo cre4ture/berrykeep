@@ -5,8 +5,12 @@ use std::path::Path;
 use std::path::{Component, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
+#[cfg(all(target_os = "linux", not(test)))]
+use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
+#[cfg(all(target_os = "linux", not(test)))]
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use tokio::process::Command;
@@ -22,6 +26,8 @@ use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDepend
 
 #[cfg(target_os = "linux")]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(target_os = "linux", not(test)))]
+const MOUNT_PROTECTION_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +64,7 @@ struct SystemdMountDependency {
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MountPoint {
+    device: String,
     path: PathBuf,
     root: PathBuf,
 }
@@ -84,6 +91,8 @@ struct MountProtectionTarget {
     path: PathBuf,
     mount_point: Option<PathBuf>,
     mount_point_is_bind: bool,
+    backing_mount_points: Vec<PathBuf>,
+    path_resolution_failed: bool,
     missing_severity: HostDependencySeverity,
 }
 
@@ -91,7 +100,12 @@ pub(super) async fn mount_protection_checks(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
 ) -> Vec<HostDependencyCheck> {
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(all(target_os = "linux", not(test)))]
+    {
+        return cached_mount_protection_checks(data_dir, storage_paths).await;
+    }
+
+    #[cfg(test)]
     {
         return mount_protection_checks_for_current_process(data_dir, storage_paths).await;
     }
@@ -101,6 +115,51 @@ pub(super) async fn mount_protection_checks(
         let _ = (data_dir, storage_paths);
         vec![not_managed_by_systemd_check()]
     }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+#[derive(Clone, PartialEq, Eq)]
+struct MountProtectionCacheKey {
+    data_dir: PathBuf,
+    storage_paths: Vec<StoragePathConfig>,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+struct MountProtectionCacheEntry {
+    key: MountProtectionCacheKey,
+    checked_at: Instant,
+    checks: Vec<HostDependencyCheck>,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+static MOUNT_PROTECTION_CACHE: OnceLock<tokio::sync::Mutex<Option<MountProtectionCacheEntry>>> =
+    OnceLock::new();
+
+#[cfg(all(target_os = "linux", not(test)))]
+async fn cached_mount_protection_checks(
+    data_dir: &Path,
+    storage_paths: &[StoragePathConfig],
+) -> Vec<HostDependencyCheck> {
+    let key = MountProtectionCacheKey {
+        data_dir: data_dir.to_path_buf(),
+        storage_paths: storage_paths.to_vec(),
+    };
+    let cache = MOUNT_PROTECTION_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut cache = cache.lock().await;
+    if let Some(entry) = cache.as_ref()
+        && entry.key == key
+        && entry.checked_at.elapsed() <= MOUNT_PROTECTION_CACHE_TTL
+    {
+        return entry.checks.clone();
+    }
+
+    let checks = mount_protection_checks_for_current_process(data_dir, storage_paths).await;
+    *cache = Some(MountProtectionCacheEntry {
+        key,
+        checked_at: Instant::now(),
+        checks: checks.clone(),
+    });
+    checks
 }
 
 fn not_managed_by_systemd_check() -> HostDependencyCheck {
@@ -517,16 +576,28 @@ fn finish_mount_dependency(
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 fn mount_protection_targets(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
 ) -> Vec<MountProtectionTarget> {
-    let mount_points = mount_points_for_current_process();
+    mount_protection_targets_with_path_resolution(data_dir, storage_paths, false, &BTreeSet::new())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mount_protection_targets_with_path_resolution(
+    data_dir: &Path,
+    storage_paths: &[StoragePathConfig],
+    data_dir_resolution_failed: bool,
+    storage_path_resolution_failures: &BTreeSet<String>,
+) -> Vec<MountProtectionTarget> {
+    let mount_points = mount_points_for_current_process().unwrap_or_default();
     let data_dir = normalized_mount_protection_path(data_dir);
-    let data_dir_mount_point = mount_points
-        .as_deref()
-        .and_then(|mount_points| mount_point_for_path(&data_dir, mount_points));
+    let data_dir_mount_point = mount_point_for_path(&data_dir, &mount_points);
+    let data_dir_backing_mount_points = data_dir_mount_point
+        .filter(|mount_point| mount_point.root != Path::new("/"))
+        .map(|mount_point| backing_mount_points_for_path(&data_dir, mount_point, &mount_points))
+        .unwrap_or_default();
     let mut protected_paths = BTreeSet::from([data_dir.clone()]);
     let mut targets = vec![MountProtectionTarget {
         id: "systemd-mount-data-dir".to_string(),
@@ -534,6 +605,8 @@ fn mount_protection_targets(
         mount_point: data_dir_mount_point.map(|mount_point| mount_point.path.clone()),
         mount_point_is_bind: data_dir_mount_point
             .is_some_and(|mount_point| mount_point.root != Path::new("/")),
+        backing_mount_points: data_dir_backing_mount_points,
+        path_resolution_failed: data_dir_resolution_failed,
         path: data_dir,
         missing_severity: HostDependencySeverity::Critical,
     }];
@@ -547,9 +620,13 @@ fn mount_protection_targets(
                 if !protected_paths.insert(path.clone()) {
                     return None;
                 }
-                let mount_point = mount_points
-                    .as_deref()
-                    .and_then(|mount_points| mount_point_for_path(&path, mount_points));
+                let mount_point = mount_point_for_path(&path, &mount_points);
+                let backing_mount_points = mount_point
+                    .filter(|mount_point| mount_point.root != Path::new("/"))
+                    .map(|mount_point| {
+                        backing_mount_points_for_path(&path, mount_point, &mount_points)
+                    })
+                    .unwrap_or_default();
                 Some(MountProtectionTarget {
                     id: format!("systemd-mount-storage-{}", configured_path.id),
                     feature: format!(
@@ -560,6 +637,9 @@ fn mount_protection_targets(
                     mount_point: mount_point.map(|mount_point| mount_point.path.clone()),
                     mount_point_is_bind: mount_point
                         .is_some_and(|mount_point| mount_point.root != Path::new("/")),
+                    backing_mount_points,
+                    path_resolution_failed: storage_path_resolution_failures
+                        .contains(&configured_path.id),
                     path,
                     missing_severity: match configured_path.state {
                         StoragePathState::Active => HostDependencySeverity::Critical,
@@ -577,11 +657,56 @@ async fn mount_protection_targets_for_current_process(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
 ) -> Result<Vec<MountProtectionTarget>, String> {
-    let data_dir = data_dir.to_path_buf();
-    let storage_paths = storage_paths.to_vec();
-    tokio::task::spawn_blocking(move || mount_protection_targets(&data_dir, &storage_paths))
-        .await
-        .map_err(|error| format!("mount protection path inspection failed: {error}"))
+    let data_dir = resolve_mount_protection_path(data_dir).await;
+    let mut storage_paths = storage_paths.to_vec();
+    let mut storage_path_resolution_failures = BTreeSet::new();
+    for storage_path in &mut storage_paths {
+        if matches!(storage_path.state, StoragePathState::Disabled) {
+            continue;
+        }
+        let resolved_path = resolve_mount_protection_path(&storage_path.path).await;
+        if resolved_path.failed {
+            storage_path_resolution_failures.insert(storage_path.id.clone());
+        }
+        storage_path.path = resolved_path.path;
+    }
+    tokio::task::spawn_blocking(move || {
+        mount_protection_targets_with_path_resolution(
+            &data_dir.path,
+            &storage_paths,
+            data_dir.failed,
+            &storage_path_resolution_failures,
+        )
+    })
+    .await
+    .map_err(|error| format!("mount protection path inspection failed: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+struct ResolvedMountProtectionPath {
+    path: PathBuf,
+    failed: bool,
+}
+
+#[cfg(target_os = "linux")]
+async fn resolve_mount_protection_path(path: &Path) -> ResolvedMountProtectionPath {
+    let lexical_path = absolutize_mount_protection_path(path);
+    let path = path.to_path_buf();
+    let resolved_path = timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || std::fs::canonicalize(path)),
+    )
+    .await;
+    match resolved_path {
+        Ok(Ok(Ok(path))) => ResolvedMountProtectionPath {
+            path,
+            failed: false,
+        },
+        _ => ResolvedMountProtectionPath {
+            path: lexical_path,
+            failed: true,
+        },
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -636,10 +761,11 @@ fn mount_points_from_mountinfo(mountinfo: &str) -> Vec<MountPoint> {
             let mut fields = line.split_whitespace();
             let _mount_id = fields.next()?;
             let _parent_id = fields.next()?;
-            let _major_minor = fields.next()?;
+            let device = fields.next()?;
             let root = fields.next()?;
             let mount_point = fields.next()?;
             Some(MountPoint {
+                device: device.to_string(),
                 path: PathBuf::from(unescape_mountinfo_path(mount_point)),
                 root: PathBuf::from(unescape_mountinfo_path(root)),
             })
@@ -662,6 +788,28 @@ fn mount_point_for_path<'a>(path: &Path, mount_points: &'a [MountPoint]) -> Opti
         .iter()
         .filter(|mount_point| path.starts_with(&mount_point.path))
         .max_by_key(|mount_point| mount_point.path.components().count())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn backing_mount_points_for_path(
+    path: &Path,
+    mount_point: &MountPoint,
+    mount_points: &[MountPoint],
+) -> Vec<PathBuf> {
+    let Some(relative_path) = path.strip_prefix(&mount_point.path).ok() else {
+        return Vec::new();
+    };
+    let filesystem_path = mount_point.root.join(relative_path);
+    mount_points
+        .iter()
+        .filter(|candidate| {
+            candidate.device == mount_point.device && candidate.path != mount_point.path
+        })
+        .filter(|candidate| filesystem_path.starts_with(&candidate.root))
+        .map(|candidate| candidate.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -742,7 +890,9 @@ fn checks_for_inspection(
         } => targets
             .iter()
             .map(|target| {
-                let protecting_mount = protecting_mount_dependency(target, &mounts, &host_mount_points);
+                let protecting_mount = (!target.path_resolution_failed)
+                    .then(|| protecting_mount_dependency(target, &mounts))
+                    .flatten();
                 match protecting_mount {
                     Some(mount) => HostDependencyCheck {
                         id: target.id.clone(),
@@ -762,6 +912,24 @@ fn checks_for_inspection(
                             mount.where_path.display()
                         )),
                         install_hint: None,
+                    },
+                    None if target.path_resolution_failed => HostDependencyCheck {
+                        id: target.id.clone(),
+                        feature: target.feature.clone(),
+                        status: HostDependencyStatus::Missing,
+                        severity: target.missing_severity,
+                        summary: format!(
+                            "Could not resolve the filesystem path for {}",
+                            target.path.display()
+                        ),
+                        detail: "The storage path could not be resolved to its physical filesystem within one second, so mount protection has not been verified. This avoids treating a symlinked or unavailable path as root-backed.".to_string(),
+                        configured_path: Some(target.path.display().to_string()),
+                        resolved_path: None,
+                        install_hint: Some(format!(
+                            "Confirm that {} resolves to the intended storage filesystem, then add `RequiresMountsFor={}` to the [Unit] section of a drop-in for `{service}`, run `sudo systemctl daemon-reload`, and restart the service.",
+                            target.path.display(),
+                            target.path.display()
+                        )),
                     },
                     None if target.mount_point.as_deref() == Some(Path::new("/")) && expected_host_mount_point(target, &host_mount_points).is_none() => HostDependencyCheck {
                         id: target.id.clone(),
@@ -827,20 +995,23 @@ fn checks_for_inspection(
 fn protecting_mount_dependency<'a>(
     target: &MountProtectionTarget,
     mounts: &'a [SystemdMountDependency],
-    host_mount_points: &BTreeSet<PathBuf>,
 ) -> Option<&'a SystemdMountDependency> {
     match target.mount_point.as_deref() {
         Some(mount_point) if mount_point == Path::new("/") => None,
-        Some(mount_point) => mounts
-            .iter()
-            .find(|mount| mount.where_path == mount_point)
-            .or_else(|| {
-                if target.mount_point_is_bind && !host_mount_points.contains(mount_point) {
-                    nearest_ancestor_mount_dependency(target, mounts)
-                } else {
-                    None
-                }
-            }),
+        Some(mount_point) => {
+            let direct_mount = mounts.iter().find(|mount| mount.where_path == mount_point);
+            if direct_mount.is_some() || !target.mount_point_is_bind {
+                return direct_mount;
+            }
+            target
+                .backing_mount_points
+                .iter()
+                .find_map(|backing_mount_point| {
+                    mounts
+                        .iter()
+                        .find(|mount| mount.where_path == *backing_mount_point)
+                })
+        }
         None => mounts
             .iter()
             .filter(|mount| {
@@ -848,19 +1019,6 @@ fn protecting_mount_dependency<'a>(
             })
             .max_by_key(|mount| mount.where_path.components().count()),
     }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn nearest_ancestor_mount_dependency<'a>(
-    target: &MountProtectionTarget,
-    mounts: &'a [SystemdMountDependency],
-) -> Option<&'a SystemdMountDependency> {
-    mounts
-        .iter()
-        .filter(|mount| {
-            mount.where_path != Path::new("/") && target.path.starts_with(&mount.where_path)
-        })
-        .max_by_key(|mount| mount.where_path.components().count())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1217,6 +1375,8 @@ mod tests {
                 path: PathBuf::from("/var/lib/berrykeep"),
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
+                backing_mount_points: Vec::new(),
+                path_resolution_failed: false,
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
@@ -1225,6 +1385,8 @@ mod tests {
                 path: PathBuf::from("/var/lib/berrykeep/pool-a"),
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
+                backing_mount_points: Vec::new(),
+                path_resolution_failed: false,
                 missing_severity: HostDependencySeverity::Critical,
             },
             MountProtectionTarget {
@@ -1233,6 +1395,8 @@ mod tests {
                 path: PathBuf::from("/mnt/primary"),
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
+                backing_mount_points: Vec::new(),
+                path_resolution_failed: false,
                 missing_severity: HostDependencySeverity::Critical,
             },
         ];
@@ -1278,6 +1442,28 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_path_is_not_treated_as_root_backed() {
+        let target = MountProtectionTarget {
+            id: "systemd-mount-storage-primary".to_string(),
+            feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
+            path: PathBuf::from("/srv/pool"),
+            mount_point: Some(PathBuf::from("/")),
+            mount_point_is_bind: false,
+            backing_mount_points: Vec::new(),
+            path_resolution_failed: true,
+            missing_severity: HostDependencySeverity::Critical,
+        };
+        let checks = checks_for_inspection(
+            &[target],
+            dependencies_with_host_mount_points(vec![systemd_mount("-.mount", "/")], &["/"]),
+        );
+
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Critical);
+        assert!(checks[0].summary.contains("Could not resolve"));
+    }
+
+    #[test]
     fn nested_storage_mount_requires_its_exact_mount_dependency() {
         let target = MountProtectionTarget {
             id: "systemd-mount-storage-primary".to_string(),
@@ -1285,6 +1471,8 @@ mod tests {
             path: PathBuf::from("/srv/pool/media"),
             mount_point: Some(PathBuf::from("/srv/pool")),
             mount_point_is_bind: false,
+            backing_mount_points: Vec::new(),
+            path_resolution_failed: false,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
@@ -1305,29 +1493,35 @@ mod tests {
     }
 
     #[test]
-    fn namespace_bind_mount_uses_its_host_mount_dependency() {
+    fn namespace_bind_mount_uses_its_mapped_source_dependency() {
         let target = MountProtectionTarget {
             id: "systemd-mount-data-dir".to_string(),
             feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
             path: PathBuf::from("/srv/berrykeep"),
             mount_point: Some(PathBuf::from("/srv/berrykeep")),
             mount_point_is_bind: true,
+            backing_mount_points: vec![PathBuf::from("/mnt/data")],
+            path_resolution_failed: false,
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
             std::slice::from_ref(&target),
             dependencies_with_host_mount_points(
-                vec![systemd_mount("srv.mount", "/srv")],
-                &["/srv"],
+                vec![systemd_mount("mnt-data.mount", "/mnt/data")],
+                &["/mnt/data"],
             ),
         );
         assert_eq!(checks[0].status, HostDependencyStatus::Ready);
 
+        let unverified_target = MountProtectionTarget {
+            backing_mount_points: Vec::new(),
+            ..target
+        };
         let checks = checks_for_inspection(
-            &[target],
+            &[unverified_target],
             dependencies_with_host_mount_points(
                 vec![systemd_mount("srv.mount", "/srv")],
-                &["/srv", "/srv/berrykeep"],
+                &["/srv"],
             ),
         );
         assert_eq!(checks[0].status, HostDependencyStatus::Missing);
@@ -1341,6 +1535,26 @@ mod tests {
         assert!(path.ends_with("data/pool"));
     }
 
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn resolved_mount_protection_path_follows_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "ironmesh-mount-protection-symlink-test-{}",
+            std::process::id()
+        ));
+        let target = root.join("mounted-storage");
+        let link = root.join("storage-link");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let resolved = resolve_mount_protection_path(&link).await;
+
+        assert_eq!(resolved.path, target);
+        assert!(!resolved.failed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn mountinfo_parser_reads_mount_points_and_roots() {
@@ -1351,9 +1565,28 @@ mod tests {
         assert_eq!(
             mount_points,
             vec![MountPoint {
+                device: "0:32".to_string(),
                 path: PathBuf::from("/srv/berrykeep"),
                 root: PathBuf::from("/srv/berrykeep"),
             }]
+        );
+    }
+
+    #[test]
+    fn bind_mount_source_is_mapped_to_its_backing_mount() {
+        let mount_points = mount_points_from_mountinfo(
+            "36 25 8:1 / /mnt/data rw,nosuid,nodev - ext4 /dev/sda1 rw\n37 25 8:1 /berrykeep /srv/berrykeep rw,nosuid,nodev - ext4 /dev/sda1 rw\n",
+        );
+        let mount_point =
+            mount_point_for_path(Path::new("/srv/berrykeep/pool"), &mount_points).unwrap();
+
+        assert_eq!(
+            backing_mount_points_for_path(
+                Path::new("/srv/berrykeep/pool"),
+                mount_point,
+                &mount_points,
+            ),
+            vec![PathBuf::from("/mnt/data")]
         );
     }
 }
