@@ -11778,21 +11778,32 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
         loop {
             ticker.tick().await;
 
+            let retained = {
+                let store = read_store(&state, "replication_auditor.retained_snapshot").await;
+                store.retained_content().await
+            };
+            if let Err(error) = &retained {
+                warn!(error = %error, "failed to enumerate retained replication obligations");
+            }
             if state.repair_config.enabled
-                && let Err(error) = content_recovery::audit_assigned(&state).await
+                && let Ok(retained) = retained.as_ref()
+                && let Err(error) =
+                    content_recovery::audit_assigned_from_retained(&state, retained).await
             {
                 warn!(error = %error, "failed to audit retained content assignments");
             }
 
-            let keys = planning_replication_subjects(&state).await;
+            let keys =
+                planning_replication_subjects_from_retained(&state, retained.as_ref().ok()).await;
 
-            let (node_transitioned_offline, plan) = {
+            let (node_transitioned_offline, plan_snapshot) = {
                 let mut cluster = state.cluster.lock().await;
                 let node_transitioned_offline =
                     cluster.update_health_and_detect_offline_transition();
-                let plan = cluster.replication_plan(&keys);
-                (node_transitioned_offline, plan)
+                let plan_snapshot = cluster.replication_plan_snapshot(&keys);
+                (node_transitioned_offline, plan_snapshot)
             };
+            let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
 
             if node_transitioned_offline || !plan.items.is_empty() {
                 info!(
@@ -11804,11 +11815,11 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
             }
 
             if state.repair_config.enabled && !plan.items.is_empty() {
-                let report = execute_tracked_local_replication_repair(
+                let report = execute_tracked_replication_plan(
                     &state,
-                    None,
+                    plan,
+                    nodes,
                     RepairRunTrigger::BackgroundAudit,
-                    Some(RepairPlanSummary::from_plan(&plan)),
                 )
                 .await;
                 info!(
@@ -12302,6 +12313,22 @@ async fn record_server_request_timing(request: Request, next: Next) -> Response 
 }
 
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
+    let retained = {
+        let store = read_store(state, "replication.retained_subjects").await;
+        store.retained_content().await
+    };
+    if let Err(error) = &retained {
+        warn!(error = %error, "failed to enumerate retained replication obligations");
+    }
+    planning_replication_subjects_from_retained(state, retained.as_ref().ok()).await
+}
+
+/// Produces one legacy planning subject per placement key. Durable content
+/// recovery handles the complete version/snapshot history independently.
+async fn planning_replication_subjects_from_retained(
+    state: &ServerState,
+    retained: Option<&storage::retained_content::RetainedContent>,
+) -> Vec<String> {
     let local_subjects = cached_local_cluster_available_subjects(state).await;
     let cluster_subjects = {
         let cluster = state.cluster.lock().await;
@@ -12311,16 +12338,23 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
     let mut subjects = BTreeSet::new();
     subjects.extend(local_subjects);
     subjects.extend(cluster_subjects);
-    let store = read_store(state, "replication.retained_subjects").await;
-    match store.retained_content().await {
-        Ok(retained) => subjects.extend(retained.subjects()),
-        Err(error) => warn!(error = %error, "failed to enumerate retained replication obligations"),
+    if let Some(retained) = retained {
+        subjects.extend(retained.subjects());
     }
     // Hash-only references have no object-key export. Their placement audit and
     // durable worker live in content_recovery, not the legacy bundle planner.
     subjects
         .retain(|subject| !subject.starts_with(storage::retained_content::MANIFEST_SUBJECT_PREFIX));
-    subjects.into_iter().collect()
+    subjects
+        .into_iter()
+        .fold(BTreeMap::new(), |mut by_placement_key, subject| {
+            by_placement_key
+                .entry(cluster::replication_placement_key(&subject).to_string())
+                .or_insert(subject);
+            by_placement_key
+        })
+        .into_values()
+        .collect()
 }
 
 async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
@@ -12943,6 +12977,41 @@ async fn execute_tracked_local_replication_repair(
         replication::execute_replication_repair_inner_with_context(
             state,
             batch_size_override,
+            Some(&tracker.run_id),
+        )
+        .await
+    })
+    .await;
+    finish_repair_run_tracking(
+        state,
+        tracker,
+        plan_summary,
+        report.run_status(),
+        Some(RepairRunSummary::from_local_report(&report)),
+        serialize_repair_run_report(&report),
+    )
+    .await;
+    report
+}
+
+/// Records a repair run for a plan already assembled by the background
+/// auditor, preserving the one retained-content snapshot used for that tick.
+async fn execute_tracked_replication_plan(
+    state: &ServerState,
+    plan: ReplicationPlan,
+    nodes: Vec<NodeDescriptor>,
+    trigger: RepairRunTrigger,
+) -> replication::ReplicationRepairReport {
+    let plan_summary = RepairPlanSummary::from_plan(&plan);
+    let tracker =
+        begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
+    let report = with_active_repair_log_tracking(&tracker, async {
+        replication::execute_replication_repair_plan(
+            state,
+            &plan,
+            nodes,
+            None,
+            false,
             Some(&tracker.run_id),
         )
         .await
