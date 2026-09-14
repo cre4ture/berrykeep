@@ -9398,17 +9398,22 @@ impl PersistentStore {
         let mut deleted_cached_chunk_records = 0usize;
 
         let chunk_files = self.collect_chunk_file_paths().await?;
-        for chunk_path in chunk_files {
-            let chunk_hash = match chunk_path.file_name().and_then(|n| n.to_str()) {
-                Some(hash) => hash.to_string(),
-                None => continue,
-            };
-
-            if protected_chunks.contains(&chunk_hash) {
+        for (chunk_path, chunk_hash) in chunk_files {
+            if chunk_hash
+                .as_ref()
+                .is_some_and(|hash| protected_chunks.contains(hash))
+            {
                 continue;
             }
 
-            let metadata = fs::metadata(&chunk_path).await?;
+            // A live atomic install can finish its rename after this sweep
+            // enumerates the temporary file. In that case there is no longer
+            // anything here to reap.
+            let metadata = match fs::metadata(&chunk_path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
             let age_secs = modified
                 .duration_since(UNIX_EPOCH)
@@ -9425,25 +9430,31 @@ impl PersistentStore {
             }
 
             let chunk_size_bytes = metadata.len();
-            fs::remove_file(&chunk_path).await?;
-            let removed_indexed_location = self.storage_pool.forget_location_at_path(
-                StorageContentKind::Chunk,
-                &chunk_hash,
-                &chunk_path,
-            );
-            if removed_indexed_location {
-                self.metadata_store
-                    .delete_storage_location(StorageContentKind::Chunk, &chunk_hash)
-                    .await?;
+            match fs::remove_file(&chunk_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             }
-            self.note_chunk_store_delta(-(chunk_size_bytes as i64))
-                .await?;
-            if removed_indexed_location && cached_chunk_hashes.contains(&chunk_hash) {
-                self.metadata_store
-                    .delete_cached_chunk_record(&chunk_hash)
+            if let Some(chunk_hash) = chunk_hash {
+                let removed_indexed_location = self.storage_pool.forget_location_at_path(
+                    StorageContentKind::Chunk,
+                    &chunk_hash,
+                    &chunk_path,
+                );
+                if removed_indexed_location {
+                    self.metadata_store
+                        .delete_storage_location(StorageContentKind::Chunk, &chunk_hash)
+                        .await?;
+                }
+                self.note_chunk_store_delta(-(chunk_size_bytes as i64))
                     .await?;
-                deleted_cached_chunks += 1;
-                deleted_cached_chunk_records += 1;
+                if removed_indexed_location && cached_chunk_hashes.contains(&chunk_hash) {
+                    self.metadata_store
+                        .delete_cached_chunk_record(&chunk_hash)
+                        .await?;
+                    deleted_cached_chunks += 1;
+                    deleted_cached_chunk_records += 1;
+                }
             }
             deleted_chunks += 1;
         }
@@ -11321,8 +11332,8 @@ impl PersistentStore {
         Ok(paths)
     }
 
-    async fn collect_chunk_file_paths(&self) -> Result<Vec<PathBuf>> {
-        let mut files = Vec::<PathBuf>::new();
+    async fn collect_chunk_file_paths(&self) -> Result<Vec<(PathBuf, Option<String>)>> {
+        let mut files = Vec::<(PathBuf, Option<String>)>::new();
         let mut dirs = self
             .storage_pool
             .path_stats_roots()
@@ -11341,16 +11352,17 @@ impl PersistentStore {
                 let ftype = entry.file_type().await?;
                 if ftype.is_dir() {
                     dirs.push(path);
-                } else if ftype.is_file()
-                    && path
+                } else if ftype.is_file() {
+                    let hash = path
                         .file_name()
                         .and_then(|name| name.to_str())
-                        .is_some_and(manifest_hash_looks_safe_filename)
-                {
-                    // Active chunk installs use a temporary suffix until their
-                    // atomic rename completes. A sweep snapshots protection
-                    // first and deliberately ignores those in-flight files.
-                    files.push(path);
+                        .filter(|name| manifest_hash_looks_safe_filename(name))
+                        .map(ToOwned::to_owned);
+                    // Temp files are not indexed or included in store-byte
+                    // accounting, but a crashed atomic install can leave one
+                    // behind indefinitely. The caller ages them out without
+                    // treating them as a content-addressed chunk.
+                    files.push((path, hash));
                 }
             }
         }

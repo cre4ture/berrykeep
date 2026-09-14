@@ -624,13 +624,14 @@ pub(crate) async fn audit_assigned_from_retained(
             continue;
         }
         // Availability can be empty during first-start convergence (or stale
-        // after an out-of-band change). Do not turn a healthy local replica
+        // after an out-of-band change). Do not turn a healthy owned replica
         // into pending repair work solely because that distributed view has
-        // not caught up yet.
-        if read_store(state, "content_recovery.audit_local_presence")
+        // not caught up yet; a cache-only copy still needs ownership promotion.
+        if read_store(state, "content_recovery.audit_local_replica")
             .await
-            .manifest_is_fully_local(hash)
-            .await?
+            .check_owned_replica_presence(hash)
+            .await
+            .is_ok()
         {
             continue;
         }
