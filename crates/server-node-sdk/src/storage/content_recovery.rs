@@ -208,6 +208,12 @@ impl PersistentStore {
             .contains(hash))
     }
 
+    /// Confirms a retained manifest and all of its chunks are present with the
+    /// cheap metadata contract used by availability and ordinary replication.
+    pub(crate) async fn manifest_is_fully_local(&self, hash: &str) -> Result<bool> {
+        manifest_is_fully_local(&self.storage_pool, hash).await
+    }
+
     pub(crate) async fn verify_recovered_content(&self, task: &ContentRepairTask) -> Result<()> {
         let payload = self
             .read_recovery_manifest(&task.reference.manifest_hash)
