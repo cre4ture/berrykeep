@@ -3073,6 +3073,7 @@ trait MetadataStore: Send + Sync {
     async fn clear_history_head_projections_for_test(&self) -> Result<()>;
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
+    #[cfg(test)]
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
     async fn load_snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>>;
     async fn list_uncompressed_snapshot_ids(&self) -> Result<Vec<String>>;
@@ -3154,12 +3155,20 @@ impl ChunkIngestor {
     }
 
     pub(crate) async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
-        // GC must not inspect or remove the temporary file of an active install.
-        let _guard = self.content_gc_gate.read().await;
         let actual_hash = hash_hex(payload);
         if actual_hash != hash {
             bail!("chunk hash mismatch: expected={hash} actual={actual_hash}");
         }
+
+        self.ingest_verified_chunk(hash, payload).await
+    }
+
+    /// Stores bytes whose BLAKE3 digest was already checked by the caller.
+    /// Keep this private to recovery/transport internals so untrusted input
+    /// always continues through `ingest_chunk`.
+    pub(crate) async fn ingest_verified_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
+        // GC must not inspect or remove the temporary file of an active install.
+        let _guard = self.content_gc_gate.read().await;
 
         let outcome = persist_storage_content(
             &self.storage_pool,
@@ -4203,11 +4212,7 @@ impl ReplicationSubjectInspector {
                 || (owned.contains(&hash)
                     && content_recovery::manifest_is_fully_local(&self.storage_pool, &hash).await?)
             {
-                subjects.extend(
-                    references
-                        .iter()
-                        .filter_map(retained_content::RetainedReference::subject),
-                );
+                subjects.extend(references.keys().cloned());
             }
         }
         Ok(subjects.into_iter().collect())
@@ -7224,6 +7229,12 @@ impl PersistentStore {
 
     pub async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
         self.chunk_ingestor.ingest_chunk(hash, payload).await
+    }
+
+    pub(crate) async fn ingest_verified_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
+        self.chunk_ingestor
+            .ingest_verified_chunk(hash, payload)
+            .await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

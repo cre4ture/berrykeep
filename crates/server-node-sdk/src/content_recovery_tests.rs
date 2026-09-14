@@ -533,7 +533,7 @@ async fn recovery_snapshot_only_uses_hash_without_version_export_impl(backend: M
         );
         assert!(
             store.retained_content().await.unwrap().manifests[&manifest.manifest_hash]
-                .iter()
+                .values()
                 .all(|r| r.snapshot_only)
         );
     }

@@ -29,7 +29,11 @@ impl RetainedReference {
 
 #[derive(Default)]
 pub(crate) struct RetainedContent {
-    pub manifests: BTreeMap<String, Vec<RetainedReference>>,
+    /// References are indexed by subject within each manifest. A manifest can
+    /// be shared by a deep version history, so linear duplicate detection here
+    /// turns catalog construction into quadratic work.
+    pub manifests: BTreeMap<String, BTreeMap<String, RetainedReference>>,
+    subjects: BTreeMap<String, String>,
     pub current_keys: usize,
     pub version_indexes: usize,
     pub version_records: usize,
@@ -75,7 +79,13 @@ impl RetainedContent {
         }
         // A compacted version index must not make snapshot-only bytes invisible.
         // One immutable reference is sufficient to protect/recover shared bytes.
-        for snapshot in metadata.load_all_snapshots().await? {
+        // Snapshot payloads can be much larger than their lightweight index
+        // rows. Decode one at a time so ordinary availability and repair work
+        // retains the same bounded-memory behavior as version-index loading.
+        for snapshot_info in metadata.list_snapshot_infos().await? {
+            let Some(snapshot) = metadata.load_snapshot_by_id(&snapshot_info.id).await? else {
+                continue;
+            };
             for (key, hash) in snapshot.objects {
                 if !result.manifests.contains_key(&hash) {
                     result.insert(RetainedReference {
@@ -92,30 +102,25 @@ impl RetainedContent {
     }
 
     fn insert(&mut self, reference: RetainedReference) {
-        let references = self
-            .manifests
-            .entry(reference.manifest_hash.clone())
-            .or_default();
-        if !references.contains(&reference) {
-            references.push(reference);
-        }
+        let Some(subject) = reference.subject() else {
+            return;
+        };
+        let manifest_hash = reference.manifest_hash.clone();
+        self.manifests
+            .entry(manifest_hash.clone())
+            .or_default()
+            .entry(subject.clone())
+            .or_insert(reference);
+        self.subjects.entry(subject).or_insert(manifest_hash);
     }
 
     pub fn reference_for_subject(&self, subject: &str) -> Option<&RetainedReference> {
-        self.manifests
-            .values()
-            .flatten()
-            .find(|r| r.subject().as_deref() == Some(subject))
+        let manifest_hash = self.subjects.get(subject)?;
+        self.manifests.get(manifest_hash)?.get(subject)
     }
 
     pub fn subjects(&self) -> Vec<String> {
-        self.manifests
-            .values()
-            .flatten()
-            .filter_map(RetainedReference::subject)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+        self.subjects.keys().cloned().collect()
     }
 }
 

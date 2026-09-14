@@ -211,6 +211,15 @@ pub(crate) struct ReplicationPlanSnapshot {
     current_replicas_by_key: HashMap<String, HashSet<NodeId>>,
 }
 
+/// Immutable topology captured while holding the cluster lock. Callers that
+/// need many placement decisions can release the lock before rendezvous
+/// scoring, sorting, and label-constraint evaluation.
+#[derive(Debug, Clone)]
+pub(crate) struct PlacementSnapshot {
+    policy: ReplicationPolicy,
+    nodes: HashMap<NodeId, NodeDescriptor>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterSummary {
     pub local_node_id: NodeId,
@@ -748,6 +757,13 @@ impl ClusterService {
         }
     }
 
+    pub(crate) fn placement_snapshot(&self) -> PlacementSnapshot {
+        PlacementSnapshot {
+            policy: self.policy.clone(),
+            nodes: self.nodes.clone(),
+        }
+    }
+
     pub fn replication_plan(&self, keys: &[String]) -> ReplicationPlan {
         self.replication_plan_snapshot(keys).plan()
     }
@@ -763,6 +779,17 @@ impl ClusterService {
             policy: self.policy.clone(),
             nodes: self.nodes.clone(),
             current_replicas_by_key,
+        }
+    }
+}
+
+impl PlacementSnapshot {
+    pub(crate) fn placement_for_key(&self, key: &str) -> PlacementDecision {
+        let placement_key = replication_placement_key(key);
+        PlacementDecision {
+            key: key.to_string(),
+            selected_nodes: select_nodes_by_rendezvous(placement_key, &self.nodes, &self.policy),
+            replication_factor: self.policy.replication_factor,
         }
     }
 }
@@ -964,7 +991,7 @@ fn select_nodes_by_rendezvous(
     selected
 }
 
-fn replication_placement_key(key: &str) -> &str {
+pub(crate) fn replication_placement_key(key: &str) -> &str {
     key.split_once("@ver-").map(|(base, _)| base).unwrap_or(key)
 }
 
@@ -1059,6 +1086,27 @@ mod tests {
         let p1 = svc.placement_for_key("alpha");
         let p2 = svc.placement_for_key("alpha");
         assert_eq!(p1.selected_nodes, p2.selected_nodes);
+    }
+
+    #[test]
+    fn placement_snapshot_matches_live_service_for_retained_subjects() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+        for (dc, rack) in [("dc-a", "rack-1"), ("dc-a", "rack-2"), ("dc-b", "rack-7")] {
+            svc.register_node(mk_node(NodeId::new_v4(), dc, rack, 900));
+        }
+
+        let snapshot = svc.placement_snapshot();
+        for subject in [
+            "current.bin",
+            "current.bin@ver-001",
+            "cas-manifest:immutable-history",
+        ] {
+            assert_eq!(
+                snapshot.placement_for_key(subject).selected_nodes,
+                svc.placement_for_key(subject).selected_nodes,
+            );
+        }
     }
 
     #[test]

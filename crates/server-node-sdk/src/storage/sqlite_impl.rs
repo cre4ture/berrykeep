@@ -2553,24 +2553,33 @@ impl MetadataStore for SqliteMetadataStore {
         &self,
         manifest_hashes: &[String],
     ) -> Result<Vec<ContentRepairTask>> {
+        const CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE: usize = 500;
+
         if manifest_hashes.is_empty() {
             return Ok(Vec::new());
         }
         let hashes = manifest_hashes.to_vec();
         self.read(move |db| {
-            let placeholders = std::iter::repeat_n("?", hashes.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let statement = format!(
-                "SELECT task_json FROM content_repair_tasks \
-                 WHERE manifest_hash IN ({placeholders}) ORDER BY manifest_hash"
-            );
-            let mut statement = db.prepare(&statement)?;
-            let mut rows = statement.query(params_from_iter(hashes.iter()))?;
-            let mut tasks = Vec::new();
-            while let Some(row) = rows.next()? {
-                tasks.push(serde_json::from_slice(&row.get::<_, Vec<u8>>(0)?)?);
+            let mut tasks = Vec::<ContentRepairTask>::new();
+            for batch in hashes.chunks(CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE) {
+                let placeholders = std::iter::repeat_n("?", batch.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let statement = format!(
+                    "SELECT task_json FROM content_repair_tasks \
+                     WHERE manifest_hash IN ({placeholders}) ORDER BY manifest_hash"
+                );
+                let mut statement = db.prepare(&statement)?;
+                let mut rows = statement.query(params_from_iter(batch.iter()))?;
+                while let Some(row) = rows.next()? {
+                    tasks.push(serde_json::from_slice(&row.get::<_, Vec<u8>>(0)?)?);
+                }
             }
+            tasks.sort_by(|left, right| {
+                left.reference
+                    .manifest_hash
+                    .cmp(&right.reference.manifest_hash)
+            });
             Ok(tasks)
         })
         .await
@@ -4783,6 +4792,7 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    #[cfg(test)]
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
         self.read(|db| {
             let mut stmt = db.prepare(

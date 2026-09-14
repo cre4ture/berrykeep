@@ -148,6 +148,46 @@ async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
     assert_eq!(selected[0].reference.manifest_hash, first.manifest_hash);
     assert!(selected[0].chunks.is_empty());
 
+    // A single scrub can enqueue every damaged manifest. The selected-task
+    // lookup must therefore remain below SQL parameter limits instead of
+    // dropping all repair intent after one unbounded `IN (...)` query.
+    let batched_tasks = (0..501)
+        .map(|index| {
+            content_recovery::ContentRepairTask::new(
+                retained_content::RetainedReference {
+                    key: Some(format!("batched/{index}")),
+                    object_id: None,
+                    version_id: None,
+                    manifest_hash: format!("{index:064x}"),
+                    snapshot_only: false,
+                },
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    let batched_hashes = batched_tasks
+        .iter()
+        .map(|task| task.reference.manifest_hash.clone())
+        .collect::<Vec<_>>();
+    for task in &batched_tasks {
+        store.persist_content_repair_task(task).await.unwrap();
+    }
+    let selected = store
+        .content_repair_tasks_for_manifests(&batched_hashes)
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), batched_tasks.len());
+    assert_eq!(
+        selected
+            .iter()
+            .map(|task| task.reference.manifest_hash.as_str())
+            .collect::<Vec<_>>(),
+        batched_hashes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+
     drop(store);
     fs::remove_dir_all(root).await.unwrap();
 }

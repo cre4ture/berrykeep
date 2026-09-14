@@ -40,7 +40,10 @@ pub(crate) async fn scrubber(state: &ServerState) -> Result<storage::DataScrubbe
             store.retained_content().await?,
         )
     };
-    Ok(scrubber.with_required_manifests(required_manifests(state, &retained).await))
+    let required = required_manifests(state, &retained).await;
+    Ok(scrubber
+        .with_required_manifests(required)
+        .with_retained_content(retained))
 }
 
 #[derive(Default)]
@@ -78,19 +81,33 @@ pub(crate) async fn required_manifests(
     state: &ServerState,
     retained: &RetainedContent,
 ) -> HashSet<String> {
-    let cluster = state.cluster.lock().await;
+    // Placement is CPU-heavy for a deep retained history. Snapshot the small
+    // mutable cluster view, then score distinct subjects without blocking
+    // heartbeats, peer requests, or availability updates behind the mutex.
+    let placement = state.cluster.lock().await.placement_snapshot();
+    let mut assigned_by_placement_key = HashMap::<String, bool>::new();
+    let assigned_subjects = retained
+        .subjects()
+        .into_iter()
+        .filter(|subject| {
+            let placement_key = cluster::replication_placement_key(subject);
+            *assigned_by_placement_key
+                .entry(placement_key.to_string())
+                .or_insert_with(|| {
+                    placement
+                        .placement_for_key(placement_key)
+                        .selected_nodes
+                        .contains(&state.node_id)
+                })
+        })
+        .collect::<HashSet<_>>();
     retained
         .manifests
         .iter()
         .filter(|(_, references)| {
-            references.iter().any(|r| {
-                r.subject().is_some_and(|subject| {
-                    cluster
-                        .placement_for_key(&subject)
-                        .selected_nodes
-                        .contains(&state.node_id)
-                })
-            })
+            references
+                .keys()
+                .any(|subject| assigned_subjects.contains(subject))
         })
         .map(|(hash, _)| hash.clone())
         .collect()
@@ -143,7 +160,9 @@ async fn recover_chunk(
                     && blake3::hash(&bytes).to_hex().as_str() == chunk.hash =>
             {
                 let store = lock_store(state, "content_recovery.install_chunk").await;
-                store.ingest_chunk(&chunk.hash, &bytes).await?;
+                // The peer response was size- and BLAKE3-validated above.
+                // Avoid immediately hashing the same bytes again while storing.
+                store.ingest_verified_chunk(&chunk.hash, &bytes).await?;
                 if cache {
                     store
                         .note_cached_chunk_fetch(
@@ -362,7 +381,7 @@ async fn repair_subjects_inner(
             subject
                 .strip_prefix(MANIFEST_SUBJECT_PREFIX)
                 .and_then(|hash| retained.manifests.get(hash))
-                .and_then(|r| r.first())
+                .and_then(|references| references.values().next())
         });
         let Some(reference) =
             reference.filter(|r| r.manifest_hash != storage::TOMBSTONE_MANIFEST_HASH)
@@ -557,17 +576,14 @@ pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
         if hash == storage::TOMBSTONE_MANIFEST_HASH
             || !required.contains(&hash)
             || pending.contains(&hash)
-            || references
-                .iter()
-                .filter_map(RetainedReference::subject)
-                .any(|s| available.contains(&s))
+            || references.keys().any(|subject| available.contains(subject))
         {
             continue;
         }
         if let Some(reference) = references
-            .iter()
-            .find(|r| r.version_id.is_some() || r.snapshot_only)
-            .or_else(|| references.first())
+            .values()
+            .find(|reference| reference.version_id.is_some() || reference.snapshot_only)
+            .or_else(|| references.values().next())
             .cloned()
         {
             let task = ContentRepairTask::new(reference, true);
