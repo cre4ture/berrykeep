@@ -426,6 +426,31 @@ async fn repair_subjects_inner(
             reference.filter(|r| r.manifest_hash != storage::TOMBSTONE_MANIFEST_HASH)
         else {
             report.skipped_items += 1;
+            let detail =
+                "retained content reference is no longer present; discarding stale repair task";
+            replication::push_repair_log_entry(
+                &mut report.detailed_log,
+                state.node_id,
+                "subject_skipped",
+                detail,
+                Some(subject.clone()),
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                Some(json!({"reason": "retained_reference_unavailable"})),
+            );
+            replication::push_repair_skipped_detail(
+                &mut report.skipped_details,
+                state.node_id,
+                subject.clone(),
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                replication::ReplicationRepairSkipReason::RetainedReferenceUnavailable,
+                detail,
+            );
             if let Some(hash) = subject.strip_prefix(MANIFEST_SUBJECT_PREFIX) {
                 read_store(state, "content_recovery.expired")
                     .await
