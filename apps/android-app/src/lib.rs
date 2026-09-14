@@ -37,33 +37,6 @@ mod tests {
         assert_eq!(normalize_embedded_web_ui_diagnostic("\n\t "), None);
     }
 
-    #[test]
-    fn legacy_android_state_directory_migrates_to_the_canonical_location() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time should be after Unix epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "berrykeep-android-state-migration-{}-{nonce}",
-            std::process::id()
-        ));
-        let canonical = root.join("berrykeep-folder-sync-state");
-        let legacy = root.join("ironmesh-folder-sync-state");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("state.sqlite"), b"legacy state").unwrap();
-
-        let resolved = migrate_legacy_android_state_dir(&canonical, &legacy).unwrap();
-
-        assert_eq!(resolved, canonical);
-        assert_eq!(
-            std::fs::read(resolved.join("state.sqlite")).unwrap(),
-            b"legacy state"
-        );
-        assert!(!legacy.exists());
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
     fn sample_profile(
         profile_id: &str,
         label: &str,
@@ -498,9 +471,8 @@ use mobile_client_core::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -1170,48 +1142,13 @@ fn android_download_stage_root(category: &str, scope: &str) -> Result<PathBuf> {
         .join("berrykeep-downloads")
         .join(category)
         .join(&scope_hash);
-    let legacy_path = state_dir
-        .join("ironmesh-downloads")
-        .join(category)
-        .join(scope_hash);
-    migrate_legacy_android_state_dir(&canonical_path, &legacy_path)
+    Ok(canonical_path)
 }
 
 fn android_folder_sync_state_root() -> Result<PathBuf> {
     let state_dir = android_no_backup_files_dir()?;
     let canonical_path = state_dir.join("berrykeep-folder-sync-state");
-    let legacy_path = state_dir.join("ironmesh-folder-sync-state");
-    migrate_legacy_android_state_dir(&canonical_path, &legacy_path)
-}
-
-fn migrate_legacy_android_state_dir(canonical_path: &Path, legacy_path: &Path) -> Result<PathBuf> {
-    if canonical_path.exists() || !legacy_path.exists() {
-        return Ok(canonical_path.to_path_buf());
-    }
-
-    let parent = canonical_path.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "canonical Android state path has no parent: {}",
-            canonical_path.display()
-        )
-    })?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create Android state parent {}", parent.display()))?;
-
-    match fs::rename(legacy_path, canonical_path) {
-        Ok(()) => Ok(canonical_path.to_path_buf()),
-        Err(_) if canonical_path.exists() || !legacy_path.exists() => {
-            Ok(canonical_path.to_path_buf())
-        }
-        Err(error) => {
-            tracing::warn!(
-                "failed to migrate legacy Android state from {} to {}: {error}; using the legacy location",
-                legacy_path.display(),
-                canonical_path.display(),
-            );
-            Ok(legacy_path.to_path_buf())
-        }
-    }
+    Ok(canonical_path)
 }
 
 fn folder_sync_modification_history_json(

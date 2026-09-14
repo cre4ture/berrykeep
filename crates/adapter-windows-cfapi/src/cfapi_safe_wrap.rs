@@ -1333,7 +1333,7 @@ mod tests {
     #[test]
     fn metadata_update_handle_allows_a_concurrent_writer() {
         let root = std::env::temp_dir().join(format!(
-            "ironmesh-cfapi-metadata-writer-{}",
+            "berrykeep-cfapi-metadata-writer-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root).expect("failed to create metadata handle test root");
@@ -1361,7 +1361,7 @@ mod tests {
     #[test]
     fn metadata_update_handle_coexists_with_a_writer_that_denies_data_writes() {
         let root = std::env::temp_dir().join(format!(
-            "ironmesh-cfapi-metadata-deny-write-{}",
+            "berrykeep-cfapi-metadata-deny-write-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root).expect("failed to create metadata handle test root");
@@ -1388,8 +1388,10 @@ mod tests {
 
     #[test]
     fn placeholder_state_query_supports_long_verbatim_paths() {
-        let root =
-            std::env::temp_dir().join(format!("ironmesh-cfapi-long-path-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!(
+            "berrykeep-cfapi-long-path-{}",
+            uuid::Uuid::new_v4()
+        ));
         let mut directory = root.clone();
         let mut segment_index = 0;
         while directory.to_string_lossy().encode_utf16().count() <= 280 {

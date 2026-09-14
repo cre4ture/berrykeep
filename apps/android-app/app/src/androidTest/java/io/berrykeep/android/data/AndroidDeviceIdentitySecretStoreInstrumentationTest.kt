@@ -53,39 +53,6 @@ class AndroidDeviceIdentitySecretStoreInstrumentationTest {
         assertFalse(error.message.isNullOrBlank())
     }
 
-    @Test
-    fun legacyKeystoreCiphertextIsMigratedToTheCanonicalKey() {
-        val legacyAlias = "ironmesh.test.${UUID.randomUUID()}"
-        val canonicalAlias = "berrykeep.test.${UUID.randomUUID()}"
-        val legacyCrypto = AndroidKeyStoreDeviceIdentityCrypto(legacyAlias)
-        val canonicalCrypto = AndroidKeyStoreDeviceIdentityCrypto(canonicalAlias)
-        val migratedFile = File(context.noBackupFilesDir, "$canonicalAlias.enc")
-        val legacyStore = AtomicFileDeviceIdentitySecretStore(
-            migratedFile,
-            crypto = legacyCrypto,
-            legacyCrypto = null,
-        )
-        val migratingStore = AtomicFileDeviceIdentitySecretStore(
-            migratedFile,
-            crypto = canonicalCrypto,
-            legacyCrypto = legacyCrypto,
-        )
-        val secret = testSecret()
-
-        try {
-            legacyStore.save(secret)
-
-            assertEquals(secret, migratingStore.load())
-            legacyCrypto.deleteKey()
-
-            assertEquals(secret, migratingStore.load())
-        } finally {
-            runCatching { migratingStore.clear() }
-            runCatching { canonicalCrypto.deleteKey() }
-            runCatching { legacyCrypto.deleteKey() }
-        }
-    }
-
     private fun testSecret(): DeviceIdentitySecret =
         DeviceIdentitySecret(
             clusterId = "cluster-1",
