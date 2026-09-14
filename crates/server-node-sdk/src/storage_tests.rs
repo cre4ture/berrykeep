@@ -4014,6 +4014,68 @@ run_on_all_metadata_backends!(
     list_replication_subjects_includes_all_heads_for_divergent_versions_turso
 );
 
+async fn list_replication_subjects_excludes_non_head_retained_history_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("replication-subjects-bounded-retained-history")
+        .await;
+    let key = "history/deep.bin";
+    let first = store
+        .put_object_versioned(key, Bytes::from_static(b"first"), PutOptions::default())
+        .await
+        .unwrap();
+    let second = store
+        .put_object_versioned(
+            key,
+            Bytes::from_static(b"second"),
+            PutOptions {
+                parent_version_ids: vec![first.version_id.clone()],
+                state: VersionConsistencyState::Confirmed,
+                inherit_preferred_parent: false,
+                create_snapshot: true,
+                explicit_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let head = store
+        .put_object_versioned(
+            key,
+            Bytes::from_static(b"head"),
+            PutOptions {
+                parent_version_ids: vec![second.version_id.clone()],
+                state: VersionConsistencyState::Confirmed,
+                inherit_preferred_parent: false,
+                create_snapshot: true,
+                explicit_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let subjects = store.list_replication_subjects().await.unwrap();
+    assert!(subjects.contains(&key.to_string()), "{subjects:?}");
+    assert!(
+        subjects.contains(&format!("{key}@{}", head.version_id)),
+        "{subjects:?}"
+    );
+    assert!(
+        !subjects.contains(&format!("{key}@{}", first.version_id))
+            && !subjects.contains(&format!("{key}@{}", second.version_id)),
+        "availability must stay bounded by current objects and heads, not retained depth: {subjects:?}"
+    );
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    list_replication_subjects_excludes_non_head_retained_history_impl,
+    list_replication_subjects_excludes_non_head_retained_history,
+    list_replication_subjects_excludes_non_head_retained_history_turso
+);
+
 // Regression test: a corrupt manifest (0-byte or invalid JSON) used to make
 // `list_replication_subjects` bubble up a hard `Err`, which callers treated as
 // "trust every locally indexed key" (see `recompute_local_cluster_available_subjects`

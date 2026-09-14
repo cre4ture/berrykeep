@@ -14428,12 +14428,10 @@ run_on_main_metadata_backends!(
 async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
     backend: MainTestBackend,
 ) {
-    // Scenario: the local store has data for an old (non-head) version, but the cluster's replica
-    // map only records the remote node as having it. This mirrors production cases where a node
-    // receives the current head directly without going through the full version chain, leaving
-    // ancestor versions locally present but untracked in the replica map. The repair should detect
-    // that the bundle is already local, register the replica, and do so without attempting any
-    // network transfer.
+    // An offline peer can leave a stale historical availability claim behind.
+    // Retained non-head content must not be re-registered through legacy
+    // replication just because it remains locally readable; hash-based durable
+    // recovery is responsible for that history.
     let state = build_test_state(2, false, backend).await;
 
     let remote_node_id = {
@@ -14450,7 +14448,8 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
     let version_old = "ver-local-reg-v1".to_string();
     let version_new = "ver-local-reg-v2".to_string();
 
-    // Write both versions. Availability must surface v1 even though it is no longer a head.
+    // Write both versions. Availability intentionally surfaces only the current
+    // head, not v1.
     seed_subject_version(
         &state,
         &key,
@@ -14468,8 +14467,7 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
     )
     .await;
 
-    // Set up the replica map to reflect the inconsistency: local node is known to have v2 (head)
-    // but NOT v1 (the old version), even though the local store actually has v1's data.
+    // Model a stale remote claim for v1 while the local node retains its bytes.
     {
         let mut cluster = state.cluster.lock().await;
         cluster.note_replica(&key, state.node_id);
@@ -14479,70 +14477,36 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
         cluster.note_replica(format!("{key}@{version_new}"), remote_node_id);
     }
 
-    // Confirm the plan sees the local node as missing v1.
     let old_version_subject = format!("{key}@{version_old}");
-    {
-        let plan = {
-            let mut cluster = state.cluster.lock().await;
-            cluster.update_health_and_detect_offline_transition();
-            cluster.replication_plan(&[
-                key.clone(),
-                old_version_subject.clone(),
-                format!("{key}@{version_new}"),
-            ])
-        };
-        assert!(
-            plan.items.iter().any(|item| {
-                item.key == old_version_subject && item.missing_nodes.contains(&state.node_id)
-            }),
-            "pre-repair plan should identify local node as missing the old version, items={:?}",
-            plan.items
-        );
-    }
-
     let report = super::replication::execute_replication_repair_inner(&state, None).await;
 
     assert_eq!(
         report.attempted_transfers, 0,
-        "no network transfer should be needed: local store already has v1"
+        "a stale historical source hint must not trigger legacy replication"
     );
     assert_eq!(report.failed_transfers, 0);
-    assert_eq!(report.skipped_items, 0);
     assert!(
-        state
+        report.skipped_details.iter().any(|detail| {
+            detail.subject == old_version_subject
+                && detail.reason
+                    == super::replication::ReplicationRepairSkipReason::LocalContentUnavailable
+        }),
+        "the historical subject must be explicitly skipped: {report:?}"
+    );
+    assert!(
+        !state
             .cluster
             .lock()
             .await
             .available_nodes_for_subject(&old_version_subject)
             .iter()
             .any(|node| node.node_id == state.node_id),
-        "the real availability refresh must recognize complete historical content before repair planning"
+        "a non-head retained version must stay outside local availability"
     );
 
-    // After repair the cluster plan should no longer list v1 as a gap.
-    {
-        let plan = {
-            let mut cluster = state.cluster.lock().await;
-            cluster.update_health_and_detect_offline_transition();
-            cluster.replication_plan(&[
-                key.clone(),
-                old_version_subject.clone(),
-                format!("{key}@{version_new}"),
-            ])
-        };
-        assert!(
-            !plan.items.iter().any(|item| {
-                item.key == old_version_subject && item.missing_nodes.contains(&state.node_id)
-            }),
-            "post-repair plan should no longer show local node as missing v1, items={:?}",
-            plan.items
-        );
-    }
-
-    // Running repair a second time should produce no work for this subject.
+    // A second pass must retain the same boundary rather than re-registering v1.
     let report2 = super::replication::execute_replication_repair_inner(&state, None).await;
     assert_eq!(report2.attempted_transfers, 0);
-    assert_eq!(report2.skipped_items, 0);
     assert!(
         !report2.detailed_log.iter().any(|entry| {
             entry.event == "local_replica_registered"

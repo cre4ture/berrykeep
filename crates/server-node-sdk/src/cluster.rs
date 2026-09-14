@@ -648,6 +648,7 @@ impl ClusterService {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn known_replication_subjects(&self) -> Vec<String> {
         let mut subjects = self
             .replicas_by_key
