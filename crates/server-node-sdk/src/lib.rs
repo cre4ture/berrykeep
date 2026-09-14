@@ -11836,64 +11836,68 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 
         loop {
             ticker.tick().await;
-            request_ttl_bounded_local_availability_refresh(&state);
-
-            let retained = {
-                let store = read_store(&state, "replication_auditor.retained_snapshot").await;
-                store.retained_content().await
-            };
-            if let Err(error) = &retained {
-                warn!(error = %error, "failed to enumerate retained replication obligations");
-            }
-            if state.repair_config.enabled
-                && let Ok(retained) = retained.as_ref()
-                && let Err(error) =
-                    content_recovery::audit_assigned_from_retained(&state, retained).await
-            {
-                warn!(error = %error, "failed to audit retained content assignments");
-            }
-
-            let keys =
-                planning_replication_subjects_for_auditor(&state, retained.as_ref().ok()).await;
-
-            let (node_transitioned_offline, plan_snapshot) = {
-                let mut cluster = state.cluster.lock().await;
-                let node_transitioned_offline =
-                    cluster.update_health_and_detect_offline_transition();
-                let plan_snapshot = cluster.replication_plan_snapshot(&keys);
-                (node_transitioned_offline, plan_snapshot)
-            };
-            let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
-
-            if node_transitioned_offline || !plan.items.is_empty() {
-                info!(
-                    under_replicated = plan.under_replicated,
-                    over_replicated = plan.over_replicated,
-                    items = plan.items.len(),
-                    "replication audit result"
-                );
-            }
-
-            if state.repair_config.enabled && !plan.items.is_empty() {
-                let report = execute_tracked_replication_plan(
-                    &state,
-                    plan,
-                    nodes,
-                    RepairRunTrigger::BackgroundAudit,
-                )
-                .await;
-                info!(
-                    attempted = report.attempted_transfers,
-                    success = report.successful_transfers,
-                    failed = report.failed_transfers,
-                    skipped = report.skipped_items,
-                    skipped_backoff = report.skipped_backoff,
-                    skipped_max_retries = report.skipped_max_retries,
-                    "replication repair executor run"
-                );
-            }
+            run_replication_audit_once(&state).await;
         }
     });
+}
+
+async fn run_replication_audit_once(state: &ServerState) {
+    request_ttl_bounded_local_availability_refresh(state);
+    // A plan snapshot is only meaningful after both the local and remote
+    // availability views have been reconciled. The plan executor intentionally
+    // consumes this snapshot directly to avoid recomputing retained history, so
+    // it cannot supply this synchronization on the auditor's behalf.
+    if state.repair_config.enabled {
+        sync_availability_views_once(state).await;
+    }
+
+    let retained = {
+        let store = read_store(state, "replication_auditor.retained_snapshot").await;
+        store.retained_content().await
+    };
+    if let Err(error) = &retained {
+        warn!(error = %error, "failed to enumerate retained replication obligations");
+    }
+    if state.repair_config.enabled
+        && let Ok(retained) = retained.as_ref()
+        && let Err(error) = content_recovery::audit_assigned_from_retained(state, retained).await
+    {
+        warn!(error = %error, "failed to audit retained content assignments");
+    }
+
+    let keys = planning_replication_subjects_for_auditor(state, retained.as_ref().ok()).await;
+
+    let (node_transitioned_offline, plan_snapshot) = {
+        let mut cluster = state.cluster.lock().await;
+        let node_transitioned_offline = cluster.update_health_and_detect_offline_transition();
+        let plan_snapshot = cluster.replication_plan_snapshot(&keys);
+        (node_transitioned_offline, plan_snapshot)
+    };
+    let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
+
+    if node_transitioned_offline || !plan.items.is_empty() {
+        info!(
+            under_replicated = plan.under_replicated,
+            over_replicated = plan.over_replicated,
+            items = plan.items.len(),
+            "replication audit result"
+        );
+    }
+
+    if state.repair_config.enabled && !plan.items.is_empty() {
+        let report =
+            execute_tracked_replication_plan(state, plan, nodes, RepairRunTrigger::BackgroundAudit)
+                .await;
+        info!(
+            attempted = report.attempted_transfers,
+            success = report.successful_transfers,
+            failed = report.failed_transfers,
+            skipped = report.skipped_items,
+            skipped_backoff = report.skipped_backoff,
+            skipped_max_retries = report.skipped_max_retries,
+            "replication repair executor run"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
