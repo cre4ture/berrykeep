@@ -634,7 +634,6 @@ fn mount_protection_targets_from_mount_points(
     let data_dir = normalized_mount_protection_path(data_dir);
     let data_dir_mount_point = mount_point_for_path(&data_dir, mount_points);
     let data_dir_backing_mount_points = data_dir_mount_point
-        .filter(|mount_point| mount_point.root != Path::new("/"))
         .map(|mount_point| backing_mount_points_for_path(&data_dir, mount_point, mount_points))
         .unwrap_or_default();
     let mut protected_paths = BTreeSet::from([data_dir.clone()]);
@@ -642,8 +641,9 @@ fn mount_protection_targets_from_mount_points(
         id: "systemd-mount-data-dir".to_string(),
         feature: "Systemd mount protection: BERRYKEEP_DATA_DIR".to_string(),
         mount_point: data_dir_mount_point.map(|mount_point| mount_point.path.clone()),
-        mount_point_is_bind: data_dir_mount_point
-            .is_some_and(|mount_point| mount_point.root != Path::new("/")),
+        mount_point_is_bind: data_dir_mount_point.is_some_and(|mount_point| {
+            mount_point.root != Path::new("/") || !data_dir_backing_mount_points.is_empty()
+        }),
         backing_mount_points: data_dir_backing_mount_points,
         path_resolution_error: data_dir_resolution_error,
         path: data_dir,
@@ -661,7 +661,6 @@ fn mount_protection_targets_from_mount_points(
                 }
                 let mount_point = mount_point_for_path(&path, mount_points);
                 let backing_mount_points = mount_point
-                    .filter(|mount_point| mount_point.root != Path::new("/"))
                     .map(|mount_point| {
                         backing_mount_points_for_path(&path, mount_point, mount_points)
                     })
@@ -674,8 +673,9 @@ fn mount_protection_targets_from_mount_points(
                         storage_path_state_label(configured_path.state)
                     ),
                     mount_point: mount_point.map(|mount_point| mount_point.path.clone()),
-                    mount_point_is_bind: mount_point
-                        .is_some_and(|mount_point| mount_point.root != Path::new("/")),
+                    mount_point_is_bind: mount_point.is_some_and(|mount_point| {
+                        mount_point.root != Path::new("/") || !backing_mount_points.is_empty()
+                    }),
                     backing_mount_points,
                     path_resolution_error: storage_path_resolution_errors
                         .get(&configured_path.id)
@@ -2090,6 +2090,45 @@ mod tests {
             ),
             vec![PathBuf::from("/mnt/data")]
         );
+    }
+
+    #[test]
+    fn whole_filesystem_namespace_bind_uses_its_source_mount_dependency() {
+        let mount_points = vec![
+            MountPoint {
+                device: "8:1".to_string(),
+                path: PathBuf::from("/mnt/data"),
+                root: PathBuf::from("/"),
+            },
+            MountPoint {
+                device: "8:1".to_string(),
+                path: PathBuf::from("/srv/berrykeep"),
+                root: PathBuf::from("/"),
+            },
+        ];
+        let targets = mount_protection_targets_from_mount_points(
+            Path::new("/srv/berrykeep"),
+            &[],
+            None,
+            &BTreeMap::new(),
+            &mount_points,
+        );
+
+        assert!(targets[0].mount_point_is_bind);
+        assert_eq!(
+            targets[0].backing_mount_points,
+            [PathBuf::from("/mnt/data")]
+        );
+
+        let checks = checks_for_inspection(
+            &targets,
+            dependencies_with_host_mount_points(
+                vec![systemd_mount("mnt-data.mount", "/mnt/data")],
+                &["/mnt/data"],
+            ),
+        );
+
+        assert_eq!(checks[0].status, HostDependencyStatus::Ready);
     }
 
     #[test]
