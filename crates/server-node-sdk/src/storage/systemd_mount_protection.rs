@@ -37,7 +37,12 @@ const PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(all(target_os = "linux", not(test)))]
 const MOUNT_PROTECTION_CACHE_TTL: Duration = Duration::from_secs(30);
 #[cfg(all(target_os = "linux", not(test)))]
-const MOUNT_PROTECTION_INSPECTION_TIMEOUT: Duration = Duration::from_secs(15);
+// The longest bounded path is six sequential five-second service/tool and
+// canonicalizer operations plus one concurrent five-second path-resolution
+// batch (35 seconds).
+// Keep the outer deadline above that sum so it remains a backstop, not the
+// normal outcome on a merely slow host.
+const MOUNT_PROTECTION_INSPECTION_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
