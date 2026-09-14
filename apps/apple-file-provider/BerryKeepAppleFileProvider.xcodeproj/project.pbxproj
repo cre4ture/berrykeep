@@ -48,6 +48,7 @@
 		5F9F92673599603F7B4FA94E /* BerryKeepFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8998582382E6AF8D8680D1 /* BerryKeepFileProviderService.swift */; };
 		61DE2DC4A82685AF6F6554D2 /* BerryKeepGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBB0FEF4247443AA0C0D393D /* BerryKeepGalleryModel.swift */; };
 		6221144F7C8633273DCB8805 /* BerryKeepIosApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ED16406A1BE1EDF63710436 /* BerryKeepIosApp.swift */; };
+		A99C0002A99C0002A99C0002 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A99C0001A99C0001A99C0001 /* Assets.xcassets */; };
 		63380B5E6141E9E28F67CD07 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
 		65453585D6DB3706C758A37C /* BerryKeepIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC064A6A2AC06203AE0B3854 /* BerryKeepIdentifierPathCache.swift */; };
 		67D608DE778EEB1DD66BA2CA /* BerryKeepFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD0D96D60F5C1E603B708FB /* BerryKeepFileProviderConflictService.swift */; };
@@ -176,6 +177,7 @@
 		6DD0D96D60F5C1E603B708FB /* BerryKeepFileProviderConflictService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderConflictService.swift; sourceTree = "<group>"; };
 		6DED46198314AD32D59D4EEE /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
 		6ED16406A1BE1EDF63710436 /* BerryKeepIosApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepIosApp.swift; sourceTree = "<group>"; };
+		A99C0001A99C0001A99C0001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		792F216BC5734E380B8D639B /* BerryKeepSyncAnchorCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepSyncAnchorCodec.swift; sourceTree = "<group>"; };
 		7DA129FD959C0FD0D040070D /* BerryKeepIosProjectTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = BerryKeepIosProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		7DD73EE64ADF4D79132C4282 /* BerryKeepAppleFFI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "BerryKeepAppleFFI-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -401,6 +403,7 @@
 				6A4777D0C0506B8D27B6198F /* AppleAppSupport */,
 				96F7B3C14F1A91CD6DCE0635 /* AppleFileProviderRuntime */,
 				69075CFCAA25D9B0A969540F /* AppleNativeBridge */,
+				A99C0003A99C0003A99C0003 /* Resources */,
 				9B49D4C4CCD3297433E6597D /* BerryKeepAppleProjectTests */,
 				E5BF17148530CB1790E898F6 /* BerryKeepIosApp */,
 				376D29036F21AEDB681A67DC /* BerryKeepIosFileProviderExtension */,
@@ -421,6 +424,14 @@
 			);
 			name = BerryKeepIosProjectTests;
 			path = Tests/BerryKeepIosProjectTests;
+			sourceTree = "<group>";
+		};
+		A99C0003A99C0003A99C0003 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				A99C0001A99C0001A99C0001 /* Assets.xcassets */,
+			);
+			path = Resources;
 			sourceTree = "<group>";
 		};
 		E5BF17148530CB1790E898F6 /* BerryKeepIosApp */ = {
@@ -575,6 +586,7 @@
 			buildPhases = (
 				07FC14D06BCBF8B7FAA879FB /* Build Rust Apple FFI */,
 				898EAFC7D0721A0B953C3839 /* Sources */,
+				A99C0004A99C0004A99C0004 /* Resources */,
 				BADE7AED9873561B8E167D86 /* Frameworks */,
 				3C7C3D1097ACBAD4AABDEAC2 /* Embed Foundation Extensions */,
 			);
@@ -659,6 +671,17 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A99C0004A99C0004A99C0004 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A99C0002A99C0002A99C0002 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
 		07FC14D06BCBF8B7FAA879FB /* Build Rust Apple FFI */ = {
