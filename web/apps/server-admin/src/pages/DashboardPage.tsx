@@ -216,9 +216,7 @@ export function DashboardPage() {
             processStatsCurrentQuery.refetch(),
             processStatsHistoryQuery.refetch(),
             processStatsMemoryQuery.refetch(),
-            ...(hostDependencyReportQuery.isStale
-              ? [hostDependencyReportQuery.refetch()]
-              : [])
+            hostDependencyReportQuery.refetch()
           ]
         : []),
       ...(canInspectRendezvous ? [rendezvousConfigQuery.refetch()] : [])
