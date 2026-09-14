@@ -1030,6 +1030,10 @@ fn checks_for_inspection(
                 id: "systemd-mount-protection".to_string(),
                 feature: "Systemd mount protection".to_string(),
                 status: HostDependencyStatus::Missing,
+                // An unreadable systemd graph means the target is unverified,
+                // not that a specific mount dependency is absent. Preserve the
+                // configured warning/critical severities for confirmed per-path
+                // gaps and keep this diagnostic off the dashboard.
                 severity: HostDependencySeverity::Info,
                 summary: format!(
                     "Could not inspect effective systemd dependencies for `{service}`"
