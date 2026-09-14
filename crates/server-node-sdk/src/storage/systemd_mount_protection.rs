@@ -1079,18 +1079,18 @@ fn checks_for_inspection(
             .map(|target| {
                 let expected_host_mount = expected_host_mount_point(target, &host_mount_points);
                 let is_root_backed_namespace_bind = target.mount_point_is_bind
-                    && expected_host_mount.is_none()
                     && target
                         .backing_mount_points
                         .iter()
                         .any(|mount_point| mount_point == Path::new("/"));
-                let target_is_on_expected_host_mount = match (
-                    target.mount_point.as_deref(),
-                    expected_host_mount.map(PathBuf::as_path),
-                ) {
-                    (Some(actual), Some(expected)) => actual.starts_with(expected),
-                    _ => true,
-                };
+                let target_is_on_expected_host_mount = !is_root_backed_namespace_bind
+                    && match (
+                        target.mount_point.as_deref(),
+                        expected_host_mount.map(PathBuf::as_path),
+                    ) {
+                        (Some(actual), Some(expected)) => actual.starts_with(expected),
+                        _ => true,
+                    };
                 let can_use_backing_mount_dependency = match (
                     target.mount_point.as_deref(),
                     expected_host_mount.map(PathBuf::as_path),
@@ -1183,7 +1183,8 @@ fn checks_for_inspection(
                         }
                     }
                     None
-                        if !target_is_on_expected_host_mount
+                        if expected_host_mount.is_some()
+                            && !target_is_on_expected_host_mount
                             && target.mount_point.as_deref() != Some(Path::new("/")) =>
                     {
                         let expected_mount = expected_host_mount
@@ -2114,12 +2115,24 @@ mod tests {
             missing_severity: HostDependencySeverity::Critical,
         };
         let checks = checks_for_inspection(
-            &[target],
+            std::slice::from_ref(&target),
             dependencies_with_host_mount_points(Vec::new(), &["/"]),
         );
 
         assert_eq!(checks[0].status, HostDependencyStatus::NotApplicable);
         assert_eq!(checks[0].severity, HostDependencySeverity::Info);
+
+        let checks = checks_for_inspection(
+            &[target],
+            dependencies_with_host_mount_points(
+                vec![systemd_mount("-.mount", "/")],
+                &["/", "/var/lib"],
+            ),
+        );
+
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Critical);
+        assert!(checks[0].summary.contains("instead of"));
     }
 
     #[test]
