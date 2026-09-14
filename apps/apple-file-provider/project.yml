@@ -92,6 +92,7 @@ targets:
       - path: Sources/AppleAppSupport
       - path: Sources/AppleNativeBridge
       - path: Sources/AppleFileProviderRuntime
+      - path: Resources/Assets.xcassets
     dependencies:
       - target: BerryKeepIosFileProviderExtension
         embed: true

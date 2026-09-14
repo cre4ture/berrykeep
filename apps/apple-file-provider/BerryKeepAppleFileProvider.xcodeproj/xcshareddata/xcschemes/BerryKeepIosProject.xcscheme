@@ -15,7 +15,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "0DA04F6B3DEE0D8908F46746"
+               BlueprintIdentifier = "E9091DE3923F6381CE8F7A88"
                BuildableName = "BerryKeepIosProjectTests.xctest"
                BlueprintName = "BerryKeepIosProjectTests"
                ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
@@ -32,7 +32,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "0DA04F6B3DEE0D8908F46746"
+            BlueprintIdentifier = "E9091DE3923F6381CE8F7A88"
             BuildableName = "BerryKeepIosProjectTests.xctest"
             BlueprintName = "BerryKeepIosProjectTests"
             ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
@@ -44,7 +44,7 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "0DA04F6B3DEE0D8908F46746"
+               BlueprintIdentifier = "E9091DE3923F6381CE8F7A88"
                BuildableName = "BerryKeepIosProjectTests.xctest"
                BlueprintName = "BerryKeepIosProjectTests"
                ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
@@ -67,7 +67,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "0DA04F6B3DEE0D8908F46746"
+            BlueprintIdentifier = "E9091DE3923F6381CE8F7A88"
             BuildableName = "BerryKeepIosProjectTests.xctest"
             BlueprintName = "BerryKeepIosProjectTests"
             ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
@@ -83,7 +83,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "0DA04F6B3DEE0D8908F46746"
+            BlueprintIdentifier = "E9091DE3923F6381CE8F7A88"
             BuildableName = "BerryKeepIosProjectTests.xctest"
             BlueprintName = "BerryKeepIosProjectTests"
             ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">

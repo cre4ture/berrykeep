@@ -7,153 +7,154 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A0115A2B772B4AD6A7C10211 /* BerryKeepOriginalShareCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0115A2B772B4AD6A7C10212 /* BerryKeepOriginalShareCoordinator.swift */; };
-		033FA480DF4A80E6F24261D9 /* BerryKeepFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DCD2A1B89C7EC9FF09E436A /* BerryKeepFileProviderConnectionService.swift */; };
-		082E983DBE4DD0A288B7E0B2 /* BerryKeepMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9E696F4C80404E103A51256 /* BerryKeepMacApp.swift */; };
-		08E716AF213E2FB823592D58 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4A19B32096F78A0D540CACC /* BerryKeepFileProviderRuntimeSupport.swift */; };
-		09176176A1A35D7D95E20B12 /* BerryKeepIosProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A36A32CA7808E8CC71993FEC /* BerryKeepIosProjectTests.swift */; };
-		0BC42E8828E7FB463CEA0761 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
-		0DBC3C31113B92CB3CFE0EFD /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
-		0E5FE19377CD8FDF125AAE42 /* BerryKeepFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E669C9817685097A05F1EA4C /* BerryKeepFileProviderItem.swift */; };
-		0F18AADE91E7CAB785BCB7F5 /* BerryKeepFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DCD2A1B89C7EC9FF09E436A /* BerryKeepFileProviderConnectionService.swift */; };
-		11B6ED71556A64B00280AC5E /* BerryKeepFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DCD2A1B89C7EC9FF09E436A /* BerryKeepFileProviderConnectionService.swift */; };
-		1596A1C38F950315CB507483 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 220FA7A03D50518BD537F1CB /* AVFoundation.framework */; };
-		1A8E87AEBF648C0E949F24EE /* BerryKeepIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC064A6A2AC06203AE0B3854 /* BerryKeepIdentifierPathCache.swift */; };
-		1E2E69BD1A65E53A91CB1EFE /* BerryKeepSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 792F216BC5734E380B8D639B /* BerryKeepSyncAnchorCodec.swift */; };
-		1EDB771D9C09AB528C3E97A7 /* BerryKeepFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41445F644F4604684C2EF8C8 /* BerryKeepFileProviderMutationService.swift */; };
-		1F12A9A2FED5E58DE11EFDDD /* BerryKeepIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC064A6A2AC06203AE0B3854 /* BerryKeepIdentifierPathCache.swift */; };
-		1F289BAE99E359A43B97B771 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6DED46198314AD32D59D4EEE /* Network.framework */; };
-		1F30F9EE22B86F396DAEA0DF /* BerryKeepFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* BerryKeepFileProviderRuntime.swift */; };
-		21E9C2712F293E5C249D8C3E /* BerryKeepFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A9A6BE8EA898EC7D430B25C /* BerryKeepFileProviderExtensionHost.swift */; };
-		27A5FFB82850B7BD3A74B1FA /* BerryKeepFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DE242824A78C12FCE941041 /* BerryKeepFileProviderReadService.swift */; };
-		2E47B7E3A1EC24B17639E56D /* BerryKeepFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EAEDFCD6573C0E56F75AD1D /* BerryKeepFileProviderEnumerator.swift */; };
-		2F0BF924B0A6486D54FC974E /* BerryKeepFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A1A4DEFA588B8859D393E5A /* BerryKeepFileProviderSyncRuntime.swift */; };
-		3652E85986B596D16D33CB7D /* BerryKeepFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EAEDFCD6573C0E56F75AD1D /* BerryKeepFileProviderEnumerator.swift */; };
-		3812238F70057C449AA7B2B0 /* BerryKeepFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD0D96D60F5C1E603B708FB /* BerryKeepFileProviderConflictService.swift */; };
-		3CE9B7BE02A592262B6F2A81 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4A19B32096F78A0D540CACC /* BerryKeepFileProviderRuntimeSupport.swift */; };
-		3ECD32BAAD7E1074A209E6A9 /* BerryKeepAppleProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7920A3DC35240252C623BC7 /* BerryKeepAppleProjectTests.swift */; };
-		4197B1B83913504F532D511F /* BerryKeepFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DE242824A78C12FCE941041 /* BerryKeepFileProviderReadService.swift */; };
-		435D0CA69066D5924C792779 /* BerryKeepFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8998582382E6AF8D8680D1 /* BerryKeepFileProviderService.swift */; };
-		43C79B50B668310E1E948E7A /* BerryKeepIosFileProviderExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = D65743C5EC88BC86B9CCD14F /* BerryKeepIosFileProviderExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-		442364943CDE6754986E4951 /* BerryKeepFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6C4CDC5E768B56A87C001C4 /* BerryKeepFileProviderLookupService.swift */; };
-		4C9B2B93D3EF1DDA5309B64C /* BerryKeepGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBB0FEF4247443AA0C0D393D /* BerryKeepGalleryModel.swift */; };
-		4F22E831A0BEF874230F1044 /* BerryKeepFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DE242824A78C12FCE941041 /* BerryKeepFileProviderReadService.swift */; };
-		50D1573E018F1F112D40ED86 /* BerryKeepFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8998582382E6AF8D8680D1 /* BerryKeepFileProviderService.swift */; };
-		51BAF01273A3A345A54851B0 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4A19B32096F78A0D540CACC /* BerryKeepFileProviderRuntimeSupport.swift */; };
-		52B068416C957652A221862F /* BerryKeepFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41445F644F4604684C2EF8C8 /* BerryKeepFileProviderMutationService.swift */; };
-		5325406375A4DA8E66293157 /* BerryKeepRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* BerryKeepRustFFIAdapter.swift */; };
-		5392619423EF7380FFA0BA73 /* BerryKeepBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13094E341F56B086D44DEDB /* BerryKeepBrowserModel.swift */; };
-		5AA87421C5EE2962F1348EEC /* BerryKeepRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* BerryKeepRustFFIAdapter.swift */; };
-		5B1FCE6BC32843D4F5EFBBFF /* BerryKeepBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13094E341F56B086D44DEDB /* BerryKeepBrowserModel.swift */; };
-		5F9F92673599603F7B4FA94E /* BerryKeepFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8998582382E6AF8D8680D1 /* BerryKeepFileProviderService.swift */; };
-		61DE2DC4A82685AF6F6554D2 /* BerryKeepGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBB0FEF4247443AA0C0D393D /* BerryKeepGalleryModel.swift */; };
-		6221144F7C8633273DCB8805 /* BerryKeepIosApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ED16406A1BE1EDF63710436 /* BerryKeepIosApp.swift */; };
-		63380B5E6141E9E28F67CD07 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
-		65453585D6DB3706C758A37C /* BerryKeepIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC064A6A2AC06203AE0B3854 /* BerryKeepIdentifierPathCache.swift */; };
-		67D608DE778EEB1DD66BA2CA /* BerryKeepFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD0D96D60F5C1E603B708FB /* BerryKeepFileProviderConflictService.swift */; };
-		6960DA8C2DA00DDF7ED65525 /* BerryKeepFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3AC8A2D308A04A831319F14 /* BerryKeepFileProviderExtensionReadHost.swift */; };
-		6BFE22DE8E310C164FEB9842 /* BerryKeepFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A9A6BE8EA898EC7D430B25C /* BerryKeepFileProviderExtensionHost.swift */; };
-		6C13F572A208AD915911CB47 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4A19B32096F78A0D540CACC /* BerryKeepFileProviderRuntimeSupport.swift */; };
-		6F3E03595FD2D97919630E3B /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 87FF1F26324D7E04DF57D36E /* AppleFileProviderShared */; };
-		70997E3B270AA2CD91D71B3F /* BerryKeepSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 792F216BC5734E380B8D639B /* BerryKeepSyncAnchorCodec.swift */; };
-		70A038B8E6E1917924173FD8 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7EA0BE16142BA4ABE0700C6 /* BerryKeepWorkingSetSignalCoordinator.swift */; };
-		71AE453247F18B2C6C8A3FD4 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 4CADBC90D590EDBD274936BB /* AppleFileProviderShared */; };
-		71CC3C788521C55110FEC7F2 /* BerryKeepFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6C4CDC5E768B56A87C001C4 /* BerryKeepFileProviderLookupService.swift */; };
-		7338228AFCA582F92DE83DE8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 3B0EAA0A0E8449F387555CF7 /* AppleCore */; };
-		73AB93ED2F8EDD1659E92CB7 /* BerryKeepFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E669C9817685097A05F1EA4C /* BerryKeepFileProviderItem.swift */; };
-		764107B1DD7C2FF34E56FE6C /* BerryKeepFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41445F644F4604684C2EF8C8 /* BerryKeepFileProviderMutationService.swift */; };
-		7C3AA36AE5D9679A105E1686 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7EA0BE16142BA4ABE0700C6 /* BerryKeepWorkingSetSignalCoordinator.swift */; };
-		81832537D853D978072D3C62 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 27724ACE6FAA8F9BBB92D194 /* AppleFileProviderShared */; };
-		84B5410C166A55EF1D7143FB /* BerryKeepFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A1A4DEFA588B8859D393E5A /* BerryKeepFileProviderSyncRuntime.swift */; };
-		87CAC7CC0E802222F7DBB812 /* GalleryMapFullscreenUiTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 45BF11F6601ED5DB94DF452C /* GalleryMapFullscreenUiTests.swift */; };
-		8BB7E92B717F247AC803FF2F /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 036A193B5DAC68469095CE5A /* AppleCore */; };
-		8E3B91407FEE58B371BDCA83 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 490DDF2FBD041940B88BC453 /* SystemConfiguration.framework */; };
-		9782220FB3499AA0A882D4BC /* BerryKeepFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6C4CDC5E768B56A87C001C4 /* BerryKeepFileProviderLookupService.swift */; };
-		98957DAEF45FB9170691016A /* BerryKeepFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* BerryKeepFileProviderRuntime.swift */; };
-		9937DD5D5A6AEBD58A6F5689 /* BerryKeepFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* BerryKeepFileProviderRuntime.swift */; };
-		9AD8E45837318E90D1A18CAE /* BerryKeepFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3AC8A2D308A04A831319F14 /* BerryKeepFileProviderExtensionReadHost.swift */; };
-		9B961AE315786144FC48A2A1 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C871EFA8FFA39346B9520B9 /* BerryKeepFileProviderExtensionMutationHost.swift */; };
-		9E39367F085BA49D4281F19D /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7EA0BE16142BA4ABE0700C6 /* BerryKeepWorkingSetSignalCoordinator.swift */; };
-		A0B22A2A394BE923D17632AD /* BerryKeepFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3AC8A2D308A04A831319F14 /* BerryKeepFileProviderExtensionReadHost.swift */; };
-		A62E2A94F79F4C586D00C090 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C871EFA8FFA39346B9520B9 /* BerryKeepFileProviderExtensionMutationHost.swift */; };
-		A78C067EB050352B1D6E68C4 /* BerryKeepFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A9A6BE8EA898EC7D430B25C /* BerryKeepFileProviderExtensionHost.swift */; };
-		A7DED56C1664CF0C39FA227C /* BerryKeepFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E669C9817685097A05F1EA4C /* BerryKeepFileProviderItem.swift */; };
-		A8F8240A7C3C6E6CA4DA5EA5 /* BerryKeepSyncProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D5ABE42C4A88C9F432EAB30 /* BerryKeepSyncProfilesView.swift */; };
-		AA84793D4F184A7BEA919B8D /* BerryKeepFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD0D96D60F5C1E603B708FB /* BerryKeepFileProviderConflictService.swift */; };
-		AA8D440478B23CB57200B604 /* BerryKeepFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41445F644F4604684C2EF8C8 /* BerryKeepFileProviderMutationService.swift */; };
-		AB76E22ACD480D5D494CCBF5 /* BerryKeepSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 792F216BC5734E380B8D639B /* BerryKeepSyncAnchorCodec.swift */; };
-		AB81FE36B1A8884EB22E1A2C /* BerryKeepGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAE325C40BA870C788A02A49 /* BerryKeepGalleryView.swift */; };
-		B02D3B50AA4DD0A74EA7EF64 /* BerryKeepIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC064A6A2AC06203AE0B3854 /* BerryKeepIdentifierPathCache.swift */; };
-		B1CEF3BBBCCA99EB5A2C2F17 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 648AE487A41AA72E53A73C09 /* AppleFileProviderShared */; };
-		B34CFEFE0F3CACD159AFC871 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = D4758290C2F46CB307E07F32 /* AppleCore */; };
-		B36DE238EE6B5D64A18A7FB8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 610C745899D565B8093E9493 /* AppleCore */; };
-		B3F11CA585F799C5462742AF /* BerryKeepSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 792F216BC5734E380B8D639B /* BerryKeepSyncAnchorCodec.swift */; };
-		B4332A6B3C4FF1837B6E1B5A /* BerryKeepFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DE242824A78C12FCE941041 /* BerryKeepFileProviderReadService.swift */; };
-		B4ACE0699544E9E161E93BF7 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7EA0BE16142BA4ABE0700C6 /* BerryKeepWorkingSetSignalCoordinator.swift */; };
-		B505F1987180B3B81BAFD838 /* BerryKeepFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD0D96D60F5C1E603B708FB /* BerryKeepFileProviderConflictService.swift */; };
-		BBE371367C8853578B16C056 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6DED46198314AD32D59D4EEE /* Network.framework */; };
-		BC573F3331A869B6230804E1 /* BerryKeepFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3AC8A2D308A04A831319F14 /* BerryKeepFileProviderExtensionReadHost.swift */; };
-		BD69388C688129F3E278CF1C /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = F0BA5FE65065A174670816F1 /* AppleFileProviderShared */; };
-		C6A90019EACA58A228F56027 /* BerryKeepFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C8998582382E6AF8D8680D1 /* BerryKeepFileProviderService.swift */; };
-		C6AA101E4103A45EE21D1EE1 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
-		C6EC8D0848B7E4A66A05D61B /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = D3D93B20FE0A9294021D714C /* AppleFileProviderShared */; };
-		CBE7EAED3C09B6F2403AFD28 /* BerryKeepIosFileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7E9C7CA35FBD3948776E0AF /* BerryKeepIosFileProviderExtension.swift */; };
-		CCEA254D25DFFA0674CEB1B8 /* BerryKeepFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A1A4DEFA588B8859D393E5A /* BerryKeepFileProviderSyncRuntime.swift */; };
-		CF3099C80F9D88009AC75FF0 /* BerryKeepFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EAEDFCD6573C0E56F75AD1D /* BerryKeepFileProviderEnumerator.swift */; };
-		D0C54EB6D904FBDA7DE798EF /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C871EFA8FFA39346B9520B9 /* BerryKeepFileProviderExtensionMutationHost.swift */; };
-		D32E29BA694DB69090891F2B /* BerryKeepFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6C4CDC5E768B56A87C001C4 /* BerryKeepFileProviderLookupService.swift */; };
-		D54791C01A831B30E44701BF /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 490DDF2FBD041940B88BC453 /* SystemConfiguration.framework */; };
-		D769F254880D897FB1A0CDAA /* BerryKeepFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A1A4DEFA588B8859D393E5A /* BerryKeepFileProviderSyncRuntime.swift */; };
-		D802864A3D2DE7B7303E6279 /* BerryKeepMacFileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3AF23604A81569FFBE88C99C /* BerryKeepMacFileProviderExtension.swift */; };
-		D94B5BAD893A2D88F7DF51C8 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 4FCEFD47F4EBD2FDE8D48497 /* AppleCore */; };
-		DD9F571E15ABD0C5B4D38F1D /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
-		DEF15D6D9BD692D36D445ACE /* BerryKeepFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E669C9817685097A05F1EA4C /* BerryKeepFileProviderItem.swift */; };
-		E139DE3EBC4A80CC22CED1D6 /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
-		E2BB351D278368B67B1C40F0 /* BerryKeepFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A9A6BE8EA898EC7D430B25C /* BerryKeepFileProviderExtensionHost.swift */; };
-		E5578688033BE7CDB458989B /* BerryKeepRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* BerryKeepRustFFIAdapter.swift */; };
-		E574A10C6D8F9A186FC35D3B /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */; };
-		E6752CA7D26660DD296011E0 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 5EB1E57AE3FC7EA54C1477E3 /* AppleCore */; };
-		EA5CEAEDBC7AE459CDEF1C8B /* BerryKeepBootstrapScannerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = E936F23DD46DDF6D86D2F447 /* BerryKeepBootstrapScannerSheet.swift */; };
-		EE180BC0B8517727ABFA2DA3 /* BerryKeepFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DCD2A1B89C7EC9FF09E436A /* BerryKeepFileProviderConnectionService.swift */; };
-		F02D4D63B27E99F45F6B05C9 /* BerryKeepFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F89BB0FEE78E57EA6B128404 /* BerryKeepFileProviderRuntime.swift */; };
-		F13F3F0DA872B57AFD30EE67 /* BerryKeepRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0FA8B4BC4DABA6189BBC74A /* BerryKeepRustFFIAdapter.swift */; };
-		F3F4A05C300CBFB60793B650 /* BerryKeepFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EAEDFCD6573C0E56F75AD1D /* BerryKeepFileProviderEnumerator.swift */; };
-		F9BC2F0979CF91901D8F1CA3 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C871EFA8FFA39346B9520B9 /* BerryKeepFileProviderExtensionMutationHost.swift */; };
-		FAF90D30003E3533BA646C07 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EC4454FA337C8FA97EBDD917 /* FileProvider.framework */; };
+		0012A634793B3FF6AEAE8FB8 /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 819AF19ACD7D631D837E41A4 /* UniformTypeIdentifiers.framework */; };
+		032D9887CE04B95BAC4B5ACC /* BerryKeepIosFileProviderExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 2F3DBDCCD1D79F343B997A8D /* BerryKeepIosFileProviderExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		033BF9AF02BB863FBB3D6FFC /* BerryKeepFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8A21956C8E56F283A5A96D /* BerryKeepFileProviderEnumerator.swift */; };
+		03FD39C57601D0BCBD763146 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25B8F2A8446BCCF1F6EEE9B4 /* BerryKeepWorkingSetSignalCoordinator.swift */; };
+		08A2042ADBBF753049A0DC84 /* BerryKeepRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D6B6EE3A5F5CCF1195AC89F /* BerryKeepRustFFIAdapter.swift */; };
+		08AF571A3EA3E0A86BC07498 /* BerryKeepIosFileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 644FDACB1048B7CE6A6020BC /* BerryKeepIosFileProviderExtension.swift */; };
+		0BE4EE1DEC597825BBA5B97C /* BerryKeepFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A56C4CC30ADF9B4867A0568 /* BerryKeepFileProviderReadService.swift */; };
+		0CA4379C02EB3206EAE92FE0 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 386BB45529D0789D5ADC3EC3 /* AppleFileProviderShared */; };
+		0F03F1491D9C868D762AFB83 /* BerryKeepFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 359ED195FF302BEABA27DBC0 /* BerryKeepFileProviderSyncRuntime.swift */; };
+		14928D158DC01B9F23E8D5A4 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25B8F2A8446BCCF1F6EEE9B4 /* BerryKeepWorkingSetSignalCoordinator.swift */; };
+		15D50C950F7BBC86A45F8E9D /* BerryKeepRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D6B6EE3A5F5CCF1195AC89F /* BerryKeepRustFFIAdapter.swift */; };
+		1838DE93308D67DD62554C3A /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = B86DC11C8C0D191307877C31 /* AppleCore */; };
+		19752C86E3F9DCE5A039049C /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3360C04A74A6EC3D4EB4B919 /* BerryKeepFileProviderExtensionMutationHost.swift */; };
+		1EB67395F99CA3135D076C6F /* BerryKeepMacFileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = E069664567BF59CF4CF3A7E9 /* BerryKeepMacFileProviderExtension.swift */; };
+		21379AEBFF344BCF47A1278D /* BerryKeepBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C2AB4A7AE33D51D5A414303 /* BerryKeepBrowserModel.swift */; };
+		240B85A702D9AC9A80ECAB0D /* BerryKeepFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F9550E513C565E597B3E886 /* BerryKeepFileProviderConflictService.swift */; };
+		2415A1C7B7B29B4F2EEA3E17 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 719D6E9329AEDD0AB734A2DD /* AVFoundation.framework */; };
+		259FA820CD5245C37B334AA7 /* BerryKeepFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A12F3F9535B7C6D0FABB24BC /* BerryKeepFileProviderExtensionHost.swift */; };
+		2FDECE4E768BA6E24F91436F /* BerryKeepFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BFB7CD5356B1CF2BD7BAD6D /* BerryKeepFileProviderMutationService.swift */; };
+		326B94EC7482C8DB97FB2389 /* BerryKeepFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A12F3F9535B7C6D0FABB24BC /* BerryKeepFileProviderExtensionHost.swift */; };
+		36AAB4E0917727FA7EB2E627 /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 819AF19ACD7D631D837E41A4 /* UniformTypeIdentifiers.framework */; };
+		3716C094047BE4E643DCACE6 /* BerryKeepFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BFB7CD5356B1CF2BD7BAD6D /* BerryKeepFileProviderMutationService.swift */; };
+		38C7E27F79EAB66DF88DFBDC /* BerryKeepFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 359ED195FF302BEABA27DBC0 /* BerryKeepFileProviderSyncRuntime.swift */; };
+		3B95318F32D6F1F68B6ACA8A /* BerryKeepIosProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 677A344F92CC82EB37F17D5F /* BerryKeepIosProjectTests.swift */; };
+		3EA4E02DCEBB21F9259A0EF4 /* BerryKeepFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C502AA0FE68AF3CC4A71B1E /* BerryKeepFileProviderItem.swift */; };
+		3FF03BE13DF55AEDD55B4EDF /* BerryKeepFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0CC29F95BA660CEA67219E /* BerryKeepFileProviderExtensionReadHost.swift */; };
+		40371F220E6E68ECEB3220EE /* BerryKeepFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72D7451EDD352F8AA774638C /* BerryKeepFileProviderConnectionService.swift */; };
+		43212CD77971354FC9A3B539 /* BerryKeepFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C502AA0FE68AF3CC4A71B1E /* BerryKeepFileProviderItem.swift */; };
+		4440F5250E6812C433214556 /* GalleryMapFullscreenUiTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEBC4F83FCFD12C7DBD01225 /* GalleryMapFullscreenUiTests.swift */; };
+		4B62C2EA85C54F2A9A0A287E /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 819AF19ACD7D631D837E41A4 /* UniformTypeIdentifiers.framework */; };
+		4BD04F253AFFA930F6AC5FEE /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 0D57367EA24E9DFAA4059FFC /* AppleFileProviderShared */; };
+		5357C37204DB7595B1AB1E2D /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = F9822A4F53C3FF1144447B3B /* AppleCore */; };
+		5401CF73F24A0609247A05B0 /* BerryKeepAppleProjectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 563AA79F0E313C1B2C1B766D /* BerryKeepAppleProjectTests.swift */; };
+		5ECAAD2D0728920A176CD541 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = D09AEE6B35C5DCF1F7CD73CE /* AppleFileProviderShared */; };
+		5ECC99D1057FFC7AC23005DD /* BerryKeepFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72D7451EDD352F8AA774638C /* BerryKeepFileProviderConnectionService.swift */; };
+		6048A016602D2A68B45EBAB3 /* BerryKeepRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D6B6EE3A5F5CCF1195AC89F /* BerryKeepRustFFIAdapter.swift */; };
+		62AB2A19B4B771A11364E3F0 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3360C04A74A6EC3D4EB4B919 /* BerryKeepFileProviderExtensionMutationHost.swift */; };
+		63190B545F8D4B7148C02970 /* BerryKeepFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F9550E513C565E597B3E886 /* BerryKeepFileProviderConflictService.swift */; };
+		633CA159D84388A915276620 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = FA6F3613D78C7C10F97866B2 /* AppleFileProviderShared */; };
+		6601F1C27BDD4489150D4F47 /* BerryKeepSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31ABBFC5D17D1F4829EDE5F9 /* BerryKeepSyncAnchorCodec.swift */; };
+		68545863AE4583B00787AFD0 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 11A6C971B25C040161B6C3FB /* FileProvider.framework */; };
+		69039271CAFDA2BCFB47FEEA /* BerryKeepFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1CDBC37F3153CE6E9554A0 /* BerryKeepFileProviderService.swift */; };
+		69B55898164B031D9A51BEB5 /* BerryKeepFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F9550E513C565E597B3E886 /* BerryKeepFileProviderConflictService.swift */; };
+		6BE4ED3542A7A19DAAA42C94 /* BerryKeepFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A12F3F9535B7C6D0FABB24BC /* BerryKeepFileProviderExtensionHost.swift */; };
+		6C663D4480E61B48A3B3F20D /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 450C01B5C5772DB7E00294A4 /* AppleCore */; };
+		6D065415344A5B18740AD1F1 /* BerryKeepFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DE19E5698D57BDC90B29421 /* BerryKeepFileProviderLookupService.swift */; };
+		6DCF3D4954274D8AA1A17F3D /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3360C04A74A6EC3D4EB4B919 /* BerryKeepFileProviderExtensionMutationHost.swift */; };
+		7054340247A4D3E4D83DAC61 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB196A1385202BC2B4D0038F /* SystemConfiguration.framework */; };
+		7232C7718884E0BB413596AD /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 819AF19ACD7D631D837E41A4 /* UniformTypeIdentifiers.framework */; };
+		7280D9C9E707FA94AD4FDD0E /* BerryKeepIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41C6F9DE4B9C7706041C9712 /* BerryKeepIdentifierPathCache.swift */; };
+		76825B000C5911E6D7AC9CDE /* BerryKeepFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DE19E5698D57BDC90B29421 /* BerryKeepFileProviderLookupService.swift */; };
+		78450F5BCC90E1577ED3EF13 /* BerryKeepFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A56C4CC30ADF9B4867A0568 /* BerryKeepFileProviderReadService.swift */; };
+		78E4E5BE61E78DF9902B653C /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 7D866EEC554740B76A20621D /* AppleCore */; };
+		79749C9C9CB6937B9CC33962 /* BerryKeepFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A56C4CC30ADF9B4867A0568 /* BerryKeepFileProviderReadService.swift */; };
+		7A070C58E9BB76442884E61E /* BerryKeepFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAE0B0DE396264B3F5127780 /* BerryKeepFileProviderRuntime.swift */; };
+		7A77A669D93DA5F467D101B9 /* BerryKeepFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 359ED195FF302BEABA27DBC0 /* BerryKeepFileProviderSyncRuntime.swift */; };
+		7C843EA3472DE9BF9737DBE5 /* BerryKeepGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C553A5831CE078BDFC3B0AD /* BerryKeepGalleryModel.swift */; };
+		7E6D4833C2DBBDB5F41A8BF0 /* BerryKeepFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DE19E5698D57BDC90B29421 /* BerryKeepFileProviderLookupService.swift */; };
+		7EE0A8D5293A47F0596AC2A4 /* BerryKeepFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1CDBC37F3153CE6E9554A0 /* BerryKeepFileProviderService.swift */; };
+		7FDCFAC9C3D07EDF1219D1B2 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0DFEE875F879C545A98EEA54 /* Network.framework */; };
+		81EDC4AB7BFED112C42257DE /* BerryKeepSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31ABBFC5D17D1F4829EDE5F9 /* BerryKeepSyncAnchorCodec.swift */; };
+		864729EBFEFB9DCE26950B75 /* BerryKeepFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1CDBC37F3153CE6E9554A0 /* BerryKeepFileProviderService.swift */; };
+		86CB4E888CB23766B4A501DB /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 2010814B7D693E31E884D41C /* AppleCore */; };
+		8A51E30A5913A8905EFBC0D7 /* AppleCore in Frameworks */ = {isa = PBXBuildFile; productRef = 395043293A38C1EB016A7CEF /* AppleCore */; };
+		8AFE6B4B994A23265AD98B1D /* BerryKeepIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41C6F9DE4B9C7706041C9712 /* BerryKeepIdentifierPathCache.swift */; };
+		8CF46EE2D2E83447A06A0E3D /* BerryKeepFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAE0B0DE396264B3F5127780 /* BerryKeepFileProviderRuntime.swift */; };
+		8D981D498F95EE821C6C1EC8 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25E755D06738C63C25C95792 /* BerryKeepFileProviderRuntimeSupport.swift */; };
+		90431D6A7933187378F159A4 /* BerryKeepRustFFIAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D6B6EE3A5F5CCF1195AC89F /* BerryKeepRustFFIAdapter.swift */; };
+		94584B75FA1C5F0743E5E11E /* BerryKeepIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41C6F9DE4B9C7706041C9712 /* BerryKeepIdentifierPathCache.swift */; };
+		96F601E259CF7DAB376F0591 /* BerryKeepBrowserModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C2AB4A7AE33D51D5A414303 /* BerryKeepBrowserModel.swift */; };
+		A1991CEFF852F55C9D9735E8 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25E755D06738C63C25C95792 /* BerryKeepFileProviderRuntimeSupport.swift */; };
+		A32F43097A255BD5ECAC6269 /* BerryKeepGalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B38BEEF82E97FF2DEAB7E441 /* BerryKeepGalleryView.swift */; };
+		A4487D3E44C7FD1D2913B0CC /* BerryKeepSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31ABBFC5D17D1F4829EDE5F9 /* BerryKeepSyncAnchorCodec.swift */; };
+		A7C635F19F1FD565EF678DBD /* BerryKeepFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72D7451EDD352F8AA774638C /* BerryKeepFileProviderConnectionService.swift */; };
+		A7F1EDCFF8AB50B0E2CFC16B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4DEDCE7ABF72419199CE7C1F /* Assets.xcassets */; };
+		A880771B50A6EB7C97326DD8 /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = CF6349C254794ECA277F2753 /* AppleFileProviderShared */; };
+		AA41DF0B7C94392682872C33 /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB196A1385202BC2B4D0038F /* SystemConfiguration.framework */; };
+		AC213516A1639FC38E6FB0FF /* BerryKeepFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAE0B0DE396264B3F5127780 /* BerryKeepFileProviderRuntime.swift */; };
+		AD0E7FBAA88D1C8F87D4AD45 /* BerryKeepFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8A21956C8E56F283A5A96D /* BerryKeepFileProviderEnumerator.swift */; };
+		AD9192DBC912C99F915EC275 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3360C04A74A6EC3D4EB4B919 /* BerryKeepFileProviderExtensionMutationHost.swift */; };
+		AFC8CE610E81BBD3D08290A5 /* BerryKeepFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BFB7CD5356B1CF2BD7BAD6D /* BerryKeepFileProviderMutationService.swift */; };
+		B0A68B10A0D900F326541F67 /* BerryKeepFileProviderMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BFB7CD5356B1CF2BD7BAD6D /* BerryKeepFileProviderMutationService.swift */; };
+		B17DA4BBEFDC14C7FA41DCA2 /* BerryKeepFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0CC29F95BA660CEA67219E /* BerryKeepFileProviderExtensionReadHost.swift */; };
+		B2051AA04FA6D31359DE8931 /* BerryKeepFileProviderReadService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A56C4CC30ADF9B4867A0568 /* BerryKeepFileProviderReadService.swift */; };
+		B5E87019065BEF1922F70473 /* BerryKeepFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8A21956C8E56F283A5A96D /* BerryKeepFileProviderEnumerator.swift */; };
+		B8571168A13F0406E3DA7282 /* BerryKeepSyncAnchorCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31ABBFC5D17D1F4829EDE5F9 /* BerryKeepSyncAnchorCodec.swift */; };
+		B85D761F62E288D77489C517 /* BerryKeepFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0CC29F95BA660CEA67219E /* BerryKeepFileProviderExtensionReadHost.swift */; };
+		BC984DC1B3564BB9208CBBD3 /* BerryKeepOriginalShareCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A536CEF8C6A1E3E0ACB7193 /* BerryKeepOriginalShareCoordinator.swift */; };
+		C503F6863E5B98B084298500 /* BerryKeepMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBC6B8396B4BD8414E5BFAAC /* BerryKeepMacApp.swift */; };
+		C7F3E84180B79198DE4B03CF /* AppleFileProviderShared in Frameworks */ = {isa = PBXBuildFile; productRef = 2C497C5557DE25C830BC5A5C /* AppleFileProviderShared */; };
+		CA4DE054981304828E31F7E7 /* BerryKeepIosApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 881C40096B831DA690769F68 /* BerryKeepIosApp.swift */; };
+		CC8650727D5EB012BF277B8C /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25B8F2A8446BCCF1F6EEE9B4 /* BerryKeepWorkingSetSignalCoordinator.swift */; };
+		CF965E78DAFB1B9E6AC44C5F /* BerryKeepFileProviderExtensionReadHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0CC29F95BA660CEA67219E /* BerryKeepFileProviderExtensionReadHost.swift */; };
+		D0F2D2D887CFB54F5D12F0DA /* BerryKeepSyncProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96FBAB8E35B5AE3EE9E5576E /* BerryKeepSyncProfilesView.swift */; };
+		D1477572C3CAE024CDC9236D /* BerryKeepBootstrapScannerSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A46213CE596835864EBA3BB /* BerryKeepBootstrapScannerSheet.swift */; };
+		D2DDAD627C57B96F1CCBB672 /* BerryKeepGalleryModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C553A5831CE078BDFC3B0AD /* BerryKeepGalleryModel.swift */; };
+		D6178695FFB9EBD8E636A36F /* BerryKeepFileProviderSyncRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 359ED195FF302BEABA27DBC0 /* BerryKeepFileProviderSyncRuntime.swift */; };
+		D65A78D1C854E462895D2F94 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 11A6C971B25C040161B6C3FB /* FileProvider.framework */; };
+		D93A97EB0816986F5574B6F8 /* BerryKeepFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C502AA0FE68AF3CC4A71B1E /* BerryKeepFileProviderItem.swift */; };
+		DA632CA21E6C4828E4E2F08F /* BerryKeepFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25E755D06738C63C25C95792 /* BerryKeepFileProviderRuntimeSupport.swift */; };
+		DEEEBAC67E3B215236E0987E /* BerryKeepFileProviderLookupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DE19E5698D57BDC90B29421 /* BerryKeepFileProviderLookupService.swift */; };
+		DF225513FBF285079A3BCD0A /* BerryKeepFileProviderConflictService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F9550E513C565E597B3E886 /* BerryKeepFileProviderConflictService.swift */; };
+		DF88EFB4A39388F6FC707A5D /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0DFEE875F879C545A98EEA54 /* Network.framework */; };
+		E191EFBA3028FE5874A01C1A /* BerryKeepFileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C502AA0FE68AF3CC4A71B1E /* BerryKeepFileProviderItem.swift */; };
+		E4295FE075A6310BAE599C1E /* BerryKeepFileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8A21956C8E56F283A5A96D /* BerryKeepFileProviderEnumerator.swift */; };
+		E9A62FC3D47A71CE54390B4F /* BerryKeepFileProviderRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAE0B0DE396264B3F5127780 /* BerryKeepFileProviderRuntime.swift */; };
+		E9D5A2F65F8B041CEC85B8E3 /* BerryKeepFileProviderService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1CDBC37F3153CE6E9554A0 /* BerryKeepFileProviderService.swift */; };
+		EA5951D1349CA1F6F507FBDD /* BerryKeepFileProviderRuntimeSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25E755D06738C63C25C95792 /* BerryKeepFileProviderRuntimeSupport.swift */; };
+		EF9C343C50EFDB525EAD79C7 /* BerryKeepFileProviderConnectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72D7451EDD352F8AA774638C /* BerryKeepFileProviderConnectionService.swift */; };
+		F05D99D24C147FEB23C6FB06 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25B8F2A8446BCCF1F6EEE9B4 /* BerryKeepWorkingSetSignalCoordinator.swift */; };
+		F539E2A1C543111C7ACD2625 /* BerryKeepIdentifierPathCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41C6F9DE4B9C7706041C9712 /* BerryKeepIdentifierPathCache.swift */; };
+		F92E83C83E6D3AA63D1529A7 /* BerryKeepFileProviderExtensionHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A12F3F9535B7C6D0FABB24BC /* BerryKeepFileProviderExtensionHost.swift */; };
+		FAF02ABC77391EE0EE417218 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 11A6C971B25C040161B6C3FB /* FileProvider.framework */; };
+		FD325E583167E75F5097CE53 /* FileProvider.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 11A6C971B25C040161B6C3FB /* FileProvider.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
-		12FA89B442EAB3D62123DB56 /* PBXContainerItemProxy */ = {
+		249B6C0A503557F9C434FED8 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
-			containerPortal = EF0C3BABBB66E445EE36D4B9 /* Project object */;
+			containerPortal = 62982080750046339AC92D17 /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = 4ED9573DAC30D96830CFD46E;
+			remoteGlobalIDString = 999419FD42D2CE645814A9E7;
 			remoteInfo = BerryKeepMacApp;
 		};
-		4E96BBC5A78D3B74CB671B20 /* PBXContainerItemProxy */ = {
+		7ECA7004DB5CD858AE7E0544 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
-			containerPortal = EF0C3BABBB66E445EE36D4B9 /* Project object */;
+			containerPortal = 62982080750046339AC92D17 /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = FC2702FC78F437CFD22D714F;
-			remoteInfo = BerryKeepIosApp;
-		};
-		A1D6D1ADD166BD2A8C4DBC53 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = EF0C3BABBB66E445EE36D4B9 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = AFBE96E8276416130D63E761;
+			remoteGlobalIDString = FD2BB2043514F427D5CE0011;
 			remoteInfo = BerryKeepIosFileProviderExtension;
+		};
+		CF33AAAC83E976137D40ECE4 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 62982080750046339AC92D17 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E394CFCFD73FB85C45134137;
+			remoteInfo = BerryKeepIosApp;
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		3C7C3D1097ACBAD4AABDEAC2 /* Embed Foundation Extensions */ = {
+		F923B75F1C599B63A7EC2E21 /* Embed Foundation Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
-				43C79B50B668310E1E948E7A /* BerryKeepIosFileProviderExtension.appex in Embed Foundation Extensions */,
+				032D9887CE04B95BAC4B5ACC /* BerryKeepIosFileProviderExtension.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -161,340 +162,309 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		A0115A2B772B4AD6A7C10212 /* BerryKeepOriginalShareCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepOriginalShareCoordinator.swift; sourceTree = "<group>"; };
-		1A9A6BE8EA898EC7D430B25C /* BerryKeepFileProviderExtensionHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderExtensionHost.swift; sourceTree = "<group>"; };
-		220FA7A03D50518BD537F1CB /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
-		244B38CABFC537484ED1F06D /* apple-file-provider */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "apple-file-provider"; path = .; sourceTree = SOURCE_ROOT; };
-		36169EE3DEFD4EF8BA28C60A /* BerryKeepIosUiTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = BerryKeepIosUiTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		3AF23604A81569FFBE88C99C /* BerryKeepMacFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepMacFileProviderExtension.swift; sourceTree = "<group>"; };
-		41445F644F4604684C2EF8C8 /* BerryKeepFileProviderMutationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderMutationService.swift; sourceTree = "<group>"; };
-		45BF11F6601ED5DB94DF452C /* GalleryMapFullscreenUiTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GalleryMapFullscreenUiTests.swift; sourceTree = "<group>"; };
-		490DDF2FBD041940B88BC453 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
-		5DCD2A1B89C7EC9FF09E436A /* BerryKeepFileProviderConnectionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderConnectionService.swift; sourceTree = "<group>"; };
-		69448FBEB222C861B5CA9C1C /* BerryKeepAppleProjectTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BerryKeepAppleProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		6C8998582382E6AF8D8680D1 /* BerryKeepFileProviderService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderService.swift; sourceTree = "<group>"; };
-		6DD0D96D60F5C1E603B708FB /* BerryKeepFileProviderConflictService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderConflictService.swift; sourceTree = "<group>"; };
-		6DED46198314AD32D59D4EEE /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
-		6ED16406A1BE1EDF63710436 /* BerryKeepIosApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepIosApp.swift; sourceTree = "<group>"; };
-		792F216BC5734E380B8D639B /* BerryKeepSyncAnchorCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepSyncAnchorCodec.swift; sourceTree = "<group>"; };
-		7DA129FD959C0FD0D040070D /* BerryKeepIosProjectTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = BerryKeepIosProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		7DD73EE64ADF4D79132C4282 /* BerryKeepAppleFFI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "BerryKeepAppleFFI-Bridging-Header.h"; sourceTree = "<group>"; };
-		8A1A4DEFA588B8859D393E5A /* BerryKeepFileProviderSyncRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderSyncRuntime.swift; sourceTree = "<group>"; };
-		8F5701975DDED656D7A9B6A6 /* BerryKeepMacFileProviderExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = BerryKeepMacFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		987EDC104DA47B5CF20BED0D /* BerryKeepMacApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BerryKeepMacApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		9C871EFA8FFA39346B9520B9 /* BerryKeepFileProviderExtensionMutationHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderExtensionMutationHost.swift; sourceTree = "<group>"; };
-		9D5ABE42C4A88C9F432EAB30 /* BerryKeepSyncProfilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepSyncProfilesView.swift; sourceTree = "<group>"; };
-		9DE242824A78C12FCE941041 /* BerryKeepFileProviderReadService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderReadService.swift; sourceTree = "<group>"; };
-		9EAEDFCD6573C0E56F75AD1D /* BerryKeepFileProviderEnumerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderEnumerator.swift; sourceTree = "<group>"; };
-		A13094E341F56B086D44DEDB /* BerryKeepBrowserModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepBrowserModel.swift; sourceTree = "<group>"; };
-		A36A32CA7808E8CC71993FEC /* BerryKeepIosProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepIosProjectTests.swift; sourceTree = "<group>"; };
-		A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = SDKROOT; };
-		A4A19B32096F78A0D540CACC /* BerryKeepFileProviderRuntimeSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderRuntimeSupport.swift; sourceTree = "<group>"; };
-		A6C4CDC5E768B56A87C001C4 /* BerryKeepFileProviderLookupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderLookupService.swift; sourceTree = "<group>"; };
-		A7E9C7CA35FBD3948776E0AF /* BerryKeepIosFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepIosFileProviderExtension.swift; sourceTree = "<group>"; };
-		B88EA20710228EA5788F3224 /* BerryKeepIosApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = BerryKeepIosApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		B9E696F4C80404E103A51256 /* BerryKeepMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepMacApp.swift; sourceTree = "<group>"; };
-		C0FA8B4BC4DABA6189BBC74A /* BerryKeepRustFFIAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepRustFFIAdapter.swift; sourceTree = "<group>"; };
-		C3AC8A2D308A04A831319F14 /* BerryKeepFileProviderExtensionReadHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderExtensionReadHost.swift; sourceTree = "<group>"; };
-		C7EA0BE16142BA4ABE0700C6 /* BerryKeepWorkingSetSignalCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepWorkingSetSignalCoordinator.swift; sourceTree = "<group>"; };
-		CAE325C40BA870C788A02A49 /* BerryKeepGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepGalleryView.swift; sourceTree = "<group>"; };
-		CC064A6A2AC06203AE0B3854 /* BerryKeepIdentifierPathCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepIdentifierPathCache.swift; sourceTree = "<group>"; };
-		D65743C5EC88BC86B9CCD14F /* BerryKeepIosFileProviderExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = BerryKeepIosFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		E669C9817685097A05F1EA4C /* BerryKeepFileProviderItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderItem.swift; sourceTree = "<group>"; };
-		E936F23DD46DDF6D86D2F447 /* BerryKeepBootstrapScannerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepBootstrapScannerSheet.swift; sourceTree = "<group>"; };
-		EBB0FEF4247443AA0C0D393D /* BerryKeepGalleryModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepGalleryModel.swift; sourceTree = "<group>"; };
-		EC4454FA337C8FA97EBDD917 /* FileProvider.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FileProvider.framework; path = System/Library/Frameworks/FileProvider.framework; sourceTree = SDKROOT; };
-		F7920A3DC35240252C623BC7 /* BerryKeepAppleProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepAppleProjectTests.swift; sourceTree = "<group>"; };
-		F89BB0FEE78E57EA6B128404 /* BerryKeepFileProviderRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderRuntime.swift; sourceTree = "<group>"; };
+		0DFEE875F879C545A98EEA54 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
+		11A6C971B25C040161B6C3FB /* FileProvider.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FileProvider.framework; path = System/Library/Frameworks/FileProvider.framework; sourceTree = SDKROOT; };
+		1BFB7CD5356B1CF2BD7BAD6D /* BerryKeepFileProviderMutationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderMutationService.swift; sourceTree = "<group>"; };
+		25B8F2A8446BCCF1F6EEE9B4 /* BerryKeepWorkingSetSignalCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepWorkingSetSignalCoordinator.swift; sourceTree = "<group>"; };
+		25E755D06738C63C25C95792 /* BerryKeepFileProviderRuntimeSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderRuntimeSupport.swift; sourceTree = "<group>"; };
+		2C502AA0FE68AF3CC4A71B1E /* BerryKeepFileProviderItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderItem.swift; sourceTree = "<group>"; };
+		2F3DBDCCD1D79F343B997A8D /* BerryKeepIosFileProviderExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = BerryKeepIosFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		31ABBFC5D17D1F4829EDE5F9 /* BerryKeepSyncAnchorCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepSyncAnchorCodec.swift; sourceTree = "<group>"; };
+		3360C04A74A6EC3D4EB4B919 /* BerryKeepFileProviderExtensionMutationHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderExtensionMutationHost.swift; sourceTree = "<group>"; };
+		359ED195FF302BEABA27DBC0 /* BerryKeepFileProviderSyncRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderSyncRuntime.swift; sourceTree = "<group>"; };
+		3A56C4CC30ADF9B4867A0568 /* BerryKeepFileProviderReadService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderReadService.swift; sourceTree = "<group>"; };
+		3C553A5831CE078BDFC3B0AD /* BerryKeepGalleryModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepGalleryModel.swift; sourceTree = "<group>"; };
+		41C6F9DE4B9C7706041C9712 /* BerryKeepIdentifierPathCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepIdentifierPathCache.swift; sourceTree = "<group>"; };
+		4C2AB4A7AE33D51D5A414303 /* BerryKeepBrowserModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepBrowserModel.swift; sourceTree = "<group>"; };
+		4DEDCE7ABF72419199CE7C1F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		4F9550E513C565E597B3E886 /* BerryKeepFileProviderConflictService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderConflictService.swift; sourceTree = "<group>"; };
+		563AA79F0E313C1B2C1B766D /* BerryKeepAppleProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepAppleProjectTests.swift; sourceTree = "<group>"; };
+		644FDACB1048B7CE6A6020BC /* BerryKeepIosFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepIosFileProviderExtension.swift; sourceTree = "<group>"; };
+		677A344F92CC82EB37F17D5F /* BerryKeepIosProjectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepIosProjectTests.swift; sourceTree = "<group>"; };
+		707E498A92234FFBF773D439 /* apple-file-provider */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "apple-file-provider"; path = .; sourceTree = SOURCE_ROOT; };
+		70D68459F820929FB0AFE03C /* BerryKeepMacFileProviderExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = BerryKeepMacFileProviderExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		719D6E9329AEDD0AB734A2DD /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
+		72D7451EDD352F8AA774638C /* BerryKeepFileProviderConnectionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderConnectionService.swift; sourceTree = "<group>"; };
+		7A536CEF8C6A1E3E0ACB7193 /* BerryKeepOriginalShareCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepOriginalShareCoordinator.swift; sourceTree = "<group>"; };
+		7DE19E5698D57BDC90B29421 /* BerryKeepFileProviderLookupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderLookupService.swift; sourceTree = "<group>"; };
+		819AF19ACD7D631D837E41A4 /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = SDKROOT; };
+		881C40096B831DA690769F68 /* BerryKeepIosApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepIosApp.swift; sourceTree = "<group>"; };
+		8A46213CE596835864EBA3BB /* BerryKeepBootstrapScannerSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepBootstrapScannerSheet.swift; sourceTree = "<group>"; };
+		96FBAB8E35B5AE3EE9E5576E /* BerryKeepSyncProfilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepSyncProfilesView.swift; sourceTree = "<group>"; };
+		98F3AD505EBC90F99011EC93 /* BerryKeepAppleProjectTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = BerryKeepAppleProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		9D6B6EE3A5F5CCF1195AC89F /* BerryKeepRustFFIAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepRustFFIAdapter.swift; sourceTree = "<group>"; };
+		A12F3F9535B7C6D0FABB24BC /* BerryKeepFileProviderExtensionHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderExtensionHost.swift; sourceTree = "<group>"; };
+		AB196A1385202BC2B4D0038F /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
+		AB8A21956C8E56F283A5A96D /* BerryKeepFileProviderEnumerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderEnumerator.swift; sourceTree = "<group>"; };
+		AEBC4F83FCFD12C7DBD01225 /* GalleryMapFullscreenUiTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GalleryMapFullscreenUiTests.swift; sourceTree = "<group>"; };
+		B38BEEF82E97FF2DEAB7E441 /* BerryKeepGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepGalleryView.swift; sourceTree = "<group>"; };
+		B7BB74CCCCA4ED086C5B4B46 /* BerryKeepIosProjectTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = BerryKeepIosProjectTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		BB03426E98549FD81FDBA320 /* BerryKeepIosApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = BerryKeepIosApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		BB0CC29F95BA660CEA67219E /* BerryKeepFileProviderExtensionReadHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderExtensionReadHost.swift; sourceTree = "<group>"; };
+		BF1CDBC37F3153CE6E9554A0 /* BerryKeepFileProviderService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderService.swift; sourceTree = "<group>"; };
+		C8FAE3F90A71DC6D6380AEA6 /* BerryKeepAppleFFI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "BerryKeepAppleFFI-Bridging-Header.h"; sourceTree = "<group>"; };
+		DAE0B0DE396264B3F5127780 /* BerryKeepFileProviderRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepFileProviderRuntime.swift; sourceTree = "<group>"; };
+		DBC6B8396B4BD8414E5BFAAC /* BerryKeepMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepMacApp.swift; sourceTree = "<group>"; };
+		DFB2E81C3D7889F90B0AF6BE /* BerryKeepMacApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BerryKeepMacApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		E069664567BF59CF4CF3A7E9 /* BerryKeepMacFileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BerryKeepMacFileProviderExtension.swift; sourceTree = "<group>"; };
+		F8E29CAE1E51E0067C6A075B /* BerryKeepIosUiTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = BerryKeepIosUiTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		2E91FA967882205DEA6909D7 /* Frameworks */ = {
+		23A1DAA6DA4F3D7606CF4585 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				E6752CA7D26660DD296011E0 /* AppleCore in Frameworks */,
-				B1CEF3BBBCCA99EB5A2C2F17 /* AppleFileProviderShared in Frameworks */,
-				1596A1C38F950315CB507483 /* AVFoundation.framework in Frameworks */,
-				63380B5E6141E9E28F67CD07 /* FileProvider.framework in Frameworks */,
-				E139DE3EBC4A80CC22CED1D6 /* UniformTypeIdentifiers.framework in Frameworks */,
+				1838DE93308D67DD62554C3A /* AppleCore in Frameworks */,
+				5ECAAD2D0728920A176CD541 /* AppleFileProviderShared in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		38A2DEC89126509F9AB22490 /* Frameworks */ = {
+		4677C08DF9F36FD445819205 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				7338228AFCA582F92DE83DE8 /* AppleCore in Frameworks */,
-				71AE453247F18B2C6C8A3FD4 /* AppleFileProviderShared in Frameworks */,
+				6C663D4480E61B48A3B3F20D /* AppleCore in Frameworks */,
+				C7F3E84180B79198DE4B03CF /* AppleFileProviderShared in Frameworks */,
+				68545863AE4583B00787AFD0 /* FileProvider.framework in Frameworks */,
+				DF88EFB4A39388F6FC707A5D /* Network.framework in Frameworks */,
+				7054340247A4D3E4D83DAC61 /* SystemConfiguration.framework in Frameworks */,
+				4B62C2EA85C54F2A9A0A287E /* UniformTypeIdentifiers.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		7295ADD219FD27199FF6A11B /* Frameworks */ = {
+		5FCB07F1399E7BC57F07A964 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				B34CFEFE0F3CACD159AFC871 /* AppleCore in Frameworks */,
-				6F3E03595FD2D97919630E3B /* AppleFileProviderShared in Frameworks */,
-				C6AA101E4103A45EE21D1EE1 /* FileProvider.framework in Frameworks */,
-				BBE371367C8853578B16C056 /* Network.framework in Frameworks */,
-				8E3B91407FEE58B371BDCA83 /* SystemConfiguration.framework in Frameworks */,
-				0DBC3C31113B92CB3CFE0EFD /* UniformTypeIdentifiers.framework in Frameworks */,
+				86CB4E888CB23766B4A501DB /* AppleCore in Frameworks */,
+				4BD04F253AFFA930F6AC5FEE /* AppleFileProviderShared in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		BADE7AED9873561B8E167D86 /* Frameworks */ = {
+		73E5268A0B609C58149AA32C /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D94B5BAD893A2D88F7DF51C8 /* AppleCore in Frameworks */,
-				BD69388C688129F3E278CF1C /* AppleFileProviderShared in Frameworks */,
-				FAF90D30003E3533BA646C07 /* FileProvider.framework in Frameworks */,
-				1F289BAE99E359A43B97B771 /* Network.framework in Frameworks */,
-				D54791C01A831B30E44701BF /* SystemConfiguration.framework in Frameworks */,
-				E574A10C6D8F9A186FC35D3B /* UniformTypeIdentifiers.framework in Frameworks */,
+				78E4E5BE61E78DF9902B653C /* AppleCore in Frameworks */,
+				A880771B50A6EB7C97326DD8 /* AppleFileProviderShared in Frameworks */,
+				FAF02ABC77391EE0EE417218 /* FileProvider.framework in Frameworks */,
+				7FDCFAC9C3D07EDF1219D1B2 /* Network.framework in Frameworks */,
+				AA41DF0B7C94392682872C33 /* SystemConfiguration.framework in Frameworks */,
+				36AAB4E0917727FA7EB2E627 /* UniformTypeIdentifiers.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		D21BAECC9077B6D63A420174 /* Frameworks */ = {
+		97F29CF6C73FDD0F03AAA2EF /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				8BB7E92B717F247AC803FF2F /* AppleCore in Frameworks */,
-				C6EC8D0848B7E4A66A05D61B /* AppleFileProviderShared in Frameworks */,
+				8A51E30A5913A8905EFBC0D7 /* AppleCore in Frameworks */,
+				0CA4379C02EB3206EAE92FE0 /* AppleFileProviderShared in Frameworks */,
+				2415A1C7B7B29B4F2EEA3E17 /* AVFoundation.framework in Frameworks */,
+				D65A78D1C854E462895D2F94 /* FileProvider.framework in Frameworks */,
+				7232C7718884E0BB413596AD /* UniformTypeIdentifiers.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		F718AB135756C1436B5312C0 /* Frameworks */ = {
+		9ECF351801F8E151C97BE693 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				B36DE238EE6B5D64A18A7FB8 /* AppleCore in Frameworks */,
-				81832537D853D978072D3C62 /* AppleFileProviderShared in Frameworks */,
-				0BC42E8828E7FB463CEA0761 /* FileProvider.framework in Frameworks */,
-				DD9F571E15ABD0C5B4D38F1D /* UniformTypeIdentifiers.framework in Frameworks */,
+				5357C37204DB7595B1AB1E2D /* AppleCore in Frameworks */,
+				633CA159D84388A915276620 /* AppleFileProviderShared in Frameworks */,
+				FD325E583167E75F5097CE53 /* FileProvider.framework in Frameworks */,
+				0012A634793B3FF6AEAE8FB8 /* UniformTypeIdentifiers.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		24C0877E8576BBFC778FFC94 /* BerryKeepMacFileProviderExtension */ = {
+		09A291299785F7269DE23B2D /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				3AF23604A81569FFBE88C99C /* BerryKeepMacFileProviderExtension.swift */,
-			);
-			name = BerryKeepMacFileProviderExtension;
-			path = Sources/BerryKeepMacFileProviderExtension;
-			sourceTree = "<group>";
-		};
-		376D29036F21AEDB681A67DC /* BerryKeepIosFileProviderExtension */ = {
-			isa = PBXGroup;
-			children = (
-				A7E9C7CA35FBD3948776E0AF /* BerryKeepIosFileProviderExtension.swift */,
-			);
-			name = BerryKeepIosFileProviderExtension;
-			path = Sources/BerryKeepIosFileProviderExtension;
-			sourceTree = "<group>";
-		};
-		3B8720FF51AAA0345F62D3FB /* Products */ = {
-			isa = PBXGroup;
-			children = (
-				69448FBEB222C861B5CA9C1C /* BerryKeepAppleProjectTests.xctest */,
-				B88EA20710228EA5788F3224 /* BerryKeepIosApp.app */,
-				D65743C5EC88BC86B9CCD14F /* BerryKeepIosFileProviderExtension.appex */,
-				7DA129FD959C0FD0D040070D /* BerryKeepIosProjectTests.xctest */,
-				36169EE3DEFD4EF8BA28C60A /* BerryKeepIosUiTests.xctest */,
-				987EDC104DA47B5CF20BED0D /* BerryKeepMacApp.app */,
-				8F5701975DDED656D7A9B6A6 /* BerryKeepMacFileProviderExtension.appex */,
-			);
-			name = Products;
-			sourceTree = "<group>";
-		};
-		5534E1C4D921104D7C7A59BD /* Frameworks */ = {
-			isa = PBXGroup;
-			children = (
-				220FA7A03D50518BD537F1CB /* AVFoundation.framework */,
-				EC4454FA337C8FA97EBDD917 /* FileProvider.framework */,
-				6DED46198314AD32D59D4EEE /* Network.framework */,
-				490DDF2FBD041940B88BC453 /* SystemConfiguration.framework */,
-				A44D70CA4793C78C57CC5D19 /* UniformTypeIdentifiers.framework */,
+				719D6E9329AEDD0AB734A2DD /* AVFoundation.framework */,
+				11A6C971B25C040161B6C3FB /* FileProvider.framework */,
+				0DFEE875F879C545A98EEA54 /* Network.framework */,
+				AB196A1385202BC2B4D0038F /* SystemConfiguration.framework */,
+				819AF19ACD7D631D837E41A4 /* UniformTypeIdentifiers.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		69075CFCAA25D9B0A969540F /* AppleNativeBridge */ = {
+		1CDE9E5CE8BD222B4755A2FD /* AppleFileProviderRuntime */ = {
 			isa = PBXGroup;
 			children = (
-				7DD73EE64ADF4D79132C4282 /* BerryKeepAppleFFI-Bridging-Header.h */,
-				C0FA8B4BC4DABA6189BBC74A /* BerryKeepRustFFIAdapter.swift */,
-			);
-			name = AppleNativeBridge;
-			path = Sources/AppleNativeBridge;
-			sourceTree = "<group>";
-		};
-		6A4777D0C0506B8D27B6198F /* AppleAppSupport */ = {
-			isa = PBXGroup;
-			children = (
-				A13094E341F56B086D44DEDB /* BerryKeepBrowserModel.swift */,
-				EBB0FEF4247443AA0C0D393D /* BerryKeepGalleryModel.swift */,
-			);
-			name = AppleAppSupport;
-			path = Sources/AppleAppSupport;
-			sourceTree = "<group>";
-		};
-		76A60EFD796E5C3B758B0F98 /* BerryKeepMacApp */ = {
-			isa = PBXGroup;
-			children = (
-				B9E696F4C80404E103A51256 /* BerryKeepMacApp.swift */,
-			);
-			name = BerryKeepMacApp;
-			path = Sources/BerryKeepMacApp;
-			sourceTree = "<group>";
-		};
-		96F7B3C14F1A91CD6DCE0635 /* AppleFileProviderRuntime */ = {
-			isa = PBXGroup;
-			children = (
-				6DD0D96D60F5C1E603B708FB /* BerryKeepFileProviderConflictService.swift */,
-				5DCD2A1B89C7EC9FF09E436A /* BerryKeepFileProviderConnectionService.swift */,
-				9EAEDFCD6573C0E56F75AD1D /* BerryKeepFileProviderEnumerator.swift */,
-				1A9A6BE8EA898EC7D430B25C /* BerryKeepFileProviderExtensionHost.swift */,
-				9C871EFA8FFA39346B9520B9 /* BerryKeepFileProviderExtensionMutationHost.swift */,
-				C3AC8A2D308A04A831319F14 /* BerryKeepFileProviderExtensionReadHost.swift */,
-				E669C9817685097A05F1EA4C /* BerryKeepFileProviderItem.swift */,
-				A6C4CDC5E768B56A87C001C4 /* BerryKeepFileProviderLookupService.swift */,
-				41445F644F4604684C2EF8C8 /* BerryKeepFileProviderMutationService.swift */,
-				9DE242824A78C12FCE941041 /* BerryKeepFileProviderReadService.swift */,
-				F89BB0FEE78E57EA6B128404 /* BerryKeepFileProviderRuntime.swift */,
-				A4A19B32096F78A0D540CACC /* BerryKeepFileProviderRuntimeSupport.swift */,
-				6C8998582382E6AF8D8680D1 /* BerryKeepFileProviderService.swift */,
-				8A1A4DEFA588B8859D393E5A /* BerryKeepFileProviderSyncRuntime.swift */,
-				CC064A6A2AC06203AE0B3854 /* BerryKeepIdentifierPathCache.swift */,
-				792F216BC5734E380B8D639B /* BerryKeepSyncAnchorCodec.swift */,
-				C7EA0BE16142BA4ABE0700C6 /* BerryKeepWorkingSetSignalCoordinator.swift */,
+				4F9550E513C565E597B3E886 /* BerryKeepFileProviderConflictService.swift */,
+				72D7451EDD352F8AA774638C /* BerryKeepFileProviderConnectionService.swift */,
+				AB8A21956C8E56F283A5A96D /* BerryKeepFileProviderEnumerator.swift */,
+				A12F3F9535B7C6D0FABB24BC /* BerryKeepFileProviderExtensionHost.swift */,
+				3360C04A74A6EC3D4EB4B919 /* BerryKeepFileProviderExtensionMutationHost.swift */,
+				BB0CC29F95BA660CEA67219E /* BerryKeepFileProviderExtensionReadHost.swift */,
+				2C502AA0FE68AF3CC4A71B1E /* BerryKeepFileProviderItem.swift */,
+				7DE19E5698D57BDC90B29421 /* BerryKeepFileProviderLookupService.swift */,
+				1BFB7CD5356B1CF2BD7BAD6D /* BerryKeepFileProviderMutationService.swift */,
+				3A56C4CC30ADF9B4867A0568 /* BerryKeepFileProviderReadService.swift */,
+				DAE0B0DE396264B3F5127780 /* BerryKeepFileProviderRuntime.swift */,
+				25E755D06738C63C25C95792 /* BerryKeepFileProviderRuntimeSupport.swift */,
+				BF1CDBC37F3153CE6E9554A0 /* BerryKeepFileProviderService.swift */,
+				359ED195FF302BEABA27DBC0 /* BerryKeepFileProviderSyncRuntime.swift */,
+				41C6F9DE4B9C7706041C9712 /* BerryKeepIdentifierPathCache.swift */,
+				31ABBFC5D17D1F4829EDE5F9 /* BerryKeepSyncAnchorCodec.swift */,
+				25B8F2A8446BCCF1F6EEE9B4 /* BerryKeepWorkingSetSignalCoordinator.swift */,
 			);
 			name = AppleFileProviderRuntime;
 			path = Sources/AppleFileProviderRuntime;
 			sourceTree = "<group>";
 		};
-		9B49D4C4CCD3297433E6597D /* BerryKeepAppleProjectTests */ = {
+		1F7FEDBDD35B221CDEA4534A /* BerryKeepAppleProjectTests */ = {
 			isa = PBXGroup;
 			children = (
-				F7920A3DC35240252C623BC7 /* BerryKeepAppleProjectTests.swift */,
+				563AA79F0E313C1B2C1B766D /* BerryKeepAppleProjectTests.swift */,
 			);
 			name = BerryKeepAppleProjectTests;
 			path = Tests/BerryKeepAppleProjectTests;
 			sourceTree = "<group>";
 		};
-		9BDB7B768C89F16A30A3E62C /* BerryKeepIosUiTests */ = {
+		59B332F7565531BF0E32DB6A /* BerryKeepMacApp */ = {
 			isa = PBXGroup;
 			children = (
-				45BF11F6601ED5DB94DF452C /* GalleryMapFullscreenUiTests.swift */,
+				DBC6B8396B4BD8414E5BFAAC /* BerryKeepMacApp.swift */,
+			);
+			name = BerryKeepMacApp;
+			path = Sources/BerryKeepMacApp;
+			sourceTree = "<group>";
+		};
+		794252B89CEBF27838DCA190 /* BerryKeepIosUiTests */ = {
+			isa = PBXGroup;
+			children = (
+				AEBC4F83FCFD12C7DBD01225 /* GalleryMapFullscreenUiTests.swift */,
 			);
 			name = BerryKeepIosUiTests;
 			path = Tests/BerryKeepIosUiTests;
 			sourceTree = "<group>";
 		};
-		A0AFBB5EB4B353003D20B835 = {
+		97D571525FE273F52E100296 /* BerryKeepIosApp */ = {
 			isa = PBXGroup;
 			children = (
-				6A4777D0C0506B8D27B6198F /* AppleAppSupport */,
-				96F7B3C14F1A91CD6DCE0635 /* AppleFileProviderRuntime */,
-				69075CFCAA25D9B0A969540F /* AppleNativeBridge */,
-				9B49D4C4CCD3297433E6597D /* BerryKeepAppleProjectTests */,
-				E5BF17148530CB1790E898F6 /* BerryKeepIosApp */,
-				376D29036F21AEDB681A67DC /* BerryKeepIosFileProviderExtension */,
-				A5D0FB02CF3B6AEB2B72D86A /* BerryKeepIosProjectTests */,
-				9BDB7B768C89F16A30A3E62C /* BerryKeepIosUiTests */,
-				76A60EFD796E5C3B758B0F98 /* BerryKeepMacApp */,
-				24C0877E8576BBFC778FFC94 /* BerryKeepMacFileProviderExtension */,
-				F8D391B477B8A6461C30F665 /* Packages */,
-				5534E1C4D921104D7C7A59BD /* Frameworks */,
-				3B8720FF51AAA0345F62D3FB /* Products */,
-			);
-			sourceTree = "<group>";
-		};
-		A5D0FB02CF3B6AEB2B72D86A /* BerryKeepIosProjectTests */ = {
-			isa = PBXGroup;
-			children = (
-				A36A32CA7808E8CC71993FEC /* BerryKeepIosProjectTests.swift */,
-			);
-			name = BerryKeepIosProjectTests;
-			path = Tests/BerryKeepIosProjectTests;
-			sourceTree = "<group>";
-		};
-		E5BF17148530CB1790E898F6 /* BerryKeepIosApp */ = {
-			isa = PBXGroup;
-			children = (
-				E936F23DD46DDF6D86D2F447 /* BerryKeepBootstrapScannerSheet.swift */,
-				CAE325C40BA870C788A02A49 /* BerryKeepGalleryView.swift */,
-				6ED16406A1BE1EDF63710436 /* BerryKeepIosApp.swift */,
-				A0115A2B772B4AD6A7C10212 /* BerryKeepOriginalShareCoordinator.swift */,
-				9D5ABE42C4A88C9F432EAB30 /* BerryKeepSyncProfilesView.swift */,
+				8A46213CE596835864EBA3BB /* BerryKeepBootstrapScannerSheet.swift */,
+				B38BEEF82E97FF2DEAB7E441 /* BerryKeepGalleryView.swift */,
+				881C40096B831DA690769F68 /* BerryKeepIosApp.swift */,
+				7A536CEF8C6A1E3E0ACB7193 /* BerryKeepOriginalShareCoordinator.swift */,
+				96FBAB8E35B5AE3EE9E5576E /* BerryKeepSyncProfilesView.swift */,
 			);
 			name = BerryKeepIosApp;
 			path = Sources/BerryKeepIosApp;
 			sourceTree = "<group>";
 		};
-		F8D391B477B8A6461C30F665 /* Packages */ = {
+		9CB96558702B12988E984434 /* AppleAppSupport */ = {
 			isa = PBXGroup;
 			children = (
-				244B38CABFC537484ED1F06D /* apple-file-provider */,
+				4C2AB4A7AE33D51D5A414303 /* BerryKeepBrowserModel.swift */,
+				3C553A5831CE078BDFC3B0AD /* BerryKeepGalleryModel.swift */,
+			);
+			name = AppleAppSupport;
+			path = Sources/AppleAppSupport;
+			sourceTree = "<group>";
+		};
+		9D17097A86421F4522DE4677 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				707E498A92234FFBF773D439 /* apple-file-provider */,
 			);
 			name = Packages;
+			sourceTree = "<group>";
+		};
+		AE0A5EE83AA799D493EC3D7B /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				4DEDCE7ABF72419199CE7C1F /* Assets.xcassets */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		B96A461120E697592A4A2C78 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				98F3AD505EBC90F99011EC93 /* BerryKeepAppleProjectTests.xctest */,
+				BB03426E98549FD81FDBA320 /* BerryKeepIosApp.app */,
+				2F3DBDCCD1D79F343B997A8D /* BerryKeepIosFileProviderExtension.appex */,
+				B7BB74CCCCA4ED086C5B4B46 /* BerryKeepIosProjectTests.xctest */,
+				F8E29CAE1E51E0067C6A075B /* BerryKeepIosUiTests.xctest */,
+				DFB2E81C3D7889F90B0AF6BE /* BerryKeepMacApp.app */,
+				70D68459F820929FB0AFE03C /* BerryKeepMacFileProviderExtension.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D8191ADD38FC9723CF09540A = {
+			isa = PBXGroup;
+			children = (
+				9CB96558702B12988E984434 /* AppleAppSupport */,
+				1CDE9E5CE8BD222B4755A2FD /* AppleFileProviderRuntime */,
+				E41FE1C7216419642BE09C29 /* AppleNativeBridge */,
+				1F7FEDBDD35B221CDEA4534A /* BerryKeepAppleProjectTests */,
+				97D571525FE273F52E100296 /* BerryKeepIosApp */,
+				EF7C2B02102399FCAABA42A9 /* BerryKeepIosFileProviderExtension */,
+				E79232A3362B40F84FCBA97C /* BerryKeepIosProjectTests */,
+				794252B89CEBF27838DCA190 /* BerryKeepIosUiTests */,
+				59B332F7565531BF0E32DB6A /* BerryKeepMacApp */,
+				DC9511785D3EB69B7E5DBF52 /* BerryKeepMacFileProviderExtension */,
+				9D17097A86421F4522DE4677 /* Packages */,
+				AE0A5EE83AA799D493EC3D7B /* Resources */,
+				09A291299785F7269DE23B2D /* Frameworks */,
+				B96A461120E697592A4A2C78 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		DC9511785D3EB69B7E5DBF52 /* BerryKeepMacFileProviderExtension */ = {
+			isa = PBXGroup;
+			children = (
+				E069664567BF59CF4CF3A7E9 /* BerryKeepMacFileProviderExtension.swift */,
+			);
+			name = BerryKeepMacFileProviderExtension;
+			path = Sources/BerryKeepMacFileProviderExtension;
+			sourceTree = "<group>";
+		};
+		E41FE1C7216419642BE09C29 /* AppleNativeBridge */ = {
+			isa = PBXGroup;
+			children = (
+				C8FAE3F90A71DC6D6380AEA6 /* BerryKeepAppleFFI-Bridging-Header.h */,
+				9D6B6EE3A5F5CCF1195AC89F /* BerryKeepRustFFIAdapter.swift */,
+			);
+			name = AppleNativeBridge;
+			path = Sources/AppleNativeBridge;
+			sourceTree = "<group>";
+		};
+		E79232A3362B40F84FCBA97C /* BerryKeepIosProjectTests */ = {
+			isa = PBXGroup;
+			children = (
+				677A344F92CC82EB37F17D5F /* BerryKeepIosProjectTests.swift */,
+			);
+			name = BerryKeepIosProjectTests;
+			path = Tests/BerryKeepIosProjectTests;
+			sourceTree = "<group>";
+		};
+		EF7C2B02102399FCAABA42A9 /* BerryKeepIosFileProviderExtension */ = {
+			isa = PBXGroup;
+			children = (
+				644FDACB1048B7CE6A6020BC /* BerryKeepIosFileProviderExtension.swift */,
+			);
+			name = BerryKeepIosFileProviderExtension;
+			path = Sources/BerryKeepIosFileProviderExtension;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		0DA04F6B3DEE0D8908F46746 /* BerryKeepIosProjectTests */ = {
+		999419FD42D2CE645814A9E7 /* BerryKeepMacApp */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 104BE8BA6F2038EAC9F3037F /* Build configuration list for PBXNativeTarget "BerryKeepIosProjectTests" */;
+			buildConfigurationList = B83B58D7FF68150BE4970B13 /* Build configuration list for PBXNativeTarget "BerryKeepMacApp" */;
 			buildPhases = (
-				88E4E98C627F204DF5016D8E /* Sources */,
-				D21BAECC9077B6D63A420174 /* Frameworks */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = BerryKeepIosProjectTests;
-			packageProductDependencies = (
-				036A193B5DAC68469095CE5A /* AppleCore */,
-				D3D93B20FE0A9294021D714C /* AppleFileProviderShared */,
-			);
-			productName = BerryKeepIosProjectTests;
-			productReference = 7DA129FD959C0FD0D040070D /* BerryKeepIosProjectTests.xctest */;
-			productType = "com.apple.product-type.bundle.unit-test";
-		};
-		219D58F25590BF1A3D18330F /* BerryKeepMacFileProviderExtension */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 2F5A3721F5889FCF397CF835 /* Build configuration list for PBXNativeTarget "BerryKeepMacFileProviderExtension" */;
-			buildPhases = (
-				EC79C2E7483EF8856A36F1EB /* Build Rust Apple FFI */,
-				AA61513144DD263788D143B8 /* Sources */,
-				2E91FA967882205DEA6909D7 /* Frameworks */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = BerryKeepMacFileProviderExtension;
-			packageProductDependencies = (
-				5EB1E57AE3FC7EA54C1477E3 /* AppleCore */,
-				648AE487A41AA72E53A73C09 /* AppleFileProviderShared */,
-			);
-			productName = BerryKeepMacFileProviderExtension;
-			productReference = 8F5701975DDED656D7A9B6A6 /* BerryKeepMacFileProviderExtension.appex */;
-			productType = "com.apple.product-type.app-extension";
-		};
-		4ED9573DAC30D96830CFD46E /* BerryKeepMacApp */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 8C92952F62EC44217705EF5E /* Build configuration list for PBXNativeTarget "BerryKeepMacApp" */;
-			buildPhases = (
-				B5E350D7E026B35BE5272036 /* Build Rust Apple FFI */,
-				7EE56167233D3A90E1359388 /* Sources */,
-				F718AB135756C1436B5312C0 /* Frameworks */,
+				5EDB7655F64941D64BFDA199 /* Build Rust Apple FFI */,
+				541C46AAA03FCB204E82F91E /* Sources */,
+				9ECF351801F8E151C97BE693 /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -502,41 +472,124 @@
 			);
 			name = BerryKeepMacApp;
 			packageProductDependencies = (
-				610C745899D565B8093E9493 /* AppleCore */,
-				27724ACE6FAA8F9BBB92D194 /* AppleFileProviderShared */,
+				F9822A4F53C3FF1144447B3B /* AppleCore */,
+				FA6F3613D78C7C10F97866B2 /* AppleFileProviderShared */,
 			);
 			productName = BerryKeepMacApp;
-			productReference = 987EDC104DA47B5CF20BED0D /* BerryKeepMacApp.app */;
+			productReference = DFB2E81C3D7889F90B0AF6BE /* BerryKeepMacApp.app */;
 			productType = "com.apple.product-type.application";
 		};
-		A2F481122FD00FA65540A1A5 /* BerryKeepAppleProjectTests */ = {
+		9F6B8FF8A36142B358BAA625 /* BerryKeepIosUiTests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 0D6926F0D9DE65A8CCA52573 /* Build configuration list for PBXNativeTarget "BerryKeepAppleProjectTests" */;
+			buildConfigurationList = 51EE81260D9CBEDD352492B3 /* Build configuration list for PBXNativeTarget "BerryKeepIosUiTests" */;
 			buildPhases = (
-				3E9CABBEFCAC86288E39F139 /* Sources */,
-				38A2DEC89126509F9AB22490 /* Frameworks */,
+				92D3674CEBA6D9D6236DA954 /* Sources */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				0405CBEACC0E9D8AE47967BB /* PBXTargetDependency */,
+				070486C4E3FE065F5C27B933 /* PBXTargetDependency */,
+			);
+			name = BerryKeepIosUiTests;
+			packageProductDependencies = (
+			);
+			productName = BerryKeepIosUiTests;
+			productReference = F8E29CAE1E51E0067C6A075B /* BerryKeepIosUiTests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		D218D094DC9C3B4C0FB04D32 /* BerryKeepAppleProjectTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D909E50636C6BA5B63EA4A34 /* Build configuration list for PBXNativeTarget "BerryKeepAppleProjectTests" */;
+			buildPhases = (
+				B99E1235259414DD3DDAE245 /* Sources */,
+				5FCB07F1399E7BC57F07A964 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				17D98E4E914FFD91D0BF7799 /* PBXTargetDependency */,
 			);
 			name = BerryKeepAppleProjectTests;
 			packageProductDependencies = (
-				3B0EAA0A0E8449F387555CF7 /* AppleCore */,
-				4CADBC90D590EDBD274936BB /* AppleFileProviderShared */,
+				2010814B7D693E31E884D41C /* AppleCore */,
+				0D57367EA24E9DFAA4059FFC /* AppleFileProviderShared */,
 			);
 			productName = BerryKeepAppleProjectTests;
-			productReference = 69448FBEB222C861B5CA9C1C /* BerryKeepAppleProjectTests.xctest */;
+			productReference = 98F3AD505EBC90F99011EC93 /* BerryKeepAppleProjectTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
-		AFBE96E8276416130D63E761 /* BerryKeepIosFileProviderExtension */ = {
+		D3C742AA3A351EDAF74BD123 /* BerryKeepMacFileProviderExtension */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 6613AEA48C03748C70AA88AD /* Build configuration list for PBXNativeTarget "BerryKeepIosFileProviderExtension" */;
+			buildConfigurationList = F1EE6D58756791476758BBE7 /* Build configuration list for PBXNativeTarget "BerryKeepMacFileProviderExtension" */;
 			buildPhases = (
-				5A8944670DD4793912F77413 /* Build Rust Apple FFI */,
-				06547582563CE0CD0F005C21 /* Sources */,
-				7295ADD219FD27199FF6A11B /* Frameworks */,
+				D2A825A268586B882AA88023 /* Build Rust Apple FFI */,
+				35FD62B81E2872AA82123AF3 /* Sources */,
+				97F29CF6C73FDD0F03AAA2EF /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = BerryKeepMacFileProviderExtension;
+			packageProductDependencies = (
+				395043293A38C1EB016A7CEF /* AppleCore */,
+				386BB45529D0789D5ADC3EC3 /* AppleFileProviderShared */,
+			);
+			productName = BerryKeepMacFileProviderExtension;
+			productReference = 70D68459F820929FB0AFE03C /* BerryKeepMacFileProviderExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		E394CFCFD73FB85C45134137 /* BerryKeepIosApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 13C73B3DBAC8482BEA95E931 /* Build configuration list for PBXNativeTarget "BerryKeepIosApp" */;
+			buildPhases = (
+				CEC7E49155533FB4132F4EBE /* Build Rust Apple FFI */,
+				66521331BB5A82113B05352B /* Sources */,
+				B813FF68593FF3859A9BB37D /* Resources */,
+				4677C08DF9F36FD445819205 /* Frameworks */,
+				F923B75F1C599B63A7EC2E21 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				AD2146084725129E94EC1FEB /* PBXTargetDependency */,
+			);
+			name = BerryKeepIosApp;
+			packageProductDependencies = (
+				450C01B5C5772DB7E00294A4 /* AppleCore */,
+				2C497C5557DE25C830BC5A5C /* AppleFileProviderShared */,
+			);
+			productName = BerryKeepIosApp;
+			productReference = BB03426E98549FD81FDBA320 /* BerryKeepIosApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+		E9091DE3923F6381CE8F7A88 /* BerryKeepIosProjectTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A2DC4295D8D603519109939B /* Build configuration list for PBXNativeTarget "BerryKeepIosProjectTests" */;
+			buildPhases = (
+				1EB81C38A209B40074424B91 /* Sources */,
+				23A1DAA6DA4F3D7606CF4585 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = BerryKeepIosProjectTests;
+			packageProductDependencies = (
+				B86DC11C8C0D191307877C31 /* AppleCore */,
+				D09AEE6B35C5DCF1F7CD73CE /* AppleFileProviderShared */,
+			);
+			productName = BerryKeepIosProjectTests;
+			productReference = B7BB74CCCCA4ED086C5B4B46 /* BerryKeepIosProjectTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		FD2BB2043514F427D5CE0011 /* BerryKeepIosFileProviderExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F34C120B9667078ADE05A629 /* Build configuration list for PBXNativeTarget "BerryKeepIosFileProviderExtension" */;
+			buildPhases = (
+				E4FF97328A8A152329804FC6 /* Build Rust Apple FFI */,
+				6417CFED377B53AC531E006F /* Sources */,
+				73E5268A0B609C58149AA32C /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -544,124 +597,94 @@
 			);
 			name = BerryKeepIosFileProviderExtension;
 			packageProductDependencies = (
-				D4758290C2F46CB307E07F32 /* AppleCore */,
-				87FF1F26324D7E04DF57D36E /* AppleFileProviderShared */,
+				7D866EEC554740B76A20621D /* AppleCore */,
+				CF6349C254794ECA277F2753 /* AppleFileProviderShared */,
 			);
 			productName = BerryKeepIosFileProviderExtension;
-			productReference = D65743C5EC88BC86B9CCD14F /* BerryKeepIosFileProviderExtension.appex */;
+			productReference = 2F3DBDCCD1D79F343B997A8D /* BerryKeepIosFileProviderExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
-		};
-		E6B8629705EA69D7FB1A0F29 /* BerryKeepIosUiTests */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 4B65554E4B611E67F68E3816 /* Build configuration list for PBXNativeTarget "BerryKeepIosUiTests" */;
-			buildPhases = (
-				7338B548DBBF754DD90F766C /* Sources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				861FDAF6FB7AB048AB3F7B1D /* PBXTargetDependency */,
-			);
-			name = BerryKeepIosUiTests;
-			packageProductDependencies = (
-			);
-			productName = BerryKeepIosUiTests;
-			productReference = 36169EE3DEFD4EF8BA28C60A /* BerryKeepIosUiTests.xctest */;
-			productType = "com.apple.product-type.bundle.ui-testing";
-		};
-		FC2702FC78F437CFD22D714F /* BerryKeepIosApp */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 64FCC4EEC5FE5632A56E5538 /* Build configuration list for PBXNativeTarget "BerryKeepIosApp" */;
-			buildPhases = (
-				07FC14D06BCBF8B7FAA879FB /* Build Rust Apple FFI */,
-				898EAFC7D0721A0B953C3839 /* Sources */,
-				BADE7AED9873561B8E167D86 /* Frameworks */,
-				3C7C3D1097ACBAD4AABDEAC2 /* Embed Foundation Extensions */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				174603968AB67FEBF8121F2F /* PBXTargetDependency */,
-			);
-			name = BerryKeepIosApp;
-			packageProductDependencies = (
-				4FCEFD47F4EBD2FDE8D48497 /* AppleCore */,
-				F0BA5FE65065A174670816F1 /* AppleFileProviderShared */,
-			);
-			productName = BerryKeepIosApp;
-			productReference = B88EA20710228EA5788F3224 /* BerryKeepIosApp.app */;
-			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		EF0C3BABBB66E445EE36D4B9 /* Project object */ = {
+		62982080750046339AC92D17 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
-					0DA04F6B3DEE0D8908F46746 = {
+					999419FD42D2CE645814A9E7 = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
-					219D58F25590BF1A3D18330F = {
+					9F6B8FF8A36142B358BAA625 = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
+						TestTargetID = E394CFCFD73FB85C45134137;
 					};
-					4ED9573DAC30D96830CFD46E = {
-						DevelopmentTeam = "";
-						ProvisioningStyle = Automatic;
-					};
-					A2F481122FD00FA65540A1A5 = {
+					D218D094DC9C3B4C0FB04D32 = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Manual;
 					};
-					AFBE96E8276416130D63E761 = {
+					D3C742AA3A351EDAF74BD123 = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
-					E6B8629705EA69D7FB1A0F29 = {
+					E394CFCFD73FB85C45134137 = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
-						TestTargetID = FC2702FC78F437CFD22D714F;
 					};
-					FC2702FC78F437CFD22D714F = {
+					E9091DE3923F6381CE8F7A88 = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+					FD2BB2043514F427D5CE0011 = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 				};
 			};
-			buildConfigurationList = 76727E7C888A54996E335170 /* Build configuration list for PBXProject "BerryKeepAppleFileProvider" */;
+			buildConfigurationList = 2014F2FC1258450DA4E724B5 /* Build configuration list for PBXProject "BerryKeepAppleFileProvider" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
 				Base,
 				en,
 			);
-			mainGroup = A0AFBB5EB4B353003D20B835;
+			mainGroup = D8191ADD38FC9723CF09540A;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				37157AA1007E5B83DF70C1B5 /* XCLocalSwiftPackageReference "." */,
+				E8D67C17F670891E13FB119A /* XCLocalSwiftPackageReference "." */,
 			);
 			preferredProjectObjectVersion = 77;
-			productRefGroup = 3B8720FF51AAA0345F62D3FB /* Products */;
+			productRefGroup = B96A461120E697592A4A2C78 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				A2F481122FD00FA65540A1A5 /* BerryKeepAppleProjectTests */,
-				FC2702FC78F437CFD22D714F /* BerryKeepIosApp */,
-				AFBE96E8276416130D63E761 /* BerryKeepIosFileProviderExtension */,
-				0DA04F6B3DEE0D8908F46746 /* BerryKeepIosProjectTests */,
-				E6B8629705EA69D7FB1A0F29 /* BerryKeepIosUiTests */,
-				4ED9573DAC30D96830CFD46E /* BerryKeepMacApp */,
-				219D58F25590BF1A3D18330F /* BerryKeepMacFileProviderExtension */,
+				D218D094DC9C3B4C0FB04D32 /* BerryKeepAppleProjectTests */,
+				E394CFCFD73FB85C45134137 /* BerryKeepIosApp */,
+				FD2BB2043514F427D5CE0011 /* BerryKeepIosFileProviderExtension */,
+				E9091DE3923F6381CE8F7A88 /* BerryKeepIosProjectTests */,
+				9F6B8FF8A36142B358BAA625 /* BerryKeepIosUiTests */,
+				999419FD42D2CE645814A9E7 /* BerryKeepMacApp */,
+				D3C742AA3A351EDAF74BD123 /* BerryKeepMacFileProviderExtension */,
 			);
 		};
 /* End PBXProject section */
 
+/* Begin PBXResourcesBuildPhase section */
+		B813FF68593FF3859A9BB37D /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A7F1EDCFF8AB50B0E2CFC16B /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXShellScriptBuildPhase section */
-		07FC14D06BCBF8B7FAA879FB /* Build Rust Apple FFI */ = {
+		5EDB7655F64941D64BFDA199 /* Build Rust Apple FFI */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -680,7 +703,7 @@
 			shellPath = /bin/sh;
 			shellScript = "\"$PROJECT_DIR/scripts/build-rust-apple-ffi.sh\" \"$PLATFORM_NAME\" \"$CONFIGURATION\"\n";
 		};
-		5A8944670DD4793912F77413 /* Build Rust Apple FFI */ = {
+		CEC7E49155533FB4132F4EBE /* Build Rust Apple FFI */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -699,7 +722,7 @@
 			shellPath = /bin/sh;
 			shellScript = "\"$PROJECT_DIR/scripts/build-rust-apple-ffi.sh\" \"$PLATFORM_NAME\" \"$CONFIGURATION\"\n";
 		};
-		B5E350D7E026B35BE5272036 /* Build Rust Apple FFI */ = {
+		D2A825A268586B882AA88023 /* Build Rust Apple FFI */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -718,7 +741,7 @@
 			shellPath = /bin/sh;
 			shellScript = "\"$PROJECT_DIR/scripts/build-rust-apple-ffi.sh\" \"$PLATFORM_NAME\" \"$CONFIGURATION\"\n";
 		};
-		EC79C2E7483EF8856A36F1EB /* Build Rust Apple FFI */ = {
+		E4FF97328A8A152329804FC6 /* Build Rust Apple FFI */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -740,164 +763,234 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		06547582563CE0CD0F005C21 /* Sources */ = {
+		1EB81C38A209B40074424B91 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				B505F1987180B3B81BAFD838 /* BerryKeepFileProviderConflictService.swift in Sources */,
-				033FA480DF4A80E6F24261D9 /* BerryKeepFileProviderConnectionService.swift in Sources */,
-				CF3099C80F9D88009AC75FF0 /* BerryKeepFileProviderEnumerator.swift in Sources */,
-				A78C067EB050352B1D6E68C4 /* BerryKeepFileProviderExtensionHost.swift in Sources */,
-				A62E2A94F79F4C586D00C090 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */,
-				6960DA8C2DA00DDF7ED65525 /* BerryKeepFileProviderExtensionReadHost.swift in Sources */,
-				0E5FE19377CD8FDF125AAE42 /* BerryKeepFileProviderItem.swift in Sources */,
-				71CC3C788521C55110FEC7F2 /* BerryKeepFileProviderLookupService.swift in Sources */,
-				764107B1DD7C2FF34E56FE6C /* BerryKeepFileProviderMutationService.swift in Sources */,
-				27A5FFB82850B7BD3A74B1FA /* BerryKeepFileProviderReadService.swift in Sources */,
-				98957DAEF45FB9170691016A /* BerryKeepFileProviderRuntime.swift in Sources */,
-				3CE9B7BE02A592262B6F2A81 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */,
-				50D1573E018F1F112D40ED86 /* BerryKeepFileProviderService.swift in Sources */,
-				CCEA254D25DFFA0674CEB1B8 /* BerryKeepFileProviderSyncRuntime.swift in Sources */,
-				1A8E87AEBF648C0E949F24EE /* BerryKeepIdentifierPathCache.swift in Sources */,
-				CBE7EAED3C09B6F2403AFD28 /* BerryKeepIosFileProviderExtension.swift in Sources */,
-				5325406375A4DA8E66293157 /* BerryKeepRustFFIAdapter.swift in Sources */,
-				AB76E22ACD480D5D494CCBF5 /* BerryKeepSyncAnchorCodec.swift in Sources */,
-				70A038B8E6E1917924173FD8 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */,
+				3B95318F32D6F1F68B6ACA8A /* BerryKeepIosProjectTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		3E9CABBEFCAC86288E39F139 /* Sources */ = {
+		35FD62B81E2872AA82123AF3 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				3ECD32BAAD7E1074A209E6A9 /* BerryKeepAppleProjectTests.swift in Sources */,
+				DF225513FBF285079A3BCD0A /* BerryKeepFileProviderConflictService.swift in Sources */,
+				5ECC99D1057FFC7AC23005DD /* BerryKeepFileProviderConnectionService.swift in Sources */,
+				E4295FE075A6310BAE599C1E /* BerryKeepFileProviderEnumerator.swift in Sources */,
+				6BE4ED3542A7A19DAAA42C94 /* BerryKeepFileProviderExtensionHost.swift in Sources */,
+				AD9192DBC912C99F915EC275 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */,
+				CF965E78DAFB1B9E6AC44C5F /* BerryKeepFileProviderExtensionReadHost.swift in Sources */,
+				E191EFBA3028FE5874A01C1A /* BerryKeepFileProviderItem.swift in Sources */,
+				7E6D4833C2DBBDB5F41A8BF0 /* BerryKeepFileProviderLookupService.swift in Sources */,
+				AFC8CE610E81BBD3D08290A5 /* BerryKeepFileProviderMutationService.swift in Sources */,
+				B2051AA04FA6D31359DE8931 /* BerryKeepFileProviderReadService.swift in Sources */,
+				8CF46EE2D2E83447A06A0E3D /* BerryKeepFileProviderRuntime.swift in Sources */,
+				EA5951D1349CA1F6F507FBDD /* BerryKeepFileProviderRuntimeSupport.swift in Sources */,
+				7EE0A8D5293A47F0596AC2A4 /* BerryKeepFileProviderService.swift in Sources */,
+				7A77A669D93DA5F467D101B9 /* BerryKeepFileProviderSyncRuntime.swift in Sources */,
+				7280D9C9E707FA94AD4FDD0E /* BerryKeepIdentifierPathCache.swift in Sources */,
+				1EB67395F99CA3135D076C6F /* BerryKeepMacFileProviderExtension.swift in Sources */,
+				15D50C950F7BBC86A45F8E9D /* BerryKeepRustFFIAdapter.swift in Sources */,
+				B8571168A13F0406E3DA7282 /* BerryKeepSyncAnchorCodec.swift in Sources */,
+				03FD39C57601D0BCBD763146 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		7338B548DBBF754DD90F766C /* Sources */ = {
+		541C46AAA03FCB204E82F91E /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				87CAC7CC0E802222F7DBB812 /* GalleryMapFullscreenUiTests.swift in Sources */,
+				96F601E259CF7DAB376F0591 /* BerryKeepBrowserModel.swift in Sources */,
+				63190B545F8D4B7148C02970 /* BerryKeepFileProviderConflictService.swift in Sources */,
+				EF9C343C50EFDB525EAD79C7 /* BerryKeepFileProviderConnectionService.swift in Sources */,
+				AD0E7FBAA88D1C8F87D4AD45 /* BerryKeepFileProviderEnumerator.swift in Sources */,
+				326B94EC7482C8DB97FB2389 /* BerryKeepFileProviderExtensionHost.swift in Sources */,
+				6DCF3D4954274D8AA1A17F3D /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */,
+				B17DA4BBEFDC14C7FA41DCA2 /* BerryKeepFileProviderExtensionReadHost.swift in Sources */,
+				D93A97EB0816986F5574B6F8 /* BerryKeepFileProviderItem.swift in Sources */,
+				76825B000C5911E6D7AC9CDE /* BerryKeepFileProviderLookupService.swift in Sources */,
+				B0A68B10A0D900F326541F67 /* BerryKeepFileProviderMutationService.swift in Sources */,
+				0BE4EE1DEC597825BBA5B97C /* BerryKeepFileProviderReadService.swift in Sources */,
+				AC213516A1639FC38E6FB0FF /* BerryKeepFileProviderRuntime.swift in Sources */,
+				8D981D498F95EE821C6C1EC8 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */,
+				E9D5A2F65F8B041CEC85B8E3 /* BerryKeepFileProviderService.swift in Sources */,
+				D6178695FFB9EBD8E636A36F /* BerryKeepFileProviderSyncRuntime.swift in Sources */,
+				D2DDAD627C57B96F1CCBB672 /* BerryKeepGalleryModel.swift in Sources */,
+				F539E2A1C543111C7ACD2625 /* BerryKeepIdentifierPathCache.swift in Sources */,
+				C503F6863E5B98B084298500 /* BerryKeepMacApp.swift in Sources */,
+				08A2042ADBBF753049A0DC84 /* BerryKeepRustFFIAdapter.swift in Sources */,
+				81EDC4AB7BFED112C42257DE /* BerryKeepSyncAnchorCodec.swift in Sources */,
+				CC8650727D5EB012BF277B8C /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		7EE56167233D3A90E1359388 /* Sources */ = {
+		6417CFED377B53AC531E006F /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				5392619423EF7380FFA0BA73 /* BerryKeepBrowserModel.swift in Sources */,
-				AA84793D4F184A7BEA919B8D /* BerryKeepFileProviderConflictService.swift in Sources */,
-				11B6ED71556A64B00280AC5E /* BerryKeepFileProviderConnectionService.swift in Sources */,
-				2E47B7E3A1EC24B17639E56D /* BerryKeepFileProviderEnumerator.swift in Sources */,
-				21E9C2712F293E5C249D8C3E /* BerryKeepFileProviderExtensionHost.swift in Sources */,
-				D0C54EB6D904FBDA7DE798EF /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */,
-				BC573F3331A869B6230804E1 /* BerryKeepFileProviderExtensionReadHost.swift in Sources */,
-				73AB93ED2F8EDD1659E92CB7 /* BerryKeepFileProviderItem.swift in Sources */,
-				442364943CDE6754986E4951 /* BerryKeepFileProviderLookupService.swift in Sources */,
-				1EDB771D9C09AB528C3E97A7 /* BerryKeepFileProviderMutationService.swift in Sources */,
-				4197B1B83913504F532D511F /* BerryKeepFileProviderReadService.swift in Sources */,
-				F02D4D63B27E99F45F6B05C9 /* BerryKeepFileProviderRuntime.swift in Sources */,
-				51BAF01273A3A345A54851B0 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */,
-				5F9F92673599603F7B4FA94E /* BerryKeepFileProviderService.swift in Sources */,
-				84B5410C166A55EF1D7143FB /* BerryKeepFileProviderSyncRuntime.swift in Sources */,
-				4C9B2B93D3EF1DDA5309B64C /* BerryKeepGalleryModel.swift in Sources */,
-				65453585D6DB3706C758A37C /* BerryKeepIdentifierPathCache.swift in Sources */,
-				082E983DBE4DD0A288B7E0B2 /* BerryKeepMacApp.swift in Sources */,
-				F13F3F0DA872B57AFD30EE67 /* BerryKeepRustFFIAdapter.swift in Sources */,
-				1E2E69BD1A65E53A91CB1EFE /* BerryKeepSyncAnchorCodec.swift in Sources */,
-				B4ACE0699544E9E161E93BF7 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */,
+				69B55898164B031D9A51BEB5 /* BerryKeepFileProviderConflictService.swift in Sources */,
+				A7C635F19F1FD565EF678DBD /* BerryKeepFileProviderConnectionService.swift in Sources */,
+				033BF9AF02BB863FBB3D6FFC /* BerryKeepFileProviderEnumerator.swift in Sources */,
+				F92E83C83E6D3AA63D1529A7 /* BerryKeepFileProviderExtensionHost.swift in Sources */,
+				62AB2A19B4B771A11364E3F0 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */,
+				3FF03BE13DF55AEDD55B4EDF /* BerryKeepFileProviderExtensionReadHost.swift in Sources */,
+				43212CD77971354FC9A3B539 /* BerryKeepFileProviderItem.swift in Sources */,
+				DEEEBAC67E3B215236E0987E /* BerryKeepFileProviderLookupService.swift in Sources */,
+				3716C094047BE4E643DCACE6 /* BerryKeepFileProviderMutationService.swift in Sources */,
+				78450F5BCC90E1577ED3EF13 /* BerryKeepFileProviderReadService.swift in Sources */,
+				E9A62FC3D47A71CE54390B4F /* BerryKeepFileProviderRuntime.swift in Sources */,
+				A1991CEFF852F55C9D9735E8 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */,
+				69039271CAFDA2BCFB47FEEA /* BerryKeepFileProviderService.swift in Sources */,
+				38C7E27F79EAB66DF88DFBDC /* BerryKeepFileProviderSyncRuntime.swift in Sources */,
+				8AFE6B4B994A23265AD98B1D /* BerryKeepIdentifierPathCache.swift in Sources */,
+				08AF571A3EA3E0A86BC07498 /* BerryKeepIosFileProviderExtension.swift in Sources */,
+				6048A016602D2A68B45EBAB3 /* BerryKeepRustFFIAdapter.swift in Sources */,
+				6601F1C27BDD4489150D4F47 /* BerryKeepSyncAnchorCodec.swift in Sources */,
+				14928D158DC01B9F23E8D5A4 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		88E4E98C627F204DF5016D8E /* Sources */ = {
+		66521331BB5A82113B05352B /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				09176176A1A35D7D95E20B12 /* BerryKeepIosProjectTests.swift in Sources */,
+				D1477572C3CAE024CDC9236D /* BerryKeepBootstrapScannerSheet.swift in Sources */,
+				21379AEBFF344BCF47A1278D /* BerryKeepBrowserModel.swift in Sources */,
+				240B85A702D9AC9A80ECAB0D /* BerryKeepFileProviderConflictService.swift in Sources */,
+				40371F220E6E68ECEB3220EE /* BerryKeepFileProviderConnectionService.swift in Sources */,
+				B5E87019065BEF1922F70473 /* BerryKeepFileProviderEnumerator.swift in Sources */,
+				259FA820CD5245C37B334AA7 /* BerryKeepFileProviderExtensionHost.swift in Sources */,
+				19752C86E3F9DCE5A039049C /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */,
+				B85D761F62E288D77489C517 /* BerryKeepFileProviderExtensionReadHost.swift in Sources */,
+				3EA4E02DCEBB21F9259A0EF4 /* BerryKeepFileProviderItem.swift in Sources */,
+				6D065415344A5B18740AD1F1 /* BerryKeepFileProviderLookupService.swift in Sources */,
+				2FDECE4E768BA6E24F91436F /* BerryKeepFileProviderMutationService.swift in Sources */,
+				79749C9C9CB6937B9CC33962 /* BerryKeepFileProviderReadService.swift in Sources */,
+				7A070C58E9BB76442884E61E /* BerryKeepFileProviderRuntime.swift in Sources */,
+				DA632CA21E6C4828E4E2F08F /* BerryKeepFileProviderRuntimeSupport.swift in Sources */,
+				864729EBFEFB9DCE26950B75 /* BerryKeepFileProviderService.swift in Sources */,
+				0F03F1491D9C868D762AFB83 /* BerryKeepFileProviderSyncRuntime.swift in Sources */,
+				7C843EA3472DE9BF9737DBE5 /* BerryKeepGalleryModel.swift in Sources */,
+				A32F43097A255BD5ECAC6269 /* BerryKeepGalleryView.swift in Sources */,
+				94584B75FA1C5F0743E5E11E /* BerryKeepIdentifierPathCache.swift in Sources */,
+				CA4DE054981304828E31F7E7 /* BerryKeepIosApp.swift in Sources */,
+				BC984DC1B3564BB9208CBBD3 /* BerryKeepOriginalShareCoordinator.swift in Sources */,
+				90431D6A7933187378F159A4 /* BerryKeepRustFFIAdapter.swift in Sources */,
+				A4487D3E44C7FD1D2913B0CC /* BerryKeepSyncAnchorCodec.swift in Sources */,
+				D0F2D2D887CFB54F5D12F0DA /* BerryKeepSyncProfilesView.swift in Sources */,
+				F05D99D24C147FEB23C6FB06 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		898EAFC7D0721A0B953C3839 /* Sources */ = {
+		92D3674CEBA6D9D6236DA954 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				EA5CEAEDBC7AE459CDEF1C8B /* BerryKeepBootstrapScannerSheet.swift in Sources */,
-				5B1FCE6BC32843D4F5EFBBFF /* BerryKeepBrowserModel.swift in Sources */,
-				3812238F70057C449AA7B2B0 /* BerryKeepFileProviderConflictService.swift in Sources */,
-				0F18AADE91E7CAB785BCB7F5 /* BerryKeepFileProviderConnectionService.swift in Sources */,
-				3652E85986B596D16D33CB7D /* BerryKeepFileProviderEnumerator.swift in Sources */,
-				6BFE22DE8E310C164FEB9842 /* BerryKeepFileProviderExtensionHost.swift in Sources */,
-				9B961AE315786144FC48A2A1 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */,
-				9AD8E45837318E90D1A18CAE /* BerryKeepFileProviderExtensionReadHost.swift in Sources */,
-				DEF15D6D9BD692D36D445ACE /* BerryKeepFileProviderItem.swift in Sources */,
-				9782220FB3499AA0A882D4BC /* BerryKeepFileProviderLookupService.swift in Sources */,
-				52B068416C957652A221862F /* BerryKeepFileProviderMutationService.swift in Sources */,
-				B4332A6B3C4FF1837B6E1B5A /* BerryKeepFileProviderReadService.swift in Sources */,
-				1F30F9EE22B86F396DAEA0DF /* BerryKeepFileProviderRuntime.swift in Sources */,
-				08E716AF213E2FB823592D58 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */,
-				C6A90019EACA58A228F56027 /* BerryKeepFileProviderService.swift in Sources */,
-				D769F254880D897FB1A0CDAA /* BerryKeepFileProviderSyncRuntime.swift in Sources */,
-				61DE2DC4A82685AF6F6554D2 /* BerryKeepGalleryModel.swift in Sources */,
-				AB81FE36B1A8884EB22E1A2C /* BerryKeepGalleryView.swift in Sources */,
-				B02D3B50AA4DD0A74EA7EF64 /* BerryKeepIdentifierPathCache.swift in Sources */,
-				6221144F7C8633273DCB8805 /* BerryKeepIosApp.swift in Sources */,
-				A0115A2B772B4AD6A7C10211 /* BerryKeepOriginalShareCoordinator.swift in Sources */,
-				E5578688033BE7CDB458989B /* BerryKeepRustFFIAdapter.swift in Sources */,
-				B3F11CA585F799C5462742AF /* BerryKeepSyncAnchorCodec.swift in Sources */,
-				A8F8240A7C3C6E6CA4DA5EA5 /* BerryKeepSyncProfilesView.swift in Sources */,
-				9E39367F085BA49D4281F19D /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */,
+				4440F5250E6812C433214556 /* GalleryMapFullscreenUiTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		AA61513144DD263788D143B8 /* Sources */ = {
+		B99E1235259414DD3DDAE245 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				67D608DE778EEB1DD66BA2CA /* BerryKeepFileProviderConflictService.swift in Sources */,
-				EE180BC0B8517727ABFA2DA3 /* BerryKeepFileProviderConnectionService.swift in Sources */,
-				F3F4A05C300CBFB60793B650 /* BerryKeepFileProviderEnumerator.swift in Sources */,
-				E2BB351D278368B67B1C40F0 /* BerryKeepFileProviderExtensionHost.swift in Sources */,
-				F9BC2F0979CF91901D8F1CA3 /* BerryKeepFileProviderExtensionMutationHost.swift in Sources */,
-				A0B22A2A394BE923D17632AD /* BerryKeepFileProviderExtensionReadHost.swift in Sources */,
-				A7DED56C1664CF0C39FA227C /* BerryKeepFileProviderItem.swift in Sources */,
-				D32E29BA694DB69090891F2B /* BerryKeepFileProviderLookupService.swift in Sources */,
-				AA8D440478B23CB57200B604 /* BerryKeepFileProviderMutationService.swift in Sources */,
-				4F22E831A0BEF874230F1044 /* BerryKeepFileProviderReadService.swift in Sources */,
-				9937DD5D5A6AEBD58A6F5689 /* BerryKeepFileProviderRuntime.swift in Sources */,
-				6C13F572A208AD915911CB47 /* BerryKeepFileProviderRuntimeSupport.swift in Sources */,
-				435D0CA69066D5924C792779 /* BerryKeepFileProviderService.swift in Sources */,
-				2F0BF924B0A6486D54FC974E /* BerryKeepFileProviderSyncRuntime.swift in Sources */,
-				1F12A9A2FED5E58DE11EFDDD /* BerryKeepIdentifierPathCache.swift in Sources */,
-				D802864A3D2DE7B7303E6279 /* BerryKeepMacFileProviderExtension.swift in Sources */,
-				5AA87421C5EE2962F1348EEC /* BerryKeepRustFFIAdapter.swift in Sources */,
-				70997E3B270AA2CD91D71B3F /* BerryKeepSyncAnchorCodec.swift in Sources */,
-				7C3AA36AE5D9679A105E1686 /* BerryKeepWorkingSetSignalCoordinator.swift in Sources */,
+				5401CF73F24A0609247A05B0 /* BerryKeepAppleProjectTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
-		0405CBEACC0E9D8AE47967BB /* PBXTargetDependency */ = {
+		070486C4E3FE065F5C27B933 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 4ED9573DAC30D96830CFD46E /* BerryKeepMacApp */;
-			targetProxy = 12FA89B442EAB3D62123DB56 /* PBXContainerItemProxy */;
+			target = E394CFCFD73FB85C45134137 /* BerryKeepIosApp */;
+			targetProxy = CF33AAAC83E976137D40ECE4 /* PBXContainerItemProxy */;
 		};
-		174603968AB67FEBF8121F2F /* PBXTargetDependency */ = {
+		17D98E4E914FFD91D0BF7799 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = AFBE96E8276416130D63E761 /* BerryKeepIosFileProviderExtension */;
-			targetProxy = A1D6D1ADD166BD2A8C4DBC53 /* PBXContainerItemProxy */;
+			target = 999419FD42D2CE645814A9E7 /* BerryKeepMacApp */;
+			targetProxy = 249B6C0A503557F9C434FED8 /* PBXContainerItemProxy */;
 		};
-		861FDAF6FB7AB048AB3F7B1D /* PBXTargetDependency */ = {
+		AD2146084725129E94EC1FEB /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = FC2702FC78F437CFD22D714F /* BerryKeepIosApp */;
-			targetProxy = 4E96BBC5A78D3B74CB671B20 /* PBXContainerItemProxy */;
+			target = FD2BB2043514F427D5CE0011 /* BerryKeepIosFileProviderExtension */;
+			targetProxy = 7ECA7004DB5CD858AE7E0544 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		0EB76EC6F65AD6952BA57CE7 /* Release */ = {
+		1DAFBE50B749A97831814D58 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGNING_REQUIRED = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = "Resources/Info/BerryKeepAppleProjectTests-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BerryKeepMacApp.app/Contents/MacOS/BerryKeepMacApp";
+			};
+			name = Debug;
+		};
+		1ED57B33E98DE291BC894572 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGNING_ALLOWED = NO;
+				"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES;
+				CODE_SIGNING_REQUIRED = NO;
+				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/BerryKeepIosApp-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		3039B1735FE24E1B78C0DB9F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/BerryKeepMacApp-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macapp;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+		3F9F3C15D518758BB07979C8 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -918,56 +1011,7 @@
 			};
 			name = Release;
 		};
-		1E854127D07AFEA80F9A3940 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGNING_ALLOWED = NO;
-				"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES;
-				CODE_SIGNING_REQUIRED = NO;
-				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
-				CODE_SIGN_IDENTITY = "iPhone Developer";
-				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
-				INFOPLIST_FILE = "Resources/Info/BerryKeepIosApp-Info.plist";
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-				);
-				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
-				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp;
-				SDKROOT = iphoneos;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Release;
-		};
-		27B5FC704E87C709C5CA9E2D /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGNING_ALLOWED = YES;
-				CODE_SIGNING_REQUIRED = YES;
-				CODE_SIGN_IDENTITY = "-";
-				CODE_SIGN_STYLE = Manual;
-				COMBINE_HIDPI_IMAGES = YES;
-				INFOPLIST_FILE = "Resources/Info/BerryKeepAppleProjectTests-Info.plist";
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-					"@loader_path/../Frameworks",
-				);
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.tests;
-				SDKROOT = macosx;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BerryKeepMacApp.app/Contents/MacOS/BerryKeepMacApp";
-			};
-			name = Release;
-		};
-		2A4879C194362ADC7F9E4A05 /* Debug */ = {
+		42E75BCBCBACFE274BDB2DE2 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
@@ -984,73 +1028,7 @@
 			};
 			name = Debug;
 		};
-		3D008F29D5D93CCA2528E436 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGNING_ALLOWED = NO;
-				"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES;
-				CODE_SIGNING_REQUIRED = NO;
-				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
-				CODE_SIGN_IDENTITY = "iPhone Developer";
-				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
-				INFOPLIST_FILE = "Resources/Info/BerryKeepIosApp-Info.plist";
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-				);
-				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
-				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp;
-				SDKROOT = iphoneos;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Debug;
-		};
-		3D5F59DE85E1A0FA2586207B /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGNING_ALLOWED = YES;
-				CODE_SIGNING_REQUIRED = YES;
-				CODE_SIGN_IDENTITY = "-";
-				CODE_SIGN_STYLE = Manual;
-				COMBINE_HIDPI_IMAGES = YES;
-				INFOPLIST_FILE = "Resources/Info/BerryKeepAppleProjectTests-Info.plist";
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-					"@loader_path/../Frameworks",
-				);
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.tests;
-				SDKROOT = macosx;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BerryKeepMacApp.app/Contents/MacOS/BerryKeepMacApp";
-			};
-			name = Debug;
-		};
-		3EB4E0AAF1593B80A71C0B94 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@loader_path/Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.ios.uitests;
-				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = BerryKeepIosApp;
-			};
-			name = Release;
-		};
-		3F89A94689BD39F40D176FAD /* Release */ = {
+		489D3255315E46C8BB960324 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -1111,7 +1089,120 @@
 			};
 			name = Release;
 		};
-		42E7C2F9C9F584AB7AF5D179 /* Debug */ = {
+		5697764302F62C9694E6643C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = NO;
+				"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES;
+				CODE_SIGNING_REQUIRED = NO;
+				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/BerryKeepIosFileProviderExtension-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp.fileprovider;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		5A4F7144810E56940ED1E6AC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGNING_REQUIRED = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = "Resources/Info/BerryKeepAppleProjectTests-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/BerryKeepMacApp.app/Contents/MacOS/BerryKeepMacApp";
+			};
+			name = Release;
+		};
+		70C3834B6B2713A6D1C729B0 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/BerryKeepMacFileProviderExtension-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				OTHER_LDFLAGS = "$(inherited) -lios_app";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macfileprovider;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		82107FDA0765F8EA32044997 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGNING_ALLOWED = NO;
+				"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES;
+				CODE_SIGNING_REQUIRED = NO;
+				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/BerryKeepIosApp-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		8F1BBCE67F8B0D7236E3E290 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.ios.uitests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = BerryKeepIosApp;
+			};
+			name = Release;
+		};
+		A7771E174FCB6BDA21F2556D /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "";
@@ -1129,9 +1220,9 @@
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "";
 			};
-			name = Debug;
+			name = Release;
 		};
-		438673375255170381B484EA /* Debug */ = {
+		D25B94C5010D927F20B7DB06 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
@@ -1152,7 +1243,7 @@
 			};
 			name = Debug;
 		};
-		56B86372DF7B4513C95FC4F4 /* Release */ = {
+		DB28595F5C321073B711CACC /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "";
@@ -1170,9 +1261,35 @@
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "";
 			};
+			name = Debug;
+		};
+		EB62E346E48310EC75CC683B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGNING_ALLOWED = NO;
+				"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES;
+				CODE_SIGNING_REQUIRED = NO;
+				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
+				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
+				INFOPLIST_FILE = "Resources/Info/BerryKeepIosFileProviderExtension-Info.plist";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
+				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp.fileprovider;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
 			name = Release;
 		};
-		6033E1896FB578470A8455DE /* Debug */ = {
+		EFEF25ECEB03B0CECB4C3E88 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -1239,171 +1356,77 @@
 			};
 			name = Debug;
 		};
-		737FE5F6A626C093F8737FED /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGNING_ALLOWED = NO;
-				"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES;
-				CODE_SIGNING_REQUIRED = NO;
-				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
-				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
-				INFOPLIST_FILE = "Resources/Info/BerryKeepIosFileProviderExtension-Info.plist";
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@executable_path/../../Frameworks",
-				);
-				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
-				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp.fileprovider;
-				SDKROOT = iphoneos;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Release;
-		};
-		A8F036FECE2D5E82FED161A1 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
-				COMBINE_HIDPI_IMAGES = YES;
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
-				INFOPLIST_FILE = "Resources/Info/BerryKeepMacApp-Info.plist";
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-				);
-				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				OTHER_LDFLAGS = "$(inherited) -lios_app";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macapp;
-				SDKROOT = macosx;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
-			};
-			name = Debug;
-		};
-		C8D904EEB4580E12BF4D2C45 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
-				COMBINE_HIDPI_IMAGES = YES;
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
-				INFOPLIST_FILE = "Resources/Info/BerryKeepMacFileProviderExtension-Info.plist";
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-					"@executable_path/../../../../Frameworks",
-				);
-				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				OTHER_LDFLAGS = "$(inherited) -lios_app";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macfileprovider;
-				SDKROOT = macosx;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
-			};
-			name = Release;
-		};
-		E1F1AC4E121D72EC14CCAE94 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGNING_ALLOWED = NO;
-				"CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]" = YES;
-				CODE_SIGNING_REQUIRED = NO;
-				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
-				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
-				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
-				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
-				INFOPLIST_FILE = "Resources/Info/BerryKeepIosFileProviderExtension-Info.plist";
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@executable_path/../../Frameworks",
-				);
-				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
-				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp.fileprovider;
-				SDKROOT = iphoneos;
-				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Debug;
-		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		0D6926F0D9DE65A8CCA52573 /* Build configuration list for PBXNativeTarget "BerryKeepAppleProjectTests" */ = {
+		13C73B3DBAC8482BEA95E931 /* Build configuration list for PBXNativeTarget "BerryKeepIosApp" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				3D5F59DE85E1A0FA2586207B /* Debug */,
-				27B5FC704E87C709C5CA9E2D /* Release */,
+				82107FDA0765F8EA32044997 /* Debug */,
+				1ED57B33E98DE291BC894572 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		104BE8BA6F2038EAC9F3037F /* Build configuration list for PBXNativeTarget "BerryKeepIosProjectTests" */ = {
+		2014F2FC1258450DA4E724B5 /* Build configuration list for PBXProject "BerryKeepAppleFileProvider" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				42E7C2F9C9F584AB7AF5D179 /* Debug */,
-				56B86372DF7B4513C95FC4F4 /* Release */,
+				EFEF25ECEB03B0CECB4C3E88 /* Debug */,
+				489D3255315E46C8BB960324 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		2F5A3721F5889FCF397CF835 /* Build configuration list for PBXNativeTarget "BerryKeepMacFileProviderExtension" */ = {
+		51EE81260D9CBEDD352492B3 /* Build configuration list for PBXNativeTarget "BerryKeepIosUiTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				438673375255170381B484EA /* Debug */,
-				C8D904EEB4580E12BF4D2C45 /* Release */,
+				42E75BCBCBACFE274BDB2DE2 /* Debug */,
+				8F1BBCE67F8B0D7236E3E290 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		4B65554E4B611E67F68E3816 /* Build configuration list for PBXNativeTarget "BerryKeepIosUiTests" */ = {
+		A2DC4295D8D603519109939B /* Build configuration list for PBXNativeTarget "BerryKeepIosProjectTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				2A4879C194362ADC7F9E4A05 /* Debug */,
-				3EB4E0AAF1593B80A71C0B94 /* Release */,
+				DB28595F5C321073B711CACC /* Debug */,
+				A7771E174FCB6BDA21F2556D /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		64FCC4EEC5FE5632A56E5538 /* Build configuration list for PBXNativeTarget "BerryKeepIosApp" */ = {
+		B83B58D7FF68150BE4970B13 /* Build configuration list for PBXNativeTarget "BerryKeepMacApp" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				3D008F29D5D93CCA2528E436 /* Debug */,
-				1E854127D07AFEA80F9A3940 /* Release */,
+				3039B1735FE24E1B78C0DB9F /* Debug */,
+				3F9F3C15D518758BB07979C8 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		6613AEA48C03748C70AA88AD /* Build configuration list for PBXNativeTarget "BerryKeepIosFileProviderExtension" */ = {
+		D909E50636C6BA5B63EA4A34 /* Build configuration list for PBXNativeTarget "BerryKeepAppleProjectTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				E1F1AC4E121D72EC14CCAE94 /* Debug */,
-				737FE5F6A626C093F8737FED /* Release */,
+				1DAFBE50B749A97831814D58 /* Debug */,
+				5A4F7144810E56940ED1E6AC /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		76727E7C888A54996E335170 /* Build configuration list for PBXProject "BerryKeepAppleFileProvider" */ = {
+		F1EE6D58756791476758BBE7 /* Build configuration list for PBXNativeTarget "BerryKeepMacFileProviderExtension" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				6033E1896FB578470A8455DE /* Debug */,
-				3F89A94689BD39F40D176FAD /* Release */,
+				D25B94C5010D927F20B7DB06 /* Debug */,
+				70C3834B6B2713A6D1C729B0 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		8C92952F62EC44217705EF5E /* Build configuration list for PBXNativeTarget "BerryKeepMacApp" */ = {
+		F34C120B9667078ADE05A629 /* Build configuration list for PBXNativeTarget "BerryKeepIosFileProviderExtension" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				A8F036FECE2D5E82FED161A1 /* Debug */,
-				0EB76EC6F65AD6952BA57CE7 /* Release */,
+				5697764302F62C9694E6643C /* Debug */,
+				EB62E346E48310EC75CC683B /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
@@ -1411,62 +1434,62 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		37157AA1007E5B83DF70C1B5 /* XCLocalSwiftPackageReference "." */ = {
+		E8D67C17F670891E13FB119A /* XCLocalSwiftPackageReference "." */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = .;
 		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		036A193B5DAC68469095CE5A /* AppleCore */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = AppleCore;
-		};
-		27724ACE6FAA8F9BBB92D194 /* AppleFileProviderShared */ = {
+		0D57367EA24E9DFAA4059FFC /* AppleFileProviderShared */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = AppleFileProviderShared;
 		};
-		3B0EAA0A0E8449F387555CF7 /* AppleCore */ = {
+		2010814B7D693E31E884D41C /* AppleCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = AppleCore;
 		};
-		4CADBC90D590EDBD274936BB /* AppleFileProviderShared */ = {
+		2C497C5557DE25C830BC5A5C /* AppleFileProviderShared */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = AppleFileProviderShared;
 		};
-		4FCEFD47F4EBD2FDE8D48497 /* AppleCore */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = AppleCore;
-		};
-		5EB1E57AE3FC7EA54C1477E3 /* AppleCore */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = AppleCore;
-		};
-		610C745899D565B8093E9493 /* AppleCore */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = AppleCore;
-		};
-		648AE487A41AA72E53A73C09 /* AppleFileProviderShared */ = {
+		386BB45529D0789D5ADC3EC3 /* AppleFileProviderShared */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = AppleFileProviderShared;
 		};
-		87FF1F26324D7E04DF57D36E /* AppleFileProviderShared */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = AppleFileProviderShared;
-		};
-		D3D93B20FE0A9294021D714C /* AppleFileProviderShared */ = {
-			isa = XCSwiftPackageProductDependency;
-			productName = AppleFileProviderShared;
-		};
-		D4758290C2F46CB307E07F32 /* AppleCore */ = {
+		395043293A38C1EB016A7CEF /* AppleCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = AppleCore;
 		};
-		F0BA5FE65065A174670816F1 /* AppleFileProviderShared */ = {
+		450C01B5C5772DB7E00294A4 /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		7D866EEC554740B76A20621D /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		B86DC11C8C0D191307877C31 /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		CF6349C254794ECA277F2753 /* AppleFileProviderShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleFileProviderShared;
+		};
+		D09AEE6B35C5DCF1F7CD73CE /* AppleFileProviderShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleFileProviderShared;
+		};
+		F9822A4F53C3FF1144447B3B /* AppleCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = AppleCore;
+		};
+		FA6F3613D78C7C10F97866B2 /* AppleFileProviderShared */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = AppleFileProviderShared;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
-	rootObject = EF0C3BABBB66E445EE36D4B9 /* Project object */;
+	rootObject = 62982080750046339AC92D17 /* Project object */;
 }
