@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -67,11 +67,11 @@ pub struct DataScrubReport {
     pub issues: Vec<DataScrubIssue>,
 }
 
-#[derive(Clone)]
 pub(crate) struct DataScrubber {
     pub(super) current_state: CurrentState,
     pub(super) storage_pool: StoragePool,
     pub(super) metadata_store: Arc<dyn MetadataStore>,
+    retained_content: Option<RetainedContent>,
     required_manifests: HashSet<String>,
     #[cfg(test)]
     pub(super) run_test_hook: Option<DataScrubRunTestHook>,
@@ -239,6 +239,7 @@ impl DataScrubber {
             current_state,
             storage_pool,
             metadata_store,
+            retained_content: None,
             required_manifests: HashSet::new(),
             #[cfg(test)]
             run_test_hook: None,
@@ -250,6 +251,14 @@ impl DataScrubber {
         self
     }
 
+    /// Reuse the retained catalog that computed placement obligations for this
+    /// scrub. It is a single-use runner, so ownership avoids reloading every
+    /// version and snapshot payload for the same run.
+    pub(crate) fn with_retained_content(mut self, retained: RetainedContent) -> Self {
+        self.retained_content = Some(retained);
+        self
+    }
+
     #[cfg(test)]
     pub(super) fn with_run_test_hook(mut self, hook: Option<DataScrubRunTestHook>) -> Self {
         self.run_test_hook = hook;
@@ -257,23 +266,23 @@ impl DataScrubber {
     }
 
     #[cfg(test)]
-    pub(crate) async fn run(&self) -> Result<DataScrubReport> {
+    pub(crate) async fn run(self) -> Result<DataScrubReport> {
         Ok(self.run_internal(None).await?.report)
     }
 
-    pub(crate) async fn run_with_repair_subjects(&self) -> Result<DataScrubRunOutput> {
+    pub(crate) async fn run_with_repair_subjects(self) -> Result<DataScrubRunOutput> {
         self.run_internal(None).await
     }
 
     pub(crate) async fn run_for_subjects(
-        &self,
+        self,
         subject_filter: &BTreeSet<String>,
     ) -> Result<DataScrubReport> {
         Ok(self.run_internal(Some(subject_filter)).await?.report)
     }
 
     async fn run_internal(
-        &self,
+        mut self,
         subject_filter: Option<&BTreeSet<String>>,
     ) -> Result<DataScrubRunOutput> {
         #[cfg(test)]
@@ -286,29 +295,32 @@ impl DataScrubber {
             repair_subjects: BTreeSet::new(),
             degraded_subjects: BTreeSet::new(),
         };
-        let retained =
-            RetainedContent::load(self.metadata_store.as_ref(), &self.current_state).await?;
+        let retained = match self.retained_content.take() {
+            Some(retained) => retained,
+            None => {
+                RetainedContent::load(self.metadata_store.as_ref(), &self.current_state).await?
+            }
+        };
         let mut manifest_references = retained.manifests;
         manifest_references.remove(TOMBSTONE_MANIFEST_HASH);
         if let Some(filter) = subject_filter {
             manifest_references.retain(|_, references| {
-                references
-                    .retain(|reference| reference.subject().is_some_and(|s| filter.contains(&s)));
+                references.retain(|subject, _| filter.contains(subject));
                 !references.is_empty()
             });
             output.report.current_keys_scanned = manifest_references
                 .values()
-                .flatten()
+                .flat_map(BTreeMap::values)
                 .filter(|r| r.version_id.is_none() && !r.snapshot_only)
                 .count();
             output.report.version_records_scanned = manifest_references
                 .values()
-                .flatten()
+                .flat_map(BTreeMap::values)
                 .filter(|r| r.version_id.is_some())
                 .count();
             output.report.version_indexes_scanned = manifest_references
                 .values()
-                .flatten()
+                .flat_map(BTreeMap::values)
                 .filter(|r| r.version_id.is_some())
                 .filter_map(|r| r.object_id.as_ref())
                 .collect::<HashSet<_>>()
@@ -331,11 +343,11 @@ impl DataScrubber {
         for manifest_hash in manifest_hashes {
             output.report.manifests_scanned = output.report.manifests_scanned.saturating_add(1);
             let contexts = manifest_references
-                .remove(&manifest_hash)
-                .unwrap_or_default();
+                .get(&manifest_hash)
+                .expect("manifest hash was collected from retained references");
             self.verify_manifest(
                 &manifest_hash,
-                &contexts,
+                contexts,
                 locally_owned_manifests.contains(&manifest_hash)
                     || self.required_manifests.contains(&manifest_hash),
                 &mut verified_chunks,
@@ -354,7 +366,7 @@ impl DataScrubber {
     async fn verify_manifest(
         &self,
         manifest_hash: &str,
-        contexts: &[DataScrubReference],
+        contexts: &BTreeMap<String, DataScrubReference>,
         manifest_required_locally: bool,
         verified_chunks: &mut VerifiedChunkCache,
         chunk_hash_buffer: &mut [u8],
@@ -433,7 +445,7 @@ impl DataScrubber {
         };
 
         let expected_keys = contexts
-            .iter()
+            .values()
             .filter_map(|context| context.key.as_deref())
             .collect::<BTreeSet<_>>();
         if !expected_keys.is_empty() && !expected_keys.contains(manifest.key.as_str()) {
@@ -616,7 +628,7 @@ impl DataScrubber {
     fn push_issue(
         &self,
         output: &mut DataScrubRunOutput,
-        contexts: &[DataScrubReference],
+        contexts: &BTreeMap<String, DataScrubReference>,
         kind: DataScrubIssueKind,
         manifest_hash: Option<String>,
         chunk_hash: Option<String>,
@@ -637,7 +649,7 @@ impl DataScrubber {
             return;
         }
 
-        let context = contexts.first();
+        let context = contexts.values().next();
         report.issues.push(DataScrubIssue {
             kind,
             key: context.and_then(|context| context.key.clone()),
@@ -654,15 +666,17 @@ fn data_scrub_issue_requires_auto_repair(kind: &DataScrubIssueKind) -> bool {
     !matches!(kind, DataScrubIssueKind::ManifestKeyMismatch)
 }
 
-fn data_scrub_repair_subjects_for_contexts(contexts: &[DataScrubReference]) -> BTreeSet<String> {
+fn data_scrub_repair_subjects_for_contexts(
+    contexts: &BTreeMap<String, DataScrubReference>,
+) -> BTreeSet<String> {
     let mut subjects = BTreeSet::new();
     let versioned_base_keys = contexts
-        .iter()
+        .values()
         .filter(|context| context.version_id.is_some())
         .filter_map(|context| context.key.clone())
         .collect::<HashSet<_>>();
 
-    for context in contexts {
+    for context in contexts.values() {
         if context.snapshot_only || context.key.is_none() {
             subjects.extend(context.subject());
             continue;
@@ -681,9 +695,11 @@ fn data_scrub_repair_subjects_for_contexts(contexts: &[DataScrubReference]) -> B
     subjects
 }
 
-fn data_scrub_all_subjects_for_contexts(contexts: &[DataScrubReference]) -> BTreeSet<String> {
+fn data_scrub_all_subjects_for_contexts(
+    contexts: &BTreeMap<String, DataScrubReference>,
+) -> BTreeSet<String> {
     contexts
-        .iter()
+        .values()
         .filter_map(DataScrubReference::subject)
         .collect()
 }

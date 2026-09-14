@@ -494,7 +494,7 @@ impl MetadataStore for TursoMetadataStore {
                 (),
             )
             .await?;
-        let mut tasks = Vec::new();
+        let mut tasks = Vec::<ContentRepairTask>::new();
         while let Some(row) = rows.next().await? {
             tasks.push(serde_json::from_slice(&row_blob(
                 &row,
@@ -509,31 +509,37 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         manifest_hashes: &[String],
     ) -> Result<Vec<ContentRepairTask>> {
+        const CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE: usize = 500;
+
         if manifest_hashes.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = (0..manifest_hashes.len())
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut rows = self
-            .connection
-            .query(
-                &format!(
-                    "SELECT task_json FROM content_repair_tasks \
-                     WHERE manifest_hash IN ({placeholders}) ORDER BY manifest_hash"
-                ),
-                params_from_iter(manifest_hashes.iter().cloned()),
-            )
-            .await?;
-        let mut tasks = Vec::new();
-        while let Some(row) = rows.next().await? {
-            tasks.push(serde_json::from_slice(&row_blob(
-                &row,
-                0,
-                "content_repair_tasks.task_json",
-            )?)?);
+        let mut tasks = Vec::<ContentRepairTask>::new();
+        for batch in manifest_hashes.chunks(CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE) {
+            let placeholders = (0..batch.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    &format!(
+                        "SELECT task_json FROM content_repair_tasks \
+                         WHERE manifest_hash IN ({placeholders}) ORDER BY manifest_hash"
+                    ),
+                    params_from_iter(batch.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                tasks.push(serde_json::from_slice(&row_blob(
+                    &row,
+                    0,
+                    "content_repair_tasks.task_json",
+                )?)?);
+            }
         }
+        tasks.sort_by(|left, right| {
+            left.reference
+                .manifest_hash
+                .cmp(&right.reference.manifest_hash)
+        });
         Ok(tasks)
     }
 
@@ -2550,6 +2556,7 @@ impl MetadataStore for TursoMetadataStore {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
         let mut rows = self
             .connection

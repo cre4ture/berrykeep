@@ -253,6 +253,21 @@ impl PersistentStore {
     pub(crate) async fn finish_content_repair(&self, task: &ContentRepairTask) -> Result<()> {
         let _guard = self.content_gc_gate.read().await;
         self.verify_recovered_content(task).await?;
+        self.finish_verified_content_repair_locked(task).await
+    }
+
+    /// Completes a repair after the caller has already validated every chunk.
+    /// This is reserved for the replication pull path, which checks existing
+    /// bytes and every received response before it calls this method.
+    pub(crate) async fn finish_verified_content_repair(
+        &self,
+        task: &ContentRepairTask,
+    ) -> Result<()> {
+        let _guard = self.content_gc_gate.read().await;
+        self.finish_verified_content_repair_locked(task).await
+    }
+
+    async fn finish_verified_content_repair_locked(&self, task: &ContentRepairTask) -> Result<()> {
         // Establish permanent protection before removing the temporary repair pin.
         if task.repair_chunks {
             self.mark_manifest_locally_owned(&task.reference.manifest_hash)

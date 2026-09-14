@@ -1732,6 +1732,20 @@ fn should_log_repair_chunk_progress(chunk_index: usize, chunk_count: usize) -> b
         || chunk_index.is_multiple_of(REPAIR_PROGRESS_CHUNK_LOG_INTERVAL)
 }
 
+fn retained_repair_pin_for_replication_pull(
+    existing: Option<storage::content_recovery::ContentRepairTask>,
+    reference: storage::retained_content::RetainedReference,
+    chunks: Vec<storage::ReplicationChunkInfo>,
+) -> storage::content_recovery::ContentRepairTask {
+    let mut pin = existing.unwrap_or_else(|| {
+        storage::content_recovery::ContentRepairTask::new(reference.clone(), true)
+    });
+    pin.reference = reference;
+    pin.repair_chunks = true;
+    pin.chunks = chunks;
+    pin
+}
+
 async fn pull_bundle_from_source(
     source_node: &NodeDescriptor,
     key: &str,
@@ -1815,17 +1829,23 @@ async fn pull_bundle_from_source(
             &bundle.manifest_hash,
             &bundle.manifest_bytes,
         )?;
-        let mut pin = storage::content_recovery::ContentRepairTask::new(
-            storage::retained_content::RetainedReference {
-                key: Some(bundle.key.clone()),
-                object_id: bundle.object_id.clone(),
-                version_id: bundle.version_id.clone(),
-                manifest_hash: bundle.manifest_hash.clone(),
-                snapshot_only: false,
-            },
-            true,
-        );
-        pin.chunks = manifest.chunks;
+        let reference = storage::retained_content::RetainedReference {
+            key: Some(bundle.key.clone()),
+            object_id: bundle.object_id.clone(),
+            version_id: bundle.version_id.clone(),
+            manifest_hash: bundle.manifest_hash.clone(),
+            snapshot_only: false,
+        };
+        // A replication pull can race the durable worker. Preserve its retry
+        // deadline, source fingerprint, and recovered progress instead of
+        // replacing the task with a newly-due empty one.
+        let existing = read_store(state, "replication_pull.existing_pin")
+            .await
+            .content_repair_tasks_for_manifests(std::slice::from_ref(&bundle.manifest_hash))
+            .await?
+            .into_iter()
+            .next();
+        let pin = retained_repair_pin_for_replication_pull(existing, reference, manifest.chunks);
         read_store(state, "replication_pull.pin")
             .await
             .persist_content_repair_task(&pin)
@@ -1874,7 +1894,9 @@ async fn pull_bundle_from_source(
     let mut store = lock_store(state, "replication_pull.import_manifest").await;
     let imported_version_id = store.import_replication_bundle(&bundle).await?;
     if let Some(pin) = &repair_pin {
-        store.finish_content_repair(pin).await?;
+        // `recover_chunks` validated each retained chunk before this import;
+        // do not turn an already verified pull into a second full-object hash.
+        store.finish_verified_content_repair(pin).await?;
     }
     info!(
         repair_run_id,
@@ -2222,6 +2244,53 @@ mod tests {
         );
 
         assert_eq!(report.run_status(), RepairRunStatus::Completed);
+    }
+
+    #[test]
+    fn replication_pull_preserves_existing_retained_repair_progress_and_backoff() {
+        let old_reference = storage::retained_content::RetainedReference {
+            key: Some("old-key".to_string()),
+            object_id: None,
+            version_id: Some("ver-old".to_string()),
+            manifest_hash: "old-manifest".to_string(),
+            snapshot_only: false,
+        };
+        let mut existing = storage::content_recovery::ContentRepairTask::new(old_reference, false);
+        existing.attempts = 4;
+        existing.next_attempt_unix = 9_999;
+        existing.last_error = Some("previous source timeout".to_string());
+        existing.waiting_for_source = true;
+        existing.source_fingerprint = "previous-sources".to_string();
+        existing.recovered_chunks = 3;
+
+        let reference = storage::retained_content::RetainedReference {
+            key: Some("new-key".to_string()),
+            object_id: Some("object-id".to_string()),
+            version_id: Some("ver-new".to_string()),
+            manifest_hash: "new-manifest".to_string(),
+            snapshot_only: false,
+        };
+        let chunks = vec![storage::ReplicationChunkInfo {
+            hash: "new-chunk".to_string(),
+            size_bytes: 42,
+        }];
+
+        let pin = retained_repair_pin_for_replication_pull(
+            Some(existing),
+            reference.clone(),
+            chunks.clone(),
+        );
+        assert_eq!(pin.reference, reference);
+        assert!(pin.repair_chunks);
+        assert_eq!(pin.chunks.len(), 1);
+        assert_eq!(pin.chunks[0].hash, chunks[0].hash);
+        assert_eq!(pin.chunks[0].size_bytes, chunks[0].size_bytes);
+        assert_eq!(pin.attempts, 4);
+        assert_eq!(pin.next_attempt_unix, 9_999);
+        assert_eq!(pin.last_error.as_deref(), Some("previous source timeout"));
+        assert!(pin.waiting_for_source);
+        assert_eq!(pin.source_fingerprint, "previous-sources");
+        assert_eq!(pin.recovered_chunks, 3);
     }
 
     #[test]
