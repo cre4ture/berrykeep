@@ -565,37 +565,6 @@ pub(crate) async fn execute_replication_repair_plan(
             continue;
         }
 
-        if bundle.is_some() && local_missing {
-            // An already-owned, complete replica can be re-advertised without a
-            // second scrub. Unowned cache and pending integrity findings cannot.
-            info!(
-                repair_run_id,
-                subject = %item.key,
-                key = %key,
-                version_id = ?version_id,
-                "replication repair found local replica not reflected in cluster state; registering"
-            );
-            push_repair_log_entry(
-                &mut detailed_log,
-                state.node_id,
-                "local_replica_registered",
-                "local replica was present but not reflected in cluster state; registering",
-                Some(item.key.clone()),
-                Some(key.clone()),
-                version_id.clone(),
-                None,
-                Some(state.node_id),
-                None,
-            );
-            let mut cluster = state.cluster.lock().await;
-            cluster.note_replica(&key, state.node_id);
-            if let Some(vid) = &version_id {
-                cluster.note_replica(format!("{key}@{vid}"), state.node_id);
-            }
-            drop(cluster);
-            replicas_state_dirty = true;
-        }
-
         if bundle.is_none() && local_missing {
             let Some(source_node) = item
                 .current_nodes

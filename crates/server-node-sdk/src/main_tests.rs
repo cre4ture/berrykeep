@@ -14425,9 +14425,7 @@ run_on_main_metadata_backends!(
     replication_repair_records_max_retry_skip_details_turso
 );
 
-async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
-    backend: MainTestBackend,
-) {
+async fn repair_skips_unavailable_local_retained_history_impl(backend: MainTestBackend) {
     // An offline peer can leave a stale historical availability claim behind.
     // Retained non-head content must not be re-registered through legacy
     // replication just because it remains locally readable; hash-based durable
@@ -14519,9 +14517,9 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
 }
 
 run_on_main_metadata_backends!(
-    repair_registers_local_replica_when_present_but_not_tracked_impl,
-    repair_registers_local_replica_when_present_but_not_tracked,
-    repair_registers_local_replica_when_present_but_not_tracked_turso
+    repair_skips_unavailable_local_retained_history_impl,
+    repair_skips_unavailable_local_retained_history,
+    repair_skips_unavailable_local_retained_history_turso
 );
 
 async fn autonomous_post_write_replication_pushes_to_missing_remote_nodes_impl(
