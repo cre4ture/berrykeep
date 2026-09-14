@@ -976,7 +976,7 @@ fn storage_path_state_label(state: StoragePathState) -> &'static str {
 #[cfg(any(target_os = "linux", test))]
 fn requires_mounts_for_remedy(service: &str, path: &Path) -> String {
     format!(
-        "Ensure the filesystem is declared in /etc/fstab or by a native .mount unit, then add `RequiresMountsFor={}` to the [Unit] section of a drop-in for `{service}`, run `sudo systemctl daemon-reload`, and restart the service.",
+        "Ensure the filesystem is declared in /etc/fstab or by a native .mount unit, then add `RequiresMountsFor={}` to the [Unit] section of a drop-in for `{service}` so systemd waits for and requires the mount before startup. If the service must also stop when that mount becomes inactive, bind it to the relevant .mount unit with `BindsTo=`. Run `sudo systemctl daemon-reload`, then restart the service.",
         path.display()
     )
 }
@@ -1161,7 +1161,7 @@ fn checks_for_inspection(
                                 target.path.display()
                             ),
                             detail: format!(
-                                "Systemd has a loaded mount unit at or above this path, but the configured storage path currently falls back to the root filesystem. `RequiresMountsFor={}` would otherwise only depend on the root filesystem and cannot protect the intended storage device.",
+                                "Systemd has a loaded mount unit at or above this path, but the configured storage path currently falls back to the root filesystem. `RequiresMountsFor={}` would otherwise only depend on the root filesystem and cannot require the intended storage device during startup.",
                                 target.path.display()
                             ),
                             configured_path: Some(target.path.display().to_string()),
@@ -1236,7 +1236,7 @@ fn checks_for_inspection(
                             target.path.display()
                         ),
                         detail: format!(
-                            "If the filesystem containing this path is unavailable at boot or is later unmounted, `{service}` can start or continue without systemd tying its lifetime to that mount."
+                            "If the filesystem containing this path is unavailable during startup, `{service}` can start without systemd waiting for and requiring the intended mount."
                         ),
                         configured_path: Some(target.path.display().to_string()),
                         resolved_path: None,
@@ -1582,6 +1582,13 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("RequiresMountsFor=/mnt/archive")
+        );
+        assert!(
+            draining
+                .install_hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("BindsTo=")
         );
         assert!(
             !checks
