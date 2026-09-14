@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::ReplicationExportBundle;
+use crate::storage::retained_content::MANIFEST_SUBJECT_PREFIX;
 
 #[tokio::test]
 async fn content_repair_claims_are_manifest_scoped() {
@@ -43,6 +44,39 @@ async fn content_repair_claims_are_manifest_scoped() {
         .unwrap();
     same.await.unwrap();
     claims.set_wait_after_failed_claim(None);
+}
+
+#[tokio::test]
+async fn repair_logs_expired_retained_reference_skips() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let subject = format!("{MANIFEST_SUBJECT_PREFIX}expired-manifest");
+
+    let report =
+        crate::content_recovery::repair_subjects(&state, vec![subject.clone()], None).await;
+
+    assert_eq!(report.skipped_items, 1, "{report:?}");
+    assert!(
+        report.detailed_log.iter().any(|entry| {
+            entry.event == "subject_skipped"
+                && entry.subject.as_deref() == Some(subject.as_str())
+                && entry
+                    .context
+                    .as_ref()
+                    .and_then(|context| context["reason"].as_str())
+                    == Some("retained_reference_unavailable")
+        }),
+        "an unresolvable retained reference must remain visible in the repair audit log: {report:?}"
+    );
+    assert!(
+        report.skipped_details.iter().any(|detail| {
+            detail.subject == subject
+                && detail.reason
+                    == crate::replication::ReplicationRepairSkipReason::RetainedReferenceUnavailable
+        }),
+        "the structured repair result must retain the skip reason: {report:?}"
+    );
+
+    cleanup_test_state(&state).await;
 }
 
 async fn local_availability_refresh_keeps_its_fresh_cache_impl(backend: MainTestBackend) {

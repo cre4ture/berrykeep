@@ -94,6 +94,7 @@ pub(crate) struct ReplicationRepairLogEntry {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReplicationRepairSkipReason {
     InvalidSubject,
+    RetainedReferenceUnavailable,
     SourceNodeUnavailable,
     BundleUnavailable,
     BackoffActive,
@@ -1683,7 +1684,7 @@ pub(crate) fn push_repair_log_entry(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_repair_skipped_detail(
+pub(crate) fn push_repair_skipped_detail(
     skipped_details: &mut Vec<ReplicationRepairSkippedItem>,
     report_node_id: NodeId,
     subject: String,
@@ -1747,6 +1748,10 @@ fn retained_repair_pin_for_replication_pull(
     pin.repair_chunks = true;
     pin.chunks = chunks;
     pin
+}
+
+fn requires_content_repair_claim(manifest_hash: &str) -> bool {
+    manifest_hash != TOMBSTONE_MANIFEST_HASH
 }
 
 async fn pull_bundle_from_source(
@@ -1826,12 +1831,22 @@ async fn pull_bundle_from_source(
         })),
     );
 
-    let _content_repair = state
-        .maintenance
-        .content_repair_claims
-        .claim(&bundle.manifest_hash)
-        .await;
-    let repair_pin = if bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH {
+    // Tombstones share one sentinel manifest hash and have no chunk recovery
+    // work. Do not serialize unrelated deletes behind a claim for that shared
+    // sentinel.
+    let needs_content_repair = requires_content_repair_claim(&bundle.manifest_hash);
+    let _content_repair = if needs_content_repair {
+        Some(
+            state
+                .maintenance
+                .content_repair_claims
+                .claim(&bundle.manifest_hash)
+                .await,
+        )
+    } else {
+        None
+    };
+    let repair_pin = if needs_content_repair {
         let manifest = storage::content_recovery::validate_manifest(
             &bundle.manifest_hash,
             &bundle.manifest_bytes,
@@ -2346,6 +2361,15 @@ mod tests {
         assert!(pin.waiting_for_source);
         assert_eq!(pin.source_fingerprint, "previous-sources");
         assert_eq!(pin.recovered_chunks, 3);
+    }
+
+    #[test]
+    fn tombstone_manifest_does_not_require_a_content_repair_claim() {
+        assert!(
+            !requires_content_repair_claim(TOMBSTONE_MANIFEST_HASH),
+            "the shared tombstone sentinel must not serialize unrelated deletes"
+        );
+        assert!(requires_content_repair_claim("immutable-manifest-hash"));
     }
 
     #[test]
