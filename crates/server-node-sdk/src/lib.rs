@@ -6691,7 +6691,7 @@ fn wait_for_local_node_ready(
 }
 
 fn runtime_log_filter_from_env(default_directive: &str) -> (EnvFilter, String) {
-    match common::legacy_compatibility::var(EnvFilter::DEFAULT_ENV) {
+    match std::env::var(EnvFilter::DEFAULT_ENV) {
         Ok(value) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {

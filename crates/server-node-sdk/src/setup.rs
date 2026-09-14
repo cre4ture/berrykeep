@@ -2216,9 +2216,9 @@ fn generate_bootstrap_tls_identity(bind_addr: SocketAddr) -> Result<(String, Str
             .subject_alt_names
             .push(SanType::IpAddress(bind_addr.ip()));
     }
-    if let Some(hostname) = common::legacy_compatibility::var("COMPUTERNAME")
+    if let Some(hostname) = std::env::var("COMPUTERNAME")
         .ok()
-        .or_else(|| common::legacy_compatibility::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {

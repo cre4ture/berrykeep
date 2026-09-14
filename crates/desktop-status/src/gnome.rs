@@ -12,7 +12,7 @@ pub struct GnomeExtensionInstallOutcome {
 }
 
 pub fn default_gnome_status_file_path() -> Result<PathBuf> {
-    let runtime_dir = common::legacy_compatibility::var_os("XDG_RUNTIME_DIR")
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is not set; pass --gnome-status-file"))?;
     Ok(PathBuf::from(runtime_dir)
         .join("berrykeep")
@@ -51,8 +51,8 @@ pub fn install_gnome_extension_from(
 }
 
 fn extension_install_dir() -> Result<PathBuf> {
-    let home_dir = common::legacy_compatibility::var_os("HOME")
-        .ok_or_else(|| anyhow!("HOME is not set for GNOME install"))?;
+    let home_dir =
+        std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set for GNOME install"))?;
     Ok(PathBuf::from(home_dir)
         .join(".local")
         .join("share")
@@ -129,7 +129,7 @@ fn extension_pending_session_discovery_note(status: String, detail: Option<&str>
 }
 
 fn restart_hint() -> &'static str {
-    match common::legacy_compatibility::var("XDG_SESSION_TYPE") {
+    match std::env::var("XDG_SESSION_TYPE") {
         Ok(value) if value.eq_ignore_ascii_case("wayland") => "log out and back in",
         _ => "restart GNOME Shell or log out and back in",
     }

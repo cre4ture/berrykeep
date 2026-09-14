@@ -12,7 +12,6 @@ crate-type = ["cdylib", "rlib"]
 adapter-windows-cfapi = { path = "../adapter-windows-cfapi" }
 anyhow.workspace = true
 client-sdk = { path = "../client-sdk" }
-common = { path = "../common" }
 sync-core = { path = "../sync-core" }
 git-version.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

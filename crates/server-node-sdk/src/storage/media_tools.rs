@@ -284,7 +284,7 @@ fn resolve_host_dependency_path(configured_path: &Path) -> Option<PathBuf> {
             .then(|| configured_path.to_path_buf());
     }
 
-    let path_env = common::legacy_compatibility::var_os("PATH")?;
+    let path_env = std::env::var_os("PATH")?;
     for entry in std::env::split_paths(&path_env) {
         #[cfg(windows)]
         {
@@ -387,7 +387,7 @@ fn windows_dependency_candidates(path: &Path) -> Vec<PathBuf> {
     }
 
     let mut candidates = Vec::new();
-    if let Some(path_exts) = common::legacy_compatibility::var_os("PATHEXT") {
+    if let Some(path_exts) = std::env::var_os("PATHEXT") {
         let path_exts = path_exts.to_string_lossy();
         for extension in path_exts
             .split(';')
