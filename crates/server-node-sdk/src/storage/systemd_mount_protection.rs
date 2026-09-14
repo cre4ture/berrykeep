@@ -19,6 +19,8 @@ use tokio::time::timeout;
 
 #[cfg(any(target_os = "linux", test))]
 use futures_util::future::join_all;
+#[cfg(all(target_os = "linux", not(test)))]
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 
 use super::StoragePathConfig;
 #[cfg(any(target_os = "linux", test))]
@@ -33,6 +35,8 @@ const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 const PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(all(target_os = "linux", not(test)))]
 const MOUNT_PROTECTION_CACHE_TTL: Duration = Duration::from_secs(30);
+#[cfg(all(target_os = "linux", not(test)))]
+const MOUNT_PROTECTION_INSPECTION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,8 +146,19 @@ struct MountProtectionCacheEntry {
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
-static MOUNT_PROTECTION_CACHE: OnceLock<tokio::sync::Mutex<Option<MountProtectionCacheEntry>>> =
-    OnceLock::new();
+struct MountProtectionCache {
+    entry: Option<MountProtectionCacheEntry>,
+    in_flight: Option<MountProtectionRefresh>,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+struct MountProtectionRefresh {
+    key: MountProtectionCacheKey,
+    checks: Shared<BoxFuture<'static, Vec<HostDependencyCheck>>>,
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+static MOUNT_PROTECTION_CACHE: OnceLock<tokio::sync::Mutex<MountProtectionCache>> = OnceLock::new();
 
 #[cfg(all(target_os = "linux", not(test)))]
 async fn cached_mount_protection_checks(
@@ -154,31 +169,77 @@ async fn cached_mount_protection_checks(
         data_dir: data_dir.to_path_buf(),
         storage_paths: storage_paths.to_vec(),
     };
-    let cache = MOUNT_PROTECTION_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
-    {
-        let cache = cache.lock().await;
-        if let Some(entry) = cache.as_ref()
-            && entry.key == key
-            && entry.checked_at.elapsed() <= MOUNT_PROTECTION_CACHE_TTL
+    let cache = MOUNT_PROTECTION_CACHE.get_or_init(|| {
+        tokio::sync::Mutex::new(MountProtectionCache {
+            entry: None,
+            in_flight: None,
+        })
+    });
+    loop {
+        let checks = {
+            let mut cache = cache.lock().await;
+            if let Some(entry) = cache.entry.as_ref()
+                && entry.key == key
+                && entry.checked_at.elapsed() <= MOUNT_PROTECTION_CACHE_TTL
+            {
+                return entry.checks.clone();
+            }
+            if let Some(refresh) = cache.in_flight.as_ref() {
+                refresh.checks.clone()
+            } else {
+                let data_dir = data_dir.to_path_buf();
+                let storage_paths = storage_paths.to_vec();
+                let checks = async move {
+                    timeout(
+                        MOUNT_PROTECTION_INSPECTION_TIMEOUT,
+                        mount_protection_checks_for_current_process(&data_dir, &storage_paths),
+                    )
+                    .await
+                    .unwrap_or_else(|_| mount_protection_inspection_timed_out_checks())
+                }
+                .boxed()
+                .shared();
+                cache.in_flight = Some(MountProtectionRefresh {
+                    key: key.clone(),
+                    checks: checks.clone(),
+                });
+                checks
+            }
+        };
+        let checks = checks.await;
+        let mut cache = cache.lock().await;
+        if cache
+            .in_flight
+            .as_ref()
+            .is_some_and(|refresh| refresh.key == key)
         {
-            return entry.checks.clone();
+            cache.entry = Some(MountProtectionCacheEntry {
+                key,
+                checked_at: Instant::now(),
+                checks: checks.clone(),
+            });
+            cache.in_flight = None;
+            return checks;
         }
     }
+}
 
-    let checks = mount_protection_checks_for_current_process(data_dir, storage_paths).await;
-    let mut cache = cache.lock().await;
-    if let Some(entry) = cache.as_ref()
-        && entry.key == key
-        && entry.checked_at.elapsed() <= MOUNT_PROTECTION_CACHE_TTL
-    {
-        return entry.checks.clone();
-    }
-    *cache = Some(MountProtectionCacheEntry {
-        key,
-        checked_at: Instant::now(),
-        checks: checks.clone(),
-    });
-    checks
+#[cfg(all(target_os = "linux", not(test)))]
+fn mount_protection_inspection_timed_out_checks() -> Vec<HostDependencyCheck> {
+    vec![HostDependencyCheck {
+        id: "systemd-mount-protection".to_string(),
+        feature: "Systemd mount protection".to_string(),
+        status: HostDependencyStatus::Missing,
+        severity: HostDependencySeverity::Info,
+        summary: "Could not finish checking systemd mount protection in time".to_string(),
+        detail: format!(
+            "The systemd dependency inspection exceeded {} seconds. Retry after the host is responsive.",
+            MOUNT_PROTECTION_INSPECTION_TIMEOUT.as_secs()
+        ),
+        configured_path: None,
+        resolved_path: None,
+        install_hint: None,
+    }]
 }
 
 fn not_managed_by_systemd_check() -> HostDependencyCheck {
@@ -753,13 +814,17 @@ async fn usable_path_canonicalizer() -> Result<PathBuf, String> {
 #[cfg(any(target_os = "linux", test))]
 async fn resolve_mount_protection_tool(configured_path: &Path) -> Option<PathBuf> {
     // Searching PATH uses synchronous filesystem metadata probes. Keep those
-    // probes off the async runtime because an unavailable network-backed PATH
-    // entry can otherwise stall a Tokio worker.
+    // probes off the async runtime and bound the wait: an unavailable
+    // network-backed PATH entry must not stall an admin request indefinitely.
     let configured_path = configured_path.to_path_buf();
-    tokio::task::spawn_blocking(move || resolve_host_dependency_path(&configured_path))
-        .await
-        .ok()
-        .flatten()
+    timeout(
+        PATH_RESOLUTION_TIMEOUT,
+        tokio::task::spawn_blocking(move || resolve_host_dependency_path(&configured_path)),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten()
 }
 
 #[cfg(any(target_os = "linux", test))]
