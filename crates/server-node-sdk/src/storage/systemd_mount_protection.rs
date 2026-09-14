@@ -1342,6 +1342,8 @@ mod tests {
     fn targets_without_known_mount_point(targets: &mut [MountProtectionTarget]) {
         for target in targets {
             target.mount_point = None;
+            target.mount_point_is_bind = false;
+            target.backing_mount_points.clear();
         }
     }
 
