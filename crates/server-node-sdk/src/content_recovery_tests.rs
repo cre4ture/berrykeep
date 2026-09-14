@@ -1100,7 +1100,7 @@ run_on_main_metadata_backends!(
     recovery_resumes_partial_work_after_restart_and_peer_reconnect_turso
 );
 
-async fn recovery_cancelled_during_transfer_resumes_verified_chunks_impl(backend: MainTestBackend) {
+async fn recovery_budget_timeout_records_completed_chunks_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let mut target = build_test_state(1, false, backend).await;
     let key = "interrupted.bin";
@@ -1139,38 +1139,43 @@ async fn recovery_cancelled_during_transfer_resumes_verified_chunks_impl(backend
         axum::serve(listener, app).await.unwrap();
     });
     register_online_source_node(&target, &source, &url).await;
-    let running_target = target.clone();
-    let repair = tokio::spawn(async move {
-        crate::replication::execute_targeted_replication_repair_inner(
-            &running_target,
-            vec![format!("{key}@{version}")],
-            None,
-        )
+    let reference = read_store(&target, "test.recovery.timeout_reference")
         .await
-    });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if read_store(&target, "test.recovery.first_installed")
-                .await
-                .read_chunk_payload(&first_hash)
-                .await
-                .unwrap()
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject(&format!("{key}@{version}"))
+        .unwrap()
+        .clone();
+    let mut task = crate::storage::content_recovery::ContentRepairTask::new(reference, true);
+    let error = crate::content_recovery::recover_task_with_budget(
+        &target,
+        &mut task,
+        Duration::from_millis(500),
+    )
     .await
-    .unwrap();
+    .unwrap_err();
     assert!(
-        !repair.is_finished(),
-        "interrupt while the second chunk request is still in flight"
+        error.is::<crate::content_recovery::DurableRepairBudgetExceeded>(),
+        "the artificial deadline must interrupt the second chunk transfer: {error:#}"
     );
-    repair.abort();
-    assert!(repair.await.unwrap_err().is_cancelled());
-    unblock.notify_waiters();
+    assert_eq!(task.recovered_chunks, 1);
+    assert!(
+        read_store(&target, "test.recovery.first_installed")
+            .await
+            .read_chunk_payload(&first_hash)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    task.defer("repair pass timed out".to_string(), 100, 30, true);
+    assert_eq!(task.attempts, 0);
+    assert_eq!(task.next_attempt_unix, 130);
+    read_store(&target, "test.recovery.persist_timeout_progress")
+        .await
+        .persist_content_repair_task(&task)
+        .await
+        .unwrap();
     stalled_peer.abort();
     let _ = stalled_peer.await;
     let root = read_store(&target, "test.recovery.restart_root")
@@ -1218,9 +1223,9 @@ async fn recovery_cancelled_during_transfer_resumes_verified_chunks_impl(backend
 }
 
 run_on_main_metadata_backends!(
-    recovery_cancelled_during_transfer_resumes_verified_chunks_impl,
-    recovery_cancelled_during_transfer_resumes_verified_chunks,
-    recovery_cancelled_during_transfer_resumes_verified_chunks_turso
+    recovery_budget_timeout_records_completed_chunks_impl,
+    recovery_budget_timeout_records_completed_chunks,
+    recovery_budget_timeout_records_completed_chunks_turso
 );
 
 async fn recovery_audit_does_not_fill_metadata_only_nodes_impl(backend: MainTestBackend) {
