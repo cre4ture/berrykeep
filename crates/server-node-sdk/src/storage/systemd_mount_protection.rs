@@ -948,7 +948,12 @@ fn backing_mount_points_for_path(
         .filter(|candidate| {
             candidate.device == mount_point.device
                 && candidate.path != mount_point.path
-                && candidate.path != Path::new("/")
+                // A bind created solely in the service namespace can map a
+                // root-backed path onto itself. Keep root as its backing source
+                // so the caller can classify that case as not applicable. A
+                // subvolume bind has distinct source and target paths, and must
+                // never use the root mount as its backing dependency.
+                && (candidate.path != Path::new("/") || mount_point.root == mount_point.path)
         })
         .filter(|candidate| filesystem_path.starts_with(&candidate.root))
         .map(|candidate| candidate.path.clone())
@@ -1064,6 +1069,12 @@ fn checks_for_inspection(
             .iter()
             .map(|target| {
                 let expected_host_mount = expected_host_mount_point(target, &host_mount_points);
+                let is_root_backed_namespace_bind = target.mount_point_is_bind
+                    && expected_host_mount.is_none()
+                    && target
+                        .backing_mount_points
+                        .iter()
+                        .any(|mount_point| mount_point == Path::new("/"));
                 let target_is_on_expected_host_mount = match (
                     target.mount_point.as_deref(),
                     expected_host_mount.map(PathBuf::as_path),
@@ -1083,7 +1094,8 @@ fn checks_for_inspection(
                     _ => true,
                 };
                 let protecting_mount = (target.path_resolution_error.is_none()
-                    && target_is_on_expected_host_mount)
+                    && target_is_on_expected_host_mount
+                    && !is_root_backed_namespace_bind)
                     .then(|| {
                         protecting_mount_dependency(
                             target,
@@ -1196,7 +1208,11 @@ fn checks_for_inspection(
                             )),
                         }
                     }
-                    None if target.mount_point.as_deref() == Some(Path::new("/")) && expected_host_mount.is_none() => HostDependencyCheck {
+                    None
+                        if expected_host_mount.is_none()
+                            && (target.mount_point.as_deref() == Some(Path::new("/"))
+                                || is_root_backed_namespace_bind) =>
+                    HostDependencyCheck {
                         id: target.id.clone(),
                         feature: target.feature.clone(),
                         status: HostDependencyStatus::NotApplicable,
@@ -2023,6 +2039,37 @@ mod tests {
             ),
             vec![PathBuf::from("/mnt/data")]
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn root_backed_namespace_bind_is_not_reported_as_an_unprotected_mount() {
+        let data_dir = Path::new("/var/lib/berrykeep-server-node");
+        let mount_points = mount_points_from_mountinfo(
+            "36 25 8:1 / / rw,nosuid,nodev - ext4 /dev/sda1 rw\n37 25 8:1 /var/lib/berrykeep-server-node /var/lib/berrykeep-server-node rw,nosuid,nodev - ext4 /dev/sda1 rw\n",
+        );
+        let mount_point = mount_point_for_path(data_dir, &mount_points).unwrap();
+        let target = MountProtectionTarget {
+            id: "systemd-mount-data-dir".to_string(),
+            feature: "Systemd mount protection: BERRYKEEP_DATA_DIR".to_string(),
+            path: data_dir.to_path_buf(),
+            mount_point: Some(mount_point.path.clone()),
+            mount_point_is_bind: true,
+            backing_mount_points: backing_mount_points_for_path(
+                data_dir,
+                mount_point,
+                &mount_points,
+            ),
+            path_resolution_error: None,
+            missing_severity: HostDependencySeverity::Critical,
+        };
+        let checks = checks_for_inspection(
+            &[target],
+            dependencies_with_host_mount_points(Vec::new(), &["/"]),
+        );
+
+        assert_eq!(checks[0].status, HostDependencyStatus::NotApplicable);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Info);
     }
 
     #[test]
