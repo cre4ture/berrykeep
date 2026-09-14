@@ -592,8 +592,17 @@ fn mount_protection_targets(
     data_dir: &Path,
     storage_paths: &[StoragePathConfig],
 ) -> Vec<MountProtectionTarget> {
-    mount_protection_targets_with_path_resolution(data_dir, storage_paths, None, &BTreeMap::new())
-        .expect("mountinfo is available while exercising mount protection targets")
+    mount_protection_targets_from_mount_points(
+        data_dir,
+        storage_paths,
+        None,
+        &BTreeMap::new(),
+        &[MountPoint {
+            device: "root".to_string(),
+            path: PathBuf::from("/"),
+            root: PathBuf::from("/"),
+        }],
+    )
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -605,11 +614,28 @@ fn mount_protection_targets_with_path_resolution(
 ) -> Result<Vec<MountProtectionTarget>, String> {
     let mount_points = mount_points_for_current_process()
         .ok_or_else(|| "could not read /proc/self/mountinfo".to_string())?;
+    Ok(mount_protection_targets_from_mount_points(
+        data_dir,
+        storage_paths,
+        data_dir_resolution_error,
+        storage_path_resolution_errors,
+        &mount_points,
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mount_protection_targets_from_mount_points(
+    data_dir: &Path,
+    storage_paths: &[StoragePathConfig],
+    data_dir_resolution_error: Option<String>,
+    storage_path_resolution_errors: &BTreeMap<String, String>,
+    mount_points: &[MountPoint],
+) -> Vec<MountProtectionTarget> {
     let data_dir = normalized_mount_protection_path(data_dir);
-    let data_dir_mount_point = mount_point_for_path(&data_dir, &mount_points);
+    let data_dir_mount_point = mount_point_for_path(&data_dir, mount_points);
     let data_dir_backing_mount_points = data_dir_mount_point
         .filter(|mount_point| mount_point.root != Path::new("/"))
-        .map(|mount_point| backing_mount_points_for_path(&data_dir, mount_point, &mount_points))
+        .map(|mount_point| backing_mount_points_for_path(&data_dir, mount_point, mount_points))
         .unwrap_or_default();
     let mut protected_paths = BTreeSet::from([data_dir.clone()]);
     let mut targets = vec![MountProtectionTarget {
@@ -633,11 +659,11 @@ fn mount_protection_targets_with_path_resolution(
                 if !protected_paths.insert(path.clone()) {
                     return None;
                 }
-                let mount_point = mount_point_for_path(&path, &mount_points);
+                let mount_point = mount_point_for_path(&path, mount_points);
                 let backing_mount_points = mount_point
                     .filter(|mount_point| mount_point.root != Path::new("/"))
                     .map(|mount_point| {
-                        backing_mount_points_for_path(&path, mount_point, &mount_points)
+                        backing_mount_points_for_path(&path, mount_point, mount_points)
                     })
                     .unwrap_or_default();
                 Some(MountProtectionTarget {
@@ -663,7 +689,7 @@ fn mount_protection_targets_with_path_resolution(
                 })
             }),
     );
-    Ok(targets)
+    targets
 }
 
 #[cfg(any(target_os = "linux", test))]
