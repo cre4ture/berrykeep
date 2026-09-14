@@ -24,6 +24,23 @@ impl std::fmt::Display for NoContentSource {
 
 impl std::error::Error for NoContentSource {}
 
+#[derive(Debug)]
+pub(crate) struct DurableRepairBudgetExceeded {
+    budget: Duration,
+}
+
+impl std::fmt::Display for DurableRepairBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "durable content repair pass exceeded its {} second budget",
+            self.budget.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for DurableRepairBudgetExceeded {}
+
 async fn source_fingerprint(state: &ServerState) -> String {
     let sources = source_nodes(state, "", None).await;
     let identities = sources
@@ -279,12 +296,9 @@ pub(crate) async fn bounded_durable_recovery<T>(
     budget: Duration,
     recovery: impl Future<Output = Result<T>>,
 ) -> Result<T> {
-    tokio::time::timeout(budget, recovery).await.map_err(|_| {
-        NoContentSource(format!(
-            "durable content repair pass exceeded its {} second budget",
-            budget.as_secs()
-        ))
-    })?
+    tokio::time::timeout(budget, recovery)
+        .await
+        .map_err(|_| DurableRepairBudgetExceeded { budget })?
 }
 
 async fn recover_task(state: &ServerState, task: &mut ContentRepairTask) -> Result<usize> {
