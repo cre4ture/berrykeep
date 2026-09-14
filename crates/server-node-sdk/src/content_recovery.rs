@@ -580,6 +580,17 @@ pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
         {
             continue;
         }
+        // Availability can be empty during first-start convergence (or stale
+        // after an out-of-band change). Do not turn a healthy local replica
+        // into pending repair work solely because that distributed view has
+        // not caught up yet.
+        if read_store(state, "content_recovery.audit_local_presence")
+            .await
+            .manifest_is_fully_local(&hash)
+            .await?
+        {
+            continue;
+        }
         if let Some(reference) = references
             .values()
             .find(|reference| reference.version_id.is_some() || reference.snapshot_only)

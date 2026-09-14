@@ -370,6 +370,53 @@ run_on_main_metadata_backends!(
     recovery_audit_finds_unadvertised_assigned_gap_turso
 );
 
+async fn recovery_audit_skips_complete_local_content_with_empty_availability_impl(
+    backend: MainTestBackend,
+) {
+    let target = build_test_state(1, false, backend).await;
+    let key = choose_locally_placed_key(&target, "empty-availability").await;
+    seed_subject_version(
+        &target,
+        &key,
+        "ver-healthy-local",
+        b"healthy local content".to_vec(),
+        vec![],
+    )
+    .await;
+
+    // Model first-start convergence: the content exists locally, but the
+    // cluster availability cache has not yet learned about it.
+    assert!(
+        target
+            .cluster
+            .lock()
+            .await
+            .available_subjects_for_node(target.node_id)
+            .is_empty()
+    );
+
+    crate::content_recovery::audit_assigned(&target)
+        .await
+        .unwrap();
+
+    assert!(
+        read_store(&target, "test.recovery.empty_availability")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a complete local replica must not be queued while availability converges"
+    );
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_audit_skips_complete_local_content_with_empty_availability_impl,
+    recovery_audit_skips_complete_local_content_with_empty_availability,
+    recovery_audit_skips_complete_local_content_with_empty_availability_turso
+);
+
 async fn recovery_combines_partial_peers_with_stale_inventory_impl(backend: MainTestBackend) {
     let source_a = build_test_state(1, false, backend).await;
     let source_b = build_test_state(1, false, backend).await;
