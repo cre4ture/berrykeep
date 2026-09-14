@@ -57,7 +57,12 @@ async fn planning_subjects_deduplicate_retained_history_by_placement_impl(
     )
     .await;
 
-    let subjects = crate::planning_replication_subjects(&state).await;
+    let retained = read_store(&state, "test.recovery.planning_history")
+        .await
+        .retained_content()
+        .await
+        .unwrap();
+    let subjects = crate::planning_replication_subjects_for_auditor(&state, Some(&retained)).await;
     let matching = subjects
         .iter()
         .filter(|subject| crate::cluster::replication_placement_key(subject) == key)

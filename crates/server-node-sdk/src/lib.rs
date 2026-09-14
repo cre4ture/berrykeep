@@ -11794,7 +11794,7 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
             }
 
             let keys =
-                planning_replication_subjects_from_retained(&state, retained.as_ref().ok()).await;
+                planning_replication_subjects_for_auditor(&state, retained.as_ref().ok()).await;
 
             let (node_transitioned_offline, plan_snapshot) = {
                 let mut cluster = state.cluster.lock().await;
@@ -12323,8 +12323,6 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
     planning_replication_subjects_from_retained(state, retained.as_ref().ok()).await
 }
 
-/// Produces one legacy planning subject per placement key. Durable content
-/// recovery handles the complete version/snapshot history independently.
 async fn planning_replication_subjects_from_retained(
     state: &ServerState,
     retained: Option<&storage::retained_content::RetainedContent>,
@@ -12345,7 +12343,17 @@ async fn planning_replication_subjects_from_retained(
     // durable worker live in content_recovery, not the legacy bundle planner.
     subjects
         .retain(|subject| !subject.starts_with(storage::retained_content::MANIFEST_SUBJECT_PREFIX));
-    subjects
+    subjects.into_iter().collect()
+}
+
+/// Bounds the periodic background audit to one legacy plan item per placement
+/// key. Explicit/manual plans keep their branch-aware version subjects.
+async fn planning_replication_subjects_for_auditor(
+    state: &ServerState,
+    retained: Option<&storage::retained_content::RetainedContent>,
+) -> Vec<String> {
+    planning_replication_subjects_from_retained(state, retained)
+        .await
         .into_iter()
         .fold(BTreeMap::new(), |mut by_placement_key, subject| {
             by_placement_key
