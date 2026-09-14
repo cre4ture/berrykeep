@@ -27,9 +27,10 @@ use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDepend
 
 #[cfg(target_os = "linux")]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
-// `systemctl show` omits inactive units during glob expansion unless `--all` is
-// present. Keep inactive generated/fstab mount units visible so an unmounted
-// expected filesystem is recognized as a root fallback, not as root-backed.
+// `systemctl show --all` preserves explicitly empty properties such as the
+// `Where=` of an inactive mount unit. This lets the parser ignore that unit
+// while retaining other effective dependencies instead of treating its absent
+// property as a failed systemd inspection.
 #[cfg(target_os = "linux")]
 const SYSTEMCTL_INCLUDE_INACTIVE_UNITS: &str = "--all";
 #[cfg(any(target_os = "linux", test))]
