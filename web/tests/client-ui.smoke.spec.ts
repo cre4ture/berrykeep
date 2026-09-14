@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { gzipSync } from "node:zlib";
-import { HttpError, fetchJson } from "@ironmesh/api";
+import { HttpError, fetchJson } from "@berrykeep/api";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import {
   createInitialOverviewGalleryEntries,

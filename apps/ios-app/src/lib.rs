@@ -2831,7 +2831,7 @@ mod tests {
         let root_prefix = CString::new("").expect("empty prefix is valid");
         let mut root_list_json = ptr::null_mut();
         let mut root_list_error = ptr::null_mut();
-        let status = ironmesh_ios_facade_list_json(
+        let status = berrykeep_ios_facade_list_json(
             handle,
             root_prefix.as_ptr(),
             1,
