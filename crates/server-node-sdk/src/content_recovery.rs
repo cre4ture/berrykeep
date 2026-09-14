@@ -354,7 +354,6 @@ pub(crate) async fn repair_subjects(
     subjects: Vec<String>,
     limit: Option<usize>,
 ) -> replication::ReplicationRepairReport {
-    let _worker = state.maintenance.content_repair_lock.lock().await;
     let mut report = empty_report();
     if let Err(error) = repair_subjects_inner(state, subjects, limit, &mut report).await {
         report.failed_transfers += 1;
@@ -428,6 +427,26 @@ async fn repair_subjects_inner(
     }
     let availability_may_have_changed = !tasks.is_empty();
     for (index, mut task) in tasks.into_values().enumerate() {
+        let _claim = state
+            .maintenance
+            .content_repair_claims
+            .claim(&task.reference.manifest_hash)
+            .await;
+        let requested_reference = task.reference.clone();
+        let requested_repair_chunks = task.repair_chunks;
+        let existing = read_store(state, "content_recovery.claimed_task")
+            .await
+            .content_repair_tasks_for_manifests(std::slice::from_ref(
+                &requested_reference.manifest_hash,
+            ))
+            .await?
+            .into_iter()
+            .next();
+        if let Some(mut existing) = existing {
+            existing.reference = requested_reference.clone();
+            existing.repair_chunks |= requested_repair_chunks;
+            task = existing;
+        }
         // The execution budget bounds this pass, not the lifetime of its work.
         read_store(state, "content_recovery.enqueue")
             .await
@@ -557,7 +576,6 @@ pub(crate) async fn resume_pending(state: &ServerState) -> Result<()> {
 /// Placement obligations exist even when no node currently advertises a replica.
 /// Queue them independently of the legacy replica map; the worker discovers bytes.
 pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
-    let _worker = state.maintenance.content_repair_lock.lock().await;
     let (retained, pending) = {
         let store = read_store(state, "content_recovery.audit").await;
         (
@@ -577,6 +595,19 @@ pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
             || !required.contains(&hash)
             || pending.contains(&hash)
             || references.keys().any(|subject| available.contains(subject))
+        {
+            continue;
+        }
+        let Some(_claim) = state.maintenance.content_repair_claims.try_claim(&hash) else {
+            // A repair already owns this manifest. Leave it to finish rather
+            // than letting one slow source hold up the rest of this audit.
+            continue;
+        };
+        if !read_store(state, "content_recovery.audit_claimed_task")
+            .await
+            .content_repair_tasks_for_manifests(std::slice::from_ref(&hash))
+            .await?
+            .is_empty()
         {
             continue;
         }

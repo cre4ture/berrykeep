@@ -427,7 +427,7 @@ struct ServerNetworkRuntime {
 
 #[derive(Clone)]
 struct ServerMaintenanceRuntime {
-    content_repair_lock: Arc<Mutex<()>>,
+    content_repair_claims: Arc<ContentRepairClaims>,
     content_repair_notify: Arc<Notify>,
     inflight_requests: Arc<AtomicUsize>,
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
@@ -445,6 +445,55 @@ struct ServerMaintenanceRuntime {
     local_availability_refresh_notify: Arc<Notify>,
     local_availability_generation: Arc<AtomicU64>,
     local_availability_cache: Arc<Mutex<Option<LocalAvailabilityCache>>>,
+}
+
+/// Serializes repair activity for one immutable manifest without allowing a
+/// stalled source for that manifest to block unrelated replication work.
+#[derive(Default)]
+struct ContentRepairClaims {
+    active_manifests: StdMutex<HashSet<String>>,
+    released: Notify,
+}
+
+struct ContentRepairClaim {
+    claims: Arc<ContentRepairClaims>,
+    manifest_hash: String,
+}
+
+impl ContentRepairClaims {
+    fn try_claim(self: &Arc<Self>, manifest_hash: &str) -> Option<ContentRepairClaim> {
+        self.active_manifests
+            .lock()
+            .expect("content repair claim lock poisoned")
+            .insert(manifest_hash.to_string())
+            .then(|| ContentRepairClaim {
+                claims: self.clone(),
+                manifest_hash: manifest_hash.to_string(),
+            })
+    }
+
+    async fn claim(self: &Arc<Self>, manifest_hash: &str) -> ContentRepairClaim {
+        loop {
+            // Register the waiter before checking the set so a concurrent
+            // release cannot be missed between the check and the await.
+            let notified = self.released.notified();
+            if let Some(claim) = self.try_claim(manifest_hash) {
+                return claim;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for ContentRepairClaim {
+    fn drop(&mut self) {
+        self.claims
+            .active_manifests
+            .lock()
+            .expect("content repair claim lock poisoned")
+            .remove(&self.manifest_hash);
+        self.claims.released.notify_waiters();
+    }
 }
 
 #[derive(Clone)]
@@ -7666,7 +7715,7 @@ async fn run_inner(
             inflight_requests: Arc::new(AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
-            content_repair_lock: Arc::new(Mutex::new(())),
+            content_repair_claims: Arc::new(ContentRepairClaims::default()),
             content_repair_notify: Arc::new(Notify::new()),
             repair_activity: Arc::new(Mutex::new(RepairActivityRuntime::default())),
             manual_repair_activity: Arc::new(Mutex::new(

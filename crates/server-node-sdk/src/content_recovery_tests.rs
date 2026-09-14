@@ -1,6 +1,47 @@
 use super::*;
 use crate::storage::ReplicationExportBundle;
 
+#[tokio::test]
+async fn content_repair_claims_are_manifest_scoped() {
+    let claims = Arc::new(crate::ContentRepairClaims::default());
+    let held = claims.claim("manifest-a").await;
+    assert!(
+        claims.try_claim("manifest-a").is_none(),
+        "audits must skip manifests an active repair already owns"
+    );
+
+    let (different_ready_tx, different_ready) = tokio::sync::oneshot::channel();
+    let different_claims = claims.clone();
+    let different = tokio::spawn(async move {
+        let _claim = different_claims.claim("manifest-b").await;
+        different_ready_tx.send(()).unwrap();
+    });
+    tokio::time::timeout(Duration::from_millis(100), different_ready)
+        .await
+        .expect("a stalled manifest must not block unrelated replication")
+        .unwrap();
+    different.await.unwrap();
+
+    let (same_ready_tx, mut same_ready) = tokio::sync::oneshot::channel();
+    let same_claims = claims.clone();
+    let same = tokio::spawn(async move {
+        let _claim = same_claims.claim("manifest-a").await;
+        same_ready_tx.send(()).unwrap();
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut same_ready)
+            .await
+            .is_err(),
+        "the same manifest must remain serialized"
+    );
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(1), same_ready)
+        .await
+        .expect("waiting repair did not resume after the matching claim released")
+        .unwrap();
+    same.await.unwrap();
+}
+
 async fn recovery_read_budget_bounds_slow_unadvertised_peers_impl(backend: MainTestBackend) {
     let target = build_test_state(1, false, backend).await;
     let source = build_test_state(1, false, backend).await;
@@ -723,7 +764,7 @@ async fn recovery_resumes_partial_work_after_restart_and_peer_reconnect_impl(
         .await
         .unwrap();
     target.store = new_store_rwlock(reopened);
-    target.maintenance.content_repair_lock = Arc::new(Mutex::new(()));
+    target.maintenance.content_repair_claims = Arc::new(crate::ContentRepairClaims::default());
     target.maintenance.repair_state = Arc::new(Mutex::new(RepairExecutorState::default()));
     // No second scrub or manual repair request: a new source breaks the old backoff.
     let (url_b, handle_b) = spawn_internal_peer_api_server(source_b.clone()).await;

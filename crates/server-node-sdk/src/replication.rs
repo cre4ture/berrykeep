@@ -1826,7 +1826,11 @@ async fn pull_bundle_from_source(
         })),
     );
 
-    let _content_worker = state.maintenance.content_repair_lock.lock().await;
+    let _content_repair = state
+        .maintenance
+        .content_repair_claims
+        .claim(&bundle.manifest_hash)
+        .await;
     let repair_pin = if bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH {
         let manifest = storage::content_recovery::validate_manifest(
             &bundle.manifest_hash,
