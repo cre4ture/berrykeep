@@ -13857,6 +13857,67 @@ fn store_index_children_plan_excludes_the_queried_directory_marker() {
     assert_eq!(plan.prefix_entries, vec!["docs/guide/"]);
 }
 
+async fn store_index_children_request_omits_current_marker_before_pagination_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    {
+        let mut store = lock_store(&state, "tests.store_index.children_request").await;
+        for (key, contents) in [
+            ("docs/", b"".as_slice()),
+            ("docs/a.txt", b"a".as_slice()),
+            ("docs/b.txt", b"b".as_slice()),
+        ] {
+            store
+                .put_object_versioned(
+                    key,
+                    bytes::Bytes::copy_from_slice(contents),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let app = super::build_server_apps(&state).public_app;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/store/index?prefix=docs&depth=1&view=children&offset=0&limit=1")
+                .body(Body::empty())
+                .expect("store index request should build"),
+        )
+        .await
+        .expect("store index request should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .expect("store index response should decode");
+    assert_eq!(payload["entries"][0]["path"], "docs/a.txt");
+    assert!(
+        payload["entries"]
+            .as_array()
+            .expect("entries should be an array")
+            .iter()
+            .all(|entry| entry["path"] != "docs/"),
+        "the queried directory marker must be removed before the page is selected"
+    );
+    assert_eq!(payload["entry_count"], 1);
+    assert_eq!(payload["total_entry_count"], 2);
+    assert_eq!(payload["offset"], 0);
+    assert_eq!(payload["limit"], 1);
+    assert_eq!(payload["has_more"], true);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    store_index_children_request_omits_current_marker_before_pagination_impl,
+    store_index_children_request_omits_current_marker_before_pagination,
+    store_index_children_request_omits_current_marker_before_pagination_turso
+);
+
 #[test]
 fn store_index_query_rejects_unknown_projection_views() {
     let error = serde_json::from_value::<super::StoreIndexQuery>(serde_json::json!({
