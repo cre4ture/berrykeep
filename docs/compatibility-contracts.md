@@ -13,7 +13,7 @@ implementation.
 | Enrollment labels | `device_label` | Bootstrap and enrollment payload readers accept `label` from older payloads. |
 | Desktop JSON stores | Explicit `version: 1` marker | Readers accept stores that predate the version marker. |
 | SQLite state caches | Explicit `schema_version` row | Readers migrate databases that predate the row. |
-| Store-index directory projection | `view=children` omits the queried directory marker before filtering, sorting, and pagination. | Nodes that reject the new projection are retried with their established unpaged `view=tree` response, projected locally, and then paginated. The rejected capability is cached for five minutes, but legacy tree data is fetched anew because its process-local consistency token is unsafe across routes and restarts. |
+| Store-index directory projection | `view=children` omits the queried directory marker before filtering, sorting, and pagination. | Nodes that reject the new projection are retried with their established unpaged `view=tree` response, projected locally, and then paginated. This preserves exact page boundaries after removing the marker; on an older node, a paged directory request can therefore transfer the complete listing. The rejected capability is cached for five minutes, but legacy tree data is fetched anew because its process-local consistency token is unsafe across routes and restarts. Upgrade older nodes before browsing large directories. |
 
 ## Maintenance rules
 
