@@ -11865,7 +11865,7 @@ async fn run_replication_audit_once(state: &ServerState) {
         warn!(error = %error, "failed to audit retained content assignments");
     }
 
-    let keys = planning_replication_subjects_for_auditor(state, retained.as_ref().ok()).await;
+    let keys = planning_replication_subjects_for_auditor(state).await;
 
     let (node_transitioned_offline, plan_snapshot) = {
         let mut cluster = state.cluster.lock().await;
@@ -12377,34 +12377,25 @@ async fn record_server_request_timing(request: Request, next: Next) -> Response 
 }
 
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
-    let retained = {
-        let store = read_store(state, "replication.retained_subjects").await;
-        store.retained_content().await
-    };
-    if let Err(error) = &retained {
-        warn!(error = %error, "failed to enumerate retained replication obligations");
-    }
-    planning_replication_subjects_from_retained(state, retained.as_ref().ok()).await
+    planning_replication_subjects_from_availability(state).await
 }
 
-async fn planning_replication_subjects_from_retained(
-    state: &ServerState,
-    retained: Option<&storage::retained_content::RetainedContent>,
-) -> Vec<String> {
+async fn planning_replication_subjects_from_availability(state: &ServerState) -> Vec<String> {
     let local_subjects = cached_local_cluster_available_subjects(state).await;
     let cluster_subjects = {
         let cluster = state.cluster.lock().await;
-        cluster.known_replication_subjects()
+        cluster
+            .export_available_by_key()
+            .into_keys()
+            .collect::<Vec<_>>()
     };
 
     let mut subjects = BTreeSet::new();
     subjects.extend(local_subjects);
     subjects.extend(cluster_subjects);
-    if let Some(retained) = retained {
-        subjects.extend(retained.subjects());
-    }
-    // Hash-only references have no object-key export. Their placement audit and
-    // durable worker live in content_recovery, not the legacy bundle planner.
+    // Historical durability obligations are scheduled by the manifest-hash
+    // worker. Keeping them out of legacy object/version planning prevents a
+    // deep retained history from expanding each availability or repair pass.
     subjects
         .retain(|subject| !subject.starts_with(storage::retained_content::MANIFEST_SUBJECT_PREFIX));
     subjects.into_iter().collect()
@@ -12412,11 +12403,8 @@ async fn planning_replication_subjects_from_retained(
 
 /// Bounds the periodic background audit to one legacy plan item per placement
 /// key. Explicit/manual plans keep their branch-aware version subjects.
-async fn planning_replication_subjects_for_auditor(
-    state: &ServerState,
-    retained: Option<&storage::retained_content::RetainedContent>,
-) -> Vec<String> {
-    planning_replication_subjects_from_retained(state, retained)
+async fn planning_replication_subjects_for_auditor(state: &ServerState) -> Vec<String> {
+    planning_replication_subjects_from_availability(state)
         .await
         .into_iter()
         .fold(BTreeMap::new(), |mut by_placement_key, subject| {

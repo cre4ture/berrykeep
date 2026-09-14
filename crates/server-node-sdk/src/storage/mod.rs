@@ -4243,13 +4243,66 @@ impl ReplicationSubjectInspector {
     }
 
     pub(crate) async fn list_replication_subjects(&self) -> Result<Vec<String>> {
-        let retained = retained_content::RetainedContent::load(
-            self.metadata_store.as_ref(),
-            &self.current_state,
-        )
-        .await?;
+        // Availability is a bounded, current-state hint. Durable manifest-hash
+        // recovery covers retained history by querying online peers directly;
+        // advertising every historical reference would make this peer payload
+        // and its persisted cluster view grow with history depth.
+        let mut candidates = BTreeMap::new();
+        for (key, manifest_hash) in &self.current_state.objects {
+            candidates.insert(key.clone(), manifest_hash.clone());
+        }
+
+        let mut indexed_object_ids = HashSet::new();
+        for (path, object_id) in &self.current_state.object_ids {
+            if let Some(index) = self
+                .metadata_store
+                .load_version_index_by_object_id(object_id)
+                .await?
+            {
+                indexed_object_ids.insert(object_id.clone());
+                for head_version_id in &index.head_version_ids {
+                    let Some(record) = index.versions.get(head_version_id) else {
+                        continue;
+                    };
+                    candidates.insert(
+                        format!("{path}@{head_version_id}"),
+                        record.manifest_hash.clone(),
+                    );
+                }
+            }
+        }
+
+        let history =
+            StoreHistoryInspector::new(self.storage_pool.clone(), self.metadata_store.clone());
+        for index in self.metadata_store.load_all_version_indexes().await? {
+            if indexed_object_ids.contains(&index.object_id) {
+                continue;
+            }
+            for head_version_id in &index.head_version_ids {
+                let Some(record) = index.versions.get(head_version_id) else {
+                    continue;
+                };
+                let Some(key) = history
+                    .resolve_key_for_version_record(&index, record)
+                    .await?
+                else {
+                    continue;
+                };
+                candidates.insert(
+                    format!("{key}@{head_version_id}"),
+                    record.manifest_hash.clone(),
+                );
+            }
+        }
+
+        let hashes = candidates
+            .values()
+            .filter(|hash| hash.as_str() != TOMBSTONE_MANIFEST_HASH)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut subjects = BTreeSet::new();
-        let hashes = retained.manifests.keys().cloned().collect::<Vec<_>>();
         let owned = self
             .metadata_store
             .filter_locally_owned_manifests(&hashes)
@@ -4260,15 +4313,21 @@ impl ReplicationSubjectInspector {
             .await?
             .into_iter()
             .collect::<HashSet<_>>();
-        for (hash, references) in retained.manifests {
+        let mut availability_by_hash = HashMap::new();
+        for hash in hashes {
             if pending.contains(&hash) {
+                availability_by_hash.insert(hash, false);
                 continue;
             }
+            let available = owned.contains(&hash)
+                && content_recovery::manifest_is_fully_local(&self.storage_pool, &hash).await?;
+            availability_by_hash.insert(hash, available);
+        }
+        for (subject, hash) in candidates {
             if hash == TOMBSTONE_MANIFEST_HASH
-                || (owned.contains(&hash)
-                    && content_recovery::manifest_is_fully_local(&self.storage_pool, &hash).await?)
+                || availability_by_hash.get(&hash).copied().unwrap_or(false)
             {
-                subjects.extend(references.keys().cloned());
+                subjects.insert(subject);
             }
         }
         Ok(subjects.into_iter().collect())

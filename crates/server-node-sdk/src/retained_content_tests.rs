@@ -213,7 +213,7 @@ fn retained_content_identity_does_not_require_a_path() {
     );
 }
 
-async fn retained_content_advertises_history_after_delete_impl(backend: StorageTestBackend) {
+async fn retained_content_advertises_tombstone_head_after_delete_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("retained-availability").await;
     let key = "history/old-name.bin";
     let old = store
@@ -224,15 +224,19 @@ async fn retained_content_advertises_history_after_delete_impl(backend: StorageT
         )
         .await
         .unwrap();
-    store
+    let tombstone_version = store
         .tombstone_object(key, PutOptions::default())
         .await
         .unwrap();
     let inspector = store.replication_subject_inspector().await.unwrap();
     let available = inspector.list_replication_subjects().await.unwrap();
     assert!(
-        available.contains(&format!("{key}@{}", old.version_id)),
+        available.contains(&format!("{key}@{tombstone_version}")),
         "{available:?}"
+    );
+    assert!(
+        !available.contains(&format!("{key}@{}", old.version_id)),
+        "historical payload recovery is hash-driven, not an availability entry: {available:?}"
     );
     assert!(!available.contains(&key.to_string()));
     assert_eq!(available, store.list_replication_subjects().await.unwrap());
@@ -241,9 +245,9 @@ async fn retained_content_advertises_history_after_delete_impl(backend: StorageT
 }
 
 run_on_all_metadata_backends!(
-    retained_content_advertises_history_after_delete_impl,
-    retained_content_advertises_history_after_delete,
-    retained_content_advertises_history_after_delete_turso
+    retained_content_advertises_tombstone_head_after_delete_impl,
+    retained_content_advertises_tombstone_head_after_delete,
+    retained_content_advertises_tombstone_head_after_delete_turso
 );
 
 async fn retained_content_metadata_only_is_not_a_broken_replica_impl(backend: StorageTestBackend) {
@@ -371,9 +375,9 @@ async fn retained_content_snapshot_only_is_scrubbed_impl(backend: StorageTestBac
         "pending content cannot be re-advertised before verification"
     );
     store.finish_content_repair(&task).await.unwrap();
-    assert_eq!(
-        store.list_replication_subjects().await.unwrap(),
-        vec![format!("cas-manifest:{}", put.manifest_hash)]
+    assert!(
+        store.list_replication_subjects().await.unwrap().is_empty(),
+        "snapshot-only content remains discoverable by durable hash recovery without expanding the bounded availability view"
     );
     assert!(
         store

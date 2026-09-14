@@ -95,6 +95,7 @@ pub(crate) struct ReplicationRepairLogEntry {
 pub(crate) enum ReplicationRepairSkipReason {
     InvalidSubject,
     RetainedReferenceUnavailable,
+    LocalContentUnavailable,
     SourceNodeUnavailable,
     BundleUnavailable,
     BackoffActive,
@@ -354,6 +355,10 @@ pub(crate) async fn execute_replication_repair_plan(
     let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
     let now = unix_ts();
     let repair_run_id = run_id.unwrap_or("untracked");
+    let locally_available = cached_local_cluster_available_subjects(state)
+        .await
+        .into_iter()
+        .collect::<HashSet<_>>();
 
     let mut plan_items = plan.items.iter().collect::<Vec<_>>();
     let plan_item_count = plan_items.len();
@@ -527,6 +532,38 @@ pub(crate) async fn execute_replication_repair_plan(
                 _ => None,
             }
         };
+
+        if bundle.is_some() && !locally_available.contains(&item.key) {
+            // A persisted remote view can retain a historical source hint while
+            // that peer is offline. Do not turn a locally retained, non-head
+            // bundle back into legacy availability or replicate it from here;
+            // durable manifest-hash recovery owns retained-history work.
+            skipped_items += 1;
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "subject_skipped",
+                "local content is outside the current availability view",
+                Some(item.key.clone()),
+                Some(key.clone()),
+                version_id.clone(),
+                None,
+                Some(state.node_id),
+                Some(serde_json::json!({"reason": "local_content_unavailable"})),
+            );
+            push_repair_skipped_detail(
+                &mut skipped_details,
+                state.node_id,
+                item.key.clone(),
+                Some(key.clone()),
+                version_id.clone(),
+                None,
+                Some(state.node_id),
+                ReplicationRepairSkipReason::LocalContentUnavailable,
+                "local content is outside the current availability view",
+            );
+            continue;
+        }
 
         if bundle.is_some() && local_missing {
             // An already-owned, complete replica can be re-advertised without a
