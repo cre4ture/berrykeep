@@ -8,6 +8,9 @@ use storage::retained_content::{MANIFEST_SUBJECT_PREFIX, RetainedContent, Retain
 const CHUNK_FETCH_CONCURRENCY: usize = 4;
 const PEER_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const READ_THROUGH_RECOVERY_BUDGET: Duration = Duration::from_secs(30);
+/// Bounds one durable repair pass. Its persisted task and any verified chunks
+/// survive cancellation, so a later pass resumes with a fresh peer snapshot.
+const DURABLE_CONTENT_REPAIR_BUDGET: Duration = Duration::from_secs(2 * 60);
 const MAX_RECOVERY_ERRORS: usize = 16;
 
 #[derive(Debug)]
@@ -272,7 +275,30 @@ async fn recover_manifest(state: &ServerState, reference: &RetainedReference) ->
     .into())
 }
 
+pub(crate) async fn bounded_durable_recovery<T>(
+    budget: Duration,
+    recovery: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(budget, recovery).await.map_err(|_| {
+        NoContentSource(format!(
+            "durable content repair pass exceeded its {} second budget",
+            budget.as_secs()
+        ))
+    })?
+}
+
 async fn recover_task(state: &ServerState, task: &mut ContentRepairTask) -> Result<usize> {
+    bounded_durable_recovery(
+        DURABLE_CONTENT_REPAIR_BUDGET,
+        recover_task_unbounded(state, task),
+    )
+    .await
+}
+
+async fn recover_task_unbounded(
+    state: &ServerState,
+    task: &mut ContentRepairTask,
+) -> Result<usize> {
     let bytes = recover_manifest(state, &task.reference).await?;
     let manifest = validate_manifest(&task.reference.manifest_hash, &bytes)?;
     {
