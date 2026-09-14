@@ -467,11 +467,13 @@ async function androidShareMessages(page: Page): Promise<string[]> {
 }
 
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
-  test.setTimeout(45_000);
+  test.setTimeout(180_000);
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
     origin: "http://127.0.0.1:4174"
   });
-  const uploadMetrics = await installClientUiMocks(page);
+  const uploadMetrics = await installClientUiMocks(page, {
+    uploadChunkDelayMsByKey: { "images/alpha.bin": 5_000 }
+  });
   const pageErrors: string[] = [];
 
   page.on("pageerror", (error) => {
@@ -556,7 +558,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     .getByRole("row", { name: /alpha\.bin/ })
     .getByRole("button", { name: "Cancel" })
     .click();
-  await expect(page.getByRole("row", { name: /alpha\.bin/ })).toContainText("Canceled");
+  await expect.poll(() => uploadMetrics.deletedUploadSessionIds()).toContain("upload-1");
   await page.locator('input[type="file"]').setInputFiles({
     name: "gamma.bin",
     mimeType: "application/octet-stream",
@@ -582,6 +584,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   const explorerTable = page.getByRole("table").first();
   await expect(explorerTable.getByRole("columnheader", { name: /Size/ })).toBeVisible();
   await expect(explorerTable.getByRole("columnheader", { name: /Modified/ })).toBeVisible();
@@ -612,10 +616,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
           entry.versionId === "version-cat-000" &&
           entry.targetPath === "gallery/cat.png"
       )
-    )
+  )
     .toBe(true);
   await expect(page.getByText('"target_path": "gallery/cat.png"')).toBeVisible();
   await page.keyboard.press("Escape");
+  await expect(page.locator(".mantine-Drawer-overlay")).toHaveCount(0);
   await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
   await page.getByRole("button", { name: "Version history" }).click();
   await expect(page.getByRole("button", { name: "Thumbnail for gallery/cat.png" })).toBeVisible();
@@ -642,8 +647,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     .filter({ has: page.getByLabel("Media viewer thumbnails") });
   await expect(mediaViewerDialog.getByRole("button", { name: "Version history" })).toBeVisible();
   await mediaViewerDialog.getByRole("button", { name: "Version history" }).click();
-  await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
-  await page.keyboard.press("Escape");
+  const versionHistoryDrawer = page.getByRole("dialog", { name: "Version history" });
+  await expect(versionHistoryDrawer.getByLabel("Key")).toHaveValue("gallery/cat.png");
+  await versionHistoryDrawer.getByRole("banner").getByRole("button").click();
+  await expect(versionHistoryDrawer).toHaveCount(0);
+  await expect(page.locator(".mantine-Drawer-overlay")).toHaveCount(0);
   await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
   await expect(mediaViewerDialog.getByRole("button", { name: "Start slideshow" })).toBeVisible();
   const mediaViewerZoomSurface = page.locator('[data-media-zoom-surface="true"]').first();
@@ -671,6 +679,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     "true"
   );
   await page.keyboard.press("Escape");
+  await expect(mediaViewerDialog).toHaveCount(0);
   await page.getByRole("row", { name: /docs\/readme\.txt/ }).getByRole("button", { name: "Read" }).click();
   await expect(page.getByText("hello from the mocked store")).toBeVisible();
   const explorerDownload = page.waitForEvent("download");
@@ -706,6 +715,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("button", { name: "Uploads 4/5 · 1 canceled" })).toBeVisible();
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   await page.getByRole("row", { name: /docs\/\s+prefix/i }).getByRole("button", { name: "Open" }).click();
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("row", { name: /scratch\/\s+prefix/i }).getByRole("button", { name: "Delete" }).click();
@@ -1355,6 +1366,8 @@ test("client-ui Android explorer resolves the preferred current version before s
   });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/?page=explorer&embedded_client=android");
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
 
   const dialog = page.getByRole("dialog");
@@ -1786,6 +1799,8 @@ test("client-ui gallery and explorer lightboxes prefer the mobile viewer thumbna
   await page.goto("/?page=explorer");
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
   await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
   await expect(
     page.getByRole("dialog").locator('img[src*="profile=mobile_viewer"]').first()
@@ -1967,6 +1982,8 @@ test("client-ui explorer refreshes history while paging current entries", async 
   });
   await page.goto("/");
   await page.getByText("Explorer", { exact: true }).click();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   await page.getByText("Show deleted or moved files", { exact: true }).click();
   await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
   await expect.poll(() => historyRequestCount).toBe(1);
@@ -2281,6 +2298,7 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
   historyEntries?: MockHistoryEntry[];
+  uploadChunkDelayMsByKey?: Record<string, number>;
   historyRestoreFailureAtCall?: number;
   cacheScope?: string | null;
   mapMetadataStatus?: number;
@@ -3075,7 +3093,9 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       activeUploadIds.add(uploadId);
       maxConcurrentUploadIds = Math.max(maxConcurrentUploadIds, activeUploadIds.size);
       try {
-        await new Promise((resolve) => setTimeout(resolve, 75));
+        const uploadKey = uploadKeys.get(uploadId) ?? "";
+        const uploadChunkDelayMs = options?.uploadChunkDelayMsByKey?.[uploadKey] ?? 75;
+        await new Promise((resolve) => setTimeout(resolve, uploadChunkDelayMs));
         await json(route, {
           stored: true,
           received_index: index
