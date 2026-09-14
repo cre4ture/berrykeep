@@ -83,15 +83,15 @@ type AndroidUiBridge = {
 
 const imageExtensions = [".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
 const videoExtensions = [".m4v", ".mkv", ".mov", ".mp4", ".ogv", ".webm"];
-const GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY = "ironmesh.gallery.thumbnails_per_row";
-const GALLERY_SHOW_METADATA_STORAGE_KEY = "ironmesh.gallery.show_metadata";
-const GALLERY_VIEW_MODE_STORAGE_KEY = "ironmesh.gallery.view_mode";
-const GALLERY_BASEMAP_ID_STORAGE_KEY = "ironmesh.gallery.basemap_id";
-const GALLERY_MAP_PROJECTION_STORAGE_KEY = "ironmesh.gallery.map_projection";
-const GALLERY_SHOW_MAP_CLUSTER_GRID_STORAGE_KEY = "ironmesh.gallery.show_map_cluster_grid";
-const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "ironmesh.gallery.map_fullscreen";
+const GALLERY_THUMBNAILS_PER_ROW_STORAGE_KEY = "berrykeep.gallery.thumbnails_per_row";
+const GALLERY_SHOW_METADATA_STORAGE_KEY = "berrykeep.gallery.show_metadata";
+const GALLERY_VIEW_MODE_STORAGE_KEY = "berrykeep.gallery.view_mode";
+const GALLERY_BASEMAP_ID_STORAGE_KEY = "berrykeep.gallery.basemap_id";
+const GALLERY_MAP_PROJECTION_STORAGE_KEY = "berrykeep.gallery.map_projection";
+const GALLERY_SHOW_MAP_CLUSTER_GRID_STORAGE_KEY = "berrykeep.gallery.show_map_cluster_grid";
+const GALLERY_MAP_FULLSCREEN_HISTORY_KEY = "berrykeep.gallery.map_fullscreen";
 const GALLERY_MAP_FULLSCREEN_MESSAGE_TYPE = "gallery-map-fullscreen";
-const GALLERY_MAP_FULLSCREEN_EXIT_EVENT = "ironmesh:gallery-map-exit-fullscreen";
+const GALLERY_MAP_FULLSCREEN_EXIT_EVENT = "berrykeep:gallery-map-exit-fullscreen";
 const GALLERY_MAX_DEPTH = 64;
 const GALLERY_MAP_INITIAL_VIEWPORT: GalleryMapViewport = {
   south: -90,
@@ -124,7 +124,7 @@ function notifyAndroidGalleryMapFullscreen(fullscreen: boolean) {
     return;
   }
 
-  const bridge = (window as Window & { IronmeshAndroidUi?: AndroidUiBridge }).IronmeshAndroidUi;
+  const bridge = (window as Window & { BerryKeepAndroidUi?: AndroidUiBridge }).BerryKeepAndroidUi;
   if (!bridge) {
     return;
   }
@@ -3231,7 +3231,7 @@ function GalleryWorldMap({
         }}
       >
         <defs>
-          <linearGradient id="ironmesh-gallery-map-land" x1="0%" y1="0%" x2="100%" y2="100%">
+          <linearGradient id="berrykeep-gallery-map-land" x1="0%" y1="0%" x2="100%" y2="100%">
             <stop offset="0%" stopColor="#335c49" />
             <stop offset="100%" stopColor="#244739" />
           </linearGradient>
@@ -3276,27 +3276,27 @@ function GalleryWorldMap({
         />
         <path
           d="M101 125c28-31 79-50 120-42 43 8 66 33 96 46 25 11 60 8 74 35 14 27-13 63-27 92-16 33-15 68-37 92-26 28-72 20-111 7-42-14-80-37-104-71-22-32-28-78-19-114 8-35-10-82 8-105z"
-          fill="url(#ironmesh-gallery-map-land)"
+          fill="url(#berrykeep-gallery-map-land)"
           opacity="0.78"
         />
         <path
           d="M247 330c32-8 51 19 63 43 13 28 15 64-3 88-17 23-48 38-77 31-27-7-47-34-50-62-3-23 12-43 23-63 11-20 18-32 44-37z"
-          fill="url(#ironmesh-gallery-map-land)"
+          fill="url(#berrykeep-gallery-map-land)"
           opacity="0.72"
         />
         <path
           d="M474 108c33-22 84-25 118-12 28 11 39 33 61 49 26 20 67 16 87 43 25 33 26 87 8 126-21 46-70 77-120 82-43 5-91-9-126-35-34-26-60-67-57-111 2-34 26-64 27-98 0-20-14-30 2-44z"
-          fill="url(#ironmesh-gallery-map-land)"
+          fill="url(#berrykeep-gallery-map-land)"
           opacity="0.82"
         />
         <path
           d="M542 352c23-20 63-24 92-16 27 8 41 31 52 54 12 24 21 53 8 77-15 29-52 46-85 43-31-3-59-24-71-53-13-32-20-78 4-105z"
-          fill="url(#ironmesh-gallery-map-land)"
+          fill="url(#berrykeep-gallery-map-land)"
           opacity="0.74"
         />
         <path
           d="M770 352c23-13 51-12 76-4 24 8 49 25 56 50 7 22-7 48-26 60-23 15-53 15-79 11-21-3-44-10-56-28-11-17-10-42 2-58 7-10 15-22 27-31z"
-          fill="url(#ironmesh-gallery-map-land)"
+          fill="url(#berrykeep-gallery-map-land)"
           opacity="0.8"
         />
       </svg>

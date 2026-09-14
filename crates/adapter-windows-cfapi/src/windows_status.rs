@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 
 use anyhow::{Context, Result, anyhow};
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use desktop_status::{
     DesktopStatusDocument, RemoteStatusUpdate, StatusFacet, StatusSnapshot, build_status_document,
     poll_remote_status, sleep_with_stop, starting_snapshot, write_status_document,
@@ -135,11 +135,11 @@ impl WindowsStatusPublisher {
 pub fn spawn_remote_status_thread(
     running: Arc<AtomicBool>,
     publisher: Arc<WindowsStatusPublisher>,
-    client: IronMeshClient,
+    client: BerryKeepClient,
     remote_status_poll_interval_ms: u64,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
-        .name("ironmesh-windows-status".to_string())
+        .name("berrykeep-windows-status".to_string())
         .spawn(move || {
             let poll_interval = Duration::from_millis(remote_status_poll_interval_ms.max(1_000));
 
@@ -198,7 +198,7 @@ impl WindowsTrayIconHandle {
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread = match thread::Builder::new()
-            .name("ironmesh-windows-tray".to_string())
+            .name("berrykeep-windows-tray".to_string())
             .spawn(move || {
                 let result = tray_thread_main(ready_tx);
                 if let Err(error) = result {
@@ -248,7 +248,7 @@ struct TraySharedState {
 }
 
 fn tray_thread_main(ready_tx: mpsc::Sender<Result<()>>) -> Result<()> {
-    let class_name = utf16_null("IronMeshWindowsTrayStatus");
+    let class_name = utf16_null("BerryKeepWindowsTrayStatus");
     let instance = unsafe { GetModuleHandleW(null()) };
     if instance.is_null() {
         let error = anyhow!("failed to load current module handle for tray window");

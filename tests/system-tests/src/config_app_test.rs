@@ -410,7 +410,7 @@ mod tests {
             );
             let log = fs::read_to_string(&log_file)
                 .with_context(|| format!("failed reading service log {}", log_file.display()))?;
-            assert!(log.contains("=== IronMesh service launch ==="));
+            assert!(log.contains("=== BerryKeep service launch ==="));
             assert!(log.contains("instance_kind=folder-agent"));
             assert!(log.contains("id=folder-log-test"));
             assert!(log.contains("spawn attempt failed executable="));
@@ -555,10 +555,10 @@ mod tests {
         let node_id = "00000000-0000-0000-0000-000000000954";
         let http = reqwest::Client::new();
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-            ("IRONMESH_RENDEZVOUS_MTLS_REQUIRED", "true"),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_RENDEZVOUS_MTLS_REQUIRED", "true"),
         ];
 
         assert!(

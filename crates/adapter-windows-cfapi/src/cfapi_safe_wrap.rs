@@ -48,10 +48,10 @@ pub(crate) struct FetchDataCallbackParams {
     pub(crate) last_dehydration_time: i64,
 }
 
-const FETCH_WORKER_MAX_CONCURRENCY_ENV: &str = "IRONMESH_CFAPI_FETCH_MAX_CONCURRENCY";
+const FETCH_WORKER_MAX_CONCURRENCY_ENV: &str = "BERRYKEEP_CFAPI_FETCH_MAX_CONCURRENCY";
 
 pub(crate) fn fetch_worker_max_concurrency_from_env() -> Result<usize> {
-    match std::env::var(FETCH_WORKER_MAX_CONCURRENCY_ENV) {
+    match common::legacy_compatibility::var(FETCH_WORKER_MAX_CONCURRENCY_ENV) {
         Ok(value) => {
             let parsed = value.parse::<usize>().with_context(|| {
                 format!("failed parsing {FETCH_WORKER_MAX_CONCURRENCY_ENV}={value} as usize")
@@ -746,7 +746,7 @@ impl FetchWorkerPool {
             let completion_sender = completion_sender.clone();
             let worker_shutting_down = shutting_down.clone();
             let handle = std::thread::Builder::new()
-                .name(format!("ironmesh-cfapi-fetch-{worker_index}"))
+                .name(format!("berrykeep-cfapi-fetch-{worker_index}"))
                 .spawn(move || {
                     while let Ok(work) = receiver.recv() {
                         let file_id = work.callback_info.file_id;
@@ -774,7 +774,7 @@ impl FetchWorkerPool {
         let (ingress, receiver) = channel();
         let dispatcher_shutting_down = shutting_down.clone();
         let dispatcher = std::thread::Builder::new()
-            .name("ironmesh-cfapi-fetch-dispatch".to_string())
+            .name("berrykeep-cfapi-fetch-dispatch".to_string())
             .spawn(move || {
                 dispatch_fetch_work(
                     receiver,
@@ -1333,7 +1333,7 @@ mod tests {
     #[test]
     fn metadata_update_handle_allows_a_concurrent_writer() {
         let root = std::env::temp_dir().join(format!(
-            "ironmesh-cfapi-metadata-writer-{}",
+            "berrykeep-cfapi-metadata-writer-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root).expect("failed to create metadata handle test root");
@@ -1361,7 +1361,7 @@ mod tests {
     #[test]
     fn metadata_update_handle_coexists_with_a_writer_that_denies_data_writes() {
         let root = std::env::temp_dir().join(format!(
-            "ironmesh-cfapi-metadata-deny-write-{}",
+            "berrykeep-cfapi-metadata-deny-write-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root).expect("failed to create metadata handle test root");
@@ -1388,8 +1388,10 @@ mod tests {
 
     #[test]
     fn placeholder_state_query_supports_long_verbatim_paths() {
-        let root =
-            std::env::temp_dir().join(format!("ironmesh-cfapi-long-path-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!(
+            "berrykeep-cfapi-long-path-{}",
+            uuid::Uuid::new_v4()
+        ));
         let mut directory = root.clone();
         let mut segment_index = 0;
         while directory.to_string_lossy().encode_utf16().count() <= 280 {

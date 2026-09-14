@@ -5,8 +5,8 @@ import {
   listClientWebServicesOnNode,
   type ClientWebServiceNodeResponse,
   type ClientWebService
-} from "@ironmesh/api";
-import { ironmeshPrimaryColor, PageHeader } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { berrykeepPrimaryColor, PageHeader } from "@berrykeep/ui";
 import { Alert, Badge, Button, Card, Code, Group, SimpleGrid, Stack, Text } from "@mantine/core";
 import { IconExternalLink, IconRefresh } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -140,7 +140,7 @@ export function WebServicesPage() {
       if (embeddedAndroidClient) {
         const launch = await launchClientWebService(service.nodeId, service.id);
         const launchUrl = new URL(launch.url);
-        launchUrl.searchParams.set("ironmesh_open", target);
+        launchUrl.searchParams.set("berrykeep_open", target);
         window.location.assign(launchUrl.toString());
         return;
       }
@@ -169,7 +169,7 @@ export function WebServicesPage() {
     <Stack gap="lg">
       <PageHeader
         title="Web services"
-        description="Open private node-local HTTP and HTTPS applications through the authenticated IronMesh transport. Each service gets an isolated local browser origin; upstream certificates are verified by its home node."
+        description="Open private node-local HTTP and HTTPS applications through the authenticated BerryKeep transport. Each service gets an isolated local browser origin; upstream certificates are verified by its home node."
         actions={
           <Button
             variant="default"
@@ -264,7 +264,7 @@ export function WebServicesPage() {
                     <Text fw={700}>{service.name}</Text>
                     <Text size="sm" c="dimmed">{service.description || "Private web service"}</Text>
                   </Stack>
-                  <Badge color={ironmeshPrimaryColor} variant="light">private</Badge>
+                  <Badge color={berrykeepPrimaryColor} variant="light">private</Badge>
                 </Group>
                 <Text size="xs" c="dimmed" ff="monospace">
                   Node {service.nodeId}

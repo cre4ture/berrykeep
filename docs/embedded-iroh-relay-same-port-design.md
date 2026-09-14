@@ -2,7 +2,7 @@
 
 ## Decision
 
-The standalone IronMesh Rendezvous service exposes its embedded Iroh relay on
+The standalone BerryKeep Rendezvous service exposes its embedded Iroh relay on
 the existing Rendezvous origin and TCP port. For example, both control traffic
 and relay traffic use `https://rendezvous.example.com:443`; Iroh connects to
 the standard `/relay` path on that origin.
@@ -18,7 +18,7 @@ or tune its ticket lifetime and per-connection receive limits.
 
 ## Request Routing
 
-One listener owns the configured `IRONMESH_RENDEZVOUS_BIND` address:
+One listener owns the configured `BERRYKEEP_RENDEZVOUS_BIND` address:
 
 1. TLS is terminated with the existing Rendezvous server certificate.
 2. TLS ALPN continues to select HTTP/2 for capable Rendezvous clients and
@@ -30,11 +30,11 @@ One listener owns the configured `IRONMESH_RENDEZVOUS_BIND` address:
 
 The listener continues to offer optional client-certificate authentication.
 Rendezvous control handlers enforce the authenticated certificate at the
-application boundary. Iroh does not present an IronMesh client certificate, so
+application boundary. Iroh does not present a BerryKeep client certificate, so
 the relay path uses a relay ticket instead.
 
 Plain HTTP remains available only when
-`IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` is explicitly selected for local
+`BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` is explicitly selected for local
 development and tests.
 
 ## Relay Authorization
@@ -44,7 +44,7 @@ Rendezvous client requests an Iroh relay ticket for its local Iroh endpoint ID:
 
 1. The client creates or loads its Iroh secret key.
 2. It authenticates to the Rendezvous control plane using its existing
-   IronMesh client certificate.
+   BerryKeep client certificate.
 3. It calls the relay-ticket endpoint with the corresponding public endpoint
    ID and cluster ID.
 4. Rendezvous returns its relay origin, a short-lived signed ticket, and the
@@ -86,39 +86,39 @@ server node's endpoint-bound ticket to another client.
 
 Custom, operator-provided Iroh relay URLs and tokens remain supported by the
 transport SDK. They are independent of the embedded same-port relay and do not
-gain IronMesh ticket semantics automatically.
+gain BerryKeep ticket semantics automatically.
 
 ## Configuration
 
 The default production setup needs no relay-specific variables. It derives the
-relay origin from `IRONMESH_RENDEZVOUS_PUBLIC_URL`, uses the existing TCP bind
+relay origin from `BERRYKEEP_RENDEZVOUS_PUBLIC_URL`, uses the existing TCP bind
 address for Rendezvous and `/relay`, and reuses the TLS identity for Iroh QUIC
 Address Discovery on UDP `7842`.
 
 Advanced controls are:
 
-- `IRONMESH_IROH_RELAY_ENABLED` — defaults to `true`; set to `false` to disable
+- `BERRYKEEP_IROH_RELAY_ENABLED` — defaults to `true`; set to `false` to disable
   the embedded relay.
-- `IRONMESH_IROH_RELAY_TICKET_TTL_SECS` — ticket and admitted-connection
+- `BERRYKEEP_IROH_RELAY_TICKET_TTL_SECS` — ticket and admitted-connection
   lifetime.
-- `IRONMESH_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND` — per-connection receive
+- `BERRYKEEP_IROH_RELAY_CLIENT_RX_BYTES_PER_SECOND` — per-connection receive
   rate.
-- `IRONMESH_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES` — per-connection burst size.
-- `IRONMESH_IROH_RELAY_QUIC_BIND` — QAD UDP bind address; defaults to
+- `BERRYKEEP_IROH_RELAY_CLIENT_RX_MAX_BURST_BYTES` — per-connection burst size.
+- `BERRYKEEP_IROH_RELAY_QUIC_BIND` — QAD UDP bind address; defaults to
   `0.0.0.0:7842` when a Rendezvous TLS identity is present.
-- `IRONMESH_IROH_RELAY_QUIC_PUBLIC_PORT` — advertised QAD UDP port; defaults
+- `BERRYKEEP_IROH_RELAY_QUIC_PUBLIC_PORT` — advertised QAD UDP port; defaults
   to the bind port.
-- `IRONMESH_IROH_RELAY_QUIC_TLS_CERT` and
-  `IRONMESH_IROH_RELAY_QUIC_TLS_KEY` — optional dedicated QAD identity for
+- `BERRYKEEP_IROH_RELAY_QUIC_TLS_CERT` and
+  `BERRYKEEP_IROH_RELAY_QUIC_TLS_KEY` — optional dedicated QAD identity for
   deployments that cannot reuse Rendezvous TLS.
-- `IRONMESH_RENDEZVOUS_MAX_CONNECTIONS` — global accepted TCP connection cap
+- `BERRYKEEP_RENDEZVOUS_MAX_CONNECTIONS` — global accepted TCP connection cap
   across Rendezvous-only, mTLS, and same-port relay modes; defaults to `512`.
-- `IRONMESH_RENDEZVOUS_MAX_TLS_HANDSHAKES` — global concurrent TLS handshake
+- `BERRYKEEP_RENDEZVOUS_MAX_TLS_HANDSHAKES` — global concurrent TLS handshake
   cap; defaults to `64` and must not exceed the connection cap.
-- `IRONMESH_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT` — combined cap for
+- `BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKETS_PER_CLIENT` — combined cap for
   outstanding multiplex tickets and active source relay WebSockets per client;
   defaults to `10`.
-- `IRONMESH_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE` — rolling issuance
+- `BERRYKEEP_RENDEZVOUS_MAX_RELAY_TICKET_ISSUES_PER_MINUTE` — rolling issuance
   cap for multiplex relay tickets per client; defaults to `10`.
 
 There is intentionally no separate relay public URL or static authentication

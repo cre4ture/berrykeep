@@ -19,7 +19,7 @@ mod tests {
             "event=http_error\n request_path=/api/v1/maps/config\tstatus=503",
         );
         assert!(buffer.render_text().contains(
-            "WARN ironmesh_android_webview event=embedded_web_ui_diagnostic event=http_error request_path=/api/v1/maps/config status=503"
+            "WARN berrykeep_android_webview event=embedded_web_ui_diagnostic event=http_error request_path=/api/v1/maps/config status=503"
         ));
     }
 
@@ -452,13 +452,13 @@ mod tests {
         );
     }
 }
-use client_sdk::ironmesh_client::DownloadRangeRequest;
+use client_sdk::berrykeep_client::DownloadRangeRequest;
 use client_sdk::{
-    ClientConnectionDiagnosticImpact, ClientConnectionDiagnostics,
+    BerryKeepClient, ClientConnectionDiagnosticImpact, ClientConnectionDiagnostics,
     ClientConnectionDiagnosticsEvent, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    EnrolledClientConnection, IronMeshClient, ManagedBootstrapPersistence, ManagedClientOptions,
-    RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
-    StoreIndexView, TitleLatencyProbeConfig, enroll_client_connection_blocking,
+    EnrolledClientConnection, ManagedBootstrapPersistence, ManagedClientOptions, RequestedRange,
+    StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder, StoreIndexView,
+    TitleLatencyProbeConfig, enroll_client_connection_blocking,
     set_connection_diagnostics_observer,
 };
 use jni::JNIEnv;
@@ -485,8 +485,8 @@ use sync_agent_core::{
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
-const ANDROID_CONNECTION_LOG_TARGET: &str = "ironmesh_android_connection";
-const ANDROID_WEBVIEW_LOG_TARGET: &str = "ironmesh_android_webview";
+const ANDROID_CONNECTION_LOG_TARGET: &str = "berrykeep_android_connection";
+const ANDROID_WEBVIEW_LOG_TARGET: &str = "berrykeep_android_webview";
 const ANDROID_FOLDER_SYNC_REMOTE_FALLBACK_INTERVAL_MS: u64 = 60_000;
 const ANDROID_FOLDER_SYNC_REMOTE_NOTIFICATION_WAIT_MS: u64 = 55_000;
 const ANDROID_FOLDER_SYNC_LOCAL_SCAN_INTERVAL_MS: u64 = 2_000;
@@ -498,7 +498,7 @@ const MAX_EMBEDDED_WEB_UI_DIAGNOSTIC_LENGTH: usize = 1_024;
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_initializeAndroidContext(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_initializeAndroidContext(
     mut env: JNIEnv,
     _class: JClass,
     application_context: JObject,
@@ -545,7 +545,7 @@ fn init_android_tracing() {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
     TRACING_INIT.call_once(|| {
         let env_filter = common::logging::env_filter_from_default_env(
-            "info,ironmesh_android_connection=debug,ironmesh_title_latency=debug",
+            "info,berrykeep_android_connection=debug,berrykeep_title_latency=debug",
         );
         let _ = tracing_subscriber::registry()
             .with(env_filter)
@@ -643,7 +643,7 @@ fn initialize_android_preferences_bridge(env: &mut JNIEnv) -> Result<()> {
         .get_java_vm()
         .context("failed to capture Java VM for preferences bridge")?;
     let class = env
-        .find_class("io/ironmesh/android/data/RustPreferencesBridge")
+        .find_class("io/berrykeep/android/data/RustPreferencesBridge")
         .context("failed to find RustPreferencesBridge class")?;
     let global = env
         .new_global_ref(class)
@@ -1138,14 +1138,17 @@ fn android_download_stage_root(category: &str, scope: &str) -> Result<PathBuf> {
         anyhow::bail!("android download staging scope cannot be empty");
     }
     let scope_hash = blake3::hash(scope.as_bytes()).to_hex().to_string();
-    Ok(state_dir
-        .join("ironmesh-downloads")
+    let canonical_path = state_dir
+        .join("berrykeep-downloads")
         .join(category)
-        .join(scope_hash))
+        .join(&scope_hash);
+    Ok(canonical_path)
 }
 
 fn android_folder_sync_state_root() -> Result<PathBuf> {
-    Ok(android_no_backup_files_dir()?.join("ironmesh-folder-sync-state"))
+    let state_dir = android_no_backup_files_dir()?;
+    let canonical_path = state_dir.join("berrykeep-folder-sync-state");
+    Ok(canonical_path)
 }
 
 fn folder_sync_modification_history_json(
@@ -1389,7 +1392,7 @@ impl AndroidFolderSyncManager {
         let thread_running = running.clone();
         let status_store = self.status.clone();
         let thread = thread::Builder::new()
-            .name(format!("ironmesh-folder-sync-{profile_id}"))
+            .name(format!("berrykeep-folder-sync-{profile_id}"))
             .spawn(move || {
                 let result = if options.local_tree_uri.is_some() {
                     android_saf_backend::run_backend_with_control(
@@ -1917,7 +1920,7 @@ fn cached_configured_sdk(
     connection_input: impl Into<String>,
     server_ca_pem: Option<String>,
     client_identity_json: Option<String>,
-) -> Result<IronMeshClient> {
+) -> Result<BerryKeepClient> {
     Ok(
         cached_configured_sdk_build(connection_input, server_ca_pem, client_identity_json)?
             .client("android foreground"),
@@ -2006,7 +2009,7 @@ fn parse_store_index_media_filter(value: Option<&str>) -> Result<Option<StoreInd
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_startWebUi(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_startWebUi(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2048,7 +2051,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopWebUi(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_stopWebUi(
     mut env: JNIEnv,
     _class: JClass,
 ) {
@@ -2061,7 +2064,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_clearCachedData(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_clearCachedData(
     mut env: JNIEnv,
     _class: JClass,
 ) {
@@ -2078,7 +2081,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_cle
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_configureTitleLatencyMonitor(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_configureTitleLatencyMonitor(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2130,7 +2133,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_con
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopTitleLatencyMonitor(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_stopTitleLatencyMonitor(
     _env: JNIEnv,
     _class: JClass,
 ) {
@@ -2141,7 +2144,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getTitleLatencyStatus(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_getTitleLatencyStatus(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -2170,7 +2173,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getDiagnosticLog(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_getDiagnosticLog(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -2191,7 +2194,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_recordEmbeddedWebUiDiagnostic(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_recordEmbeddedWebUiDiagnostic(
     mut env: JNIEnv,
     _class: JClass,
     message: JString,
@@ -2214,7 +2217,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_rec
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getConnectionRouteSnapshot(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_getConnectionRouteSnapshot(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2263,7 +2266,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_notifyNetworkChanged(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_notifyNetworkChanged(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2303,7 +2306,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_not
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_notifyForegrounded(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_notifyForegrounded(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2340,7 +2343,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_not
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_resetConnectionTimingMeasurement(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_resetConnectionTimingMeasurement(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2385,7 +2388,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_res
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_runConnectionTimingStoreIndexTest(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_runConnectionTimingStoreIndexTest(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2430,7 +2433,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enrollWithBootstrap(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_enrollWithBootstrap(
     mut env: JNIEnv,
     _class: JClass,
     bootstrap_json: JString,
@@ -2476,7 +2479,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_enr
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_putObject(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_putObject(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2514,7 +2517,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_put
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getObject(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_getObject(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2568,7 +2571,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_storeIndex(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_storeIndex(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2617,7 +2620,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_storeIndexWithOptions(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_storeIndexWithOptions(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2720,7 +2723,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_setMediaLabels(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_setMediaLabels(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2756,7 +2759,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_set
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamPutObject<
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_streamPutObject<
     'local,
 >(
     mut env: JNIEnv<'local>,
@@ -2796,7 +2799,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_deleteObject(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_deleteObject(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2830,7 +2833,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_del
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamObjectTo<
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_streamObjectTo<
     'local,
 >(
     mut env: JNIEnv<'local>,
@@ -2873,7 +2876,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getObjectSize(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_getObjectSize(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2911,7 +2914,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_readObjectRange(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_readObjectRange(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -2988,7 +2991,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_rea
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_streamRelativeUrlTo<
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_streamRelativeUrlTo<
     'local,
 >(
     mut env: JNIEnv<'local>,
@@ -3036,7 +3039,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_str
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_runFolderSyncOnce(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_runFolderSyncOnce(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -3114,7 +3117,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_run
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_startContinuousFolderSync(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_startContinuousFolderSync(
     mut env: JNIEnv,
     _class: JClass,
     profile_id: JString,
@@ -3194,7 +3197,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sta
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopContinuousFolderSync(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_stopContinuousFolderSync(
     mut env: JNIEnv,
     _class: JClass,
     profile_id: JString,
@@ -3220,7 +3223,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_stopAllContinuousFolderSync(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_stopAllContinuousFolderSync(
     mut env: JNIEnv,
     _class: JClass,
 ) {
@@ -3244,7 +3247,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_sto
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getContinuousFolderSyncStatus(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_getContinuousFolderSyncStatus(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -3275,7 +3278,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_getFolderSyncModificationHistory(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_getFolderSyncModificationHistory(
     mut env: JNIEnv,
     _class: JClass,
     connection_input: JString,
@@ -3340,7 +3343,7 @@ pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_get
 /// This function is intended to be called from Java via JNI.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_ironmesh_android_data_RustClientBridge_hasContinuousFolderSyncActive(
+pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_hasContinuousFolderSyncActive(
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {

@@ -1,10 +1,10 @@
-# IronMesh Windows CFAPI Adapter
+# BerryKeep Windows CFAPI Adapter
 
-This crate contains the Windows Cloud Files (`CFAPI`) adapter used by `ironmesh-os-integration`.
+This crate contains the Windows Cloud Files (`CFAPI`) adapter used by `berrykeep-os-integration`.
 
 It is responsible for:
 
-- registering and serving an IronMesh sync root on Windows
+- registering and serving a BerryKeep sync root on Windows
 - materializing remote namespace entries as local placeholders
 - hydrating placeholder file ranges on demand
 - observing local changes and syncing them back to the server
@@ -36,10 +36,10 @@ Version-2 placeholder identities without `object_id` remain readable. Reconcilia
 
 - The adapter now exposes a manual cancel path for a currently running hydration.
 - This is mainly intended for debugging and test scenarios where a large placeholder hydration was triggered accidentally and you want to stop it without waiting for the full download to finish.
-- The running `ironmesh-os-integration serve` process publishes active-hydration markers under `%LocalAppData%\Ironmesh\sync-roots\...` while a file fetch is in flight.
+- The running `berrykeep-os-integration serve` process publishes active-hydration markers under `%LocalAppData%\BerryKeep\sync-roots\...` while a file fetch is in flight.
 - A cancel request can be issued either:
   - through the packaged Explorer Cloud Files context menu verb `Cancel Hydration`
-  - or directly through `ironmesh-os-integration cancel-hydration --root-path <sync-root> --path <relative-or-absolute-path>`
+  - or directly through `berrykeep-os-integration cancel-hydration --root-path <sync-root> --path <relative-or-absolute-path>`
 - The cancel request is best-effort and only applies to hydrations that are active at the moment of the request.
 - The backend cancellation signal is threaded into the download path, so a large in-flight ranged download can stop mid-transfer instead of waiting for the full object to complete.
 
@@ -77,7 +77,7 @@ See the Windows system tests:
 
 Current limitation:
 
-- A normal Explorer file copy of a dehydrated placeholder is not currently delegated to IronMesh as a remote metadata-only copy.
+- A normal Explorer file copy of a dehydrated placeholder is not currently delegated to BerryKeep as a remote metadata-only copy.
 - In practice this means Windows may hydrate the source, perform a local copy, and the adapter may then observe the destination as a new local file that needs upload handling.
 
 Why this limitation exists:
@@ -87,8 +87,8 @@ Why this limitation exists:
 
 What the backend already supports:
 
-- IronMesh already has a server-side metadata copy operation in the client and server layers.
-- The client-side entry point is `copy_path` in [`../client-sdk/src/ironmesh_client.rs`](../client-sdk/src/ironmesh_client.rs).
+- BerryKeep already has a server-side metadata copy operation in the client and server layers.
+- The client-side entry point is `copy_path` in [`../client-sdk/src/berrykeep_client.rs`](../client-sdk/src/berrykeep_client.rs).
 - The server-side implementation is `copy_object_path` in [`../server-node-sdk/src/storage.rs`](../server-node-sdk/src/storage.rs).
 
 What could still be improved later:

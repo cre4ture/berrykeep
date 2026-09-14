@@ -6,11 +6,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DEFAULT_HOST="root@192.168.178.132"
 DEFAULT_REMOTE_PATH="/userdata/berrykeep-server-node"
-DEFAULT_LEGACY_REMOTE_PATH="/userdata/ironmesh-server-node"
+DEFAULT_LEGACY_REMOTE_PATH="/userdata/berrykeep-server-node"
 
-HOST="${IRONMESH_LUCKFOX_HOST:-${DEFAULT_HOST}}"
-REMOTE_PATH="${IRONMESH_LUCKFOX_REMOTE_PATH:-${DEFAULT_REMOTE_PATH}}"
-LEGACY_REMOTE_PATH="${IRONMESH_LUCKFOX_LEGACY_REMOTE_PATH:-${DEFAULT_LEGACY_REMOTE_PATH}}"
+HOST="${BERRYKEEP_LUCKFOX_HOST:-${DEFAULT_HOST}}"
+REMOTE_PATH="${BERRYKEEP_LUCKFOX_REMOTE_PATH:-${DEFAULT_REMOTE_PATH}}"
+LEGACY_REMOTE_PATH="${BERRYKEEP_LUCKFOX_LEGACY_REMOTE_PATH:-${DEFAULT_LEGACY_REMOTE_PATH}}"
 
 log() {
   printf '[deploy-server-node-to-luckfox] %s\n' "$*"
@@ -38,9 +38,9 @@ Options:
   -h, --help          Show this help text.
 
 Environment:
-  IRONMESH_LUCKFOX_HOST         Default for --host.
-  IRONMESH_LUCKFOX_REMOTE_PATH  Default for --remote-path.
-  IRONMESH_LUCKFOX_LEGACY_REMOTE_PATH
+  BERRYKEEP_LUCKFOX_HOST         Default for --host.
+  BERRYKEEP_LUCKFOX_REMOTE_PATH  Default for --remote-path.
+  BERRYKEEP_LUCKFOX_LEGACY_REMOTE_PATH
                               Legacy command path kept as a symlink to the
                               deployed BerryKeep binary.
 EOF

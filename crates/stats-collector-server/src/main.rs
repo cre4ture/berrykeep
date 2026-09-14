@@ -305,7 +305,7 @@ mod tests {
             .await
             .expect("dashboard index should be readable");
         let index_html = String::from_utf8(index_body.to_vec()).expect("dashboard index is UTF-8");
-        assert!(index_html.contains("<title>IronMesh Fleet Reliability</title>"));
+        assert!(index_html.contains("<title>BerryKeep Fleet Reliability</title>"));
         let script_path = index_html
             .split("<script")
             .find_map(|tag| tag.split("src=\"").nth(1))
@@ -338,7 +338,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/ironmesh-favicon.svg")
+                    .uri("/berrykeep-favicon.svg")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -354,7 +354,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/%69ronmesh-favicon.svg")
+                    .uri("/%62errykeep-favicon.svg")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -372,7 +372,7 @@ mod tests {
         let unreferenced_documentation_asset_response = app
             .oneshot(
                 Request::builder()
-                    .uri("/ironmesh-at-a-glance.png")
+                    .uri("/berrykeep-at-a-glance.png")
                     .body(Body::empty())
                     .unwrap(),
             )

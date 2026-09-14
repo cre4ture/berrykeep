@@ -35,7 +35,7 @@
   - Route writes/renames/deletes to core engine.
 - Status surfacing recommendation:
   - Expose lightweight sync state on the primary inode via read-only xattrs.
-  - Mount remote-side conflict artifacts under `.ironmesh-conflicts/remote/...`.
+  - Mount remote-side conflict artifacts under `.berrykeep-conflicts/remote/...`.
   - Avoid sibling marker files next to user content because they pollute directory listings and
     confuse apps/indexers.
 - Future option: GNOME GVfs or KDE KIO backend for tighter shell UX.
@@ -133,30 +133,30 @@ Out of scope for MVP:
 The Linux mount should use a hybrid status model:
 
 - Primary files/directories stay in the normal namespace and expose state through read-only
-  `user.ironmesh.*` xattrs.
-- Conflict artifacts are mounted under `.ironmesh-conflicts/remote/...`.
-- The internal `.ironmesh-conflicts` subtree is reserved and read-only from the mount.
+  `user.berrykeep.*` xattrs.
+- Conflict artifacts are mounted under `.berrykeep-conflicts/remote/...`.
+- The internal `.berrykeep-conflicts` subtree is reserved and read-only from the mount.
 
 Recommended xattrs:
 
-- `user.ironmesh.state`
+- `user.berrykeep.state`
   - Comma-separated state flags such as `clean`, `placeholder`, `dirty`, `conflict`,
     `conflict-copy`, and `read-only`.
-- `user.ironmesh.local_version`
-- `user.ironmesh.remote_version`
-- `user.ironmesh.conflict_reason`
-- `user.ironmesh.conflict_copy`
+- `user.berrykeep.local_version`
+- `user.berrykeep.remote_version`
+- `user.berrykeep.conflict_reason`
+- `user.berrykeep.conflict_copy`
   - Mount-relative path to the remote conflict artifact when present.
-- `user.ironmesh.source_path`
+- `user.berrykeep.source_path`
   - For sidecar conflict copies, the original user-visible path they represent.
 
 Current Linux FUSE interpretation:
 
-- Runtime local modifications set `user.ironmesh.state=dirty` until upload succeeds on
+- Runtime local modifications set `user.berrykeep.state=dirty` until upload succeeds on
   flush/release.
 - Planner-provided `MarkConflict` actions surface both:
   - a user-visible conflicted file with conflict xattrs, and
-  - a read-only remote-side artifact under `.ironmesh-conflicts/remote/...`.
+  - a read-only remote-side artifact under `.berrykeep-conflicts/remote/...`.
 - The conflict sidecar mirrors the remote object view. This keeps the primary namespace clean
   while preserving a discoverable place for remote conflict artifacts.
 
@@ -217,12 +217,12 @@ Current Linux FUSE interpretation:
 ## Folder agent usage (MVP)
 
 ```bash
-mkdir -p /tmp/ironmesh-root
-cargo run -p ironmesh-folder-agent -- \
-  --root-dir /tmp/ironmesh-root \
+mkdir -p /tmp/berrykeep-root
+cargo run -p berrykeep-folder-agent -- \
+  --root-dir /tmp/berrykeep-root \
   --server-base-url https://127.0.0.1:18080 \
-  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
-  --client-identity-file /path/to/ironmesh-client-identity.json
+  --server-ca-pem-file /path/to/berrykeep-public-ca.pem \
+  --client-identity-file /path/to/berrykeep-client-identity.json
 ```
 
 Key options:
@@ -235,11 +235,11 @@ Key options:
 
 ## Linux FUSE usage (current)
 
-The Linux adapter is exposed to users as `ironmesh-os-integration`.
+The Linux adapter is exposed to users as `berrykeep-os-integration`.
 
 - Crate: `crates/adapter-linux-fuse`
 - Cargo package for source-checkout `cargo run`: `apps/os-integration`
-- Installed/public command name: `ironmesh-os-integration`
+- Installed/public command name: `berrykeep-os-integration`
 
 Example snapshot file:
 
@@ -266,10 +266,10 @@ Example snapshot file:
 Mount command:
 
 ```bash
-mkdir -p /tmp/ironmesh-mount
+mkdir -p /tmp/berrykeep-mount
 cargo run -p os-integration -- \
   --snapshot-file /tmp/snapshot.json \
-  --mountpoint /tmp/ironmesh-mount
+  --mountpoint /tmp/berrykeep-mount
 ```
 
 Snapshot mode behavior:
@@ -281,12 +281,12 @@ Snapshot mode behavior:
 Direct/bootstrap client-rights edge mode:
 
 ```bash
-mkdir -p /tmp/ironmesh-mount-live
+mkdir -p /tmp/berrykeep-mount-live
 cargo run -p os-integration -- \
   --server-base-url https://127.0.0.1:18080 \
-  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
-  --client-identity-file /path/to/ironmesh-client-identity.json \
-  --mountpoint /tmp/ironmesh-mount-live
+  --server-ca-pem-file /path/to/berrykeep-public-ca.pem \
+  --client-identity-file /path/to/berrykeep-client-identity.json \
+  --mountpoint /tmp/berrykeep-mount-live
 ```
 
 - `--server-base-url` loads namespace entries from `/store/index` and, when auth is required,
@@ -296,8 +296,8 @@ cargo run -p os-integration -- \
 - `--bootstrap-file` is the equivalent authenticated entrypoint when a client bootstrap bundle is
   preferred over a raw base URL. If `--client-identity-file` is omitted, the adapter also checks
   for a sibling `*.client-identity.json`, for example
-  `ironmesh-client-bootstrap.client-identity.json` next to
-  `ironmesh-client-bootstrap.json`.
+  `berrykeep-client-bootstrap.client-identity.json` next to
+  `berrykeep-client-bootstrap.json`.
 - Local writes, deletes, and renames are captured into a durable local mutation queue first and
   then synchronized through client APIs.
 - Offline restart replays the last cached snapshot plus queued local mutations.
@@ -320,17 +320,17 @@ cargo run -p os-integration -- \
   --mountpoint /tmp/placeholder \
   gnome install-extension
 
-mkdir -p /tmp/ironmesh-mount-live
+mkdir -p /tmp/berrykeep-mount-live
 cargo run -p os-integration -- \
   --server-base-url https://127.0.0.1:18080 \
-  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
-  --client-identity-file /path/to/ironmesh-client-identity.json \
-  --mountpoint /tmp/ironmesh-mount-live \
+  --server-ca-pem-file /path/to/berrykeep-public-ca.pem \
+  --client-identity-file /path/to/berrykeep-client-identity.json \
+  --mountpoint /tmp/berrykeep-mount-live \
   --publish-gnome-status
 ```
 
 - `gnome print-status-path` prints the JSON path watched by the GNOME Shell extension.
-- `--gnome-status-file` overrides the default `$XDG_RUNTIME_DIR/ironmesh/gnome-status.json`
+- `--gnome-status-file` overrides the default `$XDG_RUNTIME_DIR/berrykeep/gnome-status.json`
   location.
 - `--remote-status-poll-interval-ms` controls how often the GNOME surface refreshes authenticated
   connection and replication status; this is separate from `--remote-refresh-interval-ms`, which
@@ -341,13 +341,13 @@ cargo run -p os-integration -- \
 Recommended same-device deployment:
 
 ```bash
-mkdir -p /tmp/ironmesh-mount-live
+mkdir -p /tmp/berrykeep-mount-live
 cargo run -p os-integration -- \
   --server-base-url https://127.0.0.1:18080 \
-  --server-ca-pem-file /path/to/ironmesh-public-ca.pem \
-  --client-identity-file /path/to/ironmesh-client-identity.json \
+  --server-ca-pem-file /path/to/berrykeep-public-ca.pem \
+  --client-identity-file /path/to/berrykeep-client-identity.json \
   --offline-object-cache off \
-  --mountpoint /tmp/ironmesh-mount-live
+  --mountpoint /tmp/berrykeep-mount-live
 ```
 
 - Use `--offline-object-cache off` when the FUSE mount already runs on the same device as a

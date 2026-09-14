@@ -33,11 +33,11 @@ Status: active implementation checklist for replacing the pre-release relay HTTP
 
 Primary files:
 
-- [x] [crates/transport-sdk/Cargo.toml](/home/uli/rust-dev/ironmesh/crates/transport-sdk/Cargo.toml)
-- [x] [crates/transport-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/lib.rs)
-- [x] [crates/transport-sdk/src/ws_stream.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/ws_stream.rs)
-- [x] [crates/transport-sdk/src/mux.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/mux.rs)
-- [x] [crates/transport-sdk/src/transport_protocol.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/transport_protocol.rs)
+- [x] [crates/transport-sdk/Cargo.toml](/home/uli/rust-dev/berrykeep/crates/transport-sdk/Cargo.toml)
+- [x] [crates/transport-sdk/src/lib.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/lib.rs)
+- [x] [crates/transport-sdk/src/ws_stream.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/ws_stream.rs)
+- [x] [crates/transport-sdk/src/mux.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/mux.rs)
+- [x] [crates/transport-sdk/src/transport_protocol.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/transport_protocol.rs)
 
 ### Milestone 2: Persistent relay sessions
 
@@ -59,13 +59,13 @@ Current slice landed:
 
 Primary files:
 
-- [x] [crates/transport-sdk/src/rendezvous.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous.rs)
-- [x] [crates/transport-sdk/src/rendezvous_runtime.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous_runtime.rs)
-- [x] [crates/transport-sdk/src/relay_tunnel.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay_tunnel.rs)
-- [x] [apps/rendezvous-service/src/main.rs](/home/uli/rust-dev/ironmesh/apps/rendezvous-service/src/main.rs)
-- [x] [crates/server-node-sdk/src/embedded_rendezvous.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/embedded_rendezvous.rs)
-- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
-- [x] [crates/server-node-sdk/src/main_tests.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/main_tests.rs)
+- [x] [crates/transport-sdk/src/rendezvous.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/rendezvous.rs)
+- [x] [crates/transport-sdk/src/rendezvous_runtime.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/rendezvous_runtime.rs)
+- [x] [crates/transport-sdk/src/relay_tunnel.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/relay_tunnel.rs)
+- [x] [apps/rendezvous-service/src/main.rs](/home/uli/rust-dev/berrykeep/apps/rendezvous-service/src/main.rs)
+- [x] [crates/server-node-sdk/src/embedded_rendezvous.rs](/home/uli/rust-dev/berrykeep/crates/server-node-sdk/src/embedded_rendezvous.rs)
+- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/berrykeep/crates/server-node-sdk/src/lib.rs)
+- [x] [crates/server-node-sdk/src/main_tests.rs](/home/uli/rust-dev/berrykeep/crates/server-node-sdk/src/main_tests.rs)
 
 ### Milestone 3: Direct multiplexed server transport
 
@@ -83,9 +83,9 @@ Current slice landed:
 
 Primary files:
 
-- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
-- [x] [crates/client-sdk/src/connection.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/connection.rs)
-- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
+- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/berrykeep/crates/server-node-sdk/src/lib.rs)
+- [x] [crates/client-sdk/src/connection.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/connection.rs)
+- [x] [crates/client-sdk/src/berrykeep_client.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/berrykeep_client.rs)
 
 ### Milestone 4: Shared server transport service layer
 
@@ -100,26 +100,26 @@ Current slice landed:
 
 Primary files:
 
-- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
-- [x] [crates/server-node-sdk/src/transport_service.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/transport_service.rs)
+- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/berrykeep/crates/server-node-sdk/src/lib.rs)
+- [x] [crates/server-node-sdk/src/transport_service.rs](/home/uli/rust-dev/berrykeep/crates/server-node-sdk/src/transport_service.rs)
 
 ### Milestone 5: Client session pool and path management
 
-- [x] Replace per-request relay setup in `IronMeshClient` with warm transport sessions.
+- [x] Replace per-request relay setup in `BerryKeepClient` with warm transport sessions.
 - [x] Introduce a session pool for direct and relay paths.
 - [x] Keep bootstrap/path-selection logic, but target sessions instead of bespoke request transports.
 
 Current slice landed:
 
 - [x] Move direct and relay warm-session ownership into a shared `session_pool` module instead of transport-specific cached session fields.
-- [x] Expose transport session-pool snapshots from `IronMeshClient` so later diagnostics can report connection reuse and resets without reworking the client surface again.
+- [x] Expose transport session-pool snapshots from `BerryKeepClient` so later diagnostics can report connection reuse and resets without reworking the client surface again.
 
 Primary files:
 
-- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
-- [x] [crates/client-sdk/src/bootstrap.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/bootstrap.rs)
-- [x] [crates/client-sdk/src/connection.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/connection.rs)
-- [x] [crates/client-sdk/src/session_pool.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/session_pool.rs)
+- [x] [crates/client-sdk/src/berrykeep_client.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/berrykeep_client.rs)
+- [x] [crates/client-sdk/src/bootstrap.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/bootstrap.rs)
+- [x] [crates/client-sdk/src/connection.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/connection.rs)
+- [x] [crates/client-sdk/src/session_pool.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/session_pool.rs)
 
 ### Milestone 6: Small-request SDK migration
 
@@ -134,10 +134,10 @@ Current slice landed:
 
 Primary files:
 
-- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
-- [x] [crates/client-sdk/src/latency_probe.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/latency_probe.rs)
-- [x] [apps/cli-client/src/main.rs](/home/uli/rust-dev/ironmesh/apps/cli-client/src/main.rs)
-- [x] [crates/web-ui-backend/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/web-ui-backend/src/lib.rs)
+- [x] [crates/client-sdk/src/berrykeep_client.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/berrykeep_client.rs)
+- [x] [crates/client-sdk/src/latency_probe.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/latency_probe.rs)
+- [x] [apps/cli-client/src/main.rs](/home/uli/rust-dev/berrykeep/apps/cli-client/src/main.rs)
+- [x] [crates/web-ui-backend/src/lib.rs](/home/uli/rust-dev/berrykeep/crates/web-ui-backend/src/lib.rs)
 
 ### Milestone 7: Bulk transfer stream migration
 
@@ -155,8 +155,8 @@ Current slice landed:
 
 Primary files:
 
-- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
-- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/lib.rs)
+- [x] [crates/client-sdk/src/berrykeep_client.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/berrykeep_client.rs)
+- [x] [crates/server-node-sdk/src/lib.rs](/home/uli/rust-dev/berrykeep/crates/server-node-sdk/src/lib.rs)
 
 ### Milestone 8: Diagnostics and UI wiring
 
@@ -171,10 +171,10 @@ Current slice landed:
 
 Primary files:
 
-- [x] [apps/cli-client/src/main.rs](/home/uli/rust-dev/ironmesh/apps/cli-client/src/main.rs)
-- [x] [crates/web-ui-backend/src/lib.rs](/home/uli/rust-dev/ironmesh/crates/web-ui-backend/src/lib.rs)
-- [x] [web/packages/api/src/client-ui/client.ts](/home/uli/rust-dev/ironmesh/web/packages/api/src/client-ui/client.ts)
-- [x] [web/apps/client-ui/src/app-shell/ClientShell.tsx](/home/uli/rust-dev/ironmesh/web/apps/client-ui/src/app-shell/ClientShell.tsx)
+- [x] [apps/cli-client/src/main.rs](/home/uli/rust-dev/berrykeep/apps/cli-client/src/main.rs)
+- [x] [crates/web-ui-backend/src/lib.rs](/home/uli/rust-dev/berrykeep/crates/web-ui-backend/src/lib.rs)
+- [x] [web/packages/api/src/client-ui/client.ts](/home/uli/rust-dev/berrykeep/web/packages/api/src/client-ui/client.ts)
+- [x] [web/apps/client-ui/src/app-shell/ClientShell.tsx](/home/uli/rust-dev/berrykeep/web/apps/client-ui/src/app-shell/ClientShell.tsx)
 
 ### Milestone 9: Legacy transport removal
 
@@ -194,12 +194,12 @@ Current slice landed:
 
 Primary files:
 
-- [x] [crates/transport-sdk/src/relay.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay.rs)
-- [x] [crates/transport-sdk/src/relay_http_wire.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/relay_http_wire.rs)
-- [x] [crates/transport-sdk/src/rendezvous_runtime.rs](/home/uli/rust-dev/ironmesh/crates/transport-sdk/src/rendezvous_runtime.rs)
-- [x] [apps/rendezvous-service/src/main.rs](/home/uli/rust-dev/ironmesh/apps/rendezvous-service/src/main.rs)
-- [x] [crates/server-node-sdk/src/embedded_rendezvous.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/embedded_rendezvous.rs)
-- [x] [crates/client-sdk/src/ironmesh_client.rs](/home/uli/rust-dev/ironmesh/crates/client-sdk/src/ironmesh_client.rs)
+- [x] [crates/transport-sdk/src/relay.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/relay.rs)
+- [x] [crates/transport-sdk/src/relay_http_wire.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/relay_http_wire.rs)
+- [x] [crates/transport-sdk/src/rendezvous_runtime.rs](/home/uli/rust-dev/berrykeep/crates/transport-sdk/src/rendezvous_runtime.rs)
+- [x] [apps/rendezvous-service/src/main.rs](/home/uli/rust-dev/berrykeep/apps/rendezvous-service/src/main.rs)
+- [x] [crates/server-node-sdk/src/embedded_rendezvous.rs](/home/uli/rust-dev/berrykeep/crates/server-node-sdk/src/embedded_rendezvous.rs)
+- [x] [crates/client-sdk/src/berrykeep_client.rs](/home/uli/rust-dev/berrykeep/crates/client-sdk/src/berrykeep_client.rs)
 
 ### Milestone 10: System-level hardening
 
@@ -219,9 +219,9 @@ Current slice landed:
 
 Primary files:
 
-- [x] [tests/system-tests/src/client_sdk_test.rs](/home/uli/rust-dev/ironmesh/tests/system-tests/src/client_sdk_test.rs)
-- [x] [tests/system-tests/src/cluster_test.rs](/home/uli/rust-dev/ironmesh/tests/system-tests/src/cluster_test.rs)
-- [x] [crates/server-node-sdk/src/main_tests.rs](/home/uli/rust-dev/ironmesh/crates/server-node-sdk/src/main_tests.rs)
+- [x] [tests/system-tests/src/client_sdk_test.rs](/home/uli/rust-dev/berrykeep/tests/system-tests/src/client_sdk_test.rs)
+- [x] [tests/system-tests/src/cluster_test.rs](/home/uli/rust-dev/berrykeep/tests/system-tests/src/cluster_test.rs)
+- [x] [crates/server-node-sdk/src/main_tests.rs](/home/uli/rust-dev/berrykeep/crates/server-node-sdk/src/main_tests.rs)
 
 ## Progress log
 
@@ -264,7 +264,7 @@ Primary files:
   Verification:
   - `cargo test -p client-sdk latency_probe`
   - `cargo check -p cli-client -p web-ui-backend`
-  - `pnpm --dir web --filter @ironmesh/api --filter @ironmesh/client-ui typecheck`
+  - `pnpm --dir web --filter @berrykeep/api --filter @berrykeep/client-ui typecheck`
 - [x] 2026-04-08: Introduce dedicated object-read transport substreams and stream ranged downloads over multiplexed direct/relay sessions instead of buffering whole range bodies through RPC frames.
   Verification:
   - `cargo check -p transport-sdk -p server-node-sdk -p client-sdk`
@@ -327,7 +327,7 @@ Primary files:
 - [x] 2026-04-08: Finish the transport migration hardening pass with end-to-end tests for relay session reuse, mixed large+small direct traffic, live latency diagnostics, relay reconnects after rendezvous restarts, and managed rendezvous failover.
   Verification:
   - `cargo test -p system-tests relay_only_bootstrap_reuses_transport_session_across_multiple_requests`
-  - `cargo test -p system-tests ironmesh_client_keeps_small_requests_responsive_during_large_download_end_to_end`
-  - `cargo test -p system-tests ironmesh_client_latency_probe_reports_cold_connect_and_session_reuse_end_to_end`
+  - `cargo test -p system-tests berrykeep_client_keeps_small_requests_responsive_during_large_download_end_to_end`
+  - `cargo test -p system-tests berrykeep_client_latency_probe_reports_cold_connect_and_session_reuse_end_to_end`
   - `cargo test -p system-tests relay_required_nodes_reconnect_after_rendezvous_restart_and_replicate`
   - `cargo test -p system-tests zero_touch_managed_rendezvous_failover_promotes_second_node_and_keeps_relay_clients_working`

@@ -1453,7 +1453,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("ironmesh-{name}-{unique}"));
+        let path = std::env::temp_dir().join(format!("berrykeep-{name}-{unique}"));
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::create_dir_all(&path);
         path
@@ -1470,7 +1470,7 @@ mod tests {
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "ironmesh-rendezvous-test-ca");
+            .push(rcgen::DnType::CommonName, "berrykeep-rendezvous-test-ca");
         params.key_usages = vec![
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
@@ -1495,17 +1495,17 @@ mod tests {
         let mut params = rcgen::CertificateParams::default();
         params.distinguished_name.push(
             rcgen::DnType::CommonName,
-            format!("ironmesh-node-{node_id}"),
+            format!("berrykeep-node-{node_id}"),
         );
         params
             .subject_alt_names
             .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:node:{node_id}"))
+            rcgen::string::Ia5String::try_from(format!("urn:berrykeep:node:{node_id}"))
                 .context("invalid node SAN URI")?,
         ));
         params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+            rcgen::string::Ia5String::try_from(format!("urn:berrykeep:cluster:{cluster_id}"))
                 .context("invalid cluster SAN URI")?,
         ));
         params.extended_key_usages = vec![
@@ -1528,14 +1528,14 @@ mod tests {
         let mut params = rcgen::CertificateParams::default();
         params.distinguished_name.push(
             rcgen::DnType::CommonName,
-            format!("ironmesh-device-{device_id}"),
+            format!("berrykeep-device-{device_id}"),
         );
         params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:device:{device_id}"))
+            rcgen::string::Ia5String::try_from(format!("urn:berrykeep:device:{device_id}"))
                 .context("invalid device SAN URI")?,
         ));
         params.subject_alt_names.push(rcgen::SanType::URI(
-            rcgen::string::Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+            rcgen::string::Ia5String::try_from(format!("urn:berrykeep:cluster:{cluster_id}"))
                 .context("invalid cluster SAN URI")?,
         ));
         params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
@@ -1551,7 +1551,7 @@ mod tests {
         let mut params = rcgen::CertificateParams::default();
         params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "ironmesh-rendezvous-service");
+            .push(rcgen::DnType::CommonName, "berrykeep-rendezvous-service");
         params
             .subject_alt_names
             .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));

@@ -4,9 +4,9 @@ Status: Adopted for the GNOME-first desktop slice
 
 ## Summary
 
-IronMesh should expose a compact desktop status surface that answers three questions quickly:
+BerryKeep should expose a compact desktop status surface that answers three questions quickly:
 
-- Is the client connected to IronMesh right now?
+- Is the client connected to BerryKeep right now?
 - Is the local folder sync engine healthy or currently transferring changes?
 - Is cluster replication healthy after local changes reach the server?
 
@@ -62,13 +62,13 @@ Why this is first:
 - Ubuntu GNOME does not provide a uniformly reliable first-class tray experience without extra
   extensions.
 - A native Shell extension avoids asking the user to install AppIndicator support before they can
-  see IronMesh state.
+  see BerryKeep state.
 
 Implementation shape:
 
 - GNOME Shell extension in the top bar.
 - The config app publishes a small merged JSON status document under
-  `$XDG_RUNTIME_DIR/ironmesh/gnome-status.json`.
+  `$XDG_RUNTIME_DIR/berrykeep/gnome-status.json`.
 - The extension monitors that file and renders:
   - a single top-bar icon,
   - a menu with connection, sync, and replication rows,
@@ -83,7 +83,7 @@ Current repo implementation:
 - `apps/background-launcher/src/main.rs`
 - `apps/folder-agent/src/gnome.rs` as folder-agent telemetry publishing
 - `crates/adapter-linux-fuse/src/gnome.rs` as Linux FUSE telemetry publishing
-- `apps/folder-agent/gnome-shell-extension/ironmesh-status@ironmesh.io/`
+- `apps/folder-agent/gnome-shell-extension/berrykeep-status@berrykeep.io/`
 
 ### 2. Windows
 
@@ -143,7 +143,7 @@ The config app owns the shared GNOME status document and combines three sources:
 - detailed telemetry documents from active desktop runtimes:
   - `sync-agent-core::run_folder_agent_with_control` status callbacks for folder sync,
   - Linux FUSE mount lifecycle state from `adapter-linux-fuse`,
-- authenticated remote status from existing IronMesh client JSON endpoints:
+- authenticated remote status from existing BerryKeep client JSON endpoints:
   - `/cluster/status`
   - `/cluster/replication/plan`
   - `/health` fallback
@@ -158,7 +158,7 @@ This gives us:
 
 The GNOME Shell extension consumes one merged config-app status document:
 
-- the config app writes `$XDG_RUNTIME_DIR/ironmesh/gnome-status.json`,
+- the config app writes `$XDG_RUNTIME_DIR/berrykeep/gnome-status.json`,
 - managed services write per-instance telemetry files under the desktop client state directory,
 - the indicator derives one icon from the merged connection, sync, and replication facets,
 - the indicator menu can open the config app web UI.
@@ -172,10 +172,10 @@ owner.
 Recommended GNOME workflow today:
 
 1. Install the extension:
-  - `cargo run -p ironmesh-config-app -- gnome install-extension`
+  - `cargo run -p berrykeep-config-app -- gnome install-extension`
 2. Start the config app:
-  - foreground web UI: `cargo run -p ironmesh-config-app`
-  - background managed-services owner: `cargo run -p ironmesh-config-app -- --background`
+  - foreground web UI: `cargo run -p berrykeep-config-app`
+  - background managed-services owner: `cargo run -p berrykeep-config-app -- --background`
 3. Define and start managed services in the config app. The config app publishes the merged status
    file, and service runtimes publish per-instance telemetry files for the aggregator.
 
@@ -183,11 +183,11 @@ Notes:
 
 - `gnome print-status-path` prints the exact JSON path the extension watches.
 - `--desktop-status-file` lets development environments override the config-app status path.
-- Debian client installs ship an XDG autostart entry for `ironmesh-config-app --background`.
+- Debian client installs ship an XDG autostart entry for `berrykeep-config-app --background`.
 - The Windows prototype installer starts the packaged background launcher after `-Install`; the
   MSIX manifest also keeps the packaged startup task for later sign-ins.
 - On GNOME Wayland, a newly copied user extension may not be discoverable until the next session.
-  The installer now queues IronMesh in `org.gnome.shell enabled-extensions`, but initial activation
+  The installer now queues BerryKeep in `org.gnome.shell enabled-extensions`, but initial activation
   can still require logging out and back in.
 - Linux FUSE snapshot mode can publish per-service telemetry, but its connection and replication
   rows remain intentionally static/unknown because no live server polling is active.

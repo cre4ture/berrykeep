@@ -1,4 +1,4 @@
-import type { HostStorageVolume, StoragePathConfig, StoragePathState, StoragePoolConfig } from "@ironmesh/api";
+import type { HostStorageVolume, StoragePathConfig, StoragePathState, StoragePoolConfig } from "@berrykeep/api";
 import { Alert, Badge, Button, Card, Group, List, Select, Stack, Text, TextInput } from "@mantine/core";
 
 const GIBIBYTE = 1024 ** 3;
@@ -122,7 +122,7 @@ export function recoveryGuidance(message: string | null): { title: string; steps
     return {
       title: "The node cannot write to this directory",
       steps: [
-        "Check that the volume is mounted read-write and that the IronMesh service account can create files there.",
+        "Check that the volume is mounted read-write and that the BerryKeep service account can create files there.",
         "Do not change the node service identity just for this check; grant that existing identity access instead.",
         "Run the prepare-and-check step again after correcting the host permission or filesystem issue."
       ]

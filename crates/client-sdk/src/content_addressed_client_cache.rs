@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use uuid::Uuid;
 
+use crate::berrykeep_client::{BerryKeepClient, SnapshotRestoreResponse, UploadResult};
 use crate::bootstrap::ConnectionBootstrap;
-use crate::ironmesh_client::{IronMeshClient, SnapshotRestoreResponse, UploadResult};
 use transport_sdk::ClientIdentityMaterial;
 
 const CACHE_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
@@ -19,7 +19,7 @@ const CACHE_SCHEMA_VERSION_CURRENT: i64 = 1;
 
 #[derive(Clone)]
 pub struct ContentAddressedClientCache {
-    client: IronMeshClient,
+    client: BerryKeepClient,
     storage: Arc<CacheStorage>,
 }
 
@@ -77,7 +77,7 @@ impl ContentAddressedClientCache {
         storage_path: impl Into<PathBuf>,
     ) -> Result<Self> {
         Self::with_client(
-            IronMeshClient::from_direct_base_url(server_base_url),
+            BerryKeepClient::from_direct_base_url(server_base_url),
             storage_path,
         )
     }
@@ -88,12 +88,12 @@ impl ContentAddressedClientCache {
         http: reqwest::Client,
     ) -> Result<Self> {
         Self::with_client(
-            IronMeshClient::from_direct_http_client(server_base_url, http),
+            BerryKeepClient::from_direct_http_client(server_base_url, http),
             storage_path,
         )
     }
 
-    pub fn with_client(client: IronMeshClient, storage_path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn with_client(client: BerryKeepClient, storage_path: impl Into<PathBuf>) -> Result<Self> {
         let storage = Arc::new(CacheStorage::init(storage_path.into())?);
         Ok(Self { client, storage })
     }

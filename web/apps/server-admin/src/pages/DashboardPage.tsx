@@ -2,6 +2,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   clearAdminMediaCache,
   getClusterNodes,
+  getHostDependencyReport,
   getRepairActivityStatus,
   getRendezvousConfig,
   getClusterSummary,
@@ -15,10 +16,11 @@ import {
   type StorageStatsSample,
   type ProcessStatsSample,
   type ChildProcessStat,
+  type HostDependencyCheck,
   type TemperatureComponentStat,
   type MemoryAttributionSample
-} from "@ironmesh/api";
-import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
+} from "@berrykeep/api";
+import { berrykeepUiRevision, berrykeepUiVersion } from "@berrykeep/config";
 import {
   ActionIcon,
   Alert,
@@ -38,11 +40,11 @@ import {
   Tooltip as MantineTooltip
 } from "@mantine/core";
 import {
-  ironmeshPrimaryColor,
+  berrykeepPrimaryColor,
   StatCard,
   ZoomableTimeSeriesChart,
   formatTimeSeriesChartTimestamp
-} from "@ironmesh/ui";
+} from "@berrykeep/ui";
 import { useDisclosure } from "@mantine/hooks";
 import { useMemo, useState } from "react";
 import {
@@ -62,6 +64,7 @@ type StorageHistoryRangeKey = "24h" | "7d" | "30d" | "90d" | "1y" | "all";
 const STORAGE_HISTORY_MAX_POINTS = 360;
 const DASHBOARD_CHART_REFRESH_INTERVAL_MS = 3_000;
 const DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS = 30_000;
+const HOST_DEPENDENCY_REPORT_STALE_TIME_MS = 5 * 60_000;
 const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
   key: StorageHistoryRangeKey;
   label: string;
@@ -108,7 +111,7 @@ const STORAGE_CHART_SERIES: Array<{
     key: "latestSnapshotUniqueChunkBytes",
     label: "Latest snapshot unique",
     color: "#34d399",
-    badgeColor: ironmeshPrimaryColor
+    badgeColor: berrykeepPrimaryColor
   }
 ];
 
@@ -191,6 +194,13 @@ export function DashboardPage() {
     enabled: canInspectRendezvous,
     refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
+  const hostDependencyReportQuery = useQuery({
+    queryKey: ["dashboard", "host-dependencies", normalizedAdminTokenOverride],
+    queryFn: () => getHostDependencyReport(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster,
+    staleTime: HOST_DEPENDENCY_REPORT_STALE_TIME_MS,
+    refetchOnWindowFocus: false
+  });
 
   async function refresh() {
     await Promise.all([
@@ -205,7 +215,8 @@ export function DashboardPage() {
             repairActivityQuery.refetch(),
             processStatsCurrentQuery.refetch(),
             processStatsHistoryQuery.refetch(),
-            processStatsMemoryQuery.refetch()
+            processStatsMemoryQuery.refetch(),
+            hostDependencyReportQuery.refetch()
           ]
         : []),
       ...(canInspectRendezvous ? [rendezvousConfigQuery.refetch()] : [])
@@ -240,6 +251,7 @@ export function DashboardPage() {
     canInspectRendezvous && !rendezvousConfigQuery.isError
       ? rendezvousConfigQuery.data ?? null
       : null;
+  const hostDependencyReport = canInspectCluster ? hostDependencyReportQuery.data ?? null : null;
   const backendHealth = backendHealthQuery.data ?? null;
   const storageStats = storageStatsQuery.data ?? null;
   const storageHistory = storageHistoryQuery.data ?? EMPTY_STORAGE_HISTORY;
@@ -271,7 +283,8 @@ export function DashboardPage() {
     canInspectCluster ? repairActivityQuery.error : null,
     canInspectCluster ? processStatsCurrentQuery.error : null,
     canInspectCluster ? processStatsHistoryQuery.error : null,
-    canInspectCluster ? processStatsMemoryQuery.error : null
+    canInspectCluster ? processStatsMemoryQuery.error : null,
+    canInspectCluster ? hostDependencyReportQuery.error : null
   ]);
 
   async function confirmMediaCacheClear() {
@@ -283,7 +296,7 @@ export function DashboardPage() {
     : null;
   const connectedRendezvousEndpoints =
     rendezvousConfig?.endpoint_registrations.filter((endpoint) => endpoint.status === "connected") ?? [];
-  const versionMismatch = Boolean(backendHealth?.version) && backendHealth?.version !== ironmeshUiVersion;
+  const versionMismatch = Boolean(backendHealth?.version) && backendHealth?.version !== berrykeepUiVersion;
   const latestStorageSample = storageStats?.sample ?? null;
   const metadataFootprintBytes = latestStorageSample
     ? latestStorageSample.metadata_db_bytes +
@@ -307,6 +320,7 @@ export function DashboardPage() {
   const reportingTemperatureComponentCount = temperatureComponents.filter(
     (component) => component.temperature_celsius !== null && component.temperature_celsius !== undefined
   ).length;
+  const hostDependencyFindings = (hostDependencyReport?.checks ?? []).filter(isDashboardHostDependencyFinding);
 
   return (
     <Stack gap="lg">
@@ -323,6 +337,21 @@ export function DashboardPage() {
         </Group>
       </Group>
       {error ? <Alert color="red" title="Failed to load dashboard">{error}</Alert> : null}
+      {hostDependencyFindings.length > 0 ? (
+        <Alert
+          color={hostDependencyFindings.some((check) => check.severity === "critical") ? "red" : "yellow"}
+          title="Host dependencies need attention"
+        >
+          <Stack gap={4}>
+            {hostDependencyFindings.map((check) => (
+              <Text key={check.id} size="sm">
+                <strong>{check.feature}:</strong> {check.summary}
+                {check.install_hint ? ` Remedy: ${check.install_hint}` : ""}
+              </Text>
+            ))}
+          </Stack>
+        </Alert>
+      ) : null}
       <Grid data-testid="dashboard-summary-metrics">
         {[
           {
@@ -408,7 +437,7 @@ export function DashboardPage() {
                   {clusterSummary?.local_node_id ?? (clusterSummaryLoading ? "loading" : "unknown")}
                 </Badge>
                 <Badge
-                  color={localNode?.reachability.relay_required ? ironmeshPrimaryColor : "blue"}
+                  color={localNode?.reachability.relay_required ? berrykeepPrimaryColor : "blue"}
                   variant="light"
                 >
                   {localNode?.reachability.relay_required ? "relay-required" : "direct-capable"}
@@ -431,7 +460,7 @@ export function DashboardPage() {
             <Stack gap="sm">
               <Text fw={700}>Version info</Text>
               <Text size="sm">
-                UI build: <Code>{formatFullVersion(ironmeshUiVersion, ironmeshUiRevision)}</Code>
+                UI build: <Code>{formatFullVersion(berrykeepUiVersion, berrykeepUiRevision)}</Code>
               </Text>
               <Text size="sm">
                 Backend build: <Code>{formatFullVersion(backendHealth?.version, backendHealth?.revision)}</Code>
@@ -484,7 +513,7 @@ export function DashboardPage() {
               <Text fw={700}>Rendezvous participation</Text>
               <Group gap="sm">
                 <Badge
-                  color={rendezvousConfig?.registration_enabled ? ironmeshPrimaryColor : "gray"}
+                  color={rendezvousConfig?.registration_enabled ? berrykeepPrimaryColor : "gray"}
                   variant="light"
                 >
                   {rendezvousConfig?.registration_enabled ? "registration enabled" : "registration disabled"}
@@ -638,7 +667,7 @@ export function DashboardPage() {
                 <Stack gap={4}>
                   <Text fw={700}>Process resource usage</Text>
                   <Text size="sm" c="dimmed" maw={760}>
-                    CPU, memory, disk I/O, and temperature sensors for the ironmesh server host.
+                    CPU, memory, disk I/O, and temperature sensors for the berrykeep server host.
                     Live process charts refresh every few seconds; summary values refresh every 30 seconds. Child
                     processes (e.g. ffmpeg during video thumbnail generation) are tracked separately.
                   </Text>
@@ -980,7 +1009,7 @@ export function DashboardPage() {
                         <Table.Tr key={node.node_id}>
                           <Table.Td>{node.node_id}</Table.Td>
                           <Table.Td>
-                            <Badge color={node.status === "online" ? ironmeshPrimaryColor : "gray"} variant="light">
+                            <Badge color={node.status === "online" ? berrykeepPrimaryColor : "gray"} variant="light">
                               {node.status}
                             </Badge>
                           </Table.Td>
@@ -1064,7 +1093,7 @@ export function DashboardPage() {
                   </Button>
                 </Group>
                 {mediaCacheClearResult ? (
-                  <Alert color={ironmeshPrimaryColor} variant="light" title="Media cache cleared">
+                  <Alert color={berrykeepPrimaryColor} variant="light" title="Media cache cleared">
                     Cleared {mediaCacheClearResult.deleted_metadata_records} metadata records and{" "}
                     {mediaCacheClearResult.deleted_thumbnail_files} generated thumbnails (
                     {formatBytes(mediaCacheClearResult.deleted_thumbnail_bytes)}) at{" "}
@@ -1149,6 +1178,10 @@ function formatOptionalTemperature(value: number | null | undefined): string {
   return `${value.toFixed(1)} C`;
 }
 
+function isDashboardHostDependencyFinding(check: HostDependencyCheck): boolean {
+  return check.severity === "warning" || check.severity === "critical";
+}
+
 function formatRepairActivityState(state: string): string {
   switch (state) {
     case "running":
@@ -1195,7 +1228,7 @@ function startupStatusColor(status: string | undefined): string {
     case "running":
       return "orange";
     case "completed":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "skipped_no_gaps":
       return "blue";
     case "scheduled":

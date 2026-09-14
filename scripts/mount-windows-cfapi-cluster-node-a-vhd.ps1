@@ -93,7 +93,7 @@ $volumeRoot = "${DriveLetter}:\"
 $workingDir = Split-Path -Parent $VhdPath
 New-Item -ItemType Directory -Force -Path $workingDir | Out-Null
 
-$markerPath = [System.IO.Path]::Combine($volumeRoot, "ironmesh-node-a-vhd.json")
+$markerPath = [System.IO.Path]::Combine($volumeRoot, "berrykeep-node-a-vhd.json")
 if ([System.IO.Directory]::Exists($volumeRoot)) {
     if ([System.IO.File]::Exists($markerPath)) {
         $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
@@ -121,7 +121,7 @@ else {
         "select vdisk file=""$VhdPath""",
         "attach vdisk",
         "create partition primary",
-        "format fs=ntfs quick label=ironmesh-node-a",
+        "format fs=ntfs quick label=berrykeep-node-a",
         "assign letter=$DriveLetter"
     ) | Out-Null
     $status = "created-and-mounted"

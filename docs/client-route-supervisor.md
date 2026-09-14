@@ -1,7 +1,7 @@
 # Client route supervisor
 
 The client SDK separates route discovery, route health, request failover, and transport sessions.
-All clones of an `IronMeshClient` share these components; a request does not create another router
+All clones of an `BerryKeepClient` share these components; a request does not create another router
 or another background maintenance loop.
 
 ## Stable route plans

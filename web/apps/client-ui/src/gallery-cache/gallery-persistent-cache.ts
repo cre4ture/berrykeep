@@ -1,4 +1,4 @@
-const GALLERY_CACHE_DATABASE_NAME = "ironmesh-client-gallery-cache";
+const GALLERY_CACHE_DATABASE_NAME = "berrykeep-client-gallery-cache";
 const GALLERY_CACHE_DATABASE_VERSION = 1;
 const GALLERY_CACHE_RECORD_STORE = "records";
 const GALLERY_CACHE_RECORD_SCHEMA_VERSION = 1;

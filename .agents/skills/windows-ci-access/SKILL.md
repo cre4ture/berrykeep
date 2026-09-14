@@ -10,16 +10,16 @@ Prefer environment parity: use native Windows rather than WSL for CFAPI, Cloud F
 ## Access
 
 - SSH: `ssh Uli@192.168.178.129 -p 2222`
-- Repository: `C:\Users\Uli\rust-dev\ironmesh`
+- Repository: `C:\Users\Uli\rust-dev\berrykeep`
 
 ## Workflow
 
 - Start with the minimal reproducer: run the smallest failing Windows test or command first.
 - For one-off remote commands, prefer `pwsh -NoProfile -Command ...`.
-- Work from `C:\Users\Uli\rust-dev\ironmesh` and keep Windows-specific investigation native to Windows.
+- Work from `C:\Users\Uli\rust-dev\berrykeep` and keep Windows-specific investigation native to Windows.
 
 Example:
 
 ```text
-ssh Uli@192.168.178.129 -p 2222 "pwsh -NoProfile -Command \"Set-Location 'C:\Users\Uli\rust-dev\ironmesh'; cargo test --manifest-path tests/system-tests/Cargo.toml\""
+ssh Uli@192.168.178.129 -p 2222 "pwsh -NoProfile -Command \"Set-Location 'C:\Users\Uli\rust-dev\berrykeep'; cargo test --manifest-path tests/system-tests/Cargo.toml\""
 ```

@@ -12,7 +12,7 @@
     InstallerVersion="500">
     <SummaryInformation
       Description="BerryKeep self-hosted storage server node"
-      Keywords="BerryKeep,IronMesh,server,node,storage" />
+      Keywords="BerryKeep,server,node,storage" />
     <MajorUpgrade
       DowngradeErrorMessage="A newer version of BerryKeep Server Node is already installed."
       Schedule="afterInstallInitialize" />

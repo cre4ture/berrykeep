@@ -2,16 +2,16 @@
 
 set -euo pipefail
 
-readonly LABEL="io.ironmesh.server-node"
+readonly LABEL="io.berrykeep.server-node"
 readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
-readonly SERVICE_ROOT="/Library/Application Support/Ironmesh"
-readonly LOG_DIR="/Library/Logs/Ironmesh"
+readonly SERVICE_ROOT="/Library/Application Support/BerryKeep"
+readonly LOG_DIR="/Library/Logs/BerryKeep"
 
 PURGE_DATA=false
 
 usage() {
   cat <<'EOF'
-Uninstall the packaged Ironmesh macOS server node.
+Uninstall the packaged BerryKeep macOS server node.
 
 Usage:
   sudo ./scripts/uninstall-macos-server-node.sh [--purge-data]
@@ -51,8 +51,7 @@ launchctl bootout "system/${LABEL}" >/dev/null 2>&1 || true
 launchctl bootout system "${PLIST_PATH}" >/dev/null 2>&1 || true
 rm -f "${PLIST_PATH}"
 rm -f "${SERVICE_ROOT}/bin/berrykeep-server-node" \
-  "${SERVICE_ROOT}/bin/ironmesh-server-node" \
-  "${SERVICE_ROOT}/bin/ironmesh-server-node-launcher" \
+  "${SERVICE_ROOT}/bin/berrykeep-server-node-launcher" \
   "${SERVICE_ROOT}/server-node.env.example"
 rmdir "${SERVICE_ROOT}/bin" 2>/dev/null || true
 rm -f "${LOG_DIR}/server-node.stdout.log" "${LOG_DIR}/server-node.stderr.log"
@@ -65,7 +64,7 @@ fi
 rmdir "${SERVICE_ROOT}" 2>/dev/null || true
 pkgutil --forget "${LABEL}" >/dev/null 2>&1 || true
 
-printf 'Ironmesh server node uninstalled'
+printf 'BerryKeep server node uninstalled'
 if [[ "${PURGE_DATA}" == false ]]; then
   printf '; configuration and server data were preserved'
 fi

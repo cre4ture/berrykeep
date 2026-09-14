@@ -1,9 +1,10 @@
 import {
   getHostDependencyReport,
   type HostDependencyReport,
+  type HostDependencySeverity,
   type HostDependencyStatus
-} from "@ironmesh/api";
-import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { berrykeepPrimaryColor, StatCard } from "@berrykeep/ui";
 import { Alert, Badge, Button, Code, Grid, Group, Stack, Table, Text } from "@mantine/core";
 import { useCallback, useEffect, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
@@ -33,37 +34,48 @@ export function DependenciesPage() {
   }, [refresh]);
 
   const checks = report?.checks ?? [];
-  const missingCount = checks.filter((check) => check.status === "missing").length;
+  const attentionChecks = checks.filter((check) => isAttentionSeverity(check.severity));
+  const criticalCount = attentionChecks.filter((check) => check.severity === "critical").length;
+  const informationalMissingCount = checks.filter(
+    (check) => check.status === "missing" && !isAttentionSeverity(check.severity)
+  ).length;
   const readyCount = checks.filter((check) => check.status === "ready").length;
   const builtinCount = checks.filter((check) => check.status === "builtin").length;
   const optionalCount = checks.filter((check) => check.status === "optional").length;
+  const notApplicableCount = checks.filter((check) => check.status === "not_applicable").length;
 
   return (
     <Stack gap="lg">
       {error ? <Alert color="red" title="Failed to load host dependency status">{error}</Alert> : null}
-      {missingCount > 0 ? (
-        <Alert color="yellow" title="Host feature dependencies missing">
-          {missingCount} host feature dependenc{missingCount === 1 ? "y is" : "ies are"} missing on this node.
-          Resolve the missing checks below before relying on their affected server features.
+      {attentionChecks.length > 0 ? (
+        <Alert color={criticalCount > 0 ? "red" : "yellow"} title="Storage mount protection needs attention">
+          {attentionChecks.length} mount-protection finding{attentionChecks.length === 1 ? " needs" : "s need"} action.
+          Review the affected paths and remedies below before restarting or relying on this node.
         </Alert>
-      ) : report ? (
-        <Alert color={ironmeshPrimaryColor} title="Host dependency checks passed">
-          This node has the currently known runtime dependencies for media processing, SMART/NVMe hardware health, and
-          automatic Natural Earth map conversion.
+      ) : null}
+      {informationalMissingCount > 0 ? (
+        <Alert color="blue" title="Informational host dependency findings">
+          {informationalMissingCount} informational host dependency finding{informationalMissingCount === 1 ? " is" : "s are"} reported.
+          Review the affected feature or host inspection below; informational findings do not count as dashboard attention.
+        </Alert>
+      ) : null}
+      {report && attentionChecks.length === 0 && informationalMissingCount === 0 ? (
+        <Alert color={berrykeepPrimaryColor} title="Host dependency checks passed">
+          No host dependency finding currently needs attention.
         </Alert>
       ) : null}
       {optionalCount > 0 ? (
         <Alert color="blue" title="Optional host administration tooling unavailable">
-          Cockpit is not installed on this host. IronMesh does not require it, but you can install and use Cockpit as a
+          Cockpit is not installed on this host. BerryKeep does not require it, but you can install and use Cockpit as a
           separate web interface for service restarts, updates, and host reboots.
         </Alert>
       ) : null}
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={760}>
-          This page checks host packages and commands required by server-node features, including <Code>smartctl</Code>
-          for SMART/NVMe hardware health and the Natural Earth map-import tools. It also reports whether optional Cockpit
-          host-administration tooling is installed. Cockpit remains a separate, separately authenticated interface for
-          host-level operations; IronMesh does not restart services or the host itself.
+          This page checks optional host tools plus storage mount protection for a server node actually managed by systemd.
+          For systemd services, it shows the live effective dependency result and a per-path remedy for{" "}
+          <Code>BERRYKEEP_DATA_DIR</Code> and active or draining storage-pool paths. Cockpit remains a separate,
+          separately authenticated interface for host-level operations; BerryKeep does not restart services or the host itself.
         </Text>
         <Button variant="light" onClick={() => void refresh()} loading={loading}>
           Refresh
@@ -80,9 +92,9 @@ export function DependenciesPage() {
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
           <StatCard
-            label="Feature dependencies missing"
-            value={loading && !report ? "loading..." : String(missingCount)}
-            hint={missingCount > 0 ? "Resolve before using affected features" : "No blocking host gaps detected"}
+            label="Needs attention"
+            value={loading && !report ? "loading..." : String(attentionChecks.length)}
+            hint={attentionChecks.length > 0 ? "Warning or critical findings" : "No actionable host findings"}
           />
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
@@ -106,17 +118,25 @@ export function DependenciesPage() {
             hint={optionalCount > 0 ? "Advisory checks unavailable" : "Optional tooling detected"}
           />
         </Grid.Col>
+        <Grid.Col span={{ base: 12, md: 6, xl: 2 }}>
+          <StatCard
+            label="Not applicable"
+            value={loading && !report ? "loading..." : String(notApplicableCount)}
+            hint="Checks skipped for this startup framework"
+          />
+        </Grid.Col>
       </Grid>
 
-      <Table.ScrollContainer minWidth={920}>
+      <Table.ScrollContainer minWidth={1180}>
         <Table striped highlightOnHover withTableBorder withColumnBorders>
           <Table.Thead>
             <Table.Tr>
-              <Table.Th>Dependency</Table.Th>
+              <Table.Th>Dependency / finding</Table.Th>
+              <Table.Th>Severity</Table.Th>
               <Table.Th>Status</Table.Th>
-              <Table.Th>Command</Table.Th>
-              <Table.Th>Resolved path</Table.Th>
-              <Table.Th>Install hint</Table.Th>
+              <Table.Th>Configured target</Table.Th>
+              <Table.Th>Effective dependency</Table.Th>
+              <Table.Th>Remedy</Table.Th>
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
@@ -129,23 +149,31 @@ export function DependenciesPage() {
                   <Text c="dimmed" size="xs">
                     {check.summary}
                   </Text>
+                  <Text c="dimmed" size="xs" mt={4}>
+                    {check.detail}
+                  </Text>
                 </Table.Td>
                 <Table.Td>
-                  <Badge variant="light" color={dependencyBadgeColor(check.status)}>
+                  <Badge variant="light" color={dependencySeverityColor(check.severity)}>
+                    {dependencySeverityLabel(check.severity)}
+                  </Badge>
+                </Table.Td>
+                <Table.Td>
+                  <Badge variant="light" color={dependencyBadgeColor(check.status, check.severity)}>
                     {dependencyBadgeLabel(check.status)}
                   </Badge>
                 </Table.Td>
                 <Table.Td>
-                  {check.configured_path ? <Code>{check.configured_path}</Code> : "built-in"}
+                  {check.configured_path ? <Code>{check.configured_path}</Code> : "—"}
                 </Table.Td>
                 <Table.Td>
                   <Text size="xs" ff="monospace">
-                    {check.resolved_path || "not resolved"}
+                    {check.resolved_path || (check.status === "not_applicable" ? "not applicable" : "not resolved")}
                   </Text>
                 </Table.Td>
                 <Table.Td>
                   {check.install_hint ? (
-                    <Text c={check.status === "missing" ? "red" : "dimmed"} size="xs">
+                    <Text c={dependencyRemedyColor(check.status, check.severity)} size="xs">
                       {check.install_hint}
                     </Text>
                   ) : (
@@ -163,15 +191,23 @@ export function DependenciesPage() {
   );
 }
 
-function dependencyBadgeColor(status: HostDependencyStatus): string {
+function dependencyBadgeColor(status: HostDependencyStatus, severity?: HostDependencySeverity | null): string {
+  if (severity === "critical") {
+    return "red";
+  }
+  if (severity === "warning") {
+    return "yellow";
+  }
   switch (status) {
     case "ready":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "missing":
-      return "red";
+      return "yellow";
     case "builtin":
       return "blue";
     case "optional":
+      return "gray";
+    case "not_applicable":
       return "gray";
   }
 }
@@ -186,5 +222,35 @@ function dependencyBadgeLabel(status: HostDependencyStatus): string {
       return "built-in";
     case "optional":
       return "optional";
+    case "not_applicable":
+      return "not applicable";
   }
+}
+
+function dependencySeverityColor(severity?: HostDependencySeverity | null): string {
+  switch (severity) {
+    case "critical":
+      return "red";
+    case "warning":
+      return "yellow";
+    case "info":
+    case null:
+    case undefined:
+      return "blue";
+  }
+}
+
+function dependencySeverityLabel(severity?: HostDependencySeverity | null): string {
+  return severity ?? "info";
+}
+
+function dependencyRemedyColor(status: HostDependencyStatus, severity?: HostDependencySeverity | null): string {
+  if (isAttentionSeverity(severity)) {
+    return severity === "critical" ? "red" : "yellow";
+  }
+  return status === "missing" ? "yellow" : "dimmed";
+}
+
+function isAttentionSeverity(severity?: HostDependencySeverity | null): boolean {
+  return severity === "warning" || severity === "critical";
 }

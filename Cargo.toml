@@ -34,7 +34,7 @@ resolver = "2"
 version = "1.2.0"
 edition = "2024"
 license = "MIT"
-authors = ["ironmesh contributors"]
+authors = ["berrykeep contributors"]
 
 [workspace.lints.rust]
 unsafe_code = "deny"

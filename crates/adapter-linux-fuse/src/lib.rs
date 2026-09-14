@@ -150,23 +150,29 @@ pub mod runtime {
 
     const ROOT_INODE: u64 = 1;
     const TTL: Duration = Duration::from_secs(1);
-    const CONFLICT_ROOT_NAME: &str = ".ironmesh-conflicts";
-    const CONFLICT_REMOTE_ROOT: &str = ".ironmesh-conflicts/remote";
+    const CONFLICT_ROOT_NAME: &str = ".berrykeep-conflicts";
+    const CONFLICT_REMOTE_ROOT: &str = ".berrykeep-conflicts/remote";
     const CONFLICT_REASON_DIVERGENT_VERSIONS: &str = "divergent_versions";
-    const XATTR_STATE: &str = "user.ironmesh.state";
-    const XATTR_LOCAL_VERSION: &str = "user.ironmesh.local_version";
-    const XATTR_REMOTE_VERSION: &str = "user.ironmesh.remote_version";
-    const XATTR_CONFLICT_REASON: &str = "user.ironmesh.conflict_reason";
-    const XATTR_CONFLICT_COPY: &str = "user.ironmesh.conflict_copy";
-    const XATTR_SOURCE_PATH: &str = "user.ironmesh.source_path";
+    const XATTR_STATE: &str = "user.berrykeep.state";
+    const XATTR_LOCAL_VERSION: &str = "user.berrykeep.local_version";
+    const XATTR_REMOTE_VERSION: &str = "user.berrykeep.remote_version";
+    const XATTR_CONFLICT_REASON: &str = "user.berrykeep.conflict_reason";
+    const XATTR_CONFLICT_COPY: &str = "user.berrykeep.conflict_copy";
+    const XATTR_SOURCE_PATH: &str = "user.berrykeep.source_path";
+    const LEGACY_XATTR_STATE: &str = "user.ironmesh.state";
+    const LEGACY_XATTR_LOCAL_VERSION: &str = "user.ironmesh.local_version";
+    const LEGACY_XATTR_REMOTE_VERSION: &str = "user.ironmesh.remote_version";
+    const LEGACY_XATTR_CONFLICT_REASON: &str = "user.ironmesh.conflict_reason";
+    const LEGACY_XATTR_CONFLICT_COPY: &str = "user.ironmesh.conflict_copy";
+    const LEGACY_XATTR_SOURCE_PATH: &str = "user.ironmesh.source_path";
     /// Default global budget for resident `FsNode.data` bytes across the mount, before
     /// least-recently-hydrated clean files get proactively re-placeholdered. Overridable
-    /// via `IRONMESH_FUSE_HYDRATION_BUDGET_BYTES` (see
+    /// via `BERRYKEEP_FUSE_HYDRATION_BUDGET_BYTES` (see
     /// docs/node-memory-footprint-reduction-plan.md Slice 1a).
     const DEFAULT_HYDRATION_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
 
     fn hydration_byte_budget() -> u64 {
-        std::env::var("IRONMESH_FUSE_HYDRATION_BUDGET_BYTES")
+        common::legacy_compatibility::var("BERRYKEEP_FUSE_HYDRATION_BUDGET_BYTES")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_HYDRATION_BYTE_BUDGET)
@@ -261,7 +267,7 @@ pub mod runtime {
             _remote_content_hash: &str,
         ) -> Result<Vec<u8>> {
             Ok(
-                format!("ironmesh placeholder hydrated: path={path} version={remote_version}\n")
+                format!("berrykeep placeholder hydrated: path={path} version={remote_version}\n")
                     .into_bytes(),
             )
         }
@@ -462,7 +468,7 @@ pub mod runtime {
         },
     }
 
-    pub struct IronmeshFuseFs {
+    pub struct BerryKeepFuseFs {
         nodes: HashMap<u64, FsNode>,
         hydrator: Box<dyn Hydrator>,
         uploader: Box<dyn Uploader>,
@@ -474,7 +480,7 @@ pub mod runtime {
         hydration_byte_budget: u64,
     }
 
-    impl IronmeshFuseFs {
+    impl BerryKeepFuseFs {
         pub fn from_action_plan(
             action_plan: &FuseActionPlan,
             hydrator: Box<dyn Hydrator>,
@@ -1193,10 +1199,11 @@ pub mod runtime {
         }
 
         fn xattr_value_for_inode(&self, inode: u64, name: &str) -> Result<Option<Vec<u8>>> {
+            let canonical_name = Self::canonical_xattr_name(name);
             Ok(self
                 .xattr_entries_for_inode(inode)?
                 .into_iter()
-                .find_map(|(entry_name, value)| (entry_name == name).then_some(value)))
+                .find_map(|(entry_name, value)| (entry_name == canonical_name).then_some(value)))
         }
 
         fn xattr_name_list_for_inode(&self, inode: u64) -> Result<Vec<u8>> {
@@ -1220,6 +1227,18 @@ pub mod runtime {
             }
 
             reply.data(payload);
+        }
+
+        fn canonical_xattr_name(name: &str) -> &str {
+            match name {
+                LEGACY_XATTR_STATE => XATTR_STATE,
+                LEGACY_XATTR_LOCAL_VERSION => XATTR_LOCAL_VERSION,
+                LEGACY_XATTR_REMOTE_VERSION => XATTR_REMOTE_VERSION,
+                LEGACY_XATTR_CONFLICT_REASON => XATTR_CONFLICT_REASON,
+                LEGACY_XATTR_CONFLICT_COPY => XATTR_CONFLICT_COPY,
+                LEGACY_XATTR_SOURCE_PATH => XATTR_SOURCE_PATH,
+                _ => name,
+            }
         }
 
         fn parent_allows_mutation(&self, parent: u64, name: &str) -> bool {
@@ -1278,7 +1297,7 @@ pub mod runtime {
                 from_path,
                 to_path,
                 base_remote_version = base_remote_version.unwrap_or("<none>"),
-                "ironmesh fuse remote rename file start"
+                "berrykeep fuse remote rename file start"
             );
             self.uploader
                 .rename_path(from_path, to_path, false, base_remote_version)
@@ -1289,7 +1308,7 @@ pub mod runtime {
                 from_path,
                 to_path,
                 elapsed_ms = started.elapsed().as_millis(),
-                "ironmesh fuse remote rename file finished"
+                "berrykeep fuse remote rename file finished"
             );
             Ok(())
         }
@@ -1309,7 +1328,7 @@ pub mod runtime {
                 to_root,
                 file_count = files.len(),
                 directory_count = directories.len(),
-                "ironmesh fuse remote rename directory subtree start"
+                "berrykeep fuse remote rename directory subtree start"
             );
 
             let file_phase_started = Instant::now();
@@ -1330,7 +1349,7 @@ pub mod runtime {
                     to_path = new_path.as_str(),
                     base_remote_version = remote_version.unwrap_or("<none>"),
                     file_count,
-                    "ironmesh fuse remote rename directory file step"
+                    "berrykeep fuse remote rename directory file step"
                 );
                 self.remote_rename_file(&old_path, &new_path, remote_version)?;
             }
@@ -1339,7 +1358,7 @@ pub mod runtime {
                 to_root,
                 file_count,
                 elapsed_ms = file_phase_started.elapsed().as_millis(),
-                "ironmesh fuse remote rename directory file phase finished"
+                "berrykeep fuse remote rename directory file phase finished"
             );
 
             let mut directory_paths: Vec<String> = directories
@@ -1370,7 +1389,7 @@ pub mod runtime {
                     from_path = old_path.as_str(),
                     to_path = new_path.as_str(),
                     directory_count,
-                    "ironmesh fuse remote rename directory marker create step"
+                    "berrykeep fuse remote rename directory marker create step"
                 );
                 self.ensure_remote_directory_marker(&new_path)?;
             }
@@ -1379,7 +1398,7 @@ pub mod runtime {
                 to_root,
                 directory_count,
                 elapsed_ms = marker_create_started.elapsed().as_millis(),
-                "ironmesh fuse remote rename directory marker create phase finished"
+                "berrykeep fuse remote rename directory marker create phase finished"
             );
 
             directory_paths.sort_by_key(|path| std::cmp::Reverse(Self::path_depth(path)));
@@ -1389,7 +1408,7 @@ pub mod runtime {
                 tracing::info!(
                     old_marker = old_marker.as_str(),
                     directory_count,
-                    "ironmesh fuse remote rename directory marker delete step"
+                    "berrykeep fuse remote rename directory marker delete step"
                 );
                 self.uploader
                     .delete_path(&old_marker, None)
@@ -1401,7 +1420,7 @@ pub mod runtime {
                 directory_count,
                 elapsed_ms = marker_delete_started.elapsed().as_millis(),
                 total_elapsed_ms = started.elapsed().as_millis(),
-                "ironmesh fuse remote rename directory subtree finished"
+                "berrykeep fuse remote rename directory subtree finished"
             );
 
             Ok(())
@@ -2049,7 +2068,7 @@ pub mod runtime {
         }
     }
 
-    impl Filesystem for IronmeshFuseFs {
+    impl Filesystem for BerryKeepFuseFs {
         fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
             self.drain_remote_updates();
 
@@ -2467,7 +2486,7 @@ pub mod runtime {
                 kind = ?node.kind,
                 flags,
                 destination_exists = new_parent_node.children.contains_key(new_name),
-                "ironmesh fuse rename start"
+                "berrykeep fuse rename start"
             );
 
             if let Some(existing_inode) = new_parent_node.children.get(new_name).copied() {
@@ -2476,7 +2495,7 @@ pub mod runtime {
                         from_path = old_full_path.as_str(),
                         to_path = new_full_path.as_str(),
                         elapsed_ms = started.elapsed().as_millis(),
-                        "ironmesh fuse rename short-circuited because destination already matches source"
+                        "berrykeep fuse rename short-circuited because destination already matches source"
                     );
                     reply.ok();
                     return;
@@ -2534,7 +2553,7 @@ pub mod runtime {
                     to_path = new_full_path.as_str(),
                     elapsed_ms = started.elapsed().as_millis(),
                     error = %error,
-                    "ironmesh fuse rename failed"
+                    "berrykeep fuse rename failed"
                 );
                 reply.error(EIO);
                 return;
@@ -2544,7 +2563,7 @@ pub mod runtime {
                 from_path = old_full_path.as_str(),
                 to_path = new_full_path.as_str(),
                 elapsed_ms = started.elapsed().as_millis(),
-                "ironmesh fuse rename finished"
+                "berrykeep fuse rename finished"
             );
             reply.ok();
         }
@@ -2690,7 +2709,7 @@ pub mod runtime {
                         offset,
                         size,
                         error = %error,
-                        "ironmesh fuse read failed"
+                        "berrykeep fuse read failed"
                     );
                     reply.error(EIO);
                 }
@@ -2937,7 +2956,7 @@ pub mod runtime {
             ));
         }
 
-        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader, None);
+        let fs = BerryKeepFuseFs::from_action_plan(&action_plan, hydrator, uploader, None);
         fuser::mount2(fs, &config.mountpoint, &config.mount_options())?;
         Ok(())
     }
@@ -2951,7 +2970,7 @@ pub mod runtime {
         mount_action_plan_until_shutdown_with_updates(config, action_plan, hydrator, uploader, None)
     }
 
-    pub fn mount_fs_until_shutdown(config: &FuseMountConfig, fs: IronmeshFuseFs) -> Result<()> {
+    pub fn mount_fs_until_shutdown(config: &FuseMountConfig, fs: BerryKeepFuseFs) -> Result<()> {
         if !Path::new(&config.mountpoint).exists() {
             return Err(anyhow!(
                 "mountpoint does not exist: {}",
@@ -2994,7 +3013,7 @@ pub mod runtime {
             ));
         }
 
-        let fs = IronmeshFuseFs::from_action_plan(&action_plan, hydrator, uploader, refresh_rx);
+        let fs = BerryKeepFuseFs::from_action_plan(&action_plan, hydrator, uploader, refresh_rx);
         mount_fs_until_shutdown(config, fs)
     }
 
@@ -3129,7 +3148,7 @@ pub mod runtime {
                 }],
             };
 
-            let fs = IronmeshFuseFs::from_action_plan(
+            let fs = BerryKeepFuseFs::from_action_plan(
                 &plan,
                 Box::new(DemoHydrator),
                 Box::new(DemoUploader),
@@ -3158,7 +3177,7 @@ pub mod runtime {
             };
             let hydrator = RecordingHydrator::default();
             let uploader = RecordingUploader::default();
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &plan,
                 Box::new(hydrator.clone()),
                 Box::new(uploader),
@@ -3242,7 +3261,7 @@ pub mod runtime {
                 .collect();
             let plan = FuseActionPlan { actions };
             let hydrator = SizedHydrator { sizes_by_path };
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &plan,
                 Box::new(hydrator),
                 Box::new(DemoUploader),
@@ -3309,7 +3328,7 @@ pub mod runtime {
         fn dirty_zero_byte_handles_flush_empty_uploads() {
             let hydrator = RecordingHydrator::default();
             let uploader = RecordingUploader::default();
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(hydrator),
                 Box::new(uploader.clone()),
@@ -3351,7 +3370,7 @@ pub mod runtime {
         #[test]
         fn conflict_actions_surface_xattrs_and_conflict_sidecars() {
             let hydrator = RecordingHydrator::default();
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan {
                     actions: vec![FuseAction::MarkConflict {
                         path: "albums/report.csv".to_string(),
@@ -3370,7 +3389,7 @@ pub mod runtime {
                 .lookup_inode_by_relative_path("albums/report.csv")
                 .expect("conflicted user file should exist");
             let sidecar_inode = fs
-                .lookup_inode_by_relative_path(".ironmesh-conflicts/remote/albums/report.csv")
+                .lookup_inode_by_relative_path(".berrykeep-conflicts/remote/albums/report.csv")
                 .expect("conflict sidecar should exist");
 
             assert_eq!(
@@ -3379,9 +3398,14 @@ pub mod runtime {
                 Some(b"placeholder,conflict".to_vec())
             );
             assert_eq!(
+                fs.xattr_value_for_inode(user_inode, LEGACY_XATTR_STATE)
+                    .expect("legacy xattr lookup should work"),
+                Some(b"placeholder,conflict".to_vec())
+            );
+            assert_eq!(
                 fs.xattr_value_for_inode(user_inode, XATTR_CONFLICT_COPY)
                     .expect("xattr lookup should work"),
-                Some(b".ironmesh-conflicts/remote/albums/report.csv".to_vec())
+                Some(b".berrykeep-conflicts/remote/albums/report.csv".to_vec())
             );
             assert_eq!(
                 fs.xattr_value_for_inode(sidecar_inode, XATTR_STATE)
@@ -3413,7 +3437,7 @@ pub mod runtime {
 
         #[test]
         fn dirty_state_xattr_tracks_open_write_handles() {
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(RecordingHydrator::default()),
                 Box::new(RecordingUploader::default()),
@@ -3446,7 +3470,7 @@ pub mod runtime {
 
         #[test]
         fn dirty_state_xattr_treats_enqueued_open_writes_as_dirty() {
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(RecordingHydrator::default()),
                 Box::new(RecordingUploader::default()),
@@ -3481,7 +3505,7 @@ pub mod runtime {
 
         #[test]
         fn refresh_replaces_conflict_state_with_plain_placeholder() {
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan {
                     actions: vec![FuseAction::MarkConflict {
                         path: "albums/report.csv".to_string(),
@@ -3519,14 +3543,14 @@ pub mod runtime {
                 None
             );
             assert!(
-                fs.lookup_inode_by_relative_path(".ironmesh-conflicts/remote/albums/report.csv")
+                fs.lookup_inode_by_relative_path(".berrykeep-conflicts/remote/albums/report.csv")
                     .is_none()
             );
         }
 
         #[test]
         fn refresh_does_not_clobber_unsynced_local_file_with_placeholder() {
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(RecordingHydrator::default()),
                 Box::new(RecordingUploader::default()),
@@ -3564,7 +3588,7 @@ pub mod runtime {
 
         #[test]
         fn refresh_rebinds_remote_version_when_local_bytes_match_remote_content() {
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(RecordingHydrator::default()),
                 Box::new(RecordingUploader::default()),
@@ -3607,7 +3631,7 @@ pub mod runtime {
         fn rename_overwrites_replaceable_file_targets() {
             let hydrator = RecordingHydrator::default();
             let uploader = RecordingUploader::default();
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(hydrator),
                 Box::new(uploader.clone()),
@@ -3676,7 +3700,7 @@ pub mod runtime {
         fn rename_overwrites_replaceable_empty_directory_targets() {
             let hydrator = RecordingHydrator::default();
             let uploader = RecordingUploader::default();
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(hydrator),
                 Box::new(uploader.clone()),
@@ -3771,7 +3795,7 @@ pub mod runtime {
         fn rename_rejects_non_empty_directory_targets() {
             let hydrator = RecordingHydrator::default();
             let uploader = RecordingUploader::default();
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(hydrator),
                 Box::new(uploader.clone()),
@@ -3853,7 +3877,7 @@ pub mod runtime {
 
         #[test]
         fn rename_cycle_detection_blocks_descendant_targets() {
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(RecordingHydrator::default()),
                 Box::new(RecordingUploader::default()),
@@ -3905,7 +3929,7 @@ pub mod runtime {
 
         #[test]
         fn replay_actions_restore_pending_file_over_placeholder() {
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan {
                     actions: vec![FuseAction::EnsurePlaceholder {
                         path: "docs/report.txt".to_string(),
@@ -3936,7 +3960,7 @@ pub mod runtime {
 
         #[test]
         fn replay_actions_restore_queued_rename_and_delete() {
-            let mut fs = IronmeshFuseFs::from_action_plan(
+            let mut fs = BerryKeepFuseFs::from_action_plan(
                 &FuseActionPlan::default(),
                 Box::new(RecordingHydrator::default()),
                 Box::new(RecordingUploader::default()),
@@ -3974,12 +3998,12 @@ pub mod runtime {
 
         #[test]
         fn open_only_hydrates_for_write_without_truncate() {
-            assert!(!IronmeshFuseFs::should_hydrate_on_open(libc::O_RDONLY));
-            assert!(!IronmeshFuseFs::should_hydrate_on_open(
+            assert!(!BerryKeepFuseFs::should_hydrate_on_open(libc::O_RDONLY));
+            assert!(!BerryKeepFuseFs::should_hydrate_on_open(
                 libc::O_WRONLY | libc::O_TRUNC
             ));
-            assert!(IronmeshFuseFs::should_hydrate_on_open(libc::O_WRONLY));
-            assert!(IronmeshFuseFs::should_hydrate_on_open(libc::O_RDWR));
+            assert!(BerryKeepFuseFs::should_hydrate_on_open(libc::O_WRONLY));
+            assert!(BerryKeepFuseFs::should_hydrate_on_open(libc::O_RDWR));
         }
 
         #[test]
@@ -3994,15 +4018,15 @@ pub mod runtime {
             );
             let hydrated = FsNode::regular_file(3, "hydrated.txt".to_string(), ROOT_INODE);
 
-            assert!(!IronmeshFuseFs::should_hydrate_for_size_change(
+            assert!(!BerryKeepFuseFs::should_hydrate_for_size_change(
                 &placeholder,
                 2048,
             ));
-            assert!(IronmeshFuseFs::should_hydrate_for_size_change(
+            assert!(BerryKeepFuseFs::should_hydrate_for_size_change(
                 &placeholder,
                 1024,
             ));
-            assert!(!IronmeshFuseFs::should_hydrate_for_size_change(
+            assert!(!BerryKeepFuseFs::should_hydrate_for_size_change(
                 &hydrated, 0,
             ));
         }
@@ -4016,7 +4040,7 @@ mod tests {
 
     #[test]
     fn adapter_maps_remote_only_file_to_placeholder_action() {
-        let adapter = LinuxFuseAdapter::new("ironmesh");
+        let adapter = LinuxFuseAdapter::new("berrykeep");
         let snapshot = SyncSnapshot {
             local: vec![],
             remote: vec![NamespaceEntry::file_sized(
@@ -4042,7 +4066,7 @@ mod tests {
 
     #[test]
     fn adapter_maps_local_only_file_to_upload_on_flush() {
-        let adapter = LinuxFuseAdapter::new("ironmesh");
+        let adapter = LinuxFuseAdapter::new("berrykeep");
         let snapshot = SyncSnapshot {
             local: vec![LocalEntry::new(
                 NamespaceEntry::file("notes/task.txt", "v-local", "h-local"),
@@ -4065,7 +4089,7 @@ mod tests {
 
     #[test]
     fn adapter_maps_divergence_to_conflict_action() {
-        let adapter = LinuxFuseAdapter::new("ironmesh");
+        let adapter = LinuxFuseAdapter::new("berrykeep");
         let snapshot = SyncSnapshot {
             local: vec![LocalEntry::new(
                 NamespaceEntry::file("report.csv", "v-local", "h1"),

@@ -11,7 +11,7 @@ param(
     [string]$SigningCertificateThumbprint,
     [string]$TimestampUrl,
     [string]$CertificateSubject = 'CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21',
-    [string]$CertificatePassword = 'ironmesh-store-upload'
+    [string]$CertificatePassword = 'berrykeep-store-upload'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -137,7 +137,7 @@ function Ensure-CodeSigningCertificate {
             -Type Custom `
             -Subject $Subject `
             -KeyUsage DigitalSignature `
-            -FriendlyName 'IronMesh Store Upload Dev' `
+            -FriendlyName 'BerryKeep Store Upload Dev' `
             -CertStoreLocation 'Cert:\CurrentUser\My' `
             -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3')
     }
@@ -364,7 +364,7 @@ if (-not $SkipSigning) {
 
 Write-Step 'Building BerryKeep desktop-client artifacts (release)'
 $env:CARGO_TARGET_DIR = $cargoTargetDir
-Invoke-NativeChecked -FilePath 'cargo' -Arguments @('build', '-p', 'windows-thumbnail-provider', '-p', 'cli-client', '-p', 'os-integration', '-p', 'ironmesh-folder-agent', '-p', 'ironmesh-background-launcher', '-p', 'ironmesh-config-app', '--release')
+Invoke-NativeChecked -FilePath 'cargo' -Arguments @('build', '-p', 'windows-thumbnail-provider', '-p', 'cli-client', '-p', 'os-integration', '-p', 'berrykeep-folder-agent', '-p', 'berrykeep-background-launcher', '-p', 'berrykeep-config-app', '--release')
 
 $releaseDir = Join-Path $cargoTargetDir 'release'
 $dllPath = Resolve-BuildArtifact -ReleaseDir $releaseDir -PrimaryFileName 'windows_thumbnail_provider.dll' -FallbackPatterns @('windows_thumbnail_provider-*.dll')

@@ -7,9 +7,9 @@ those capabilities become available on `main` when this branch is merged.
 
 ## Goal
 
-Offer one or more public IronMesh rendezvous/relay services that hobby-operated
+Offer one or more public BerryKeep rendezvous/relay services that hobby-operated
 clusters can use without operating their own Internet-reachable service. The
-relay operator must not be able to read, change, or inject relayed IronMesh
+relay operator must not be able to read, change, or inject relayed BerryKeep
 application traffic.
 
 The first delivery uses **Option 1**: the global service trusts a registered
@@ -67,8 +67,8 @@ Existing cluster-issued identities are sufficient for this first phase:
 - The target node uses its existing internal node identity as the inner TLS
   server identity.
 - The source validates the target certificate chain against the cluster CA and
-  requires its `urn:ironmesh:node:<node_id>` and
-  `urn:ironmesh:cluster:<cluster_id>` SAN values.
+  requires its `urn:berrykeep:node:<node_id>` and
+  `urn:berrykeep:cluster:<cluster_id>` SAN values.
 - The target validates the source certificate chain against the cluster CA and
   requires the source device/node SAN to match the identity bound into the
   relay session.
@@ -185,9 +185,9 @@ not from an untrusted JSON request body.
 For the Option 1 MVP, every cluster has exactly one active registered P-256
 CA. Node and device rendezvous certificates must both carry:
 
-- `urn:ironmesh:cluster:<cluster_id>`
-- either `urn:ironmesh:node:<node_id>` or
-  `urn:ironmesh:device:<device_id>`
+- `urn:berrykeep:cluster:<cluster_id>`
+- either `urn:berrykeep:node:<node_id>` or
+  `urn:berrykeep:device:<device_id>`
 
 The verifier reads the cluster SAN from the presented certificate and selects
 exactly that cluster's one registered CA. It must verify only against that CA;

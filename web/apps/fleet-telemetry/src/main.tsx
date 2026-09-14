@@ -3,7 +3,7 @@ import "./styles/globals.css";
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { IronmeshMantineProvider, IronmeshQueryProvider } from "@ironmesh/ui/fleet-telemetry";
+import { BerryKeepMantineProvider, BerryKeepQueryProvider } from "@berrykeep/ui/fleet-telemetry";
 import { App } from "./App";
 
 const root = document.getElementById("root");
@@ -14,10 +14,10 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <IronmeshMantineProvider>
-      <IronmeshQueryProvider>
+    <BerryKeepMantineProvider>
+      <BerryKeepQueryProvider>
         <App />
-      </IronmeshQueryProvider>
-    </IronmeshMantineProvider>
+      </BerryKeepQueryProvider>
+    </BerryKeepMantineProvider>
   </StrictMode>
 );

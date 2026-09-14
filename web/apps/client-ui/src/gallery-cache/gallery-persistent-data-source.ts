@@ -1,11 +1,11 @@
-import { getClientCacheContext } from "@ironmesh/api";
+import { getClientCacheContext } from "@berrykeep/api";
 import type {
   GalleryDataSource,
   GalleryDataUpdate,
   GalleryLoadEntriesOptions,
   GalleryPayload,
   GallerySnapshot
-} from "@ironmesh/ui";
+} from "@berrykeep/ui";
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
 import {
   GalleryPersistentCache,

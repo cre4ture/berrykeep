@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Builds, stages, optionally signs, and optionally installs the local IronMesh prototype MSIX package.
+Builds, stages, optionally signs, and optionally installs the local BerryKeep prototype MSIX package.
 
 .DESCRIPTION
 Run this script from the repository root when testing the packaged Windows prototype.
@@ -24,7 +24,7 @@ Notes:
 - Rust/Cargo must be available.
 - Full packing and signing require Windows SDK tools such as MakeAppx.exe and SignTool.exe.
 - -Install may require an elevated PowerShell session so the development certificate can be imported into LocalMachine\TrustedPeople.
-- After installation, the helper starts the packaged IronMesh background launcher once so the config app can own desktop status immediately.
+- After installation, the helper starts the packaged BerryKeep background launcher once so the config app can own desktop status immediately.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File .\windows\thumbnail-provider\Build-PrototypePackage.ps1 -StageOnly
@@ -53,7 +53,7 @@ param(
     [string]$SigningCertificateThumbprint,
     [string]$TimestampUrl,
     [string]$CertificateSubject = "CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21",
-    [string]$CertificatePassword = "ironmesh-dev"
+    [string]$CertificatePassword = "berrykeep-dev"
 )
 
 $ErrorActionPreference = "Stop"
@@ -149,7 +149,7 @@ function Save-StagedManifest {
 }
 
 function Start-InstalledBackgroundConfigApp {
-    Write-Step "Starting packaged IronMesh background config app"
+    Write-Step "Starting packaged BerryKeep background config app"
 
     $aliasPath = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\berrykeep-background-launcher.exe"
     $candidates = @()
@@ -231,7 +231,7 @@ function Ensure-CodeSigningCertificate {
             -Type Custom `
             -Subject $Subject `
             -KeyUsage DigitalSignature `
-            -FriendlyName "Ironmesh Thumbnail Provider Dev" `
+            -FriendlyName "BerryKeep Thumbnail Provider Dev" `
             -CertStoreLocation "Cert:\\CurrentUser\\My" `
             -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
     } else {
@@ -280,10 +280,10 @@ $assetsPath = Join-Path $scriptDir "Assets"
 $outputRoot = Join-Path $scriptDir "out"
 $stagePath = Join-Path $outputRoot "stage"
 $cargoTargetDir = Join-Path $outputRoot "cargo-target"
-$packageName = "IronMesh.msix"
+$packageName = "BerryKeep.msix"
 $packagePath = Join-Path $outputRoot $packageName
-$developmentPfxPath = Join-Path $outputRoot "IronMesh.pfx"
-$cerPath = Join-Path $outputRoot "IronMesh.cer"
+$developmentPfxPath = Join-Path $outputRoot "BerryKeep.pfx"
+$cerPath = Join-Path $outputRoot "BerryKeep.cer"
 $cargoVersion = Get-WorkspaceCargoVersion -RepoRoot $repoRoot
 $resolvedPackageVersion = if ($PackageVersion) {
     $PackageVersion
@@ -317,9 +317,9 @@ $cargoArgs = @(
     "-p", "windows-thumbnail-provider",
     "-p", "cli-client",
     "-p", "os-integration",
-    "-p", "ironmesh-folder-agent",
-    "-p", "ironmesh-background-launcher",
-    "-p", "ironmesh-config-app"
+    "-p", "berrykeep-folder-agent",
+    "-p", "berrykeep-background-launcher",
+    "-p", "berrykeep-config-app"
 )
 if ($Configuration -eq "release") {
     $cargoArgs += "--release"

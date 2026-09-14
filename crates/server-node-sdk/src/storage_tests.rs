@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use super::media_tools::HostDependencySeverity;
 use super::*;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -7,7 +9,7 @@ use time::{Date, Month, PrimitiveDateTime, Time, UtcOffset};
 
 fn test_store_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "ironmesh-{name}-{}-{}",
+        "berrykeep-{name}-{}-{}",
         std::process::id(),
         unix_ts_nanos()
     ))
@@ -712,6 +714,7 @@ fn host_dependency_report_marks_ready_and_missing_video_tools() {
         .find(|check| check.id == "video-thumbnails")
         .unwrap();
     assert_eq!(ffmpeg_check.status, HostDependencyStatus::Missing);
+    assert_eq!(ffmpeg_check.severity, HostDependencySeverity::Info);
     assert_eq!(
         ffmpeg_check.configured_path.as_deref(),
         Some(missing_ffmpeg_path.to_string_lossy().as_ref())
@@ -11781,7 +11784,7 @@ run_on_all_metadata_backends!(
 );
 
 /// A sidecar as an external editor writes it: keywords next to camera raw and
-/// Photoshop properties that Ironmesh neither models nor could reconstruct.
+/// Photoshop properties that BerryKeep neither models nor could reconstruct.
 const THIRD_PARTY_SIDECAR: &str = concat!(
     "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n",
     "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core\">\n",

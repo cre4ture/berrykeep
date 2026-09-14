@@ -18,8 +18,8 @@ const child = spawn(binaryPath, [], {
   cwd: repoRoot,
   env: {
     ...process.env,
-    IRONMESH_SERVER_BIND: "127.0.0.1:18443",
-    IRONMESH_DATA_DIR: dataDir,
+    BERRYKEEP_SERVER_BIND: "127.0.0.1:18443",
+    BERRYKEEP_DATA_DIR: dataDir,
     RUST_LOG: process.env.RUST_LOG ?? "info"
   },
   stdio: "inherit"

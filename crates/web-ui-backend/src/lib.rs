@@ -12,15 +12,15 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
 use client_sdk::{
-    ClientConnectionRouteSnapshot, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ConnectionBootstrapDiagnosticTargets, IronMeshClient, LatencyProbeComparison,
+    BerryKeepClient, ClientConnectionRouteSnapshot, ClientIdentityMaterial, ClientNode,
+    ConnectionBootstrap, ConnectionBootstrapDiagnosticTargets, LatencyProbeComparison,
     LatencyProbeConfig, LatencyProbeResult, RelayMode, RendezvousClientConfig,
     RendezvousControlClient, RendezvousEndpointConnectionState, RendezvousEndpointStatus,
     RequestedRange, StoreIndexMediaFilter, StoreIndexRequestOptions, StoreIndexSortOrder,
     StoreIndexView, StoreIndexViewport, UploadMode,
+    berrykeep_client::{DownloadRangeRequest, RelativePathResponse},
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
-    ironmesh_client::{DownloadRangeRequest, RelativePathResponse},
     public_key_fingerprint,
 };
 use common::{
@@ -52,9 +52,9 @@ const WEB_LATENCY_PROBE_TIMEOUT_PER_REQUEST_SLACK_MS: u64 = 3_000;
 const DEFAULT_DIAGNOSTIC_LOG_WINDOW_SECS: u64 = 3 * 60;
 const MAX_DIAGNOSTIC_LOG_WINDOW_SECS: u64 = 60 * 60;
 const WEB_API_V1_PREFIX: &str = "/api/v1";
-const DIAGNOSTIC_CONTEXT_HEADER: &str = "x-ironmesh-diagnostic-context";
-pub const EMBEDDED_WEB_UI_SESSION_HEADER: &str = "x-ironmesh-web-ui-session";
-const EMBEDDED_WEB_UI_SESSION_COOKIE: &str = "ironmesh_web_ui_session";
+const DIAGNOSTIC_CONTEXT_HEADER: &str = "x-berrykeep-diagnostic-context";
+pub const EMBEDDED_WEB_UI_SESSION_HEADER: &str = "x-berrykeep-web-ui-session";
+const EMBEDDED_WEB_UI_SESSION_COOKIE: &str = "berrykeep_web_ui_session";
 const EMBEDDED_WEB_UI_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[cfg(test)]
@@ -115,7 +115,7 @@ pub mod assets {
     }
 
     pub(crate) fn favicon_svg() -> &'static str {
-        include_str!("../../../docs/assets/ironmesh-favicon.svg")
+        include_str!("../../../docs/assets/berrykeep-favicon.svg")
     }
 
     pub(crate) fn extra_asset(path: &str) -> Option<(&'static [u8], &'static str)> {
@@ -198,7 +198,7 @@ pub struct WebUiConfig {
     pub client_identity: Option<ClientIdentityMaterial>,
     pub connection_bootstrap: Option<ConnectionBootstrap>,
     pub connection_bootstrap_persistence: Option<WebUiBootstrapPersistence>,
-    pub transport_client: Option<IronMeshClient>,
+    pub transport_client: Option<BerryKeepClient>,
     pub log_buffer: Option<Arc<LogBuffer>>,
     embedded_session_authorization: Option<EmbeddedWebUiSessionAuthorization>,
 }
@@ -235,7 +235,7 @@ impl WebUiConfig {
     pub fn new(server_url: impl Into<String>) -> Self {
         Self {
             server_url: server_url.into(),
-            service_name: "ironmesh-web".to_string(),
+            service_name: "berrykeep-web".to_string(),
             server_ca_pem: None,
             client_identity: None,
             connection_bootstrap: None,
@@ -246,10 +246,10 @@ impl WebUiConfig {
         }
     }
 
-    pub fn from_client(client: IronMeshClient) -> Self {
+    pub fn from_client(client: BerryKeepClient) -> Self {
         Self {
             server_url: String::new(),
-            service_name: "ironmesh-web".to_string(),
+            service_name: "berrykeep-web".to_string(),
             server_ca_pem: None,
             client_identity: None,
             connection_bootstrap: None,
@@ -288,7 +288,7 @@ impl WebUiConfig {
         self
     }
 
-    pub fn with_transport_client(mut self, client: IronMeshClient) -> Self {
+    pub fn with_transport_client(mut self, client: BerryKeepClient) -> Self {
         self.transport_client = Some(client);
         self
     }
@@ -354,7 +354,7 @@ struct GalleryMapUpstreamRoutes {
 }
 
 struct WebRuntime {
-    sdk: IronMeshClient,
+    sdk: BerryKeepClient,
     client: ClientNode,
     rendezvous: Option<WebRendezvousRuntimeConfig>,
     last_rendezvous_probe_error: Option<String>,
@@ -403,9 +403,9 @@ pub fn router(config: WebUiConfig) -> Router {
             }
         }
     };
-    let map_perf_logging_enabled = env_flag_is_truthy("IRONMESH_MAP_PERF_LOG");
+    let map_perf_logging_enabled = env_flag_is_truthy("BERRYKEEP_MAP_PERF_LOG");
     if map_perf_logging_enabled {
-        info!("map performance logging enabled via IRONMESH_MAP_PERF_LOG");
+        info!("map performance logging enabled via BERRYKEEP_MAP_PERF_LOG");
     }
     let log_buffer = config
         .log_buffer
@@ -597,7 +597,7 @@ pub fn router(config: WebUiConfig) -> Router {
 
     let app = Router::new()
         .route("/", get(web_static_index))
-        .route("/ironmesh-favicon.svg", get(web_static_favicon))
+        .route("/berrykeep-favicon.svg", get(web_static_favicon))
         .nest(WEB_API_V1_PREFIX, api_v1)
         .merge(legacy_api)
         .route("/{*path}", get(web_static_file))
@@ -735,7 +735,7 @@ fn cookie_values<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Ite
 }
 
 fn env_flag_is_truthy(name: &str) -> bool {
-    std::env::var(name)
+    common::legacy_compatibility::var(name)
         .ok()
         .map(|value| {
             matches!(
@@ -1087,7 +1087,7 @@ struct WebLatencyProbeTask {
     transport_mode: String,
     uses_current_runtime: bool,
     target: Option<String>,
-    client: IronMeshClient,
+    client: BerryKeepClient,
 }
 
 enum PendingWebLatencyProbeEntry {
@@ -1279,7 +1279,7 @@ fn log_local_diagnostic_request(
     );
 }
 
-async fn current_sdk(state: &WebState) -> IronMeshClient {
+async fn current_sdk(state: &WebState) -> BerryKeepClient {
     state.runtime.read().await.sdk.clone()
 }
 
@@ -1465,7 +1465,7 @@ fn web_latency_probe_config(payload: WebLatencyProbeRequest) -> LatencyProbeConf
     config
 }
 
-fn web_latency_target_description(client: &IronMeshClient) -> Option<String> {
+fn web_latency_target_description(client: &BerryKeepClient) -> Option<String> {
     if client.uses_relay_transport() {
         let rendezvous_hint = client
             .rendezvous_client()
@@ -1582,7 +1582,7 @@ async fn probe_web_latency_client(
 
 fn push_web_relay_latency_probe_entries(
     entries: &mut Vec<PendingWebLatencyProbeEntry>,
-    current_client: &IronMeshClient,
+    current_client: &BerryKeepClient,
     diagnostic_targets: &ConnectionBootstrapDiagnosticTargets,
     identity: Option<&ClientIdentityMaterial>,
     config: &LatencyProbeConfig,
@@ -1958,7 +1958,7 @@ async fn probe_rendezvous_and_build_view(state: &WebState) -> WebClientRendezvou
 
 async fn apply_runtime_client(
     state: &WebState,
-    sdk: IronMeshClient,
+    sdk: BerryKeepClient,
     bootstrap: ConnectionBootstrap,
     client_identity: Option<ClientIdentityMaterial>,
     persistence: Option<WebUiBootstrapPersistence>,
@@ -2235,7 +2235,7 @@ struct ObjectRangeSelection {
 }
 
 struct ObjectRangeDownloadRequest {
-    sdk: IronMeshClient,
+    sdk: BerryKeepClient,
     selection: ObjectRangeSelection,
     perf_logging_enabled: bool,
     cancelled: Arc<AtomicBool>,
@@ -2258,7 +2258,7 @@ async fn download_object_range_bytes(request: ObjectRangeDownloadRequest) -> Res
         } = selection;
         let started = Instant::now();
         let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
-        let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
+        let mut on_progress = |_progress: client_sdk::berrykeep_client::DownloadProgress| {};
         let should_cancel = || cancelled.load(Ordering::Relaxed);
         sdk.download_range_to_writer_with_progress_blocking(
             DownloadRangeRequest {
@@ -2383,7 +2383,7 @@ fn client_cache_scope(
 ) -> Option<String> {
     let identity = identity?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ironmesh-client-cache-scope-v1\0");
+    hasher.update(b"berrykeep-client-cache-scope-v1\0");
     hasher.update(service_name.as_bytes());
     hasher.update(b"\0");
     hasher.update(identity.cluster_id.as_bytes());
@@ -3774,7 +3774,7 @@ impl Write for SelectedRangeWriter<'_> {
 }
 
 async fn binary_stream_body(
-    sdk: IronMeshClient,
+    sdk: BerryKeepClient,
     query: WebStoreBinaryGetQuery,
     total_size_bytes: u64,
     selected_range: Option<LogicalFileByteRange>,
@@ -3823,7 +3823,7 @@ async fn binary_stream_body(
             } else {
                 writer
             };
-            let mut on_progress = |_progress: client_sdk::ironmesh_client::DownloadProgress| {};
+            let mut on_progress = |_progress: client_sdk::berrykeep_client::DownloadProgress| {};
             let should_cancel = || cancellation.is_cancelled();
             sdk.download_range_to_writer_with_progress_blocking(
                 DownloadRangeRequest {
@@ -4299,8 +4299,8 @@ mod tests {
     use axum::routing::get;
     use axum::{Router, middleware};
     use client_sdk::{
-        ClientIdentityMaterial, IronMeshClient, LatencyProbeConfig,
-        ironmesh_client::RelativePathResponse,
+        BerryKeepClient, ClientIdentityMaterial, LatencyProbeConfig,
+        berrykeep_client::RelativePathResponse,
     };
     use common::logging::LogBuffer;
     use std::collections::HashMap;
@@ -4322,7 +4322,7 @@ mod tests {
         assert!(address.ip().is_loopback());
 
         let app = router(
-            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
+            WebUiConfig::from_client(BerryKeepClient::from_direct_base_url("http://127.0.0.1:9"))
                 .with_embedded_session_authorization(authorization),
         );
         let task = tokio::spawn(async move {
@@ -4519,7 +4519,7 @@ mod tests {
             .expect("web listener should have an address");
         let server = tokio::spawn(async move {
             let app = router(WebUiConfig::from_client(
-                IronMeshClient::from_direct_base_url("http://127.0.0.1:9"),
+                BerryKeepClient::from_direct_base_url("http://127.0.0.1:9"),
             ));
             let _ = axum::serve(listener, app).await;
         });
@@ -4583,7 +4583,7 @@ mod tests {
             .local_addr()
             .expect("web listener should have an address");
         let app = router(WebUiConfig::from_client(
-            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}")),
+            BerryKeepClient::from_direct_base_url(format!("http://{upstream_address}")),
         ));
         let web = tokio::spawn(async move {
             let _ = axum::serve(web_listener, app).await;
@@ -4632,7 +4632,7 @@ mod tests {
             .local_addr()
             .expect("web listener should have an address");
         let app = router(WebUiConfig::from_client(
-            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}")),
+            BerryKeepClient::from_direct_base_url(format!("http://{upstream_address}")),
         ));
         let web = tokio::spawn(async move {
             let _ = axum::serve(web_listener, app).await;
@@ -4711,7 +4711,7 @@ mod tests {
             .local_addr()
             .expect("web listener should have an address");
         let app = router(WebUiConfig::from_client(
-            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}")),
+            BerryKeepClient::from_direct_base_url(format!("http://{upstream_address}")),
         ));
         let web = tokio::spawn(async move {
             let _ = axum::serve(web_listener, app).await;
@@ -4769,7 +4769,7 @@ mod tests {
             .local_addr()
             .expect("web listener should have an address");
         let upstream_sdk =
-            IronMeshClient::from_direct_base_url(format!("http://{upstream_address}"));
+            BerryKeepClient::from_direct_base_url(format!("http://{upstream_address}"));
         let app = router(WebUiConfig::from_client(upstream_sdk.clone()));
         let web = tokio::spawn(async move {
             let _ = axum::serve(web_listener, app).await;
@@ -4974,7 +4974,7 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("web UI listener should have a local address");
-        let map_sdk = IronMeshClient::from_direct_base_url("http://127.0.0.1:9");
+        let map_sdk = BerryKeepClient::from_direct_base_url("http://127.0.0.1:9");
         let app =
             router(WebUiConfig::from_client(map_sdk.clone()).with_log_buffer(Arc::clone(&buffer)));
         let server = tokio::spawn(async move {
@@ -5043,7 +5043,7 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("web UI listener should have a local address");
-        let sdk = IronMeshClient::from_direct_base_url("http://127.0.0.1:9");
+        let sdk = BerryKeepClient::from_direct_base_url("http://127.0.0.1:9");
         let app = router(WebUiConfig::from_client(sdk.clone()));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -5136,17 +5136,17 @@ mod tests {
         )
         .expect("other identity should be generated");
 
-        let scope = client_cache_scope("ironmesh-ios", Some(&identity));
-        assert_eq!(scope, client_cache_scope("ironmesh-ios", Some(&identity)));
+        let scope = client_cache_scope("berrykeep-ios", Some(&identity));
+        assert_eq!(scope, client_cache_scope("berrykeep-ios", Some(&identity)));
         assert_ne!(
             scope,
-            client_cache_scope("ironmesh-android", Some(&identity))
+            client_cache_scope("berrykeep-android", Some(&identity))
         );
         assert_ne!(
             scope,
-            client_cache_scope("ironmesh-ios", Some(&other_identity))
+            client_cache_scope("berrykeep-ios", Some(&other_identity))
         );
-        assert_eq!(client_cache_scope("ironmesh-ios", None), None);
+        assert_eq!(client_cache_scope("berrykeep-ios", None), None);
     }
 
     #[tokio::test]
@@ -5164,7 +5164,7 @@ mod tests {
             .local_addr()
             .expect("test listener should have a local address");
         let app = router(
-            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
+            WebUiConfig::from_client(BerryKeepClient::from_direct_base_url("http://127.0.0.1:9"))
                 .with_service_name("client-cache-test")
                 .with_client_identity(identity),
         );
@@ -5223,7 +5223,7 @@ mod tests {
             .local_addr()
             .expect("test listener should have a local address");
         let app = router(
-            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
+            WebUiConfig::from_client(BerryKeepClient::from_direct_base_url("http://127.0.0.1:9"))
                 .with_client_identity(identity.clone()),
         );
         let server = tokio::spawn(async move {
@@ -5426,7 +5426,7 @@ mod tests {
             .local_addr()
             .expect("test listener should have a local address");
         let app = router(
-            WebUiConfig::from_client(IronMeshClient::from_direct_base_url("http://127.0.0.1:9"))
+            WebUiConfig::from_client(BerryKeepClient::from_direct_base_url("http://127.0.0.1:9"))
                 .with_log_buffer(Arc::clone(&buffer)),
         );
         let server = tokio::spawn(async move {
@@ -5470,7 +5470,7 @@ mod tests {
         });
 
         let buffer = Arc::new(LogBuffer::new(32));
-        let client = IronMeshClient::from_direct_base_url(format!("http://{upstream_address}"));
+        let client = BerryKeepClient::from_direct_base_url(format!("http://{upstream_address}"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("web UI listener should bind");
@@ -5530,7 +5530,7 @@ mod tests {
         });
 
         let buffer = Arc::new(LogBuffer::new(32));
-        let client = IronMeshClient::from_direct_base_url(format!("http://{upstream_address}"));
+        let client = BerryKeepClient::from_direct_base_url(format!("http://{upstream_address}"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("web UI listener should bind");

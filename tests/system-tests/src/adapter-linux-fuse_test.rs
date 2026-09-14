@@ -11,7 +11,7 @@ mod tests {
     };
     use anyhow::{Context, Result, bail};
     use bytes::Bytes;
-    use client_sdk::IronMeshClient;
+    use client_sdk::BerryKeepClient;
     use std::ffi::CString;
     use std::fs;
     use std::io::Write;
@@ -58,7 +58,7 @@ mod tests {
 
     struct AuthenticatedLinuxFuseFixture {
         server: ChildGuard,
-        sdk: IronMeshClient,
+        sdk: BerryKeepClient,
         connection: LinuxFuseConnection,
     }
 
@@ -446,7 +446,7 @@ mod tests {
     }
 
     async fn wait_for_object_bytes(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         key: &str,
         expected: &[u8],
         retries: usize,
@@ -477,7 +477,7 @@ mod tests {
     }
 
     async fn wait_for_remote_directory_existence(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         dir_name: &str,
         retries: usize,
     ) -> Result<()> {
@@ -506,7 +506,7 @@ mod tests {
     }
 
     async fn wait_for_remote_directory_absence(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         dir_name: &str,
         retries: usize,
     ) -> Result<()> {
@@ -532,7 +532,7 @@ mod tests {
     }
 
     async fn wait_for_remote_file_absence(
-        sdk: &IronMeshClient,
+        sdk: &BerryKeepClient,
         key: &str,
         retries: usize,
     ) -> Result<()> {
@@ -749,18 +749,18 @@ mod tests {
         let node_id_b = "00000000-0000-0000-0000-00000000f102";
 
         let extra_env = [
-            ("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
-            ("IRONMESH_STARTUP_REPAIR_ENABLED", "false"),
-            ("IRONMESH_REPLICATION_REPAIR_ENABLED", "false"),
-            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "true"),
+            ("BERRYKEEP_STARTUP_REPAIR_ENABLED", "false"),
+            ("BERRYKEEP_REPLICATION_REPAIR_ENABLED", "false"),
+            ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
         ];
 
         let mut node_a =
             start_open_server_with_env(bind_a, &data_a, node_id_a, 2, &extra_env).await?;
         let mut node_b =
             start_open_server_with_env(bind_b, &data_b, node_id_b, 2, &extra_env).await?;
-        let sdk_a = IronMeshClient::from_direct_base_url(&base_a);
-        let sdk_b = IronMeshClient::from_direct_base_url(&base_b);
+        let sdk_a = BerryKeepClient::from_direct_base_url(&base_a);
+        let sdk_b = BerryKeepClient::from_direct_base_url(&base_b);
         let http = reqwest::Client::new();
 
         let result = async {
@@ -800,7 +800,7 @@ mod tests {
 
                 let initial_report: serde_json::Value = http
                     .post(format!("{base_a}/cluster/replication/repair"))
-                    .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                    .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                     .send()
                     .await?
                     .error_for_status()?
@@ -822,7 +822,7 @@ mod tests {
 
                 let delete_report: serde_json::Value = http
                     .post(format!("{base_a}/cluster/replication/repair"))
-                    .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                    .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
                     .send()
                     .await?
                     .error_for_status()?
@@ -1168,7 +1168,7 @@ mod tests {
         let scenario = async {
             let primary = mountpoint.join("report.csv");
             let conflict_copy = mountpoint
-                .join(".ironmesh-conflicts")
+                .join(".berrykeep-conflicts")
                 .join("remote")
                 .join("report.csv");
             wait_for_file(&primary, 120).await?;
@@ -1176,28 +1176,28 @@ mod tests {
             wait_for_metadata_size(&primary, 256, 120).await?;
             wait_for_xattr_value(
                 &primary,
-                "user.ironmesh.state",
+                "user.berrykeep.state",
                 b"placeholder,conflict",
                 120,
             )
             .await?;
             wait_for_xattr_value(
                 &primary,
-                "user.ironmesh.conflict_copy",
-                b".ironmesh-conflicts/remote/report.csv",
+                "user.berrykeep.conflict_copy",
+                b".berrykeep-conflicts/remote/report.csv",
                 120,
             )
             .await?;
             wait_for_xattr_value(
                 &conflict_copy,
-                "user.ironmesh.state",
+                "user.berrykeep.state",
                 b"placeholder,conflict,conflict-copy,read-only",
                 120,
             )
             .await?;
             wait_for_xattr_value(
                 &conflict_copy,
-                "user.ironmesh.source_path",
+                "user.berrykeep.source_path",
                 b"report.csv",
                 120,
             )
@@ -1244,14 +1244,14 @@ mod tests {
                 file.write_all(b"dirty-payload").with_context(|| {
                     format!("failed to write mounted file {}", mounted_file.display())
                 })?;
-                wait_for_xattr_value(&mounted_file, "user.ironmesh.state", b"dirty", 120).await?;
+                wait_for_xattr_value(&mounted_file, "user.berrykeep.state", b"dirty", 120).await?;
                 file.flush().with_context(|| {
                     format!("failed to flush mounted file {}", mounted_file.display())
                 })?;
                 drop(file);
 
                 wait_for_object_bytes(&sdk, "dirty-state.txt", b"dirty-payload", 180).await?;
-                wait_for_xattr_value(&mounted_file, "user.ironmesh.state", b"clean", 120).await?;
+                wait_for_xattr_value(&mounted_file, "user.berrykeep.state", b"clean", 120).await?;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -1516,7 +1516,7 @@ mod tests {
         let mountpoint = fresh_data_dir("linux-fuse-client-rights-edge-mount");
         let base_url = format!("http://{bind}");
         let connection = LinuxFuseConnection::direct(base_url.clone());
-        let sdk = IronMeshClient::from_direct_base_url(&base_url);
+        let sdk = BerryKeepClient::from_direct_base_url(&base_url);
         let mut server =
             start_open_server_with_env(bind, &server_data_dir, &node_id, 1, &[]).await?;
 

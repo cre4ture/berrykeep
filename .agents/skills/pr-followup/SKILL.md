@@ -5,7 +5,7 @@ description: How to follow an open pull request. Use automatically after opening
 
 # PR Follow-up
 
-Read [references/ironmesh-pr-facts.md](references/ironmesh-pr-facts.md) before the first watch. Use [../../../docs/ci-runbook.md](../../../docs/ci-runbook.md) when choosing local CI reproduction and validation commands.
+Read [references/berrykeep-pr-facts.md](references/berrykeep-pr-facts.md) before the first watch. Use [../../../docs/ci-runbook.md](../../../docs/ci-runbook.md) when choosing local CI reproduction and validation commands.
 
 ## Workflow
 

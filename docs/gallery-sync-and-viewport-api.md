@@ -252,13 +252,13 @@ snapshots.
 Media can carry user labels — for example `private` — without touching the media bytes
 themselves. Labels are stored in an XMP sidecar object next to the media, named by appending
 `.xmp` to the media's key (`album/photo.jpg` sidecar is `album/photo.jpg.xmp`). The sidecar is an
-ordinary object: it can be written by Ironmesh itself, or produced and synced by a third-party
+ordinary object: it can be written by BerryKeep itself, or produced and synced by a third-party
 tool such as Lightroom or digiKam, and either path updates the gallery projection.
 
 Because labelling only rewrites the small sidecar object, it costs no new version, chunks, or
 manifest on the image itself. An existing sidecar is read-modify-written, so third-party XMP
-properties Ironmesh does not model survive a label change untouched. A sidecar that cannot be
-parsed is left in place rather than overwritten, to avoid destroying metadata Ironmesh cannot
+properties BerryKeep does not model survive a label change untouched. A sidecar that cannot be
+parsed is left in place rather than overwritten, to avoid destroying metadata BerryKeep cannot
 interpret.
 
 Set labels with:
@@ -309,14 +309,14 @@ therefore filter nothing, so they remain valid.
 Managed first-run setup offers SQLite and the `turso-metadata` backend, with Turso selected by
 default in the distributed server-node builds. The selected backend is node-local and is persisted
 in `managed/setup-state.json`; subsequent managed starts use that value instead of reevaluating
-`IRONMESH_METADATA_BACKEND`.
+`BERRYKEEP_METADATA_BACKEND`.
 
 Setup-state versions that predate the persisted selection are migrated once. The migration imports
-`IRONMESH_METADATA_BACKEND` when it is set and otherwise records SQLite, which was the historical
+`BERRYKEEP_METADATA_BACKEND` when it is set and otherwise records SQLite, which was the historical
 default. Recovery keeps the recorded backend because changing between `state/metadata.sqlite` and
 `state/metadata.turso.db` requires an explicit metadata migration rather than a configuration
 toggle. Environment-only, unmanaged server-node startup continues to use
-`IRONMESH_METADATA_BACKEND` on each start.
+`BERRYKEEP_METADATA_BACKEND` on each start.
 
 Both backends provide the same durable gallery projection, viewport and Web Mercator indexes,
 spatial clustering, and revision log. Both maintain changes as part of their metadata updates, and

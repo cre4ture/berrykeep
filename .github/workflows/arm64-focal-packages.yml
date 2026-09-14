@@ -140,7 +140,7 @@ jobs:
         id: restore-zig
         uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/ironmesh-build-tools
+          path: ~/.cache/berrykeep-build-tools
           key: static-server-node-zig-0.16.0-${{ runner.os }}-${{ runner.arch }}
 
       - name: Cache static Server Node Rust build
@@ -174,7 +174,7 @@ jobs:
         if: ${{ github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/') && matrix.architecture == 'arm64' && steps.restore-zig.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
-          path: ~/.cache/ironmesh-build-tools
+          path: ~/.cache/berrykeep-build-tools
           key: ${{ steps.restore-zig.outputs.cache-primary-key }}
 
       - name: Upload portable ${{ matrix.architecture }} Server Node

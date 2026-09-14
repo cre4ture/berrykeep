@@ -108,8 +108,11 @@ pub use rendezvous_runtime::{
 pub use request_auth::{
     HEADER_AUTH_NONCE, HEADER_AUTH_SIGNATURE, HEADER_AUTH_TIMESTAMP, HEADER_CLUSTER_ID,
     HEADER_CONNECTION_NAME, HEADER_CREDENTIAL_FINGERPRINT, HEADER_DEVICE_ID, HEADER_OPERATION_ID,
-    SignedRequestHeaders, build_signed_request_headers, credential_fingerprint, next_auth_nonce,
-    public_key_fingerprint, verify_signed_request_headers,
+    LEGACY_HEADER_AUTH_NONCE, LEGACY_HEADER_AUTH_SIGNATURE, LEGACY_HEADER_AUTH_TIMESTAMP,
+    LEGACY_HEADER_CLUSTER_ID, LEGACY_HEADER_CONNECTION_NAME, LEGACY_HEADER_CREDENTIAL_FINGERPRINT,
+    LEGACY_HEADER_DEVICE_ID, LEGACY_HEADER_OPERATION_ID, SignedRequestHeaders,
+    build_signed_request_headers, credential_fingerprint, next_auth_nonce, public_key_fingerprint,
+    verify_signed_request_headers,
 };
 pub use session::{
     SessionPreference, TransportPathKind, TransportSessionPlan, TransportSessionRequest,

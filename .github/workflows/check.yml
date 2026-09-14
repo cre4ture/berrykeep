@@ -287,7 +287,7 @@ jobs:
         id: set-matrix
         env:
           ANDROID_RELEASE_REQUESTED: ${{ contains(github.event.pull_request.labels.*.name, 'ci:android-release') }}
-          IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 }}
+          BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_B64: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 }}
         run: |
           # Debug legs run the cheap JVM unit tests (+ server-node package
           # validation build). They always run, including on pull requests.
@@ -300,10 +300,10 @@ jobs:
           NODE_RELEASE_TARGET='{"label":"node rel","module":"android-server-node-app","directory":"apps/android-server-node-app","variant":"release","artifact":"android-server-node-release-performance"}'
 
           TARGETS="${DEBUG_TARGETS}"
-          if { [ "${GITHUB_EVENT_NAME}" != "pull_request" ] || [ "${ANDROID_RELEASE_REQUESTED}" = "true" ]; } && [ -n "${IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64}" ]; then
+          if { [ "${GITHUB_EVENT_NAME}" != "pull_request" ] || [ "${ANDROID_RELEASE_REQUESTED}" = "true" ]; } && [ -n "${BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_B64}" ]; then
             TARGETS="${TARGETS},${APP_RELEASE_TARGET}"
           fi
-          if { [ "${ANDROID_RELEASE_REQUESTED}" = "true" ] || { [ "${GITHUB_REF_TYPE}" = "tag" ] && [[ "${GITHUB_REF_NAME}" =~ ^v[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; }; } && [ -n "${IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64}" ]; then
+          if { [ "${ANDROID_RELEASE_REQUESTED}" = "true" ] || { [ "${GITHUB_REF_TYPE}" = "tag" ] && [[ "${GITHUB_REF_NAME}" =~ ^v[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; }; } && [ -n "${BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_B64}" ]; then
             TARGETS="${TARGETS},${NODE_RELEASE_TARGET}"
           fi
           echo "matrix={\"target\":[${TARGETS}]}" >> "$GITHUB_OUTPUT"
@@ -318,10 +318,10 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
-      IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 }}
-      IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD }}
-      IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS }}
-      IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD }}
+      BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_B64: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 }}
+      BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD }}
+      BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_ALIAS: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS }}
+      BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD: ${{ secrets.IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -363,12 +363,12 @@ jobs:
         # release legs): build.gradle.kts validates the release signing config
         # at configuration time for every task, including :app:testDebugUnitTest,
         # so the debug legs also need STORE_FILE set to avoid a partial config.
-        if: ${{ env.IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
+        if: ${{ env.BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_B64 != '' }}
         run: |
           mkdir -p $HOME/.android
-          printf '%s' "$IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64" | base64 --decode > $HOME/.android/ironmesh-internal-release.keystore
-          chmod 600 $HOME/.android/ironmesh-internal-release.keystore
-          echo "IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE=$HOME/.android/ironmesh-internal-release.keystore" >> $GITHUB_ENV
+          printf '%s' "$BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_B64" | base64 --decode > $HOME/.android/berrykeep-internal-release.keystore
+          chmod 600 $HOME/.android/berrykeep-internal-release.keystore
+          echo "BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_FILE=$HOME/.android/berrykeep-internal-release.keystore" >> $GITHUB_ENV
 
       - name: Run Android JVM unit tests
         if: ${{ matrix.target.variant == 'debug' }}
@@ -405,19 +405,19 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
-      IRONMESH_IOS_SIGNING_CERT_B64: ${{ secrets.IRONMESH_IOS_SIGNING_CERT_B64 }}
-      IRONMESH_IOS_SIGNING_CERT_PASSWORD: ${{ secrets.IRONMESH_IOS_SIGNING_CERT_PASSWORD }}
-      IRONMESH_IOS_APP_PROFILE_B64: ${{ secrets.IRONMESH_IOS_APP_PROFILE_B64 }}
-      IRONMESH_IOS_EXTENSION_PROFILE_B64: ${{ secrets.IRONMESH_IOS_EXTENSION_PROFILE_B64 }}
-      IRONMESH_IOS_EXPORT_METHOD: ${{ vars.IRONMESH_IOS_EXPORT_METHOD }}
-      IOS_APP_SCHEME: IronmeshIosApp
-      IOS_ARCHIVE_PATH: ${{ github.workspace }}/.tmp/IronmeshIosApp.xcarchive
-      IOS_DERIVED_DATA_PATH: ${{ github.workspace }}/.tmp/ironmesh-ios-derived-data
-      IOS_EXPORT_OPTIONS_PATH: ${{ github.workspace }}/.tmp/ironmesh-ios-export-options.plist
-      IOS_EXPORT_PATH: ${{ github.workspace }}/.tmp/ironmesh-ios-export
-      IOS_PROJECT_PATH: apps/apple-file-provider/IronmeshAppleFileProvider.xcodeproj
-      IOS_TEST_SCHEME: IronmeshIosApp
-      IOS_XCRESULT_PATH: ${{ github.workspace }}/.tmp/IronmeshIosProject.xcresult
+      BERRYKEEP_IOS_SIGNING_CERT_B64: ${{ secrets.IRONMESH_IOS_SIGNING_CERT_B64 }}
+      BERRYKEEP_IOS_SIGNING_CERT_PASSWORD: ${{ secrets.IRONMESH_IOS_SIGNING_CERT_PASSWORD }}
+      BERRYKEEP_IOS_APP_PROFILE_B64: ${{ secrets.IRONMESH_IOS_APP_PROFILE_B64 }}
+      BERRYKEEP_IOS_EXTENSION_PROFILE_B64: ${{ secrets.IRONMESH_IOS_EXTENSION_PROFILE_B64 }}
+      BERRYKEEP_IOS_EXPORT_METHOD: ${{ vars.IRONMESH_IOS_EXPORT_METHOD }}
+      IOS_APP_SCHEME: BerryKeepIosApp
+      IOS_ARCHIVE_PATH: ${{ github.workspace }}/.tmp/BerryKeepIosApp.xcarchive
+      IOS_DERIVED_DATA_PATH: ${{ github.workspace }}/.tmp/berrykeep-ios-derived-data
+      IOS_EXPORT_OPTIONS_PATH: ${{ github.workspace }}/.tmp/berrykeep-ios-export-options.plist
+      IOS_EXPORT_PATH: ${{ github.workspace }}/.tmp/berrykeep-ios-export
+      IOS_PROJECT_PATH: apps/apple-file-provider/BerryKeepAppleFileProvider.xcodeproj
+      IOS_TEST_SCHEME: BerryKeepIosApp
+      IOS_XCRESULT_PATH: ${{ github.workspace }}/.tmp/BerryKeepIosProject.xcresult
       IOS_RELEASE_REQUESTED: ${{ contains(github.event.pull_request.labels.*.name, 'ci:ios-release') }}
     steps:
       - name: Checkout
@@ -439,14 +439,14 @@ jobs:
 
       - name: Determine iOS signing mode
         run: |
-          if [ -n "$IRONMESH_IOS_SIGNING_CERT_B64" ] && [ -n "$IRONMESH_IOS_SIGNING_CERT_PASSWORD" ] && [ -n "$IRONMESH_IOS_APP_PROFILE_B64" ] && [ -n "$IRONMESH_IOS_EXTENSION_PROFILE_B64" ]; then
+          if [ -n "$BERRYKEEP_IOS_SIGNING_CERT_B64" ] && [ -n "$BERRYKEEP_IOS_SIGNING_CERT_PASSWORD" ] && [ -n "$BERRYKEEP_IOS_APP_PROFILE_B64" ] && [ -n "$BERRYKEEP_IOS_EXTENSION_PROFILE_B64" ]; then
             echo "IOS_SIGNED_EXPORT_ENABLED=true" >> "$GITHUB_ENV"
           else
             echo "IOS_SIGNED_EXPORT_ENABLED=false" >> "$GITHUB_ENV"
           fi
 
-          EXPORT_METHOD="${IRONMESH_IOS_EXPORT_METHOD:-development}"
-          echo "IRONMESH_IOS_EXPORT_METHOD=${EXPORT_METHOD}" >> "$GITHUB_ENV"
+          EXPORT_METHOD="${BERRYKEEP_IOS_EXPORT_METHOD:-development}"
+          echo "BERRYKEEP_IOS_EXPORT_METHOD=${EXPORT_METHOD}" >> "$GITHUB_ENV"
 
       - name: Create iOS temp workspace
         run: mkdir -p "$(dirname "$IOS_ARCHIVE_PATH")"
@@ -520,13 +520,13 @@ jobs:
 
       - name: Resolve iOS Simulator destination
         run: |
-          DESTINATION="$(IRONMESH_IOS_SIMULATOR_APP_BUNDLE_ID=dev.ironmesh.apple.iosapp IRONMESH_IOS_SIMULATOR_RESET=1 apps/apple-file-provider/scripts/prepare-ios-simulator.sh "$IOS_PROJECT_PATH" "$IOS_TEST_SCHEME")"
+          DESTINATION="$(BERRYKEEP_IOS_SIMULATOR_APP_BUNDLE_ID=dev.ironmesh.apple.iosapp BERRYKEEP_IOS_SIMULATOR_RESET=1 apps/apple-file-provider/scripts/prepare-ios-simulator.sh "$IOS_PROJECT_PATH" "$IOS_TEST_SCHEME")"
           echo "IOS_SIMULATOR_DESTINATION=${DESTINATION}" >> "$GITHUB_ENV"
 
       - name: Run iOS simulator tests
         run: |
           rm -rf "$IOS_XCRESULT_PATH" "$IOS_DERIVED_DATA_PATH"
-          IRONMESH_GALLERY_RUNTIME_URL=http://127.0.0.1:18081/ xcodebuild test \
+          BERRYKEEP_GALLERY_RUNTIME_URL=http://127.0.0.1:18081/ xcodebuild test \
             -project "$IOS_PROJECT_PATH" \
             -scheme "$IOS_TEST_SCHEME" \
             -destination "$IOS_SIMULATOR_DESTINATION" \
@@ -555,11 +555,11 @@ jobs:
               -derivedDataPath "$IOS_DERIVED_DATA_PATH" \
               -archivePath "$IOS_ARCHIVE_PATH" \
               CODE_SIGN_STYLE=Automatic \
-              CODE_SIGN_IDENTITY="$IRONMESH_IOS_SIGNING_IDENTITY" \
+              CODE_SIGN_IDENTITY="$BERRYKEEP_IOS_SIGNING_IDENTITY" \
               CODE_SIGNING_ALLOWED=YES \
               CODE_SIGNING_REQUIRED=YES \
-              DEVELOPMENT_TEAM="$IRONMESH_IOS_DEVELOPMENT_TEAM" \
-              OTHER_CODE_SIGN_FLAGS="--keychain $IRONMESH_IOS_KEYCHAIN_PATH"
+              DEVELOPMENT_TEAM="$BERRYKEEP_IOS_DEVELOPMENT_TEAM" \
+              OTHER_CODE_SIGN_FLAGS="--keychain $BERRYKEEP_IOS_KEYCHAIN_PATH"
           else
             xcodebuild archive \
               -project "$IOS_PROJECT_PATH" \
@@ -587,20 +587,20 @@ jobs:
             <key>compileBitcode</key>
             <false/>
             <key>method</key>
-            <string>${IRONMESH_IOS_EXPORT_METHOD}</string>
+            <string>${BERRYKEEP_IOS_EXPORT_METHOD}</string>
             <key>provisioningProfiles</key>
             <dict>
               <key>dev.ironmesh.apple.iosapp</key>
-              <string>${IRONMESH_IOS_APP_PROFILE_UUID}</string>
+              <string>${BERRYKEEP_IOS_APP_PROFILE_UUID}</string>
               <key>dev.ironmesh.apple.iosapp.fileprovider</key>
-              <string>${IRONMESH_IOS_EXTENSION_PROFILE_UUID}</string>
+              <string>${BERRYKEEP_IOS_EXTENSION_PROFILE_UUID}</string>
             </dict>
             <key>signingStyle</key>
             <string>manual</string>
             <key>stripSwiftSymbols</key>
             <true/>
             <key>teamID</key>
-            <string>${IRONMESH_IOS_DEVELOPMENT_TEAM}</string>
+            <string>${BERRYKEEP_IOS_DEVELOPMENT_TEAM}</string>
             <key>thinning</key>
             <string>&lt;none&gt;</string>
           </dict>
@@ -614,7 +614,7 @@ jobs:
             -archivePath "$IOS_ARCHIVE_PATH" \
             -exportPath "$IOS_EXPORT_PATH" \
             -exportOptionsPlist "$IOS_EXPORT_OPTIONS_PATH" \
-            OTHER_CODE_SIGN_FLAGS="--keychain $IRONMESH_IOS_KEYCHAIN_PATH"
+            OTHER_CODE_SIGN_FLAGS="--keychain $BERRYKEEP_IOS_KEYCHAIN_PATH"
 
       - name: Upload signed iOS IPA for manual installs
         if: ${{ env.IOS_SIGNED_EXPORT_ENABLED == 'true' && (github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true') }}
@@ -677,7 +677,7 @@ jobs:
       - name: Start Client UI gallery runtime fixture
         working-directory: web
         run: |
-          IRONMESH_GALLERY_RUNTIME_BIND=0.0.0.0 node tests/scripts/run-cli-client-gallery-runtime.mjs > "$RUNNER_TEMP/android-gallery-runtime.log" 2>&1 &
+          BERRYKEEP_GALLERY_RUNTIME_BIND=0.0.0.0 node tests/scripts/run-cli-client-gallery-runtime.mjs > "$RUNNER_TEMP/android-gallery-runtime.log" 2>&1 &
           echo "ANDROID_GALLERY_RUNTIME_PID=$!" >> "$GITHUB_ENV"
           for attempt in $(seq 1 60); do
             if curl --fail --silent --show-error http://127.0.0.1:18081/ >/dev/null; then
@@ -783,7 +783,7 @@ jobs:
         id: restore-zig
         uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/ironmesh-build-tools
+          path: ~/.cache/berrykeep-build-tools
           key: static-server-node-zig-0.16.0-${{ runner.os }}-${{ runner.arch }}
 
       - name: Cache Rust build artifacts
@@ -803,7 +803,7 @@ jobs:
         if: ${{ github.event_name != 'pull_request' && steps.restore-zig.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
-          path: ~/.cache/ironmesh-build-tools
+          path: ~/.cache/berrykeep-build-tools
           key: ${{ steps.restore-zig.outputs.cache-primary-key }}
 
       - name: Upload static x86_64 Server Node
@@ -867,9 +867,9 @@ jobs:
         run: |
           cargo build --locked --release \
             -p cli-client \
-            -p ironmesh-config-app \
-            -p ironmesh-background-launcher \
-            -p ironmesh-folder-agent \
+            -p berrykeep-config-app \
+            -p berrykeep-background-launcher \
+            -p berrykeep-folder-agent \
             -p os-integration \
             -p rendezvous-service
           mkdir -p artifacts/linux-debian-binaries

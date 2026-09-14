@@ -27,9 +27,9 @@ use desktop_client_config::{
     ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
     default_service_log_dir, generate_instance_id, launch_client_cli_instance,
     launch_enabled_instances, launch_folder_agent_instance, launch_os_integration_instance,
-    launch_report_with_updated_outcome, load_last_launch_report, migrate_legacy_state_paths,
-    package_root_from_current_exe, save_launch_report, service_desktop_status_file_path,
-    service_runtime_statuses, stop_service_from_report,
+    launch_report_with_updated_outcome, load_last_launch_report, package_root_from_current_exe,
+    save_launch_report, service_desktop_status_file_path, service_runtime_statuses,
+    stop_service_from_report,
 };
 use desktop_status::{
     DesktopServiceStatus, DesktopStatusDocument, GNOME_EXTENSION_UUID, StatusFacet, StatusSnapshot,
@@ -598,7 +598,6 @@ async fn main() -> Result<()> {
 
     let bind_addr: SocketAddr = cli.bind.parse().context("failed parsing --bind address")?;
     let package_root = package_root_from_current_exe()?;
-    migrate_legacy_state_paths()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let state = AppState {
         paths: ManagedPaths::new(
@@ -627,7 +626,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index_html))
-        .route("/ironmesh-favicon.svg", get(app_favicon))
+        .route("/berrykeep-favicon.svg", get(app_favicon))
         .route("/app.css", get(app_css))
         .route("/app.js", get(app_js))
         .route("/api/config", get(get_config))
@@ -2490,7 +2489,7 @@ fn windows_local_appdata_root() -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("Ironmesh")
+        .join("BerryKeep")
 }
 
 #[cfg(windows)]
@@ -2648,7 +2647,7 @@ const APP_HTML: &str = r###"<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <script>
     try {
-      const storageKey = "ironmesh-color-scheme";
+      const storageKey = "berrykeep-color-scheme";
       const storedColorScheme = window.localStorage.getItem(storageKey);
       const colorScheme =
         storedColorScheme === "light" || storedColorScheme === "dark" || storedColorScheme === "auto"
@@ -2664,7 +2663,7 @@ const APP_HTML: &str = r###"<!doctype html>
     } catch {}
   </script>
   <title>BerryKeep Desktop Config</title>
-  <link rel="icon" type="image/svg+xml" href="/ironmesh-favicon.svg" />
+  <link rel="icon" type="image/svg+xml" href="/berrykeep-favicon.svg" />
   <link rel="stylesheet" href="/app.css" />
 </head>
 <body>
@@ -2732,7 +2731,7 @@ const APP_HTML: &str = r###"<!doctype html>
           </a>
           <a class="shell-nav-link" href="#client-panel">
             <span class="nav-title">Client Services</span>
-            <span class="nav-description">Configure background ironmesh serve-web instances and their local bind addresses.</span>
+            <span class="nav-description">Configure background berrykeep serve-web instances and their local bind addresses.</span>
           </a>
           <a id="os-nav-link" class="shell-nav-link" href="#os-panel">
             <span id="os-nav-title" class="nav-title">OS Integration</span>
@@ -2831,7 +2830,7 @@ const APP_HTML: &str = r###"<!doctype html>
               <div class="panel-header">
                 <div>
                   <h2>Client Services</h2>
-                  <p>Each entry runs one background ironmesh serve-web instance with its own local bind address and connection settings.</p>
+                  <p>Each entry runs one background berrykeep serve-web instance with its own local bind address and connection settings.</p>
                 </div>
                 <button id="clear-client-form" class="secondary">New Instance</button>
               </div>
@@ -2966,8 +2965,8 @@ const APP_HTML: &str = r###"<!doctype html>
                 </label>
                 <label>
                   <span class="field-label">Filesystem Name</span>
-                  <span class="field-help">Optional mount name shown by FUSE tooling. The runtime defaults to ironmesh.</span>
-                  <input id="os-fs-name" placeholder="ironmesh" />
+                  <span class="field-help">Optional mount name shown by FUSE tooling. The runtime defaults to berrykeep.</span>
+                  <input id="os-fs-name" placeholder="berrykeep" />
                 </label>
                 <label>
                   <span class="field-label">Namespace Depth</span>
@@ -3102,7 +3101,7 @@ const APP_HTML: &str = r###"<!doctype html>
 </html>
 "###;
 
-const APP_FAVICON: &str = include_str!("../../../docs/assets/ironmesh-tray-mark.svg");
+const APP_FAVICON: &str = include_str!("../../../docs/assets/berrykeep-tray-mark.svg");
 
 const APP_CSS: &str = r###"
 html {
@@ -3759,7 +3758,7 @@ pre {
 
 const APP_JS: &str = r###"
 let currentConfig = null;
-const colorSchemeStorageKey = 'ironmesh-color-scheme';
+const colorSchemeStorageKey = 'berrykeep-color-scheme';
 
 function getPreferredColorScheme() {
   try {
@@ -4577,7 +4576,7 @@ mod tests {
     #[test]
     fn refresh_client_identity_metadata_reads_rendezvous_cert_expiry() {
         let temp_dir = std::env::temp_dir().join(format!(
-            "ironmesh-config-app-rendezvous-expiry-{}-{}",
+            "berrykeep-config-app-rendezvous-expiry-{}-{}",
             std::process::id(),
             unix_ts_ms()
         ));
@@ -4616,7 +4615,7 @@ mod tests {
     #[test]
     fn refresh_client_identity_metadata_clears_rendezvous_cert_expiry_without_pem() {
         let temp_dir = std::env::temp_dir().join(format!(
-            "ironmesh-config-app-rendezvous-expiry-clear-{}-{}",
+            "berrykeep-config-app-rendezvous-expiry-clear-{}-{}",
             std::process::id(),
             unix_ts_ms()
         ));

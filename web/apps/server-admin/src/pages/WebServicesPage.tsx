@@ -7,8 +7,8 @@ import {
   type AdminWebService,
   type AdminWebServiceUpsertRequest,
   type ClientCredentialView
-} from "@ironmesh/api";
-import { ironmeshPrimaryColor } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { berrykeepPrimaryColor } from "@berrykeep/ui";
 import {
   Alert,
   Badge,
@@ -328,7 +328,7 @@ export function WebServicesPage() {
             <Stack gap="md">
               <Group justify="space-between">
                 <Text fw={700}>Configured on this node</Text>
-                <Badge color={ironmeshPrimaryColor} variant="light">{services.length}</Badge>
+                <Badge color={berrykeepPrimaryColor} variant="light">{services.length}</Badge>
               </Group>
               <Table striped highlightOnHover withTableBorder>
                 <Table.Thead>
@@ -347,7 +347,7 @@ export function WebServicesPage() {
                         <Text fw={600}>{service.name}</Text>
                         <Group gap="xs">
                           <Code>{service.id}</Code>
-                          <Badge color={service.enabled ? ironmeshPrimaryColor : "gray"} variant="light">
+                          <Badge color={service.enabled ? berrykeepPrimaryColor : "gray"} variant="light">
                             {service.enabled ? "enabled" : "disabled"}
                           </Badge>
                         </Group>

@@ -369,7 +369,7 @@ mod tests {
         assert!(!object.contains_key("target_node_id"));
 
         let dir = std::env::temp_dir().join(format!(
-            "ironmesh-rendezvous-failover-{}",
+            "berrykeep-rendezvous-failover-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should create");
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn load_rendezvous_failover_package_decrypts_payload() {
         let dir = std::env::temp_dir().join(format!(
-            "ironmesh-rendezvous-failover-{}",
+            "berrykeep-rendezvous-failover-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should create");
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn load_rendezvous_failover_package_accepts_legacy_payload_without_client_ca() {
         let dir = std::env::temp_dir().join(format!(
-            "ironmesh-rendezvous-failover-{}",
+            "berrykeep-rendezvous-failover-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should create");
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn load_rendezvous_failover_package_rejects_wrong_passphrase() {
         let dir = std::env::temp_dir().join(format!(
-            "ironmesh-rendezvous-failover-{}",
+            "berrykeep-rendezvous-failover-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should create");

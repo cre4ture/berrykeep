@@ -7,7 +7,7 @@ final class AppleSyncProfilesTests: XCTestCase {
     func testManagedDomainWithoutProfileFailsClosedInsteadOfExposingRemoteRoot() {
         XCTAssertThrowsError(
             try AppleSyncProfileResolution.resolve(
-                domainIdentifier: "dev.ironmesh.profile.orphaned",
+                domainIdentifier: "dev.berrykeep.profile.orphaned",
                 storedProfile: nil,
                 configuredProfile: nil,
                 legacyDisplayName: "Orphaned"
@@ -15,7 +15,7 @@ final class AppleSyncProfilesTests: XCTestCase {
         ) { error in
             XCTAssertEqual(
                 error as? AppleSyncProfileResolutionError,
-                .missingManagedProfile("dev.ironmesh.profile.orphaned")
+                .missingManagedProfile("dev.berrykeep.profile.orphaned")
             )
         }
     }
@@ -99,6 +99,27 @@ final class AppleSyncProfilesTests: XCTestCase {
         XCTAssertEqual(try restartedStore.load().first?.lifecycle, .active)
     }
 
+    func testProfileStoreMigratesFormerProfilesWithoutChangingTheirDomain() throws {
+        let suiteName = "AppleSyncProfilesTests.FormerProfiles.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let canonicalKey = "berrykeep.test.profiles"
+        let legacyKey = "ironmesh.test.profiles"
+        let legacyProfile = AppleSyncProfile(id: "documents", displayName: "Documents")
+        defaults.set(try JSONEncoder().encode([legacyProfile]), forKey: legacyKey)
+        let store = AppleSyncProfileStore(
+            defaults: defaults,
+            profilesKey: canonicalKey,
+            legacyProfilesKey: legacyKey
+        )
+
+        let migrated = try XCTUnwrap(store.load().first)
+
+        XCTAssertEqual(migrated.domainIdentifier, "dev.ironmesh.profile.documents")
+        XCTAssertNotNil(defaults.data(forKey: canonicalKey))
+        XCTAssertNil(defaults.data(forKey: legacyKey))
+    }
+
     func testProfilePathMapperKeepsEachDomainInsideItsRemotePrefix() throws {
         let mapper = AppleProfilePathMapper(remotePrefix: "/team/documents/")
         let remoteItem = item(
@@ -166,7 +187,7 @@ final class AppleSyncProfilesTests: XCTestCase {
         guard case .blocked(let reason) = decision else {
             return XCTFail("expected the offline policy to block remote work")
         }
-        let error = ironmeshConstraintError(reason)
+        let error = berrykeepConstraintError(reason)
 
         XCTAssertEqual(error.domain, NSFileProviderErrorDomain)
         XCTAssertEqual(error.code, NSFileProviderError.Code.serverUnreachable.rawValue)
@@ -257,7 +278,7 @@ final class AppleSyncProfilesTests: XCTestCase {
 
         XCTAssertEqual(first, retry)
         XCTAssertNotEqual(first, differentBase)
-        XCTAssertTrue(first.hasPrefix("docs/readme (IronMesh conflict "))
+        XCTAssertTrue(first.hasPrefix("docs/readme (BerryKeep conflict "))
         XCTAssertTrue(first.hasSuffix(".txt"))
     }
 
@@ -268,7 +289,7 @@ final class AppleSyncProfilesTests: XCTestCase {
         XCTAssertEqual(initial.updatedIdentifiers, [original.identifier.serialized])
 
         let updated = item(path: "docs/readme.txt", revision: "v2")
-        let concurrent = item(path: "docs/readme (IronMesh conflict abc).txt", revision: "conflict-v1")
+        let concurrent = item(path: "docs/readme (BerryKeep conflict abc).txt", revision: "conflict-v1")
         let changed = journal.reconcile([updated, concurrent])
         XCTAssertEqual(
             changed.updatedIdentifiers,

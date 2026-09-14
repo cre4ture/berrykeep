@@ -1,10 +1,8 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +11,7 @@ use crate::{LocalEntryKind, LocalEntryState, LocalTreeState, normalize_relative_
 
 pub(crate) const FOLDER_AGENT_BASELINE_FILE_NAME: &str = "baseline.sqlite";
 pub(crate) const FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME: &str = "modification-log.sqlite";
-const FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN: &str = "ironmesh-folder-agent-profile-v1";
+const FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN: &str = "berrykeep-folder-agent-profile-v1";
 
 #[derive(Debug, Clone)]
 pub struct PathScope {
@@ -70,16 +68,16 @@ impl PathScope {
 #[derive(Debug, Clone)]
 pub(crate) struct FolderAgentProfilePaths {
     pub scope_fingerprint: String,
-    pub legacy_profile_dir: Option<PathBuf>,
     pub baseline_path: PathBuf,
     pub modification_log_path: PathBuf,
 }
 
 pub(crate) fn default_folder_agent_state_root() -> PathBuf {
-    xdg_state_home()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("ironmesh")
-        .join("folder-agent")
+    folder_agent_state_root_in(xdg_state_home().unwrap_or_else(std::env::temp_dir))
+}
+
+fn folder_agent_state_root_in(state_home: PathBuf) -> PathBuf {
+    state_home.join("berrykeep").join("folder-agent")
 }
 
 pub(crate) fn folder_agent_profile_paths(
@@ -89,18 +87,9 @@ pub(crate) fn folder_agent_profile_paths(
     state_root_dir: &Path,
 ) -> FolderAgentProfilePaths {
     let scope_fingerprint = stable_scope_fingerprint(identity_root, scope, connection_target);
-    let legacy_profile_dir = legacy_folder_agent_profile_dir(
-        identity_root,
-        scope,
-        connection_target,
-        state_root_dir,
-        &scope_fingerprint,
-    );
-
     let profile_dir = state_root_dir.join("profiles").join(&scope_fingerprint);
     FolderAgentProfilePaths {
         scope_fingerprint,
-        legacy_profile_dir,
         baseline_path: profile_dir.join(FOLDER_AGENT_BASELINE_FILE_NAME),
         modification_log_path: profile_dir.join(FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME),
     }
@@ -111,8 +100,22 @@ fn stable_scope_fingerprint(
     scope: &PathScope,
     connection_target: &str,
 ) -> String {
+    stable_scope_fingerprint_with_domain(
+        FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN,
+        identity_root,
+        scope,
+        connection_target,
+    )
+}
+
+fn stable_scope_fingerprint_with_domain(
+    domain: &str,
+    identity_root: &Path,
+    scope: &PathScope,
+    connection_target: &str,
+) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(FOLDER_AGENT_SCOPE_FINGERPRINT_DOMAIN.as_bytes());
+    hasher.update(domain.as_bytes());
     hasher.update(&[0]);
     hasher.update(identity_root.to_string_lossy().as_bytes());
     hasher.update(&[0]);
@@ -120,175 +123,6 @@ fn stable_scope_fingerprint(
     hasher.update(&[0]);
     hasher.update(connection_target.as_bytes());
     hasher.finalize().to_hex().to_string()
-}
-
-fn legacy_scope_fingerprint(
-    identity_root: &Path,
-    scope: &PathScope,
-    connection_target: &str,
-) -> String {
-    let mut hasher = DefaultHasher::new();
-    identity_root.to_string_lossy().hash(&mut hasher);
-    scope.remote_prefix().unwrap_or_default().hash(&mut hasher);
-    connection_target.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-pub(crate) fn legacy_folder_agent_profile_dir(
-    identity_root: &Path,
-    scope: &PathScope,
-    connection_target: &str,
-    state_root_dir: &Path,
-    current_scope_fingerprint: &str,
-) -> Option<PathBuf> {
-    let legacy_scope_fingerprint =
-        legacy_scope_fingerprint(identity_root, scope, connection_target);
-    (legacy_scope_fingerprint != current_scope_fingerprint).then(|| {
-        state_root_dir
-            .join("profiles")
-            .join(legacy_scope_fingerprint)
-    })
-}
-
-pub(crate) fn migrate_legacy_folder_agent_profile_dir(
-    current_profile_dir: &Path,
-    legacy_profile_dir: Option<&Path>,
-    current_scope_fingerprint: &str,
-) -> Result<()> {
-    let Some(legacy_profile_dir) = legacy_profile_dir.filter(|path| path.exists()) else {
-        return Ok(());
-    };
-    if current_profile_dir.exists() {
-        return Ok(());
-    }
-
-    if let Some(parent) = current_profile_dir.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create folder-agent profile parent directory {}",
-                parent.display()
-            )
-        })?;
-    }
-
-    move_or_copy_profile_dir(legacy_profile_dir, current_profile_dir)?;
-    rewrite_scope_fingerprint_metadata(
-        &current_profile_dir.join(FOLDER_AGENT_BASELINE_FILE_NAME),
-        "baseline_meta",
-        current_scope_fingerprint,
-    )?;
-    rewrite_scope_fingerprint_metadata(
-        &current_profile_dir.join(FOLDER_AGENT_MODIFICATION_LOG_FILE_NAME),
-        "modification_meta",
-        current_scope_fingerprint,
-    )?;
-
-    Ok(())
-}
-
-fn move_or_copy_profile_dir(source: &Path, target: &Path) -> Result<()> {
-    match fs::rename(source, target) {
-        Ok(()) => Ok(()),
-        Err(rename_error) => {
-            copy_profile_dir_recursive(source, target).with_context(|| {
-                format!(
-                    "failed copying legacy folder-agent profile dir from {} to {} after rename error: {}",
-                    source.display(),
-                    target.display(),
-                    rename_error
-                )
-            })?;
-            fs::remove_dir_all(source).with_context(|| {
-                format!(
-                    "failed removing legacy folder-agent profile dir {} after copy migration",
-                    source.display()
-                )
-            })?;
-            Ok(())
-        }
-    }
-}
-
-fn copy_profile_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
-
-    for entry in
-        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
-    {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        let file_type = entry.file_type().with_context(|| {
-            format!(
-                "failed to inspect legacy folder-agent profile entry {}",
-                source_path.display()
-            )
-        })?;
-
-        if file_type.is_dir() {
-            copy_profile_dir_recursive(&source_path, &target_path)?;
-        } else if file_type.is_file() {
-            fs::copy(&source_path, &target_path).with_context(|| {
-                format!(
-                    "failed copying legacy folder-agent profile file {} to {}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
-fn rewrite_scope_fingerprint_metadata(
-    sqlite_path: &Path,
-    meta_table: &str,
-    current_scope_fingerprint: &str,
-) -> Result<()> {
-    if !sqlite_path.exists() {
-        return Ok(());
-    }
-
-    let connection = Connection::open(sqlite_path).with_context(|| {
-        format!(
-            "failed to open migrated sqlite store {}",
-            sqlite_path.display()
-        )
-    })?;
-    let table_exists = connection
-        .query_row(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [meta_table],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .with_context(|| {
-            format!(
-                "failed to inspect sqlite metadata table {} in {}",
-                meta_table,
-                sqlite_path.display()
-            )
-        })?;
-    if table_exists.is_none() {
-        return Ok(());
-    }
-
-    connection
-        .execute(
-            &format!(
-                "INSERT INTO {meta_table}(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-            ),
-            params!["scope_fingerprint", current_scope_fingerprint],
-        )
-        .with_context(|| {
-            format!(
-                "failed to rewrite sqlite scope fingerprint metadata in {}",
-                sqlite_path.display()
-            )
-        })?;
-
-    Ok(())
 }
 
 fn xdg_state_home() -> Option<PathBuf> {
@@ -319,7 +153,6 @@ pub(crate) fn configure_folder_agent_sqlite_connection(
 pub struct StartupStateStore {
     pub path: PathBuf,
     scope_fingerprint: String,
-    legacy_profile_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,12 +187,7 @@ impl StartupStateStore {
         Self {
             path: profile_paths.baseline_path,
             scope_fingerprint: profile_paths.scope_fingerprint,
-            legacy_profile_dir: profile_paths.legacy_profile_dir,
         }
-    }
-
-    pub(crate) fn legacy_profile_dir(&self) -> Option<&Path> {
-        self.legacy_profile_dir.as_deref()
     }
 
     pub fn load_local_baseline(&self) -> Result<LocalTreeState> {
@@ -696,12 +524,6 @@ impl StartupStateStore {
     }
 
     fn sqlite_connection(&self) -> Result<Connection> {
-        migrate_legacy_folder_agent_profile_dir(
-            self.path.parent().unwrap_or_else(|| Path::new(".")),
-            self.legacy_profile_dir.as_deref(),
-            &self.scope_fingerprint,
-        )?;
-
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -907,7 +729,7 @@ pub fn load_local_baseline_hashes_with_retries(
     }
 }
 
-pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usize> {
+pub fn cleanup_berrykeep_part_files(root_dir: &Path, dry_run: bool) -> Result<usize> {
     if !root_dir.exists() {
         return Ok(0);
     }
@@ -960,7 +782,7 @@ pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usi
                 continue;
             };
 
-            if !is_ironmesh_part_file_name(file_name) {
+            if !is_berrykeep_part_file_name(file_name) {
                 continue;
             }
 
@@ -982,9 +804,29 @@ pub fn cleanup_ironmesh_part_files(root_dir: &Path, dry_run: bool) -> Result<usi
 }
 
 pub fn conflict_copy_dir(root_dir: &Path, side: &str, relative_path: &str) -> PathBuf {
+    conflict_copy_dir_in_root(root_dir, ".berrykeep-conflicts", side, relative_path)
+}
+
+fn legacy_conflict_copy_dir(root_dir: &Path, side: &str, relative_path: &str) -> PathBuf {
+    conflict_copy_dir_in_root(root_dir, ".ironmesh-conflicts", side, relative_path)
+}
+
+fn conflict_copy_dir_in_root(
+    root_dir: &Path,
+    conflict_root_name: &str,
+    side: &str,
+    relative_path: &str,
+) -> PathBuf {
     let rel = Path::new(relative_path);
     let parent = rel.parent().unwrap_or_else(|| Path::new(""));
-    root_dir.join(".ironmesh-conflicts").join(side).join(parent)
+    root_dir.join(conflict_root_name).join(side).join(parent)
+}
+
+fn conflict_copy_dirs(root_dir: &Path, side: &str, relative_path: &str) -> [PathBuf; 2] {
+    [
+        conflict_copy_dir(root_dir, side, relative_path),
+        legacy_conflict_copy_dir(root_dir, side, relative_path),
+    ]
 }
 
 pub fn newest_remote_conflict_copy(root_dir: &Path, relative_path: &str) -> Result<PathBuf> {
@@ -993,39 +835,44 @@ pub fn newest_remote_conflict_copy(root_dir: &Path, relative_path: &str) -> Resu
         bail!("conflicts: invalid path (expected file): {relative_path}");
     };
 
-    let dir = conflict_copy_dir(root_dir, "remote", relative_path);
-    if !dir.is_dir() {
+    let dirs = conflict_copy_dirs(root_dir, "remote", relative_path);
+    if !dirs.iter().any(|dir| dir.is_dir()) {
         bail!(
-            "conflicts: no remote conflict copies found for {relative_path} (missing directory {})",
-            dir.display()
+            "conflicts: no remote conflict copies found for {relative_path} (missing directories {} and {})",
+            dirs[0].display(),
+            dirs[1].display(),
         );
     }
 
     let prefix = format!("{file_name}.remote-conflict-");
     let mut best: Option<(u128, PathBuf)> = None;
 
-    for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
+    for dir in dirs.iter().filter(|dir| dir.is_dir()) {
+        for entry in
+            fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
 
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
 
-        let Some(rest) = name.strip_prefix(prefix.as_str()) else {
-            continue;
-        };
-        let Ok(timestamp) = rest.parse::<u128>() else {
-            continue;
-        };
+            let Some(rest) = name.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            let Ok(timestamp) = rest.parse::<u128>() else {
+                continue;
+            };
 
-        match &best {
-            None => best = Some((timestamp, path)),
-            Some((best_ts, _)) if timestamp > *best_ts => best = Some((timestamp, path)),
-            _ => {}
+            match &best {
+                None => best = Some((timestamp, path)),
+                Some((best_ts, _)) if timestamp > *best_ts => best = Some((timestamp, path)),
+                _ => {}
+            }
         }
     }
 
@@ -1045,27 +892,28 @@ pub fn delete_conflict_copies(root_dir: &Path, relative_path: &str) -> Result<us
         ("remote", format!("{file_name}.remote-conflict-")),
         ("local", format!("{file_name}.local-conflict-")),
     ] {
-        let dir = conflict_copy_dir(root_dir, side, relative_path);
-        if !dir.is_dir() {
-            continue;
-        }
+        for dir in conflict_copy_dirs(root_dir, side, relative_path) {
+            if !dir.is_dir() {
+                continue;
+            }
 
-        for entry in
-            fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if !name.starts_with(prefix.as_str()) {
-                continue;
-            }
-            if fs::remove_file(&path).is_ok() {
-                removed += 1;
+            for entry in
+                fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with(prefix.as_str()) {
+                    continue;
+                }
+                if fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
             }
         }
     }
@@ -1085,7 +933,7 @@ pub fn copy_file_atomically(source: &Path, target: &Path) -> Result<()> {
     }
 
     let temp_name = format!(
-        ".{}.ironmesh-part-{}",
+        ".{}.berrykeep-part-{}",
         target
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
@@ -1130,12 +978,16 @@ pub fn current_unix_ms() -> u128 {
         .as_millis()
 }
 
-fn is_ironmesh_part_file_name(file_name: &str) -> bool {
+fn is_berrykeep_part_file_name(file_name: &str) -> bool {
     if !file_name.starts_with('.') {
         return false;
     }
 
-    let Some((_, suffix)) = file_name.rsplit_once(".ironmesh-part-") else {
+    let suffix = file_name
+        .rsplit_once(".berrykeep-part-")
+        .or_else(|| file_name.rsplit_once(".ironmesh-part-"))
+        .map(|(_, suffix)| suffix);
+    let Some(suffix) = suffix else {
         return false;
     };
 
@@ -1355,99 +1207,10 @@ mod tests {
     }
 
     #[test]
-    fn startup_state_store_migrates_legacy_profile_dir_to_stable_scope_fingerprint() {
-        let root = test_root();
-        let state_root = root.join("state-root");
-        let identity_root = root.join("identity-root");
-        let scope = PathScope::new(Some("photos/camera".to_string()));
-        let connection_target = "http://127.0.0.1:8080";
-        let profile_paths =
-            folder_agent_profile_paths(&identity_root, &scope, connection_target, &state_root);
-        let legacy_profile_dir = profile_paths
-            .legacy_profile_dir
-            .clone()
-            .expect("legacy profile dir should differ from stable digest path");
-        let legacy_baseline_path = legacy_profile_dir.join(FOLDER_AGENT_BASELINE_FILE_NAME);
-        ensure_parent_dir(&legacy_baseline_path);
-
-        let legacy_scope_fingerprint =
-            legacy_scope_fingerprint(&identity_root, &scope, connection_target);
-        {
-            let connection = Connection::open(&legacy_baseline_path).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE baseline_meta (
-                         key TEXT PRIMARY KEY,
-                         value TEXT NOT NULL
-                     );
-                     CREATE TABLE baseline_entries (
-                         path TEXT PRIMARY KEY,
-                         kind INTEGER NOT NULL,
-                         size_bytes INTEGER NOT NULL,
-                         modified_unix_ms INTEGER NOT NULL,
-                         content_hash TEXT
-                     );
-                     CREATE TABLE conflicts (
-                         path TEXT PRIMARY KEY,
-                         reason TEXT NOT NULL,
-                         details_json TEXT NOT NULL,
-                         created_unix_ms INTEGER NOT NULL
-                     );",
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)",
-                    params![
-                        "schema_version",
-                        BASELINE_SCHEMA_VERSION_CURRENT.to_string()
-                    ],
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO baseline_meta(key, value) VALUES(?1, ?2)",
-                    params!["scope_fingerprint", legacy_scope_fingerprint.as_str()],
-                )
-                .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO baseline_entries(path, kind, size_bytes, modified_unix_ms, content_hash)
-                     VALUES(?1, ?2, ?3, ?4, ?5)",
-                    params!["docs/readme.txt", 0_i64, 5_i64, 11_i64, "hash-1"],
-                )
-                .unwrap();
-        }
-
-        let store = StartupStateStore::new_with_state_root(
-            &identity_root,
-            &scope,
-            connection_target,
-            &state_root,
-        );
-        let loaded = store.load_local_baseline().unwrap();
-
-        let state = loaded.get("docs/readme.txt").unwrap();
-        assert_eq!(state.kind, LocalEntryKind::File);
-        assert_eq!(state.size_bytes, 5);
-        assert_eq!(state.modified_unix_ms, 11);
-        assert_eq!(store.path, profile_paths.baseline_path);
-        assert!(store.path.exists());
-        assert!(!legacy_profile_dir.exists());
-
-        let connection = Connection::open(&store.path).unwrap();
-        let stored_fingerprint: String = connection
-            .query_row(
-                "SELECT value FROM baseline_meta WHERE key = ?1",
-                ["scope_fingerprint"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored_fingerprint, profile_paths.scope_fingerprint);
-
-        drop(connection);
-        remove_sqlite_sidecars(&store.path);
-        fs::remove_dir_all(root).unwrap();
+    fn partial_file_cleanup_recognizes_canonical_and_legacy_names() {
+        assert!(is_berrykeep_part_file_name(".report.berrykeep-part-123"));
+        assert!(is_berrykeep_part_file_name(".report.ironmesh-part-456"));
+        assert!(!is_berrykeep_part_file_name("report.ironmesh-part-456"));
     }
 
     #[test]
@@ -1468,21 +1231,48 @@ mod tests {
     }
 
     #[test]
+    fn newest_remote_conflict_copy_reads_legacy_conflict_root() {
+        let root = test_root();
+        let remote_dir = legacy_conflict_copy_dir(&root, "remote", "docs/report.txt");
+        fs::create_dir_all(&remote_dir).unwrap();
+        let legacy = remote_dir.join("report.txt.remote-conflict-100");
+        fs::write(&legacy, b"legacy").unwrap();
+
+        let selected = newest_remote_conflict_copy(&root, "docs/report.txt").unwrap();
+
+        assert_eq!(selected, legacy);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn delete_conflict_copies_removes_matching_local_and_remote_backups_only() {
         let root = test_root();
         let remote_dir = conflict_copy_dir(&root, "remote", "docs/report.txt");
         let local_dir = conflict_copy_dir(&root, "local", "docs/report.txt");
+        let legacy_remote_dir = legacy_conflict_copy_dir(&root, "remote", "docs/report.txt");
         fs::create_dir_all(&remote_dir).unwrap();
         fs::create_dir_all(&local_dir).unwrap();
+        fs::create_dir_all(&legacy_remote_dir).unwrap();
         fs::write(remote_dir.join("report.txt.remote-conflict-100"), b"remote").unwrap();
         fs::write(local_dir.join("report.txt.local-conflict-200"), b"local").unwrap();
+        fs::write(
+            legacy_remote_dir.join("report.txt.remote-conflict-300"),
+            b"legacy remote",
+        )
+        .unwrap();
         fs::write(remote_dir.join("other.txt.remote-conflict-300"), b"keep").unwrap();
 
         let removed = delete_conflict_copies(&root, "docs/report.txt").unwrap();
 
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         assert!(!remote_dir.join("report.txt.remote-conflict-100").exists());
         assert!(!local_dir.join("report.txt.local-conflict-200").exists());
+        assert!(
+            !legacy_remote_dir
+                .join("report.txt.remote-conflict-300")
+                .exists()
+        );
         assert!(remote_dir.join("other.txt.remote-conflict-300").exists());
 
         fs::remove_dir_all(root).unwrap();
@@ -1507,7 +1297,7 @@ mod tests {
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .filter(|name| name.contains(".ironmesh-part-"))
+            .filter(|name| name.contains(".berrykeep-part-"))
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty());
 
@@ -1521,7 +1311,7 @@ mod tests {
             .as_nanos();
         let mut root = std::env::temp_dir();
         root.push(format!(
-            "ironmesh-folder-agent-state-test-{}-{}",
+            "berrykeep-folder-agent-state-test-{}-{}",
             std::process::id(),
             nonce
         ));

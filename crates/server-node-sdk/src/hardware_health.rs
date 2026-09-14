@@ -19,8 +19,8 @@ pub(crate) struct HardwareHealthCurrentResponse {
 pub(crate) struct HardwareHealthReport {
     reporting_node_id: NodeId,
     generated_at_unix: u64,
-    pub(crate) ironmesh_version: String,
-    ironmesh_revision: String,
+    pub(crate) berrykeep_version: String,
+    berrykeep_revision: String,
     pub(crate) hardware_profile_id: String,
     pub(crate) inventory: HardwareInventory,
     pub(crate) node_lifecycle: HardwareNodeLifecycle,
@@ -494,8 +494,8 @@ fn finalize_hardware_health_report(
     HardwareHealthReport {
         reporting_node_id: state.node_id,
         generated_at_unix: collected.generated_at_unix,
-        ironmesh_version: BUILD_VERSION.to_string(),
-        ironmesh_revision: BUILD_REVISION.to_string(),
+        berrykeep_version: BUILD_VERSION.to_string(),
+        berrykeep_revision: BUILD_REVISION.to_string(),
         hardware_profile_id,
         inventory,
         node_lifecycle,
@@ -671,7 +671,7 @@ async fn collect_runtime_findings(
     let storage_stats_runtime = state.storage.storage_stats_runtime.lock().await.clone();
     if storage_stats_runtime.last_error.is_some() {
         findings.push(HardwareHealthFinding {
-            source: "ironmesh_runtime".to_string(),
+            source: "berrykeep_runtime".to_string(),
             category: "collector".to_string(),
             finding_code: "storage_stats_collector_failed".to_string(),
             severity: "warn".to_string(),
@@ -709,7 +709,7 @@ fn scrub_findings(latest_scrub: &DataScrubRunRecord) -> Vec<HardwareHealthFindin
     counts
         .into_iter()
         .map(|(issue_kind, count)| HardwareHealthFinding {
-            source: "ironmesh_scrub".to_string(),
+            source: "berrykeep_scrub".to_string(),
             category: "data_integrity".to_string(),
             finding_code: issue_kind.clone(),
             severity: scrub_issue_severity(issue_kind.as_str()).to_string(),
@@ -744,7 +744,7 @@ fn repair_finding(latest_repair: &RepairRunRecord) -> Option<HardwareHealthFindi
     }
 
     Some(HardwareHealthFinding {
-        source: "ironmesh_repair".to_string(),
+        source: "berrykeep_repair".to_string(),
         category: "replication".to_string(),
         finding_code: "repair_failures".to_string(),
         severity: if summary.failed_transfers > 0 || summary.failed_nodes.unwrap_or(0) > 0 {
@@ -860,7 +860,7 @@ fn log_pattern_findings(
         }
 
         findings.push(HardwareHealthFinding {
-            source: "ironmesh_logs".to_string(),
+            source: "berrykeep_logs".to_string(),
             category: category.to_string(),
             finding_code: code.to_string(),
             severity: severity.to_string(),
@@ -1017,7 +1017,7 @@ async fn enrich_storage_with_smartctl(
                     available: false,
                     last_collected_at_unix: Some(generated_at_unix),
                     last_error_code: Some(SMARTCTL_NOT_INSTALLED_ERROR_CODE.to_string()),
-                    detail: "The smartctl executable is not installed or is not on the IronMesh process PATH. Install the smartmontools package, grant the IronMesh service access to physical block devices, then refresh."
+                    detail: "The smartctl executable is not installed or is not on the BerryKeep process PATH. Install the smartmontools package, grant the BerryKeep service access to physical block devices, then refresh."
                         .to_string(),
                 },
                 Vec::new(),
@@ -1120,9 +1120,9 @@ fn smartctl_collected_detail(
 
 fn smartctl_unavailable_detail(last_error_code: Option<&str>) -> String {
     match last_error_code {
-        Some(SMARTCTL_NOT_INSTALLED_ERROR_CODE) => "The smartctl executable is not installed or is not on the IronMesh process PATH. Install the smartmontools package, grant the IronMesh service access to physical block devices, then refresh."
+        Some(SMARTCTL_NOT_INSTALLED_ERROR_CODE) => "The smartctl executable is not installed or is not on the BerryKeep process PATH. Install the smartmontools package, grant the BerryKeep service access to physical block devices, then refresh."
             .to_string(),
-        Some("permission_denied") => "The IronMesh process does not have permission to read the physical block devices. Grant the service device access, then refresh."
+        Some("permission_denied") => "The BerryKeep process does not have permission to read the physical block devices. Grant the service device access, then refresh."
             .to_string(),
         Some(error_code) => format!(
             "SMART or NVMe lifecycle data could not be read from any physical storage device (error: {error_code})."
@@ -2389,7 +2389,7 @@ pub(crate) mod test_support {
 
         let findings = vec![
             HardwareHealthFinding {
-                source: "ironmesh_scrub".to_string(),
+                source: "berrykeep_scrub".to_string(),
                 category: "data_integrity".to_string(),
                 finding_code: "chunk_hash_mismatch".to_string(),
                 severity: "critical".to_string(),
@@ -2402,7 +2402,7 @@ pub(crate) mod test_support {
                 evidence: json!({}),
             },
             HardwareHealthFinding {
-                source: "ironmesh_scrub".to_string(),
+                source: "berrykeep_scrub".to_string(),
                 category: "data_integrity".to_string(),
                 finding_code: "chunk_hash_mismatch".to_string(),
                 severity: "critical".to_string(),
@@ -2462,8 +2462,8 @@ pub(crate) mod test_support {
         HardwareHealthReport {
             reporting_node_id: NodeId::from_u128(0),
             generated_at_unix: 1_700_000_000,
-            ironmesh_version: "9.9.9-test".to_string(),
-            ironmesh_revision: "test-revision".to_string(),
+            berrykeep_version: "9.9.9-test".to_string(),
+            berrykeep_revision: "test-revision".to_string(),
             hardware_profile_id: "hp-test".to_string(),
             inventory: HardwareInventory {
                 host_os: "linux".to_string(),
@@ -2576,11 +2576,11 @@ mod tests {
     fn smartctl_status_details_explain_missing_tool_and_device_access() {
         assert_eq!(
             smartctl_unavailable_detail(Some(SMARTCTL_NOT_INSTALLED_ERROR_CODE)),
-            "The smartctl executable is not installed or is not on the IronMesh process PATH. Install the smartmontools package, grant the IronMesh service access to physical block devices, then refresh."
+            "The smartctl executable is not installed or is not on the BerryKeep process PATH. Install the smartmontools package, grant the BerryKeep service access to physical block devices, then refresh."
         );
         assert_eq!(
             smartctl_unavailable_detail(Some("permission_denied")),
-            "The IronMesh process does not have permission to read the physical block devices. Grant the service device access, then refresh."
+            "The BerryKeep process does not have permission to read the physical block devices. Grant the service device access, then refresh."
         );
     }
 

@@ -1,5 +1,5 @@
 {
-  "name": "@ironmesh/config",
+  "name": "@berrykeep/config",
   "private": true,
   "type": "module",
   "exports": {

@@ -58,7 +58,7 @@ async fn acquire_object_id_migration_lock(metadata_db_path: &Path) -> Result<std
 }
 
 fn current_objects_cache_capacity() -> usize {
-    std::env::var("IRONMESH_CURRENT_OBJECTS_CACHE_CAPACITY")
+    common::legacy_compatibility::var("BERRYKEEP_CURRENT_OBJECTS_CACHE_CAPACITY")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_CURRENT_OBJECTS_CACHE_CAPACITY)
@@ -105,6 +105,7 @@ pub(super) mod manifest_reader;
 pub(super) mod media_cache;
 pub(super) mod media_tools;
 mod sqlite_impl;
+mod systemd_mount_protection;
 #[cfg(feature = "turso-metadata")]
 mod turso_impl;
 
@@ -127,7 +128,16 @@ pub use media_cache::{
     CachedMediaMetadata, MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates,
     media_cache_retry_due, promote_cached_media_metadata_to_incomplete,
 };
-pub use media_tools::{HostDependencyReport, HostDependencyStatus};
+pub use media_tools::{
+    HostDependencyCheck, HostDependencyReport, HostDependencySeverity, HostDependencyStatus,
+};
+
+pub(crate) async fn systemd_mount_protection_checks(
+    data_dir: &Path,
+    storage_paths: &[StoragePathConfig],
+) -> Vec<HostDependencyCheck> {
+    systemd_mount_protection::mount_protection_checks(data_dir, storage_paths).await
+}
 
 pub(crate) use data_scrub::DataScrubber;
 #[cfg(test)]
@@ -170,9 +180,9 @@ const GC_MANIFEST_LOAD_BATCH_SIZE: usize = 500;
 /// used only for the dashboard's memory-attribution estimate.
 const CURRENT_OBJECT_CACHE_ENTRY_ESTIMATED_BYTES: u64 = 300;
 const SNAPSHOT_HISTORY_MAX_BATCH_WINDOW_SECS: u64 = 2 * 60 * 60;
-const STORAGE_POOL_CONFIG_ENV: &str = "IRONMESH_STORAGE_CONFIG";
+const STORAGE_POOL_CONFIG_ENV: &str = "BERRYKEEP_STORAGE_CONFIG";
 const STORAGE_POOL_CONFIG_FILE: &str = "storage-pool.json";
-const STORAGE_POOL_PATH_MARKER_FILE: &str = ".ironmesh-storage-path.json";
+const STORAGE_POOL_PATH_MARKER_FILE: &str = ".berrykeep-storage-path.json";
 const STORAGE_POOL_CONFIG_VERSION: u32 = 1;
 /// Largest XMP sidecar the label ingest reads into memory. Sidecars written by
 /// cameras and photo tools stay in the kilobyte range; the bound keeps an
@@ -370,7 +380,7 @@ struct StoragePool {
 impl StoragePool {
     async fn load(root_dir: &Path, node_id: Option<NodeId>) -> Result<Self> {
         fs::create_dir_all(root_dir).await?;
-        let config_path = std::env::var_os(STORAGE_POOL_CONFIG_ENV)
+        let config_path = common::legacy_compatibility::var_os(STORAGE_POOL_CONFIG_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| root_dir.join("state").join(STORAGE_POOL_CONFIG_FILE));
         let config = match fs::read(&config_path).await {
@@ -2108,7 +2118,7 @@ pub struct ObjectVersionMetadataRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct S3ObjectVersionRecord {
     pub bucket_name: String,
-    pub ironmesh_key: String,
+    pub berrykeep_key: String,
     pub version_id: String,
     pub etag: String,
     #[serde(default)]
@@ -2626,7 +2636,7 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
     },
     MetadataDbLogicalTableSpec {
         table: "s3_object_versions",
-        tracked_columns: &["bucket_name", "ironmesh_key", "version_id", "etag"],
+        tracked_columns: &["bucket_name", "berrykeep_key", "version_id", "etag"],
     },
     MetadataDbLogicalTableSpec {
         table: "admin_audit_events",
@@ -2975,12 +2985,12 @@ trait MetadataStore: Send + Sync {
     async fn list_s3_object_versions_for_key(
         &self,
         bucket_name: &str,
-        ironmesh_key: &str,
+        berrykeep_key: &str,
     ) -> Result<Vec<S3ObjectVersionRecord>>;
     async fn list_s3_object_versions(
         &self,
         bucket_name: &str,
-        ironmesh_key_prefix: Option<&str>,
+        berrykeep_key_prefix: Option<&str>,
     ) -> Result<Vec<S3ObjectVersionRecord>>;
     async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()>;
     async fn delete_s3_object_version(&self, bucket_name: &str, version_id: &str) -> Result<()>;
@@ -5021,6 +5031,10 @@ impl PersistentStore {
         self.media_tools.host_dependency_report()
     }
 
+    pub(crate) fn mount_protection_paths(&self) -> (PathBuf, Vec<StoragePathConfig>) {
+        (self.root_dir.clone(), self.storage_pool.config().paths)
+    }
+
     #[cfg(all(test, unix))]
     pub fn set_media_tool_paths_for_test(
         &mut self,
@@ -5447,20 +5461,20 @@ impl PersistentStore {
     pub async fn list_s3_object_versions_for_key(
         &self,
         bucket_name: &str,
-        ironmesh_key: &str,
+        berrykeep_key: &str,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
         self.metadata_store
-            .list_s3_object_versions_for_key(bucket_name, ironmesh_key)
+            .list_s3_object_versions_for_key(bucket_name, berrykeep_key)
             .await
     }
 
     pub async fn list_s3_object_versions(
         &self,
         bucket_name: &str,
-        ironmesh_key_prefix: Option<&str>,
+        berrykeep_key_prefix: Option<&str>,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
         self.metadata_store
-            .list_s3_object_versions(bucket_name, ironmesh_key_prefix)
+            .list_s3_object_versions(bucket_name, berrykeep_key_prefix)
             .await
     }
 
@@ -10135,7 +10149,7 @@ impl PersistentStore {
     /// media object has none yet.
     ///
     /// A stored packet that cannot be parsed is reported rather than replaced:
-    /// it may hold third-party properties Ironmesh neither models nor can
+    /// it may hold third-party properties BerryKeep neither models nor can
     /// reconstruct, so overwriting it would destroy user data. Ingest tolerates
     /// such packets on purpose, because rejecting them there would fail an
     /// upload whose bytes the client owns; refusing to write over them here

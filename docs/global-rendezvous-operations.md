@@ -15,34 +15,34 @@ encrypted inner TLS stream, not application payloads or inner TLS termination.
   private key. Keep this service identity separate from all registered cluster
   CAs and their private keys.
 - [ ] Put the registry on durable storage and set
-  `IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY` to its persistent path. The
+  `BERRYKEEP_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY` to its persistent path. The
   parent directory must already exist, the path must not contain `..`, and the
   process account must have only the permissions required to read and update
   that path.
 - [ ] Back up the registry and audit records on a schedule, protect backup
   access, and test restoration before enabling public registration.
-- [ ] Set `IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED=false` until the
+- [ ] Set `BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED=false` until the
   HTTPS endpoint, persistence, audit logging, and abuse controls are verified.
 
 ## Phase-2 configuration contract
 
-- [ ] `IRONMESH_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY` names the persistent
+- [ ] `BERRYKEEP_RENDEZVOUS_GLOBAL_CLUSTER_REGISTRY` names the persistent
   cluster registry path.
-- [ ] `IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED` is the global,
+- [ ] `BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED` is the global,
   service-side self-registration gate.
-- [ ] `IRONMESH_RENDEZVOUS_GLOBAL_ADMIN_TOKEN` protects global registry
+- [ ] `BERRYKEEP_RENDEZVOUS_GLOBAL_ADMIN_TOKEN` protects global registry
   administration, including suspend and resume. Store it in secret storage;
   never log it or place it in a command line.
-- [ ] `IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE` sets the
+- [ ] `BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_RATE_LIMIT_PER_MINUTE` sets the
   registration attempt limit. Set an explicit conservative value and alert on
   repeated rate-limit hits.
-- [ ] `IRONMESH_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS` sets proof challenge
+- [ ] `BERRYKEEP_RENDEZVOUS_GLOBAL_CHALLENGE_TTL_SECS` sets proof challenge
   lifetime. Set an explicit short operational value and reject expired or
   reused challenges.
-- [ ] `IRONMESH_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES` bounds in-memory
+- [ ] `BERRYKEEP_RENDEZVOUS_GLOBAL_MAX_PENDING_CHALLENGES` bounds in-memory
   outstanding registration challenges. Set an explicit conservative value and
   alert when the service rejects registrations because the bound is exhausted.
-- [ ] `IRONMESH_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED` is the server-node
+- [ ] `BERRYKEEP_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED` is the server-node
   opt-in. Enable it only on nodes intended to self-register and only after the
   service-side gate is enabled.
 
@@ -75,7 +75,7 @@ global service gate.
   enforces the suspension before resuming it. Resume only after the incident
   review is recorded.
 - [ ] For an active incident, first disable new registration with
-  `IRONMESH_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED=false`, suspend affected
+  `BERRYKEEP_RENDEZVOUS_GLOBAL_REGISTRATION_ENABLED=false`, suspend affected
   clusters, preserve registry and audit snapshots, rotate exposed service or
   admin secrets, and restore only from a verified registry backup if recovery
   is required.

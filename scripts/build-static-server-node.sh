@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 ZIG_VERSION="0.16.0"
 CARGO_ZIGBUILD_VERSION="0.23.0"
-ZIG_CACHE_DIR="${IRONMESH_ZIG_CACHE_DIR:-${HOME}/.cache/ironmesh-build-tools}"
+ZIG_CACHE_DIR="${BERRYKEEP_ZIG_CACHE_DIR:-${HOME}/.cache/berrykeep-build-tools}"
 
 PACKAGE_NAME="server-node"
 BINARY_NAME="berrykeep-server-node"
@@ -59,8 +59,8 @@ build-metadata.json, plus a checksum for the archive itself. The build fails if
 the ELF binary requests a dynamic interpreter or contains a DT_NEEDED entry.
 
 Environment:
-  IRONMESH_ZIG_CACHE_DIR      Cache directory for the verified Zig toolchain.
-  IRONMESH_PREBUILT_WEB_DIR   Optional prebuilt server-admin/client-ui assets
+  BERRYKEEP_ZIG_CACHE_DIR      Cache directory for the verified Zig toolchain.
+  BERRYKEEP_PREBUILT_WEB_DIR   Optional prebuilt server-admin/client-ui assets
                                consumed by the existing Rust build scripts.
 EOF
 }

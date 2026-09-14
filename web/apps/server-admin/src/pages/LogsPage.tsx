@@ -1,5 +1,5 @@
-import { getRecentLogs } from "@ironmesh/api";
-import { LogsSurface } from "@ironmesh/ui";
+import { getRecentLogs } from "@berrykeep/api";
+import { LogsSurface } from "@berrykeep/ui";
 import { useCallback } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 

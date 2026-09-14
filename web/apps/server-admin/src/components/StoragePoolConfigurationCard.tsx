@@ -5,7 +5,7 @@ import {
   validateStoragePoolConfig,
   type StoragePathConfig,
   type StoragePoolConfig
-} from "@ironmesh/api";
+} from "@berrykeep/api";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Alert,
@@ -56,7 +56,7 @@ export function StoragePoolConfigurationCard({
   const [draft, setDraft] = useState<StoragePoolConfig | null>(initialDraft);
   const [advancedDraftText, setAdvancedDraftText] = useState("");
   const [selectedVolumePath, setSelectedVolumePath] = useState<string | null>(null);
-  const [directoryName, setDirectoryName] = useState("ironmesh-data");
+  const [directoryName, setDirectoryName] = useState("berrykeep-data");
   const [preparedPath, setPreparedPath] = useState<string | null>(null);
   const [newPathId, setNewPathId] = useState("external-storage");
   const [requestError, setRequestError] = useState<string | null>(null);
@@ -139,7 +139,7 @@ export function StoragePoolConfigurationCard({
           ...current.paths,
           {
             id,
-            path: "/path/to/ironmesh-data",
+            path: "/path/to/berrykeep-data",
             state: "active",
             weight: 1,
             reserve_bytes: 0
@@ -232,8 +232,8 @@ export function StoragePoolConfigurationCard({
         </Stack>
 
         <Alert color="blue" title="Host operations stay explicit">
-          The built-in host storage agent lists mounted volumes and verifies access as the IronMesh service account. It
-          never mounts, formats, ejects, or restarts anything. Save a checked path, then restart the IronMesh service
+          The built-in host storage agent lists mounted volumes and verifies access as the BerryKeep service account. It
+          never mounts, formats, ejects, or restarts anything. Save a checked path, then restart the BerryKeep service
           through the host&apos;s normal service manager when a controlled restart is possible.
         </Alert>
 
@@ -271,7 +271,7 @@ export function StoragePoolConfigurationCard({
               />
               <TextInput
                 label="Storage subfolder"
-                description="A single directory name, for example ironmesh-data"
+                description="A single directory name, for example berrykeep-data"
                 value={directoryName}
                 onChange={(event) => {
                   setDirectoryName(event.currentTarget.value);
@@ -351,8 +351,8 @@ export function StoragePoolConfigurationCard({
         ) : null}
         {notice?.kind === "saved" ? (
           <Alert color="yellow" title="Configuration saved — restart required" withCloseButton onClose={() => setNotice(null)}>
-            The next IronMesh service start will load <Code>{notice.configPath}</Code>. Restart it through the
-            platform&apos;s host administration interface; IronMesh will not initiate that restart itself.
+            The next BerryKeep service start will load <Code>{notice.configPath}</Code>. Restart it through the
+            platform&apos;s host administration interface; BerryKeep will not initiate that restart itself.
           </Alert>
         ) : null}
 

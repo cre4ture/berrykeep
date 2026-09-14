@@ -10,9 +10,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/test-debian-package-transition.sh [--package-dir DIR]
 
-Unpack synthetic pre-rename Ironmesh and released BerryKeep package sets with
-the supplied packages into isolated dpkg roots. The host package database is
-not changed.
+Verify the supported server-package transition with the supplied packages in
+an isolated dpkg root. The host package database is not changed.
 EOF
 }
 
@@ -65,14 +64,13 @@ PACKAGE_DIR="$(cd "${PACKAGE_DIR}" && pwd)"
 
 declare -A PACKAGE_PATHS=()
 for package_name in \
+  ironmesh-server-node \
+  ironmesh-server-node-map-tools \
+  ironmesh-rendezvous-service \
   berrykeep-client \
   berrykeep-server-node \
   berrykeep-server-node-map-tools \
-  berrykeep-rendezvous-service \
-  ironmesh-client \
-  ironmesh-server-node \
-  ironmesh-server-node-map-tools \
-  ironmesh-rendezvous-service; do
+  berrykeep-rendezvous-service; do
   PACKAGE_PATHS["${package_name}"]="$(find_package "${package_name}")"
 done
 
@@ -90,23 +88,6 @@ make_legacy_package() {
     "${package_name}" "${ARCHITECTURE}" > "${package_root}/DEBIAN/control"
 
   case "${package_name}" in
-    ironmesh-client)
-      mkdir -p \
-        "${package_root}/usr/bin" \
-        "${package_root}/usr/lib/ironmesh-client/gnome-shell-extension/ironmesh-status@ironmesh.io" \
-        "${package_root}/usr/share/applications" \
-        "${package_root}/etc/xdg/autostart"
-      for binary_name in ironmesh ironmesh-config-app; do
-        printf 'legacy %s\n' "${binary_name}" > "${package_root}/usr/bin/${binary_name}"
-        chmod 0755 "${package_root}/usr/bin/${binary_name}"
-        printf 'legacy %s\n' "${binary_name}" > "${package_root}/usr/lib/ironmesh-client/${binary_name}"
-        chmod 0755 "${package_root}/usr/lib/ironmesh-client/${binary_name}"
-      done
-      printf 'legacy extension\n' > "${package_root}/usr/lib/ironmesh-client/gnome-shell-extension/ironmesh-status@ironmesh.io/extension.js"
-      printf 'legacy desktop entry\n' > "${package_root}/usr/share/applications/ironmesh-config-app.desktop"
-      printf 'legacy autostart entry\n' > "${package_root}/etc/xdg/autostart/ironmesh-config-app-background.desktop"
-      printf '%s\n' '/etc/xdg/autostart/ironmesh-config-app-background.desktop' > "${package_root}/DEBIAN/conffiles"
-      ;;
     ironmesh-server-node)
       mkdir -p "${package_root}/usr/bin" "${package_root}/etc/ironmesh"
       printf 'legacy server node\n' > "${package_root}/usr/bin/ironmesh-server-node"
@@ -130,21 +111,6 @@ make_legacy_package() {
   dpkg-deb --root-owner-group --build "${package_root}" "${TEST_ROOT}/${package_name}-old.deb" >/dev/null
 }
 
-make_released_berrykeep_client_package() {
-  local package_root="${TEST_ROOT}/released-berrykeep-client"
-
-  mkdir -p \
-    "${package_root}/DEBIAN" \
-    "${package_root}/usr/share/applications" \
-    "${package_root}/etc/xdg/autostart"
-  printf 'Package: berrykeep-client\nVersion: 1.1.0-2~repo1~test\nArchitecture: %s\nMaintainer: Test <test@example.invalid>\nBreaks: ironmesh-client (<< 1.1.0-2~repo1~test)\nReplaces: ironmesh-client (<< 1.1.0-2~repo1~test)\nDescription: released BerryKeep client fixture\n' \
-    "${ARCHITECTURE}" > "${package_root}/DEBIAN/control"
-  printf 'legacy desktop entry\n' > "${package_root}/usr/share/applications/ironmesh-config-app.desktop"
-  printf 'legacy autostart entry\n' > "${package_root}/etc/xdg/autostart/ironmesh-config-app-background.desktop"
-  printf '%s\n' '/etc/xdg/autostart/ironmesh-config-app-background.desktop' > "${package_root}/DEBIAN/conffiles"
-  dpkg-deb --root-owner-group --build "${package_root}" "${TEST_ROOT}/berrykeep-client-released.deb" >/dev/null
-}
-
 unpack_package() {
   dpkg --root="${DPKG_ROOT}" --force-not-root --force-script-chrootless --force-depends \
     --unpack "$1" >/dev/null 2>&1
@@ -162,7 +128,6 @@ test_conffile_pending_or_installed() {
 }
 
 for package_name in \
-  ironmesh-client \
   ironmesh-server-node \
   ironmesh-server-node-map-tools \
   ironmesh-rendezvous-service; do
@@ -175,26 +140,22 @@ for package_name in \
   berrykeep-server-node \
   berrykeep-server-node-map-tools \
   berrykeep-rendezvous-service \
-  ironmesh-client \
   ironmesh-server-node \
   ironmesh-server-node-map-tools \
   ironmesh-rendezvous-service; do
   unpack_package "${PACKAGE_PATHS[${package_name}]}"
 done
 configure_package berrykeep-client
-configure_package ironmesh-client
 
 test -x "${DPKG_ROOT}/usr/bin/berrykeep"
 test -f "${DPKG_ROOT}/usr/share/applications/berrykeep-config-app.desktop"
 test -f "${DPKG_ROOT}/etc/xdg/autostart/berrykeep-config-app-background.desktop"
-test "$(readlink "${DPKG_ROOT}/usr/bin/ironmesh")" = ../lib/berrykeep-client/ironmesh
-test -d "${DPKG_ROOT}/usr/lib/ironmesh-client"
-test "$(readlink "${DPKG_ROOT}/usr/lib/ironmesh-client/ironmesh-config-app")" = ../berrykeep-client/berrykeep-config-app
-test -f "${DPKG_ROOT}/usr/lib/ironmesh-client/gnome-shell-extension/ironmesh-status@ironmesh.io/extension.js"
-test -f "${DPKG_ROOT}/usr/share/applications/ironmesh-config-app.desktop"
-test -f "${DPKG_ROOT}/etc/xdg/autostart/ironmesh-config-app-background.desktop"
-grep -Fxq 'NoDisplay=true' "${DPKG_ROOT}/usr/share/applications/ironmesh-config-app.desktop"
-grep -Fxq 'Hidden=true' "${DPKG_ROOT}/etc/xdg/autostart/ironmesh-config-app-background.desktop"
+test -f "${DPKG_ROOT}/usr/lib/berrykeep-client/gnome-shell-extension/berrykeep-status@berrykeep.io/extension.js"
+test -f "${DPKG_ROOT}/usr/lib/berrykeep-client/gnome-shell-extension/berrykeep-status@berrykeep.io/icons/berrykeep-brand-symbolic.svg"
+grep -Fxq "const BerryKeepIndicator = GObject.registerClass(" \
+  "${DPKG_ROOT}/usr/lib/berrykeep-client/gnome-shell-extension/berrykeep-status@berrykeep.io/extension.js"
+grep -Fxq '  "uuid": "berrykeep-status@berrykeep.io",' \
+  "${DPKG_ROOT}/usr/lib/berrykeep-client/gnome-shell-extension/berrykeep-status@berrykeep.io/metadata.json"
 test "$(readlink "${DPKG_ROOT}/usr/bin/ironmesh-server-node")" = berrykeep-server-node
 test "$(readlink "${DPKG_ROOT}/usr/bin/ironmesh-rendezvous-service")" = berrykeep-rendezvous-service
 # Server packages have maintainer scripts, which this isolated test intentionally
@@ -209,24 +170,4 @@ grep -Fxq 'Conflicts=ironmesh-server-node.service' \
 grep -Fxq 'Conflicts=ironmesh-rendezvous-service.service' \
   "${DPKG_ROOT}/usr/lib/systemd/system/berrykeep-rendezvous-service.service"
 
-# The originally released berrykeep-client briefly owned the legacy desktop
-# paths. Verify the new transitional package can claim those paths regardless
-# of unpack order, while dpkg still retains administrator conffile changes.
-DPKG_ROOT="${TEST_ROOT}/released-berrykeep-root"
-mkdir -p "${DPKG_ROOT}/var/lib/dpkg"
-make_released_berrykeep_client_package
-unpack_package "${TEST_ROOT}/berrykeep-client-released.deb"
-printf '%s\n' '# administrator setting' >> \
-  "${DPKG_ROOT}/etc/xdg/autostart/ironmesh-config-app-background.desktop"
-unpack_package "${PACKAGE_PATHS[ironmesh-client]}"
-unpack_package "${PACKAGE_PATHS[berrykeep-client]}"
-configure_package berrykeep-client
-configure_package ironmesh-client
-test -f "${DPKG_ROOT}/usr/share/applications/berrykeep-config-app.desktop"
-test -f "${DPKG_ROOT}/etc/xdg/autostart/berrykeep-config-app-background.desktop"
-grep -Fxq '# administrator setting' \
-  "${DPKG_ROOT}/etc/xdg/autostart/ironmesh-config-app-background.desktop"
-dpkg-query --admindir "${DPKG_ROOT}/var/lib/dpkg" --showformat='${Conffiles}\n' --show ironmesh-client | \
-  grep -Fq '/etc/xdg/autostart/ironmesh-config-app-background.desktop'
-
-printf 'Debian Ironmesh-to-BerryKeep package transition passed\n'
+printf 'Debian server package transition passed\n'

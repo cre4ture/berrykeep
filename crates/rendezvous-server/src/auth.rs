@@ -462,14 +462,14 @@ fn cluster_id_from_certificate(certificate: &CertificateDer<'_>) -> Result<Clust
                     if let Some(existing_cluster_id) = cluster_id
                         && existing_cluster_id != parsed_cluster_id
                     {
-                        bail!("peer certificate contains conflicting ironmesh cluster URI SANs");
+                        bail!("peer certificate contains conflicting berrykeep cluster URI SANs");
                     }
                     cluster_id = Some(parsed_cluster_id);
                 }
             }
         }
     }
-    cluster_id.context("peer certificate is missing an ironmesh cluster URI SAN")
+    cluster_id.context("peer certificate is missing a BerryKeep cluster URI SAN")
 }
 
 fn extract_authenticated_peer_from_peer_certs(
@@ -491,7 +491,7 @@ fn extract_authenticated_peer_from_peer_certs(
                             && existing_identity != &parsed_identity
                         {
                             bail!(
-                                "peer certificate contains conflicting ironmesh identity URI SANs"
+                                "peer certificate contains conflicting berrykeep identity URI SANs"
                             );
                         }
                         identity = Some(parsed_identity);
@@ -501,7 +501,7 @@ fn extract_authenticated_peer_from_peer_certs(
                             && existing_cluster_id != parsed_cluster_id
                         {
                             bail!(
-                                "peer certificate contains conflicting ironmesh cluster URI SANs"
+                                "peer certificate contains conflicting berrykeep cluster URI SANs"
                             );
                         }
                         cluster_id = Some(parsed_cluster_id);
@@ -511,7 +511,7 @@ fn extract_authenticated_peer_from_peer_certs(
         }
     }
 
-    let identity = identity.context("peer certificate missing URI SAN for ironmesh identity")?;
+    let identity = identity.context("peer certificate missing URI SAN for berrykeep identity")?;
     Ok(AuthenticatedPeer {
         identity,
         cluster_id,
@@ -519,23 +519,30 @@ fn extract_authenticated_peer_from_peer_certs(
 }
 
 fn parse_peer_identity_from_san_uri(uri: &str) -> Option<PeerIdentity> {
-    if let Some(rest) = uri.strip_prefix("urn:ironmesh:node:") {
+    if let Some(rest) = uri
+        .strip_prefix("urn:berrykeep:node:")
+        .or_else(|| uri.strip_prefix("urn:ironmesh:node:"))
+    {
         return rest.parse().ok().map(PeerIdentity::Node);
     }
 
-    uri.strip_prefix("urn:ironmesh:device:")
+    uri.strip_prefix("urn:berrykeep:device:")
+        .or_else(|| uri.strip_prefix("urn:ironmesh:device:"))
         .and_then(|rest| rest.parse().ok())
         .map(PeerIdentity::Device)
 }
 
 fn parse_cluster_id_from_san_uri(uri: &str) -> Result<Option<ClusterId>> {
-    let Some(value) = uri.strip_prefix("urn:ironmesh:cluster:") else {
+    let Some(value) = uri
+        .strip_prefix("urn:berrykeep:cluster:")
+        .or_else(|| uri.strip_prefix("urn:ironmesh:cluster:"))
+    else {
         return Ok(None);
     };
 
     let cluster_id = value
         .parse::<ClusterId>()
-        .context("invalid urn:ironmesh:cluster:<uuid> SAN URI in peer certificate")?;
+        .context("invalid urn:berrykeep:cluster:<uuid> SAN URI in peer certificate")?;
     if cluster_id.is_nil() {
         bail!("peer certificate cluster SAN must not use the nil UUID");
     }
@@ -559,7 +566,7 @@ mod tests {
     }
 
     fn test_registry_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("ironmesh-{name}-{}.json", ClusterId::now_v7()))
+        std::env::temp_dir().join(format!("berrykeep-{name}-{}.json", ClusterId::now_v7()))
     }
 
     fn test_ca(common_name: &str) -> TestCa {
@@ -590,15 +597,15 @@ mod tests {
             .expect("test client certificate parameters should initialize");
         params
             .distinguished_name
-            .push(DnType::CommonName, "ironmesh-test-client");
+            .push(DnType::CommonName, "berrykeep-test-client");
         let identity = DeviceId::now_v7();
         params.subject_alt_names = vec![
             SanType::URI(
-                rcgen::string::Ia5String::try_from(format!("urn:ironmesh:device:{identity}"))
+                rcgen::string::Ia5String::try_from(format!("urn:berrykeep:device:{identity}"))
                     .expect("device URI SAN should be valid"),
             ),
             SanType::URI(
-                rcgen::string::Ia5String::try_from(format!("urn:ironmesh:cluster:{cluster_id}"))
+                rcgen::string::Ia5String::try_from(format!("urn:berrykeep:cluster:{cluster_id}"))
                     .expect("cluster URI SAN should be valid"),
             ),
         ];
@@ -672,16 +679,21 @@ mod tests {
     fn cluster_san_parser_requires_a_non_nil_uuid() {
         let cluster_id = ClusterId::now_v7();
         assert_eq!(
-            parse_cluster_id_from_san_uri(&format!("urn:ironmesh:cluster:{cluster_id}"))
+            parse_cluster_id_from_san_uri(&format!("urn:berrykeep:cluster:{cluster_id}"))
                 .expect("cluster SAN should parse"),
             Some(cluster_id)
         );
-        assert!(parse_cluster_id_from_san_uri("urn:ironmesh:cluster:not-a-uuid").is_err());
+        assert!(parse_cluster_id_from_san_uri("urn:berrykeep:cluster:not-a-uuid").is_err());
         assert!(
             parse_cluster_id_from_san_uri(
-                "urn:ironmesh:cluster:00000000-0000-0000-0000-000000000000"
+                "urn:berrykeep:cluster:00000000-0000-0000-0000-000000000000"
             )
             .is_err()
+        );
+        assert_eq!(
+            parse_cluster_id_from_san_uri(&format!("urn:ironmesh:cluster:{cluster_id}"))
+                .expect("legacy cluster SAN should parse"),
+            Some(cluster_id)
         );
     }
 

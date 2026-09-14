@@ -29,6 +29,16 @@ pub enum HostDependencyStatus {
     Missing,
     Builtin,
     Optional,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostDependencySeverity {
+    #[default]
+    Info,
+    Warning,
+    Critical,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,6 +46,8 @@ pub struct HostDependencyCheck {
     pub id: String,
     pub feature: String,
     pub status: HostDependencyStatus,
+    #[serde(default)]
+    pub severity: HostDependencySeverity,
     pub summary: String,
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,6 +84,7 @@ impl MediaToolPaths {
                     id: "image-thumbnails".to_string(),
                     feature: "Image thumbnails and metadata".to_string(),
                     status: HostDependencyStatus::Builtin,
+                    severity: HostDependencySeverity::Info,
                     summary: "Ready without extra host packages".to_string(),
                     detail: "Server-side image thumbnails and metadata use the built-in Rust image pipeline on this node.".to_string(),
                     configured_path: None,
@@ -116,9 +129,9 @@ fn smartctl_dependency_check_for_path(configured_path: &Path) -> HostDependencyC
         "smartctl",
         "SMART / NVMe hardware health",
         configured_path,
-        "SMART and NVMe lifecycle collection needs smartctl on the server host. The IronMesh service also needs permission to read the physical block devices.",
+        "SMART and NVMe lifecycle collection needs smartctl on the server host. The BerryKeep service also needs permission to read the physical block devices.",
         Some(
-            "Install the `smartmontools` package to provide `smartctl` (Ubuntu/Debian: `sudo apt install smartmontools`). Then grant the IronMesh service access to the physical block devices.",
+            "Install the `smartmontools` package to provide `smartctl` (Ubuntu/Debian: `sudo apt install smartmontools`). Then grant the BerryKeep service access to the physical block devices.",
         ),
     )
 }
@@ -138,8 +151,9 @@ fn cockpit_dependency_check_for_candidates(candidates: &[PathBuf]) -> HostDepend
             id: "cockpit".to_string(),
             feature: "Cockpit host administration".to_string(),
             status: HostDependencyStatus::Ready,
+            severity: HostDependencySeverity::Info,
             summary: format!("Cockpit web service found at {}", path.display()),
-            detail: "Cockpit is available as a separate host-administration interface. Use its own sign-in and UI for host-level tasks such as restarting the IronMesh service, applying updates, or rebooting the host. IronMesh does not invoke Cockpit or share credentials with it.".to_string(),
+            detail: "Cockpit is available as a separate host-administration interface. Use its own sign-in and UI for host-level tasks such as restarting the BerryKeep service, applying updates, or rebooting the host. BerryKeep does not invoke Cockpit or share credentials with it.".to_string(),
             configured_path: None,
             resolved_path: Some(path.display().to_string()),
             install_hint: None,
@@ -148,8 +162,9 @@ fn cockpit_dependency_check_for_candidates(candidates: &[PathBuf]) -> HostDepend
             id: "cockpit".to_string(),
             feature: "Cockpit host administration".to_string(),
             status: HostDependencyStatus::Optional,
+            severity: HostDependencySeverity::Info,
             summary: "Cockpit web service was not found on this host".to_string(),
-            detail: "Cockpit is optional and is not required by IronMesh. If you use Cockpit for host administration, install and access it separately to restart the IronMesh service, apply updates, or reboot the host.".to_string(),
+            detail: "Cockpit is optional and is not required by BerryKeep. If you use Cockpit for host administration, install and access it separately to restart the BerryKeep service, apply updates, or reboot the host.".to_string(),
             configured_path: None,
             resolved_path: None,
             install_hint: Some(
@@ -220,6 +235,7 @@ fn binary_dependency_check(
         id: id.to_string(),
         feature: feature.to_string(),
         status: status.clone(),
+        severity: HostDependencySeverity::Info,
         summary,
         detail,
         configured_path: Some(configured_path_display),
@@ -257,6 +273,7 @@ fn natural_earth_gdal_dependency_check() -> HostDependencyCheck {
         id: "natural-earth-gdal".to_string(),
         feature: "Natural Earth map conversion (GDAL)".to_string(),
         status: status.clone(),
+        severity: HostDependencySeverity::Info,
         summary: if missing_commands.is_empty() {
             "All required GDAL map-conversion commands were resolved on PATH".to_string()
         } else {
@@ -338,7 +355,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("ironmesh-cockpit-dependency-{unique_suffix}"));
+            std::env::temp_dir().join(format!("berrykeep-cockpit-dependency-{unique_suffix}"));
         std::fs::create_dir_all(&root).unwrap();
         let missing_path = root.join("missing-cockpit-ws");
 
@@ -369,7 +386,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let missing_path =
-            std::env::temp_dir().join(format!("ironmesh-missing-smartctl-{unique_suffix}"));
+            std::env::temp_dir().join(format!("berrykeep-missing-smartctl-{unique_suffix}"));
         let check = smartctl_dependency_check_for_path(&missing_path);
 
         assert_eq!(check.status, HostDependencyStatus::Missing);

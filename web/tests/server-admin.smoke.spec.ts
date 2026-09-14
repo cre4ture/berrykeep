@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
-import type { GalleryMapConfiguration } from "@ironmesh/api";
+import type { GalleryMapConfiguration, HostDependencyCheck } from "@berrykeep/api";
 import { expect, test, type Page, type Route } from "@playwright/test";
 import {
   createInitialOverviewGalleryEntries,
@@ -58,7 +58,7 @@ registerGalleryMapContractTests({
 
 test("embedded iOS accent color overrides the browser-local preference", async ({ page }) => {
   await page.addInitScript(() => {
-    window.localStorage.setItem("ironmesh-accent-color", "#db2777");
+    window.localStorage.setItem("berrykeep-accent-color", "#db2777");
   });
   await installServerAdminMocks(page);
   await page.goto("/?embedded_client=ios&accent_color=%237c3aed");
@@ -66,7 +66,7 @@ test("embedded iOS accent color overrides the browser-local preference", async (
   await expect
     .poll(() =>
       page.evaluate(() =>
-        document.documentElement.style.getPropertyValue("--ironmesh-accent-rgb").trim()
+        document.documentElement.style.getPropertyValue("--berrykeep-accent-rgb").trim()
       )
     )
     .toBe("124, 58, 237");
@@ -740,7 +740,7 @@ test("server-admin prepares, validates, and saves a host-checked storage path wi
 
   await page.getByRole("textbox", { name: "Mounted volume" }).click();
   await page.getByRole("option", { name: /External USB/ }).click();
-  await page.getByLabel("Storage subfolder").fill("ironmesh-data");
+  await page.getByLabel("Storage subfolder").fill("berrykeep-data");
   await page.getByRole("button", { name: "Prepare and check storage" }).click();
   await expect(page.getByText("Directory is writable by the node service", { exact: true })).toBeVisible();
   await page.getByLabel("Stable storage-path ID").fill("secondary");
@@ -752,14 +752,14 @@ test("server-admin prepares, validates, and saves a host-checked storage path wi
     paths: [
       {
         id: "primary",
-        path: "/srv/ironmesh/primary",
+        path: "/srv/berrykeep/primary",
         state: "active",
         weight: 1,
         reserve_bytes: 0
       },
       {
         id: "secondary",
-        path: "/Volumes/External USB/ironmesh-data",
+        path: "/Volumes/External USB/berrykeep-data",
         state: "active",
         weight: 2,
         reserve_bytes: 2 * 1024 ** 3
@@ -802,6 +802,154 @@ test("server-admin Dependencies reports a detected Cockpit installation", async 
   await expect(
     page.getByRole("row").filter({ hasText: "Cockpit host administration" }).getByText("ready", { exact: true })
   ).toBeVisible();
+});
+
+test("server-admin Dependencies lists systemd mount findings and remedies per protected path", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    hostDependencyChecks: [
+      {
+        id: "systemd-mount-data-dir",
+        feature: "Systemd mount protection: BERRYKEEP_DATA_DIR",
+        status: "ready",
+        severity: "info",
+        summary: "Effective dependencies include srv.mount",
+        detail: "The live dependency graph includes implicit and drop-in dependencies.",
+        configured_path: "/srv/berrykeep",
+        resolved_path: "srv.mount (/srv)",
+        install_hint: null
+      },
+      {
+        id: "systemd-mount-storage-primary",
+        feature: "Systemd mount protection: storage pool `primary` (active)",
+        status: "missing",
+        severity: "critical",
+        summary: "No effective systemd mount dependency protects /mnt/primary",
+        detail: "An active storage path needs mount protection.",
+        configured_path: "/mnt/primary",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/mnt/primary` to the service drop-in."
+      },
+      {
+        id: "systemd-mount-storage-archive",
+        feature: "Systemd mount protection: storage pool `archive` (draining)",
+        status: "missing",
+        severity: "warning",
+        summary: "No effective systemd mount dependency protects /mnt/archive",
+        detail: "A draining storage path still needs mount protection.",
+        configured_path: "/mnt/archive",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/mnt/archive` to the service drop-in."
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Dependencies", { exact: true }).click();
+  await expect(page.getByText("Systemd mount protection: BERRYKEEP_DATA_DIR", { exact: true })).toBeVisible();
+  await expect(page.getByText("Systemd mount protection: storage pool `primary` (active)", { exact: true })).toBeVisible();
+  await expect(page.getByText("Systemd mount protection: storage pool `archive` (draining)", { exact: true })).toBeVisible();
+  await expect(page.getByText(/RequiresMountsFor=\/mnt\/primary/)).toBeVisible();
+  await expect(page.getByText(/RequiresMountsFor=\/mnt\/archive/)).toBeVisible();
+});
+
+test("server-admin Dependencies keeps informational tooling visible with mount-protection attention", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    hostDependencyChecks: [
+      {
+        id: "natural-earth-gdal",
+        feature: "Natural Earth map conversion (GDAL)",
+        status: "missing",
+        severity: "info",
+        summary: "Optional GDAL tooling unavailable",
+        detail: "This optional feature needs gdal-bin.",
+        configured_path: "gdal_rasterize",
+        resolved_path: null,
+        install_hint: "Install gdal-bin."
+      },
+      {
+        id: "systemd-mount-data-dir",
+        feature: "Systemd mount protection: BERRYKEEP_DATA_DIR",
+        status: "missing",
+        severity: "critical",
+        summary: "Data directory needs mount protection",
+        detail: "The node state must be protected.",
+        configured_path: "/srv/berrykeep",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/srv/berrykeep`."
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Dependencies", { exact: true }).click();
+  await expect(page.getByText("Storage mount protection needs attention", { exact: true })).toBeVisible();
+  await expect(page.getByText("Informational host dependency findings", { exact: true })).toBeVisible();
+  await expect(page.getByText("Optional GDAL tooling unavailable", { exact: true })).toBeVisible();
+});
+
+test("server-admin dashboard filters dependency findings by severity", async ({ page }) => {
+  await installServerAdminMocks(page, {
+    hostDependencyChecks: [
+      {
+        id: "natural-earth-gdal",
+        feature: "Natural Earth map conversion (GDAL)",
+        status: "missing",
+        severity: "info",
+        summary: "Optional GDAL tooling unavailable",
+        detail: "This optional feature needs gdal-bin.",
+        configured_path: "gdal_rasterize",
+        resolved_path: null,
+        install_hint: "Install gdal-bin."
+      },
+      {
+        id: "systemd-mount-storage-archive",
+        feature: "Systemd mount protection: storage pool `archive` (draining)",
+        status: "missing",
+        severity: "warning",
+        summary: "Draining storage needs mount protection",
+        detail: "The path is still readable while draining.",
+        configured_path: "/mnt/archive",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/mnt/archive`."
+      },
+      {
+        id: "systemd-mount-data-dir",
+        feature: "Systemd mount protection: BERRYKEEP_DATA_DIR",
+        status: "missing",
+        severity: "critical",
+        summary: "Data directory needs mount protection",
+        detail: "The node state must be protected.",
+        configured_path: "/srv/berrykeep",
+        resolved_path: null,
+        install_hint: "Add `RequiresMountsFor=/srv/berrykeep`."
+      }
+    ]
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Admin Access" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByText("Host dependencies need attention", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Draining storage needs mount protection/)).toBeVisible();
+  await expect(page.getByText(/Data directory needs mount protection/)).toBeVisible();
+  await expect(page.getByText("Optional GDAL tooling unavailable", { exact: true })).toHaveCount(0);
 });
 
 test("server-admin explorer loads version history with thumbnails", async ({ page }) => {
@@ -900,7 +1048,7 @@ test("server-admin provisioning can target a selected rendezvous service", async
 
 test("server-admin provisioning forces a bright theme while the QR is visible and restores it after navigation", async ({ page }) => {
   await page.addInitScript(() => {
-    window.localStorage.setItem("ironmesh-color-scheme", "dark");
+    window.localStorage.setItem("berrykeep-color-scheme", "dark");
   });
   await installServerAdminMocks(page);
 
@@ -969,12 +1117,12 @@ test("server-admin provisioning can copy and download the issued bootstrap claim
   const claimDownloadPromise = page.waitForEvent("download");
   await downloadBootstrapClaimButton.click();
   const claimDownload = await claimDownloadPromise;
-  expect(claimDownload.suggestedFilename()).toBe("ironmesh-client-bootstrap-claim-cluster-alpha.json");
+  expect(claimDownload.suggestedFilename()).toBe("berrykeep-client-bootstrap-claim-cluster-alpha.json");
 
   const bundleDownloadPromise = page.waitForEvent("download");
   await downloadBootstrapBundleButton.click();
   const bundleDownload = await bundleDownloadPromise;
-  expect(bundleDownload.suggestedFilename()).toBe("ironmesh-client-bootstrap-cluster-alpha.json");
+  expect(bundleDownload.suggestedFilename()).toBe("berrykeep-client-bootstrap-cluster-alpha.json");
 });
 
 test("server-admin gallery follows depth-one tree navigation", async ({ page }) => {
@@ -1666,7 +1814,7 @@ test("server-admin provisioning falls back to the full bootstrap bundle when cla
   await page.getByRole("button", { name: "Issue bootstrap claim" }).click();
 
   await expect(page.getByText("Compact claim issuance is temporarily unavailable on this node, so the page fell back to a full bootstrap QR.")).toBeVisible();
-  await expect(page.getByText("Scan the full bootstrap bundle with the ironmesh Android app")).toBeVisible();
+  await expect(page.getByText("Scan the full bootstrap bundle with the berrykeep Android app")).toBeVisible();
   await expect(page.getByAltText("Client bootstrap QR code")).toBeVisible();
   await expect(page.locator("pre").filter({ hasText: '"relay_mode": "relay-preferred"' })).toBeVisible();
   await expect(page.getByText("Request failed", { exact: true })).toHaveCount(0);
@@ -1906,6 +2054,7 @@ async function installServerAdminMocks(
     protectDashboardAdminRoutesUntilSessionConfirmed?: boolean;
     galleryEntries?: AdminMockStoreEntry[];
     cockpitStatus?: "ready" | "optional";
+    hostDependencyChecks?: HostDependencyCheck[];
     mapMetadataCenter?: [number, number, number];
     mapConfiguration?: GalleryMapConfiguration;
     mapConfigurationStatus?: number;
@@ -2040,7 +2189,7 @@ async function installServerAdminMocks(
     paths: [
       {
         id: "primary",
-        path: "/srv/ironmesh/primary",
+        path: "/srv/berrykeep/primary",
         state: "active",
         weight: 1,
         reserve_bytes: 0
@@ -2184,11 +2333,12 @@ async function installServerAdminMocks(
       return json(route, {
         host_os: "linux",
         generated_at_unix: 1_900_000_333,
-        checks: [
+        checks: options?.hostDependencyChecks ?? [
           {
             id: "image-thumbnails",
             feature: "Image thumbnails and metadata",
             status: "builtin",
+            severity: "info",
             summary: "Ready without extra host packages",
             detail: "Built into the test node.",
             configured_path: null,
@@ -2199,10 +2349,11 @@ async function installServerAdminMocks(
             id: "cockpit",
             feature: "Cockpit host administration",
             status: cockpitReady ? "ready" : "optional",
+            severity: "info",
             summary: cockpitReady
               ? "Cockpit web service found at /usr/lib/cockpit/cockpit-ws"
               : "Cockpit web service was not found on this host",
-            detail: "Cockpit remains separately authenticated from IronMesh.",
+            detail: "Cockpit remains separately authenticated from BerryKeep.",
             configured_path: null,
             resolved_path: cockpitReady ? "/usr/lib/cockpit/cockpit-ws" : null,
             install_hint: cockpitReady ? null : "Install Cockpit with the host package manager."
@@ -2211,6 +2362,7 @@ async function installServerAdminMocks(
             id: "natural-earth-unzip",
             feature: "Natural Earth archive extraction (unzip)",
             status: "ready",
+            severity: "info",
             summary: "Resolved on host at /usr/bin/unzip",
             detail: "Automatic Natural Earth map imports need unzip to extract the official source archive.",
             configured_path: "unzip",
@@ -2221,6 +2373,7 @@ async function installServerAdminMocks(
             id: "natural-earth-gdal",
             feature: "Natural Earth map conversion (GDAL)",
             status: "missing",
+            severity: "info",
             summary: "Required GDAL command(s) not found on PATH: gdal_rasterize",
             detail: "Automatic Natural Earth map imports need GDAL to rasterize source layers, project them to Web Mercator, and create MBTiles overviews.",
             configured_path: "gdal_rasterize, gdalwarp, gdal_translate, gdaladdo",
@@ -2256,11 +2409,11 @@ async function installServerAdminMocks(
     if (pathname === apiV1("/auth/storage/host/volumes/prepare") && method === "POST") {
       expect(route.request().postDataJSON()).toEqual({
         mount_path: "/Volumes/External USB",
-        directory_name: "ironmesh-data"
+        directory_name: "berrykeep-data"
       });
       return json(route, {
         mount_path: "/Volumes/External USB",
-        path: "/Volumes/External USB/ironmesh-data",
+        path: "/Volumes/External USB/berrykeep-data",
         directory_created: true,
         write_check: "passed"
       });
@@ -2277,7 +2430,7 @@ async function installServerAdminMocks(
         return;
       }
       return json(route, {
-        config_path: "/var/lib/ironmesh/state/storage-pool.json",
+        config_path: "/var/lib/berrykeep/state/storage-pool.json",
         restart_required: true
       });
     }
@@ -2287,7 +2440,7 @@ async function installServerAdminMocks(
       storagePoolSaveRequests.push(config);
       storagePoolConfig = config;
       return json(route, {
-        config_path: "/var/lib/ironmesh/state/storage-pool.json",
+        config_path: "/var/lib/berrykeep/state/storage-pool.json",
         restart_required: true
       });
     }
@@ -3112,7 +3265,7 @@ async function installServerAdminMocks(
     if (pathname === "/setup/status" && method === "GET" && options?.setupMode) {
       return json(route, {
         state: "pending_join",
-        data_dir: "/tmp/ironmesh-node-beta",
+        data_dir: "/tmp/berrykeep-node-beta",
         bind_addr: "0.0.0.0:8443",
         bootstrap_tls_cert_path: "/tmp/bootstrap.pem",
         bootstrap_tls_fingerprint: "setup-fingerprint",
@@ -3589,7 +3742,7 @@ type StoragePoolMockConfig = {
 
 function storagePoolStatus(config: StoragePoolMockConfig) {
   return {
-    config_path: "/var/lib/ironmesh/state/storage-pool.json",
+    config_path: "/var/lib/berrykeep/state/storage-pool.json",
     config,
     paths: config.paths.map((path) => ({
       id: path.id,

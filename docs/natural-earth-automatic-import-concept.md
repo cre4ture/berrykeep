@@ -161,7 +161,7 @@ nor shell fragments. The physical profile needs `unzip`, `gdal_rasterize`,
 `gdalwarp`, `gdal_translate`, and `gdaladdo` on `PATH`; the labels profile also
 needs `ogr2ogr`. Debian installations receive all GDAL commands from `gdal-bin`
 and archive extraction from `unzip` through the optional
-`ironmesh-server-node-map-tools` package. The core Server Node package does not
+`berrykeep-server-node-map-tools` package. The core Server Node package does not
 depend on those programs. Dependency checks use `unzip -v`, which is supported
 by Info-ZIP, rather than the unsupported `--version` spelling.
 

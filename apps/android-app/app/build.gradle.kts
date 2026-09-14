@@ -70,6 +70,10 @@ private fun escapeBuildConfigString(value: String): String =
 private fun readTrimmedEnvironmentVariable(name: String): String? =
     System.getenv(name)?.trim()?.takeIf { it.isNotEmpty() }
 
+private fun readCanonicalOrLegacyEnvironmentVariable(canonicalName: String): String? =
+    readTrimmedEnvironmentVariable(canonicalName)
+        ?: readTrimmedEnvironmentVariable(canonicalName.replace("BERRYKEEP_", "IRONMESH_"))
+
 private fun sanitizeBranchName(value: String?): String? =
     value?.trim()?.replace(Regex("[^A-Za-z0-9._-]"), "-")?.replace(Regex("-+"), "-")?.trim('-')
 
@@ -202,15 +206,15 @@ val majorVersionCode = readMajorVersionCode(workspaceVersion)
 val androidVersionCode = majorVersionCode
 val longVersion = "${workspaceVersion}\nBuild metadata: ${versionBuildMetadata}\nBuild revision: ${gitBuildRevision}"
 val internalReleaseSigningEnvironment = mapOf(
-    "IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE"),
-    "IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD"),
-    "IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS"),
-    "IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD" to readTrimmedEnvironmentVariable("IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD"),
+    "BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_FILE" to readCanonicalOrLegacyEnvironmentVariable("BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_FILE"),
+    "BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD" to readCanonicalOrLegacyEnvironmentVariable("BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD"),
+    "BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_ALIAS" to readCanonicalOrLegacyEnvironmentVariable("BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_ALIAS"),
+    "BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD" to readCanonicalOrLegacyEnvironmentVariable("BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD"),
 )
-val internalReleaseStoreFile = internalReleaseSigningEnvironment["IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_FILE"]
-val internalReleaseStorePassword = internalReleaseSigningEnvironment["IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD"]
-val internalReleaseKeyAlias = internalReleaseSigningEnvironment["IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_ALIAS"]
-val internalReleaseKeyPassword = internalReleaseSigningEnvironment["IRONMESH_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD"]
+val internalReleaseStoreFile = internalReleaseSigningEnvironment["BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_FILE"]
+val internalReleaseStorePassword = internalReleaseSigningEnvironment["BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_PASSWORD"]
+val internalReleaseKeyAlias = internalReleaseSigningEnvironment["BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_ALIAS"]
+val internalReleaseKeyPassword = internalReleaseSigningEnvironment["BERRYKEEP_ANDROID_INTERNAL_RELEASE_KEY_PASSWORD"]
 val hasAnyInternalReleaseSigning = internalReleaseSigningEnvironment.values.any { it != null }
 val hasCompleteInternalReleaseSigning = internalReleaseSigningEnvironment.values.all { it != null }
 
@@ -240,10 +244,13 @@ plugins {
 }
 
 android {
-    namespace = "io.ironmesh.android"
+    namespace = "io.berrykeep.android"
     compileSdk = 34
 
     defaultConfig {
+        // Retain the published package identity while the Android distribution
+        // channel is migrated. This does not preserve client state or SAF grants:
+        // the BerryKeep client requires a fresh installation.
         applicationId = "io.ironmesh.android"
         minSdk = 26
         targetSdk = 34

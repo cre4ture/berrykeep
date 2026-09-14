@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const GNOME_EXTENSION_UUID: &str = "ironmesh-status@ironmesh.io";
+pub const GNOME_EXTENSION_UUID: &str = "berrykeep-status@berrykeep.io";
 
 #[derive(Debug)]
 pub struct GnomeExtensionInstallOutcome {
@@ -15,7 +15,7 @@ pub fn default_gnome_status_file_path() -> Result<PathBuf> {
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is not set; pass --gnome-status-file"))?;
     Ok(PathBuf::from(runtime_dir)
-        .join("ironmesh")
+        .join("berrykeep")
         .join("gnome-status.json"))
 }
 
@@ -280,11 +280,11 @@ mod tests {
     fn parse_enabled_extensions_supports_plain_arrays() {
         assert_eq!(
             parse_enabled_extensions_value(
-                "['ding@rastersoft.com', 'ironmesh-status@ironmesh.io']"
+                "['ding@rastersoft.com', 'berrykeep-status@berrykeep.io']"
             ),
             vec![
                 "ding@rastersoft.com".to_string(),
-                "ironmesh-status@ironmesh.io".to_string(),
+                "berrykeep-status@berrykeep.io".to_string(),
             ]
         );
     }
@@ -298,7 +298,7 @@ mod tests {
     fn format_enabled_extensions_round_trips() {
         let values = vec![
             "ding@rastersoft.com".to_string(),
-            "ironmesh-status@ironmesh.io".to_string(),
+            "berrykeep-status@berrykeep.io".to_string(),
         ];
         let formatted = format_enabled_extensions_value(&values);
         assert_eq!(parse_enabled_extensions_value(&formatted), values);

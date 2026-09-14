@@ -37,7 +37,7 @@ mod tests {
             "\ncontent-fingerprint"
         );
         let path = std::env::temp_dir().join(format!(
-            "ironmesh-content-fingerprint-{}.bin",
+            "berrykeep-content-fingerprint-{}.bin",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, payload.as_bytes())?;

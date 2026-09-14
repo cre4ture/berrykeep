@@ -130,7 +130,7 @@ function apiV1(path: string): string {
 function buildAdminHeaders(adminTokenOverride?: string, extraHeaders?: HeadersInit): HeadersInit {
   const headers = new Headers(extraHeaders);
   if (adminTokenOverride?.trim()) {
-    headers.set("x-ironmesh-admin-token", adminTokenOverride.trim());
+    headers.set("x-berrykeep-admin-token", adminTokenOverride.trim());
   }
   return headers;
 }

@@ -64,7 +64,7 @@ export type ClientWebServiceRequestOptions = {
 };
 
 const API_V1_PREFIX = "/api/v1";
-const DIAGNOSTIC_CONTEXT_HEADER = "x-ironmesh-diagnostic-context";
+const DIAGNOSTIC_CONTEXT_HEADER = "x-berrykeep-diagnostic-context";
 type GalleryMapEndpoint = "clusters" | "clusterEntries";
 
 const galleryMapEndpointPaths = {

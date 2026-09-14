@@ -1,5 +1,5 @@
 param(
-    [string]$OutFile = (Join-Path $PSScriptRoot "..\\assets\\windows\\ironmesh.ico")
+    [string]$OutFile = (Join-Path $PSScriptRoot "..\\assets\\windows\\berrykeep.ico")
 )
 
 Set-StrictMode -Version Latest
@@ -66,7 +66,7 @@ function New-BerryKeepBitmap {
     $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $graphics.Clear([System.Drawing.Color]::Transparent)
 
-    # Source geometry is authored in a 200x200 space (see docs/assets/ironmesh-favicon.svg).
+    # Source geometry is authored in a 200x200 space (see docs/assets/berrykeep-favicon.svg).
     $scale = $Size / 200.0
 
     $panelPath = New-RoundedRectanglePath -X 0 -Y 0 -Width (200.0 * $scale) -Height (200.0 * $scale) -Radius (44.0 * $scale)

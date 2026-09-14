@@ -21,7 +21,8 @@ public enum AppleSyncProfileResolution {
         if let storedProfile {
             return storedProfile
         }
-        if domainIdentifier.hasPrefix(AppleSyncProfile.managedDomainPrefix) {
+        if domainIdentifier.hasPrefix(AppleSyncProfile.managedDomainPrefix) ||
+            domainIdentifier.hasPrefix(AppleSyncProfile.legacyManagedDomainPrefix) {
             throw AppleSyncProfileResolutionError.missingManagedProfile(domainIdentifier)
         }
         if let configuredProfile {

@@ -5,7 +5,7 @@
 Proposal only.
 
 This note evaluates how [`ncoevoet/facet`](https://github.com/ncoevoet/facet)
-can fit into IronMesh and turns the earlier feasibility check into a concrete
+can fit into BerryKeep and turns the earlier feasibility check into a concrete
 integration plan.
 
 Facet repo state inspected for this note:
@@ -26,7 +26,7 @@ Key upstream files inspected:
 - `docs/CONFIGURATION.md`
 - `docs/DEPLOYMENT.md`
 
-Relevant IronMesh context:
+Relevant BerryKeep context:
 
 - `docs/persistent-storage-strategy.md`
 - `docs/server-node-media-cache.md`
@@ -38,24 +38,24 @@ Related follow-up implementation note:
 
 ## Decision Summary
 
-Facet should be integrated with IronMesh as a sidecar application first.
+Facet should be integrated with BerryKeep as a sidecar application first.
 
 Recommended shape:
 
-1. IronMesh remains the system of record for original photo files.
+1. BerryKeep remains the system of record for original photo files.
 2. A dedicated Facet worker node keeps the target photo library locally
-   available through IronMesh sync or a fully hydrated local mirror.
+   available through BerryKeep sync or a fully hydrated local mirror.
 3. Facet scans those local files and keeps its live SQLite database and
-   derivative storage on local disk outside the synced IronMesh namespace.
-4. IronMesh optionally imports a small, path-independent summary of Facet
+   derivative storage on local disk outside the synced BerryKeep namespace.
+4. BerryKeep optionally imports a small, path-independent summary of Facet
    outputs keyed by `content_fingerprint`.
 
-Do not attempt to make Facet use the IronMesh object store directly in the
+Do not attempt to make Facet use the BerryKeep object store directly in the
 first iteration.
 
 ## Why The Direct Integration Is Expensive
 
-IronMesh is object- and version-centric:
+BerryKeep is object- and version-centric:
 
 - content-addressed chunk storage,
 - immutable manifests,
@@ -78,10 +78,10 @@ cleanly enough for a direct backend swap.
 
 ### Data-access needs
 
-| Need | What Facet expects | IronMesh implication |
+| Need | What Facet expects | BerryKeep implication |
 | --- | --- | --- |
 | Original photo access | Real local files that can be opened repeatedly by path | A Facet worker needs a local replica or a fully hydrated mirror, not just remote object reads |
-| Stable lookup key | Path strings like `/photos/2025/trip/img_001.cr3` | IronMesh must present a stable local path view for the worker |
+| Stable lookup key | Path strings like `/photos/2025/trip/img_001.cr3` | BerryKeep must present a stable local path view for the worker |
 | Recursive scanning | Directory walks over mounted/local trees | Best fit is a synced directory or materialized mount |
 | RAW decode | Direct byte access to CR2/CR3/NEF/ARW/etc. | Placeholder-only access is a poor fit unless files are hydrated first |
 | EXIF extraction | `exiftool` over local paths | Paths must resolve to actual files on disk |
@@ -104,13 +104,13 @@ Facet expects a writable local SQLite database with:
 Important consequence:
 
 - the live Facet database should not be stored as ordinary synchronized content
-  inside IronMesh.
+  inside BerryKeep.
 
 Reasons:
 
 - live SQLite WAL databases are single-system application state,
 - they change at high frequency,
-- they are not a good semantic match for IronMesh's file/object replication
+- they are not a good semantic match for BerryKeep's file/object replication
   model,
 - accidental multi-node sharing of the same live DB would be fragile.
 
@@ -148,7 +148,7 @@ Facet assumes these are local to the worker host:
 - optional `rawpy` / ONNX / PyTorch acceleration,
 - optional `sqlite-vec`.
 
-## Recommended IronMesh Architecture
+## Recommended BerryKeep Architecture
 
 ### 1. Topology
 
@@ -156,7 +156,7 @@ Use one designated Facet worker for each library scope.
 
 Example layout:
 
-- IronMesh cluster stores original photos under logical prefixes like
+- BerryKeep cluster stores original photos under logical prefixes like
   `photos/family/` or `photos/archive/`.
 - One worker node keeps those prefixes locally available.
 - Facet runs only on that worker.
@@ -168,7 +168,7 @@ Example layout:
 
 Preferred source for the Facet scanner:
 
-- an IronMesh-managed local replica of the target tree.
+- a BerryKeep-managed local replica of the target tree.
 
 Acceptable variants:
 
@@ -194,9 +194,9 @@ library.
 
 Example:
 
-- IronMesh logical key: `photos/family/2026/trip/img_001.cr3`
-- local worker path: `/srv/ironmesh-facet/photos/family/2026/trip/img_001.cr3`
-- Facet `photos.path`: `/srv/ironmesh-facet/photos/family/2026/trip/img_001.cr3`
+- BerryKeep logical key: `photos/family/2026/trip/img_001.cr3`
+- local worker path: `/srv/berrykeep-facet/photos/family/2026/trip/img_001.cr3`
+- Facet `photos.path`: `/srv/berrykeep-facet/photos/family/2026/trip/img_001.cr3`
 
 That keeps upstream Facet behavior intact.
 
@@ -204,7 +204,7 @@ That keeps upstream Facet behavior intact.
 
 ### Phase A: file availability
 
-1. IronMesh replicates the target prefixes to the Facet worker.
+1. BerryKeep replicates the target prefixes to the Facet worker.
 2. The worker ensures the target files are locally available before scan.
 3. A scan job starts only after the local mirror is in a stable state.
 
@@ -217,18 +217,18 @@ That keeps upstream Facet behavior intact.
 4. Facet writes all live application state to its local SQLite database and
    optional local storage directory.
 
-### Phase C: optional export back into IronMesh
+### Phase C: optional export back into BerryKeep
 
 1. An export task reads selected Facet results.
-2. The exporter resolves each Facet photo path back to the current IronMesh key
+2. The exporter resolves each Facet photo path back to the current BerryKeep key
    and current `content_fingerprint`.
 3. The exporter produces path-independent annotation records.
-4. IronMesh imports those records into a dedicated annotation store keyed by
+4. BerryKeep imports those records into a dedicated annotation store keyed by
    `content_fingerprint`.
 
-## What IronMesh Should Import
+## What BerryKeep Should Import
 
-Do not try to import all of Facet's relational state into IronMesh at first.
+Do not try to import all of Facet's relational state into BerryKeep at first.
 
 Recommended first import set:
 
@@ -257,7 +257,7 @@ Those remain Facet-local application data.
 
 ## Why Import By `content_fingerprint`
 
-IronMesh already uses `content_fingerprint` as the path-independent media cache
+BerryKeep already uses `content_fingerprint` as the path-independent media cache
 identity.
 
 That gives the right deduplication behavior for imported annotations:
@@ -271,7 +271,7 @@ at export time, but the durable lookup key should be `content_fingerprint`.
 
 ## Proposed Annotation Shapes
 
-### 1. Summary store inside IronMesh metadata
+### 1. Summary store inside BerryKeep metadata
 
 Add a dedicated annotation table or equivalent metadata store keyed by:
 
@@ -323,7 +323,7 @@ That is useful for:
 
 This export object should still be a derived artifact, not the live upstream DB.
 
-## Interaction With Existing IronMesh Media Cache
+## Interaction With Existing BerryKeep Media Cache
 
 The current media cache already covers:
 
@@ -355,21 +355,21 @@ For the Facet worker:
 
 - keep the live DB on local disk,
 - back it up with a SQLite-aware tool or local snapshot process,
-- optionally export derived annotation objects into IronMesh for replicated
+- optionally export derived annotation objects into BerryKeep for replicated
   durability.
 
-Do not rely on synchronizing the live `photo_scores_pro.db` through IronMesh as
+Do not rely on synchronizing the live `photo_scores_pro.db` through BerryKeep as
 the primary durability mechanism.
 
 ## What To Avoid
 
 Avoid these designs in the first iteration:
 
-- storing the live Facet SQLite DB in the shared IronMesh namespace,
+- storing the live Facet SQLite DB in the shared BerryKeep namespace,
 - running multiple Facet writers against the same DB,
-- trying to map IronMesh object IDs directly into Facet without a filesystem
+- trying to map BerryKeep object IDs directly into Facet without a filesystem
   view,
-- pushing full vector embeddings into IronMesh before a concrete search use case
+- pushing full vector embeddings into BerryKeep before a concrete search use case
   exists,
 - scanning large placeholder-only trees that hydrate file-by-file during
   scoring.
@@ -380,52 +380,52 @@ Avoid these designs in the first iteration:
 
 Goal:
 
-- prove that Facet adds value on top of IronMesh-managed files.
+- prove that Facet adds value on top of BerryKeep-managed files.
 
 Work:
 
-1. Stand up a dedicated Facet worker against an IronMesh-managed local mirror.
+1. Stand up a dedicated Facet worker against a BerryKeep-managed local mirror.
 2. Keep Facet DB and `storage/` local-only.
 3. Document the worker deployment contract.
-4. Do not import metadata back into IronMesh yet.
+4. Do not import metadata back into BerryKeep yet.
 
 Success criteria:
 
 - Facet scans and serves the library reliably,
 - RAW decode and EXIF extraction perform well enough,
-- no dependency on direct IronMesh object reads inside Facet.
+- no dependency on direct BerryKeep object reads inside Facet.
 
-### Phase 2: summary import into IronMesh
+### Phase 2: summary import into BerryKeep
 
 Goal:
 
-- let IronMesh surface Facet value in its own gallery.
+- let BerryKeep surface Facet value in its own gallery.
 
 Work:
 
 1. Build an exporter from Facet DB rows to annotation summary records.
-2. Resolve each exported row to current IronMesh `content_fingerprint`.
+2. Resolve each exported row to current BerryKeep `content_fingerprint`.
 3. Add a dedicated server-side annotation metadata store.
 4. Extend `GET /store/index` or a sibling endpoint to expose imported summary
    fields.
 
 Success criteria:
 
-- IronMesh gallery can filter or rank on imported Facet summaries,
+- BerryKeep gallery can filter or rank on imported Facet summaries,
 - rename/copy do not create redundant imported records.
 
 ### Phase 3: richer UI composition
 
 Goal:
 
-- use Facet as an analysis engine while IronMesh remains the primary storage
+- use Facet as an analysis engine while BerryKeep remains the primary storage
   and browsing product.
 
 Work:
 
-1. Show imported badges, scores, and tags in the IronMesh gallery.
+1. Show imported badges, scores, and tags in the BerryKeep gallery.
 2. Add server-side selection/filter support over imported summaries.
-3. Decide whether any Facet-local concepts should become native IronMesh
+3. Decide whether any Facet-local concepts should become native BerryKeep
    features.
 
 Candidates:
@@ -439,7 +439,7 @@ Candidates:
 
 Possible future work:
 
-- native IronMesh annotation pipelines,
+- native BerryKeep annotation pipelines,
 - direct annotation jobs on server nodes,
 - clustered distribution of heavier ML work,
 - richer person/faces integration.
@@ -450,9 +450,9 @@ This phase should only start if the sidecar path proves product value first.
 
 The right first move is:
 
-- treat Facet as a local analysis engine attached to an IronMesh-managed photo
+- treat Facet as a local analysis engine attached to a BerryKeep-managed photo
   replica,
 - keep Facet's live database and heavy derived state local,
-- import only path-independent summaries back into IronMesh,
+- import only path-independent summaries back into BerryKeep,
 - delay any deeper storage-model unification until the sidecar path has proven
   worth the complexity.

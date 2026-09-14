@@ -1,7 +1,7 @@
 use anyhow::Context;
 use anyhow::{Result, bail};
 use client_sdk::{
-    ClientIdentityMaterial, ConnectionBootstrap, IronMeshClient, enroll_connection_input_blocking,
+    ClientIdentityMaterial, ConnectionBootstrap, BerryKeepClient, enroll_connection_input_blocking,
 };
 use reqwest::StatusCode;
 use std::collections::BTreeMap;
@@ -81,7 +81,7 @@ pub struct EnrolledTestClient {
 }
 
 impl EnrolledTestClient {
-    pub async fn build_client_async(&self) -> Result<IronMeshClient> {
+    pub async fn build_client_async(&self) -> Result<BerryKeepClient> {
         let bootstrap = self.bootstrap.clone();
         let identity = self.identity.clone();
         tokio::task::spawn_blocking(move || bootstrap.build_client_with_identity(&identity))
@@ -110,7 +110,7 @@ fn test_ca() -> Result<&'static TestCa> {
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "ironmesh-test-node-ca");
+        .push(rcgen::DnType::CommonName, "berrykeep-test-node-ca");
     params.key_usages = vec![
         rcgen::KeyUsagePurpose::KeyCertSign,
         rcgen::KeyUsagePurpose::CrlSign,
@@ -141,11 +141,11 @@ fn issue_node_cert(node_id: &str, cluster_id: &str) -> Result<(String, String)> 
     let mut params = rcgen::CertificateParams::default();
     params.distinguished_name.push(
         rcgen::DnType::CommonName,
-        format!("ironmesh-node-{node_id}"),
+        format!("berrykeep-node-{node_id}"),
     );
 
-    let uri = format!("urn:ironmesh:node:{node_id}");
-    let cluster_uri = format!("urn:ironmesh:cluster:{cluster_id}");
+    let uri = format!("urn:berrykeep:node:{node_id}");
+    let cluster_uri = format!("urn:berrykeep:cluster:{cluster_id}");
     params
         .subject_alt_names
         .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(
@@ -177,7 +177,7 @@ fn cluster_id_for_test_node(extra_env: &[(&str, &str)]) -> String {
     extra_env
         .iter()
         .rev()
-        .find_map(|(key, value)| (*key == "IRONMESH_CLUSTER_ID").then_some((*value).to_string()))
+        .find_map(|(key, value)| (*key == "BERRYKEEP_CLUSTER_ID").then_some((*value).to_string()))
         .unwrap_or_else(|| DEFAULT_TEST_CLUSTER_ID.to_string())
 }
 
@@ -512,8 +512,8 @@ pub async fn start_authenticated_server_with_env_options(
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
     let env = [
-        ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
-        ("IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS", "false"),
+        ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+        ("BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS", "false"),
     ];
     let mut merged_env = env.to_vec();
     merged_env.extend_from_slice(extra_env);
@@ -547,8 +547,8 @@ pub async fn start_zero_touch_server(bind: &str, data_dir: &Path) -> Result<Chil
 
     let mut command = Command::new(server_bin);
     command
-        .env("IRONMESH_SERVER_BIND", bind)
-        .env("IRONMESH_DATA_DIR", data_dir)
+        .env("BERRYKEEP_SERVER_BIND", bind)
+        .env("BERRYKEEP_DATA_DIR", data_dir)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 
@@ -656,7 +656,7 @@ pub async fn start_open_server_with_public_https_env(
     replication_factor: usize,
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
-    let mut merged_env = vec![("IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS", "true")];
+    let mut merged_env = vec![("BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS", "true")];
     merged_env.extend_from_slice(extra_env);
     start_server_with_env_options_inner(
         bind,
@@ -681,8 +681,8 @@ pub async fn start_open_server_with_env_options(
     extra_env: &[(&str, &str)],
 ) -> Result<ChildGuard> {
     let mut merged_env = vec![
-        ("IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS", "true"),
-        ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+        ("BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS", "true"),
+        ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
     ];
     merged_env.extend_from_slice(extra_env);
     start_server_with_env_options_inner(
@@ -711,7 +711,7 @@ async fn start_server_with_env_options_inner(
 ) -> Result<ChildGuard> {
     let server_bin = binary_path("server-node")?;
 
-    // The server falls back to a generated UUID when IRONMESH_NODE_ID is not a
+    // The server falls back to a generated UUID when BERRYKEEP_NODE_ID is not a
     // UUID. Resolve the same value here so the test node certificate SAN and
     // the runtime node identity cannot diverge.
     let node_id = node_id
@@ -728,7 +728,7 @@ async fn start_server_with_env_options_inner(
     if let Some(s3_bind) = extra_env
         .iter()
         .rev()
-        .find_map(|(key, value)| (*key == "IRONMESH_S3_BIND").then_some(*value))
+        .find_map(|(key, value)| (*key == "BERRYKEEP_S3_BIND").then_some(*value))
     {
         resource_keys.push(tcp_resource_key(s3_bind));
     }
@@ -759,36 +759,36 @@ async fn start_server_with_env_options_inner(
     let stderr_file = std::fs::File::create(&stderr_log).context("failed creating stderr log")?;
 
     let command = command
-        .env("IRONMESH_SERVER_BIND", bind)
-        .env("IRONMESH_PUBLIC_URL", public_url)
-        .env("IRONMESH_DATA_DIR", data_dir)
-        .env("IRONMESH_CLUSTER_ID", &cluster_id)
-        .env("IRONMESH_NODE_ID", &node_id)
-        .env("IRONMESH_INTERNAL_BIND", internal_bind)
-        .env("IRONMESH_INTERNAL_URL", internal_url)
-        .env("IRONMESH_INTERNAL_TLS_CA_CERT", &ca_path)
-        .env("IRONMESH_INTERNAL_TLS_CA_KEY", &ca_key_path)
-        .env("IRONMESH_INTERNAL_TLS_CERT", &cert_path)
-        .env("IRONMESH_INTERNAL_TLS_KEY", &key_path)
+        .env("BERRYKEEP_SERVER_BIND", bind)
+        .env("BERRYKEEP_PUBLIC_URL", public_url)
+        .env("BERRYKEEP_DATA_DIR", data_dir)
+        .env("BERRYKEEP_CLUSTER_ID", &cluster_id)
+        .env("BERRYKEEP_NODE_ID", &node_id)
+        .env("BERRYKEEP_INTERNAL_BIND", internal_bind)
+        .env("BERRYKEEP_INTERNAL_URL", internal_url)
+        .env("BERRYKEEP_INTERNAL_TLS_CA_CERT", &ca_path)
+        .env("BERRYKEEP_INTERNAL_TLS_CA_KEY", &ca_key_path)
+        .env("BERRYKEEP_INTERNAL_TLS_CERT", &cert_path)
+        .env("BERRYKEEP_INTERNAL_TLS_KEY", &key_path)
         .env(
-            "IRONMESH_REPLICATION_FACTOR",
+            "BERRYKEEP_REPLICATION_FACTOR",
             replication_factor.to_string(),
         )
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 
     if let Some(mode) = metadata_commit_mode {
-        command.env("IRONMESH_METADATA_COMMIT_MODE", mode);
+        command.env("BERRYKEEP_METADATA_COMMIT_MODE", mode);
     }
 
     if let Some(timeout) = heartbeat_timeout_secs {
-        command.env("IRONMESH_HEARTBEAT_TIMEOUT_SECS", timeout.to_string());
+        command.env("BERRYKEEP_HEARTBEAT_TIMEOUT_SECS", timeout.to_string());
     }
 
-    command.env("IRONMESH_AUTONOMOUS_HEARTBEAT_ENABLED", "false");
-    command.env("IRONMESH_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "false");
+    command.env("BERRYKEEP_AUTONOMOUS_HEARTBEAT_ENABLED", "false");
+    command.env("BERRYKEEP_AUTONOMOUS_REPLICATION_ON_PUT_ENABLED", "false");
     if !public_https {
-        command.env("IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP", "true");
+        command.env("BERRYKEEP_ALLOW_INSECURE_PUBLIC_HTTP", "true");
     }
 
     for (key, value) in extra_env {
@@ -797,9 +797,9 @@ async fn start_server_with_env_options_inner(
 
     if public_https {
         command
-            .env("IRONMESH_PUBLIC_TLS_CERT", &cert_path)
-            .env("IRONMESH_PUBLIC_TLS_KEY", &key_path)
-            .env("IRONMESH_PUBLIC_TLS_CA_CERT", &ca_path);
+            .env("BERRYKEEP_PUBLIC_TLS_CERT", &cert_path)
+            .env("BERRYKEEP_PUBLIC_TLS_KEY", &key_path)
+            .env("BERRYKEEP_PUBLIC_TLS_CA_CERT", &ca_path);
     }
 
     let mut child = command.spawn().context("failed to spawn server-node")?;
@@ -882,7 +882,7 @@ pub async fn register_node(
     });
 
     http.put(format!("{controller_base}/cluster/nodes/{node_id}"))
-        .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+        .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
         .json(&body)
         .send()
         .await?
@@ -891,7 +891,7 @@ pub async fn register_node(
     Ok(())
 }
 
-pub async fn latest_snapshot_id_for_client(client: &IronMeshClient) -> Result<String> {
+pub async fn latest_snapshot_id_for_client(client: &BerryKeepClient) -> Result<String> {
     let parsed = client.get_json_path("/snapshots").await?;
     latest_snapshot_id_from_value(parsed)
 }
@@ -1100,7 +1100,7 @@ pub async fn issue_pairing_token(
 ) -> Result<String> {
     let response: serde_json::Value = http
         .post(format!("{base_url}/auth/pairing-tokens/issue"))
-        .header("x-ironmesh-admin-token", admin_token)
+        .header("x-berrykeep-admin-token", admin_token)
         .json(&serde_json::json!({
             "label": label,
             "expires_in_secs": expires_in_secs,
@@ -1127,7 +1127,7 @@ pub async fn issue_bootstrap_bundle(
     expires_in_secs: Option<u64>,
 ) -> Result<client_sdk::ConnectionBootstrap> {
     http.post(format!("{base_url}/auth/bootstrap-bundles/issue"))
-        .header("x-ironmesh-admin-token", admin_token)
+        .header("x-berrykeep-admin-token", admin_token)
         .json(&serde_json::json!({
             "label": label,
             "expires_in_secs": expires_in_secs,
@@ -1146,7 +1146,7 @@ pub fn default_client_identity_path(bootstrap_path: &Path) -> PathBuf {
         file_name.push(".client-identity.json");
         return bootstrap_path.with_file_name(file_name);
     }
-    bootstrap_path.with_file_name("ironmesh-client-identity.json")
+    bootstrap_path.with_file_name("berrykeep-client-identity.json")
 }
 
 pub async fn issue_bootstrap_bundle_and_enroll_client(
@@ -1262,7 +1262,7 @@ pub async fn issue_bootstrap_claim(
     preferred_rendezvous_url: Option<&str>,
 ) -> Result<client_sdk::ClientBootstrapClaimIssueResponse> {
     http.post(format!("{base_url}/auth/bootstrap-claims/issue"))
-        .header("x-ironmesh-admin-token", admin_token)
+        .header("x-berrykeep-admin-token", admin_token)
         .json(&serde_json::json!({
             "label": label,
             "expires_in_secs": expires_in_secs,
@@ -1317,9 +1317,9 @@ pub async fn start_rendezvous_service_with_env(
     let public_url = format!("http://{bind}");
     let mut command = Command::new(rendezvous_bin);
     command
-        .env("IRONMESH_RENDEZVOUS_BIND", bind)
-        .env("IRONMESH_RENDEZVOUS_PUBLIC_URL", &public_url)
-        .env("IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP", "true")
+        .env("BERRYKEEP_RENDEZVOUS_BIND", bind)
+        .env("BERRYKEEP_RENDEZVOUS_PUBLIC_URL", &public_url)
+        .env("BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP", "true")
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
 
@@ -1411,7 +1411,7 @@ pub async fn wait_for_online_nodes(
     for _ in 0..retries {
         if let Ok(resp) = http
             .get(format!("{base_url}/cluster/status"))
-            .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+            .header("x-berrykeep-admin-token", TEST_ADMIN_TOKEN)
             .send()
             .await
             && let Ok(ok_resp) = resp.error_for_status()
@@ -1568,7 +1568,7 @@ pub async fn wait_for_object_payload(
 
 #[allow(dead_code)]
 pub async fn wait_for_store_index_entry(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     prefix: Option<&str>,
     depth: usize,
     expected_path: &str,
@@ -1607,12 +1607,12 @@ pub async fn stop_server_without_cleanup(child: &mut ChildGuard) {
 
 pub fn binary_path(name: &str) -> Result<PathBuf> {
     let override_key = match name {
-        "server-node" => "IRONMESH_SERVER_BIN",
-        "cli-client" => "IRONMESH_CLI_BIN",
-        "config-app" => "IRONMESH_CONFIG_APP_BIN",
-        "os-integration" => "IRONMESH_OS_INTEGRATION_BIN",
-        "berrykeep-folder-agent" => "IRONMESH_FOLDER_AGENT_BIN",
-        "rendezvous-service" => "IRONMESH_RENDEZVOUS_BIN",
+        "server-node" => "BERRYKEEP_SERVER_BIN",
+        "cli-client" => "BERRYKEEP_CLI_BIN",
+        "config-app" => "BERRYKEEP_CONFIG_APP_BIN",
+        "os-integration" => "BERRYKEEP_OS_INTEGRATION_BIN",
+        "berrykeep-folder-agent" => "BERRYKEEP_FOLDER_AGENT_BIN",
+        "rendezvous-service" => "BERRYKEEP_RENDEZVOUS_BIN",
         _ => "",
     };
 
@@ -1632,10 +1632,10 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
     let artifact_path = match name {
         "server-node" => option_env!("CARGO_BIN_FILE_SERVER_NODE_berrykeep-server-node"),
         "cli-client" => option_env!("CARGO_BIN_FILE_CLI_CLIENT_berrykeep"),
-        "config-app" => option_env!("CARGO_BIN_FILE_IRONMESH_CONFIG_APP_berrykeep-config-app"),
+        "config-app" => option_env!("CARGO_BIN_FILE_BERRYKEEP_CONFIG_APP_berrykeep-config-app"),
         "os-integration" => option_env!("CARGO_BIN_FILE_OS_INTEGRATION_berrykeep-os-integration"),
         "berrykeep-folder-agent" => {
-            option_env!("CARGO_BIN_FILE_IRONMESH_FOLDER_AGENT_berrykeep-folder-agent")
+            option_env!("CARGO_BIN_FILE_BERRYKEEP_FOLDER_AGENT_berrykeep-folder-agent")
         }
         "rendezvous-service" => {
             option_env!("CARGO_BIN_FILE_RENDEZVOUS_SERVICE_berrykeep-rendezvous-service")
@@ -1667,12 +1667,12 @@ pub fn binary_path(name: &str) -> Result<PathBuf> {
         bail!(
             "expected binary does not exist: {} (artifact env missing; use nightly + artifact dependencies, or prebuild binaries, or set {}/{}/{}/{}/{}/{} overrides)",
             path.display(),
-            "IRONMESH_SERVER_BIN",
-            "IRONMESH_CLI_BIN",
-            "IRONMESH_CONFIG_APP_BIN",
-            "IRONMESH_OS_INTEGRATION_BIN",
-            "IRONMESH_FOLDER_AGENT_BIN",
-            "IRONMESH_RENDEZVOUS_BIN"
+            "BERRYKEEP_SERVER_BIN",
+            "BERRYKEEP_CLI_BIN",
+            "BERRYKEEP_CONFIG_APP_BIN",
+            "BERRYKEEP_OS_INTEGRATION_BIN",
+            "BERRYKEEP_FOLDER_AGENT_BIN",
+            "BERRYKEEP_RENDEZVOUS_BIN"
         );
     }
 
@@ -1690,7 +1690,7 @@ pub fn workspace_root() -> Result<PathBuf> {
 
 pub fn fresh_data_dir(name: &str) -> PathBuf {
     let unique = Uuid::new_v4();
-    let path = std::env::temp_dir().join(format!("ironmesh-{name}-{unique}"));
+    let path = std::env::temp_dir().join(format!("berrykeep-{name}-{unique}"));
     let _ = fs::remove_dir_all(&path);
     let _ = fs::create_dir_all(&path);
     path

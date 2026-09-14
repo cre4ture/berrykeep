@@ -1,0 +1,56 @@
+.berrykeep-indicator {
+    background-color: #0d6b5c;
+}
+
+.berrykeep-indicator:hover,
+.berrykeep-indicator:focus,
+.berrykeep-indicator:active {
+    background-color: #0d6b5c;
+}
+
+.berrykeep-panel-icons {
+    spacing: 1px;
+}
+
+.berrykeep-status-icon {
+    padding: 0px 0px;
+}
+
+.berrykeep-brand-icon {
+    color: #effff9;
+}
+
+.berrykeep-header {
+    font-weight: 700;
+}
+
+.berrykeep-status-row {
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+
+.berrykeep-status-title {
+    font-size: 0.84em;
+    color: rgba(255, 255, 255, 0.72);
+}
+
+.berrykeep-status-value {
+    font-weight: 600;
+}
+
+.berrykeep-status-detail {
+    font-size: 0.88em;
+    color: rgba(255, 255, 255, 0.78);
+}
+
+.berrykeep-state-error .berrykeep-status-value {
+    color: #ffb4a8;
+}
+
+.berrykeep-state-warning .berrykeep-status-value {
+    color: #ffd37a;
+}
+
+.berrykeep-state-syncing .berrykeep-status-value {
+    color: #9fd0ff;
+}

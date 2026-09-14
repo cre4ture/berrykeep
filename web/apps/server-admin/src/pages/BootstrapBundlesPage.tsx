@@ -8,7 +8,7 @@ import {
   type BootstrapClaimIssueResponse,
   type NodeEnrollmentPackage,
   type RendezvousConfigView
-} from "@ironmesh/api";
+} from "@berrykeep/api";
 import {
   Alert,
   Badge,
@@ -25,7 +25,7 @@ import {
   useMantineColorScheme
 } from "@mantine/core";
 import { useClipboard } from "@mantine/hooks";
-import { JsonBlock, ironmeshColorSchemeStorageKey } from "@ironmesh/ui";
+import { JsonBlock, berrykeepColorSchemeStorageKey } from "@berrykeep/ui";
 import QRCode from "qrcode";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAdminAccess } from "../lib/admin-access";
@@ -34,8 +34,8 @@ const BOOTSTRAP_QR_WIDTH = 1024;
 const BOOTSTRAP_QR_MARGIN = 12;
 const BOOTSTRAP_QR_FRAME_PADDING = 24;
 const MANTINE_COLOR_SCHEME_ATTRIBUTE = "data-mantine-color-scheme";
-const PROVISIONING_THEME_RESTORE_KEY = "ironmesh-provisioning-theme-restore";
-const PROVISIONING_THEME_ACTIVE_KEY = "ironmesh-provisioning-theme-active";
+const PROVISIONING_THEME_RESTORE_KEY = "berrykeep-provisioning-theme-restore";
+const PROVISIONING_THEME_ACTIVE_KEY = "berrykeep-provisioning-theme-active";
 
 type StoredColorScheme = "light" | "dark" | "auto";
 
@@ -51,10 +51,10 @@ function applyDocumentColorScheme(colorScheme: StoredColorScheme) {
   const resolvedColorScheme = resolveDocumentColorScheme(colorScheme);
 
   try {
-    window.localStorage.setItem(ironmeshColorSchemeStorageKey, colorScheme);
+    window.localStorage.setItem(berrykeepColorSchemeStorageKey, colorScheme);
     window.dispatchEvent(
       new StorageEvent("storage", {
-        key: ironmeshColorSchemeStorageKey,
+        key: berrykeepColorSchemeStorageKey,
         newValue: colorScheme,
         storageArea: window.localStorage
       })
@@ -340,7 +340,7 @@ export function BootstrapBundlesPage() {
     }
     downloadJson(
       bootstrapClaimJson,
-      `ironmesh-client-bootstrap-claim-${bootstrapClaimClusterId ?? "claim"}.json`
+      `berrykeep-client-bootstrap-claim-${bootstrapClaimClusterId ?? "claim"}.json`
     );
   }
 
@@ -350,7 +350,7 @@ export function BootstrapBundlesPage() {
     }
     downloadJson(
       JSON.stringify(bootstrapBundle, null, 2),
-      `ironmesh-client-bootstrap-${bootstrapBundle.cluster_id ?? "bundle"}.json`
+      `berrykeep-client-bootstrap-${bootstrapBundle.cluster_id ?? "bundle"}.json`
     );
   }
 
@@ -465,7 +465,7 @@ export function BootstrapBundlesPage() {
               </Text>
               {bootstrapClaim ? (
                 <Stack gap="xs">
-                  <Text fw={600}>Scan the compact claim with the ironmesh Android app (use Bright theme for best scanning experience)</Text>
+                  <Text fw={600}>Scan the compact claim with the berrykeep Android app (use Bright theme for best scanning experience)</Text>
                   {bootstrapBundleQrDataUrl ? (
                     <div
                       style={{
@@ -491,7 +491,7 @@ export function BootstrapBundlesPage() {
                 </Stack>
               ) : bootstrapBundle ? (
                 <Stack gap="xs">
-                  <Text fw={600}>Scan the full bootstrap bundle with the ironmesh Android app</Text>
+                  <Text fw={600}>Scan the full bootstrap bundle with the berrykeep Android app</Text>
                   {bootstrapBundleQrDataUrl ? (
                     <div
                       style={{

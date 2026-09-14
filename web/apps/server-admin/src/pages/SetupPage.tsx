@@ -7,8 +7,8 @@ import {
   type MetadataDbBackendKind,
   type SetupStatus,
   type SetupTransitionResponse
-} from "@ironmesh/api";
-import { ironmeshPrimaryColor, JsonBlock, StatCard } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { berrykeepPrimaryColor, JsonBlock, StatCard } from "@berrykeep/ui";
 import {
   Alert,
   Badge,
@@ -147,7 +147,7 @@ export function SetupPage() {
     return (
       <Stack gap="lg">
         {error ? <Alert color="red" title="Setup endpoint error">{error}</Alert> : null}
-        <Alert color={ironmeshPrimaryColor} title="Bootstrap setup APIs are not active on this node">
+        <Alert color={berrykeepPrimaryColor} title="Bootstrap setup APIs are not active on this node">
           This node is already in normal runtime mode. The shared React admin app now uses this same Setup page during
           first-run bootstrap mode, and keeps it here as a reference view once setup is complete.
         </Alert>

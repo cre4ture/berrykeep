@@ -9,11 +9,11 @@ fi
 ENV_OUTPUT_FILE="$1"
 RUNNER_TEMP_DIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 PROFILE_DIR="${HOME}/Library/MobileDevice/Provisioning Profiles"
-KEYCHAIN_PATH="${RUNNER_TEMP_DIR}/ironmesh-ios-signing.keychain-db"
-CERT_PATH="${RUNNER_TEMP_DIR}/ironmesh-ios-signing.p12"
-APP_PROFILE_PATH="${RUNNER_TEMP_DIR}/ironmesh-ios-app.mobileprovision"
-EXTENSION_PROFILE_PATH="${RUNNER_TEMP_DIR}/ironmesh-ios-extension.mobileprovision"
-KEYCHAIN_PASSWORD_FILE="${RUNNER_TEMP_DIR}/ironmesh-ios-signing.password"
+KEYCHAIN_PATH="${RUNNER_TEMP_DIR}/berrykeep-ios-signing.keychain-db"
+CERT_PATH="${RUNNER_TEMP_DIR}/berrykeep-ios-signing.p12"
+APP_PROFILE_PATH="${RUNNER_TEMP_DIR}/berrykeep-ios-app.mobileprovision"
+EXTENSION_PROFILE_PATH="${RUNNER_TEMP_DIR}/berrykeep-ios-extension.mobileprovision"
+KEYCHAIN_PASSWORD_FILE="${RUNNER_TEMP_DIR}/berrykeep-ios-signing.password"
 
 require_env() {
     VAR_NAME="$1"
@@ -71,16 +71,16 @@ install_profile() {
     mkdir -p "$PROFILE_DIR"
     cp "$RAW_PROFILE_PATH" "$PROFILE_DIR/${PROFILE_UUID}.mobileprovision"
 
-    append_env "IRONMESH_IOS_${LABEL}_PROFILE_UUID" "$PROFILE_UUID"
-    append_env "IRONMESH_IOS_${LABEL}_PROFILE_PATH" "$PROFILE_DIR/${PROFILE_UUID}.mobileprovision"
+    append_env "BERRYKEEP_IOS_${LABEL}_PROFILE_UUID" "$PROFILE_UUID"
+    append_env "BERRYKEEP_IOS_${LABEL}_PROFILE_PATH" "$PROFILE_DIR/${PROFILE_UUID}.mobileprovision"
 
     printf '%s\n' "$PROFILE_TEAM"
 }
 
-require_env "IRONMESH_IOS_SIGNING_CERT_B64"
-require_env "IRONMESH_IOS_SIGNING_CERT_PASSWORD"
-require_env "IRONMESH_IOS_APP_PROFILE_B64"
-require_env "IRONMESH_IOS_EXTENSION_PROFILE_B64"
+require_env "BERRYKEEP_IOS_SIGNING_CERT_B64"
+require_env "BERRYKEEP_IOS_SIGNING_CERT_PASSWORD"
+require_env "BERRYKEEP_IOS_APP_PROFILE_B64"
+require_env "BERRYKEEP_IOS_EXTENSION_PROFILE_B64"
 
 KEYCHAIN_PASSWORD="$(uuidgen)"
 printf '%s' "$KEYCHAIN_PASSWORD" >"$KEYCHAIN_PASSWORD_FILE"
@@ -90,10 +90,10 @@ security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-decode_base64 "$IRONMESH_IOS_SIGNING_CERT_B64" "$CERT_PATH"
+decode_base64 "$BERRYKEEP_IOS_SIGNING_CERT_B64" "$CERT_PATH"
 security import "$CERT_PATH" \
     -k "$KEYCHAIN_PATH" \
-    -P "$IRONMESH_IOS_SIGNING_CERT_PASSWORD" \
+    -P "$BERRYKEEP_IOS_SIGNING_CERT_PASSWORD" \
     -A \
     -t cert \
     -f pkcs12
@@ -113,15 +113,15 @@ if [ -z "$SIGNING_IDENTITY" ]; then
     exit 67
 fi
 
-APP_TEAM="$(install_profile "APP" "$IRONMESH_IOS_APP_PROFILE_B64" "$APP_PROFILE_PATH")"
-EXTENSION_TEAM="$(install_profile "EXTENSION" "$IRONMESH_IOS_EXTENSION_PROFILE_B64" "$EXTENSION_PROFILE_PATH")"
+APP_TEAM="$(install_profile "APP" "$BERRYKEEP_IOS_APP_PROFILE_B64" "$APP_PROFILE_PATH")"
+EXTENSION_TEAM="$(install_profile "EXTENSION" "$BERRYKEEP_IOS_EXTENSION_PROFILE_B64" "$EXTENSION_PROFILE_PATH")"
 
 if [ "$APP_TEAM" != "$EXTENSION_TEAM" ]; then
     echo "iOS app and extension provisioning profiles use different team identifiers" >&2
     exit 68
 fi
 
-append_env "IRONMESH_IOS_DEVELOPMENT_TEAM" "$APP_TEAM"
-append_env "IRONMESH_IOS_KEYCHAIN_PATH" "$KEYCHAIN_PATH"
-append_env "IRONMESH_IOS_KEYCHAIN_PASSWORD_FILE" "$KEYCHAIN_PASSWORD_FILE"
-append_env "IRONMESH_IOS_SIGNING_IDENTITY" "$SIGNING_IDENTITY"
+append_env "BERRYKEEP_IOS_DEVELOPMENT_TEAM" "$APP_TEAM"
+append_env "BERRYKEEP_IOS_KEYCHAIN_PATH" "$KEYCHAIN_PATH"
+append_env "BERRYKEEP_IOS_KEYCHAIN_PASSWORD_FILE" "$KEYCHAIN_PASSWORD_FILE"
+append_env "BERRYKEEP_IOS_SIGNING_IDENTITY" "$SIGNING_IDENTITY"

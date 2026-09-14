@@ -7,7 +7,7 @@ use crate::framework::{
 };
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use client_sdk::IronMeshClient;
+use client_sdk::BerryKeepClient;
 use rusqlite::{Connection, OptionalExtension};
 use std::fs;
 use std::io::Read;
@@ -64,7 +64,7 @@ impl FolderAgentConnection {
 
 struct AuthenticatedFolderAgentFixture {
     server: ChildGuard,
-    sdk: IronMeshClient,
+    sdk: BerryKeepClient,
     connection: FolderAgentConnection,
 }
 
@@ -334,7 +334,7 @@ fn local_files_in_dir_containing(dir: &Path, needle: &str) -> Result<Vec<PathBuf
 }
 
 async fn wait_for_remote_file_bytes(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     key: &str,
     expected: &[u8],
     retries: usize,
@@ -353,7 +353,7 @@ async fn wait_for_remote_file_bytes(
 }
 
 async fn assert_remote_store_index_has_no_paths_containing(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     needle: &str,
     checks: usize,
 ) -> Result<()> {
@@ -372,7 +372,7 @@ async fn assert_remote_store_index_has_no_paths_containing(
 }
 
 async fn wait_for_remote_directory(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     dir_path: &str,
     retries: usize,
 ) -> Result<()> {
@@ -395,7 +395,7 @@ async fn wait_for_remote_directory(
 }
 
 async fn wait_for_remote_directory_marker_shape(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     dir_path: &str,
     retries: usize,
 ) -> Result<()> {
@@ -437,7 +437,7 @@ async fn wait_for_remote_directory_marker_shape(
 }
 
 async fn wait_for_remote_plain_file_shape(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     file_path: &str,
     retries: usize,
 ) -> Result<()> {
@@ -479,7 +479,7 @@ async fn wait_for_remote_plain_file_shape(
 }
 
 async fn wait_for_remote_path_absence_any_shape(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     path: &str,
     retries: usize,
 ) -> Result<()> {
@@ -516,7 +516,7 @@ async fn wait_for_remote_path_absence_any_shape(
 }
 
 async fn wait_for_remote_file_absence(
-    sdk: &IronMeshClient,
+    sdk: &BerryKeepClient,
     key: &str,
     retries: usize,
 ) -> Result<()> {
@@ -535,7 +535,7 @@ async fn wait_for_remote_file_absence(
     bail!("remote file {key} was expected to be deleted")
 }
 
-async fn delete_remote_key_by_query(sdk: &IronMeshClient, key: &str) -> Result<()> {
+async fn delete_remote_key_by_query(sdk: &BerryKeepClient, key: &str) -> Result<()> {
     sdk.delete_path(key)
         .await
         .with_context(|| format!("failed to request remote delete for key={key}"))
@@ -2020,7 +2020,7 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_is_missing(
             )
             .await?;
 
-            let conflict_dir = local_root.join(".ironmesh-conflicts/remote/conflict");
+            let conflict_dir = local_root.join(".berrykeep-conflicts/remote/conflict");
             let mut found_remote_copy = false;
             if let Ok(entries) = fs::read_dir(&conflict_dir) {
                 for entry in entries {
@@ -2105,7 +2105,7 @@ async fn folder_agent_records_dual_modify_conflict_when_baseline_row_exists() ->
             )
             .await?;
 
-            let conflict_dir = local_root.join(".ironmesh-conflicts/remote/conflict2");
+            let conflict_dir = local_root.join(".berrykeep-conflicts/remote/conflict2");
             let mut found_remote_copy = false;
             if let Ok(entries) = fs::read_dir(&conflict_dir) {
                 for entry in entries {
@@ -2204,7 +2204,7 @@ async fn folder_agent_recovers_after_crash_during_active_sync_writes() -> Result
             .arg("100")
             .arg("--no-watch-local")
             .env(
-                "IRONMESH_TEST_CRASH_AFTER_UPLOAD_STATE_KEY",
+                "BERRYKEEP_TEST_CRASH_AFTER_UPLOAD_STATE_KEY",
                 "crash-active/local-c.bin",
             )
             .stdout(Stdio::null())
@@ -2351,7 +2351,7 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
         .await?;
 
         let target = local_root.join("partial-download/target.bin");
-        let staged_download_dir = local_root.join(".ironmesh/transfers/downloads");
+        let staged_download_dir = local_root.join(".berrykeep/transfers/downloads");
         let mut artifact: Option<PathBuf> = None;
         for _ in 0..400 {
             if let Ok(bytes) = fs::read(&target)
@@ -2384,7 +2384,7 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
             250,
             250,
             &[(
-                "IRONMESH_TEST_CONFLICT_COPY_SLEEP_AFTER_TEMP_CREATE_MS",
+                "BERRYKEEP_TEST_CONFLICT_COPY_SLEEP_AFTER_TEMP_CREATE_MS",
                 "2000",
             )],
             true,
@@ -2405,7 +2405,7 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
                 "expected temp artifact to be cleaned up after restart completed: {}",
                 artifact.display()
             );
-            assert_remote_store_index_has_no_paths_containing(&sdk, "ironmesh-part-", 20).await?;
+            assert_remote_store_index_has_no_paths_containing(&sdk, "berrykeep-part-", 20).await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -2472,7 +2472,7 @@ async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Re
             "expected remote content_hash to differ from baseline after remote update"
         );
 
-        let conflict_dir = local_root.join(".ironmesh-conflicts/remote/conflict-copy");
+        let conflict_dir = local_root.join(".berrykeep-conflicts/remote/conflict-copy");
 
         // Deterministic crash injection: abort right after creating the conflict temp file.
         let agent_bin = binary_path("berrykeep-folder-agent")?;
@@ -2488,7 +2488,7 @@ async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Re
             .arg("--local-scan-interval-ms")
             .arg("250")
             .arg("--no-watch-local")
-            .env("IRONMESH_TEST_CRASH_AFTER_CONFLICT_COPY_TEMP_CREATE", "1")
+            .env("BERRYKEEP_TEST_CRASH_AFTER_CONFLICT_COPY_TEMP_CREATE", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
@@ -2500,7 +2500,7 @@ async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Re
             bail!("expected folder-agent crash injection run to fail, got status {status}");
         }
 
-        let artifacts = local_files_in_dir_containing(&conflict_dir, "ironmesh-part-")?;
+        let artifacts = local_files_in_dir_containing(&conflict_dir, "berrykeep-part-")?;
         let artifact = artifacts
             .into_iter()
             .next()
@@ -2556,7 +2556,7 @@ async fn folder_agent_recovers_after_crash_during_conflict_copy_download() -> Re
                 conflict_copy.context("did not observe remote conflict copy after restart")?;
             wait_for_local_file_bytes(&conflict_copy, b"remote-v2", 60).await?;
 
-            assert_remote_store_index_has_no_paths_containing(&sdk, "ironmesh-part-", 20).await?;
+            assert_remote_store_index_has_no_paths_containing(&sdk, "berrykeep-part-", 20).await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;

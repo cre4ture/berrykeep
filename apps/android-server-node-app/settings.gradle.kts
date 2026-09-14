@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ironmesh-server-node-android"
+rootProject.name = "berrykeep-server-node-android"
 include(":app")

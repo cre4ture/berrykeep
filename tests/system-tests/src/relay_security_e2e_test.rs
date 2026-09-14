@@ -419,14 +419,14 @@ mod tests {
 
         std::fs::create_dir_all(&client_dir)?;
         let observer = RelayFrameObserver::start(rendezvous_bind).await?;
-        let rendezvous_env = [("IRONMESH_RELAY_PUBLIC_URLS", observer.public_url())];
+        let rendezvous_env = [("BERRYKEEP_RELAY_PUBLIC_URLS", observer.public_url())];
         let node_env = [
-            ("IRONMESH_CLUSTER_ID", cluster_id),
-            ("IRONMESH_RENDEZVOUS_URLS", rendezvous_url.as_str()),
-            ("IRONMESH_RELAY_MODE", "required"),
-            ("IRONMESH_PUBLIC_PEER_API_ENABLED", "true"),
-            ("IRONMESH_REQUIRE_CLIENT_AUTH", "true"),
-            ("IRONMESH_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
+            ("BERRYKEEP_CLUSTER_ID", cluster_id),
+            ("BERRYKEEP_RENDEZVOUS_URLS", rendezvous_url.as_str()),
+            ("BERRYKEEP_RELAY_MODE", "required"),
+            ("BERRYKEEP_PUBLIC_PEER_API_ENABLED", "true"),
+            ("BERRYKEEP_REQUIRE_CLIENT_AUTH", "true"),
+            ("BERRYKEEP_ADMIN_TOKEN", TEST_ADMIN_TOKEN),
         ];
 
         let mut rendezvous =
@@ -522,8 +522,8 @@ mod tests {
                 b"DELETE /".as_slice(),
                 b"Authorization:".as_slice(),
                 b"Bearer ".as_slice(),
-                b"x-ironmesh-auth-signature".as_slice(),
-                b"x-ironmesh-credential-fingerprint".as_slice(),
+                b"x-berrykeep-auth-signature".as_slice(),
+                b"x-berrykeep-credential-fingerprint".as_slice(),
                 KNOWN_RELAY_PAYLOAD,
                 enrolled
                     .identity

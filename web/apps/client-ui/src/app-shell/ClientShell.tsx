@@ -33,12 +33,12 @@ import {
 } from "@tabler/icons-react";
 import {
   ColorSchemeControl,
-  ironmeshPrimaryColor,
+  berrykeepPrimaryColor,
   JsonBlock,
   NavigationShell,
   PageHeader,
   StatCard
-} from "@ironmesh/ui";
+} from "@berrykeep/ui";
 import {
   runClientLatencyTest,
   deleteStoreValue,
@@ -72,8 +72,8 @@ import {
   type StoreEntry,
   type StoreListResponse,
   type VersionGraphResponse
-} from "@ironmesh/api";
-import { ironmeshUiRevision, ironmeshUiVersion } from "@ironmesh/config";
+} from "@berrykeep/api";
+import { berrykeepUiRevision, berrykeepUiVersion } from "@berrykeep/config";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { ConnectionPathsPage } from "../pages/ConnectionPathsPage";
 import { ExplorerPage as ClientExplorerPage } from "../pages/ExplorerPage";
@@ -303,7 +303,7 @@ export function ClientShell() {
           ) : null}
           <ColorSchemeControl />
           {ping ? <Badge variant="light">{ping.service}</Badge> : null}
-          <Badge color={ironmeshPrimaryColor} variant="filled">
+          <Badge color={berrykeepPrimaryColor} variant="filled">
             Transport-aware
           </Badge>
         </>
@@ -815,7 +815,7 @@ function OverviewPage({
   const replicationFactor = getNestedNumber(clusterStatus, "policy", "replication_factor");
   const runtimeMode = typeof health?.mode === "string" ? health.mode : "runtime";
   const connectionSummary = summarizeClientConnection(connectionStatus);
-  const versionMismatch = Boolean(ping?.backend_version) && ping?.backend_version !== ironmeshUiVersion;
+  const versionMismatch = Boolean(ping?.backend_version) && ping?.backend_version !== berrykeepUiVersion;
 
   return (
     <>
@@ -848,7 +848,7 @@ function OverviewPage({
             <Stack gap="sm">
               <Text fw={700}>Connection summary</Text>
               <Group gap="sm">
-                <Badge color={ironmeshPrimaryColor} variant="light">
+                <Badge color={berrykeepPrimaryColor} variant="light">
                   {onlineNodes ?? 0} online
                 </Badge>
                 <Badge color={offlineNodes ? "yellow" : "gray"} variant="light">
@@ -925,7 +925,7 @@ function OverviewPage({
             <Stack gap="sm">
               <Text fw={700}>Version info</Text>
               <Text size="sm">
-                UI build: <Code>{formatFullVersion(ironmeshUiVersion, ironmeshUiRevision)}</Code>
+                UI build: <Code>{formatFullVersion(berrykeepUiVersion, berrykeepUiRevision)}</Code>
               </Text>
               <Text size="sm">
                 Backend build: <Code>{formatFullVersion(ping?.backend_version, ping?.backend_revision)}</Code>
@@ -947,7 +947,7 @@ function OverviewPage({
             <Stack gap="sm">
               <Text fw={700}>Active route</Text>
               <Group gap="sm">
-                <Badge color={connectionStatus?.transport_mode === "relay" ? ironmeshPrimaryColor : "blue"} variant="light">
+                <Badge color={connectionStatus?.transport_mode === "relay" ? berrykeepPrimaryColor : "blue"} variant="light">
                   {connectionSummary.routeMode}
                 </Badge>
                 {connectionStatus?.transport_mode === "relay" && connectionStatus.active_url ? (
@@ -1115,12 +1115,12 @@ function RendezvousPage() {
         </Alert>
       ) : null}
       {rendezvous?.editable && rendezvous.persistence_source === "android_preferences" ? (
-        <Alert color={ironmeshPrimaryColor} title="Persisted to Android preferences">
+        <Alert color={berrykeepPrimaryColor} title="Persisted to Android preferences">
           Rendezvous URL edits are written back into the Android app's persisted bootstrap state and will be reused after restart.
         </Alert>
       ) : null}
       {rendezvous?.editable && rendezvous.persistence_source === "bootstrap_file" ? (
-        <Alert color={ironmeshPrimaryColor} title="Persisted to bootstrap file">
+        <Alert color={berrykeepPrimaryColor} title="Persisted to bootstrap file">
           Rendezvous URL edits are written back into the bootstrap file that launched this web session.
         </Alert>
       ) : null}
@@ -1183,7 +1183,7 @@ function RendezvousPage() {
                 <Badge color={rendezvous?.mtls_required ? "blue" : "gray"} variant="light">
                   {rendezvous?.mtls_required ? "mTLS required" : "mTLS optional"}
                 </Badge>
-                <Badge color={rendezvous?.transport_mode === "relay" ? ironmeshPrimaryColor : "gray"} variant="light">
+                <Badge color={rendezvous?.transport_mode === "relay" ? berrykeepPrimaryColor : "gray"} variant="light">
                   {rendezvous?.transport_mode === "relay" ? "relay active" : "direct active"}
                 </Badge>
               </Group>
@@ -1235,7 +1235,7 @@ function RendezvousPage() {
                           <Group gap="xs">
                             <Code>{endpoint.url}</Code>
                             {endpoint.active ? (
-                              <Badge color={ironmeshPrimaryColor} variant="filled">
+                              <Badge color={berrykeepPrimaryColor} variant="filled">
                                 active
                               </Badge>
                             ) : null}
@@ -1449,7 +1449,7 @@ function LatencyPage() {
                               </Stack>
                             </Table.Td>
                             <Table.Td>
-                              <Badge color={target.transport_mode === "relay" ? ironmeshPrimaryColor : "blue"} variant="light">
+                              <Badge color={target.transport_mode === "relay" ? berrykeepPrimaryColor : "blue"} variant="light">
                                 {target.transport_mode}
                               </Badge>
                             </Table.Td>
@@ -1741,7 +1741,7 @@ function StorePage({ binaryUpload }: { binaryUpload: BinaryUploadController }) {
                     <Badge color="blue" variant="light">
                       {binaryUploadSummary.activeFiles} active
                     </Badge>
-                    <Badge color={ironmeshPrimaryColor} variant="light">
+                    <Badge color={berrykeepPrimaryColor} variant="light">
                       {binaryUploadSummary.completedFiles} complete
                     </Badge>
                     <Badge color={binaryUploadSummary.canceledFiles > 0 ? "yellow" : "gray"} variant="light">
@@ -2404,7 +2404,7 @@ function binaryUploadHeaderColor(
     return "blue";
   }
   if (summary.completedFiles > 0 && summary.completedFiles === summary.totalFiles) {
-    return ironmeshPrimaryColor;
+    return berrykeepPrimaryColor;
   }
   return "gray";
 }
@@ -2438,7 +2438,7 @@ function binaryUploadStatusColor(status: BinaryUploadQueueStatus): string {
     return "gray";
   }
   if (status === "complete") {
-    return ironmeshPrimaryColor;
+    return berrykeepPrimaryColor;
   }
   if (status === "canceled") {
     return "yellow";

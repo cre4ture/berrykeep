@@ -33,10 +33,10 @@ Status: active implementation checklist for moving the server-node admin UI and 
 
 Files:
 
-- [x] [web/package.json](c:/Users/hornu/dev-rust/ironmesh/web/package.json)
-- [x] [web/pnpm-workspace.yaml](c:/Users/hornu/dev-rust/ironmesh/web/pnpm-workspace.yaml)
-- [x] [web/tsconfig.base.json](c:/Users/hornu/dev-rust/ironmesh/web/tsconfig.base.json)
-- [x] [web/README.md](c:/Users/hornu/dev-rust/ironmesh/web/README.md)
+- [x] [web/package.json](c:/Users/hornu/dev-rust/berrykeep/web/package.json)
+- [x] [web/pnpm-workspace.yaml](c:/Users/hornu/dev-rust/berrykeep/web/pnpm-workspace.yaml)
+- [x] [web/tsconfig.base.json](c:/Users/hornu/dev-rust/berrykeep/web/tsconfig.base.json)
+- [x] [web/README.md](c:/Users/hornu/dev-rust/berrykeep/web/README.md)
 
 ## Phase 2: Server admin app
 
@@ -61,11 +61,11 @@ Pages to reach parity:
 
 Current Rust sources to replace:
 
-- [x] [crates/server-node-sdk/src/ui/index.html](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/ui/index.html)
-- [x] [crates/server-node-sdk/src/ui/app.js](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/ui/app.js)
-- [x] [crates/server-node-sdk/src/ui/app.css](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/ui/app.css)
-- [x] [crates/server-node-sdk/src/ui/setup_index.html](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/ui/setup_index.html)
-- [x] [crates/server-node-sdk/src/ui/setup_app.js](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/ui/setup_app.js)
+- [x] [crates/server-node-sdk/src/ui/index.html](c:/Users/hornu/dev-rust/berrykeep/crates/server-node-sdk/src/ui/index.html)
+- [x] [crates/server-node-sdk/src/ui/app.js](c:/Users/hornu/dev-rust/berrykeep/crates/server-node-sdk/src/ui/app.js)
+- [x] [crates/server-node-sdk/src/ui/app.css](c:/Users/hornu/dev-rust/berrykeep/crates/server-node-sdk/src/ui/app.css)
+- [x] [crates/server-node-sdk/src/ui/setup_index.html](c:/Users/hornu/dev-rust/berrykeep/crates/server-node-sdk/src/ui/setup_index.html)
+- [x] [crates/server-node-sdk/src/ui/setup_app.js](c:/Users/hornu/dev-rust/berrykeep/crates/server-node-sdk/src/ui/setup_app.js)
 
 ## Phase 3: Rust embed path for server-admin
 
@@ -78,9 +78,9 @@ Current Rust sources to replace:
 
 Rust integration points:
 
-- [x] [crates/server-node-sdk/src/ui.rs](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/ui.rs)
-- [ ] [crates/server-node-sdk/src/lib.rs](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/lib.rs)
-- [x] [crates/server-node-sdk/src/setup.rs](c:/Users/hornu/dev-rust/ironmesh/crates/server-node-sdk/src/setup.rs)
+- [x] [crates/server-node-sdk/src/ui.rs](c:/Users/hornu/dev-rust/berrykeep/crates/server-node-sdk/src/ui.rs)
+- [ ] [crates/server-node-sdk/src/lib.rs](c:/Users/hornu/dev-rust/berrykeep/crates/server-node-sdk/src/lib.rs)
+- [x] [crates/server-node-sdk/src/setup.rs](c:/Users/hornu/dev-rust/berrykeep/crates/server-node-sdk/src/setup.rs)
 
 ## Phase 4: Shared packages hardening
 
@@ -99,7 +99,7 @@ Rust integration points:
 
 Current Rust integration point:
 
-- [x] [crates/web-ui-backend/src/lib.rs](c:/Users/hornu/dev-rust/ironmesh/crates/web-ui-backend/src/lib.rs)
+- [x] [crates/web-ui-backend/src/lib.rs](c:/Users/hornu/dev-rust/berrykeep/crates/web-ui-backend/src/lib.rs)
 
 ## Phase 6: Android embedded client UI
 
@@ -109,8 +109,8 @@ Current Rust integration point:
 
 Likely touch points:
 
-- [ ] [apps/android-app/src/lib.rs](c:/Users/hornu/dev-rust/ironmesh/apps/android-app/src/lib.rs)
-- [ ] [apps/android-app/app/src/main/java/io/ironmesh/android/data/RustClientBridge.kt](c:/Users/hornu/dev-rust/ironmesh/apps/android-app/app/src/main/java/io/ironmesh/android/data/RustClientBridge.kt)
+- [ ] [apps/android-app/src/lib.rs](c:/Users/hornu/dev-rust/berrykeep/apps/android-app/src/lib.rs)
+- [ ] [apps/android-app/app/src/main/java/io/berrykeep/android/data/RustClientBridge.kt](c:/Users/hornu/dev-rust/berrykeep/apps/android-app/app/src/main/java/io/berrykeep/android/data/RustClientBridge.kt)
 
 ## Phase 7: Remove old handwritten assets
 

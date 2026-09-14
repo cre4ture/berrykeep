@@ -1,5 +1,5 @@
-import { getSetupStatus, isHttpErrorStatus } from "@ironmesh/api";
-import { ColorSchemeControl, ironmeshPrimaryColor, NavigationShell, PageHeader } from "@ironmesh/ui";
+import { getSetupStatus, isHttpErrorStatus } from "@berrykeep/api";
+import { ColorSchemeControl, berrykeepPrimaryColor, NavigationShell, PageHeader } from "@berrykeep/ui";
 import { Alert, Badge, Button, Center, Loader, Paper, Stack, Text, Title } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { useEffect, useState } from "react";
@@ -77,7 +77,7 @@ export function ServerAdminShell() {
             <Badge
               data-testid="server-admin-session-badge"
               color={
-                surfaceMode === "setup" ? "blue" : sessionStatus?.authenticated ? ironmeshPrimaryColor : "gray"
+                surfaceMode === "setup" ? "blue" : sessionStatus?.authenticated ? berrykeepPrimaryColor : "gray"
               }
             >
               {surfaceMode === "setup"
@@ -101,7 +101,7 @@ export function ServerAdminShell() {
             />
             <Center py="xl">
               <Stack align="center" gap="sm">
-                <Loader color={ironmeshPrimaryColor} />
+                <Loader color={berrykeepPrimaryColor} />
                 <Text c="dimmed">Loading the server-admin surface…</Text>
               </Stack>
             </Center>

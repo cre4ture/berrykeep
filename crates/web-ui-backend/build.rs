@@ -13,7 +13,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
     let web_workspace_dir =
         canonicalize_or_fallback(manifest_dir.join("..").join("..").join("web"));
-    let prebuilt_web_dir = env::var_os("IRONMESH_PREBUILT_WEB_DIR").map(PathBuf::from);
+    let prebuilt_web_dir = env::var_os("BERRYKEEP_PREBUILT_WEB_DIR").map(PathBuf::from);
     let generated_dist_dir = out_dir.join("client-ui-dist");
     let mut client_ui_dist_candidates = client_ui_dist_candidates(&web_workspace_dir);
 
@@ -161,11 +161,11 @@ fn main() {
             .join("..")
             .join("docs")
             .join("assets")
-            .join("ironmesh-favicon.svg")
+            .join("berrykeep-favicon.svg")
             .display()
     );
     println!("cargo:rerun-if-env-changed=PATH");
-    println!("cargo:rerun-if-env-changed=IRONMESH_PREBUILT_WEB_DIR");
+    println!("cargo:rerun-if-env-changed=BERRYKEEP_PREBUILT_WEB_DIR");
     if let Some(prebuilt_web_dir) = prebuilt_web_dir.as_deref() {
         println!(
             "cargo:rerun-if-changed={}",
@@ -204,7 +204,7 @@ fn main() {
     let built_index_path = client_ui_dist_dir.join("index.html");
     let index_html = fs::read_to_string(&built_index_path).unwrap_or_else(|error| {
         panic!(
-            "failed reading built client-ui HTML at {} after `pnpm --filter @ironmesh/client-ui build`: {error}",
+            "failed reading built client-ui HTML at {} after `pnpm --filter @berrykeep/client-ui build`: {error}",
             built_index_path.display()
         )
     });
@@ -414,7 +414,7 @@ fn resolve_prebuilt_dist_dir(prebuilt_web_dir: &Path, app_name: &str) -> PathBuf
     }
 
     panic!(
-        "prebuilt web assets requested via IRONMESH_PREBUILT_WEB_DIR={}, but {} is missing index.html",
+        "prebuilt web assets requested via BERRYKEEP_PREBUILT_WEB_DIR={}, but {} is missing index.html",
         prebuilt_web_dir.display(),
         candidate.display()
     );
@@ -503,7 +503,7 @@ struct FrontendBuildLock {
 
 impl FrontendBuildLock {
     fn acquire(web_workspace_dir: &Path) -> Self {
-        let lock_path = web_workspace_dir.join(".ironmesh-build.lock");
+        let lock_path = web_workspace_dir.join(".berrykeep-build.lock");
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -554,7 +554,7 @@ fn run_frontend_build(web_workspace_dir: &Path, generated_dist_dir: &Path) {
     let generated_dist_arg = generated_dist_dir.to_string_lossy().into_owned();
     let args = [
         "--filter",
-        "@ironmesh/client-ui",
+        "@berrykeep/client-ui",
         "exec",
         "vite",
         "build",
@@ -564,7 +564,7 @@ fn run_frontend_build(web_workspace_dir: &Path, generated_dist_dir: &Path) {
 
     let status = run_pnpm_command(web_workspace_dir, &args).unwrap_or_else(|error| {
         panic!(
-            "failed to execute `corepack {PNPM_PACKAGE_MANAGER} --filter @ironmesh/client-ui exec vite build --outDir {}` in {}: {error}. Install a supported Node.js release with Corepack enabled and ensure `corepack` is on PATH.",
+            "failed to execute `corepack {PNPM_PACKAGE_MANAGER} --filter @berrykeep/client-ui exec vite build --outDir {}` in {}: {error}. Install a supported Node.js release with Corepack enabled and ensure `corepack` is on PATH.",
             generated_dist_dir.display(),
             web_workspace_dir.display()
         )

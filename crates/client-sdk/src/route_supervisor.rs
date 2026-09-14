@@ -8,7 +8,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crate::ironmesh_client::IronMeshClient;
+use crate::berrykeep_client::BerryKeepClient;
 
 /// Stable identity of a client transport route.
 ///
@@ -112,17 +112,17 @@ pub(crate) struct RouteSupervisor {
 
 #[derive(Default)]
 struct RouteSupervisorPending {
-    client: Option<IronMeshClient>,
+    client: Option<BerryKeepClient>,
     completions: Vec<tokio::sync::oneshot::Sender<()>>,
     wake_queued: bool,
 }
 
 impl RouteSupervisor {
-    pub(crate) fn signal(&self, client: IronMeshClient) -> bool {
+    pub(crate) fn signal(&self, client: BerryKeepClient) -> bool {
         self.send(client, None)
     }
 
-    pub(crate) async fn refresh_due(&self, client: IronMeshClient) {
+    pub(crate) async fn refresh_due(&self, client: BerryKeepClient) {
         let (completion, receiver) = tokio::sync::oneshot::channel();
         if !self.send(client, Some(completion)) {
             return;
@@ -132,7 +132,7 @@ impl RouteSupervisor {
 
     fn send(
         &self,
-        client: IronMeshClient,
+        client: BerryKeepClient,
         completion: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> bool {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {

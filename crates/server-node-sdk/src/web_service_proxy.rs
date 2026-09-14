@@ -43,9 +43,9 @@ const MAX_UPSTREAM_URL_BYTES: usize = 2_048;
 const MAX_TLS_CA_PEM_BYTES: usize = 256 * 1024;
 const WEB_SERVICE_PATH_PREFIX: &str = "/api/v1/web-services/";
 const WEB_SERVICE_CONNECT_SUFFIX: &str = "/connect";
-pub(crate) const HEADER_UPSTREAM_AUTHORITY: &str = "x-ironmesh-web-service-authority";
-pub(crate) const HEADER_UPSTREAM_BASE_PATH: &str = "x-ironmesh-web-service-base-path";
-pub(crate) const HEADER_UPSTREAM_SCHEME: &str = "x-ironmesh-web-service-scheme";
+pub(crate) const HEADER_UPSTREAM_AUTHORITY: &str = "x-berrykeep-web-service-authority";
+pub(crate) const HEADER_UPSTREAM_BASE_PATH: &str = "x-berrykeep-web-service-base-path";
+pub(crate) const HEADER_UPSTREAM_SCHEME: &str = "x-berrykeep-web-service-scheme";
 
 #[derive(Clone)]
 pub(crate) struct WebServiceRegistry {
@@ -757,7 +757,7 @@ where
             request_id,
             status,
             headers: vec![TransportHeader {
-                name: "x-ironmesh-error".to_string(),
+                name: "x-berrykeep-error".to_string(),
                 value: message,
             }],
         },
@@ -1007,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn registry_persists_acl_and_defaults_to_deny() {
         let root = std::env::temp_dir().join(format!(
-            "ironmesh-web-services-test-{}",
+            "berrykeep-web-services-test-{}",
             uuid::Uuid::now_v7().simple()
         ));
         let registry = WebServiceRegistry::load(&root).await.unwrap();
@@ -1038,11 +1038,11 @@ mod tests {
     #[tokio::test]
     async fn registry_rejects_state_directory_symlink_escape() {
         let root = std::env::temp_dir().join(format!(
-            "ironmesh-web-services-symlink-test-{}",
+            "berrykeep-web-services-symlink-test-{}",
             uuid::Uuid::now_v7().simple()
         ));
         let outside = std::env::temp_dir().join(format!(
-            "ironmesh-web-services-outside-test-{}",
+            "berrykeep-web-services-outside-test-{}",
             uuid::Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();

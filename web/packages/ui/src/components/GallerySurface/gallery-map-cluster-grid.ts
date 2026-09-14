@@ -1,9 +1,9 @@
 import * as maplibregl from "maplibre-gl";
 import type { GeoJSONSource } from "maplibre-gl";
 
-const GALLERY_MAP_CLUSTER_GRID_SOURCE_ID = "ironmesh-gallery-cluster-grid";
-const GALLERY_MAP_CLUSTER_GRID_FILL_LAYER_ID = "ironmesh-gallery-cluster-grid-fill";
-const GALLERY_MAP_CLUSTER_GRID_LINE_LAYER_ID = "ironmesh-gallery-cluster-grid-line";
+const GALLERY_MAP_CLUSTER_GRID_SOURCE_ID = "berrykeep-gallery-cluster-grid";
+const GALLERY_MAP_CLUSTER_GRID_FILL_LAYER_ID = "berrykeep-gallery-cluster-grid-fill";
+const GALLERY_MAP_CLUSTER_GRID_LINE_LAYER_ID = "berrykeep-gallery-cluster-grid-line";
 
 type GalleryMapClusterGridPayload = {
   resolution: number;

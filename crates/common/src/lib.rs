@@ -3,6 +3,7 @@ use unicode_general_category::{GeneralCategory, get_general_category};
 use uuid::Uuid;
 
 pub mod content_fingerprint;
+pub mod legacy_compatibility;
 pub mod logging;
 pub mod range_chunk_cache;
 pub mod traced_mutex;
@@ -13,7 +14,7 @@ pub type NodeId = Uuid;
 pub type ClusterId = Uuid;
 pub type DeviceId = Uuid;
 
-/// Maximum UTF-8 byte length accepted for a host name shown in IronMesh user
+/// Maximum UTF-8 byte length accepted for a host name shown in BerryKeep user
 /// interfaces. This matches the DNS host name limit while deliberately not
 /// requiring the operating system's display value to be a DNS name.
 pub const MAX_NODE_HOSTNAME_BYTES: usize = 255;

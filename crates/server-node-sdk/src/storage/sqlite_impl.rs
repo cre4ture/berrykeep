@@ -2043,7 +2043,7 @@ async fn open_sqlite_reader_connection(metadata_db_path: &Path) -> Result<TokioC
 }
 
 fn sqlite_read_connection_count() -> usize {
-    std::env::var("IRONMESH_SQLITE_READ_CONNECTIONS")
+    common::legacy_compatibility::var("BERRYKEEP_SQLITE_READ_CONNECTIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .map(|value| value.max(1))
@@ -4116,7 +4116,7 @@ impl MetadataStore for SqliteMetadataStore {
         let db = self.metadata_conn()?;
         let row = db
             .query_row(
-                "SELECT ironmesh_key, etag, multipart_part_count, created_at_unix
+                "SELECT berrykeep_key, etag, multipart_part_count, created_at_unix
                  FROM s3_object_versions
                  WHERE bucket_name = ?1 AND version_id = ?2",
                 params![bucket_name, version_id],
@@ -4132,10 +4132,10 @@ impl MetadataStore for SqliteMetadataStore {
             .optional()?;
 
         match row {
-            Some((ironmesh_key, etag, multipart_part_count, created_at_unix)) => {
+            Some((berrykeep_key, etag, multipart_part_count, created_at_unix)) => {
                 Ok(Some(S3ObjectVersionRecord {
                     bucket_name: bucket_name.to_string(),
-                    ironmesh_key,
+                    berrykeep_key,
                     version_id: version_id.to_string(),
                     etag,
                     multipart_part_count: multipart_part_count
@@ -4155,16 +4155,16 @@ impl MetadataStore for SqliteMetadataStore {
     async fn list_s3_object_versions_for_key(
         &self,
         bucket_name: &str,
-        ironmesh_key: &str,
+        berrykeep_key: &str,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
         let db = self.metadata_conn()?;
         let mut stmt = db.prepare(
             "SELECT version_id, etag, multipart_part_count, created_at_unix
              FROM s3_object_versions
-             WHERE bucket_name = ?1 AND ironmesh_key = ?2
+             WHERE bucket_name = ?1 AND berrykeep_key = ?2
              ORDER BY created_at_unix DESC, version_id DESC",
         )?;
-        let rows = stmt.query_map(params![bucket_name, ironmesh_key], |row| {
+        let rows = stmt.query_map(params![bucket_name, berrykeep_key], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -4178,7 +4178,7 @@ impl MetadataStore for SqliteMetadataStore {
             let (version_id, etag, multipart_part_count, created_at_unix) = row?;
             records.push(S3ObjectVersionRecord {
                 bucket_name: bucket_name.to_string(),
-                ironmesh_key: ironmesh_key.to_string(),
+                berrykeep_key: berrykeep_key.to_string(),
                 version_id,
                 etag,
                 multipart_part_count: multipart_part_count
@@ -4197,17 +4197,17 @@ impl MetadataStore for SqliteMetadataStore {
     async fn list_s3_object_versions(
         &self,
         bucket_name: &str,
-        ironmesh_key_prefix: Option<&str>,
+        berrykeep_key_prefix: Option<&str>,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
         let db = self.metadata_conn()?;
         let mut records = Vec::new();
-        if let Some(prefix) = ironmesh_key_prefix {
+        if let Some(prefix) = berrykeep_key_prefix {
             let like_pattern = super::sqlite_like_prefix_pattern(prefix);
             let mut stmt = db.prepare(
-                "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                "SELECT berrykeep_key, version_id, etag, multipart_part_count, created_at_unix
                  FROM s3_object_versions
-                 WHERE bucket_name = ?1 AND ironmesh_key LIKE ?2 ESCAPE '\\'
-                 ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+                 WHERE bucket_name = ?1 AND berrykeep_key LIKE ?2 ESCAPE '\\'
+                 ORDER BY berrykeep_key ASC, created_at_unix DESC, version_id DESC",
             )?;
             let rows = stmt.query_map(params![bucket_name, like_pattern], |row| {
                 Ok((
@@ -4220,10 +4220,10 @@ impl MetadataStore for SqliteMetadataStore {
             })?;
 
             for row in rows {
-                let (ironmesh_key, version_id, etag, multipart_part_count, created_at_unix) = row?;
+                let (berrykeep_key, version_id, etag, multipart_part_count, created_at_unix) = row?;
                 records.push(S3ObjectVersionRecord {
                     bucket_name: bucket_name.to_string(),
-                    ironmesh_key,
+                    berrykeep_key,
                     version_id,
                     etag,
                     multipart_part_count: multipart_part_count
@@ -4238,10 +4238,10 @@ impl MetadataStore for SqliteMetadataStore {
             }
         } else {
             let mut stmt = db.prepare(
-                "SELECT ironmesh_key, version_id, etag, multipart_part_count, created_at_unix
+                "SELECT berrykeep_key, version_id, etag, multipart_part_count, created_at_unix
                  FROM s3_object_versions
                  WHERE bucket_name = ?1
-                 ORDER BY ironmesh_key ASC, created_at_unix DESC, version_id DESC",
+                 ORDER BY berrykeep_key ASC, created_at_unix DESC, version_id DESC",
             )?;
             let rows = stmt.query_map(params![bucket_name], |row| {
                 Ok((
@@ -4254,10 +4254,10 @@ impl MetadataStore for SqliteMetadataStore {
             })?;
 
             for row in rows {
-                let (ironmesh_key, version_id, etag, multipart_part_count, created_at_unix) = row?;
+                let (berrykeep_key, version_id, etag, multipart_part_count, created_at_unix) = row?;
                 records.push(S3ObjectVersionRecord {
                     bucket_name: bucket_name.to_string(),
-                    ironmesh_key,
+                    berrykeep_key,
                     version_id,
                     etag,
                     multipart_part_count: multipart_part_count
@@ -4279,20 +4279,20 @@ impl MetadataStore for SqliteMetadataStore {
         db.execute(
             "INSERT INTO s3_object_versions (
                  bucket_name,
-                 ironmesh_key,
+                 berrykeep_key,
                  version_id,
                  etag,
                  multipart_part_count,
                  created_at_unix
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(bucket_name, version_id) DO UPDATE
-             SET ironmesh_key = excluded.ironmesh_key,
+             SET berrykeep_key = excluded.berrykeep_key,
                  etag = excluded.etag,
                  multipart_part_count = excluded.multipart_part_count,
                  created_at_unix = excluded.created_at_unix",
             params![
                 record.bucket_name,
-                record.ironmesh_key,
+                record.berrykeep_key,
                 record.version_id,
                 record.etag,
                 record.multipart_part_count.map(i64::from),
@@ -5421,7 +5421,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS s3_object_versions (
             bucket_name TEXT NOT NULL,
-            ironmesh_key TEXT NOT NULL,
+            berrykeep_key TEXT NOT NULL,
             version_id TEXT NOT NULL,
             etag TEXT NOT NULL,
             multipart_part_count INTEGER,
@@ -5525,7 +5525,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject
             ON cluster_replicas(subject);
         CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
-            ON s3_object_versions(bucket_name, ironmesh_key, created_at_unix DESC, version_id DESC);
+            ON s3_object_versions(bucket_name, berrykeep_key, created_at_unix DESC, version_id DESC);
         ",
     )?;
     add_sqlite_column_if_missing(
@@ -5946,7 +5946,7 @@ mod tests {
             .expect("system clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "ironmesh-{name}-{}-{stamp}.sqlite",
+            "berrykeep-{name}-{}-{stamp}.sqlite",
             std::process::id()
         ))
     }

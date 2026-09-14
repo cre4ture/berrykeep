@@ -106,6 +106,38 @@ final class AppleOriginalShareCapabilityTests: XCTestCase {
         XCTAssertTrue(expiration.updatedIdentifiers.isEmpty)
     }
 
+    func testFormerCapabilityDirectoryIsMigratedBeforeResolving() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let canonicalDirectory = root.appendingPathComponent("BerryKeep", isDirectory: true)
+        let legacyDirectory = root.appendingPathComponent("Ironmesh", isDirectory: true)
+        let token = "123e4567-e89b-12d3-a456-426614174000"
+        let request = try AppleOriginalShareRequest.decodeWebMessage(
+            webMessage(snapshotID: "snapshot-1", versionID: nil)
+        )
+        let legacyStore = AppleOriginalShareCapabilityStore(
+            directoryURL: legacyDirectory,
+            tokenFactory: { token }
+        )
+        _ = try legacyStore.create(request)
+        let migratingStore = AppleOriginalShareCapabilityStore(
+            directoryURL: canonicalDirectory,
+            legacyDirectoryURL: legacyDirectory
+        )
+
+        XCTAssertEqual(try migratingStore.resolve(token: token).token, token)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: canonicalDirectory.appendingPathComponent("\(token).json").path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: legacyDirectory.appendingPathComponent("\(token).json").path
+            )
+        )
+    }
+
     func testCapabilityStoreRejectsPathLikeTokens() throws {
         let store = AppleOriginalShareCapabilityStore(directoryURL: temporaryDirectory())
 

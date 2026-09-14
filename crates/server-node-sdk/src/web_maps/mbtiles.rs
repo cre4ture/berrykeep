@@ -164,7 +164,7 @@ impl LogicalMbtilesSource {
             cache: Mutex::new(LogicalFileChunkCache::default()),
         });
         let vfs_name = format!(
-            "ironmesh-mbtiles-{}",
+            "berrykeep-mbtiles-{}",
             NEXT_VFS_ID.fetch_add(1, Ordering::Relaxed)
         );
         sqlite_vfs::register(

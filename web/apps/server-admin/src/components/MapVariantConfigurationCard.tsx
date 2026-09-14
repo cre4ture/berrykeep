@@ -1,8 +1,8 @@
 import {
   updateAdminGalleryMapConfiguration,
   type AdminGalleryMapConfiguration
-} from "@ironmesh/api";
-import { galleryQueryKeys } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { galleryQueryKeys } from "@berrykeep/ui";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,

@@ -16,7 +16,7 @@ The main contracts to freeze, or deliberately change before release, are:
 - packaging, installation, and update behavior
 - security, migration, observability, and release gates
 
-Active compatibility shims and aliases should be tracked in [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) so cleanup decisions can be made entry by entry.
+Active compatibility shims and aliases should be tracked in [compatibility-contracts.md](compatibility-contracts.md) so cleanup decisions can be made entry by entry.
 
 ## Current Release Snapshot
 
@@ -25,10 +25,10 @@ Last updated: 2026-05-01.
 - Release tag `v1.0.0-beta.1` exists and points at `17a8451` (`Document first beta inter-node contract`).
 - Workspace package version: `1.0.0-beta.1`.
 - Debian package version and target series: `1.0.0~beta.1-1~ppa2~ubuntu24.04.1` for Ubuntu `noble`.
-- PPA target selected for upload: `ppa:ulrich-hornung/ironmesh`.
+- PPA target selected for upload: `ppa:ulrich-hornung/berrykeep`.
 - GitHub CI on the tagged beta code was green for `Workspace Check`, `Coverage`, `Security`, `System Tests`, and `CodeQL`.
 - The `ppa1` source upload was accepted, but the Launchpad binary build failed because `dpkg-source` stripped vendored Cargo dotfiles that Cargo checksums still referenced.
-- The matching `../ironmesh_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes` source upload artifact has been built locally unsigned for validation; build it signed before upload.
+- The matching `../berrykeep_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes` source upload artifact has been built locally unsigned for validation; build it signed before upload.
 
 ## Review Rules
 
@@ -59,22 +59,22 @@ These are the main release-surface candidates already visible in the repo and wo
 
 | Surface | Current state to verify | Why it matters |
 | --- | --- | --- |
-| CLI command name | `apps/cli-client` remains the Cargo package name, while the public binary and command name are `ironmesh` | Cargo/package naming can stay internal, but released executable naming must stay stable |
-| Service binary name | `apps/server-node` remains the Cargo package name, while the public binary and command name are `ironmesh-server-node` | Node automation and cluster tooling will depend on it |
-| Rendezvous service name | `apps/rendezvous-service` remains the Cargo package name, while the public binary and command name are `ironmesh-rendezvous-service` | Deployment and troubleshooting depend on it |
-| Desktop executable set | `ironmesh`, `ironmesh-config-app`, `ironmesh-background-launcher`, `ironmesh-os-integration`, and `ironmesh-folder-agent` are treated as sibling packaged executables where packaged client services are supported | Package layout and launcher behavior become user-visible contracts |
-| Filesystem integration naming | `ironmesh-os-integration` is the intended public wrapper while Linux FUSE and Windows CFAPI adapter names remain implementation details underneath it | Keeping one documented entrypoint avoids support and packaging drift |
-| Windows startup task ID | `IronmeshBackgroundLauncher` is hard-coded | OS-level registration names are expensive to change later |
-| Desktop config path | Windows uses `%LOCALAPPDATA%\Ironmesh\desktop-client-config\instances.json`; Linux uses `$XDG_CONFIG_HOME/ironmesh/desktop-client-config/instances.json` and `$XDG_STATE_HOME/ironmesh/desktop-client-config/last-launch-report.json`, with migration from legacy uppercase XDG roots | Users, scripts, and packaged apps may start depending on these paths |
-| Sync-root local state path | Windows CFAPI uses `%LOCALAPPDATA%\Ironmesh\sync-roots\<label-hash>\...` for `connection-bootstrap.json`, `client-identity.json`, and `desktop-status.json` | This becomes a persistence and migration contract |
-| Runtime env var naming | Binary runtime envs use `IRONMESH_*`; local helper scripts should keep distinct prefixes such as `IRONMESH_LOCAL_CLUSTER_*` and `IRONMESH_RENDEZVOUS_DEPLOY_*` rather than reusing the runtime `IRONMESH_RENDEZVOUS_*` namespace | This avoids confusing helper automation settings with the actual runtime config contract |
-| Direct connection flag naming | User-facing direct client flows should use `--server-base-url` across `ironmesh`, `ironmesh-os-integration`, and `ironmesh-folder-agent`; legacy `ironmesh --server-url` should stay compatibility-only if kept at all | This prevents docs, scripts, and UI-generated command lines from drifting across clients |
-| Auth / CA flag naming | `--client-identity-file` and `--server-ca-pem-file` should stay canonical across `ironmesh`, `ironmesh-os-integration`, and `ironmesh-folder-agent`; legacy Windows `--server-ca-cert` should stay compatibility-only if retained | Config-app generated commands, system tests, and platform docs should not drift by OS |
-| Folder-agent state root | `sync-agent-core` defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/folder-agent/` and should stay aligned with the Linux persisted-state root family | Consistent Linux XDG roots reduce migration and support complexity |
-| Bootstrap and identity file naming | External examples should use `ironmesh-client-bootstrap*.json`; live flows infer sibling `*.client-identity.json` files such as `ironmesh-client-bootstrap.client-identity.json`; Windows sync-root persistence should stay on `connection-bootstrap.json` and `client-identity.json` under `%LOCALAPPDATA%\Ironmesh\sync-roots\...` | This freezes the release-facing handoff names and keeps legacy hidden Windows names out of current docs and packaging |
+| CLI command name | `apps/cli-client` remains the Cargo package name, while the public binary and command name are `berrykeep` | Cargo/package naming can stay internal, but released executable naming must stay stable |
+| Service binary name | `apps/server-node` remains the Cargo package name, while the public binary and command name are `berrykeep-server-node` | Node automation and cluster tooling will depend on it |
+| Rendezvous service name | `apps/rendezvous-service` remains the Cargo package name, while the public binary and command name are `berrykeep-rendezvous-service` | Deployment and troubleshooting depend on it |
+| Desktop executable set | `berrykeep`, `berrykeep-config-app`, `berrykeep-background-launcher`, `berrykeep-os-integration`, and `berrykeep-folder-agent` are treated as sibling packaged executables where packaged client services are supported | Package layout and launcher behavior become user-visible contracts |
+| Filesystem integration naming | `berrykeep-os-integration` is the intended public wrapper while Linux FUSE and Windows CFAPI adapter names remain implementation details underneath it | Keeping one documented entrypoint avoids support and packaging drift |
+| Windows startup task ID | `BerryKeepBackgroundLauncher` is hard-coded | OS-level registration names are expensive to change later |
+| Desktop config path | Windows uses `%LOCALAPPDATA%\BerryKeep\desktop-client-config\instances.json`; Linux uses `$XDG_CONFIG_HOME/berrykeep/desktop-client-config/instances.json` and `$XDG_STATE_HOME/berrykeep/desktop-client-config/last-launch-report.json`, with migration from legacy uppercase XDG roots | Users, scripts, and packaged apps may start depending on these paths |
+| Sync-root local state path | Windows CFAPI uses `%LOCALAPPDATA%\BerryKeep\sync-roots\<label-hash>\...` for `connection-bootstrap.json`, `client-identity.json`, and `desktop-status.json` | This becomes a persistence and migration contract |
+| Runtime env var naming | Binary runtime envs use `BERRYKEEP_*`; local helper scripts should keep distinct prefixes such as `BERRYKEEP_LOCAL_CLUSTER_*` and `BERRYKEEP_RENDEZVOUS_DEPLOY_*` rather than reusing the runtime `BERRYKEEP_RENDEZVOUS_*` namespace | This avoids confusing helper automation settings with the actual runtime config contract |
+| Direct connection flag naming | User-facing direct client flows should use `--server-base-url` across `berrykeep`, `berrykeep-os-integration`, and `berrykeep-folder-agent`; legacy `berrykeep --server-url` should stay compatibility-only if kept at all | This prevents docs, scripts, and UI-generated command lines from drifting across clients |
+| Auth / CA flag naming | `--client-identity-file` and `--server-ca-pem-file` should stay canonical across `berrykeep`, `berrykeep-os-integration`, and `berrykeep-folder-agent`; legacy Windows `--server-ca-cert` should stay compatibility-only if retained | Config-app generated commands, system tests, and platform docs should not drift by OS |
+| Folder-agent state root | `sync-agent-core` defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/berrykeep/folder-agent/` and should stay aligned with the Linux persisted-state root family | Consistent Linux XDG roots reduce migration and support complexity |
+| Bootstrap and identity file naming | External examples should use `berrykeep-client-bootstrap*.json`; live flows infer sibling `*.client-identity.json` files such as `berrykeep-client-bootstrap.client-identity.json`; Windows sync-root persistence should stay on `connection-bootstrap.json` and `client-identity.json` under `%LOCALAPPDATA%\BerryKeep\sync-roots\...` | This freezes the release-facing handoff names and keeps legacy hidden Windows names out of current docs and packaging |
 | Client enrollment JSON naming | Direct enrollment, bootstrap-claim redeem, and SDK enrollment results should use `device_label` as the canonical JSON field; bare `label` should stay compatibility-only if retained | This keeps bootstrap JSON, enrollment APIs, and mobile/bootstrap tooling aligned |
 | Managed rendezvous failover package JSON | Export/import packages should keep top-level fields `version`, `cluster_id`, `source_node_id`, `target_node_id`, `exported_at_unix`, `public_url`, `pbkdf2_rounds`, `salt_b64`, `nonce_b64`, and `ciphertext_b64` stable; the encrypted payload should continue carrying the standalone mTLS client CA plus the server cert and key | Failover handoff files become an operator disaster-recovery contract |
-| Inter-node identity contract | Peer TLS identity is based on cert SAN values like `urn:ironmesh:node:<uuid>` | This is a core compatibility and security contract |
+| Inter-node identity contract | Peer TLS identity is based on cert SAN values like `urn:berrykeep:node:<uuid>` | This is a core compatibility and security contract |
 | HTTP API versioning | Canonical client-facing routes are versioned under `/api/v1`, with temporary legacy aliases retained server-side for compatibility | The release contract now has an explicit version namespace while bundled callers migrate to the canonical paths |
 | Client-facing JSON error shape | Current v1 error bodies stay on the top-level `{ "error": "<message>" }` envelope across server-node and bundled web routes | Bundled clients and external tooling need one predictable error body across the `/api/v1` surface |
 | Desktop managed JSON schema markers | `instances.json` and `last-launch-report.json` persist top-level `version: 1` and accept missing version from older files | Desktop state needs an explicit migration marker before release |
@@ -133,16 +133,16 @@ Working evidence log:
 
    | Cargo package | Built binary name | User-facing command name | Documented name | Supported platforms | Initial classification |
    | --- | --- | --- | --- | --- | --- |
-   | `cli-client` | `ironmesh` | `ironmesh` | `ironmesh` | Cross-platform Rust CLI | `public stable` |
-   | `server-node` | `ironmesh-server-node` | `ironmesh-server-node` | `ironmesh-server-node` | Cross-platform Rust service | `public stable` |
-   | `rendezvous-service` | `ironmesh-rendezvous-service` | `ironmesh-rendezvous-service` | `ironmesh-rendezvous-service` | Cross-platform Rust service | `public stable` |
-   | `os-integration` | `ironmesh-os-integration` | `ironmesh-os-integration` | `ironmesh-os-integration` | Windows CFAPI and Linux FUSE | `public stable` |
-   | `ironmesh-config-app` | `ironmesh-config-app` | `ironmesh-config-app` | `ironmesh-config-app` | Linux and Windows packaged desktop builds | `public stable` |
-   | `ironmesh-background-launcher` | `ironmesh-background-launcher` | `ironmesh-background-launcher` | packaged background launcher helper | Linux and Windows packaged desktop builds | `stable internal` |
-   | `ironmesh-folder-agent` | `ironmesh-folder-agent` | `ironmesh-folder-agent` | packaged folder sync agent | Linux and Windows packaged desktop builds | `stable internal` |
+   | `cli-client` | `berrykeep` | `berrykeep` | `berrykeep` | Cross-platform Rust CLI | `public stable` |
+   | `server-node` | `berrykeep-server-node` | `berrykeep-server-node` | `berrykeep-server-node` | Cross-platform Rust service | `public stable` |
+   | `rendezvous-service` | `berrykeep-rendezvous-service` | `berrykeep-rendezvous-service` | `berrykeep-rendezvous-service` | Cross-platform Rust service | `public stable` |
+   | `os-integration` | `berrykeep-os-integration` | `berrykeep-os-integration` | `berrykeep-os-integration` | Windows CFAPI and Linux FUSE | `public stable` |
+   | `berrykeep-config-app` | `berrykeep-config-app` | `berrykeep-config-app` | `berrykeep-config-app` | Linux and Windows packaged desktop builds | `public stable` |
+   | `berrykeep-background-launcher` | `berrykeep-background-launcher` | `berrykeep-background-launcher` | packaged background launcher helper | Linux and Windows packaged desktop builds | `stable internal` |
+   | `berrykeep-folder-agent` | `berrykeep-folder-agent` | `berrykeep-folder-agent` | packaged folder sync agent | Linux and Windows packaged desktop builds | `stable internal` |
 - Findings:
-   - `major`: [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs) was still resolving the sibling packaged executable as `os-integration`; this pass updates it to `ironmesh-os-integration` so packaged launch behavior matches the actual binary contract already enforced by the app package and tests.
-   - `minor`: the package-name versus command-name split is intentional for `cli-client`, `server-node`, `rendezvous-service`, and `os-integration`; support docs should keep spelling out that `cargo run -p ...` uses Cargo package names while released binaries use the `ironmesh-*` command names above.
+   - `major`: [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs) was still resolving the sibling packaged executable as `os-integration`; this pass updates it to `berrykeep-os-integration` so packaged launch behavior matches the actual binary contract already enforced by the app package and tests.
+   - `minor`: the package-name versus command-name split is intentional for `cli-client`, `server-node`, `rendezvous-service`, and `os-integration`; support docs should keep spelling out that `cargo run -p ...` uses Cargo package names while released binaries use the `berrykeep-*` command names above.
    - `question`: the table above is enough to freeze names and classifications, but Pass 6 still needs to decide the final first-release artifact scope per platform.
 - Missing tests or docs:
    - No Pass 1 inventory gap remains. The release-visible runtime env contract is captured in [README.md](../README.md), and the persisted file stable-vs-internal matrix is captured in Pass 5 below.
@@ -215,7 +215,7 @@ Working evidence log:
    - Relay transport preserves peer HTTP headers through `RelayHttpHeader { name, value }`; no caller-provided identity header is part of the internal peer-auth contract.
 - Confirmed stable identity and authorization assumptions:
    - Internal peer routes require node-to-node authentication through mTLS on direct peer transport, or through the relay multiplex handshake bound to `PeerIdentity::Node`.
-   - The authenticated node identity comes from the peer certificate SAN `urn:ironmesh:node:<uuid>` and cluster binding SAN `urn:ironmesh:cluster:<cluster_uuid>`; caller-controlled headers such as `x-ironmesh-node-id` are not trusted for internal caller identity.
+   - The authenticated node identity comes from the peer certificate SAN `urn:berrykeep:node:<uuid>` and cluster binding SAN `urn:berrykeep:cluster:<cluster_uuid>`; caller-controlled headers such as `x-berrykeep-node-id` are not trusted for internal caller identity.
    - Any internal route that carries `{node_id}` in the path must compare that path value to the authenticated peer identity. The heartbeat route currently enforces this with `403` on mismatch.
    - Routine node enrollment renewal preserves the stable logical `node_id`, requires matching `cluster_id`, and is authorized by current cluster membership. Removal from current membership is the first-beta denial mechanism for renewal.
 - Confirmed stable rendezvous and relay dependencies:
@@ -264,17 +264,17 @@ Checklist:
 Working evidence log:
 
 - Reviewed paths:
-   - [crates/client-sdk/src/ironmesh_client.rs](../crates/client-sdk/src/ironmesh_client.rs)
+   - [crates/client-sdk/src/berrykeep_client.rs](../crates/client-sdk/src/berrykeep_client.rs)
    - [crates/client-sdk/src/remote_sync.rs](../crates/client-sdk/src/remote_sync.rs)
    - [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs)
    - [crates/server-node-sdk/src/web_maps.rs](../crates/server-node-sdk/src/web_maps.rs)
    - [crates/web-ui-backend/src/lib.rs](../crates/web-ui-backend/src/lib.rs)
    - [web/tests/client-ui.smoke.spec.ts](../web/tests/client-ui.smoke.spec.ts)
    - [web/tests/server-admin.smoke.spec.ts](../web/tests/server-admin.smoke.spec.ts)
-   - [docs/backwards-compatibility-aliases.md](backwards-compatibility-aliases.md)
+   - [docs/compatibility-contracts.md](compatibility-contracts.md)
 - Confirmed stable contracts:
    - `client-sdk`, `server-node-sdk`, and `web-ui-backend` now use `/api/v1` as the canonical client-facing prefix, and bootstrap direct-target probes use `/api/v1/health`.
-   - Legacy unversioned client-facing aliases remain server-side only as temporary compatibility shims and are now recorded in [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md).
+   - Legacy unversioned client-facing aliases remain server-side only as temporary compatibility shims and are now recorded in [compatibility-contracts.md](compatibility-contracts.md).
    - Representative server-node and bundled-web error helpers now pin the top-level public JSON envelope to `{ "error": string }`, and the smoke suites assert canonical `/api/v1` URLs instead of legacy unversioned paths.
 - Findings:
    - `question`: whether bundled `web-ui-backend` routes should be documented as part of the public stable surface or treated as bundled-tool internal routes is still undecided.
@@ -283,7 +283,7 @@ Working evidence log:
    - A single route catalog that maps each stable client-facing endpoint and payload to Rust or smoke-test coverage is still missing.
 - Proposed pre-release actions:
    - Write the explicit stable-route catalog and decide whether `web-ui-backend` stays internal or joins the public first-release API surface.
-   - Keep legacy aliases documented in [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) until external callers are known to be off them.
+   - Keep legacy aliases documented in [compatibility-contracts.md](compatibility-contracts.md) until external callers are known to be off them.
 - Deferred post-release items:
    - Remove temporary unversioned aliases once the compatibility window closes.
 
@@ -305,7 +305,7 @@ Primary repo areas:
 Checklist:
 
 - [x] Confirm the final user-visible binary and command names for all shipped artifacts.
-- [x] Resolve the `cli-client` package name versus `ironmesh` command-name split in docs, packaging, and support language.
+- [x] Resolve the `cli-client` package name versus `berrykeep` command-name split in docs, packaging, and support language.
 - [x] Decide whether `os-integration` is the only supported user-facing entrypoint for filesystem integration, with adapter-specific names treated as implementation details.
 - [x] Review all code that assumes packaged sibling executables live under one package root.
 - [x] Review OS-level names that become hard to change later, including startup-task IDs and package-root assumptions.
@@ -321,10 +321,10 @@ Working evidence log:
    - [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs)
    - [apps/*/tests/version.rs](../apps)
 - Confirmed stable contracts:
-   - Installed user-facing command names are `ironmesh`, `ironmesh-server-node`, `ironmesh-rendezvous-service`, `ironmesh-os-integration`, and `ironmesh-folder-agent`.
+   - Installed user-facing command names are `berrykeep`, `berrykeep-server-node`, `berrykeep-rendezvous-service`, `berrykeep-os-integration`, and `berrykeep-folder-agent`.
    - `cli-client`, `server-node`, `rendezvous-service`, and `os-integration` remain Cargo package names for source-checkout workflows only.
-   - The Ubuntu `ironmesh-client` package keeps desktop helper binaries together under one package root and exposes the documented commands through `/usr/bin` symlinks.
-   - Filesystem integration is documented through `ironmesh-os-integration`; adapter crate names remain implementation details.
+   - The Ubuntu `berrykeep-client` package keeps desktop helper binaries together under one package root and exposes the documented commands through `/usr/bin` symlinks.
+   - Filesystem integration is documented through `berrykeep-os-integration`; adapter crate names remain implementation details.
 - Findings:
    - `resolved`: README now explicitly separates Cargo package names from installed command names.
    - `resolved`: Debian packaging installs the final command set and keeps package-root sibling assumptions intact for the config app/background launcher path.
@@ -352,7 +352,7 @@ Primary repo areas:
 Checklist:
 
 - [x] Enumerate stable or semi-stable persisted files by platform, including `instances.json`, `last-launch-report.json`, `connection-bootstrap.json`, `client-identity.json`, `desktop-status.json`, GNOME status JSON, and the folder-agent SQLite files.
-- [x] Decide whether path-root casing differences such as `Ironmesh` versus `ironmesh` are intentional release contracts or inconsistencies to fix before release.
+- [x] Decide whether path-root casing differences such as `BerryKeep` versus `berrykeep` are intentional release contracts or inconsistencies to fix before release.
 - [x] Review migration behavior for legacy paths such as `windows-client-config` and older bootstrap or identity-file discovery names.
 - [x] Review JSON and SQLite format stability, including whether explicit schema or format version markers are needed before release.
 - [x] Keep stable JSON stores on explicit format markers; `instances.json` and `last-launch-report.json` currently use `version: 1` with compatibility for missing legacy versions.
@@ -370,34 +370,34 @@ Working evidence log:
    - [crates/sync-agent-core/src/folder_agent_state.rs](../crates/sync-agent-core/src/folder_agent_state.rs)
    - [crates/client-sdk/src/content_addressed_client_cache.rs](../crates/client-sdk/src/content_addressed_client_cache.rs)
    - [crates/server-node-sdk/src/storage/sqlite_impl.rs](../crates/server-node-sdk/src/storage/sqlite_impl.rs)
-   - [docs/backwards-compatibility-aliases.md](backwards-compatibility-aliases.md)
+   - [docs/compatibility-contracts.md](compatibility-contracts.md)
    - [docs/cross-platform-filesystem-integration-strategy.md](cross-platform-filesystem-integration-strategy.md)
    - [docs/windows-msix-release-update-strategy.md](windows-msix-release-update-strategy.md)
 - Confirmed stable contracts:
    - `instances.json` and `last-launch-report.json` now persist top-level `version: 1` and accept missing version in legacy files.
    - The client content cache and server metadata SQLite stores now persist explicit `schema_version` markers and treat missing legacy marker rows as current while rejecting future versions.
-   - Desktop config roots remain `%LOCALAPPDATA%\Ironmesh\desktop-client-config\...` on Windows and XDG `ironmesh/...` roots on Linux; that casing split is now treated as an intentional OS-specific release contract, with migration from older legacy roots still in place.
+   - Desktop config roots remain `%LOCALAPPDATA%\BerryKeep\desktop-client-config\...` on Windows and XDG `berrykeep/...` roots on Linux; that casing split is now treated as an intentional OS-specific release contract, with migration from older legacy roots still in place.
 
   | Platform | Path / file family | Classification | Format / derivation | Compatibility / migration notes |
   | --- | --- | --- | --- | --- |
-  | Windows | `%LOCALAPPDATA%\Ironmesh\desktop-client-config\instances.json` | `public stable` | JSON with top-level `version: 1` | Migrates from `%LOCALAPPDATA%\Ironmesh\windows-client-config\instances.json` |
-  | Windows | `%LOCALAPPDATA%\Ironmesh\desktop-client-config\last-launch-report.json` | `stable internal` | JSON with top-level `version: 1` | Migrates from `%LOCALAPPDATA%\Ironmesh\windows-client-config\last-launch-report.json` |
-  | Windows | `%LOCALAPPDATA%\Ironmesh\sync-roots\<sanitized-leaf>-<blake3(normalized-sync-root)>\{connection-bootstrap.json, client-identity.json, desktop-status.json}` | `semi-stable` | Directory label is deterministic from the normalized sync-root path plus the leaf name | Current release-facing persisted sync-root state; preferred names are `connection-bootstrap.json` and `client-identity.json` |
-  | Windows | hidden `*.ironmesh-connection.json` and `*.ironmesh-client-identity.json` discovery names | `legacy/internal` | Legacy hidden filenames | Keep out of release-facing docs; use only as compatibility readers if still needed |
-  | Windows | `%LOCALAPPDATA%\Ironmesh\thumbnail-cache` and `%LOCALAPPDATA%\Ironmesh\thumbnail-provider.log` | `stable internal` | Packaged runtime cache and diagnostics | Explicitly documented as out-of-package mutable state in the Windows MSIX strategy |
-  | Linux | `${XDG_CONFIG_HOME:-$HOME/.config}/ironmesh/desktop-client-config/instances.json` | `public stable` | JSON with top-level `version: 1` | Lower-case XDG root is intentional on Linux |
-  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/desktop-client-config/last-launch-report.json` | `stable internal` | JSON with top-level `version: 1` | Lower-case XDG root is intentional on Linux |
-  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/os-integration/client-rights-edge/<sanitized-scope>/state/{pending-mutations.json, remote-snapshot.json}` plus sibling `staged/`, `upload-state/`, and `object-cache/` | `semi-stable root, private internal contents` | Root is derived from direct URL or bootstrap path, prefix, and mountpoint; contents are implementation detail | `--client-edge-state-dir` overrides the default root |
-  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/os-integration/downloads/<blake3(scope)>/` | `private implementation` | Deterministic blake3 hash of connection target, prefix, and mountpoint | Download staging only |
-  | Linux | `${XDG_RUNTIME_DIR}/ironmesh/gnome-status.json` | `semi-stable` | Desktop-status JSON document | `--gnome-status-file` overrides the default runtime path |
-  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/ironmesh/folder-agent/profiles/<scope_fingerprint>/{baseline.sqlite, modification-log.sqlite}` | `semi-stable` | SQLite baseline plus modification log under a domain-separated BLAKE3 digest of identity root, scope prefix, and connection target | Legacy pre-release `DefaultHasher` profile directories migrate forward on open and rewrite persisted scope-fingerprint metadata |
+  | Windows | `%LOCALAPPDATA%\BerryKeep\desktop-client-config\instances.json` | `public stable` | JSON with top-level `version: 1` | Migrates from `%LOCALAPPDATA%\BerryKeep\windows-client-config\instances.json` |
+  | Windows | `%LOCALAPPDATA%\BerryKeep\desktop-client-config\last-launch-report.json` | `stable internal` | JSON with top-level `version: 1` | Migrates from `%LOCALAPPDATA%\BerryKeep\windows-client-config\last-launch-report.json` |
+  | Windows | `%LOCALAPPDATA%\BerryKeep\sync-roots\<sanitized-leaf>-<blake3(normalized-sync-root)>\{connection-bootstrap.json, client-identity.json, desktop-status.json}` | `semi-stable` | Directory label is deterministic from the normalized sync-root path plus the leaf name | Current release-facing persisted sync-root state; preferred names are `connection-bootstrap.json` and `client-identity.json` |
+  | Windows | hidden `*.berrykeep-connection.json` and `*.berrykeep-client-identity.json` discovery names | `legacy/internal` | Legacy hidden filenames | Keep out of release-facing docs; use only as compatibility readers if still needed |
+  | Windows | `%LOCALAPPDATA%\BerryKeep\thumbnail-cache` and `%LOCALAPPDATA%\BerryKeep\thumbnail-provider.log` | `stable internal` | Packaged runtime cache and diagnostics | Explicitly documented as out-of-package mutable state in the Windows MSIX strategy |
+  | Linux | `${XDG_CONFIG_HOME:-$HOME/.config}/berrykeep/desktop-client-config/instances.json` | `public stable` | JSON with top-level `version: 1` | Lower-case XDG root is intentional on Linux |
+  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/berrykeep/desktop-client-config/last-launch-report.json` | `stable internal` | JSON with top-level `version: 1` | Lower-case XDG root is intentional on Linux |
+  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/berrykeep/os-integration/client-rights-edge/<sanitized-scope>/state/{pending-mutations.json, remote-snapshot.json}` plus sibling `staged/`, `upload-state/`, and `object-cache/` | `semi-stable root, private internal contents` | Root is derived from direct URL or bootstrap path, prefix, and mountpoint; contents are implementation detail | `--client-edge-state-dir` overrides the default root |
+  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/berrykeep/os-integration/downloads/<blake3(scope)>/` | `private implementation` | Deterministic blake3 hash of connection target, prefix, and mountpoint | Download staging only |
+  | Linux | `${XDG_RUNTIME_DIR}/berrykeep/gnome-status.json` | `semi-stable` | Desktop-status JSON document | `--gnome-status-file` overrides the default runtime path |
+  | Linux | `${XDG_STATE_HOME:-$HOME/.local/state}/berrykeep/folder-agent/profiles/<scope_fingerprint>/{baseline.sqlite, modification-log.sqlite}` | `semi-stable` | SQLite baseline plus modification log under a domain-separated BLAKE3 digest of identity root, scope prefix, and connection target | Legacy pre-release `DefaultHasher` profile directories migrate forward on open and rewrite persisted scope-fingerprint metadata |
 - Findings:
    - `resolved`: [crates/sync-agent-core/src/folder_agent_state.rs](../crates/sync-agent-core/src/folder_agent_state.rs) now derives `profiles/<scope_fingerprint>/` with an explicit domain-separated BLAKE3 digest and migrates legacy `DefaultHasher` profile directories plus stored SQLite `scope_fingerprint` metadata on open.
-   - `minor`: the Windows sync-root state family is on current release-facing names (`connection-bootstrap.json`, `client-identity.json`, `desktop-status.json`), but legacy hidden `.ironmesh-*` discovery names still exist in implementation and should remain compatibility-only.
+   - `minor`: the Windows sync-root state family is on current release-facing names (`connection-bootstrap.json`, `client-identity.json`, `desktop-status.json`), but legacy hidden `.berrykeep-*` discovery names still exist in implementation and should remain compatibility-only.
 - Missing tests or docs:
    - No additional persisted-path gaps were found in this pass beyond broader release-review work.
 - Proposed pre-release actions:
-   - Keep the Windows `Ironmesh` root and Linux `ironmesh` XDG roots as intentional OS-specific contracts, and keep [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) as the cleanup ledger for retained legacy readers.
+   - Keep the Windows `BerryKeep` root and Linux `berrykeep` XDG roots as intentional OS-specific contracts, and keep [compatibility-contracts.md](compatibility-contracts.md) as the cleanup ledger for retained legacy readers.
 - Deferred post-release items:
    - Remove missing-version compatibility paths only after the supported upgrade window no longer requires reading pre-marker files or databases.
    - Remove legacy hidden Windows bootstrap and identity discovery names once the compatibility window closes.
@@ -437,10 +437,10 @@ Working evidence log:
    - [scripts/build-ppa-source.sh](../scripts/build-ppa-source.sh)
    - [scripts/build-local-debs.sh](../scripts/build-local-debs.sh)
    - [scripts/prepare-ppa-source.sh](../scripts/prepare-ppa-source.sh)
-   - [debian/ironmesh-server-node.service](../debian/ironmesh-server-node.service)
-   - [debian/ironmesh-rendezvous-service.service](../debian/ironmesh-rendezvous-service.service)
-   - [debian/ironmesh-server-node.env](../debian/ironmesh-server-node.env)
-   - [debian/ironmesh-rendezvous-service.env](../debian/ironmesh-rendezvous-service.env)
+   - [debian/berrykeep-server-node.service](../debian/berrykeep-server-node.service)
+   - [debian/berrykeep-rendezvous-service.service](../debian/berrykeep-rendezvous-service.service)
+   - [debian/berrykeep-server-node.env](../debian/berrykeep-server-node.env)
+   - [debian/berrykeep-rendezvous-service.env](../debian/berrykeep-rendezvous-service.env)
    - [crates/desktop-client-config/src/lib.rs](../crates/desktop-client-config/src/lib.rs)
    - [apps/background-launcher/src/main.rs](../apps/background-launcher/src/main.rs)
    - [crates/adapter-linux-fuse/src/gnome.rs](../crates/adapter-linux-fuse/src/gnome.rs)
@@ -451,29 +451,29 @@ Working evidence log:
   | Platform | Artifact / install channel | Classification | Update path | Notes |
   | --- | --- | --- | --- | --- |
   | Windows | Store-submitted `.msixupload` / MSIX package | `public stable` | Microsoft Store | Package identity is fixed; installed package root is ephemeral; mutable runtime state must stay outside the package |
-  | Debian-family Server Node | Static musl `ironmesh-server-node` package, plus optional `ironmesh-server-node-map-tools` | `public stable` | Signed apt repository | One generic binary is built per CPU ABI; current `focal`/`noble` suites are migration entries before a product-owned `stable` suite |
-  | Ubuntu client and rendezvous | Launchpad PPA packages `ironmesh-client` and `ironmesh-rendezvous-service` | `public stable` | `apt upgrade`, Update Manager, or unattended-upgrades | Target PPA is `ppa:ulrich-hornung/ironmesh`; these components remain per-series source builds |
+  | Debian-family Server Node | Static musl `berrykeep-server-node` package, plus optional `berrykeep-server-node-map-tools` | `public stable` | Signed apt repository | One generic binary is built per CPU ABI; current `focal`/`noble` suites are migration entries before a product-owned `stable` suite |
+  | Ubuntu client and rendezvous | Launchpad PPA packages `berrykeep-client` and `berrykeep-rendezvous-service` | `public stable` | `apt upgrade`, Update Manager, or unattended-upgrades | Target PPA is `ppa:ulrich-hornung/berrykeep`; these components remain per-series source builds |
   | Android and iOS shells | Workspace code only | `out of scope for first release` | n/a | No first-release packaging or update channel is defined yet |
 - Confirmed packaging and update behavior:
    - Windows first release stays on Microsoft Store delivery; direct sideload packaging remains a development-only path.
    - The Server Node should use the product-owned signed apt repository and a
      static musl binary per CPU ABI. Client and rendezvous packages may keep
      using the Launchpad PPA while they remain distribution-specific. Both
-     paths retain ordinary apt upgrades rather than an Ironmesh self-updater.
+     paths retain ordinary apt upgrades rather than a BerryKeep self-updater.
    - The current Ubuntu beta package target is `1.0.0~beta.1-1~ppa2~ubuntu24.04.1` for `noble`.
-   - `ironmesh-client` installs the public `ironmesh` CLI and the packaged helpers `ironmesh-config-app`, `ironmesh-folder-agent`, `ironmesh-os-integration`, and `ironmesh-background-launcher` under one package root, with `/usr/bin` symlinks for the documented commands.
+   - `berrykeep-client` installs the public `berrykeep` CLI and the packaged helpers `berrykeep-config-app`, `berrykeep-folder-agent`, `berrykeep-os-integration`, and `berrykeep-background-launcher` under one package root, with `/usr/bin` symlinks for the documented commands.
    - Linux background launching resolves sibling binaries from `current_exe().parent()`, so keeping the client helpers together under one package root is part of the update contract for `apt`-delivered upgrades.
-   - Linux mutable client state stays under XDG `Ironmesh` roots, while server and rendezvous packages keep operator-edited config in `/etc/ironmesh/*.env` and runtime state in systemd `StateDirectory` roots under `/var/lib`; package upgrades should not rewrite those paths.
-   - Debian packaging installs but does not auto-enable or auto-start `ironmesh-server-node.service` or `ironmesh-rendezvous-service.service`; operators must fill in the matching env file and run `systemctl enable --now ...` explicitly.
-   - The client package ships GNOME extension assets, but GNOME Shell integration remains optional and per-user. The package does not auto-enable the extension; `ironmesh-os-integration gnome install-extension` or `ironmesh-folder-agent gnome install-extension` still performs the user install step.
-   - Linux `Run Enabled Services` works from the config app, and the Debian client package ships an XDG autostart entry for `ironmesh-config-app --background` so the config app can relaunch enabled managed services after graphical sign-in.
+   - Linux mutable client state stays under XDG `BerryKeep` roots, while server and rendezvous packages keep operator-edited config in `/etc/berrykeep/*.env` and runtime state in systemd `StateDirectory` roots under `/var/lib`; package upgrades should not rewrite those paths.
+   - Debian packaging installs but does not auto-enable or auto-start `berrykeep-server-node.service` or `berrykeep-rendezvous-service.service`; operators must fill in the matching env file and run `systemctl enable --now ...` explicitly.
+   - The client package ships GNOME extension assets, but GNOME Shell integration remains optional and per-user. The package does not auto-enable the extension; `berrykeep-os-integration gnome install-extension` or `berrykeep-folder-agent gnome install-extension` still performs the user install step.
+   - Linux `Run Enabled Services` works from the config app, and the Debian client package ships an XDG autostart entry for `berrykeep-config-app --background` so the config app can relaunch enabled managed services after graphical sign-in.
 - Findings:
    - `decision`: [docs/portable-server-node-package-strategy.md](portable-server-node-package-strategy.md) defines the Server Node as a generic static musl artifact per CPU ABI. [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) retains the Launchpad source-build path for the distribution-specific client and rendezvous packages; neither path needs a custom in-app updater.
    - `minor`: Linux autostart is now package-driven through XDG Autostart rather than a user-level systemd service, so release docs should describe how users can disable the autostart entry if they do not want background desktop status.
    - `minor`: [crates/desktop-status/src/gnome.rs](../crates/desktop-status/src/gnome.rs) installs the GNOME extension into `~/.local/share/gnome-shell/extensions/...`, which keeps the extension per-user and update-safe but means the Debian package alone does not finish desktop integration.
 - Missing tests or docs:
    - The production PPA target is known. The `ppa1` upload was accepted but failed to build on Launchpad; the `ppa2` source artifact has been built locally unsigned for validation and still needs a signed upload.
-   - [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) still uses placeholder install and upload examples instead of the concrete `ppa:ulrich-hornung/ironmesh` target.
+   - [docs/ubuntu-ppa-packaging.md](ubuntu-ppa-packaging.md) still uses placeholder install and upload examples instead of the concrete `ppa:ulrich-hornung/berrykeep` target.
    - Validate install, start, and upgrade of the same static Server Node `.deb`
      on fresh Debian, Ubuntu, and 64-bit Raspberry Pi OS-compatible images.
    - Validate the real `add-apt-repository`, `apt install`, and `apt upgrade`
@@ -483,7 +483,7 @@ Working evidence log:
      repository, then run the cross-distribution install and upgrade matrix.
    - Build the signed source package for the remaining Ubuntu components with
      `./scripts/build-ppa-source.sh`, upload it with `dput
-     ppa:ulrich-hornung/ironmesh ../ironmesh_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes`,
+     ppa:ulrich-hornung/berrykeep ../berrykeep_1.0.0~beta.1-1~ppa2~ubuntu24.04.1_source.changes`,
      and wait for Launchpad build success.
    - Document the final end-user install and update commands with the real PPA name.
    - Keep Linux service enablement and GNOME extension enablement as explicit opt-in steps unless a deliberate packaging hook is added later.
@@ -530,21 +530,21 @@ Working evidence log:
    - [crates/rendezvous-server/src/auth.rs](../crates/rendezvous-server/src/auth.rs)
    - [crates/transport-sdk/src/rendezvous.rs](../crates/transport-sdk/src/rendezvous.rs)
 - Confirmed security and operational controls:
-   - Internal peer traffic is materially stricter than the public listener. `ironmesh-server-node` requires internal TLS material at startup, wraps the internal router with authenticated `InternalCaller` extraction, and only allows node-enrollment auto-renew when the caller cluster ID matches and the caller node ID is still present in cluster membership.
-   - `ironmesh-server-node` public startup now mirrors the rendezvous fail-closed model: runtime startup refuses plaintext public HTTP unless `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP=true` is set explicitly for local development or testing.
-   - Standalone `ironmesh-rendezvous-service` already refuses plaintext HTTP by default. It only starts without mTLS when `IRONMESH_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` is set explicitly for local development, and its config validation also rejects partial or inconsistent failover-package TLS inputs.
+   - Internal peer traffic is materially stricter than the public listener. `berrykeep-server-node` requires internal TLS material at startup, wraps the internal router with authenticated `InternalCaller` extraction, and only allows node-enrollment auto-renew when the caller cluster ID matches and the caller node ID is still present in cluster membership.
+   - `berrykeep-server-node` public startup now mirrors the rendezvous fail-closed model: runtime startup refuses plaintext public HTTP unless `BERRYKEEP_ALLOW_INSECURE_PUBLIC_HTTP=true` is set explicitly for local development or testing.
+   - Standalone `berrykeep-rendezvous-service` already refuses plaintext HTTP by default. It only starts without mTLS when `BERRYKEEP_RENDEZVOUS_ALLOW_INSECURE_HTTP=true` is set explicitly for local development, and its config validation also rejects partial or inconsistent failover-package TLS inputs.
    - Client bootstrap and rendezvous enrollment flows fail fast when the release-time trust roots are incomplete. In particular, rendezvous client identity issuance aborts when rendezvous mTLS is required but cluster CA or internal CA key material is missing.
    - Admin actions are audit-persisted in both metadata backends through `admin_audit_events`, and destructive operations still require explicit `approve=true` before they can run as non-dry-run requests.
    - Support-facing status surfaces already exist for first release triage: public `/health`, authenticated node-certificate status, scrub and repair activity or history endpoints, and the recent log buffer, which now sits behind client-or-admin authentication on the public router.
 - Findings:
    - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now fails closed on public admin and maintenance routes when no admin token or password-backed admin auth is configured. `authorize_admin_request()` returns `412 Precondition Failed` instead of falling through, and the admin session status endpoint no longer reports the surface as implicitly open.
-   - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now refuses public runtime startup without `IRONMESH_PUBLIC_TLS_CERT` and `IRONMESH_PUBLIC_TLS_KEY` unless `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP=true` is set explicitly for local development or testing.
-   - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now treats unauthenticated client access as an explicit development-only override via `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS=true`, and [README.md](../README.md) no longer advertises the old `IRONMESH_REQUIRE_CLIENT_AUTH` knob as part of the supported runtime contract.
+   - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now refuses public runtime startup without `BERRYKEEP_PUBLIC_TLS_CERT` and `BERRYKEEP_PUBLIC_TLS_KEY` unless `BERRYKEEP_ALLOW_INSECURE_PUBLIC_HTTP=true` is set explicitly for local development or testing.
+   - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) now treats unauthenticated client access as an explicit development-only override via `BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS=true`, and [README.md](../README.md) no longer advertises the old `BERRYKEEP_REQUIRE_CLIENT_AUTH` knob as part of the supported runtime contract.
    - `resolved`: [crates/server-node-sdk/src/lib.rs](../crates/server-node-sdk/src/lib.rs) no longer leaves `/logs` anonymous on the public router; the route now requires either valid client auth or admin auth, and [web/apps/server-admin/src/pages/LogsPage.tsx](../web/apps/server-admin/src/pages/LogsPage.tsx) forwards the admin token override when present.
 - Missing tests or docs:
    - None beyond keeping the development-only override notes explicit in the README runtime contract.
 - Proposed pre-release actions:
-   - Keep `IRONMESH_ALLOW_INSECURE_PUBLIC_HTTP` and `IRONMESH_ALLOW_UNAUTHENTICATED_CLIENTS` documented as development-only overrides rather than release-facing runtime contract knobs.
+   - Keep `BERRYKEEP_ALLOW_INSECURE_PUBLIC_HTTP` and `BERRYKEEP_ALLOW_UNAUTHENTICATED_CLIENTS` documented as development-only overrides rather than release-facing runtime contract knobs.
 
 Exit criteria:
 
@@ -590,7 +590,7 @@ Working evidence log:
    - `Pass 2` client-facing API versioning and JSON-shape contracts map to `crates/web-ui-backend/src/lib.rs::error_response_preserves_public_json_contract`, `crates/server-node-sdk/src/web_maps.rs::error_response_preserves_public_json_contract`, and `crates/server-node-sdk/src/main_tests.rs::client_device_enroll_request_accepts_legacy_label_alias`, with relay/bootstrap issuance regressions covered by `issue_bootstrap_claim_returns_json_error_when_rendezvous_is_unavailable`.
    - `Pass 3` inter-node protocol and identity expectations map to `crates/server-node-sdk/src/main_tests.rs::register_node_uses_structured_reachability_payload` plus the nightly relay or peer system tests in `tests/system-tests/src/cluster_test.rs`, especially `bootstrap_client_prefers_direct_and_uses_relay_after_rendezvous_restart_and_forced_direct_failure` and `relay_required_nodes_reconnect_after_rendezvous_restart_and_replicate`.
    - `Pass 4` bootstrap, enrollment, and failover handoff contracts map to `crates/server-node-sdk/src/setup.rs::managed_setup_state_roundtrip`, `crates/server-node-sdk/src/setup.rs::managed_rendezvous_failover_roundtrip_restores_material_and_state`, the bootstrap-claim issuance tests in `crates/server-node-sdk/src/main_tests.rs`, and the embedded rendezvous manual guide in `docs/manual-rendezvous-relay-test.md`.
-   - `Pass 5` persisted-file and path contracts map to the desktop config migration tests in `crates/desktop-client-config/src/lib.rs` and `crates/windows-client-config/src/lib.rs`, metadata schema-marker coverage in `crates/server-node-sdk/src/storage/sqlite_impl.rs::init_metadata_db_persists_schema_version`, Windows LocalAppData restart coverage in `tests/system-tests/src/cfapi_monitor_test.rs::test_cfapi_adapter_persists_local_appdata_state_and_restarts_without_bootstrap_argument`, and folder-agent restart coverage in `tests/system-tests/src/folder_agent_test.rs`.
+   - `Pass 5` persisted-file and path contracts map to the desktop config migration tests in `crates/desktop-client-config/src/lib.rs`, metadata schema-marker coverage in `crates/server-node-sdk/src/storage/sqlite_impl.rs::init_metadata_db_persists_schema_version`, Windows LocalAppData restart coverage in `tests/system-tests/src/cfapi_monitor_test.rs::test_cfapi_adapter_persists_local_appdata_state_and_restarts_without_bootstrap_argument`, and folder-agent restart coverage in `tests/system-tests/src/folder_agent_test.rs`.
    - `Pass 6` packaging and update contracts map to the build workflows `android-build`, `static-server-node-build`, `fuse-mount-build`, and `windows-cfapi-check`, the static artifact checks in `scripts/build-static-server-node.sh`, the Linux packaged config-app handoff regression in `apps/config-app/tests/package_handoff.rs`, the portable Server Node and Windows packaging strategies, the Linux FUSE and packaged Windows manual flows in `docs/ci-runbook.md`, and the dedicated packaged Windows restart guide in `docs/manual-windows-sync-root-restart-test.md`.
    - `Pass 7` security and operational-safety contracts map to `crates/server-node-sdk/src/main_tests.rs::cluster_config_requires_explicit_insecure_public_http_override`, `public_logs_route_requires_client_or_admin_auth`, `admin_authorization_requires_configured_auth`, `admin_authorization_requires_token_when_configured`, and the full `cargo test -p server-node-sdk` regression suite.
 - Manual-flow coverage gathered:
@@ -598,7 +598,7 @@ Working evidence log:
    - Direct client enroll and CRUD smoke can be driven entirely from `scripts/local-cluster.sh bootstrap ...` plus `cargo run -p cli-client -- ... enroll|put|get`.
    - Embedded rendezvous relay enroll already has an exact command-oriented guide in `docs/manual-rendezvous-relay-test.md`.
    - Linux FUSE live mount commands exist in the README and are now copied into the CI runbook as explicit release validation steps.
-   - Folder-agent restart or resume can be exercised with the existing `ironmesh-folder-agent` CLI, and automated restart coverage already exists in `tests/system-tests/src/folder_agent_test.rs` through `folder_agent_detects_remote_add_and_modify_done_while_stopped_after_restart` and `folder_agent_detects_local_add_and_modify_done_while_stopped_after_restart`.
+   - Folder-agent restart or resume can be exercised with the existing `berrykeep-folder-agent` CLI, and automated restart coverage already exists in `tests/system-tests/src/folder_agent_test.rs` through `folder_agent_detects_remote_add_and_modify_done_while_stopped_after_restart` and `folder_agent_detects_local_add_and_modify_done_while_stopped_after_restart`.
    - Packaged Windows sync-root restart now has a dedicated operator-facing guide in `docs/manual-windows-sync-root-restart-test.md`, derived from the packaged config-app flow and the existing LocalAppData restart coverage in `tests/system-tests/src/cfapi_monitor_test.rs`.
 - Findings:
    - `open`: Pass 8 still needs one human-executed packaged Windows sync-root restart run recorded against the new manual guide before the exit criteria can be treated as satisfied.
@@ -613,8 +613,8 @@ Primary repo areas:
 - [docs](.)
 - [scripts](../scripts)
 - [start_node.sh](../start_node.sh)
-- [ironmesh-client-bootstrap.client-identity.json](../ironmesh-client-bootstrap.client-identity.json)
-- [ironmesh-client-bootstrap.json](../ironmesh-client-bootstrap.json)
+- [berrykeep-client-bootstrap.client-identity.json](../berrykeep-client-bootstrap.client-identity.json)
+- [berrykeep-client-bootstrap.json](../berrykeep-client-bootstrap.json)
 
 Checklist:
 
@@ -636,16 +636,16 @@ Working evidence log:
    - [docs/cross-platform-filesystem-integration-strategy.md](cross-platform-filesystem-integration-strategy.md)
    - [docs/manual-windows-sync-root-restart-test.md](manual-windows-sync-root-restart-test.md)
    - [start_node.sh](../start_node.sh)
-   - [ironmesh-client-bootstrap.json](../ironmesh-client-bootstrap.json)
-   - [ironmesh-client-bootstrap.client-identity.json](../ironmesh-client-bootstrap.client-identity.json)
+   - [berrykeep-client-bootstrap.json](../berrykeep-client-bootstrap.json)
+   - [berrykeep-client-bootstrap.client-identity.json](../berrykeep-client-bootstrap.client-identity.json)
 - Confirmed stable contracts:
-   - The shipped sample asset filenames already use the canonical release-facing pair `ironmesh-client-bootstrap.json` and `ironmesh-client-bootstrap.client-identity.json`.
+   - The shipped sample asset filenames already use the canonical release-facing pair `berrykeep-client-bootstrap.json` and `berrykeep-client-bootstrap.client-identity.json`.
    - `start_node.sh` and `scripts/local-cluster.sh` are source-checkout helpers that intentionally use Cargo package names like `server-node`; they are not installed-command documentation surfaces.
    - README now carries an explicit first-release scope snapshot so the stable public commands, canonical bootstrap filenames, and intentionally still-evolving surfaces are spelled out in one place.
 - Findings:
-   - `resolved`: [docs/cross-platform-filesystem-integration-strategy.md](cross-platform-filesystem-integration-strategy.md) was still describing `apps/os-integration` as the user-facing binary and still showed direct FUSE examples against plain HTTP. Those examples now point at the public `ironmesh-os-integration` command contract, while the source-checkout `cargo run -p os-integration` wording stays clearly labeled as a Cargo package detail, and the direct-mode examples now match the hardened HTTPS plus CA expectations from the runtime contract.
-   - `resolved`: [ironmesh-client-bootstrap.client-identity.json](../ironmesh-client-bootstrap.client-identity.json) was still using the legacy top-level `label` field even though current client SDK serialization emits `device_label` and only accepts bare `label` for compatibility. The shipped sample asset now uses the canonical field.
-   - `resolved`: [docs/manual-windows-sync-root-restart-test.md](manual-windows-sync-root-restart-test.md) no longer exposes the internal `os-integration` label as if it were the public Windows runtime name; the guide now talks about the OS integration instance generically while keeping the packaged binary name `ironmesh-os-integration` explicit where it matters.
+   - `resolved`: [docs/cross-platform-filesystem-integration-strategy.md](cross-platform-filesystem-integration-strategy.md) was still describing `apps/os-integration` as the user-facing binary and still showed direct FUSE examples against plain HTTP. Those examples now point at the public `berrykeep-os-integration` command contract, while the source-checkout `cargo run -p os-integration` wording stays clearly labeled as a Cargo package detail, and the direct-mode examples now match the hardened HTTPS plus CA expectations from the runtime contract.
+   - `resolved`: [berrykeep-client-bootstrap.client-identity.json](../berrykeep-client-bootstrap.client-identity.json) was still using the legacy top-level `label` field even though current client SDK serialization emits `device_label` and only accepts bare `label` for compatibility. The shipped sample asset now uses the canonical field.
+   - `resolved`: [docs/manual-windows-sync-root-restart-test.md](manual-windows-sync-root-restart-test.md) no longer exposes the internal `os-integration` label as if it were the public Windows runtime name; the guide now talks about the OS integration instance generically while keeping the packaged binary name `berrykeep-os-integration` explicit where it matters.
    - `resolved`: README now distinguishes what is stable for the first release from what is still expected to evolve, especially around packaged command names, bootstrap naming, mobile shells, Apple filesystem integration, and non-contract tuning envs.
 - Missing tests or docs:
    - The remaining gap is not naming or path drift inside the repo; it is independent human validation of the doc flows, especially the packaged Windows restart guide and the PPA install/upgrade flow after Launchpad publication.
@@ -653,7 +653,7 @@ Working evidence log:
 - Proposed pre-release actions:
    - Run the new packaged Windows restart guide once on a real packaged build and record the result.
    - Do one fresh-reader dry run of the README plus Linux FUSE instructions to validate the exit criterion.
-   - Replace placeholder PPA examples with `ppa:ulrich-hornung/ironmesh` once the first beta upload is accepted.
+   - Replace placeholder PPA examples with `ppa:ulrich-hornung/berrykeep` once the first beta upload is accepted.
 
 ## Pass 10. Final Sign-Off And Backlog Split
 

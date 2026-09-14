@@ -106,8 +106,8 @@ On every read:
 ## Operational notes
 
 - Default data directory: `./data/server-node`
-- Override with: `IRONMESH_DATA_DIR=/path/to/node-data`
-- Bind address override: `IRONMESH_SERVER_BIND=host:port`
+- Override with: `BERRYKEEP_DATA_DIR=/path/to/node-data`
+- Bind address override: `BERRYKEEP_SERVER_BIND=host:port`
 
 ## Future extensions
 

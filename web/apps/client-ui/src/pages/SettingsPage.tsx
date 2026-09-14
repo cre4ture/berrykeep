@@ -5,8 +5,8 @@ import {
   exportClientDiagnosticLogs,
   type ClientDiagnosticLogExport,
   type ServerLogEntry
-} from "@ironmesh/api";
-import { PageHeader } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { PageHeader } from "@berrykeep/ui";
 import { useState } from "react";
 
 const DIAGNOSTIC_LOG_WINDOW_SECS = 3 * 60;
@@ -72,7 +72,7 @@ export function SettingsPage() {
 function formatDiagnosticLogExport(payload: ClientDiagnosticLogExport): string {
   const generatedAt = formatUnixTimestamp(payload.generated_at_unix);
   const header = [
-    "Ironmesh client diagnostic log export",
+    "BerryKeep client diagnostic log export",
     `Generated at: ${generatedAt}`,
     `Requested window: last ${payload.requested_window_secs} seconds`,
     `Retained entries: ${payload.entries.length}`,

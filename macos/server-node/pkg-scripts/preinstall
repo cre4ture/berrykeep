@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly LABEL="io.ironmesh.server-node"
+readonly LABEL="io.berrykeep.server-node"
 readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
 
 # Package Installer passes the target volume as its third argument. A package

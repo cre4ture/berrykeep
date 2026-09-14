@@ -7,7 +7,8 @@ use serde_json::json;
 use std::path::PathBuf;
 use sync_agent_core::{
     ConflictResolutionStrategy, FolderAgentRuntimeOptions, PathScope, StartupStateStore,
-    cleanup_ironmesh_part_files, delete_conflict_copies, resolve_conflict_action, run_folder_agent,
+    cleanup_berrykeep_part_files, delete_conflict_copies, resolve_conflict_action,
+    run_folder_agent,
 };
 
 const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -82,7 +83,7 @@ enum Command {
         #[command(subcommand)]
         command: ConflictCommand,
     },
-    /// Remove partial download artifacts (`.ironmesh-part-*`) left behind by crashes/power loss.
+    /// Remove partial download artifacts (`.berrykeep-part-*`) left behind by crashes/power loss.
     Cleanup {
         /// Only print the number of files that would be removed.
         #[arg(long, default_value_t = false)]
@@ -153,7 +154,7 @@ fn main() -> Result<()> {
 fn run_command(args: &Args, command: &Command) -> Result<()> {
     match command {
         Command::Cleanup { dry_run } => {
-            let removed = cleanup_ironmesh_part_files(&args.root_dir, *dry_run)?;
+            let removed = cleanup_berrykeep_part_files(&args.root_dir, *dry_run)?;
             if *dry_run {
                 println!("cleanup: would remove {removed} partial download artifacts");
             } else {
@@ -311,7 +312,7 @@ fn run_agent(args: &Args) -> Result<()> {
     let runtime_options = FolderAgentRuntimeOptions {
         root_dir: args.root_dir.clone(),
         state_root_dir: args.state_root_dir.clone(),
-        connection_name: Some("ironmesh-folder-agent".to_string()),
+        connection_name: Some("berrykeep-folder-agent".to_string()),
         local_tree_uri: None,
         server_base_url: target.server_base_url.clone(),
         client_bootstrap_json: target.client_bootstrap_json.clone(),

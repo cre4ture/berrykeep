@@ -10,8 +10,8 @@ import {
   restoreAdminStoreHistoryEntries,
   restoreAdminStoreVersion,
   restoreAdminStorePathFromSnapshot
-} from "@ironmesh/api";
-import { ExplorerSurface, type ExplorerLoadEntriesOptions } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { ExplorerSurface, type ExplorerLoadEntriesOptions } from "@berrykeep/ui";
 import { useCallback } from "react";
 import { useAdminAccess } from "../lib/admin-access";
 

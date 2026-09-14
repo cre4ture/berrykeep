@@ -1,5 +1,5 @@
-import { getClientRecentLogs } from "@ironmesh/api";
-import { LogsSurface, PageHeader } from "@ironmesh/ui";
+import { getClientRecentLogs } from "@berrykeep/api";
+import { LogsSurface, PageHeader } from "@berrykeep/ui";
 import { useCallback } from "react";
 
 export function LogsPage() {

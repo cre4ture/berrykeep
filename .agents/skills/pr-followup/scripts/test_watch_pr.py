@@ -249,7 +249,7 @@ class EventStateTest(unittest.TestCase):
             other = watch_pr.default_event_state_file(self.repo, self.number + 1)
 
         self.assertNotEqual(current, other)
-        self.assertEqual(current.parent, Path("/tmp/state/ironmesh/pr-followup"))
+        self.assertEqual(current.parent, Path("/tmp/state/berrykeep/pr-followup"))
 
     def test_failed_save_does_not_advance_observed_event_ids(self) -> None:
         identity = watch_pr.event_state_identity(self.repo, self.number)

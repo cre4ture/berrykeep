@@ -40,7 +40,7 @@ pub const CLIENT_CLI_EXE: &str = if cfg!(windows) {
 } else {
     "berrykeep"
 };
-pub const STARTUP_TASK_ID: &str = "IronmeshBackgroundLauncher";
+pub const STARTUP_TASK_ID: &str = "BerryKeepBackgroundLauncher";
 pub const PLATFORM_KIND: &str = env::consts::OS;
 pub const STARTUP_INTEGRATION_LABEL: &str = if cfg!(windows) {
     "Startup Task"
@@ -59,10 +59,8 @@ pub const STARTUP_INTEGRATION_NOTE: &str = if cfg!(windows) {
 };
 pub const OS_INTEGRATION_MANAGEMENT_SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 
-const LOCAL_STATE_ROOT_DIR: &str = "Ironmesh";
+const LOCAL_STATE_ROOT_DIR: &str = "BerryKeep";
 const CONFIG_SUBDIR: &str = "desktop-client-config";
-#[cfg(windows)]
-const LEGACY_WINDOWS_CONFIG_SUBDIR: &str = "windows-client-config";
 const INSTANCE_STORE_FILE_NAME: &str = "instances.json";
 const LAST_LAUNCH_REPORT_FILE_NAME: &str = "last-launch-report.json";
 const DESKTOP_STATUS_FILE_NAME: &str = "desktop-status.json";
@@ -827,19 +825,6 @@ pub fn service_desktop_status_file_path(instance_kind: &str, id: &str) -> PathBu
     ))
 }
 
-pub fn migrate_legacy_state_paths() -> Result<()> {
-    #[cfg(windows)]
-    {
-        migrate_legacy_windows_file(
-            &legacy_instance_store_path(),
-            &default_instance_store_path(),
-        )?;
-        migrate_legacy_windows_file(&legacy_launch_report_path(), &default_launch_report_path())?;
-    }
-
-    Ok(())
-}
-
 pub fn load_last_launch_report(path: &Path) -> Result<Option<LaunchReport>> {
     if !path.exists() {
         return Ok(None);
@@ -1566,7 +1551,7 @@ fn write_launch_log_header(
     command_line: &[String],
 ) -> Result<()> {
     writeln!(file)?;
-    writeln!(file, "=== IronMesh service launch ===")?;
+    writeln!(file, "=== BerryKeep service launch ===")?;
     writeln!(file, "launched_at_unix_ms={launched_at_unix_ms}")?;
     writeln!(file, "instance_kind={instance_kind}")?;
     writeln!(file, "id={id}")?;
@@ -1616,55 +1601,16 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn local_appdata_root() -> PathBuf {
+fn local_appdata_base_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join(LOCAL_STATE_ROOT_DIR)
 }
 
 #[cfg(windows)]
-fn legacy_instance_store_path() -> PathBuf {
-    local_appdata_root()
-        .join(LEGACY_WINDOWS_CONFIG_SUBDIR)
-        .join(INSTANCE_STORE_FILE_NAME)
-}
-
-#[cfg(windows)]
-fn legacy_launch_report_path() -> PathBuf {
-    local_appdata_root()
-        .join(LEGACY_WINDOWS_CONFIG_SUBDIR)
-        .join(LAST_LAUNCH_REPORT_FILE_NAME)
-}
-
-#[cfg(windows)]
-fn migrate_legacy_windows_file(legacy_path: &Path, current_path: &Path) -> Result<()> {
-    if current_path.exists() || !legacy_path.exists() {
-        return Ok(());
-    }
-
-    ensure_parent_dir(current_path)?;
-    match fs::rename(legacy_path, current_path) {
-        Ok(()) => Ok(()),
-        Err(rename_error) => {
-            fs::copy(legacy_path, current_path).with_context(|| {
-                format!(
-                    "failed copying legacy config state from {} to {} after rename error: {}",
-                    legacy_path.display(),
-                    current_path.display(),
-                    rename_error
-                )
-            })?;
-            fs::remove_file(legacy_path).with_context(|| {
-                format!(
-                    "failed removing legacy config state {} after migration",
-                    legacy_path.display()
-                )
-            })?;
-            Ok(())
-        }
-    }
+fn local_appdata_root() -> PathBuf {
+    local_appdata_base_dir().join(LOCAL_STATE_ROOT_DIR)
 }
 
 #[cfg(not(windows))]
@@ -1850,7 +1796,7 @@ mod tests {
         let report = LaunchReport {
             version: LAUNCH_REPORT_VERSION,
             launched_at_unix_ms: 1,
-            package_root: "/opt/ironmesh".to_string(),
+            package_root: "/opt/berrykeep".to_string(),
             total_enabled: 1,
             outcomes: vec![LaunchOutcome {
                 instance_kind: "folder-agent".to_string(),
@@ -1858,7 +1804,7 @@ mod tests {
                 label: "Folder".to_string(),
                 executable: "/opt/berrykeep/berrykeep-folder-agent".to_string(),
                 command_line: vec!["--root-dir".to_string(), "/tmp/folder".to_string()],
-                log_file: Some("/tmp/ironmesh/folder-agent-folder-1.log".to_string()),
+                log_file: Some("/tmp/berrykeep/folder-agent-folder-1.log".to_string()),
                 pid: Some(42),
                 error: None,
             }],
@@ -1907,7 +1853,7 @@ mod tests {
         let report = LaunchReport {
             version: LAUNCH_REPORT_VERSION,
             launched_at_unix_ms: 1,
-            package_root: "/opt/ironmesh".to_string(),
+            package_root: "/opt/berrykeep".to_string(),
             total_enabled: 1,
             outcomes: vec![LaunchOutcome {
                 instance_kind: "folder-agent".to_string(),
@@ -2038,7 +1984,7 @@ mod tests {
             "unexpected log file path: {log_file}"
         );
         let log = std::fs::read_to_string(&log_file).expect("log file should be readable");
-        assert!(log.contains("=== IronMesh service launch ==="));
+        assert!(log.contains("=== BerryKeep service launch ==="));
         assert!(log.contains("instance_kind=folder-agent"));
         assert!(log.contains("id=folder/one"));
         assert!(log.contains("spawn attempt failed executable="));
@@ -2054,7 +2000,7 @@ mod tests {
             return;
         };
         let package_root = PathBuf::from(
-            r"C:\Program Files\WindowsApps\UlrichHornung.IronMesh_1.0.2.1_neutral__bnh81bg69mtt8",
+            r"C:\Program Files\WindowsApps\UlrichHornung.BerryKeep_1.0.2.1_neutral__bnh81bg69mtt8",
         );
 
         let candidates = service_executable_candidates(&package_root, OS_INTEGRATION_EXE);
@@ -2078,7 +2024,7 @@ mod tests {
             &path,
             r#"{
   "launched_at_unix_ms": 1,
-  "package_root": "/opt/ironmesh",
+  "package_root": "/opt/berrykeep",
   "total_enabled": 0,
   "outcomes": []
 }"#,
@@ -2103,7 +2049,7 @@ mod tests {
             r#"{
   "version": 99,
   "launched_at_unix_ms": 1,
-  "package_root": "/opt/ironmesh",
+  "package_root": "/opt/berrykeep",
   "total_enabled": 0,
   "outcomes": []
 }"#,

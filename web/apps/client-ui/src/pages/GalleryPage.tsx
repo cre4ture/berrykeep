@@ -9,7 +9,7 @@ import {
   restoreStoreVersion,
   retryStoreMediaCacheEntry,
   setStoreMediaLabels
-} from "@ironmesh/api";
+} from "@berrykeep/api";
 import {
   GallerySurface,
   galleryBasemapsFromConfiguration,
@@ -22,7 +22,7 @@ import {
   type GalleryEntry,
   type GalleryMediaRequests,
   type GallerySurfaceViewMode
-} from "@ironmesh/ui";
+} from "@berrykeep/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { createPersistentGalleryDataSource } from "../gallery-cache/gallery-persistent-data-source";

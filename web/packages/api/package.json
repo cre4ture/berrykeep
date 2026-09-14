@@ -1,5 +1,5 @@
 {
-  "name": "@ironmesh/api",
+  "name": "@berrykeep/api",
   "private": true,
   "type": "module",
   "exports": {

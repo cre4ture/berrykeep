@@ -26,8 +26,8 @@ if ($Build -or -not (Test-Path $binaryPath)) {
 
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 
-$env:IRONMESH_SERVER_BIND = $Bind
-$env:IRONMESH_DATA_DIR = $DataDir
+$env:BERRYKEEP_SERVER_BIND = $Bind
+$env:BERRYKEEP_DATA_DIR = $DataDir
 $env:RUST_LOG = $RustLog
 
 Write-Host "Starting berrykeep-server-node.exe"

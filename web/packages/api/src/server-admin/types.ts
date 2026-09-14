@@ -552,12 +552,15 @@ export type DataScrubTriggerResponse = {
   node_results: DataScrubTriggerNodeResult[];
 };
 
-export type HostDependencyStatus = "ready" | "missing" | "builtin" | "optional";
+export type HostDependencyStatus = "ready" | "missing" | "builtin" | "optional" | "not_applicable";
+
+export type HostDependencySeverity = "info" | "warning" | "critical";
 
 export type HostDependencyCheck = {
   id: string;
   feature: string;
   status: HostDependencyStatus;
+  severity?: HostDependencySeverity | null;
   summary: string;
   detail: string;
   configured_path?: string | null;
@@ -727,8 +730,8 @@ export type HardwareHealthFinding = {
 export type HardwareHealthReport = {
   reporting_node_id: string;
   generated_at_unix: number;
-  ironmesh_version: string;
-  ironmesh_revision: string;
+  berrykeep_version: string;
+  berrykeep_revision: string;
   hardware_profile_id: string;
   inventory: HardwareInventory;
   node_lifecycle: HardwareNodeLifecycle;

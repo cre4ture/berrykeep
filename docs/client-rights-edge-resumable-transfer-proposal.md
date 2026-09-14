@@ -298,7 +298,7 @@ Persist local download session rows:
 - remote key
 - selected snapshot/version if any
 - target local path
-- temp path such as `.ironmesh-part-*`
+- temp path such as `.berrykeep-part-*`
 - `etag` / `manifest_hash`
 - expected total size
 - bytes_written

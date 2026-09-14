@@ -11,7 +11,7 @@ fn sqlite_test_db_path(name: &str) -> PathBuf {
         .expect("system clock should be after epoch")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "ironmesh-{name}-{}-{stamp}.sqlite",
+        "berrykeep-{name}-{}-{stamp}.sqlite",
         std::process::id()
     ))
 }

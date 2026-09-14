@@ -13,9 +13,9 @@ use crate::connection::{
     build_unprobed_client_with_optional_identity_from_planned_targets, planned_transport_route_key,
 };
 use crate::{
-    ClientConnectionDiagnosticImpact, ClientConnectionRouteEndpointSnapshot,
+    BerryKeepClient, ClientConnectionDiagnosticImpact, ClientConnectionRouteEndpointSnapshot,
     ClientConnectionRouteSnapshot, ClientIdentityMaterial, ClientRouteMaintenancePolicy,
-    ConnectionBootstrap, IronMeshClient, PlannedConnectionBootstrapTarget,
+    ConnectionBootstrap, PlannedConnectionBootstrapTarget,
 };
 
 const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
@@ -162,13 +162,13 @@ pub struct RouteRefreshOutcome {
 }
 
 #[derive(Clone)]
-pub struct ManagedIronMeshClient {
-    client: IronMeshClient,
+pub struct ManagedBerryKeepClient {
+    client: BerryKeepClient,
     controller: Arc<ManagedRouteController>,
 }
 
 struct ManagedRouteController {
-    client: IronMeshClient,
+    client: BerryKeepClient,
     bootstrap: Mutex<ConnectionBootstrap>,
     identity: Mutex<Option<ClientIdentityMaterial>>,
     options: ManagedClientOptions,
@@ -264,7 +264,7 @@ impl ConnectionBootstrap {
         &self,
         identity: Option<ClientIdentityMaterial>,
         options: ManagedClientOptions,
-    ) -> Result<ManagedIronMeshClient> {
+    ) -> Result<ManagedBerryKeepClient> {
         self.validate()?;
         if let Some(identity) = identity.as_ref() {
             identity.validate()?;
@@ -297,7 +297,7 @@ impl ConnectionBootstrap {
             periodic_refresh_started: AtomicBool::new(false),
             runtime_guard: Mutex::new(None),
         });
-        let managed = ManagedIronMeshClient {
+        let managed = ManagedBerryKeepClient {
             client,
             controller: controller.clone(),
         };
@@ -356,7 +356,7 @@ impl ConnectionBootstrap {
         &self,
         identity: ClientIdentityMaterial,
         options: ManagedClientOptions,
-    ) -> Result<ManagedIronMeshClient> {
+    ) -> Result<ManagedBerryKeepClient> {
         // Keep the public async wrapper shallow for FFI and CLI callers. The
         // managed refresh path includes multiplexed direct and relay request
         // futures; boxing it here avoids requiring every consumer crate to
@@ -372,7 +372,7 @@ impl ConnectionBootstrap {
         &self,
         identity: Option<ClientIdentityMaterial>,
         options: ManagedClientOptions,
-    ) -> Result<ManagedIronMeshClient> {
+    ) -> Result<ManagedBerryKeepClient> {
         let runtime = blocking_managed_client_runtime();
         let managed = runtime.block_on(self.build_managed_client(identity, options))?;
         managed.attach_runtime(runtime);
@@ -380,8 +380,8 @@ impl ConnectionBootstrap {
     }
 }
 
-impl ManagedIronMeshClient {
-    pub fn client(&self) -> IronMeshClient {
+impl ManagedBerryKeepClient {
+    pub fn client(&self) -> BerryKeepClient {
         self.client
             .clone()
             .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::UserFacing)
@@ -966,7 +966,7 @@ impl ManagedRouteController {
     fn schedule_refresh(self: Arc<Self>, reason: RouteRefreshReason) {
         let task_controller = self.clone();
         let task = async move {
-            let managed = ManagedIronMeshClient {
+            let managed = ManagedBerryKeepClient {
                 client: task_controller.client.clone(),
                 controller: task_controller,
             };
@@ -996,7 +996,7 @@ impl ManagedRouteController {
                 let Some(controller) = weak_controller.upgrade() else {
                     return;
                 };
-                let managed = ManagedIronMeshClient {
+                let managed = ManagedBerryKeepClient {
                     client: controller.client.clone(),
                     controller,
                 };
@@ -1449,7 +1449,7 @@ mod tests {
         let client = bootstrap
             .build_client_with_identity(&identity)
             .expect("test client should build");
-        let managed = ManagedIronMeshClient {
+        let managed = ManagedBerryKeepClient {
             client: client.clone(),
             controller: Arc::new(ManagedRouteController {
                 client,

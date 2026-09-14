@@ -1,6 +1,6 @@
 # Server node connection priority
 
-IronMesh clients can prefer stronger server hardware without turning the preference into a hard routing rule. A node priority is a signed integer from `-20` through `20`:
+BerryKeep clients can prefer stronger server hardware without turning the preference into a hard routing rule. A node priority is a signed integer from `-20` through `20`:
 
 - `0` is neutral and preserves the previous behavior.
 - Positive values make a node more attractive to clients.
@@ -20,7 +20,7 @@ Content-Type: application/json
 {"priority": 8}
 ```
 
-When the node was started from a node-enrollment package, the setting is written back to that package. Otherwise it is runtime-only. Environment-based deployments can set `IRONMESH_NODE_CONNECTION_PRIORITY`; the value is validated at startup.
+When the node was started from a node-enrollment package, the setting is written back to that package. Otherwise it is runtime-only. Environment-based deployments can set `BERRYKEEP_NODE_CONNECTION_PRIORITY`; the value is validated at startup.
 
 The node advertises the value through its Rendezvous presence under the reserved `client_connection_priority` label. Rendezvous discovery returns it as `node_connection_priority`. Older nodes and Rendezvous services omit the value and are treated as priority `0`.
 

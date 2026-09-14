@@ -98,7 +98,7 @@ if (-not $SkipBuild) {
     Push-Location $repoRoot
     try {
         cargo build --locked -p server-node --bin berrykeep-server-node
-        cargo build --locked -p ironmesh-folder-agent --bin berrykeep-folder-agent
+        cargo build --locked -p berrykeep-folder-agent --bin berrykeep-folder-agent
         cargo build --locked --manifest-path tests\system-tests\Cargo.toml --bin windows_folder_agent_cluster_workload_driver
     }
     finally {
@@ -126,22 +126,22 @@ if (Test-Path -LiteralPath $cleanupSignalPath) {
 }
 
 $inner = @(
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_FILE_COUNT=$FileCount`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MIN_BYTES=$($MinSizeMiB * 1MB)`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_BYTES=$($MaxSizeMiB * 1MB)`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_VERIFY_SAMPLE_COUNT=$VerifySampleCount`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_SUBDIR_COUNT=$SubdirCount`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LOAD_MAX_DIR_DEPTH=$MaxDirDepth`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_START_MODE=$StartMode`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_UPLOAD_TIMEOUT_SECS=$($UploadTimeoutMinutes * 60)`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_REPLICATION_TIMEOUT_SECS=$($ReplicationTimeoutMinutes * 60)`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_MANIFEST_PATH=$manifestPath`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_CONTINUE_SIGNAL_PATH=$continueSignalPath`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_CLEANUP_SIGNAL_PATH=$cleanupSignalPath`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_COPY=$($HoldAfterCopy.IsPresent.ToString().ToLowerInvariant())`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_UPLOAD=$($HoldAfterUpload.IsPresent.ToString().ToLowerInvariant())`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_REPLICATION=$($HoldAfterReplication.IsPresent.ToString().ToLowerInvariant())`"",
-    "set `"IRONMESH_WINDOWS_FOLDER_AGENT_LIVE_HOLD_ON_FAILURE=$($HoldOnFailure.ToString().ToLowerInvariant())`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_FILE_COUNT=$FileCount`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_MIN_BYTES=$($MinSizeMiB * 1MB)`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_MAX_BYTES=$($MaxSizeMiB * 1MB)`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_VERIFY_SAMPLE_COUNT=$VerifySampleCount`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_SUBDIR_COUNT=$SubdirCount`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LOAD_MAX_DIR_DEPTH=$MaxDirDepth`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_START_MODE=$StartMode`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_UPLOAD_TIMEOUT_SECS=$($UploadTimeoutMinutes * 60)`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_REPLICATION_TIMEOUT_SECS=$($ReplicationTimeoutMinutes * 60)`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_MANIFEST_PATH=$manifestPath`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_CONTINUE_SIGNAL_PATH=$continueSignalPath`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_CLEANUP_SIGNAL_PATH=$cleanupSignalPath`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_COPY=$($HoldAfterCopy.IsPresent.ToString().ToLowerInvariant())`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_UPLOAD=$($HoldAfterUpload.IsPresent.ToString().ToLowerInvariant())`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_HOLD_AFTER_REPLICATION=$($HoldAfterReplication.IsPresent.ToString().ToLowerInvariant())`"",
+    "set `"BERRYKEEP_WINDOWS_FOLDER_AGENT_LIVE_HOLD_ON_FAILURE=$($HoldOnFailure.ToString().ToLowerInvariant())`"",
     "`"$driverExe`" > `"$driverLogPath`" 2>&1"
 ) -join " && "
 

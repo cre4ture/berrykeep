@@ -213,7 +213,7 @@ async fn start_cfapi_adapter_with_resolved_inputs(
     if let Some(local_appdata_dir) = local_appdata_dir {
         command.env("LOCALAPPDATA", local_appdata_dir);
         command.env(
-            "IRONMESH_CFAPI_CLOSE_UPLOAD_TRACE_FILE",
+            "BERRYKEEP_CFAPI_CLOSE_UPLOAD_TRACE_FILE",
             local_appdata_dir.join("close-upload.debug.log"),
         );
     }

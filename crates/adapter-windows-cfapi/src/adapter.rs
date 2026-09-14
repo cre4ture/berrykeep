@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn adapter_maps_remote_only_file_to_placeholder_action() {
-        let adapter = WindowsCfapiAdapter::new("Ironmesh");
+        let adapter = WindowsCfapiAdapter::new("BerryKeep");
         let snapshot = SyncSnapshot {
             local: vec![],
             remote: vec![
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn adapter_maps_local_only_file_to_upload_on_close() {
-        let adapter = WindowsCfapiAdapter::new("Ironmesh");
+        let adapter = WindowsCfapiAdapter::new("BerryKeep");
         let snapshot = SyncSnapshot {
             local: vec![LocalEntry::new(
                 NamespaceEntry::file("notes/task.txt", "v-local", "h-local"),
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn adapter_maps_divergence_to_conflict_action() {
-        let adapter = WindowsCfapiAdapter::new("Ironmesh");
+        let adapter = WindowsCfapiAdapter::new("BerryKeep");
         let snapshot = SyncSnapshot {
             local: vec![LocalEntry::new(
                 NamespaceEntry::file("report.csv", "v-local", "h1"),
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn adapter_carries_remote_metadata_for_file_actions() {
-        let adapter = WindowsCfapiAdapter::new("Ironmesh");
+        let adapter = WindowsCfapiAdapter::new("BerryKeep");
         let mut remote = NamespaceEntry::file_sized("docs/readme.md", "v1", "h1", Some(42));
         remote.object_id = Some("obj-readme".to_string());
         remote.modified_at_unix = Some(1_723_456_789);
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn adapter_maps_remote_directory_to_ensure_directory() {
-        let adapter = WindowsCfapiAdapter::new("Ironmesh");
+        let adapter = WindowsCfapiAdapter::new("BerryKeep");
         let mut directory = NamespaceEntry::directory("nested/dir");
         directory.object_id = Some("obj-directory".to_string());
         directory.version = Some("revision-directory".to_string());

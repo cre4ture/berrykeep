@@ -38,7 +38,7 @@ runs:
         write: ${{ inputs.write }}
         # A format-specific namespace keeps the previous v0.2 objects as a
         # rollback path and never mixes them with CARv2 pack entries.
-        key-prefix: ironmesh-bazel-car-v1
+        key-prefix: berrykeep-bazel-car-v1
         storage-mode: ${{ inputs.storage-mode }}
         pack-size-mb: '8'
 

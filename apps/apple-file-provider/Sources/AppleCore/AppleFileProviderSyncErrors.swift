@@ -1,7 +1,7 @@
 @preconcurrency import FileProvider
 import Foundation
 
-public func ironmeshConstraintError(_ reason: String) -> NSError {
+public func berrykeepConstraintError(_ reason: String) -> NSError {
     NSError(
         domain: NSFileProviderErrorDomain,
         code: NSFileProviderError.Code.serverUnreachable.rawValue,
@@ -9,7 +9,7 @@ public func ironmeshConstraintError(_ reason: String) -> NSError {
     )
 }
 
-public func ironmeshConflictError(
+public func berrykeepConflictError(
     originalPath: String,
     conflictCopyPath: String,
     expectedRevision: String,
@@ -21,14 +21,14 @@ public func ironmeshConflictError(
         userInfo: [
             NSLocalizedDescriptionKey:
                 "The remote version of \(originalPath) changed. Your edit was preserved as \(conflictCopyPath).",
-            "IronmeshConflictCopyPath": conflictCopyPath,
-            "IronmeshExpectedRevision": expectedRevision,
-            "IronmeshCurrentRevision": currentRevision,
+            "BerryKeepConflictCopyPath": conflictCopyPath,
+            "BerryKeepExpectedRevision": expectedRevision,
+            "BerryKeepCurrentRevision": currentRevision,
         ]
     )
 }
 
-public func ironmeshRevisionConflictError(
+public func berrykeepRevisionConflictError(
     path: String,
     expectedRevision: String,
     currentRevision: String
@@ -39,13 +39,13 @@ public func ironmeshRevisionConflictError(
         userInfo: [
             NSLocalizedDescriptionKey:
                 "The remote version of \(path) changed. Refresh the item before retrying this operation.",
-            "IronmeshExpectedRevision": expectedRevision,
-            "IronmeshCurrentRevision": currentRevision,
+            "BerryKeepExpectedRevision": expectedRevision,
+            "BerryKeepCurrentRevision": currentRevision,
         ]
     )
 }
 
-public func ironmeshDeletionRejectedError(
+public func berrykeepDeletionRejectedError(
     path: String,
     expectedRevision: String? = nil,
     currentRevision: String? = nil,
@@ -54,10 +54,10 @@ public func ironmeshDeletionRejectedError(
     var userInfo: [String: Any] = [
         NSLocalizedDescriptionKey:
             "The remote item at \(path) could not be deleted safely. Files will restore its current version.",
-        "IronmeshConflictReason": reason,
+        "BerryKeepConflictReason": reason,
     ]
-    userInfo["IronmeshExpectedRevision"] = expectedRevision
-    userInfo["IronmeshCurrentRevision"] = currentRevision
+    userInfo["BerryKeepExpectedRevision"] = expectedRevision
+    userInfo["BerryKeepCurrentRevision"] = currentRevision
     return NSError(
         domain: NSFileProviderErrorDomain,
         code: NSFileProviderError.Code.deletionRejected.rawValue,
@@ -68,7 +68,7 @@ public func ironmeshDeletionRejectedError(
 public enum AppleWorkingSetSignalPolicy {
     public static func shouldSignal(after error: NSError) -> Bool {
         error.domain == NSFileProviderErrorDomain
-            && error.userInfo["IronmeshConflictCopyPath"] as? String != nil
+            && error.userInfo["BerryKeepConflictCopyPath"] as? String != nil
     }
 }
 
@@ -89,7 +89,7 @@ public enum ApplePostMoveRevisionPolicy {
                 NSLocalizedDescriptionKey:
                     "The destination revision for \(path) could not be verified after moving the item. "
                     + "Refresh before retrying the content update.",
-                "IronmeshConflictReason": "missing_post_move_revision",
+                "BerryKeepConflictReason": "missing_post_move_revision",
             ]
         )
     }

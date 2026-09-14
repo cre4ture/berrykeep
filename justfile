@@ -20,7 +20,7 @@ test-stable:
 
 coverage:
     cargo +stable llvm-cov --locked --workspace --all-features --summary-only \
-        --ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/(ironmesh-folder-agent|os-integration|ironmesh-config-app|ironmesh-background-launcher)/src/main.rs|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/|crates/desktop-client-config/src/lib.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)|crates/sync-agent-core/src/folder_agent_ui.rs|crates/web-ui-backend/src/lib.rs' \
+        --ignore-filename-regex 'apps/(android-app|ios-app|cli-client|web-ui)/|apps/(berrykeep-folder-agent|os-integration|berrykeep-config-app|berrykeep-background-launcher)/src/main.rs|apps/server-node/src/main.rs|crates/common/src/lib.rs|crates/adapter-linux-fuse/|crates/desktop-client-config/src/lib.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)|crates/sync-agent-core/src/folder_agent_ui.rs|crates/web-ui-backend/src/lib.rs' \
         --fail-under-lines 70
 
 web-test-e2e-client:
@@ -83,10 +83,10 @@ ci-required:
 ci-ios:
     cargo test --locked -p ios-app
     cd apps/apple-file-provider && swift test
-    DEST="$$(IRONMESH_IOS_SIMULATOR_APP_BUNDLE_ID=dev.ironmesh.apple.iosapp apps/apple-file-provider/scripts/prepare-ios-simulator.sh apps/apple-file-provider/IronmeshAppleFileProvider.xcodeproj IronmeshIosProject)" && \
+    DEST="$$(BERRYKEEP_IOS_SIMULATOR_APP_BUNDLE_ID=dev.ironmesh.apple.iosapp apps/apple-file-provider/scripts/prepare-ios-simulator.sh apps/apple-file-provider/BerryKeepAppleFileProvider.xcodeproj BerryKeepIosProject)" && \
         xcodebuild test \
-            -project apps/apple-file-provider/IronmeshAppleFileProvider.xcodeproj \
-            -scheme IronmeshIosProject \
+            -project apps/apple-file-provider/BerryKeepAppleFileProvider.xcodeproj \
+            -scheme BerryKeepIosProject \
             -destination "$$DEST" \
             -destination-timeout 180
 
@@ -101,10 +101,10 @@ web-install:
     cd web && pnpm install
 
 web-dev-admin:
-    cd web && pnpm --filter @ironmesh/server-admin dev
+    cd web && pnpm --filter @berrykeep/server-admin dev
 
 web-dev-client:
-    cd web && pnpm --filter @ironmesh/client-ui dev
+    cd web && pnpm --filter @berrykeep/client-ui dev
 
 web-build:
     cd web && pnpm build

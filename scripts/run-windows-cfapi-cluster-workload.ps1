@@ -35,13 +35,13 @@ if ($CloseUploadConcurrency -le 0) {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
-$env:IRONMESH_WINDOWS_CFAPI_LOAD_FILE_COUNT = [string]$FileCount
-$env:IRONMESH_WINDOWS_CFAPI_LOAD_MIN_BYTES = [string]($MinSizeMiB * 1MB)
-$env:IRONMESH_WINDOWS_CFAPI_LOAD_MAX_BYTES = [string]($MaxSizeMiB * 1MB)
-$env:IRONMESH_WINDOWS_CFAPI_LOAD_VERIFY_SAMPLE_COUNT = [string]$VerifySampleCount
-$env:IRONMESH_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT = [string]$SubdirCount
-$env:IRONMESH_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH = [string]$MaxDirDepth
-$env:IRONMESH_CFAPI_CLOSE_UPLOAD_MAX_CONCURRENCY = [string]$CloseUploadConcurrency
+$env:BERRYKEEP_WINDOWS_CFAPI_LOAD_FILE_COUNT = [string]$FileCount
+$env:BERRYKEEP_WINDOWS_CFAPI_LOAD_MIN_BYTES = [string]($MinSizeMiB * 1MB)
+$env:BERRYKEEP_WINDOWS_CFAPI_LOAD_MAX_BYTES = [string]($MaxSizeMiB * 1MB)
+$env:BERRYKEEP_WINDOWS_CFAPI_LOAD_VERIFY_SAMPLE_COUNT = [string]$VerifySampleCount
+$env:BERRYKEEP_WINDOWS_CFAPI_LOAD_SUBDIR_COUNT = [string]$SubdirCount
+$env:BERRYKEEP_WINDOWS_CFAPI_LOAD_MAX_DIR_DEPTH = [string]$MaxDirDepth
+$env:BERRYKEEP_CFAPI_CLOSE_UPLOAD_MAX_CONCURRENCY = [string]$CloseUploadConcurrency
 
 Write-Host "Running Windows CFAPI cluster workload"
 Write-Host "  files          : $FileCount"

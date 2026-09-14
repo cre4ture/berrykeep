@@ -5,8 +5,8 @@ import {
   type DataChangeActorKind,
   type DataChangeEventsCursor,
   type DataChangeEvent
-} from "@ironmesh/api";
-import { ironmeshPrimaryColor, StatCard } from "@ironmesh/ui";
+} from "@berrykeep/api";
+import { berrykeepPrimaryColor, StatCard } from "@berrykeep/ui";
 import {
   Alert,
   Badge,
@@ -315,7 +315,7 @@ function actionBadgeColor(action: DataChangeAction): string {
     case "upload":
       return "blue";
     case "rename":
-      return ironmeshPrimaryColor;
+      return berrykeepPrimaryColor;
     case "copy":
       return "cyan";
     case "delete":

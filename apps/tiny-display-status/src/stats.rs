@@ -171,7 +171,7 @@ fn is_mount_point(path: &str) -> bool {
         .any(|mount_point| mount_point == path)
 }
 
-pub struct IronmeshInfo {
+pub struct BerryKeepInfo {
     pub reachable: bool,
     pub node_id: Option<String>,
     pub version: Option<String>,
@@ -179,14 +179,19 @@ pub struct IronmeshInfo {
     pub offline_nodes: Option<u32>,
 }
 
-pub fn collect_ironmesh_info(base_url: &str) -> IronmeshInfo {
+/// Compatibility type alias for consumers compiled against the former API.
+#[allow(dead_code)]
+#[deprecated(note = "use BerryKeepInfo")]
+pub type IronmeshInfo = BerryKeepInfo;
+
+pub fn collect_berrykeep_info(base_url: &str) -> BerryKeepInfo {
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
     {
         Ok(client) => client,
         Err(_) => {
-            return IronmeshInfo {
+            return BerryKeepInfo {
                 reachable: false,
                 node_id: None,
                 version: None,
@@ -230,11 +235,18 @@ pub fn collect_ironmesh_info(base_url: &str) -> IronmeshInfo {
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
 
-    IronmeshInfo {
+    BerryKeepInfo {
         reachable,
         node_id,
         version,
         online_nodes,
         offline_nodes,
     }
+}
+
+/// Compatibility function for consumers compiled against the former API.
+#[allow(dead_code, deprecated)]
+#[deprecated(note = "use collect_berrykeep_info")]
+pub fn collect_ironmesh_info(base_url: &str) -> IronmeshInfo {
+    collect_berrykeep_info(base_url)
 }
