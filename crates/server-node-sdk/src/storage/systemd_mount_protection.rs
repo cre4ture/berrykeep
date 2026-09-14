@@ -19,8 +19,6 @@ use tokio::time::timeout;
 
 #[cfg(any(target_os = "linux", test))]
 use futures_util::future::join_all;
-#[cfg(all(target_os = "linux", not(test)))]
-use futures_util::future::{BoxFuture, FutureExt, Shared};
 
 use super::StoragePathConfig;
 #[cfg(any(target_os = "linux", test))]
@@ -146,19 +144,8 @@ struct MountProtectionCacheEntry {
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
-struct MountProtectionCache {
-    entry: Option<MountProtectionCacheEntry>,
-    in_flight: Option<MountProtectionRefresh>,
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-struct MountProtectionRefresh {
-    key: MountProtectionCacheKey,
-    checks: Shared<BoxFuture<'static, Vec<HostDependencyCheck>>>,
-}
-
-#[cfg(all(target_os = "linux", not(test)))]
-static MOUNT_PROTECTION_CACHE: OnceLock<tokio::sync::Mutex<MountProtectionCache>> = OnceLock::new();
+static MOUNT_PROTECTION_CACHE: OnceLock<tokio::sync::Mutex<Option<MountProtectionCacheEntry>>> =
+    OnceLock::new();
 
 #[cfg(all(target_os = "linux", not(test)))]
 async fn cached_mount_protection_checks(
@@ -169,59 +156,26 @@ async fn cached_mount_protection_checks(
         data_dir: data_dir.to_path_buf(),
         storage_paths: storage_paths.to_vec(),
     };
-    let cache = MOUNT_PROTECTION_CACHE.get_or_init(|| {
-        tokio::sync::Mutex::new(MountProtectionCache {
-            entry: None,
-            in_flight: None,
-        })
-    });
-    loop {
-        let checks = {
-            let mut cache = cache.lock().await;
-            if let Some(entry) = cache.entry.as_ref()
-                && entry.key == key
-                && entry.checked_at.elapsed() <= MOUNT_PROTECTION_CACHE_TTL
-            {
-                return entry.checks.clone();
-            }
-            if let Some(refresh) = cache.in_flight.as_ref() {
-                refresh.checks.clone()
-            } else {
-                let data_dir = data_dir.to_path_buf();
-                let storage_paths = storage_paths.to_vec();
-                let checks = async move {
-                    timeout(
-                        MOUNT_PROTECTION_INSPECTION_TIMEOUT,
-                        mount_protection_checks_for_current_process(&data_dir, &storage_paths),
-                    )
-                    .await
-                    .unwrap_or_else(|_| mount_protection_inspection_timed_out_checks())
-                }
-                .boxed()
-                .shared();
-                cache.in_flight = Some(MountProtectionRefresh {
-                    key: key.clone(),
-                    checks: checks.clone(),
-                });
-                checks
-            }
-        };
-        let checks = checks.await;
-        let mut cache = cache.lock().await;
-        if cache
-            .in_flight
-            .as_ref()
-            .is_some_and(|refresh| refresh.key == key)
-        {
-            cache.entry = Some(MountProtectionCacheEntry {
-                key,
-                checked_at: Instant::now(),
-                checks: checks.clone(),
-            });
-            cache.in_flight = None;
-            return checks;
-        }
+    let cache = MOUNT_PROTECTION_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut cache = cache.lock().await;
+    if let Some(entry) = cache.as_ref()
+        && entry.key == key
+        && entry.checked_at.elapsed() <= MOUNT_PROTECTION_CACHE_TTL
+    {
+        return entry.checks.clone();
     }
+    let checks = timeout(
+        MOUNT_PROTECTION_INSPECTION_TIMEOUT,
+        mount_protection_checks_for_current_process(data_dir, storage_paths),
+    )
+    .await
+    .unwrap_or_else(|_| mount_protection_inspection_timed_out_checks());
+    *cache = Some(MountProtectionCacheEntry {
+        key,
+        checked_at: Instant::now(),
+        checks: checks.clone(),
+    });
+    checks
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
@@ -692,7 +646,7 @@ fn mount_protection_targets_with_path_resolution(
     let mut protected_paths = BTreeSet::from([data_dir.clone()]);
     let mut targets = vec![MountProtectionTarget {
         id: "systemd-mount-data-dir".to_string(),
-        feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+        feature: "Systemd mount protection: BERRYKEEP_DATA_DIR".to_string(),
         mount_point: data_dir_mount_point.map(|mount_point| mount_point.path.clone()),
         mount_point_is_bind: data_dir_mount_point
             .is_some_and(|mount_point| mount_point.root != Path::new("/")),
@@ -1071,7 +1025,7 @@ fn checks_for_inspection(
                 id: "systemd-mount-protection".to_string(),
                 feature: "Systemd mount protection".to_string(),
                 status: HostDependencyStatus::Missing,
-                severity: HostDependencySeverity::Warning,
+                severity: HostDependencySeverity::Info,
                 summary: format!(
                     "Could not inspect effective systemd dependencies for `{service}`"
                 ),
@@ -1455,6 +1409,21 @@ mod tests {
     }
 
     #[test]
+    fn failed_systemd_inspection_remains_informational() {
+        let checks = checks_for_inspection(
+            &[],
+            SystemdMountProtectionInspection::QueryFailed {
+                service: "berrykeep-server-node.service".to_string(),
+                reason: "systemctl did not respond".to_string(),
+            },
+        );
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Info);
+    }
+
+    #[test]
     fn does_not_treat_a_non_service_systemd_scope_as_a_managed_server_service() {
         let service = systemd_service_from_cgroups(
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/session-4.scope\n",
@@ -1715,7 +1684,7 @@ mod tests {
         let targets = vec![
             MountProtectionTarget {
                 id: "systemd-mount-data-dir".to_string(),
-                feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+                feature: "Systemd mount protection: BERRYKEEP_DATA_DIR".to_string(),
                 path: PathBuf::from("/var/lib/berrykeep"),
                 mount_point: Some(PathBuf::from("/")),
                 mount_point_is_bind: false,
@@ -1848,7 +1817,7 @@ mod tests {
     fn expected_deeper_mount_cannot_use_an_ancestor_dependency() {
         let target = MountProtectionTarget {
             id: "systemd-mount-data-dir".to_string(),
-            feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+            feature: "Systemd mount protection: BERRYKEEP_DATA_DIR".to_string(),
             path: PathBuf::from("/srv/berrykeep"),
             mount_point: Some(PathBuf::from("/srv")),
             mount_point_is_bind: false,
@@ -1881,7 +1850,7 @@ mod tests {
     fn namespace_bind_mount_uses_its_mapped_source_dependency() {
         let target = MountProtectionTarget {
             id: "systemd-mount-data-dir".to_string(),
-            feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+            feature: "Systemd mount protection: BERRYKEEP_DATA_DIR".to_string(),
             path: PathBuf::from("/srv/berrykeep"),
             mount_point: Some(PathBuf::from("/srv/berrykeep")),
             mount_point_is_bind: true,
@@ -1916,7 +1885,7 @@ mod tests {
     fn host_bind_mount_cannot_use_its_backing_source_dependency() {
         let target = MountProtectionTarget {
             id: "systemd-mount-data-dir".to_string(),
-            feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+            feature: "Systemd mount protection: BERRYKEEP_DATA_DIR".to_string(),
             path: PathBuf::from("/srv/berrykeep"),
             mount_point: Some(PathBuf::from("/srv/berrykeep")),
             mount_point_is_bind: true,
@@ -1940,7 +1909,7 @@ mod tests {
     fn namespace_bind_mount_can_use_its_host_ancestor_dependency() {
         let target = MountProtectionTarget {
             id: "systemd-mount-data-dir".to_string(),
-            feature: "Systemd mount protection: IRONMESH_DATA_DIR".to_string(),
+            feature: "Systemd mount protection: BERRYKEEP_DATA_DIR".to_string(),
             path: PathBuf::from("/srv/berrykeep"),
             mount_point: Some(PathBuf::from("/srv/berrykeep")),
             mount_point_is_bind: true,

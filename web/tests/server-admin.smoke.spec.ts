@@ -761,7 +761,7 @@ test("server-admin Dependencies lists systemd mount findings and remedies per pr
     hostDependencyChecks: [
       {
         id: "systemd-mount-data-dir",
-        feature: "Systemd mount protection: IRONMESH_DATA_DIR",
+        feature: "Systemd mount protection: BERRYKEEP_DATA_DIR",
         status: "ready",
         severity: "info",
         summary: "Effective dependencies include srv.mount",
@@ -803,7 +803,7 @@ test("server-admin Dependencies lists systemd mount findings and remedies per pr
   await page.keyboard.press("Escape");
 
   await page.getByText("Dependencies", { exact: true }).click();
-  await expect(page.getByText("Systemd mount protection: IRONMESH_DATA_DIR", { exact: true })).toBeVisible();
+  await expect(page.getByText("Systemd mount protection: BERRYKEEP_DATA_DIR", { exact: true })).toBeVisible();
   await expect(page.getByText("Systemd mount protection: storage pool `primary` (active)", { exact: true })).toBeVisible();
   await expect(page.getByText("Systemd mount protection: storage pool `archive` (draining)", { exact: true })).toBeVisible();
   await expect(page.getByText(/RequiresMountsFor=\/mnt\/primary/)).toBeVisible();
@@ -826,7 +826,7 @@ test("server-admin Dependencies keeps informational tooling visible with mount-p
       },
       {
         id: "systemd-mount-data-dir",
-        feature: "Systemd mount protection: IRONMESH_DATA_DIR",
+        feature: "Systemd mount protection: BERRYKEEP_DATA_DIR",
         status: "missing",
         severity: "critical",
         summary: "Data directory needs mount protection",
@@ -878,7 +878,7 @@ test("server-admin dashboard filters dependency findings by severity", async ({ 
       },
       {
         id: "systemd-mount-data-dir",
-        feature: "Systemd mount protection: IRONMESH_DATA_DIR",
+        feature: "Systemd mount protection: BERRYKEEP_DATA_DIR",
         status: "missing",
         severity: "critical",
         summary: "Data directory needs mount protection",

@@ -73,8 +73,8 @@ export function DependenciesPage() {
       <Group justify="space-between" align="flex-start">
         <Text c="dimmed" maw={760}>
           This page checks optional host tools plus storage mount protection for a server node actually managed by systemd.
-          For systemd services, it shows the live effective dependency result and a per-path remedy for
-          <Code> IRONMESH_DATA_DIR </Code> and active or draining storage-pool paths. Cockpit remains a separate,
+          For systemd services, it shows the live effective dependency result and a per-path remedy for{" "}
+          <Code>BERRYKEEP_DATA_DIR</Code> and active or draining storage-pool paths. Cockpit remains a separate,
           separately authenticated interface for host-level operations; BerryKeep does not restart services or the host itself.
         </Text>
         <Button variant="light" onClick={() => void refresh()} loading={loading}>
