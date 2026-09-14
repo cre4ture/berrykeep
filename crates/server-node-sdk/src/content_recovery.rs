@@ -210,13 +210,30 @@ pub(crate) async fn recover_chunks(
     preferred: Option<&NodeDescriptor>,
     cache: bool,
 ) -> ChunkRecoveryResult {
+    recover_chunks_with_progress(state, subject, chunks, preferred, cache, None).await
+}
+
+async fn recover_chunks_with_progress(
+    state: &ServerState,
+    subject: &str,
+    chunks: &[ReplicationChunkInfo],
+    preferred: Option<&NodeDescriptor>,
+    cache: bool,
+    recovered_progress: Option<Arc<AtomicUsize>>,
+) -> ChunkRecoveryResult {
     let sources = Arc::new(source_nodes(state, subject, preferred).await);
     let unique: BTreeMap<_, _> = chunks.iter().map(|c| (c.hash.clone(), c.clone())).collect();
     let mut work = stream::iter(unique.into_values().map(|chunk| {
         let state = state.clone();
         let sources = sources.clone();
+        let recovered_progress = recovered_progress.clone();
         async move {
             let outcome = recover_chunk(&state, &chunk, &sources, cache).await;
+            if matches!(&outcome, Ok(true))
+                && let Some(recovered_progress) = recovered_progress
+            {
+                recovered_progress.fetch_add(1, Ordering::Relaxed);
+            }
             (chunk.hash, outcome)
         }
     }))
@@ -302,16 +319,30 @@ pub(crate) async fn bounded_durable_recovery<T>(
 }
 
 async fn recover_task(state: &ServerState, task: &mut ContentRepairTask) -> Result<usize> {
-    bounded_durable_recovery(
-        DURABLE_CONTENT_REPAIR_BUDGET,
-        recover_task_unbounded(state, task),
+    recover_task_with_budget(state, task, DURABLE_CONTENT_REPAIR_BUDGET).await
+}
+
+pub(crate) async fn recover_task_with_budget(
+    state: &ServerState,
+    task: &mut ContentRepairTask,
+    budget: Duration,
+) -> Result<usize> {
+    let recovered_progress = Arc::new(AtomicUsize::new(0));
+    let outcome = bounded_durable_recovery(
+        budget,
+        recover_task_unbounded(state, task, recovered_progress.clone()),
     )
-    .await
+    .await;
+    task.recovered_chunks = task
+        .recovered_chunks
+        .saturating_add(recovered_progress.load(Ordering::Relaxed));
+    outcome
 }
 
 async fn recover_task_unbounded(
     state: &ServerState,
     task: &mut ContentRepairTask,
+    recovered_progress: Arc<AtomicUsize>,
 ) -> Result<usize> {
     let bytes = recover_manifest(state, &task.reference).await?;
     let manifest = validate_manifest(&task.reference.manifest_hash, &bytes)?;
@@ -338,8 +369,15 @@ async fn recover_task_unbounded(
             .await?;
     }
     let subject = task.reference.subject().unwrap_or_default();
-    let result = recover_chunks(state, &subject, &task.chunks, None, !task.repair_chunks).await;
-    task.recovered_chunks = task.recovered_chunks.saturating_add(result.recovered);
+    let result = recover_chunks_with_progress(
+        state,
+        &subject,
+        &task.chunks,
+        None,
+        !task.repair_chunks,
+        Some(recovered_progress),
+    )
+    .await;
     if !result.remaining.is_empty() {
         let detail = format!(
             "{} chunks recovered; {} still missing; {}",
