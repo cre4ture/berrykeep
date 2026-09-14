@@ -1256,12 +1256,10 @@ fn protecting_mount_dependency<'a>(
                         .find(|mount| mount.where_path == *backing_mount_point)
                 })
         }
-        None => mounts
-            .iter()
-            .filter(|mount| {
-                mount.where_path != Path::new("/") && target.path.starts_with(&mount.where_path)
-            })
-            .max_by_key(|mount| mount.where_path.components().count()),
+        // A readable Linux mount table always contains `/`, so a path has a
+        // mount point. Treat an absent one as unverified rather than crediting
+        // an ancestor dependency that might not protect the target filesystem.
+        None => None,
     }
 }
 
@@ -1322,9 +1320,16 @@ mod tests {
         }
     }
 
-    fn targets_without_known_mount_point(targets: &mut [MountProtectionTarget]) {
-        for target in targets {
-            target.mount_point = None;
+    fn set_target_mount_points(
+        targets: &mut [MountProtectionTarget],
+        mount_points: &[(&str, &str)],
+    ) {
+        for (target_id, mount_point) in mount_points {
+            let target = targets
+                .iter_mut()
+                .find(|target| target.id == *target_id)
+                .unwrap_or_else(|| panic!("missing target {target_id}"));
+            target.mount_point = Some(PathBuf::from(mount_point));
             target.mount_point_is_bind = false;
             target.backing_mount_points.clear();
         }
@@ -1435,19 +1440,8 @@ mod tests {
 
     #[test]
     fn non_systemd_startup_is_not_applicable_and_never_warns() {
-        let mut targets = mount_protection_targets(
-            Path::new("/srv/berrykeep"),
-            &[storage_path(
-                "primary",
-                "/mnt/primary",
-                StoragePathState::Active,
-            )],
-        );
-        targets_without_known_mount_point(&mut targets);
-        let checks = checks_for_inspection(
-            &targets,
-            SystemdMountProtectionInspection::NotManagedBySystemd,
-        );
+        let checks =
+            checks_for_inspection(&[], SystemdMountProtectionInspection::NotManagedBySystemd);
 
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, HostDependencyStatus::NotApplicable);
@@ -1464,7 +1458,13 @@ mod tests {
                 StoragePathState::Active,
             )],
         );
-        targets_without_known_mount_point(&mut targets);
+        set_target_mount_points(
+            &mut targets,
+            &[
+                ("systemd-mount-data-dir", "/srv"),
+                ("systemd-mount-storage-primary", "/mnt/primary"),
+            ],
+        );
         let checks = checks_for_inspection(
             &targets,
             dependencies(vec![
@@ -1494,7 +1494,13 @@ mod tests {
                 storage_path("archive", "/mnt/archive", StoragePathState::Draining),
             ],
         );
-        targets_without_known_mount_point(&mut targets);
+        set_target_mount_points(
+            &mut targets,
+            &[
+                ("systemd-mount-data-dir", "/"),
+                ("systemd-mount-storage-archive", "/mnt/archive"),
+            ],
+        );
         let checks = checks_for_inspection(
             &targets,
             dependencies(vec![systemd_mount("archive.mount", "/mnt/archive")]),
@@ -1506,14 +1512,12 @@ mod tests {
                 .iter()
                 .any(|check| check.id == "systemd-mount-data-dir")
         );
-        assert_eq!(
-            checks
-                .iter()
-                .find(|check| check.id == "systemd-mount-data-dir")
-                .unwrap()
-                .severity,
-            HostDependencySeverity::Critical
-        );
+        let data_dir = checks
+            .iter()
+            .find(|check| check.id == "systemd-mount-data-dir")
+            .unwrap();
+        assert_eq!(data_dir.status, HostDependencyStatus::NotApplicable);
+        assert_eq!(data_dir.severity, HostDependencySeverity::Info);
         assert!(
             checks
                 .iter()
@@ -1536,7 +1540,14 @@ mod tests {
                 storage_path("retired", "/mnt/retired", StoragePathState::Disabled),
             ],
         );
-        targets_without_known_mount_point(&mut targets);
+        set_target_mount_points(
+            &mut targets,
+            &[
+                ("systemd-mount-data-dir", "/srv"),
+                ("systemd-mount-storage-primary", "/mnt/primary"),
+                ("systemd-mount-storage-archive", "/mnt/archive"),
+            ],
+        );
         let checks = checks_for_inspection(
             &targets,
             dependencies(vec![
@@ -1790,6 +1801,27 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Retry once")
         );
+    }
+
+    #[test]
+    fn unknown_mount_point_does_not_credit_an_ancestor_dependency() {
+        let target = MountProtectionTarget {
+            id: "systemd-mount-storage-primary".to_string(),
+            feature: "Systemd mount protection: storage pool `primary` (active)".to_string(),
+            path: PathBuf::from("/srv/berrykeep"),
+            mount_point: None,
+            mount_point_is_bind: false,
+            backing_mount_points: Vec::new(),
+            path_resolution_error: None,
+            missing_severity: HostDependencySeverity::Critical,
+        };
+        let checks = checks_for_inspection(
+            &[target],
+            dependencies(vec![systemd_mount("srv.mount", "/srv")]),
+        );
+
+        assert_eq!(checks[0].status, HostDependencyStatus::Missing);
+        assert_eq!(checks[0].severity, HostDependencySeverity::Critical);
     }
 
     #[test]
