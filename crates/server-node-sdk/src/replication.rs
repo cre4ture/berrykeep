@@ -44,6 +44,9 @@ impl ReplicationRepairReport {
             if self.successful_transfers > 0 || chunk_progress {
                 return RepairRunStatus::PartiallyRepaired;
             }
+            if unresolved {
+                return RepairRunStatus::Unresolved;
+            }
             if waiting_for_source {
                 return RepairRunStatus::WaitingForSource;
             }
@@ -54,11 +57,11 @@ impl ReplicationRepairReport {
         // for an under-replicated subject correctly skips that bundle; it did not
         // fail a repair and must not turn the run red. Content recovery records
         // its durable pending state explicitly through these events.
-        if waiting_for_source {
-            return RepairRunStatus::WaitingForSource;
-        }
         if unresolved {
             return RepairRunStatus::Unresolved;
+        }
+        if waiting_for_source {
+            return RepairRunStatus::WaitingForSource;
         }
         if self.skipped_items > 0 && (self.successful_transfers > 0 || chunk_progress) {
             return RepairRunStatus::PartiallyRepaired;
@@ -2244,6 +2247,30 @@ mod tests {
         );
 
         assert_eq!(report.run_status(), RepairRunStatus::Completed);
+    }
+
+    #[test]
+    fn repair_status_does_not_mask_an_unresolved_task_with_another_waiting_task() {
+        let node_id = NodeId::new_v4();
+        for failed_transfers in [0, 1] {
+            let mut report = empty_report();
+            report.failed_transfers = failed_transfers;
+            for event in ["repair_waiting", "repair_unresolved"] {
+                push_repair_log_entry(
+                    &mut report.detailed_log,
+                    node_id,
+                    event,
+                    event.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+            assert_eq!(report.run_status(), RepairRunStatus::Unresolved);
+        }
     }
 
     #[test]
