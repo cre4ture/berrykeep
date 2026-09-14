@@ -3298,6 +3298,13 @@ async fn cleanup_unreferenced_reaps_stale_chunk_temp_files_impl(backend: Storage
     fs::write(&temp_path, b"incomplete atomic chunk")
         .await
         .unwrap();
+    std::fs::File::open(&temp_path)
+        .unwrap()
+        .set_modified(
+            std::time::SystemTime::now()
+                - Duration::from_secs(CHUNK_ATOMIC_TEMP_MIN_RETENTION_SECS + 1),
+        )
+        .unwrap();
 
     let report = store.cleanup_unreferenced(0, false).await.unwrap();
     assert!(report.deleted_chunks >= 1);
@@ -9431,6 +9438,41 @@ async fn metadata_only_cached_chunks_are_evicted_by_cleanup_impl(backend: Storag
             .is_empty()
     );
 
+    // A cache-only integrity repair must pin its bytes without promoting them
+    // out of cache tracking. Once the task finishes, ordinary cache eviction
+    // may reclaim both the file and its record.
+    let reference = target
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject("docs/cached-range.bin")
+        .unwrap()
+        .clone();
+    let mut task = content_recovery::ContentRepairTask::new(reference, false);
+    task.chunks.push(ReplicationChunkInfo {
+        hash: first_chunk.hash.clone(),
+        size_bytes: first_chunk.size_bytes,
+    });
+    target.persist_content_repair_task(&task).await.unwrap();
+
+    let pinned_report = target.cleanup_unreferenced(0, false).await.unwrap();
+    assert_eq!(pinned_report.deleted_cached_chunks, 0);
+    assert_eq!(
+        target
+            .list_cached_chunk_records_for_test()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a repair pin must preserve cache tracking until ownership changes"
+    );
+    let first_chunk_path = target.chunk_path_for_test(&first_chunk.hash);
+    assert!(fs::try_exists(&first_chunk_path).await.unwrap());
+    target
+        .discard_content_repair_task(&task.reference.manifest_hash)
+        .await
+        .unwrap();
+
     let report = target.cleanup_unreferenced(0, false).await.unwrap();
     assert_eq!(report.deleted_cached_chunks, 1);
     assert!(report.deleted_cached_chunk_records >= 1);
@@ -9442,7 +9484,6 @@ async fn metadata_only_cached_chunks_are_evicted_by_cleanup_impl(backend: Storag
             .is_empty()
     );
 
-    let first_chunk_path = target.chunk_path_for_test(&first_chunk.hash);
     assert!(!fs::try_exists(&first_chunk_path).await.unwrap());
 
     let metadata_subjects = target.list_metadata_subjects().await.unwrap();
