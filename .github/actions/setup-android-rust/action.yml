@@ -57,6 +57,10 @@ runs:
 
     - name: Setup Android SDK
       uses: android-actions/setup-android@v3
+      with:
+        # The legacy `tools` package was removed from the Android SDK
+        # repository. Request only the still-supported platform tools.
+        packages: platform-tools
 
     - name: Install Android NDK (side by side)
       shell: bash
