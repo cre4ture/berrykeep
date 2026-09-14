@@ -320,7 +320,7 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
     content_recovery::repair_subjects(state, subjects, batch_size_override).await
 }
 
-async fn execute_replication_repair_plan(
+pub(crate) async fn execute_replication_repair_plan(
     state: &ServerState,
     plan: &ReplicationPlan,
     nodes: Vec<NodeDescriptor>,
@@ -2275,6 +2275,30 @@ mod tests {
             }
             assert_eq!(report.run_status(), RepairRunStatus::Unresolved);
         }
+    }
+
+    #[test]
+    fn repair_status_uses_this_attempt_progress_not_durable_total() {
+        let node_id = NodeId::new_v4();
+        let mut report = empty_report();
+        report.failed_transfers = 1;
+        push_repair_log_entry(
+            &mut report.detailed_log,
+            node_id,
+            "repair_waiting",
+            "source still unavailable".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(serde_json::json!({
+                "chunks_recovered": 0,
+                "total_chunks_recovered": 3,
+            })),
+        );
+
+        assert_eq!(report.run_status(), RepairRunStatus::WaitingForSource);
     }
 
     #[test]

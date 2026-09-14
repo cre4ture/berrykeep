@@ -42,6 +42,36 @@ async fn content_repair_claims_are_manifest_scoped() {
     same.await.unwrap();
 }
 
+async fn planning_subjects_deduplicate_retained_history_by_placement_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let key = choose_locally_placed_key(&state, "planning-history").await;
+    seed_subject_version(&state, &key, "ver-planning-a", b"first".to_vec(), vec![]).await;
+    seed_subject_version(
+        &state,
+        &key,
+        "ver-planning-b",
+        b"second".to_vec(),
+        vec!["ver-planning-a".to_string()],
+    )
+    .await;
+
+    let subjects = crate::planning_replication_subjects(&state).await;
+    let matching = subjects
+        .iter()
+        .filter(|subject| crate::cluster::replication_placement_key(subject) == key)
+        .collect::<Vec<_>>();
+    assert_eq!(matching, vec![&key]);
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    planning_subjects_deduplicate_retained_history_by_placement_impl,
+    planning_subjects_deduplicate_retained_history_by_placement,
+    planning_subjects_deduplicate_retained_history_by_placement_turso
+);
+
 async fn recovery_read_budget_bounds_slow_unadvertised_peers_impl(backend: MainTestBackend) {
     let target = build_test_state(1, false, backend).await;
     let source = build_test_state(1, false, backend).await;

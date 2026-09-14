@@ -485,6 +485,7 @@ async fn repair_subjects_inner(
         task.source_fingerprint = fingerprint.clone();
         report.attempted_transfers += 1;
         await_repair_busy_threshold(state).await;
+        let recovered_before_attempt = task.recovered_chunks;
         match recover_task(state, &mut task).await {
             Ok(recovered) => {
                 report.successful_transfers += 1;
@@ -494,7 +495,7 @@ async fn repair_subjects_inner(
                     &task,
                     "repair_verified",
                     "retained content repaired and verified".to_string(),
-                    json!({"chunks_recovered": recovered, "verified_at_unix": unix_ts(), "manifest_hash": task.reference.manifest_hash}),
+                    json!({"chunks_recovered": recovered, "total_chunks_recovered": task.recovered_chunks, "verified_at_unix": unix_ts(), "manifest_hash": task.reference.manifest_hash}),
                 );
             }
             Err(error) => {
@@ -518,7 +519,7 @@ async fn repair_subjects_inner(
                     &task,
                     event,
                     detail,
-                    json!({"pending": true, "chunks_recovered": task.recovered_chunks, "next_attempt_unix": task.next_attempt_unix, "manifest_hash": task.reference.manifest_hash}),
+                    json!({"pending": true, "chunks_recovered": task.recovered_chunks.saturating_sub(recovered_before_attempt), "total_chunks_recovered": task.recovered_chunks, "next_attempt_unix": task.next_attempt_unix, "manifest_hash": task.reference.manifest_hash}),
                 );
             }
         }
@@ -575,37 +576,48 @@ pub(crate) async fn resume_pending(state: &ServerState) -> Result<()> {
 
 /// Placement obligations exist even when no node currently advertises a replica.
 /// Queue them independently of the legacy replica map; the worker discovers bytes.
+#[cfg(test)]
 pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
-    let (retained, pending) = {
+    let retained = {
         let store = read_store(state, "content_recovery.audit").await;
-        (
-            store.retained_content().await?,
-            store.content_repair_task_hashes().await?,
-        )
+        store.retained_content().await?
     };
-    let required = required_manifests(state, &retained).await;
+    audit_assigned_from_retained(state, &retained).await
+}
+
+/// Audits a caller-owned retained-content snapshot so one background pass does
+/// not repeatedly decode the full version and snapshot history.
+pub(crate) async fn audit_assigned_from_retained(
+    state: &ServerState,
+    retained: &RetainedContent,
+) -> Result<()> {
+    let pending = read_store(state, "content_recovery.audit_pending")
+        .await
+        .content_repair_task_hashes()
+        .await?;
+    let required = required_manifests(state, retained).await;
     let available = cached_local_cluster_available_subjects(state)
         .await
         .into_iter()
         .collect::<HashSet<_>>();
     let pending = pending.into_iter().collect::<HashSet<_>>();
     let mut enqueued = false;
-    for (hash, references) in retained.manifests {
+    for (hash, references) in &retained.manifests {
         if hash == storage::TOMBSTONE_MANIFEST_HASH
-            || !required.contains(&hash)
-            || pending.contains(&hash)
+            || !required.contains(hash)
+            || pending.contains(hash)
             || references.keys().any(|subject| available.contains(subject))
         {
             continue;
         }
-        let Some(_claim) = state.maintenance.content_repair_claims.try_claim(&hash) else {
+        let Some(_claim) = state.maintenance.content_repair_claims.try_claim(hash) else {
             // A repair already owns this manifest. Leave it to finish rather
             // than letting one slow source hold up the rest of this audit.
             continue;
         };
         if !read_store(state, "content_recovery.audit_claimed_task")
             .await
-            .content_repair_tasks_for_manifests(std::slice::from_ref(&hash))
+            .content_repair_tasks_for_manifests(std::slice::from_ref(hash))
             .await?
             .is_empty()
         {
@@ -617,7 +629,7 @@ pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
         // not caught up yet.
         if read_store(state, "content_recovery.audit_local_presence")
             .await
-            .manifest_is_fully_local(&hash)
+            .manifest_is_fully_local(hash)
             .await?
         {
             continue;
