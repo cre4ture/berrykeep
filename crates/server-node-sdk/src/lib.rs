@@ -278,14 +278,14 @@ use storage::{
     ClientCredentialRecord, ClientCredentialState, CurrentObjectsCacheStats, DataChangeAction,
     DataChangeActorKind, DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery,
     DataChangeUploadMode, DataScrubReport, HistoryHeadProjectionBackfillState,
-    HostDependencyReport, HostDependencySeverity, HostDependencyStatus, MediaCacheLookup,
-    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
-    MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
-    ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, ObjectVersionMetadataRecord,
-    PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
-    PutOptions, ReconcileVersionEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
-    RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
-    S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
+    HostDependencyReport, MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates,
+    MetadataBackendKind, MetadataDbLogicalDistribution, MetadataDbLogicalProgress,
+    MetadataDbLogicalProgressCallback, MetadataExportBundle, ObjectReadDescriptor, ObjectReadMode,
+    ObjectStreamPlan, ObjectVersionMetadataRecord, PairingAuthorizationRecord, PathMutationResult,
+    PersistentStore, PreferredHeadReason, PutOptions, ReconcileVersionEntry,
+    RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
+    ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord, S3BucketRecord,
+    S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
     StoragePathConfig, StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
     TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, grid_thumbnail_profile,
     media_cache_retry_due, metadata_db_logical_table_count,
@@ -13359,20 +13359,18 @@ async fn host_dependency_status(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let action = "auth/host/dependencies/get";
-    let authz = match authorize_admin_request(
+    if let Err(status) = authorize_admin_request(
         &state,
         &headers,
-        action,
+        "auth/host/dependencies/get",
         true,
         true,
         json!({ "node_id": state.node_id }),
     )
     .await
     {
-        Ok(request) => request,
-        Err(status) => return status.into_response(),
-    };
+        return status.into_response();
+    }
 
     let (mut report, data_dir, storage_paths): (
         HostDependencyReport,
@@ -13386,37 +13384,6 @@ async fn host_dependency_status(
     report
         .checks
         .extend(storage::systemd_mount_protection_checks(&data_dir, &storage_paths).await);
-    let missing_count = report
-        .checks
-        .iter()
-        .filter(|check| check.status == HostDependencyStatus::Missing)
-        .count();
-    let attention_count = report
-        .checks
-        .iter()
-        .filter(|check| {
-            check.status == HostDependencyStatus::Missing
-                && check.severity != HostDependencySeverity::Info
-        })
-        .count();
-
-    append_admin_audit(
-        &state,
-        action,
-        &authz,
-        true,
-        true,
-        true,
-        "success",
-        json!({
-            "host_os": report.host_os,
-            "dependency_count": report.checks.len(),
-            "missing_count": missing_count,
-            "attention_count": attention_count,
-        }),
-    )
-    .await;
-
     (StatusCode::OK, Json(report)).into_response()
 }
 
