@@ -595,11 +595,22 @@ async fn repair_subjects_inner(
     }
     let availability_may_have_changed = !tasks.is_empty();
     for (index, mut task) in tasks.into_values().enumerate() {
-        let _claim = state
+        let Some(_claim) = state
             .maintenance
             .content_repair_claims
-            .claim(&task.reference.manifest_hash)
-            .await;
+            .try_claim(&task.reference.manifest_hash)
+        else {
+            report.skipped_items += 1;
+            log_outcome(
+                state,
+                report,
+                &task,
+                "repair_waiting",
+                "repair remains queued while another operation owns its manifest".to_string(),
+                json!({"pending": true, "reason": "manifest_repair_in_progress"}),
+            );
+            continue;
+        };
         let requested_reference = task.reference.clone();
         let requested_repair_chunks = task.repair_chunks;
         let existing = read_store(state, "content_recovery.claimed_task")
