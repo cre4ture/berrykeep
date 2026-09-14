@@ -855,6 +855,16 @@ fn request_local_availability_refresh(state: &ServerState) {
         .notify_one();
 }
 
+/// Lets the availability cache's TTL detect out-of-band storage changes without
+/// invalidating it on every replication-auditor tick. The refresher performs a
+/// cheap cache hit until the TTL expires, then recomputes from local storage.
+fn request_ttl_bounded_local_availability_refresh(state: &ServerState) {
+    state
+        .maintenance
+        .local_availability_refresh_notify
+        .notify_one();
+}
+
 async fn run_local_availability_refresh(
     state: &ServerState,
     trigger: &'static str,
@@ -11826,6 +11836,7 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 
         loop {
             ticker.tick().await;
+            request_ttl_bounded_local_availability_refresh(&state);
 
             let retained = {
                 let store = read_store(&state, "replication_auditor.retained_snapshot").await;

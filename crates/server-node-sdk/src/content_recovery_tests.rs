@@ -87,6 +87,42 @@ async fn local_availability_refresh_keeps_its_fresh_cache_impl(backend: MainTest
         "a changed local view should remain cacheable for the refresh TTL"
     );
 
+    let scheduled_refresh = state
+        .maintenance
+        .local_availability_refresh_notify
+        .notified();
+    crate::request_ttl_bounded_local_availability_refresh(&state);
+    tokio::time::timeout(Duration::from_secs(1), scheduled_refresh)
+        .await
+        .expect("the auditor refresh request was not queued");
+    assert_eq!(
+        state
+            .maintenance
+            .local_availability_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        generation_after,
+        "a periodic refresh request must retain a valid cache until its TTL expires"
+    );
+    state
+        .maintenance
+        .local_availability_cache
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .computed_at = std::time::Instant::now() - crate::LOCAL_AVAILABILITY_CACHE_TTL;
+    crate::refresh_local_availability_view_once(&state).await;
+    assert!(
+        state
+            .maintenance
+            .local_availability_cache
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|cache| cache.is_valid_for(generation_after)),
+        "the queued refresh must recompute and replace an expired local view"
+    );
+
     cleanup_test_state(&state).await;
 }
 
