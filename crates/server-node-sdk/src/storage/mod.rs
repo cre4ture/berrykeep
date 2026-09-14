@@ -128,9 +128,9 @@ pub use media_cache::{
     CachedMediaMetadata, MediaCacheLookup, MediaCacheStatus, MediaGpsCoordinates,
     media_cache_retry_due, promote_cached_media_metadata_to_incomplete,
 };
-pub use media_tools::{HostDependencyCheck, HostDependencyReport};
-#[cfg(test)]
-pub(crate) use media_tools::{HostDependencySeverity, HostDependencyStatus};
+pub use media_tools::{
+    HostDependencyCheck, HostDependencyReport, HostDependencySeverity, HostDependencyStatus,
+};
 
 pub(crate) async fn systemd_mount_protection_checks(
     data_dir: &Path,
