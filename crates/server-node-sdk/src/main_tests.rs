@@ -14653,6 +14653,100 @@ run_on_main_metadata_backends!(
     autonomous_post_write_replication_pushes_to_missing_remote_nodes_turso
 );
 
+async fn replication_audit_syncs_availability_before_planning_repairs_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(2, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    let placeholder_node_id = {
+        let cluster = source.cluster.lock().await;
+        cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id != source.node_id)
+            .map(|node| node.node_id)
+            .expect("expected seeded remote placeholder")
+    };
+    assert!(source.cluster.lock().await.remove_node(placeholder_node_id));
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(target.clone(), &source).await;
+    register_online_source_node(&source, &target, &peer_base_url).await;
+    let key = "auditor-availability-sync.bin";
+    let version = "ver-auditor-availability-sync";
+    for node in [&source, &target] {
+        seed_subject_version(node, key, version, b"already replicated".to_vec(), vec![]).await;
+    }
+    super::refresh_local_availability_view_once(&target).await;
+
+    assert!(
+        source
+            .cluster
+            .lock()
+            .await
+            .available_nodes_for_subject(key)
+            .iter()
+            .all(|node| node.node_id != target.node_id),
+        "the test requires an initially stale remote availability view"
+    );
+
+    let target_descriptor = source
+        .cluster
+        .lock()
+        .await
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == target.node_id)
+        .expect("target should be registered with the auditor");
+    let response = super::execute_peer_request(
+        &source,
+        &target_descriptor,
+        reqwest::Method::GET,
+        "/cluster/availability/subjects/local",
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    .expect("auditor should reach the target availability endpoint");
+    let advertised = response
+        .json::<super::LocalAvailableSubjectsResponse>()
+        .expect("target availability response should decode");
+    assert!(
+        advertised.subjects.iter().any(|subject| subject == key),
+        "target must advertise its healthy subject: {advertised:?}"
+    );
+
+    super::run_replication_audit_once(&source).await;
+
+    assert!(
+        source
+            .cluster
+            .lock()
+            .await
+            .available_nodes_for_subject(key)
+            .iter()
+            .any(|node| node.node_id == target.node_id),
+        "the auditor must synchronize the remote view before its plan snapshot"
+    );
+    let history = repair_run_history(&source).await;
+    assert!(
+        history.is_empty(),
+        "a remote node that already advertises the subject must not receive a duplicate auditor repair: {history:?}"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    replication_audit_syncs_availability_before_planning_repairs_impl,
+    replication_audit_syncs_availability_before_planning_repairs,
+    replication_audit_syncs_availability_before_planning_repairs_turso
+);
+
 async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
     backend: MainTestBackend,
 ) {
