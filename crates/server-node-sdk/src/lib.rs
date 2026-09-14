@@ -453,6 +453,33 @@ struct ServerMaintenanceRuntime {
 struct ContentRepairClaims {
     active_manifests: StdMutex<HashSet<String>>,
     released: Notify,
+    #[cfg(test)]
+    wait_after_failed_claim: StdMutex<Option<ContentRepairClaimWaitHook>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ContentRepairClaimWaitHook {
+    waiting: Arc<Notify>,
+    resume: Arc<Notify>,
+}
+
+#[cfg(test)]
+impl ContentRepairClaimWaitHook {
+    fn new() -> Self {
+        Self {
+            waiting: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn wait_until_failed_claim(&self) {
+        self.waiting.notified().await;
+    }
+
+    fn resume_claim(&self) {
+        self.resume.notify_one();
+    }
 }
 
 struct ContentRepairClaim {
@@ -477,11 +504,33 @@ impl ContentRepairClaims {
             // Register the waiter before checking the set so a concurrent
             // release cannot be missed between the check and the await.
             let notified = self.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(claim) = self.try_claim(manifest_hash) {
                 return claim;
             }
+            #[cfg(test)]
+            let hook = {
+                self.wait_after_failed_claim
+                    .lock()
+                    .expect("content repair claim lock poisoned")
+                    .clone()
+            };
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook.waiting.notify_one();
+                hook.resume.notified().await;
+            }
             notified.await;
         }
+    }
+
+    #[cfg(test)]
+    fn set_wait_after_failed_claim(&self, hook: Option<ContentRepairClaimWaitHook>) {
+        *self
+            .wait_after_failed_claim
+            .lock()
+            .expect("content repair claim lock poisoned") = hook;
     }
 }
 
@@ -12450,7 +12499,7 @@ async fn refresh_local_availability_view_once(state: &ServerState) -> usize {
         cluster.reconcile_node_subjects(state.node_id, local_subjects.as_slice())
     };
 
-    if replicas_changed && let Err(err) = persist_cluster_replicas_state(state).await {
+    if replicas_changed && let Err(err) = persist_local_availability_reconciliation(state).await {
         warn!(
             error = %err,
             subject_count,
@@ -31027,10 +31076,26 @@ async fn persist_repair_state(state: &ServerState) -> Result<()> {
 }
 
 async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
-    // Cluster membership can change through imports and remote availability
-    // syncs without a namespace mutation. Force the next local view to use a
-    // fresh snapshot instead of replaying an older cached subject set.
-    invalidate_local_availability_cache(state);
+    persist_cluster_replicas_state_inner(state, true).await
+}
+
+/// Persists the local availability set computed in this refresh. It is already
+/// tied to the current generation, so invalidating it here would discard the
+/// fresh cache immediately and force another full retained-history scan.
+async fn persist_local_availability_reconciliation(state: &ServerState) -> Result<()> {
+    persist_cluster_replicas_state_inner(state, false).await
+}
+
+async fn persist_cluster_replicas_state_inner(
+    state: &ServerState,
+    invalidate_local_availability: bool,
+) -> Result<()> {
+    if invalidate_local_availability {
+        // Cluster membership can change through imports and remote availability
+        // syncs without a namespace mutation. Force the next local view to use
+        // a fresh snapshot instead of replaying an older cached subject set.
+        invalidate_local_availability_cache(state);
+    }
     let (replicas, available) = {
         let cluster = state.cluster.lock().await;
         (

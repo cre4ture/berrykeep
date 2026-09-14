@@ -22,25 +22,79 @@ async fn content_repair_claims_are_manifest_scoped() {
         .unwrap();
     different.await.unwrap();
 
-    let (same_ready_tx, mut same_ready) = tokio::sync::oneshot::channel();
+    let hook = crate::ContentRepairClaimWaitHook::new();
+    claims.set_wait_after_failed_claim(Some(hook.clone()));
+    let (same_ready_tx, same_ready) = tokio::sync::oneshot::channel();
     let same_claims = claims.clone();
     let same = tokio::spawn(async move {
         let _claim = same_claims.claim("manifest-a").await;
         same_ready_tx.send(()).unwrap();
     });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(25), &mut same_ready)
-            .await
-            .is_err(),
-        "the same manifest must remain serialized"
-    );
+    tokio::time::timeout(Duration::from_secs(1), hook.wait_until_failed_claim())
+        .await
+        .expect("waiting repair did not reach the claim wait point");
+    // This release falls between the failed claim and the await. `Notified::enable`
+    // must retain it; `notify_waiters` otherwise loses it and strands the waiter.
     drop(held);
+    hook.resume_claim();
     tokio::time::timeout(Duration::from_secs(1), same_ready)
         .await
         .expect("waiting repair did not resume after the matching claim released")
         .unwrap();
     same.await.unwrap();
+    claims.set_wait_after_failed_claim(None);
 }
+
+async fn local_availability_refresh_keeps_its_fresh_cache_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let key = "availability-cache-reconciliation.bin";
+    seed_subject_version(
+        &state,
+        key,
+        "v1",
+        b"availability cache bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    assert!(
+        crate::cached_local_cluster_available_subjects(&state)
+            .await
+            .is_empty(),
+        "the refresh must have a local availability change to persist"
+    );
+
+    let generation_before = state
+        .maintenance
+        .local_availability_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    crate::refresh_local_availability_view_once(&state).await;
+    let generation_after = state
+        .maintenance
+        .local_availability_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        generation_after, generation_before,
+        "persisting the locally computed availability set must not invalidate it"
+    );
+    assert!(
+        state
+            .maintenance
+            .local_availability_cache
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|cache| cache.is_valid_for(generation_after)),
+        "a changed local view should remain cacheable for the refresh TTL"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    local_availability_refresh_keeps_its_fresh_cache_impl,
+    local_availability_refresh_keeps_its_fresh_cache,
+    local_availability_refresh_keeps_its_fresh_cache_turso
+);
 
 async fn planning_subjects_deduplicate_retained_history_by_placement_impl(
     backend: MainTestBackend,
