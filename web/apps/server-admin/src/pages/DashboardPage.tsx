@@ -2,6 +2,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   clearAdminMediaCache,
   getClusterNodes,
+  getHostDependencyReport,
   getRepairActivityStatus,
   getRendezvousConfig,
   getClusterSummary,
@@ -15,6 +16,7 @@ import {
   type StorageStatsSample,
   type ProcessStatsSample,
   type ChildProcessStat,
+  type HostDependencyCheck,
   type TemperatureComponentStat,
   type MemoryAttributionSample
 } from "@berrykeep/api";
@@ -62,6 +64,7 @@ type StorageHistoryRangeKey = "24h" | "7d" | "30d" | "90d" | "1y" | "all";
 const STORAGE_HISTORY_MAX_POINTS = 360;
 const DASHBOARD_CHART_REFRESH_INTERVAL_MS = 3_000;
 const DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS = 30_000;
+const HOST_DEPENDENCY_REPORT_STALE_TIME_MS = 5 * 60_000;
 const STORAGE_HISTORY_RANGE_OPTIONS: Array<{
   key: StorageHistoryRangeKey;
   label: string;
@@ -191,6 +194,13 @@ export function DashboardPage() {
     enabled: canInspectRendezvous,
     refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
+  const hostDependencyReportQuery = useQuery({
+    queryKey: ["dashboard", "host-dependencies", normalizedAdminTokenOverride],
+    queryFn: () => getHostDependencyReport(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster,
+    staleTime: HOST_DEPENDENCY_REPORT_STALE_TIME_MS,
+    refetchOnWindowFocus: false
+  });
 
   async function refresh() {
     await Promise.all([
@@ -205,7 +215,8 @@ export function DashboardPage() {
             repairActivityQuery.refetch(),
             processStatsCurrentQuery.refetch(),
             processStatsHistoryQuery.refetch(),
-            processStatsMemoryQuery.refetch()
+            processStatsMemoryQuery.refetch(),
+            hostDependencyReportQuery.refetch()
           ]
         : []),
       ...(canInspectRendezvous ? [rendezvousConfigQuery.refetch()] : [])
@@ -240,6 +251,7 @@ export function DashboardPage() {
     canInspectRendezvous && !rendezvousConfigQuery.isError
       ? rendezvousConfigQuery.data ?? null
       : null;
+  const hostDependencyReport = canInspectCluster ? hostDependencyReportQuery.data ?? null : null;
   const backendHealth = backendHealthQuery.data ?? null;
   const storageStats = storageStatsQuery.data ?? null;
   const storageHistory = storageHistoryQuery.data ?? EMPTY_STORAGE_HISTORY;
@@ -271,7 +283,8 @@ export function DashboardPage() {
     canInspectCluster ? repairActivityQuery.error : null,
     canInspectCluster ? processStatsCurrentQuery.error : null,
     canInspectCluster ? processStatsHistoryQuery.error : null,
-    canInspectCluster ? processStatsMemoryQuery.error : null
+    canInspectCluster ? processStatsMemoryQuery.error : null,
+    canInspectCluster ? hostDependencyReportQuery.error : null
   ]);
 
   async function confirmMediaCacheClear() {
@@ -307,6 +320,7 @@ export function DashboardPage() {
   const reportingTemperatureComponentCount = temperatureComponents.filter(
     (component) => component.temperature_celsius !== null && component.temperature_celsius !== undefined
   ).length;
+  const hostDependencyFindings = (hostDependencyReport?.checks ?? []).filter(isDashboardHostDependencyFinding);
 
   return (
     <Stack gap="lg">
@@ -323,6 +337,21 @@ export function DashboardPage() {
         </Group>
       </Group>
       {error ? <Alert color="red" title="Failed to load dashboard">{error}</Alert> : null}
+      {hostDependencyFindings.length > 0 ? (
+        <Alert
+          color={hostDependencyFindings.some((check) => check.severity === "critical") ? "red" : "yellow"}
+          title="Host dependencies need attention"
+        >
+          <Stack gap={4}>
+            {hostDependencyFindings.map((check) => (
+              <Text key={check.id} size="sm">
+                <strong>{check.feature}:</strong> {check.summary}
+                {check.install_hint ? ` Remedy: ${check.install_hint}` : ""}
+              </Text>
+            ))}
+          </Stack>
+        </Alert>
+      ) : null}
       <Grid data-testid="dashboard-summary-metrics">
         {[
           {
@@ -1147,6 +1176,10 @@ function formatOptionalTemperature(value: number | null | undefined): string {
     return "unknown";
   }
   return `${value.toFixed(1)} C`;
+}
+
+function isDashboardHostDependencyFinding(check: HostDependencyCheck): boolean {
+  return check.severity === "warning" || check.severity === "critical";
 }
 
 function formatRepairActivityState(state: string): string {

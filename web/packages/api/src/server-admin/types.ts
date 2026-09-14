@@ -552,12 +552,15 @@ export type DataScrubTriggerResponse = {
   node_results: DataScrubTriggerNodeResult[];
 };
 
-export type HostDependencyStatus = "ready" | "missing" | "builtin" | "optional";
+export type HostDependencyStatus = "ready" | "missing" | "builtin" | "optional" | "not_applicable";
+
+export type HostDependencySeverity = "info" | "warning" | "critical";
 
 export type HostDependencyCheck = {
   id: string;
   feature: string;
   status: HostDependencyStatus;
+  severity?: HostDependencySeverity | null;
   summary: string;
   detail: string;
   configured_path?: string | null;

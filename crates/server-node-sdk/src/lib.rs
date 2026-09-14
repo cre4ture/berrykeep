@@ -278,15 +278,15 @@ use storage::{
     ClientCredentialRecord, ClientCredentialState, CurrentObjectsCacheStats, DataChangeAction,
     DataChangeActorKind, DataChangeEvent, DataChangeEventCursor, DataChangeEventQuery,
     DataChangeUploadMode, DataScrubReport, HistoryHeadProjectionBackfillState,
-    HostDependencyReport, HostDependencyStatus, MediaCacheLookup, MediaCacheStatus,
-    MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
+    HostDependencyReport, HostDependencySeverity, HostDependencyStatus, MediaCacheLookup,
+    MediaCacheStatus, MediaGpsCoordinates, MetadataBackendKind, MetadataDbLogicalDistribution,
     MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback, MetadataExportBundle,
     ObjectReadDescriptor, ObjectReadMode, ObjectStreamPlan, ObjectVersionMetadataRecord,
     PairingAuthorizationRecord, PathMutationResult, PersistentStore, PreferredHeadReason,
     PutOptions, ReconcileVersionEntry, RecoverableHistoryListing, RecoverableHistoryListingEntry,
     RepairAttemptRecord, ReplicationChunkInfo, ReplicationExportBundle, S3AccessKeyRecord,
     S3BucketRecord, S3BucketVersioningStatus, S3ControlPlaneState, SnapshotRestoreMutationResult,
-    StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
+    StoragePathConfig, StoragePathStats, StoragePoolConfig, StorageStatsSample, StoreReadError,
     TOMBSTONE_MANIFEST_HASH, UploadChunkRef, VersionConsistencyState, grid_thumbnail_profile,
     media_cache_retry_due, metadata_db_logical_table_count,
     promote_cached_media_metadata_to_incomplete, thumbnail_profile_from_query,
@@ -13374,14 +13374,30 @@ async fn host_dependency_status(
         Err(status) => return status.into_response(),
     };
 
-    let report: HostDependencyReport = {
+    let (mut report, data_dir, storage_paths): (
+        HostDependencyReport,
+        PathBuf,
+        Vec<StoragePathConfig>,
+    ) = {
         let store = read_store(&state, "host_dependency_report").await;
-        store.host_dependency_report()
+        let (data_dir, storage_paths) = store.mount_protection_paths();
+        (store.host_dependency_report(), data_dir, storage_paths)
     };
+    report
+        .checks
+        .extend(storage::systemd_mount_protection_checks(&data_dir, &storage_paths).await);
     let missing_count = report
         .checks
         .iter()
         .filter(|check| check.status == HostDependencyStatus::Missing)
+        .count();
+    let attention_count = report
+        .checks
+        .iter()
+        .filter(|check| {
+            check.status == HostDependencyStatus::Missing
+                && check.severity != HostDependencySeverity::Info
+        })
         .count();
 
     append_admin_audit(
@@ -13396,6 +13412,7 @@ async fn host_dependency_status(
             "host_os": report.host_os,
             "dependency_count": report.checks.len(),
             "missing_count": missing_count,
+            "attention_count": attention_count,
         }),
     )
     .await;
