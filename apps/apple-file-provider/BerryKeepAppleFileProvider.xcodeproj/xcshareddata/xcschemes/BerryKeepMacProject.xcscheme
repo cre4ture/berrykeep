@@ -15,7 +15,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "4ED9573DAC30D96830CFD46E"
+               BlueprintIdentifier = "999419FD42D2CE645814A9E7"
                BuildableName = "BerryKeepMacApp.app"
                BlueprintName = "BerryKeepMacApp"
                ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
@@ -29,7 +29,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "219D58F25590BF1A3D18330F"
+               BlueprintIdentifier = "D3C742AA3A351EDAF74BD123"
                BuildableName = "BerryKeepMacFileProviderExtension.appex"
                BlueprintName = "BerryKeepMacFileProviderExtension"
                ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
@@ -46,7 +46,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "4ED9573DAC30D96830CFD46E"
+            BlueprintIdentifier = "999419FD42D2CE645814A9E7"
             BuildableName = "BerryKeepMacApp.app"
             BlueprintName = "BerryKeepMacApp"
             ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
@@ -58,7 +58,7 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "A2F481122FD00FA65540A1A5"
+               BlueprintIdentifier = "D218D094DC9C3B4C0FB04D32"
                BuildableName = "BerryKeepAppleProjectTests.xctest"
                BlueprintName = "BerryKeepAppleProjectTests"
                ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
@@ -82,7 +82,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "4ED9573DAC30D96830CFD46E"
+            BlueprintIdentifier = "999419FD42D2CE645814A9E7"
             BuildableName = "BerryKeepMacApp.app"
             BlueprintName = "BerryKeepMacApp"
             ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
@@ -99,7 +99,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "4ED9573DAC30D96830CFD46E"
+            BlueprintIdentifier = "999419FD42D2CE645814A9E7"
             BuildableName = "BerryKeepMacApp.app"
             BlueprintName = "BerryKeepMacApp"
             ReferencedContainer = "container:BerryKeepAppleFileProvider.xcodeproj">
