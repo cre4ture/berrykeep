@@ -23,8 +23,6 @@ use futures_util::future::join_all;
 use super::StoragePathConfig;
 #[cfg(any(target_os = "linux", test))]
 use super::StoragePathState;
-#[cfg(any(target_os = "linux", test))]
-use super::media_tools::resolve_host_dependency_path;
 use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDependencyStatus};
 
 #[cfg(target_os = "linux")]
@@ -490,36 +488,21 @@ fn mount_dependencies_from_properties(
 ) -> Result<Vec<SystemdMountDependency>, String> {
     let expected_units = mount_units.iter().cloned().collect::<BTreeSet<_>>();
     let mut dependencies = BTreeMap::new();
-    let mut unit = None;
-    let mut where_path = None;
-
-    for line in properties.lines().chain(std::iter::once("")) {
-        if line.is_empty() {
-            finish_mount_dependency(
-                &expected_units,
-                &mut dependencies,
-                &mut unit,
-                &mut where_path,
-            )?;
-            continue;
-        }
-        let Some((property, value)) = line.split_once('=') else {
-            return Err(format!("unexpected systemctl output line `{line}`"));
+    for_each_mount_unit_record(properties, |unit, where_path| {
+        let Some(where_path) = where_path else {
+            return Err(format!("systemctl did not report Where for `{unit}`"));
         };
-        match property {
-            "Id" if unit.replace(value.to_string()).is_some() => {
-                return Err("systemctl reported Id more than once for one mount unit".to_string());
-            }
-            "Id" => {}
-            "Where" if where_path.replace(PathBuf::from(value)).is_some() => {
-                return Err(
-                    "systemctl reported Where more than once for one mount unit".to_string()
-                );
-            }
-            "Where" => {}
-            _ => return Err(format!("unexpected systemctl property `{property}`")),
+        if !expected_units.contains(&unit) {
+            return Err(format!("systemctl reported unexpected mount unit `{unit}`"));
         }
-    }
+        if where_path.as_os_str().is_empty() || where_path == Path::new("-") {
+            return Ok(());
+        }
+        if dependencies.insert(unit.clone(), where_path).is_some() {
+            return Err(format!("systemctl reported `{unit}` more than once"));
+        }
+        Ok(())
+    })?;
 
     Ok(mount_units
         .iter()
@@ -537,12 +520,51 @@ fn mount_dependencies_from_properties(
 #[cfg(any(target_os = "linux", test))]
 fn host_mount_points_from_properties(properties: &str) -> Result<BTreeSet<PathBuf>, String> {
     let mut mount_points = BTreeSet::new();
+    for_each_mount_unit_record(properties, |unit, where_path| {
+        if !unit.ends_with(".mount") {
+            return Err(format!("systemctl reported non-mount unit `{unit}`"));
+        }
+        let Some(where_path) = where_path else {
+            return Ok(());
+        };
+        if where_path.as_os_str().is_empty() || where_path == Path::new("-") {
+            return Ok(());
+        }
+        mount_points.insert(where_path);
+        Ok(())
+    })?;
+
+    Ok(mount_points)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn nonempty_host_mount_points_from_properties(
+    properties: &str,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let mount_points = host_mount_points_from_properties(properties)?;
+    if mount_points.is_empty() {
+        Err("systemctl did not report any host mount units".to_string())
+    } else {
+        Ok(mount_points)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn for_each_mount_unit_record(
+    properties: &str,
+    mut visit: impl FnMut(String, Option<PathBuf>) -> Result<(), String>,
+) -> Result<(), String> {
     let mut unit = None;
     let mut where_path = None;
-
     for line in properties.lines().chain(std::iter::once("")) {
         if line.is_empty() {
-            finish_host_mount_point(&mut mount_points, &mut unit, &mut where_path)?;
+            let Some(unit) = unit.take() else {
+                if where_path.take().is_some() {
+                    return Err("systemctl reported Where without Id".to_string());
+                }
+                continue;
+            };
+            visit(unit, where_path.take())?;
             continue;
         }
         let Some((property, value)) = line.split_once('=') else {
@@ -561,72 +583,6 @@ fn host_mount_points_from_properties(properties: &str) -> Result<BTreeSet<PathBu
             "Where" => {}
             _ => return Err(format!("unexpected systemctl property `{property}`")),
         }
-    }
-
-    Ok(mount_points)
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn nonempty_host_mount_points_from_properties(
-    properties: &str,
-) -> Result<BTreeSet<PathBuf>, String> {
-    let mount_points = host_mount_points_from_properties(properties)?;
-    if mount_points.is_empty() {
-        Err("systemctl did not report any host mount units".to_string())
-    } else {
-        Ok(mount_points)
-    }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn finish_host_mount_point(
-    mount_points: &mut BTreeSet<PathBuf>,
-    unit: &mut Option<String>,
-    where_path: &mut Option<PathBuf>,
-) -> Result<(), String> {
-    let Some(unit) = unit.take() else {
-        if where_path.take().is_some() {
-            return Err("systemctl reported Where without Id".to_string());
-        }
-        return Ok(());
-    };
-    if !unit.ends_with(".mount") {
-        return Err(format!("systemctl reported non-mount unit `{unit}`"));
-    }
-    let Some(where_path) = where_path.take() else {
-        return Ok(());
-    };
-    if where_path.as_os_str().is_empty() || where_path == Path::new("-") {
-        return Ok(());
-    }
-    mount_points.insert(where_path);
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn finish_mount_dependency(
-    expected_units: &BTreeSet<String>,
-    dependencies: &mut BTreeMap<String, PathBuf>,
-    unit: &mut Option<String>,
-    where_path: &mut Option<PathBuf>,
-) -> Result<(), String> {
-    let Some(unit) = unit.take() else {
-        if where_path.take().is_some() {
-            return Err("systemctl reported Where without Id".to_string());
-        }
-        return Ok(());
-    };
-    let Some(where_path) = where_path.take() else {
-        return Err(format!("systemctl did not report Where for `{unit}`"));
-    };
-    if !expected_units.contains(&unit) {
-        return Err(format!("systemctl reported unexpected mount unit `{unit}`"));
-    }
-    if where_path.as_os_str().is_empty() || where_path == Path::new("-") {
-        return Ok(());
-    }
-    if dependencies.insert(unit.clone(), where_path).is_some() {
-        return Err(format!("systemctl reported `{unit}` more than once"));
     }
     Ok(())
 }
@@ -777,18 +733,29 @@ async fn usable_path_canonicalizer() -> Result<PathBuf, String> {
 
 #[cfg(any(target_os = "linux", test))]
 async fn resolve_mount_protection_tool(configured_path: &Path) -> Option<PathBuf> {
-    // Searching PATH uses synchronous filesystem metadata probes. Keep those
-    // probes off the async runtime and bound the wait: an unavailable
-    // network-backed PATH entry must not stall an admin request indefinitely.
-    let configured_path = configured_path.to_path_buf();
-    timeout(
-        PATH_RESOLUTION_TIMEOUT,
-        tokio::task::spawn_blocking(move || resolve_host_dependency_path(&configured_path)),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .flatten()
+    // Resolve PATH inside a killable child: metadata on an unavailable
+    // network-backed PATH entry can block indefinitely, while dropping a Tokio
+    // blocking task cannot cancel its worker thread. The tool name is passed as
+    // a positional argument rather than interpolated into the shell program.
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "command -v -- \"$1\"",
+            "berrykeep-mount-protection-tool-resolution",
+        ])
+        .arg(configured_path)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = timeout(PATH_RESOLUTION_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = readlink_output_path(&output.stdout).ok()?;
+    (path.is_absolute() || path.components().count() > 1).then_some(path)
 }
 
 #[cfg(any(target_os = "linux", test))]
