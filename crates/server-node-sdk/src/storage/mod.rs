@@ -2739,6 +2739,58 @@ pub struct PersistentStore {
     media_tools: MediaToolPaths,
     #[cfg(test)]
     data_scrub_run_test_hook: Option<DataScrubRunTestHook>,
+    #[cfg(test)]
+    cleanup_unreferenced_test_hook: Option<CleanupUnreferencedTestHook>,
+}
+
+/// Content reachability captured atomically before a GC sweep. New repair
+/// pins registered after this snapshot are handled by a later sweep; they are
+/// never mistaken for part of the snapshot that this sweep protects.
+struct CleanupProtectionSnapshot {
+    recovery_tasks: Vec<ContentRepairTask>,
+    referenced_manifests: HashSet<String>,
+    owned_referenced_manifests: HashSet<String>,
+    cached_chunk_records: Vec<CachedChunkRecord>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct CleanupUnreferencedTestHook {
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl CleanupUnreferencedTestHook {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    async fn block_after_snapshot(&self) {
+        self.started.add_permits(1);
+        let permit = self
+            .release
+            .acquire()
+            .await
+            .expect("cleanup test hook should remain open");
+        permit.forget();
+    }
+
+    pub(crate) async fn wait_until_started(&self) {
+        let permit = self
+            .started
+            .acquire()
+            .await
+            .expect("cleanup test hook should remain open");
+        permit.forget();
+    }
+
+    pub(crate) fn release_sweep(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 #[derive(Clone)]
@@ -4314,6 +4366,8 @@ impl PersistentStore {
             media_tools: MediaToolPaths::default(),
             #[cfg(test)]
             data_scrub_run_test_hook: None,
+            #[cfg(test)]
+            cleanup_unreferenced_test_hook: None,
         };
         let object_id_migration_started = Instant::now();
         let object_id_migration_needed =
@@ -4941,6 +4995,14 @@ impl PersistentStore {
     #[cfg(test)]
     pub fn set_data_scrub_run_test_hook(&mut self, hook: Option<DataScrubRunTestHook>) {
         self.data_scrub_run_test_hook = hook;
+    }
+
+    #[cfg(test)]
+    pub fn set_cleanup_unreferenced_test_hook(
+        &mut self,
+        hook: Option<CleanupUnreferencedTestHook>,
+    ) {
+        self.cleanup_unreferenced_test_hook = hook;
     }
 
     #[cfg(test)]
@@ -9218,13 +9280,26 @@ impl PersistentStore {
         retention_secs: u64,
         dry_run: bool,
     ) -> Result<CleanupReport> {
-        let _gc_guard = self.content_gc_gate.write().await;
-        let recovery_tasks = self.metadata_store.load_content_repair_tasks().await?;
+        // The exclusive gate only protects the reachability snapshot. Keeping
+        // it through directory walks and file deletion would block durable
+        // task registration and verified chunk installation for the duration
+        // of a store-sized sweep.
+        let protection = {
+            let _gc_guard = self.content_gc_gate.write().await;
+            self.cleanup_protection_snapshot().await?
+        };
+        let CleanupProtectionSnapshot {
+            recovery_tasks,
+            referenced_manifests,
+            owned_referenced_manifests,
+            cached_chunk_records,
+        } = protection;
+        #[cfg(test)]
+        if let Some(hook) = &self.cleanup_unreferenced_test_hook {
+            hook.block_after_snapshot().await;
+        }
         let now = unix_ts();
-        let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
-        let owned_referenced_manifests = self.collect_owned_referenced_manifest_hashes().await?;
         let manifest_paths = self.list_manifest_paths().await?;
-        let cached_chunk_records = self.metadata_store.list_cached_chunk_records().await?;
         let tracked_cached_chunks = cached_chunk_records.len();
         let cached_chunk_hashes = cached_chunk_records
             .iter()
@@ -9428,6 +9503,15 @@ impl PersistentStore {
             deleted_cached_chunk_records,
             retained_manifests_processed: retained_manifest_hashes.len(),
             peak_manifest_batch_size,
+        })
+    }
+
+    async fn cleanup_protection_snapshot(&self) -> Result<CleanupProtectionSnapshot> {
+        Ok(CleanupProtectionSnapshot {
+            recovery_tasks: self.metadata_store.load_content_repair_tasks().await?,
+            referenced_manifests: self.collect_referenced_manifest_hashes().await?,
+            owned_referenced_manifests: self.collect_owned_referenced_manifest_hashes().await?,
+            cached_chunk_records: self.metadata_store.list_cached_chunk_records().await?,
         })
     }
 
@@ -11257,7 +11341,15 @@ impl PersistentStore {
                 let ftype = entry.file_type().await?;
                 if ftype.is_dir() {
                     dirs.push(path);
-                } else if ftype.is_file() {
+                } else if ftype.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(manifest_hash_looks_safe_filename)
+                {
+                    // Active chunk installs use a temporary suffix until their
+                    // atomic rename completes. A sweep snapshots protection
+                    // first and deliberately ignores those in-flight files.
                     files.push(path);
                 }
             }

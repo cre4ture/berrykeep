@@ -3172,6 +3172,63 @@ run_on_all_metadata_backends!(
     cleanup_unreferenced_dry_run_reports_without_deleting_turso
 );
 
+async fn cleanup_snapshot_allows_repair_pin_registration_during_sweep_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("cleanup-repair-pin-concurrency").await;
+    let put = store
+        .put_object_versioned(
+            "live.bin",
+            Bytes::from_static(b"live content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let reference = store
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject("live.bin")
+        .unwrap()
+        .clone();
+    let task = content_recovery::ContentRepairTask::new(reference, true);
+    let hook = CleanupUnreferencedTestHook::new();
+    store.set_cleanup_unreferenced_test_hook(Some(hook.clone()));
+
+    let cleanup = store.cleanup_unreferenced(0, false);
+    tokio::pin!(cleanup);
+    tokio::select! {
+        _ = hook.wait_until_started() => {},
+        result = &mut cleanup => panic!("cleanup completed before its test hook: {result:?}"),
+    }
+
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        store.persist_content_repair_task(&task),
+    )
+    .await
+    .expect("repair pin registration must not wait for the file sweep")
+    .unwrap();
+    hook.release_sweep();
+    cleanup.await.unwrap();
+    assert!(
+        store
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .any(|pending| pending.reference.manifest_hash == put.manifest_hash)
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_snapshot_allows_repair_pin_registration_during_sweep_impl,
+    cleanup_snapshot_allows_repair_pin_registration_during_sweep,
+    cleanup_snapshot_allows_repair_pin_registration_during_sweep_turso
+);
+
 async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("cleanup-delete").await;
 
