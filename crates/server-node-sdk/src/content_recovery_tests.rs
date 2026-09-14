@@ -79,6 +79,46 @@ async fn repair_logs_expired_retained_reference_skips() {
     cleanup_test_state(&state).await;
 }
 
+async fn fully_local_recovery_does_not_require_the_store_write_lock_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let key = choose_locally_placed_key(&state, "shared-recovery-store").await;
+    seed_subject_version(
+        &state,
+        &key,
+        "v1",
+        b"fully local repair bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    let manifest = bundle(&state, &key, "v1").await;
+
+    let reader = read_store(&state, "test.recovery.shared_store_reader").await;
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::content_recovery::repair_subjects(
+            &state,
+            vec![format!(
+                "{MANIFEST_SUBJECT_PREFIX}{}",
+                manifest.manifest_hash
+            )],
+            None,
+        ),
+    )
+    .await
+    .expect("fully local recovery must not wait for the store write lock");
+    drop(reader);
+
+    assert_eq!(report.successful_transfers, 1, "{report:?}");
+    assert_eq!(report.failed_transfers, 0, "{report:?}");
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    fully_local_recovery_does_not_require_the_store_write_lock_impl,
+    fully_local_recovery_does_not_require_the_store_write_lock,
+    fully_local_recovery_does_not_require_the_store_write_lock_turso
+);
+
 async fn local_availability_refresh_keeps_its_fresh_cache_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let key = "availability-cache-reconciliation.bin";

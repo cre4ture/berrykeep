@@ -316,7 +316,11 @@ async fn recover_task_unbounded(
     let bytes = recover_manifest(state, &task.reference).await?;
     let manifest = validate_manifest(&task.reference.manifest_hash, &bytes)?;
     {
-        let store = lock_store(state, "content_recovery.prepare").await;
+        // This pass only reads chunk presence and persists metadata through
+        // `PersistentStore`'s interior synchronization. Keeping the global
+        // store lock shared lets ordinary reads proceed while large manifests
+        // are prepared for recovery.
+        let store = read_store(state, "content_recovery.prepare").await;
         task.chunks.clear();
         for chunk in manifest.chunks {
             // Metadata-only nodes repair damaged cached bytes without hydrating
@@ -348,7 +352,10 @@ async fn recover_task_unbounded(
         }
         return Err(NoContentSource(detail).into());
     }
-    let store = lock_store(state, "content_recovery.finish").await;
+    // Completion re-hashes every recovered byte. It must retain the content
+    // GC gate inside `finish_content_repair`, but does not mutate the store
+    // object itself, so do not monopolize the global store lock for the scan.
+    let store = read_store(state, "content_recovery.finish").await;
     store.finish_content_repair(task).await?;
     Ok(result.recovered)
 }
@@ -571,7 +578,12 @@ async fn repair_subjects_inner(
                     "repair_unresolved"
                 };
                 let detail = format!("{error:#}");
-                task.defer(detail.clone(), unix_ts(), state.repair_config.backoff_secs);
+                task.defer(
+                    detail.clone(),
+                    unix_ts(),
+                    state.repair_config.backoff_secs,
+                    task.recovered_chunks > recovered_before_attempt,
+                );
                 read_store(state, "content_recovery.defer")
                     .await
                     .persist_content_repair_task(&task)

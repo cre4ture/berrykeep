@@ -427,7 +427,7 @@ async fn retained_content_repair_pins_survive_restart_and_gc_impl(backend: Stora
     task.chunks = content_recovery::validate_manifest(&task.reference.manifest_hash, &bytes)
         .unwrap()
         .chunks;
-    task.defer("peer offline".to_string(), unix_ts(), 1);
+    task.defer("peer offline".to_string(), unix_ts(), 1, false);
     target.persist_content_repair_task(&task).await.unwrap();
     let chunk_hash = hash_hex(b"pinned bytes");
     let (cleanup, install) = tokio::join!(
