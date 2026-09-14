@@ -227,6 +227,23 @@ run_on_main_metadata_backends!(
     recovery_read_budget_bounds_slow_unadvertised_peers_turso
 );
 
+#[tokio::test]
+async fn durable_recovery_budget_turns_stalled_work_into_retryable_wait() {
+    let error =
+        crate::content_recovery::bounded_durable_recovery(Duration::from_millis(5), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("durable content repair pass exceeded"),
+        "a budget expiry must follow the retryable no-source path: {error:#}"
+    );
+}
+
 async fn recovery_targeted_repair_respects_busy_throttle_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let mut target = build_test_state(1, false, backend).await;
