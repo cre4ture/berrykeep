@@ -106,7 +106,7 @@ fn is_windows_apps_package_root(path: &std::path::Path) -> bool {
 
 #[cfg(windows)]
 fn windows_app_execution_alias_path(executable_name: &str) -> Option<std::path::PathBuf> {
-    common::legacy_compatibility::var_os("LOCALAPPDATA")
+    std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
         .map(|path| {

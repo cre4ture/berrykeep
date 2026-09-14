@@ -233,7 +233,7 @@ mod windows_service_host {
     }
 
     fn service_environment_file_path() -> PathBuf {
-        let program_data = common::legacy_compatibility::var_os("ProgramData")
+        let program_data = std::env::var_os("ProgramData")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
         program_data

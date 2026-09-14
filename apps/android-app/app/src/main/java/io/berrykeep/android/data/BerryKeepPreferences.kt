@@ -14,8 +14,6 @@ private const val DEVICE_AUTH_STATE_KEY = "device_auth_state"
 object BerryKeepPreferences {
     private const val DEVICE_AUTH_PREFS_NAME = "berrykeep_prefs"
     private const val APP_PREFS_NAME = "berrykeep_app_prefs"
-    private const val LEGACY_DEVICE_AUTH_PREFS_NAME = "ironmesh_prefs"
-    private const val LEGACY_APP_PREFS_NAME = "ironmesh_app_prefs"
     private const val PREF_SYNC_CONFIGS = "folder_sync_configs"
     private const val PREF_GALLERY_VIEW_MODE = "gallery_view_mode"
     private const val PREF_APP_CONNECTION_STATUS = "app_connection_status"
@@ -50,25 +48,11 @@ object BerryKeepPreferences {
     private fun deviceAuthPrefs(context: Context) =
         context.getSharedPreferences(DEVICE_AUTH_PREFS_NAME, Context.MODE_PRIVATE)
 
-    private fun legacyAppPrefs(context: Context) =
-        context.getSharedPreferences(LEGACY_APP_PREFS_NAME, Context.MODE_PRIVATE)
-
-    private fun legacyDeviceAuthPrefs(context: Context) =
-        context.getSharedPreferences(LEGACY_DEVICE_AUTH_PREFS_NAME, Context.MODE_PRIVATE)
-
-    private fun legacyAppPreferenceStores(context: Context) = listOf(
-        legacyAppPrefs(context),
-        legacyDeviceAuthPrefs(context),
-    )
-
     private fun deviceAuthPersistence(context: Context): DeviceAuthStatePersistence {
         deviceAuthPersistence?.let { return it }
         return synchronized(this) {
             deviceAuthPersistence ?: DeviceAuthStatePersistence(
-                preferences = MigratingDeviceAuthPreferencesStorage(
-                    preferences = deviceAuthPrefs(context),
-                    legacyPreferences = legacyDeviceAuthPrefs(context),
-                ),
+                preferences = SharedPreferencesDeviceAuthStorage(deviceAuthPrefs(context)),
                 secretStore = AtomicFileDeviceIdentitySecretStore(
                     context.noBackupFilesDir.resolve(
                         AtomicFileDeviceIdentitySecretStore.DEFAULT_FILE_NAME,
@@ -82,15 +66,7 @@ object BerryKeepPreferences {
         context: Context,
         key: String,
     ): String? {
-        appPrefs(context).getString(key, null)?.let { return it }
-        for (legacyPrefs in legacyAppPreferenceStores(context)) {
-            val legacyValue = legacyPrefs.getString(key, null) ?: continue
-            if (appPrefs(context).edit().putString(key, legacyValue).commit()) {
-                legacyPrefs.edit().remove(key).apply()
-            }
-            return legacyValue
-        }
-        return null
+        return appPrefs(context).getString(key, null)
     }
 
     private fun writeAppPreference(
@@ -105,9 +81,6 @@ object BerryKeepPreferences {
             editor.putString(key, value)
         }
         editor.apply()
-        legacyAppPreferenceStores(context).forEach { legacyPrefs ->
-            legacyPrefs.edit().remove(key).apply()
-        }
     }
 
     fun getFolderSyncConfigs(context: Context): List<FolderSyncConfig> {
@@ -195,17 +168,11 @@ object BerryKeepPreferences {
     }
 }
 
-private class MigratingDeviceAuthPreferencesStorage(
+private class SharedPreferencesDeviceAuthStorage(
     private val preferences: SharedPreferences,
-    private val legacyPreferences: SharedPreferences,
 ) : DeviceAuthPreferencesStorage {
     override fun read(): String? {
-        preferences.getString(DEVICE_AUTH_STATE_KEY, null)?.let { return it }
-        val legacyValue = legacyPreferences.getString(DEVICE_AUTH_STATE_KEY, null) ?: return null
-        if (preferences.edit().putString(DEVICE_AUTH_STATE_KEY, legacyValue).commit()) {
-            legacyPreferences.edit().remove(DEVICE_AUTH_STATE_KEY).apply()
-        }
-        return legacyValue
+        return preferences.getString(DEVICE_AUTH_STATE_KEY, null)
     }
 
     override fun write(value: String) {
@@ -214,7 +181,6 @@ private class MigratingDeviceAuthPreferencesStorage(
                 "Could not save device authentication settings. Enrollment was not changed.",
             )
         }
-        legacyPreferences.edit().remove(DEVICE_AUTH_STATE_KEY).apply()
     }
 
     override fun clear() {
@@ -223,6 +189,5 @@ private class MigratingDeviceAuthPreferencesStorage(
                 "Could not clear device authentication settings. Enrollment was not changed.",
             )
         }
-        legacyPreferences.edit().remove(DEVICE_AUTH_STATE_KEY).apply()
     }
 }

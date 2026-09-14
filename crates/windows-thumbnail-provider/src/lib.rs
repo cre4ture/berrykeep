@@ -303,7 +303,7 @@ fn thumbnail_bytes_cache() -> &'static Mutex<ThumbnailBytesCache> {
 }
 
 fn append_diagnostic_log(message: &str) {
-    let root = common::legacy_compatibility::var_os("LOCALAPPDATA")
+    let root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("BerryKeep");

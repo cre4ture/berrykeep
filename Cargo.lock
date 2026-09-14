@@ -1596,7 +1596,6 @@ version = "1.2.0"
 dependencies = [
  "anyhow",
  "client-sdk",
- "common",
  "serde",
  "serde_json",
  "tracing",
@@ -5968,7 +5967,6 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-server",
- "common",
  "fs2",
  "iptocc",
  "percent-encoding",
@@ -7772,7 +7770,6 @@ dependencies = [
  "adapter-windows-cfapi",
  "anyhow",
  "client-sdk",
- "common",
  "git-version",
  "image",
  "reqwest 0.12.28",

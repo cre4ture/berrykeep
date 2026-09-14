@@ -16,7 +16,7 @@ The main contracts to freeze, or deliberately change before release, are:
 - packaging, installation, and update behavior
 - security, migration, observability, and release gates
 
-Active compatibility shims and aliases should be tracked in [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) so cleanup decisions can be made entry by entry.
+Active compatibility shims and aliases should be tracked in [compatibility-contracts.md](compatibility-contracts.md) so cleanup decisions can be made entry by entry.
 
 ## Current Release Snapshot
 
@@ -271,10 +271,10 @@ Working evidence log:
    - [crates/web-ui-backend/src/lib.rs](../crates/web-ui-backend/src/lib.rs)
    - [web/tests/client-ui.smoke.spec.ts](../web/tests/client-ui.smoke.spec.ts)
    - [web/tests/server-admin.smoke.spec.ts](../web/tests/server-admin.smoke.spec.ts)
-   - [docs/backwards-compatibility-aliases.md](backwards-compatibility-aliases.md)
+   - [docs/compatibility-contracts.md](compatibility-contracts.md)
 - Confirmed stable contracts:
    - `client-sdk`, `server-node-sdk`, and `web-ui-backend` now use `/api/v1` as the canonical client-facing prefix, and bootstrap direct-target probes use `/api/v1/health`.
-   - Legacy unversioned client-facing aliases remain server-side only as temporary compatibility shims and are now recorded in [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md).
+   - Legacy unversioned client-facing aliases remain server-side only as temporary compatibility shims and are now recorded in [compatibility-contracts.md](compatibility-contracts.md).
    - Representative server-node and bundled-web error helpers now pin the top-level public JSON envelope to `{ "error": string }`, and the smoke suites assert canonical `/api/v1` URLs instead of legacy unversioned paths.
 - Findings:
    - `question`: whether bundled `web-ui-backend` routes should be documented as part of the public stable surface or treated as bundled-tool internal routes is still undecided.
@@ -283,7 +283,7 @@ Working evidence log:
    - A single route catalog that maps each stable client-facing endpoint and payload to Rust or smoke-test coverage is still missing.
 - Proposed pre-release actions:
    - Write the explicit stable-route catalog and decide whether `web-ui-backend` stays internal or joins the public first-release API surface.
-   - Keep legacy aliases documented in [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) until external callers are known to be off them.
+   - Keep legacy aliases documented in [compatibility-contracts.md](compatibility-contracts.md) until external callers are known to be off them.
 - Deferred post-release items:
    - Remove temporary unversioned aliases once the compatibility window closes.
 
@@ -370,7 +370,7 @@ Working evidence log:
    - [crates/sync-agent-core/src/folder_agent_state.rs](../crates/sync-agent-core/src/folder_agent_state.rs)
    - [crates/client-sdk/src/content_addressed_client_cache.rs](../crates/client-sdk/src/content_addressed_client_cache.rs)
    - [crates/server-node-sdk/src/storage/sqlite_impl.rs](../crates/server-node-sdk/src/storage/sqlite_impl.rs)
-   - [docs/backwards-compatibility-aliases.md](backwards-compatibility-aliases.md)
+   - [docs/compatibility-contracts.md](compatibility-contracts.md)
    - [docs/cross-platform-filesystem-integration-strategy.md](cross-platform-filesystem-integration-strategy.md)
    - [docs/windows-msix-release-update-strategy.md](windows-msix-release-update-strategy.md)
 - Confirmed stable contracts:
@@ -397,7 +397,7 @@ Working evidence log:
 - Missing tests or docs:
    - No additional persisted-path gaps were found in this pass beyond broader release-review work.
 - Proposed pre-release actions:
-   - Keep the Windows `BerryKeep` root and Linux `berrykeep` XDG roots as intentional OS-specific contracts, and keep [backwards-compatibility-aliases.md](backwards-compatibility-aliases.md) as the cleanup ledger for retained legacy readers.
+   - Keep the Windows `BerryKeep` root and Linux `berrykeep` XDG roots as intentional OS-specific contracts, and keep [compatibility-contracts.md](compatibility-contracts.md) as the cleanup ledger for retained legacy readers.
 - Deferred post-release items:
    - Remove missing-version compatibility paths only after the supported upgrade window no longer requires reading pre-marker files or databases.
    - Remove legacy hidden Windows bootstrap and identity discovery names once the compatibility window closes.

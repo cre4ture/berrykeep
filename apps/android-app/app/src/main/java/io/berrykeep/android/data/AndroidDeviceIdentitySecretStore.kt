@@ -88,7 +88,6 @@ class AndroidKeyStoreDeviceIdentityCrypto(
 
     companion object {
         const val DEFAULT_KEY_ALIAS = "berrykeep.device-identity.aes-gcm.v1"
-        const val LEGACY_KEY_ALIAS = "ironmesh.device-identity.aes-gcm.v1"
         private const val ANDROID_KEY_STORE = "AndroidKeyStore"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val KEY_SIZE_BITS = 256
@@ -99,9 +98,6 @@ class AndroidKeyStoreDeviceIdentityCrypto(
 class AtomicFileDeviceIdentitySecretStore(
     baseFile: File,
     private val crypto: DeviceIdentityCrypto = AndroidKeyStoreDeviceIdentityCrypto(),
-    private val legacyCrypto: DeviceIdentityCrypto? = AndroidKeyStoreDeviceIdentityCrypto(
-        AndroidKeyStoreDeviceIdentityCrypto.LEGACY_KEY_ALIAS,
-    ),
 ) : DeviceIdentitySecretStore {
     private val atomicFile = AtomicFile(baseFile)
     private val secretAdapter = moshi.adapter(DeviceIdentitySecret::class.java)
@@ -119,23 +115,17 @@ class AtomicFileDeviceIdentitySecretStore(
             check(envelope.version == ENVELOPE_VERSION) {
                 "unsupported encrypted identity envelope version ${envelope.version}"
             }
-            val decrypted = decrypt(
+            val plaintext = crypto.decrypt(
                 DeviceIdentityCiphertext(
                     iv = Base64.getDecoder().decode(envelope.iv),
                     ciphertext = Base64.getDecoder().decode(envelope.ciphertext),
                 ),
             )
             try {
-                val secret = secretAdapter.fromJson(decrypted.plaintext.toString(Charsets.UTF_8))
+                secretAdapter.fromJson(plaintext.toString(Charsets.UTF_8))
                     ?: throw IllegalStateException("decrypted device identity is empty")
-                if (decrypted.usedLegacyKey) {
-                    // Keep the readable legacy ciphertext if re-encryption cannot
-                    // complete; the fallback remains available on the next launch.
-                    runCatching { save(secret) }
-                }
-                secret
             } finally {
-                decrypted.plaintext.fill(0)
+                plaintext.fill(0)
             }
         } catch (error: Exception) {
             throw DeviceIdentityRecoveryRequiredException(error)
@@ -191,24 +181,6 @@ class AtomicFileDeviceIdentitySecretStore(
             )
         }
     }
-
-    private fun decrypt(payload: DeviceIdentityCiphertext): DecryptedIdentity =
-        try {
-            DecryptedIdentity(crypto.decrypt(payload), usedLegacyKey = false)
-        } catch (canonicalError: Exception) {
-            val legacy = legacyCrypto ?: throw canonicalError
-            try {
-                DecryptedIdentity(legacy.decrypt(payload), usedLegacyKey = true)
-            } catch (legacyError: Exception) {
-                canonicalError.addSuppressed(legacyError)
-                throw canonicalError
-            }
-        }
-
-    private data class DecryptedIdentity(
-        val plaintext: ByteArray,
-        val usedLegacyKey: Boolean,
-    )
 
     private data class DeviceIdentityEnvelope(
         val version: Int,

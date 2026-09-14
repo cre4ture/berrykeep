@@ -2485,7 +2485,7 @@ fn windows_local_appdata_sync_root_state_dir(sync_root_path: &Path) -> PathBuf {
 
 #[cfg(windows)]
 fn windows_local_appdata_root() -> PathBuf {
-    common::legacy_compatibility::var_os("LOCALAPPDATA")
+    std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)

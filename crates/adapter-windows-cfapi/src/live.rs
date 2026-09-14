@@ -429,7 +429,7 @@ const WINDOWS_LOCAL_STATE_ROOT_DIR: &str = "BerryKeep";
 const WINDOWS_DOWNLOAD_STAGE_SUBDIR: &str = "cfapi-downloads";
 
 pub fn windows_download_stage_root(scope: &str) -> Result<PathBuf> {
-    let base = common::legacy_compatibility::var_os("LOCALAPPDATA")
+    let base = std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);

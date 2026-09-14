@@ -121,11 +121,6 @@ internal class OriginalShareCapabilityStore(
         PREFERENCES_NAME,
         Context.MODE_PRIVATE,
     )
-    private val legacyPreferences = context.applicationContext.getSharedPreferences(
-        LEGACY_PREFERENCES_NAME,
-        Context.MODE_PRIVATE,
-    )
-
     fun create(request: OriginalShareRequest): OriginalShareCapability = synchronized(lock) {
         val now = clock()
         pruneLocked(now, entriesToReserve = 1)
@@ -153,33 +148,28 @@ internal class OriginalShareCapabilityStore(
         if (!TOKEN_PATTERN.matches(token)) {
             throw FileNotFoundException("Invalid original-share capability")
         }
-        val sourcePreferences = preferenceContaining(token)
-            ?: throw FileNotFoundException("Original-share capability is unavailable")
-        val raw = sourcePreferences.getString(token, null)
+        val raw = preferences.getString(token, null)
             ?: throw FileNotFoundException("Original-share capability is unavailable")
         val capability = runCatching { OriginalShareCapability.fromJson(token, raw) }
             .getOrElse { error ->
-                sourcePreferences.edit().remove(token).apply()
+                preferences.edit().remove(token).apply()
                 throw FileNotFoundException("Original-share capability is invalid").apply {
                     initCause(error)
                 }
             }
         if (capability.expiresAtUnixMs <= clock()) {
-            sourcePreferences.edit().remove(token).apply()
+            preferences.edit().remove(token).apply()
             throw FileNotFoundException("Original-share capability has expired")
         }
-        migrateLegacyCapability(token, raw, sourcePreferences)
         capability
     }
 
     fun remove(token: String) = synchronized(lock) {
         preferences.edit().remove(token).apply()
-        legacyPreferences.edit().remove(token).apply()
     }
 
     internal fun clearForTesting() = synchronized(lock) {
         preferences.edit().clear().commit()
-        legacyPreferences.edit().clear().commit()
     }
 
     private fun pruneLocked(now: Long, entriesToReserve: Int) {
@@ -202,26 +192,8 @@ internal class OriginalShareCapabilityStore(
         check(editor.commit()) { "Could not prune Android share capabilities" }
     }
 
-    private fun preferenceContaining(token: String): SharedPreferences? = when {
-        preferences.contains(token) -> preferences
-        legacyPreferences.contains(token) -> legacyPreferences
-        else -> null
-    }
-
-    private fun migrateLegacyCapability(
-        token: String,
-        raw: String,
-        sourcePreferences: SharedPreferences,
-    ) {
-        if (sourcePreferences !== legacyPreferences) return
-        if (preferences.edit().putString(token, raw).commit()) {
-            legacyPreferences.edit().remove(token).apply()
-        }
-    }
-
     private companion object {
         const val PREFERENCES_NAME = "berrykeep_share_capabilities"
-        const val LEGACY_PREFERENCES_NAME = "ironmesh_share_capabilities"
         const val CAPABILITY_LIFETIME_MS = 24L * 60L * 60L * 1_000L
         const val MAX_CAPABILITY_COUNT = 64
         val TOKEN_PATTERN = Regex(

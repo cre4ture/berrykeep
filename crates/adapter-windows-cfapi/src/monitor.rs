@@ -2074,7 +2074,7 @@ mod tests {
         let mut monitor = SyncRootMonitor::new(
             "monitor-test",
             std::env::temp_dir().join(format!(
-                "ironmesh-monitor-upload-identity-retry-{}",
+                "berrykeep-monitor-upload-identity-retry-{}",
                 uuid::Uuid::new_v4()
             )),
             uuid::Uuid::nil(),
@@ -2128,7 +2128,7 @@ mod tests {
     #[test]
     fn vanished_materialized_replacement_marks_retry_before_advancing_cas_baseline() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-monitor-vanished-replacement-{}",
+            "berrykeep-monitor-vanished-replacement-{}",
             uuid::Uuid::new_v4()
         ));
         let path = "docs/report.txt";
@@ -2180,7 +2180,7 @@ mod tests {
     #[test]
     fn ambiguous_materialized_upload_marks_retry_instead_of_dropping_cas_intent() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-monitor-ambiguous-file-{}",
+            "berrykeep-monitor-ambiguous-file-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create sync root");
@@ -2225,7 +2225,7 @@ mod tests {
     #[test]
     fn ambiguous_directory_upload_marks_retry() {
         let sync_root = std::env::temp_dir().join(format!(
-            "ironmesh-monitor-ambiguous-directory-{}",
+            "berrykeep-monitor-ambiguous-directory-{}",
             uuid::Uuid::new_v4()
         ));
         let path = "docs";
@@ -2279,7 +2279,7 @@ mod tests {
     #[test]
     fn placeholder_classification_failure_never_becomes_a_materialized_upload() {
         let root = std::env::temp_dir().join(format!(
-            "ironmesh-monitor-placeholder-classification-{}",
+            "berrykeep-monitor-placeholder-classification-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root).expect("failed to create test root");
@@ -2317,7 +2317,7 @@ mod tests {
         let mut monitor = SyncRootMonitor::new(
             "monitor-test",
             std::env::temp_dir().join(format!(
-                "ironmesh-monitor-placeholder-inspection-baseline-{}",
+                "berrykeep-monitor-placeholder-inspection-baseline-{}",
                 uuid::Uuid::new_v4()
             )),
             uuid::Uuid::nil(),
@@ -2686,7 +2686,7 @@ mod tests {
     fn directory_replacing_file_is_uploaded_as_a_new_marker() {
         let unique = uuid::Uuid::new_v4();
         let sync_root =
-            std::env::temp_dir().join(format!("ironmesh-monitor-file-to-directory-{unique}"));
+            std::env::temp_dir().join(format!("berrykeep-monitor-file-to-directory-{unique}"));
         std::fs::create_dir_all(sync_root.join("docs")).expect("failed to create sync root");
         let replaced_path = sync_root.join("docs").join("entry");
         std::fs::write(&replaced_path, b"old file").expect("failed to create original file");
