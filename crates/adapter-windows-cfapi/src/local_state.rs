@@ -20,7 +20,7 @@ fn local_appdata_sync_root_state_dir_in(
     local_appdata_base_dir
         .join(LOCAL_STATE_ROOT_DIR)
         .join(LOCAL_STATE_SYNC_ROOTS_DIR)
-        .join(state_label);
+        .join(state_label)
 }
 
 pub(crate) fn local_appdata_connection_bootstrap_path(sync_root_path: &Path) -> PathBuf {

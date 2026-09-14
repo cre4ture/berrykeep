@@ -110,8 +110,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string())
         .parse()
         .context("invalid STATS_COLLECTOR_BIND_ADDR")?;
-    let db_path = std::env::var("STATS_COLLECTOR_DB_PATH")
-        .unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
+    let db_path =
+        std::env::var("STATS_COLLECTOR_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
     let admin_token = std::env::var("STATS_COLLECTOR_ADMIN_TOKEN").ok();
     let k_anonymity_min = std::env::var("STATS_COLLECTOR_K_ANONYMITY_MIN")
         .ok()
@@ -194,10 +194,8 @@ fn build_app(state: StatsCollectorAppState) -> Router {
 }
 
 fn tls_files_from_env() -> Result<Option<TlsFiles>> {
-    let cert_path =
-        std::env::var_os("STATS_COLLECTOR_TLS_CERT_PATH").map(PathBuf::from);
-    let key_path =
-        std::env::var_os("STATS_COLLECTOR_TLS_KEY_PATH").map(PathBuf::from);
+    let cert_path = std::env::var_os("STATS_COLLECTOR_TLS_CERT_PATH").map(PathBuf::from);
+    let key_path = std::env::var_os("STATS_COLLECTOR_TLS_KEY_PATH").map(PathBuf::from);
     match (cert_path, key_path) {
         (None, None) => Ok(None),
         (Some(cert_path), Some(key_path)) => {
