@@ -20045,7 +20045,7 @@ async fn build_test_state(
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
-            content_repair_lock: Arc::new(Mutex::new(())),
+            content_repair_claims: Arc::new(crate::ContentRepairClaims::default()),
             content_repair_notify: Arc::new(tokio::sync::Notify::new()),
             repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
             manual_repair_activity: Arc::new(Mutex::new(
