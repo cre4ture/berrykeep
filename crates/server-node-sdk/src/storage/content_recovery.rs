@@ -33,7 +33,16 @@ impl ContentRepairTask {
         }
     }
 
-    pub fn defer(&mut self, error: String, now: u64, base_delay: u64) {
+    pub fn defer(&mut self, error: String, now: u64, base_delay: u64, made_progress: bool) {
+        if made_progress {
+            // A bounded repair pass can make durable progress before it runs
+            // out of time or sources. Start its next pass at the base interval
+            // instead of exponentially delaying an actively recovering object.
+            self.attempts = 0;
+            self.next_attempt_unix = now.saturating_add(base_delay.max(1));
+            self.last_error = Some(error);
+            return;
+        }
         self.attempts = self.attempts.saturating_add(1);
         let delay = base_delay
             .max(1)
@@ -283,5 +292,48 @@ impl PersistentStore {
         self.metadata_store
             .delete_content_repair_task(&task.reference.manifest_hash)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task() -> ContentRepairTask {
+        ContentRepairTask::new(
+            RetainedReference {
+                key: Some("progress.bin".to_string()),
+                object_id: None,
+                version_id: Some("v1".to_string()),
+                manifest_hash: "manifest".to_string(),
+                snapshot_only: false,
+            },
+            true,
+        )
+    }
+
+    #[test]
+    fn productive_deferred_repair_returns_to_the_base_interval() {
+        let mut task = task();
+        task.attempts = 6;
+
+        task.defer("remaining chunk unavailable".to_string(), 100, 30, true);
+
+        assert_eq!(task.attempts, 0);
+        assert_eq!(task.next_attempt_unix, 130);
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some("remaining chunk unavailable")
+        );
+    }
+
+    #[test]
+    fn unproductive_deferred_repair_keeps_exponential_backoff() {
+        let mut task = task();
+
+        task.defer("source unavailable".to_string(), 100, 30, false);
+
+        assert_eq!(task.attempts, 1);
+        assert_eq!(task.next_attempt_unix, 160);
     }
 }
