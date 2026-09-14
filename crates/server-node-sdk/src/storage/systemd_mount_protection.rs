@@ -29,6 +29,11 @@ use super::media_tools::{HostDependencyCheck, HostDependencySeverity, HostDepend
 
 #[cfg(target_os = "linux")]
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
+// `systemctl show` omits inactive units during glob expansion unless `--all` is
+// present. Keep inactive generated/fstab mount units visible so an unmounted
+// expected filesystem is recognized as a root fallback, not as root-backed.
+#[cfg(target_os = "linux")]
+const SYSTEMCTL_INCLUDE_INACTIVE_UNITS: &str = "--all";
 #[cfg(any(target_os = "linux", test))]
 const PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(all(target_os = "linux", not(test)))]
@@ -276,7 +281,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
         &systemctl,
         [
             "show",
-            "--all",
+            SYSTEMCTL_INCLUDE_INACTIVE_UNITS,
             "--property=Requires",
             "--property=BindsTo",
             "--property=After",
@@ -300,7 +305,12 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
         Vec::new()
     } else {
         let mut where_arguments = Vec::with_capacity(mount_units.len() + 5);
-        where_arguments.extend(["show", "--all", "--property=Id", "--property=Where"]);
+        where_arguments.extend([
+            "show",
+            SYSTEMCTL_INCLUDE_INACTIVE_UNITS,
+            "--property=Id",
+            "--property=Where",
+        ]);
         where_arguments.push("--");
         where_arguments.extend(mount_units.iter().map(String::as_str));
         let where_output = match run_systemctl(&systemctl, where_arguments).await {
@@ -326,7 +336,7 @@ async fn inspect_current_process() -> SystemdMountProtectionInspection {
         &systemctl,
         [
             "show",
-            "--all",
+            SYSTEMCTL_INCLUDE_INACTIVE_UNITS,
             "--property=Id",
             "--property=Where",
             "--",
