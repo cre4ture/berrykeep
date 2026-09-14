@@ -593,6 +593,7 @@ fn mount_protection_targets(
     storage_paths: &[StoragePathConfig],
 ) -> Vec<MountProtectionTarget> {
     mount_protection_targets_with_path_resolution(data_dir, storage_paths, None, &BTreeMap::new())
+        .expect("mountinfo is available while exercising mount protection targets")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -601,8 +602,9 @@ fn mount_protection_targets_with_path_resolution(
     storage_paths: &[StoragePathConfig],
     data_dir_resolution_error: Option<String>,
     storage_path_resolution_errors: &BTreeMap<String, String>,
-) -> Vec<MountProtectionTarget> {
-    let mount_points = mount_points_for_current_process().unwrap_or_default();
+) -> Result<Vec<MountProtectionTarget>, String> {
+    let mount_points = mount_points_for_current_process()
+        .ok_or_else(|| "could not read /proc/self/mountinfo".to_string())?;
     let data_dir = normalized_mount_protection_path(data_dir);
     let data_dir_mount_point = mount_point_for_path(&data_dir, &mount_points);
     let data_dir_backing_mount_points = data_dir_mount_point
@@ -661,7 +663,7 @@ fn mount_protection_targets_with_path_resolution(
                 })
             }),
     );
-    targets
+    Ok(targets)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -706,7 +708,7 @@ async fn mount_protection_targets_for_current_process(
         )
     })
     .await
-    .map_err(|error| format!("mount protection path inspection failed: {error}"))
+    .map_err(|error| format!("mount protection path inspection failed: {error}"))?
 }
 
 #[cfg(any(target_os = "linux", test))]

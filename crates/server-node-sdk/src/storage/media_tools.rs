@@ -295,7 +295,7 @@ fn dependency_uses_explicit_path(path: &Path) -> bool {
     path.is_absolute() || path.components().count() > 1
 }
 
-pub(super) fn resolve_host_dependency_path(configured_path: &Path) -> Option<PathBuf> {
+fn resolve_host_dependency_path(configured_path: &Path) -> Option<PathBuf> {
     if dependency_uses_explicit_path(configured_path) {
         return dependency_path_is_executable(configured_path)
             .then(|| configured_path.to_path_buf());
