@@ -5875,6 +5875,11 @@ impl BerryKeepClient {
         fallback_options.page_size = None;
         fallback_options.offset = None;
         fallback_options.limit = None;
+        // Synthesize only after recreating the requested children page below.
+        // Otherwise this unpaged fallback would add folder markers from later
+        // pages and reorder the complete tree before applying the caller's
+        // offset and limit.
+        fallback_options.synthesize_missing_folder_markers = false;
 
         // A legacy node exposes no durable token that is safe across request
         // routes or process restarts. Fetch its complete tree for every
@@ -5885,9 +5890,9 @@ impl BerryKeepClient {
             .request_store_index(prefix, depth, snapshot, &fallback_options)
             .await?;
         let response = decode_store_index_response(fallback_response, &fallback_options)?;
-        Ok(project_store_index_children_response(
-            &response, prefix, options,
-        ))
+        let mut response = project_store_index_children_response(&response, prefix, options);
+        synthesize_missing_folder_markers_for_page(&mut response, options);
+        Ok(response)
     }
 
     async fn request_store_index(

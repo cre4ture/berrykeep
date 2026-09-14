@@ -216,6 +216,82 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
 }
 
 #[tokio::test]
+async fn store_index_children_legacy_fallback_synthesizes_only_the_requested_page() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose its address");
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let route_queries = Arc::clone(&queries);
+    let router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let route_queries = Arc::clone(&route_queries);
+            async move {
+                let query = query.unwrap_or_default();
+                route_queries.lock().await.push(query.clone());
+                if query.contains("view=children") {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "unknown variant `children`" })),
+                    )
+                        .into_response();
+                }
+
+                assert!(query.contains("view=tree"));
+                assert!(!query.contains("offset="));
+                assert!(!query.contains("limit="));
+                Json(serde_json::json!({
+                    "prefix": "docs",
+                    "depth": 2,
+                    "entry_count": 3,
+                    "total_entry_count": 3,
+                    "entries": [
+                        { "path": "docs/", "entry_type": "prefix" },
+                        { "path": "docs/a/b.txt", "entry_type": "key" },
+                        { "path": "docs/c/d.txt", "entry_type": "key" },
+                    ],
+                }))
+                .into_response()
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .expect("fallback test server should run");
+    });
+
+    let client = BerryKeepClient::from_direct_base_url(format!("http://{address}"));
+    let response = client
+        .store_index_with_options(
+            Some("docs"),
+            2,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                offset: Some(1),
+                limit: Some(1),
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect("older nodes should project the requested page before synthesis");
+
+    assert_eq!(response.total_entry_count, 2);
+    assert_eq!(response.entry_count, 1);
+    assert_eq!(response.offset, 1);
+    assert_eq!(response.limit, Some(1));
+    assert!(!response.has_more);
+    assert_eq!(response.entries[0].path, "docs/c/d.txt");
+    assert_eq!(queries.lock().await.len(), 2);
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn store_index_children_does_not_retry_unrelated_bad_requests() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
