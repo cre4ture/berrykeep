@@ -74,6 +74,19 @@ pub(crate) struct ChunkRecoveryResult {
     has_local_error: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ExistingChunkCheck {
+    /// Read and hash any local chunk before deciding to reuse it. Foreground
+    /// reads use this to avoid returning a corrupt cache entry.
+    VerifyContent,
+    /// A durable repair defers the full integrity scan to its completion step,
+    /// so one bounded pass does not hash a large object twice.
+    MatchMetadata,
+    /// Completion identified a corrupt chunk; replace it from a verified peer
+    /// even when the local file still has the expected size.
+    Replace,
+}
+
 pub(crate) async fn source_nodes(
     state: &ServerState,
     subject: &str,
@@ -162,14 +175,29 @@ async fn recover_chunk(
     chunk: &ReplicationChunkInfo,
     sources: &[NodeDescriptor],
     cache: bool,
+    existing_chunk_check: ExistingChunkCheck,
 ) -> Result<bool> {
-    {
-        let store = read_store(state, "content_recovery.check_chunk").await;
-        if let Ok(Some(bytes)) = store.read_chunk_payload(&chunk.hash).await
-            && bytes.len() == chunk.size_bytes
-        {
-            return Ok(false);
+    match existing_chunk_check {
+        ExistingChunkCheck::VerifyContent => {
+            let store = read_store(state, "content_recovery.check_chunk").await;
+            if let Ok(Some(bytes)) = store.read_chunk_payload(&chunk.hash).await
+                && bytes.len() == chunk.size_bytes
+            {
+                return Ok(false);
+            }
         }
+        ExistingChunkCheck::MatchMetadata => {
+            let store = read_store(state, "content_recovery.check_chunk").await;
+            if matches!(
+                store
+                    .chunk_path_matches_size(&chunk.hash, chunk.size_bytes)
+                    .await,
+                Ok(true)
+            ) {
+                return Ok(false);
+            }
+        }
+        ExistingChunkCheck::Replace => {}
     }
     let path = format!("/cluster/v2/replication/chunk/{}", chunk.hash);
     let mut last_error = "no online content source".to_string();
@@ -210,7 +238,16 @@ pub(crate) async fn recover_chunks(
     preferred: Option<&NodeDescriptor>,
     cache: bool,
 ) -> ChunkRecoveryResult {
-    recover_chunks_with_progress(state, subject, chunks, preferred, cache, None).await
+    recover_chunks_with_progress(
+        state,
+        subject,
+        chunks,
+        preferred,
+        cache,
+        ExistingChunkCheck::VerifyContent,
+        None,
+    )
+    .await
 }
 
 async fn recover_chunks_with_progress(
@@ -219,6 +256,7 @@ async fn recover_chunks_with_progress(
     chunks: &[ReplicationChunkInfo],
     preferred: Option<&NodeDescriptor>,
     cache: bool,
+    existing_chunk_check: ExistingChunkCheck,
     recovered_progress: Option<Arc<AtomicUsize>>,
 ) -> ChunkRecoveryResult {
     let sources = Arc::new(source_nodes(state, subject, preferred).await);
@@ -228,7 +266,8 @@ async fn recover_chunks_with_progress(
         let sources = sources.clone();
         let recovered_progress = recovered_progress.clone();
         async move {
-            let outcome = recover_chunk(&state, &chunk, &sources, cache).await;
+            let outcome =
+                recover_chunk(&state, &chunk, &sources, cache, existing_chunk_check).await;
             if matches!(&outcome, Ok(true))
                 && let Some(recovered_progress) = recovered_progress
             {
@@ -355,8 +394,8 @@ async fn recover_task_unbounded(
         task.chunks.clear();
         for chunk in manifest.chunks {
             // Metadata-only nodes repair damaged cached bytes without hydrating
-            // absent cache entries or acquiring replica ownership. Do not hash
-            // here: `recover_chunks` validates every included local entry once.
+            // absent cache entries or acquiring replica ownership. Durable
+            // completion performs the single full-byte validation pass.
             if task.repair_chunks
                 || !matches!(store.chunk_path_exists(&chunk.hash).await, Ok(false))
             {
@@ -375,7 +414,8 @@ async fn recover_task_unbounded(
         &task.chunks,
         None,
         !task.repair_chunks,
-        Some(recovered_progress),
+        ExistingChunkCheck::MatchMetadata,
+        Some(recovered_progress.clone()),
     )
     .await;
     if !result.remaining.is_empty() {
@@ -390,12 +430,45 @@ async fn recover_task_unbounded(
         }
         return Err(NoContentSource(detail).into());
     }
+    let invalid_chunks = {
+        let store = read_store(state, "content_recovery.verify_selection").await;
+        store.invalid_recovered_chunks(task).await?
+    };
+    if invalid_chunks.is_empty() {
+        // `invalid_recovered_chunks` just performed the full-byte verification.
+        // Finalize under the GC gate without reading the entire object again.
+        let store = read_store(state, "content_recovery.finish_verified").await;
+        store.finish_verified_content_repair(task).await?;
+        return Ok(result.recovered);
+    }
+    let replacement = recover_chunks_with_progress(
+        state,
+        &subject,
+        &invalid_chunks,
+        None,
+        !task.repair_chunks,
+        ExistingChunkCheck::Replace,
+        Some(recovered_progress),
+    )
+    .await;
+    if !replacement.remaining.is_empty() {
+        let detail = format!(
+            "{} corrupt chunks replaced; {} still missing; {}",
+            replacement.recovered,
+            replacement.remaining.len(),
+            replacement.errors.join("; ")
+        );
+        if replacement.has_local_error {
+            bail!(detail);
+        }
+        return Err(NoContentSource(detail).into());
+    }
     // Completion re-hashes every recovered byte. It must retain the content
     // GC gate inside `finish_content_repair`, but does not mutate the store
     // object itself, so do not monopolize the global store lock for the scan.
     let store = read_store(state, "content_recovery.finish").await;
     store.finish_content_repair(task).await?;
-    Ok(result.recovered)
+    Ok(result.recovered.saturating_add(replacement.recovered))
 }
 
 fn empty_report() -> replication::ReplicationRepairReport {

@@ -119,6 +119,55 @@ run_on_main_metadata_backends!(
     fully_local_recovery_does_not_require_the_store_write_lock_turso
 );
 
+async fn durable_recovery_replaces_same_size_corrupt_chunks_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let key = choose_locally_placed_key(&target, "same-size-corrupt-recovery").await;
+    let payload = b"verified retained repair bytes".to_vec();
+    for state in [&source, &target] {
+        seed_subject_version(state, &key, "v1", payload.clone(), vec![]).await;
+    }
+    let manifest = bundle(&target, &key, "v1").await;
+    fs::write(
+        read_store(&target, "test.recovery.same_size_corruption")
+            .await
+            .chunk_path_for_test(&manifest.manifest.chunks[0].hash),
+        vec![0; payload.len()],
+    )
+    .await
+    .unwrap();
+    let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &url).await;
+
+    let report = crate::replication::execute_targeted_replication_repair_inner(
+        &target,
+        vec![format!("{key}@v1")],
+        None,
+    )
+    .await;
+
+    assert_eq!(report.successful_transfers, 1, "{report:?}");
+    assert_eq!(
+        read_store(&target, "test.recovery.same_size_result")
+            .await
+            .get_object(&key, None, Some("v1"), ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        payload
+    );
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    durable_recovery_replaces_same_size_corrupt_chunks_impl,
+    durable_recovery_replaces_same_size_corrupt_chunks,
+    durable_recovery_replaces_same_size_corrupt_chunks_turso
+);
+
 async fn local_availability_refresh_keeps_its_fresh_cache_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let key = "availability-cache-reconciliation.bin";

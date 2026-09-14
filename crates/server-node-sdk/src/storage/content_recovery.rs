@@ -168,13 +168,25 @@ impl PersistentStore {
     }
 
     /// A cache-repair task only needs to decide whether a chunk entry exists.
-    /// Hashing and size validation happen once in `recover_chunks`, where an
-    /// invalid local entry is replaced from a verified peer response.
+    /// Hashing and size validation happen once at durable-repair completion,
+    /// where any invalid local entry is replaced from a verified peer response.
     pub(crate) async fn chunk_path_exists(&self, hash: &str) -> Result<bool> {
         let path = self
             .storage_pool
             .content_path(StorageContentKind::Chunk, hash)?;
         Ok(fs::try_exists(path).await?)
+    }
+
+    pub(crate) async fn chunk_path_matches_size(&self, hash: &str, size: usize) -> Result<bool> {
+        let path = self
+            .storage_pool
+            .content_path(StorageContentKind::Chunk, hash)?;
+        let metadata = match fs::metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(metadata.is_file() && metadata.len() == size as u64)
     }
 
     pub(crate) async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {
@@ -224,27 +236,43 @@ impl PersistentStore {
         manifest_is_fully_local(&self.storage_pool, hash).await
     }
 
-    pub(crate) async fn verify_recovered_content(&self, task: &ContentRepairTask) -> Result<()> {
+    pub(crate) async fn invalid_recovered_chunks(
+        &self,
+        task: &ContentRepairTask,
+    ) -> Result<Vec<ReplicationChunkInfo>> {
         let payload = self
             .read_recovery_manifest(&task.reference.manifest_hash)
             .await?
             .context("repaired manifest missing")?;
         let manifest = validate_manifest(&task.reference.manifest_hash, &payload)?;
-        {
-            let chunks = if task.repair_chunks {
-                &manifest.chunks
-            } else {
-                &task.chunks
-            };
-            for chunk in chunks {
-                let payload = self
-                    .read_chunk_payload(&chunk.hash)
-                    .await?
-                    .with_context(|| format!("repaired chunk missing: {}", chunk.hash))?;
-                if payload.len() != chunk.size_bytes {
-                    bail!("repaired chunk size mismatch: {}", chunk.hash);
+        let chunks = if task.repair_chunks {
+            &manifest.chunks
+        } else {
+            &task.chunks
+        };
+        let mut invalid = Vec::new();
+        for chunk in chunks {
+            let path = self
+                .storage_pool
+                .content_path(StorageContentKind::Chunk, &chunk.hash)?;
+            match fs::read(path).await {
+                Ok(payload)
+                    if payload.len() == chunk.size_bytes && hash_hex(&payload) == chunk.hash => {}
+                Ok(_) => {
+                    invalid.push(chunk.clone());
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    invalid.push(chunk.clone());
+                }
+                Err(error) => return Err(error.into()),
             }
+        }
+        Ok(invalid)
+    }
+
+    pub(crate) async fn verify_recovered_content(&self, task: &ContentRepairTask) -> Result<()> {
+        if let Some(chunk) = self.invalid_recovered_chunks(task).await?.first() {
+            bail!("repaired chunk is missing or corrupt: {}", chunk.hash);
         }
         Ok(())
     }

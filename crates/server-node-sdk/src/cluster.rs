@@ -604,6 +604,15 @@ impl ClusterService {
         self.replica_subjects_by_node.clear();
         self.available_subjects_by_node.clear();
 
+        // `cluster_available` was introduced after replica hints were already
+        // durable. On the first restart after that upgrade, retain those hints
+        // as availability until peers can publish their fresh views; otherwise
+        // an offline peer is spuriously backfilled immediately.
+        let available = if available.is_empty() {
+            replicas.clone()
+        } else {
+            available
+        };
         for (key, nodes) in replicas {
             for node_id in nodes {
                 Self::insert_subject_membership(
@@ -1439,6 +1448,28 @@ mod tests {
         );
         assert_eq!(svc.subjects_for_node(node_b), vec!["subject-a".to_string()]);
         assert!(svc.available_subjects_for_node(node_b).is_empty());
+    }
+
+    #[test]
+    fn import_replica_views_seeds_empty_availability_from_legacy_replicas() {
+        let local = NodeId::new_v4();
+        let offline = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        svc.import_replica_views(
+            HashMap::from([("subject-a".to_string(), vec![offline])]),
+            HashMap::new(),
+        );
+
+        assert_eq!(
+            svc.current_replica_nodes_for_subject("subject-a"),
+            HashSet::from([offline]),
+            "an upgrade must retain an offline replica until it can publish availability"
+        );
+        assert_eq!(
+            svc.available_subjects_for_node(offline),
+            vec!["subject-a".to_string()]
+        );
     }
 
     #[test]
