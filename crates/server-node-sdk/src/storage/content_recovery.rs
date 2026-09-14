@@ -210,6 +210,7 @@ impl PersistentStore {
 
     /// Confirms a retained manifest and all of its chunks are present with the
     /// cheap metadata contract used by availability and ordinary replication.
+    #[cfg(test)]
     pub(crate) async fn manifest_is_fully_local(&self, hash: &str) -> Result<bool> {
         manifest_is_fully_local(&self.storage_pool, hash).await
     }

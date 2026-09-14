@@ -3287,6 +3287,35 @@ run_on_all_metadata_backends!(
     cleanup_unreferenced_deletes_orphan_manifest_and_chunk_turso
 );
 
+async fn cleanup_unreferenced_reaps_stale_chunk_temp_files_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cleanup-stale-chunk-temp").await;
+    let hash = hash_hex(b"abandoned atomic chunk write");
+    let chunk_path = store.chunk_path_for_test(&hash);
+    let temp_path = chunk_path.with_extension("tmp-crashed-install");
+    fs::create_dir_all(temp_path.parent().unwrap())
+        .await
+        .unwrap();
+    fs::write(&temp_path, b"incomplete atomic chunk")
+        .await
+        .unwrap();
+
+    let report = store.cleanup_unreferenced(0, false).await.unwrap();
+    assert!(report.deleted_chunks >= 1);
+    assert!(
+        !fs::try_exists(&temp_path).await.unwrap(),
+        "a stale atomic-write scratch file must not leak indefinitely"
+    );
+    assert_eq!(store.current_chunk_store_bytes(None).await.unwrap(), 0);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_unreferenced_reaps_stale_chunk_temp_files_impl,
+    cleanup_unreferenced_reaps_stale_chunk_temp_files,
+    cleanup_unreferenced_reaps_stale_chunk_temp_files_turso
+);
+
 async fn cleanup_unreferenced_processes_retained_manifests_across_batches_impl(
     backend: StorageTestBackend,
 ) {

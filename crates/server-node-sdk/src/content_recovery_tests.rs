@@ -493,6 +493,83 @@ run_on_main_metadata_backends!(
     recovery_audit_skips_complete_local_content_with_empty_availability_turso
 );
 
+async fn recovery_audit_claims_complete_cached_assigned_content_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &url).await;
+    let key = choose_locally_placed_key(&target, "cached-assigned-content").await;
+    let version = "ver-cached-only";
+    seed_subject_version(
+        &source,
+        &key,
+        version,
+        b"verified cache bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    let metadata = read_store(&source, "test.recovery.cached_metadata")
+        .await
+        .export_metadata_bundle(&key, Some(version), ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+    lock_store(&target, "test.recovery.import_cached_metadata")
+        .await
+        .import_metadata_bundle(&metadata)
+        .await
+        .unwrap();
+    let manifest = bundle(&source, &key, version).await;
+    let cached = crate::content_recovery::recover_chunks(
+        &target,
+        &key,
+        &manifest.manifest.chunks,
+        None,
+        true,
+    )
+    .await;
+    assert!(cached.remaining.is_empty(), "{:?}", cached.errors);
+    let store = read_store(&target, "test.recovery.cached_presence").await;
+    assert!(
+        store
+            .manifest_is_fully_local(&manifest.manifest_hash)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .manifest_is_owned(&manifest.manifest_hash)
+            .await
+            .unwrap(),
+        "read-through cache bytes must not be mistaken for replica ownership"
+    );
+    drop(store);
+
+    crate::content_recovery::audit_assigned(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_store(&target, "test.recovery.cached_task")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "assigned cache-only content must be promoted through a durable repair task"
+    );
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_audit_claims_complete_cached_assigned_content_impl,
+    recovery_audit_claims_complete_cached_assigned_content,
+    recovery_audit_claims_complete_cached_assigned_content_turso
+);
+
 async fn recovery_combines_partial_peers_with_stale_inventory_impl(backend: MainTestBackend) {
     let source_a = build_test_state(1, false, backend).await;
     let source_b = build_test_state(1, false, backend).await;
