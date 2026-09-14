@@ -228,7 +228,7 @@ run_on_main_metadata_backends!(
 );
 
 #[tokio::test]
-async fn durable_recovery_budget_turns_stalled_work_into_retryable_wait() {
+async fn durable_recovery_budget_keeps_stalled_work_unresolved() {
     let error =
         crate::content_recovery::bounded_durable_recovery(Duration::from_millis(5), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -237,10 +237,8 @@ async fn durable_recovery_budget_turns_stalled_work_into_retryable_wait() {
         .await
         .unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("durable content repair pass exceeded"),
-        "a budget expiry must follow the retryable no-source path: {error:#}"
+        error.is::<crate::content_recovery::DurableRepairBudgetExceeded>(),
+        "a budget expiry is ambiguous and must stay on the unresolved path: {error:#}"
     );
 }
 
