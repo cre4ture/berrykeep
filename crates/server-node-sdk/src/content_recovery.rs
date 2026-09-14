@@ -579,33 +579,18 @@ async fn repair_subjects_inner(
         };
         references.insert(reference.manifest_hash.clone(), reference);
     }
-    let requested_hashes = references.keys().cloned().collect::<Vec<_>>();
-    let pending: HashMap<_, _> = read_store(state, "content_recovery.selected_pending")
-        .await
-        .content_repair_tasks_for_manifests(&requested_hashes)
-        .await?
-        .into_iter()
-        .map(|task| (task.reference.manifest_hash.clone(), task))
-        .collect();
     let mut tasks = BTreeMap::new();
     for reference in references.into_values() {
         let owned = read_store(state, "content_recovery.ownership")
             .await
             .manifest_is_owned(&reference.manifest_hash)
             .await?;
-        let mut task = pending
-            .get(&reference.manifest_hash)
-            .cloned()
-            .unwrap_or_else(|| {
-                ContentRepairTask::new(
-                    reference.clone(),
-                    owned || required.contains(&reference.manifest_hash),
-                )
-            });
-        task.reference = reference.clone();
         // An assigned repair remains a durability obligation during placement
         // changes. Normal replica handoff/cleanup releases it after verification.
-        task.repair_chunks |= owned || required.contains(&reference.manifest_hash);
+        let task = ContentRepairTask::new(
+            reference.clone(),
+            owned || required.contains(&reference.manifest_hash),
+        );
         tasks.insert(reference.manifest_hash.clone(), task);
     }
     let availability_may_have_changed = !tasks.is_empty();
@@ -625,11 +610,11 @@ async fn repair_subjects_inner(
             .await?
             .into_iter()
             .next();
-        if let Some(mut existing) = existing {
-            existing.reference = requested_reference.clone();
-            existing.repair_chunks |= requested_repair_chunks;
-            task = existing;
-        }
+        task = existing.unwrap_or_else(|| {
+            ContentRepairTask::new(requested_reference.clone(), requested_repair_chunks)
+        });
+        task.reference = requested_reference;
+        task.repair_chunks |= requested_repair_chunks;
         // The execution budget bounds this pass, not the lifetime of its work.
         read_store(state, "content_recovery.enqueue")
             .await
