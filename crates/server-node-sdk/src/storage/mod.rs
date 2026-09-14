@@ -169,6 +169,10 @@ use media_tools::MediaToolPaths;
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
+// GC deliberately has no global lock while walking a large chunk store. Keep
+// atomic-write scratch files for this minimum period so the sweep cannot race a
+// slow live write, while still reclaiming leftovers from interrupted installs.
+const CHUNK_ATOMIC_TEMP_MIN_RETENTION_SECS: u64 = 10 * 60;
 const SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS: u128 = 250;
 const READ_THROUGH_CACHE_CLASS: &str = "read_through";
 const LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT: usize = 64;
@@ -7277,18 +7281,6 @@ impl PersistentStore {
         Ok(())
     }
 
-    async fn collect_owned_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
-        let referenced = self.collect_referenced_manifest_hashes().await?;
-        if referenced.is_empty() {
-            return Ok(HashSet::new());
-        }
-
-        let referenced_vec = referenced.into_iter().collect::<Vec<_>>();
-        self.metadata_store
-            .filter_locally_owned_manifests(&referenced_vec)
-            .await
-    }
-
     pub async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
         self.chunk_ingestor.ingest_chunk(hash, payload).await
     }
@@ -9370,10 +9362,14 @@ impl PersistentStore {
         // content inspected, and even that is read one bounded batch at a time so peak
         // resident manifest data stays flat as the store grows instead of scaling with
         // total manifest count (see docs/node-memory-footprint-reduction-plan.md Slice 3).
+        // A repair task pins its current work set so a sweep cannot remove
+        // bytes while verification is in progress. Cache records remain cache
+        // records until an owned referenced manifest protects the same chunk.
         let mut protected_chunks: HashSet<String> = recovery_tasks
             .iter()
             .flat_map(|task| task.chunks.iter().map(|chunk| chunk.hash.clone()))
             .collect();
+        let mut owned_referenced_chunks = HashSet::<String>::new();
         let mut protected_media_fingerprints = HashSet::<String>::new();
         let mut peak_manifest_batch_size = 0usize;
         let retained_manifest_hashes: Vec<&String> = retained_manifests.iter().collect();
@@ -9386,11 +9382,12 @@ impl PersistentStore {
                 protected_media_fingerprints.insert(content_fingerprint_from_manifest(&manifest));
                 if owned_referenced_manifests.contains(*manifest_hash) {
                     for chunk in &manifest.chunks {
-                        protected_chunks.insert(chunk.hash.clone());
+                        owned_referenced_chunks.insert(chunk.hash.clone());
                     }
                 }
             }
         }
+        protected_chunks.extend(owned_referenced_chunks.iter().cloned());
 
         let mut skipped_recent_chunks = 0usize;
         let mut deleted_chunks = 0usize;
@@ -9420,7 +9417,12 @@ impl PersistentStore {
                 .map(|d| now.saturating_sub(d.as_secs()))
                 .unwrap_or(0);
 
-            if age_secs < retention_secs {
+            let required_retention_secs = if chunk_hash.is_some() {
+                retention_secs
+            } else {
+                retention_secs.max(CHUNK_ATOMIC_TEMP_MIN_RETENTION_SECS)
+            };
+            if age_secs < required_retention_secs {
                 skipped_recent_chunks += 1;
                 continue;
             }
@@ -9461,7 +9463,7 @@ impl PersistentStore {
 
         if !dry_run {
             for record in cached_chunk_records {
-                if protected_chunks.contains(&record.hash) {
+                if owned_referenced_chunks.contains(&record.hash) {
                     self.metadata_store
                         .delete_cached_chunk_record(&record.hash)
                         .await?;
@@ -9518,10 +9520,20 @@ impl PersistentStore {
     }
 
     async fn cleanup_protection_snapshot(&self) -> Result<CleanupProtectionSnapshot> {
+        let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
+        let owned_referenced_manifests = if referenced_manifests.is_empty() {
+            HashSet::new()
+        } else {
+            self.metadata_store
+                .filter_locally_owned_manifests(
+                    &referenced_manifests.iter().cloned().collect::<Vec<_>>(),
+                )
+                .await?
+        };
         Ok(CleanupProtectionSnapshot {
             recovery_tasks: self.metadata_store.load_content_repair_tasks().await?,
-            referenced_manifests: self.collect_referenced_manifest_hashes().await?,
-            owned_referenced_manifests: self.collect_owned_referenced_manifest_hashes().await?,
+            referenced_manifests,
+            owned_referenced_manifests,
             cached_chunk_records: self.metadata_store.list_cached_chunk_records().await?,
         })
     }
@@ -11353,15 +11365,17 @@ impl PersistentStore {
                 if ftype.is_dir() {
                     dirs.push(path);
                 } else if ftype.is_file() {
-                    let hash = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .filter(|name| manifest_hash_looks_safe_filename(name))
-                        .map(ToOwned::to_owned);
-                    // Temp files are not indexed or included in store-byte
-                    // accounting, but a crashed atomic install can leave one
-                    // behind indefinitely. The caller ages them out without
-                    // treating them as a content-addressed chunk.
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    let hash = manifest_hash_looks_safe_filename(name).then(|| name.to_string());
+                    if hash.is_none() && !is_atomic_chunk_temp_file_name(name) {
+                        continue;
+                    }
+                    // Temp files are unindexed and absent from store-byte
+                    // accounting. Keep only the atomic-write form so a
+                    // crashed install is reaped without treating arbitrary
+                    // files in the chunk tree as content.
                     files.push((path, hash));
                 }
             }
@@ -11445,6 +11459,13 @@ impl PersistentStore {
         }
         Ok(path)
     }
+}
+
+fn is_atomic_chunk_temp_file_name(name: &str) -> bool {
+    let Some((hash, suffix)) = name.split_once(".tmp-") else {
+        return false;
+    };
+    manifest_hash_looks_safe_filename(hash) && !suffix.is_empty()
 }
 
 impl MetadataDbDistributionLoader {
