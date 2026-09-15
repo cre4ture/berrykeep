@@ -21,13 +21,13 @@
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>BerryKeepAppGroupIdentifier</key>
-    <string>group.dev.ironmesh.apple.shared</string>
+    <string>group.dev.berrykeep.apple.shared</string>
     <key>BerryKeepKeychainAccessGroup</key>
-    <string>$(AppIdentifierPrefix)dev.ironmesh.apple.shared-keychain</string>
+    <string>$(AppIdentifierPrefix)dev.berrykeep.apple.shared-keychain</string>
     <key>BerryKeepDomainDisplayName</key>
     <string>BerryKeep</string>
     <key>BerryKeepDomainIdentifier</key>
-    <string>dev.ironmesh.default</string>
+    <string>dev.berrykeep.default</string>
     <key>NSCameraUsageDescription</key>
     <string>BerryKeep uses the camera to scan bootstrap claim QR codes during device enrollment.</string>
     <key>NSAppTransportSecurity</key>

@@ -5,7 +5,7 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
     func testPreferencesSuiteAndKeychainAccessGroupRemainIndependent() throws {
         let preferences = try IsolatedDefaults(label: "SeparateGroups")
         defer { preferences.clear() }
-        let keychainAccessGroup = "ABCDE12345.dev.ironmesh.apple.shared-keychain"
+        let keychainAccessGroup = "ABCDE12345.dev.berrykeep.apple.shared-keychain"
 
         let store = AppleConnectionSettingsStore(
             preferencesSuiteName: preferences.suiteName,
