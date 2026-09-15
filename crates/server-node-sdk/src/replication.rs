@@ -2279,6 +2279,27 @@ mod tests {
     }
 
     #[test]
+    fn repair_status_treats_scheduling_deferral_with_other_successes_as_completed() {
+        let node_id = NodeId::new_v4();
+        let mut report = empty_report();
+        report.successful_transfers = 1;
+        push_repair_log_entry(
+            &mut report.detailed_log,
+            node_id,
+            "repair_deferred",
+            "repair remains queued while another operation owns its manifest".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(serde_json::json!({"pending": true, "reason": "manifest_repair_in_progress"})),
+        );
+
+        assert_eq!(report.run_status(), RepairRunStatus::Completed);
+    }
+
+    #[test]
     fn repair_status_marks_deferred_transfers_partial_after_other_successes() {
         for (skipped_backoff, skipped_max_retries) in [(1, 0), (0, 1)] {
             let mut report = empty_report();

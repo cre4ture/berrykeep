@@ -605,7 +605,7 @@ async fn repair_subjects_inner(
                 state,
                 report,
                 &task,
-                "repair_waiting",
+                "repair_deferred",
                 "repair remains queued while another operation owns its manifest".to_string(),
                 json!({"pending": true, "reason": "manifest_repair_in_progress"}),
             );
@@ -637,7 +637,7 @@ async fn repair_subjects_inner(
                 state,
                 report,
                 &task,
-                "repair_waiting",
+                "repair_deferred",
                 "repair queued for a later execution batch".to_string(),
                 json!({"pending": true}),
             );
