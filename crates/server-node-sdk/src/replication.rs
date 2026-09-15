@@ -39,6 +39,7 @@ impl ReplicationRepairReport {
             .detailed_log
             .iter()
             .any(|entry| entry.event == "repair_unresolved");
+        let deferred_transfer = self.skipped_backoff > 0 || self.skipped_max_retries > 0;
 
         if self.failed_transfers > 0 {
             if self.successful_transfers > 0 || chunk_progress {
@@ -55,15 +56,17 @@ impl ReplicationRepairReport {
 
         // Plan execution runs on every node. A node that is not an owned source
         // for an under-replicated subject correctly skips that bundle; it did not
-        // fail a repair and must not turn the run red. Content recovery records
-        // its durable pending state explicitly through these events.
+        // fail a repair and must not turn the run red. Only a transfer skipped
+        // for retry backoff or exhausted retries remains unfinished here.
+        // Content recovery records its durable pending state explicitly through
+        // its own events.
         if unresolved {
             return RepairRunStatus::Unresolved;
         }
         if waiting_for_source {
             return RepairRunStatus::WaitingForSource;
         }
-        if self.skipped_items > 0 && (self.successful_transfers > 0 || chunk_progress) {
+        if deferred_transfer && (self.successful_transfers > 0 || chunk_progress) {
             return RepairRunStatus::PartiallyRepaired;
         }
         RepairRunStatus::Completed
@@ -2244,9 +2247,10 @@ mod tests {
     }
 
     #[test]
-    fn repair_status_treats_a_non_source_bundle_skip_as_completed() {
+    fn repair_status_treats_a_non_source_bundle_skip_with_other_successes_as_completed() {
         let node_id = NodeId::new_v4();
         let mut report = empty_report();
+        report.successful_transfers = 1;
         report.skipped_items = 1;
         report.skipped_details.push(ReplicationRepairSkippedItem {
             report_node_id: node_id,
@@ -2272,6 +2276,18 @@ mod tests {
         );
 
         assert_eq!(report.run_status(), RepairRunStatus::Completed);
+    }
+
+    #[test]
+    fn repair_status_marks_deferred_transfers_partial_after_other_successes() {
+        for (skipped_backoff, skipped_max_retries) in [(1, 0), (0, 1)] {
+            let mut report = empty_report();
+            report.successful_transfers = 1;
+            report.skipped_backoff = skipped_backoff;
+            report.skipped_max_retries = skipped_max_retries;
+
+            assert_eq!(report.run_status(), RepairRunStatus::PartiallyRepaired);
+        }
     }
 
     #[test]
