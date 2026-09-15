@@ -519,7 +519,15 @@ async fn recovery_batch_limit_keeps_all_intent_durable_impl(backend: MainTestBac
     assert_eq!(report.attempted_transfers, 1);
     assert_eq!(
         report.run_status(),
-        crate::RepairRunStatus::WaitingForSource
+        crate::RepairRunStatus::WaitingForSource,
+        "the first item has no source; the later batch-capacity deferral must not change that"
+    );
+    assert!(
+        report
+            .detailed_log
+            .iter()
+            .any(|entry| entry.event == "repair_deferred"),
+        "a batch-capacity deferral must not be reported as a missing source: {report:?}"
     );
     assert_eq!(
         read_store(&target, "test.recovery.batch_queue")
