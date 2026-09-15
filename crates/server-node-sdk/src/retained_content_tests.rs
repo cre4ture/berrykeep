@@ -88,6 +88,14 @@ async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
         )
         .await
         .unwrap();
+    let third = store
+        .put_object_versioned(
+            "deferred-c.bin",
+            Bytes::from_static(b"deferred c"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
     let retained = store.retained_content().await.unwrap();
     let mut first_task = content_recovery::ContentRepairTask::new(
         retained
@@ -107,6 +115,15 @@ async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
     );
     second_task.next_attempt_unix = 200;
     second_task.source_fingerprint = "changed-sources".to_string();
+    let mut third_task = content_recovery::ContentRepairTask::new(
+        retained
+            .reference_for_subject("deferred-c.bin")
+            .unwrap()
+            .clone(),
+        true,
+    );
+    third_task.next_attempt_unix = 300;
+    third_task.source_fingerprint = "z-sources".to_string();
     // Keep a large pin list in the inactive task. Scheduling must inspect its
     // indexed deadline/fingerprint rather than deserialize this payload.
     second_task.chunks = vec![
@@ -124,11 +141,19 @@ async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
         .persist_content_repair_task(&second_task)
         .await
         .unwrap();
+    store
+        .persist_content_repair_task(&third_task)
+        .await
+        .unwrap();
 
     let mut hashes = store.content_repair_task_hashes().await.unwrap();
     hashes.sort();
     assert_eq!(hashes, {
-        let mut expected = vec![first.manifest_hash.clone(), second.manifest_hash.clone()];
+        let mut expected = vec![
+            first.manifest_hash.clone(),
+            second.manifest_hash.clone(),
+            third.manifest_hash.clone(),
+        ];
         expected.sort();
         expected
     });
@@ -139,6 +164,14 @@ async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
             .unwrap(),
         vec![second.manifest_hash.clone()],
         "a changed source fingerprint is due without loading every task"
+    );
+    assert_eq!(
+        store
+            .due_content_repair_task_hashes(50, "same-sources", 2)
+            .await
+            .unwrap(),
+        vec![second.manifest_hash.clone(), third.manifest_hash.clone()],
+        "fingerprint changes on either B-tree range must be selected without a full queue scan"
     );
     let selected = store
         .content_repair_tasks_for_manifests(std::slice::from_ref(&first.manifest_hash))
