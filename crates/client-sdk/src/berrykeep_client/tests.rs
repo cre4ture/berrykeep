@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        Path as AxumPath, RawQuery, State,
+        Path as AxumPath, Query, RawQuery, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{Response, header},
@@ -83,6 +83,465 @@ fn object_url_builder_escapes_segments() {
         url.as_str(),
         "http://127.0.0.1:18080/api/v1/store/read%20me.txt"
     );
+}
+
+#[test]
+fn store_index_children_view_uses_its_wire_value() {
+    assert_eq!(StoreIndexView::Children.as_query_value(), "children");
+}
+
+#[tokio::test]
+async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
+    #[derive(Clone, Debug, serde::Deserialize)]
+    struct LegacyStoreIndexQuery {
+        view: Option<LegacyStoreIndexView>,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyStoreIndexView {
+        Tree,
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose its address");
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let route_queries = Arc::clone(&queries);
+    let tree_request_count = Arc::new(AtomicUsize::new(0));
+    let route_tree_request_count = Arc::clone(&tree_request_count);
+    let router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |Query(query): Query<LegacyStoreIndexQuery>| {
+            let route_queries = Arc::clone(&route_queries);
+            let route_tree_request_count = Arc::clone(&route_tree_request_count);
+            async move {
+                route_queries.lock().await.push(query.clone());
+                assert!(matches!(query.view, Some(LegacyStoreIndexView::Tree)));
+                let tree_request = route_tree_request_count.fetch_add(1, Ordering::SeqCst);
+                let second_file = if tree_request == 0 {
+                    "docs/b.txt"
+                } else {
+                    "docs/c.txt"
+                };
+
+                Json(serde_json::json!({
+                    "prefix": "docs",
+                    "depth": 1,
+                    "entry_count": 3,
+                    "total_entry_count": 3,
+                    "consistency_token": "namespace:1",
+                    "entries": [
+                        { "path": "docs/", "entry_type": "prefix" },
+                        { "path": "docs/a.txt", "entry_type": "key" },
+                        { "path": second_file, "entry_type": "key" },
+                    ],
+                }))
+                .into_response()
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .expect("fallback test server should run");
+    });
+
+    let client = BerryKeepClient::from_direct_base_url(format!("http://{address}"));
+    let response = client
+        .store_index_with_options(
+            Some("docs"),
+            1,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                offset: Some(1),
+                limit: Some(1),
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect("older nodes should fall back to the tree projection");
+
+    assert_eq!(response.total_entry_count, 2);
+    assert_eq!(response.offset, 1);
+    assert_eq!(response.limit, Some(1));
+    assert!(!response.has_more);
+    assert_eq!(response.entries.len(), 1);
+    assert_eq!(response.entries[0].path, "docs/b.txt");
+
+    let refreshed_response = client
+        .store_index_with_options(
+            Some("docs"),
+            1,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                offset: Some(1),
+                limit: Some(1),
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect("a remembered older node should request its tree projection directly");
+
+    assert_eq!(refreshed_response.total_entry_count, 2);
+    assert_eq!(refreshed_response.offset, 1);
+    assert_eq!(refreshed_response.limit, Some(1));
+    assert!(!refreshed_response.has_more);
+    assert_eq!(refreshed_response.entries.len(), 1);
+    assert_eq!(refreshed_response.entries[0].path, "docs/c.txt");
+
+    let recorded_queries = queries.lock().await.clone();
+    assert_eq!(recorded_queries.len(), 2);
+    assert!(matches!(
+        recorded_queries[0].view,
+        Some(LegacyStoreIndexView::Tree)
+    ));
+    assert_eq!(recorded_queries[0].offset, None);
+    assert_eq!(recorded_queries[0].limit, None);
+    assert!(matches!(
+        recorded_queries[1].view,
+        Some(LegacyStoreIndexView::Tree)
+    ));
+    assert_eq!(recorded_queries[1].offset, None);
+    assert_eq!(recorded_queries[1].limit, None);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn store_index_children_legacy_capability_is_scoped_to_the_serving_route() {
+    let legacy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("legacy listener should bind");
+    let legacy_address = legacy_listener
+        .local_addr()
+        .expect("legacy listener should expose its address");
+    let legacy_queries = Arc::new(Mutex::new(Vec::new()));
+    let legacy_route_queries = Arc::clone(&legacy_queries);
+    let legacy_tree_request_count = Arc::new(AtomicUsize::new(0));
+    let legacy_route_tree_request_count = Arc::clone(&legacy_tree_request_count);
+    let legacy_router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let legacy_route_queries = Arc::clone(&legacy_route_queries);
+            let legacy_route_tree_request_count = Arc::clone(&legacy_route_tree_request_count);
+            async move {
+                let query = query.unwrap_or_default();
+                legacy_route_queries.lock().await.push(query.clone());
+                if query.contains("view=children") {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "unknown variant `children`" })),
+                    )
+                        .into_response();
+                }
+                if legacy_route_tree_request_count.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+
+                Json(serde_json::json!({
+                    "prefix": "docs",
+                    "depth": 1,
+                    "entry_count": 2,
+                    "total_entry_count": 2,
+                    "entries": [
+                        { "path": "docs/", "entry_type": "prefix" },
+                        { "path": "docs/legacy.txt", "entry_type": "key" },
+                    ],
+                }))
+                .into_response()
+            }
+        }),
+    );
+    let legacy_server = tokio::spawn(async move {
+        axum::serve(legacy_listener, legacy_router.into_make_service())
+            .await
+            .expect("legacy fallback server should run");
+    });
+
+    let modern_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("modern listener should bind");
+    let modern_address = modern_listener
+        .local_addr()
+        .expect("modern listener should expose its address");
+    let modern_queries = Arc::new(Mutex::new(Vec::new()));
+    let modern_route_queries = Arc::clone(&modern_queries);
+    let modern_router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let modern_route_queries = Arc::clone(&modern_route_queries);
+            async move {
+                let query = query.unwrap_or_default();
+                modern_route_queries.lock().await.push(query);
+                Json(serde_json::json!({
+                    "prefix": "docs",
+                    "depth": 1,
+                    "entry_count": 1,
+                    "total_entry_count": 1,
+                    "entries": [
+                        { "path": "docs/modern.txt", "entry_type": "key" },
+                    ],
+                }))
+            }
+        }),
+    );
+    let modern_server = tokio::spawn(async move {
+        axum::serve(modern_listener, modern_router.into_make_service())
+            .await
+            .expect("modern projection server should run");
+    });
+
+    let client = BerryKeepClient::combine(vec![
+        BerryKeepClient::from_direct_base_url(format!("http://{legacy_address}")),
+        BerryKeepClient::from_direct_base_url(format!("http://{modern_address}")),
+    ])
+    .expect("clients should combine");
+    let requested_options = StoreIndexRequestOptions {
+        view: Some(StoreIndexView::Children),
+        offset: Some(0),
+        limit: Some(100),
+        ..StoreIndexRequestOptions::default()
+    };
+
+    let legacy_response = client
+        .store_index_with_options(Some("docs"), 1, None, requested_options.clone())
+        .await
+        .expect("legacy route should use its tree fallback");
+    assert_eq!(legacy_response.entries[0].path, "docs/legacy.txt");
+
+    let modern_children_response = client
+        .store_index_with_options(Some("docs"), 1, None, requested_options.clone())
+        .await
+        .expect("a modern route should retain the children projection");
+    assert_eq!(modern_children_response.entries[0].path, "docs/modern.txt");
+
+    let modern_endpoint = client
+        .transport_router
+        .endpoints_snapshot()
+        .into_iter()
+        .nth(1)
+        .expect("combined client should retain the modern route");
+    *client
+        .transport_router
+        .endpoints
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![modern_endpoint];
+
+    let modern_response = client
+        .store_index_with_options(Some("docs"), 1, None, requested_options)
+        .await
+        .expect("modern route must retain the children projection");
+    assert_eq!(modern_response.entries[0].path, "docs/modern.txt");
+
+    let legacy_queries = legacy_queries.lock().await.clone();
+    assert_eq!(legacy_queries.len(), 2);
+    assert!(legacy_queries[0].contains("view=children"));
+    assert!(legacy_queries[1].contains("view=tree"));
+    let modern_queries = modern_queries.lock().await.clone();
+    assert_eq!(modern_queries.len(), 2);
+    assert!(modern_queries[0].contains("view=children"));
+    assert!(modern_queries[1].contains("view=children"));
+    assert!(modern_queries[1].contains("offset=0"));
+    assert!(modern_queries[1].contains("limit=100"));
+
+    legacy_server.abort();
+    modern_server.abort();
+}
+
+#[tokio::test]
+async fn store_index_children_legacy_fallback_synthesizes_only_the_requested_page() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose its address");
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let route_queries = Arc::clone(&queries);
+    let router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let route_queries = Arc::clone(&route_queries);
+            async move {
+                let query = query.unwrap_or_default();
+                route_queries.lock().await.push(query.clone());
+                if query.contains("view=children") {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "unknown variant `children`" })),
+                    )
+                        .into_response();
+                }
+
+                assert!(query.contains("view=tree"));
+                assert!(!query.contains("offset="));
+                assert!(!query.contains("limit="));
+                Json(serde_json::json!({
+                    "prefix": "docs",
+                    "depth": 2,
+                    "entry_count": 3,
+                    "total_entry_count": 3,
+                    "entries": [
+                        { "path": "docs/", "entry_type": "prefix" },
+                        { "path": "docs/a/b.txt", "entry_type": "key" },
+                        { "path": "docs/c/d.txt", "entry_type": "key" },
+                    ],
+                }))
+                .into_response()
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .expect("fallback test server should run");
+    });
+
+    let client = BerryKeepClient::from_direct_base_url(format!("http://{address}"));
+    let response = client
+        .store_index_with_options(
+            Some("docs"),
+            2,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                offset: Some(1),
+                limit: Some(1),
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect("older nodes should project the requested page before synthesis");
+
+    assert_eq!(response.total_entry_count, 2);
+    assert_eq!(response.entry_count, 1);
+    assert_eq!(response.offset, 1);
+    assert_eq!(response.limit, Some(1));
+    assert!(!response.has_more);
+    assert_eq!(response.entries[0].path, "docs/c/d.txt");
+    assert_eq!(queries.lock().await.len(), 2);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn store_index_children_does_not_retry_unrelated_bad_requests() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose its address");
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let route_queries = Arc::clone(&queries);
+    let router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let route_queries = Arc::clone(&route_queries);
+            async move {
+                route_queries.lock().await.push(query.unwrap_or_default());
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "label filters are unavailable with cursor pagination"
+                    })),
+                )
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .expect("bad-request test server should run");
+    });
+
+    let client = BerryKeepClient::from_direct_base_url(format!("http://{address}"));
+    let error = client
+        .store_index_with_options(
+            Some("docs"),
+            1,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                require_labels: vec!["favorite".to_string()],
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect_err("unrelated bad requests must not trigger a tree retry");
+
+    assert!(error.to_string().contains("400 Bad Request"));
+    let queries = queries.lock().await.clone();
+    assert_eq!(queries.len(), 1);
+    assert!(queries[0].contains("view=children"));
+    assert!(queries[0].contains("require_labels=favorite"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn store_index_children_does_not_retry_cursor_pagination_on_older_nodes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose its address");
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let route_queries = Arc::clone(&queries);
+    let router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let route_queries = Arc::clone(&route_queries);
+            async move {
+                route_queries.lock().await.push(query.unwrap_or_default());
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "unknown variant `children`" })),
+                )
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .expect("cursor-pagination test server should run");
+    });
+
+    let client = BerryKeepClient::from_direct_base_url(format!("http://{address}"));
+    let error = client
+        .store_index_with_options(
+            Some("docs"),
+            1,
+            None,
+            StoreIndexRequestOptions {
+                view: Some(StoreIndexView::Children),
+                cursor: Some("cursor-1".to_string()),
+                page_size: Some(20),
+                require_labels: vec!["favorite".to_string()],
+                ..StoreIndexRequestOptions::default()
+            },
+        )
+        .await
+        .expect_err("cursor pagination must not be replaced with an unpaged tree request");
+
+    assert!(error.to_string().contains("400 Bad Request"));
+    let queries = queries.lock().await.clone();
+    assert_eq!(queries.len(), 1);
+    assert!(queries[0].contains("view=children"));
+    assert!(queries[0].contains("cursor=cursor-1"));
+    assert!(queries[0].contains("page_size=20"));
+    assert!(queries[0].contains("require_labels=favorite"));
+
+    server.abort();
 }
 
 #[test]
@@ -1884,9 +2343,11 @@ struct SnapshotHttpRouteState {
     restore_hits: Arc<AtomicUsize>,
     object_hits: Arc<AtomicUsize>,
     status: StatusCode,
+    reject_children_view: bool,
     response_body: Vec<u8>,
     snapshot_list_body: Vec<u8>,
     last_index_query: Arc<Mutex<Option<String>>>,
+    index_queries: Arc<Mutex<Vec<String>>>,
     last_restore_request: Arc<Mutex<Option<serde_json::Value>>>,
     last_object_query: Arc<Mutex<Option<String>>>,
 }
@@ -1895,6 +2356,33 @@ async fn spawn_snapshot_http_route_server(
     status: StatusCode,
     response_body: Vec<u8>,
     snapshot_list_body: Vec<u8>,
+) -> (String, SnapshotHttpRouteState, tokio::task::JoinHandle<()>) {
+    spawn_snapshot_http_route_server_with_children_view_support(
+        status,
+        response_body,
+        snapshot_list_body,
+        true,
+    )
+    .await
+}
+
+async fn spawn_legacy_snapshot_http_route_server(
+    response_body: Vec<u8>,
+) -> (String, SnapshotHttpRouteState, tokio::task::JoinHandle<()>) {
+    spawn_snapshot_http_route_server_with_children_view_support(
+        StatusCode::OK,
+        response_body,
+        Vec::new(),
+        false,
+    )
+    .await
+}
+
+async fn spawn_snapshot_http_route_server_with_children_view_support(
+    status: StatusCode,
+    response_body: Vec<u8>,
+    snapshot_list_body: Vec<u8>,
+    supports_children_view: bool,
 ) -> (String, SnapshotHttpRouteState, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1906,9 +2394,11 @@ async fn spawn_snapshot_http_route_server(
         restore_hits: Arc::new(AtomicUsize::new(0)),
         object_hits: Arc::new(AtomicUsize::new(0)),
         status,
+        reject_children_view: !supports_children_view,
         response_body,
         snapshot_list_body,
         last_index_query: Arc::new(Mutex::new(None)),
+        index_queries: Arc::new(Mutex::new(Vec::new())),
         last_restore_request: Arc::new(Mutex::new(None)),
         last_object_query: Arc::new(Mutex::new(None)),
     };
@@ -1920,7 +2410,20 @@ async fn spawn_snapshot_http_route_server(
                     |State(state): State<SnapshotHttpRouteState>,
                      RawQuery(query): RawQuery| async move {
                         state.hits.fetch_add(1, Ordering::SeqCst);
-                        *state.last_index_query.lock().await = query;
+                        let query = query.unwrap_or_default();
+                        *state.last_index_query.lock().await = Some(query.clone());
+                        state.index_queries.lock().await.push(query.clone());
+                        if state.reject_children_view && query.contains("view=children") {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                serde_json::to_vec(&serde_json::json!({
+                                    "error": "unknown variant `children`"
+                                }))
+                                .expect("legacy error should serialize"),
+                            )
+                                .into_response();
+                        }
                         (
                             state.status,
                             [(header::CONTENT_TYPE, "application/json")],
@@ -5876,6 +6379,57 @@ async fn qualified_snapshot_store_index_targets_owner_and_strips_qualifier() {
         .expect("owner should receive a query");
     assert!(query.contains("snapshot=snapshot-local-7"));
     assert!(!query.contains("snapshot-v1"));
+
+    other_server.abort();
+    owner_server.abort();
+}
+
+#[tokio::test]
+async fn qualified_snapshot_children_fallback_targets_owner_and_strips_qualifier() {
+    let (other_url, other_state, other_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("wrong-node.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let (owner_url, owner_state, owner_server) =
+        spawn_legacy_snapshot_http_route_server(snapshot_index_response_body("snapshot-owner.jpg"))
+            .await;
+    let other_node_id = NodeId::new_v4();
+    let owner_node_id = NodeId::new_v4();
+    let client = BerryKeepClient::combine(vec![
+        direct_http_test_client_for_node(other_url, other_node_id),
+        direct_http_test_client_for_node(owner_url, owner_node_id),
+    ])
+    .expect("combined direct client should build");
+    let selector = client_snapshot_selector(owner_node_id, "snapshot-local-7");
+    let options = StoreIndexRequestOptions {
+        view: Some(StoreIndexView::Children),
+        ..StoreIndexRequestOptions::default()
+    };
+
+    let first_response = client
+        .store_index_with_options(None, 1, Some(&selector), options.clone())
+        .await
+        .expect("qualified snapshot should fall back on its owner");
+    assert_eq!(first_response.entries[0].path, "snapshot-owner.jpg");
+
+    let cached_response = client
+        .store_index_with_options(None, 1, Some(&selector), options)
+        .await
+        .expect("cached fallback should keep targeting the snapshot owner");
+    assert_eq!(cached_response.entries[0].path, "snapshot-owner.jpg");
+
+    assert_eq!(other_state.hits.load(Ordering::SeqCst), 0);
+    let owner_queries = owner_state.index_queries.lock().await.clone();
+    assert_eq!(owner_queries.len(), 3);
+    assert!(owner_queries[0].contains("view=children"));
+    assert!(owner_queries[1].contains("view=tree"));
+    assert!(owner_queries[2].contains("view=tree"));
+    for query in owner_queries {
+        assert!(query.contains("snapshot=snapshot-local-7"));
+        assert!(!query.contains("snapshot-v1"));
+    }
 
     other_server.abort();
     owner_server.abort();

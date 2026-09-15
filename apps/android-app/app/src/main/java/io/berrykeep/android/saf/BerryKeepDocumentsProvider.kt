@@ -16,7 +16,6 @@ import android.provider.DocumentsProvider
 import android.webkit.MimeTypeMap
 import io.berrykeep.android.R
 import io.berrykeep.android.api.StoreIndexEntry
-import io.berrykeep.android.api.isDirectStoreIndexChildPath
 import io.berrykeep.android.data.DeviceAuthState
 import io.berrykeep.android.data.AndroidDiagnosticLog as Log
 import io.berrykeep.android.data.DeviceIdentityStorageException
@@ -85,10 +84,9 @@ class BerryKeepDocumentsProvider : DocumentsProvider() {
         }
 
         val prefix = parent.path.takeIf { it.isNotBlank() }
-        // loadDirectoryEntries() always requests the store index view=tree, whose server-side
-        // contract collapses trailing-slash folder markers into a single canonical "prefix"
-        // entry per directory. SAF can rely on entry_type alone rather than re-deriving
-        // directory-ness from the path.
+        // loadDirectoryEntries() requests view=children. Its server-side contract returns
+        // entries below this directory only and canonicalizes directory markers to "prefix"
+        // entries, so SAF does not need to re-derive child membership or directory-ness.
         val entries = runBlocking {
             loadDirectoryEntries(prefix)
         }
@@ -97,18 +95,12 @@ class BerryKeepDocumentsProvider : DocumentsProvider() {
         entries.forEach { entry ->
             if (entry.entry_type == "prefix") {
                 val dirPath = entry.path.trimEnd('/')
-                if (!isDirectStoreIndexChildPath(parent.path, dirPath)) {
-                    return@forEach
-                }
                 val documentId = directoryDocumentId(dirPath)
                 if (!emittedDocumentIds.add(documentId)) {
                     return@forEach
                 }
                 includeDirectory(result, documentId, dirPath.substringAfterLast('/'))
             } else {
-                if (!isDirectStoreIndexChildPath(parent.path, entry.path)) {
-                    return@forEach
-                }
                 val documentId = fileDocumentId(entry.path)
                 if (!emittedDocumentIds.add(documentId)) {
                     return@forEach
@@ -498,7 +490,6 @@ class BerryKeepDocumentsProvider : DocumentsProvider() {
         val entries = repository.storeIndexDirectoryListing(
             connectionInput = resolveConnectionInput(),
             prefix = prefix,
-            depth = 1,
             serverCaPem = resolveServerCaPem(),
             clientIdentityJson = resolveClientIdentityJson(),
         ).entries

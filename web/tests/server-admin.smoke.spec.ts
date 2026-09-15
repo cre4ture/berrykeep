@@ -10,6 +10,7 @@ import {
 import { GalleryMapMockSession } from "./gallery-map.mock";
 import {
   filterMockStoreEntriesToPrefix,
+  projectMockStoreChildrenEntries,
   projectMockStoreTreeEntries
 } from "./store-index.mock";
 
@@ -644,6 +645,7 @@ test("server-admin explorer restores snapshot entries", async ({ page }) => {
 
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("button", { name: "Refresh snapshots" })).toBeVisible();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
 
   await page.getByRole("textbox", { name: "Snapshot" }).click();
   await page.getByRole("option", { name: "snapshot-admin-001" }).click();
@@ -916,6 +918,9 @@ test("server-admin explorer loads version history with thumbnails", async ({ pag
   await page.keyboard.press("Escape");
 
   await page.getByText("Explorer", { exact: true }).click();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
+  await expect(page.getByRole("row", { name: /gallery\/cat\.png/ })).toBeVisible();
   await page
     .getByRole("row", { name: /gallery\/cat\.png/ })
     .getByRole("button", { name: "History" })
@@ -2398,7 +2403,7 @@ async function installServerAdminMocks(
     }
 
     if (pathname === apiV1("/auth/store/index") && method === "GET") {
-      expect(searchParams.get("view")).toBe("tree");
+      expect(["tree", "children"]).toContain(searchParams.get("view"));
       return json(route, buildAdminStoreIndexResponse(galleryEntries, searchParams));
     }
 
@@ -3711,15 +3716,13 @@ function buildAdminStoreIndexResponse(
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
-  const isTreeNavigationRequest =
-    searchParams.get("view") === "tree" &&
-    !searchParams.has("offset") &&
-    !searchParams.has("limit") &&
-    !searchParams.has("sort") &&
-    !mediaFilter;
-  const scopedEntries = isTreeNavigationRequest
-    ? projectMockStoreTreeEntries(entries, prefix, depth)
-    : filterMockStoreEntriesToPrefix(entries, prefix);
+  const view = searchParams.get("view");
+  const scopedEntries =
+    view === "children"
+      ? projectMockStoreChildrenEntries(entries, prefix, depth)
+      : view === "tree"
+        ? projectMockStoreTreeEntries(entries, prefix, depth)
+        : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter
     ? scopedEntries.filter((entry) => matchesAdminMediaFilter(entry, mediaFilter))
     : scopedEntries;
@@ -3740,6 +3743,7 @@ function buildAdminStoreIndexResponse(
     offset,
     limit,
     has_more: offset + pagedEntries.length < totalEntryCount,
+    consistency_token: "namespace:server-admin-test",
     media_summary: summarizeAdminMediaEntries(filteredEntries),
     entries: pagedEntries
   };

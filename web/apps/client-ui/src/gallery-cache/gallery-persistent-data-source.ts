@@ -23,7 +23,7 @@ type ResourceDescriptor =
       prefix: string;
       depth: number;
       snapshotId: string | null;
-      view: "raw" | "tree";
+      view: "raw" | "tree" | "children";
       offset: number | null;
       limit: number | null;
       sort: GalleryLoadEntriesOptions["sort"] | null;

@@ -13636,6 +13636,11 @@ struct GalleryMapClusterEntriesQuery {
 enum StoreIndexView {
     Raw,
     Tree,
+    /// A prefix-scoped tree projection which excludes the queried prefix itself.
+    ///
+    /// Directory browsers use this view so an explicit marker for the current
+    /// directory is never presented as one of its children.
+    Children,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -17640,7 +17645,7 @@ fn store_index_page_cache_key(
     thumbnail_route: &str,
     label_filter: &storage::GalleryLabelFilter,
 ) -> Option<StoreIndexPageCacheKey> {
-    if !matches!(query.view, Some(StoreIndexView::Tree))
+    if !store_index_view_uses_tree_entry_shape(query.view)
         || query.limit.is_none()
         || store_index_has_viewport(query)
     {
@@ -17732,7 +17737,15 @@ fn store_index_gallery_query(
     depth: usize,
     label_filter: storage::GalleryLabelFilter,
 ) -> Option<storage::GalleryIndexQuery> {
-    if query.snapshot.is_some() || query.cursor.is_some() || query.page_size.is_some() {
+    // The gallery index contains only media rows, whereas children is a
+    // directory projection that must run before filtering and pagination.
+    // Keep children on the general index path so its contract remains valid
+    // even if gallery rows later gain directory markers.
+    if matches!(query.view, Some(StoreIndexView::Children))
+        || query.snapshot.is_some()
+        || query.cursor.is_some()
+        || query.page_size.is_some()
+    {
         return None;
     }
     let media_filter = match query.media_filter? {
@@ -18297,7 +18310,11 @@ async fn list_store_index_response_attempt(
     }
 
     let entry_plan_started_at = Instant::now();
-    let mut entry_plan = plan_store_index_entries(&keys, &prefix, depth);
+    let mut entry_plan = if matches!(query.view, Some(StoreIndexView::Children)) {
+        plan_store_index_children(&keys, &prefix, depth)
+    } else {
+        plan_store_index_entries(&keys, &prefix, depth)
+    };
     prefilter_store_index_entry_plan_for_media(&mut entry_plan, query.media_filter);
     let visible_object_hashes =
         filter_store_index_values_for_paths(&key_hashes, &entry_plan.file_entries);
@@ -18474,7 +18491,7 @@ async fn list_store_index_response_attempt(
     };
 
     let collapse_started_at = Instant::now();
-    if matches!(query.view, Some(StoreIndexView::Tree)) {
+    if store_index_view_uses_tree_entry_shape(query.view) {
         entries = collapse_store_index_entries_for_tree_view(entries);
     }
     let tree_collapse_ms = collapse_started_at.elapsed().as_millis();
@@ -18705,7 +18722,7 @@ async fn list_store_index_response_cursor_mode(
     snapshot_created_at_limit: Option<u64>,
     store_index_inspector: storage::StoreIndexInspector,
 ) -> Response {
-    if matches!(query.view, Some(StoreIndexView::Tree))
+    if store_index_view_uses_tree_entry_shape(query.view)
         || query.offset.is_some()
         || query.limit.is_some()
         || query.media_filter.is_some()
@@ -19106,6 +19123,10 @@ fn collapse_store_index_entries_for_tree_view(
     }
 
     collapsed.into_values().collect()
+}
+
+fn store_index_view_uses_tree_entry_shape(view: Option<StoreIndexView>) -> bool {
+    matches!(view, Some(StoreIndexView::Tree | StoreIndexView::Children))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19596,6 +19617,21 @@ fn plan_store_index_entries(keys: &[String], prefix: &str, depth: usize) -> Stor
         file_entries: file_entries.into_iter().collect(),
         prefix_entries: prefix_entries.into_iter().collect(),
     }
+}
+
+fn plan_store_index_children(keys: &[String], prefix: &str, depth: usize) -> StoreIndexEntryPlan {
+    let normalized_prefix = prefix.trim().trim_matches('/');
+    let mut plan = plan_store_index_entries(keys, normalized_prefix, depth);
+
+    if normalized_prefix.is_empty() {
+        return plan;
+    }
+
+    plan.file_entries
+        .retain(|entry_path| entry_path.trim().trim_matches('/') != normalized_prefix);
+    plan.prefix_entries
+        .retain(|entry_path| entry_path.trim().trim_matches('/') != normalized_prefix);
+    plan
 }
 
 fn filter_store_index_values_for_paths<T: Clone>(

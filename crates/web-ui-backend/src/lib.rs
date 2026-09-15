@@ -3006,6 +3006,7 @@ async fn web_store_list(
         None => None,
         Some("tree") => Some(StoreIndexView::Tree),
         Some("raw") => Some(StoreIndexView::Raw),
+        Some("children") => Some(StoreIndexView::Children),
         Some(other) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -3089,8 +3090,10 @@ async fn web_store_list(
                 viewport,
                 require_labels,
                 exclude_labels,
-                synthesize_missing_folder_markers: matches!(view, Some(StoreIndexView::Tree))
-                    && query.offset.is_none()
+                synthesize_missing_folder_markers: matches!(
+                    view,
+                    Some(StoreIndexView::Tree | StoreIndexView::Children)
+                ) && query.offset.is_none()
                     && query.limit.is_none()
                     && sort.is_none()
                     && media_filter.is_none(),

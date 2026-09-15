@@ -620,7 +620,10 @@ impl IosStorageApp {
         depth: usize,
         snapshot: Option<&str>,
     ) -> Result<AppleListResponse> {
-        let response = self.client.store_index(prefix, depth, snapshot).await?;
+        let response = self
+            .sdk
+            .store_index_with_view(prefix, depth, snapshot, Some(StoreIndexView::Children))
+            .await?;
         let mut entries = Vec::with_capacity(response.entries.len());
 
         for entry in response.entries {
@@ -811,8 +814,9 @@ fn store_index_with_options_json(
     exclude_labels: Vec<String>,
 ) -> Result<String> {
     let app = unsafe { handle_to_app(handle)? };
+    let view = parse_store_index_view(view)?;
     let options = StoreIndexRequestOptions {
-        view: parse_store_index_view(view)?,
+        view,
         cursor: None,
         page_size: None,
         offset,
@@ -824,8 +828,10 @@ fn store_index_with_options_json(
         viewport: None,
         require_labels: Vec::new(),
         exclude_labels,
-        synthesize_missing_folder_markers: matches!(view, Some("tree"))
-            && offset.is_none()
+        synthesize_missing_folder_markers: matches!(
+            view,
+            Some(StoreIndexView::Tree | StoreIndexView::Children)
+        ) && offset.is_none()
             && limit.is_none()
             && sort.is_none()
             && media_filter.is_none(),
@@ -1812,6 +1818,7 @@ fn parse_store_index_view(value: Option<&str>) -> Result<Option<StoreIndexView>>
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some("raw") => Ok(Some(StoreIndexView::Raw)),
         Some("tree") => Ok(Some(StoreIndexView::Tree)),
+        Some("children") => Ok(Some(StoreIndexView::Children)),
         Some(other) => bail!("unsupported store index view: {other}"),
         None => Ok(None),
     }
@@ -2058,6 +2065,7 @@ mod tests {
         objects: Arc<Mutex<BTreeMap<String, TestObject>>>,
         last_store_index_query: Arc<Mutex<Option<String>>>,
         last_relative_path: Arc<Mutex<Option<String>>>,
+        omit_store_index_folder_markers: bool,
     }
 
     #[derive(Clone)]
@@ -2332,25 +2340,42 @@ mod tests {
             });
         }
 
-        for prefix in prefixes {
-            entries.push(StoreIndexEntry {
-                path: prefix,
-                entry_type: "prefix".to_string(),
-                object_id: None,
-                labels: Vec::new(),
-                labels_resolved: false,
-                version: None,
-                content_hash: None,
-                size_bytes: None,
-                modified_at_unix: None,
-                content_fingerprint: None,
-                media: None,
-            });
+        if !state.omit_store_index_folder_markers {
+            for prefix in prefixes {
+                entries.push(StoreIndexEntry {
+                    path: prefix,
+                    entry_type: "prefix".to_string(),
+                    object_id: None,
+                    labels: Vec::new(),
+                    labels_resolved: false,
+                    version: None,
+                    content_hash: None,
+                    size_bytes: None,
+                    modified_at_unix: None,
+                    content_fingerprint: None,
+                    media: None,
+                });
+            }
         }
 
+        let is_children_view = uri
+            .query()
+            .is_some_and(|query| query.split('&').any(|pair| pair == "view=children"));
+        let response_prefix = uri
+            .query()
+            .filter(|query| {
+                query
+                    .split('&')
+                    .any(|pair| matches!(pair, "prefix=docs" | "prefix=docs%2F"))
+            })
+            .map(|_| "docs".to_string())
+            .unwrap_or_default();
+        if is_children_view && !response_prefix.is_empty() {
+            entries.retain(|entry| entry.path.trim_matches('/') != response_prefix);
+        }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let response = StoreIndexResponse {
-            prefix: String::new(),
+            prefix: response_prefix,
             depth: 1,
             entry_count: entries.len(),
             total_entry_count: entries.len(),
@@ -2654,6 +2679,57 @@ mod tests {
     }
 
     #[test]
+    fn blocking_facade_children_view_synthesizes_missing_folder_markers() {
+        let state = TestServerState {
+            omit_store_index_folder_markers: true,
+            ..TestServerState::default()
+        };
+        state.objects.lock().expect("lock poisoned").insert(
+            "docs/a/b.txt".to_string(),
+            TestObject {
+                bytes: b"nested document".to_vec(),
+                object_id: "nested-document".to_string(),
+            },
+        );
+        let (addr, _) = spawn_test_server_with_state(state);
+        let handle = create_handle_for_server(addr);
+
+        let prefix = CString::new("docs").expect("prefix should be valid");
+        let view = CString::new("children").expect("view should be valid");
+        let mut json_out = ptr::null_mut();
+        let mut error_out = ptr::null_mut();
+        let status = berrykeep_ios_facade_store_index_with_options_json(
+            handle,
+            prefix.as_ptr(),
+            2,
+            ptr::null(),
+            view.as_ptr(),
+            -1,
+            -1,
+            ptr::null(),
+            ptr::null(),
+            u64::MAX,
+            u64::MAX,
+            ptr::null(),
+            &mut json_out,
+            &mut error_out,
+        );
+
+        assert_eq!(status, FFI_OK);
+        assert!(error_out.is_null());
+        let response: StoreIndexResponse =
+            serde_json::from_str(&read_string(json_out)).expect("store index should parse");
+        assert!(
+            response
+                .entries
+                .iter()
+                .any(|entry| { entry.path == "docs/a/" && entry.entry_type == "prefix" })
+        );
+
+        berrykeep_ios_facade_free(handle);
+    }
+
+    #[test]
     fn blocking_facade_maps_store_index_options_and_fetches_relative_bytes() {
         let state = TestServerState::default();
         let (addr, state) = spawn_test_server_with_state(state);
@@ -2747,7 +2823,8 @@ mod tests {
 
     #[test]
     fn blocking_facade_round_trips_list_metadata_fetch_put_move_and_delete() {
-        let addr = spawn_test_server();
+        let state = TestServerState::default();
+        let (addr, state) = spawn_test_server_with_state(state);
         let handle = create_handle_for_server(addr);
 
         let payload = b"hello apple facade";
@@ -2786,17 +2863,49 @@ mod tests {
         assert!(list_error.is_null());
         let list_response: AppleListResponse =
             serde_json::from_str(&read_string(list_json)).expect("list response should parse");
-        assert_eq!(list_response.entries.len(), 2);
+        assert_eq!(list_response.entries.len(), 1);
         assert!(
-            list_response.entries.iter().any(
-                |entry| entry.path == "docs/" && matches!(entry.kind, AppleItemKind::Directory)
-            )
+            list_response
+                .entries
+                .iter()
+                .all(|entry| entry.path != "docs/")
         );
         assert!(
             list_response
                 .entries
                 .iter()
                 .any(|entry| entry.path == "docs/readme.txt")
+        );
+        assert!(
+            state
+                .last_store_index_query
+                .lock()
+                .expect("lock poisoned")
+                .as_deref()
+                .is_some_and(|query| query.contains("view=children"))
+        );
+
+        let root_prefix = CString::new("").expect("empty prefix is valid");
+        let mut root_list_json = ptr::null_mut();
+        let mut root_list_error = ptr::null_mut();
+        let status = berrykeep_ios_facade_list_json(
+            handle,
+            root_prefix.as_ptr(),
+            1,
+            snapshot.as_ptr(),
+            &mut root_list_json,
+            &mut root_list_error,
+        );
+        assert_eq!(status, FFI_OK);
+        assert!(root_list_error.is_null());
+        let root_list_response: AppleListResponse =
+            serde_json::from_str(&read_string(root_list_json)).expect("root list should parse");
+        assert!(
+            root_list_response
+                .entries
+                .iter()
+                .any(|entry| entry.path == "docs/"),
+            "the root children projection must retain its child directories"
         );
 
         let mut metadata_json = ptr::null_mut();

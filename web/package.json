@@ -17,6 +17,7 @@
     "test:e2e:server-admin-setup-rust": "pnpm build && cargo build --locked -p server-node --manifest-path ../Cargo.toml && playwright test tests/server-admin.setup.rust.smoke.spec.ts --config playwright.server-node-setup.config.ts"
   },
   "devDependencies": {
+    "@berrykeep/api": "workspace:*",
     "@playwright/test": "^1.52.0",
     "@vitejs/plugin-react": "^4.4.1",
     "typescript": "^5.8.2",

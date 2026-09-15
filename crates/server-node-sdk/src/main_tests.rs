@@ -13844,6 +13844,156 @@ fn store_index_entry_plan_limits_visible_files_to_requested_depth() {
 }
 
 #[test]
+fn store_index_children_plan_excludes_the_queried_directory_marker() {
+    let keys = vec![
+        "docs/".to_string(),
+        "docs/readme.md".to_string(),
+        "docs/guide/intro.md".to_string(),
+    ];
+
+    let plan = super::plan_store_index_children(&keys, "docs/", 1);
+
+    assert_eq!(plan.file_entries, vec!["docs/readme.md"]);
+    assert_eq!(plan.prefix_entries, vec!["docs/guide/"]);
+}
+
+async fn store_index_children_request_omits_current_marker_before_pagination_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    {
+        let mut store = lock_store(&state, "tests.store_index.children_request").await;
+        for (key, contents) in [
+            ("docs/", b"".as_slice()),
+            ("docs/a.txt", b"a".as_slice()),
+            ("docs/b.txt", b"b".as_slice()),
+        ] {
+            store
+                .put_object_versioned(
+                    key,
+                    bytes::Bytes::copy_from_slice(contents),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let app = super::build_server_apps(&state).public_app;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/store/index?prefix=docs&depth=1&view=children&offset=0&limit=1")
+                .body(Body::empty())
+                .expect("store index request should build"),
+        )
+        .await
+        .expect("store index request should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+            .expect("store index response should decode");
+    assert_eq!(payload["entries"][0]["path"], "docs/a.txt");
+    assert!(
+        payload["entries"]
+            .as_array()
+            .expect("entries should be an array")
+            .iter()
+            .all(|entry| entry["path"] != "docs/"),
+        "the queried directory marker must be removed before the page is selected"
+    );
+    assert_eq!(payload["entry_count"], 1);
+    assert_eq!(payload["total_entry_count"], 2);
+    assert_eq!(payload["offset"], 0);
+    assert_eq!(payload["limit"], 1);
+    assert_eq!(payload["has_more"], true);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    store_index_children_request_omits_current_marker_before_pagination_impl,
+    store_index_children_request_omits_current_marker_before_pagination,
+    store_index_children_request_omits_current_marker_before_pagination_turso
+);
+
+#[test]
+fn store_index_query_rejects_unknown_projection_views() {
+    let error = serde_json::from_value::<super::StoreIndexQuery>(serde_json::json!({
+        "view": "future_projection",
+    }))
+    .expect_err("unknown projections must produce the compatibility error");
+
+    assert!(error.to_string().contains("unknown variant"));
+}
+
+#[tokio::test]
+async fn store_index_query_rejection_exposes_the_children_capability_signal() {
+    #[derive(serde::Deserialize)]
+    struct LegacyStoreIndexQuery {
+        view: Option<LegacyStoreIndexView>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyStoreIndexView {
+        Raw,
+        Tree,
+    }
+
+    async fn accept_store_index_query(Query(query): Query<LegacyStoreIndexQuery>) -> StatusCode {
+        let _ = query.view;
+        StatusCode::NO_CONTENT
+    }
+
+    let app = Router::new().route("/api/v1/store/index", get(accept_store_index_query));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/store/index?view=children")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("query route should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("query rejection body should be readable");
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("unknown variant"));
+    assert!(body.contains("children"));
+}
+
+#[test]
+fn store_index_gallery_fast_path_skips_the_children_projection() {
+    let query = super::StoreIndexQuery {
+        prefix: Some("docs".to_string()),
+        depth: Some(1),
+        snapshot: None,
+        view: Some(super::StoreIndexView::Children),
+        cursor: None,
+        page_size: None,
+        offset: Some(0),
+        limit: Some(50),
+        sort: Some(super::StoreIndexSortOrder::CapturedDesc),
+        media_filter: Some(super::StoreIndexMediaFilter::Image),
+        captured_from_unix: None,
+        captured_until_unix: None,
+        south: None,
+        west: None,
+        north: None,
+        east: None,
+        require_labels: None,
+        exclude_labels: None,
+    };
+
+    assert!(super::store_index_gallery_query(&query, "docs", 1, Default::default()).is_none());
+}
+
+#[test]
 fn store_index_object_map_filter_respects_prefix_boundaries() {
     let (hashes, object_ids) = super::filter_store_index_object_maps_for_prefix(
         HashMap::from([

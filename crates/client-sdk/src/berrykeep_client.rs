@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sync_core::{EntryKind, NamespaceEntry, SyncSnapshot};
 use transport_sdk::{
     BufferedTransportRequest, BufferedTransportResponse as MultiplexBufferedTransportResponse,
@@ -84,6 +84,7 @@ const MOBILE_CONNECTION_LOG_TARGET: &str = "berrykeep_mobile_connection";
 const STORE_INDEX_WAIT_DEFAULT_TIMEOUT_MS: u64 = 25_000;
 const STORE_INDEX_WAIT_MIN_TIMEOUT_MS: u64 = 250;
 const STORE_INDEX_WAIT_MAX_TIMEOUT_MS: u64 = 60_000;
+const STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER: Duration = Duration::from_secs(5 * 60);
 pub(crate) const CLIENT_API_V1_PREFIX: &str = "/api/v1";
 const GALLERY_MAP_CLUSTERS_PATH: &str = "/gallery/map/clusters";
 const GALLERY_MAP_CLUSTER_ENTRIES_PATH: &str = "/gallery/map/cluster-entries";
@@ -192,6 +193,7 @@ pub struct BerryKeepClient {
     connection_diagnostic_impact: ClientConnectionDiagnosticImpact,
     upload_session_affinities: Arc<Mutex<HashMap<String, NodeRouteAffinity>>>,
     gallery_map_api_routes: Arc<RwLock<GalleryMapApiRoutes>>,
+    store_index_children_view_capability: Arc<Mutex<StoreIndexChildrenViewCapability>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -226,6 +228,17 @@ enum GalleryMapApiEndpoint {
 struct GalleryMapApiRoutes {
     clusters: GalleryMapApiRoute,
     cluster_entries: GalleryMapApiRoute,
+}
+
+#[derive(Debug, Default)]
+struct StoreIndexChildrenViewCapability {
+    unsupported_until_by_route: HashMap<RouteId, Instant>,
+}
+
+#[derive(Debug)]
+enum StoreIndexChildrenViewRoutePlan {
+    Children(Option<RouteId>),
+    LegacyTree(RouteId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3632,6 +3645,8 @@ pub struct VersionGraphSummary {
 pub enum StoreIndexView {
     Raw,
     Tree,
+    /// Prefix-scoped tree entries without the marker for the queried prefix.
+    Children,
 }
 
 impl StoreIndexView {
@@ -3639,6 +3654,7 @@ impl StoreIndexView {
         match self {
             Self::Raw => "raw",
             Self::Tree => "tree",
+            Self::Children => "children",
         }
     }
 }
@@ -4136,6 +4152,9 @@ impl BerryKeepClient {
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
             gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
+            store_index_children_view_capability: Arc::new(Mutex::new(
+                StoreIndexChildrenViewCapability::default(),
+            )),
         }
     }
 
@@ -4192,6 +4211,9 @@ impl BerryKeepClient {
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
             gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
+            store_index_children_view_capability: Arc::new(Mutex::new(
+                StoreIndexChildrenViewCapability::default(),
+            )),
         }
     }
 
@@ -4220,6 +4242,9 @@ impl BerryKeepClient {
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
             gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
+            store_index_children_view_capability: Arc::new(Mutex::new(
+                StoreIndexChildrenViewCapability::default(),
+            )),
         }
     }
 
@@ -4272,6 +4297,9 @@ impl BerryKeepClient {
             connection_diagnostic_impact: ClientConnectionDiagnosticImpact::UserFacing,
             upload_session_affinities: Arc::new(Mutex::new(HashMap::new())),
             gallery_map_api_routes: Arc::new(RwLock::new(GalleryMapApiRoutes::default())),
+            store_index_children_view_capability: Arc::new(Mutex::new(
+                StoreIndexChildrenViewCapability::default(),
+            )),
         })
     }
 
@@ -5783,6 +5811,203 @@ impl BerryKeepClient {
         snapshot: Option<&str>,
         options: StoreIndexRequestOptions,
     ) -> Result<StoreIndexResponse> {
+        let can_fallback_to_tree = options.view == Some(StoreIndexView::Children)
+            && options.cursor.is_none()
+            && options.page_size.is_none();
+        let preferred_children_route = if can_fallback_to_tree {
+            match self.store_index_children_view_route_plan(snapshot)? {
+                StoreIndexChildrenViewRoutePlan::Children(route_id) => route_id,
+                StoreIndexChildrenViewRoutePlan::LegacyTree(route_id) => {
+                    return self
+                        .store_index_with_legacy_tree_projection(
+                            prefix,
+                            depth,
+                            snapshot,
+                            &options,
+                            Some(&route_id),
+                        )
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
+
+        let routed_response = self
+            .request_store_index_on_route(
+                prefix,
+                depth,
+                snapshot,
+                &options,
+                preferred_children_route.as_ref(),
+            )
+            .await?;
+
+        // `children` was introduced after the original tree projection. Older
+        // nodes reject unknown enum values while deserializing the query, so
+        // retry their established tree view and project the current marker out
+        // locally. The fallback deliberately fetches the unpaged tree: the
+        // server must apply the children projection before pagination for its
+        // offset and total to remain meaningful.
+        let children_view_was_rejected = options.view == Some(StoreIndexView::Children)
+            && store_index_view_was_rejected(&routed_response.response, StoreIndexView::Children);
+        if children_view_was_rejected {
+            let rejected_route_id = routed_response.route_affinity.preferred_route_id.clone();
+            if let Some(route_id) = rejected_route_id.as_ref() {
+                self.remember_store_index_children_view_is_unsupported(route_id);
+            }
+            if can_fallback_to_tree {
+                return self
+                    .store_index_with_legacy_tree_projection(
+                        prefix,
+                        depth,
+                        snapshot,
+                        &options,
+                        rejected_route_id.as_ref(),
+                    )
+                    .await;
+            }
+        }
+
+        decode_store_index_response(routed_response.response, &options)
+    }
+
+    fn store_index_children_view_route_plan(
+        &self,
+        snapshot: Option<&str>,
+    ) -> Result<StoreIndexChildrenViewRoutePlan> {
+        let mut url = self.store_index_url()?;
+        append_optional_query(&mut url, "snapshot", snapshot);
+        let route_ids = self.normalized_request_route_ids(&mut url, None)?;
+        let mut capability = self
+            .store_index_children_view_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        capability
+            .unsupported_until_by_route
+            .retain(|_, unsupported_until| now < *unsupported_until);
+        if let Some(route_id) = route_ids.iter().find(|route_id| {
+            !capability
+                .unsupported_until_by_route
+                .contains_key(*route_id)
+        }) {
+            return Ok(StoreIndexChildrenViewRoutePlan::Children(Some(
+                route_id.clone(),
+            )));
+        }
+        Ok(route_ids
+            .into_iter()
+            .next()
+            .map(StoreIndexChildrenViewRoutePlan::LegacyTree)
+            .unwrap_or(StoreIndexChildrenViewRoutePlan::Children(None)))
+    }
+
+    fn remember_store_index_children_view_is_unsupported(&self, route_id: &RouteId) {
+        let mut capability = self
+            .store_index_children_view_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        capability.unsupported_until_by_route.insert(
+            route_id.clone(),
+            Instant::now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER,
+        );
+    }
+
+    async fn store_index_with_legacy_tree_projection(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: &StoreIndexRequestOptions,
+        route_id: Option<&RouteId>,
+    ) -> Result<StoreIndexResponse> {
+        let mut fallback_options = options.clone();
+        fallback_options.view = Some(StoreIndexView::Tree);
+        fallback_options.cursor = None;
+        fallback_options.page_size = None;
+        fallback_options.offset = None;
+        fallback_options.limit = None;
+        // Synthesize only after recreating the requested children page below.
+        // Otherwise this unpaged fallback would add folder markers from later
+        // pages and reorder the complete tree before applying the caller's
+        // offset and limit.
+        fallback_options.synthesize_missing_folder_markers = false;
+
+        // A legacy node exposes no durable token that is safe across request
+        // routes or process restarts. Fetch its complete tree for every
+        // projected request instead of risking a stale live listing. The
+        // rejected capability itself is cached above, so this does not repeat
+        // the doomed `children` request until the reprobe window expires.
+        let fallback_response = self
+            .request_store_index_on_route(prefix, depth, snapshot, &fallback_options, route_id)
+            .await?;
+        let response = decode_store_index_response(fallback_response.response, &fallback_options)?;
+        let mut response = project_store_index_children_response(&response, prefix, options);
+        synthesize_missing_folder_markers_for_page(&mut response, options);
+        Ok(response)
+    }
+
+    async fn request_store_index_on_route(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: &StoreIndexRequestOptions,
+        route_id: Option<&RouteId>,
+    ) -> Result<RoutedBufferedTransportResponse> {
+        let mut url = self.store_index_request_url(prefix, depth, snapshot, options)?;
+        match route_id {
+            Some(route_id) => {
+                let route_ids = self.normalized_request_route_ids(&mut url, Some(route_id))?;
+                if route_ids.is_empty() {
+                    bail!("no client transport endpoints are available for /store/index");
+                }
+                self.execute_buffered_request_on_routes(
+                    Method::GET,
+                    url,
+                    Vec::new(),
+                    None,
+                    &route_ids,
+                )
+                .await
+            }
+            None => {
+                self.execute_buffered_request_with_route(Method::GET, url, Vec::new(), None)
+                    .await
+            }
+        }
+        .context("failed to request /store/index")
+    }
+
+    fn normalized_request_route_ids(
+        &self,
+        url: &mut Url,
+        preferred_route_id: Option<&RouteId>,
+    ) -> Result<Vec<RouteId>> {
+        let snapshot_owner_node_id = normalize_client_snapshot_selector_in_url(url)?;
+        let mut route_ids = match snapshot_owner_node_id {
+            Some(node_id) => self.route_ids_for_target_node(node_id)?,
+            None => self.transport_router.foreground_route_ids(),
+        };
+        if let Some(preferred_route_id) = preferred_route_id
+            && let Some(position) = route_ids
+                .iter()
+                .position(|route_id| route_id == preferred_route_id)
+        {
+            let route_id = route_ids.remove(position);
+            route_ids.insert(0, route_id);
+        }
+        Ok(route_ids)
+    }
+
+    fn store_index_request_url(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: &StoreIndexRequestOptions,
+    ) -> Result<Url> {
         let mut url = self.store_index_url()?;
         url.query_pairs_mut()
             .append_pair("depth", &depth.max(1).to_string());
@@ -5832,26 +6057,7 @@ impl BerryKeepClient {
         }
         append_comma_separated_labels(&mut url, "require_labels", &options.require_labels);
         append_comma_separated_labels(&mut url, "exclude_labels", &options.exclude_labels);
-
-        let response = self
-            .execute_buffered_request(Method::GET, url, Vec::new(), None)
-            .await
-            .context("failed to request /store/index")?;
-        if !response.status.is_success() {
-            bail!(
-                "/store/index returned non-success status: {}",
-                response.status
-            );
-        }
-
-        let mut result = serde_json::from_slice::<StoreIndexResponse>(&response.body)
-            .context("failed to parse /store/index response");
-
-        if let Ok(ref mut response) = result {
-            synthesize_missing_folder_markers_for_page(response, &options);
-        }
-
-        result
+        Ok(url)
     }
 
     pub fn store_index_blocking(
@@ -9902,6 +10108,84 @@ fn synthesize_missing_folder_markers_for_page(
     ensure_missing_folder_markers(&mut response.entries, &response.prefix);
     response.entry_count = response.entries.len();
     response.total_entry_count = response.total_entry_count.max(response.entry_count);
+}
+
+fn decode_store_index_response(
+    response: BufferedTransportResponse,
+    options: &StoreIndexRequestOptions,
+) -> Result<StoreIndexResponse> {
+    if !response.status.is_success() {
+        bail!(
+            "/store/index returned non-success status: {}",
+            response.status
+        );
+    }
+
+    let mut response = serde_json::from_slice::<StoreIndexResponse>(&response.body)
+        .context("failed to parse /store/index response")?;
+    synthesize_missing_folder_markers_for_page(&mut response, options);
+    Ok(response)
+}
+
+fn store_index_view_was_rejected(
+    response: &BufferedTransportResponse,
+    requested_view: StoreIndexView,
+) -> bool {
+    if response.status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+
+    let body = String::from_utf8_lossy(&response.body);
+    body.contains("unknown variant") && body.contains(requested_view.as_query_value())
+}
+
+fn project_store_index_children_response(
+    response: &StoreIndexResponse,
+    prefix: Option<&str>,
+    requested_options: &StoreIndexRequestOptions,
+) -> StoreIndexResponse {
+    let normalized_prefix = prefix
+        .map(str::trim)
+        .map(|value| value.trim_matches('/'))
+        .filter(|value| !value.is_empty());
+
+    let is_visible_entry = |entry: &StoreIndexEntry| {
+        normalized_prefix.is_none_or(|normalized_prefix| {
+            entry.path.trim().trim_matches('/') != normalized_prefix
+        })
+    };
+    let total_entry_count = response
+        .entries
+        .iter()
+        .filter(|entry| is_visible_entry(entry))
+        .count();
+    let offset = requested_options.offset.unwrap_or(0);
+    let limit = requested_options.limit.map(|limit| limit.max(1));
+    let page_end = limit
+        .map(|limit| offset.saturating_add(limit).min(total_entry_count))
+        .unwrap_or(total_entry_count);
+    let entries = response
+        .entries
+        .iter()
+        .filter(|entry| is_visible_entry(entry))
+        .skip(offset)
+        .take(page_end.saturating_sub(offset))
+        .cloned()
+        .collect::<Vec<_>>();
+    StoreIndexResponse {
+        prefix: response.prefix.clone(),
+        depth: response.depth,
+        entry_count: entries.len(),
+        total_entry_count,
+        offset,
+        limit,
+        has_more: page_end < total_entry_count,
+        next_cursor: None,
+        sync_token: response.sync_token.clone(),
+        consistency_token: response.consistency_token.clone(),
+        media_summary: response.media_summary.clone(),
+        entries,
+    }
 }
 
 fn append_optional_query(url: &mut Url, key: &str, value: Option<&str>) {

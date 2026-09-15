@@ -166,12 +166,11 @@ class BerryKeepDocumentsProviderInstrumentationTest {
     }
 
     @Test
-    fun queryChildDocuments_treeViewFolderMarkersAreNamedWithoutDuplicates() {
-        // The mock server collapses trailing-slash/"prefix" duplicates into a single
-        // canonical "prefix" entry per directory when view=tree is requested, matching the
-        // production server contract (see collapse_store_index_entries_for_tree_view). The
-        // provider trusts that contract rather than re-deriving directory-ness itself.
-        configureProviderDownloadScenario()
+    fun queryChildDocuments_childrenViewFolderMarkersAreNamedWithoutDuplicates() {
+        // The mock server returns the queried directory marker for view=tree but removes it
+        // for view=children. The provider trusts that projection rather than re-deriving
+        // child membership or directory-ness itself.
+        val scenario = configureProviderDownloadScenario()
         val childrenUri = DocumentsContract.buildChildDocumentsUri(
             "${appContext.packageName}.documents",
             "dir:",
@@ -210,10 +209,42 @@ class BerryKeepDocumentsProviderInstrumentationTest {
             "SAF directory rows must always have a display name: $rows",
             rows.all { (_, displayName) -> displayName.isNotBlank() },
         )
+
+        val docsUri = DocumentsContract.buildChildDocumentsUri(
+            "${appContext.packageName}.documents",
+            "dir:docs",
+        )
+        val docsCursor = requireNotNull(
+            appContext.contentResolver.query(
+                docsUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                ),
+                null,
+                null,
+                null,
+            ),
+        )
+        val docsRows = docsCursor.use {
+            buildList {
+                while (it.moveToNext()) {
+                    add(
+                        it.getString(0) to it.getString(1),
+                    )
+                }
+            }
+        }
+        assertEquals(
+            listOf(
+                "file:${scenario.remoteDocumentPath}" to scenario.remoteDocumentPath.substringAfterLast('/'),
+            ),
+            docsRows,
+        )
         assertTrue(
-            "SAF directory listing should request the deduplicated tree view",
+            "SAF directory listing should request the central children projection",
             jsonArrayStrings(RustClientTestBridge.getCapturedRequestPaths()).any { path ->
-                path.startsWith("/api/v1/store/index?") && path.contains("view=tree")
+                path.startsWith("/api/v1/store/index?") && path.contains("view=children")
             },
         )
     }

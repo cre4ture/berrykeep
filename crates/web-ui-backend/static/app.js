@@ -189,7 +189,7 @@ let currentExplorer = null;
     }
 
     async function listStoreEntries(prefix, snapshot) {
-      const query = new URLSearchParams({ depth: '1' });
+      const query = new URLSearchParams({ depth: '1', view: 'children' });
       const normalizedPrefix = normalizePath(prefix);
       if (normalizedPrefix) query.set('prefix', folderMarkerKey(normalizedPrefix));
       if (snapshot) query.set('snapshot', snapshot);
@@ -204,9 +204,7 @@ let currentExplorer = null;
       return entries
         .filter(entry => {
           const target = String(entry.path || '');
-          if (!target) return false;
-          if (!basePrefix) return true;
-          return target.startsWith(basePrefix) && target !== basePrefix;
+          return target.length > 0;
         })
         .map(entry => {
           const rawPath = String(entry.path || '');
@@ -232,6 +230,7 @@ let currentExplorer = null;
     function createExplorer(rootId, options) {
       const root = document.getElementById(rootId);
       let currentPath = '';
+      let entriesRequestSequence = 0;
 
       root.innerHTML = `
         <h3>${options.title}</h3>
@@ -278,6 +277,7 @@ let currentExplorer = null;
         getCurrentPath: () => currentPath,
         setCurrentPath: (path) => {
           currentPath = normalizePath(path);
+          entriesRequestSequence += 1;
         },
         refresh: render,
         showOutput,
@@ -288,7 +288,9 @@ let currentExplorer = null;
       }
 
       async function render() {
-        pathEl.textContent = currentPath ? '/' + currentPath : '/';
+        const requestedPath = currentPath;
+        const requestSequence = ++entriesRequestSequence;
+        pathEl.textContent = requestedPath ? '/' + requestedPath : '/';
         if (typeof options.onRender === 'function') {
           options.onRender(explorerApi);
         }
@@ -296,19 +298,22 @@ let currentExplorer = null;
         listEl.innerHTML = '<div class="explorer-empty">loading...</div>';
 
         try {
-          const entries = await options.loadEntries(currentPath, root);
+          const entries = await options.loadEntries(requestedPath, root);
+          if (requestSequence !== entriesRequestSequence || currentPath !== requestedPath) {
+            return;
+          }
           const visible = options.transformEntries
-            ? options.transformEntries(entries, currentPath)
-            : childEntriesForPath(entries, currentPath);
+            ? options.transformEntries(entries, requestedPath)
+            : childEntriesForPath(entries, requestedPath);
 
           listEl.innerHTML = '';
 
-          if (currentPath) {
+          if (requestedPath) {
             const upBtn = document.createElement('button');
             upBtn.className = 'explorer-item';
             upBtn.textContent = '[DIR] ..';
             upBtn.onclick = () => {
-              currentPath = parentPath(currentPath);
+              currentPath = parentPath(requestedPath);
               render();
             };
             listEl.appendChild(upBtn);
@@ -344,6 +349,9 @@ let currentExplorer = null;
             listEl.appendChild(btn);
           }
         } catch (err) {
+          if (requestSequence !== entriesRequestSequence || currentPath !== requestedPath) {
+            return;
+          }
           listEl.innerHTML = '<div class="explorer-empty">(failed to load)</div>';
           showOutput({ error: err.message });
         }

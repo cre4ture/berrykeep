@@ -42,6 +42,12 @@ export function projectMockStoreTreeEntries<T extends MockStoreIndexEntry>(
     let relativePath = pathWithoutTrailingSlash;
     if (normalizedPrefix) {
       if (pathWithoutTrailingSlash === normalizedPrefix) {
+        const normalizedPath = `${pathWithoutTrailingSlash}/`;
+        projectedEntries.set(normalizedPath, {
+          ...entry,
+          path: normalizedPath,
+          entry_type: "prefix"
+        });
         continue;
       }
       const prefixWithSeparator = `${normalizedPrefix}/`;
@@ -66,12 +72,30 @@ export function projectMockStoreTreeEntries<T extends MockStoreIndexEntry>(
       continue;
     }
 
-    const normalizedPath =
-      entry.entry_type === "prefix" ? `${pathWithoutTrailingSlash}/` : pathWithoutTrailingSlash;
-    projectedEntries.set(normalizedPath, { ...entry, path: normalizedPath });
+    const isDirectoryLike = entry.entry_type === "prefix" || entry.path.endsWith("/");
+    const normalizedPath = isDirectoryLike
+      ? `${pathWithoutTrailingSlash}/`
+      : pathWithoutTrailingSlash;
+    projectedEntries.set(
+      normalizedPath,
+      isDirectoryLike
+        ? { ...entry, path: normalizedPath, entry_type: "prefix" }
+        : { ...entry, path: normalizedPath }
+    );
   }
 
   return [...projectedEntries.values()];
+}
+
+export function projectMockStoreChildrenEntries<T extends MockStoreIndexEntry>(
+  entries: T[],
+  requestedPrefix: string,
+  requestedDepth: number
+): Array<T | MockStoreIndexPrefixEntry> {
+  const normalizedPrefix = normalizeMockStorePath(requestedPrefix);
+  return projectMockStoreTreeEntries(entries, requestedPrefix, requestedDepth).filter(
+    (entry) => normalizeMockStorePath(entry.path) !== normalizedPrefix
+  );
 }
 
 function normalizeMockStorePath(path: string): string {

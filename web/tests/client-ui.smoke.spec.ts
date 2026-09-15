@@ -10,6 +10,7 @@ import {
 import { GalleryMapMockSession } from "./gallery-map.mock";
 import {
   filterMockStoreEntriesToPrefix,
+  projectMockStoreChildrenEntries,
   projectMockStoreTreeEntries
 } from "./store-index.mock";
 
@@ -27,6 +28,34 @@ const CONCURRENT_WEB_SERVICE_NODE_IDS = [
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
 }
+
+test("client-ui store-index mock excludes the queried marker only for children", () => {
+  const entries = [
+    {
+      path: "docs/",
+      entry_type: "key" as const,
+      object_id: "directory-marker-object",
+      version: "directory-marker-version",
+      size_bytes: 42,
+      modified_at_unix: 1_712_345_678
+    },
+    { path: "docs/readme.txt", entry_type: "key" as const }
+  ];
+
+  const treeEntries = projectMockStoreTreeEntries(entries, "docs", 1);
+  expect(treeEntries.map((entry) => entry.path)).toEqual(["docs/", "docs/readme.txt"]);
+  expect(treeEntries[0]).toMatchObject({
+    path: "docs/",
+    entry_type: "prefix",
+    object_id: "directory-marker-object",
+    version: "directory-marker-version",
+    size_bytes: 42,
+    modified_at_unix: 1_712_345_678
+  });
+  expect(projectMockStoreChildrenEntries(entries, "docs", 1).map((entry) => entry.path)).toEqual([
+    "docs/readme.txt"
+  ]);
+});
 
 function createDeferred(): { promise: Promise<void>; resolve: () => void } {
   let resolvePromise!: () => void;
@@ -391,11 +420,13 @@ async function androidShareMessages(page: Page): Promise<string[]> {
 }
 
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
-  test.setTimeout(45_000);
+  test.setTimeout(75_000);
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
     origin: "http://127.0.0.1:4174"
   });
-  const uploadMetrics = await installClientUiMocks(page);
+  const uploadMetrics = await installClientUiMocks(page, {
+    uploadChunkDelayMsByKey: { "images/alpha.bin": 5_000 }
+  });
   const pageErrors: string[] = [];
 
   page.on("pageerror", (error) => {
@@ -476,11 +507,10 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("images/beta.bin", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /Uploads 0\/2|Uploads 1\/2|Uploads 2\/2/ })).toBeVisible();
   await expect(page.getByText(/Starting|Uploading/).first()).toBeVisible();
-  await page
-    .getByRole("row", { name: /alpha\.bin/ })
-    .getByRole("button", { name: "Cancel" })
-    .click();
-  await expect(page.getByRole("row", { name: /alpha\.bin/ })).toContainText("Canceled");
+  const alphaUploadRow = page.getByRole("row", { name: /alpha\.bin/ });
+  await alphaUploadRow.getByRole("button", { name: "Cancel" }).click();
+  await expect(alphaUploadRow).toContainText("Canceled");
+  await expect.poll(() => uploadMetrics.deletedUploadSessionIds()).toContain("upload-1");
   await page.locator('input[type="file"]').setInputFiles({
     name: "gamma.bin",
     mimeType: "application/octet-stream",
@@ -506,6 +536,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
 
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   const explorerTable = page.getByRole("table").first();
   await expect(explorerTable.getByRole("columnheader", { name: /Size/ })).toBeVisible();
   await expect(explorerTable.getByRole("columnheader", { name: /Modified/ })).toBeVisible();
@@ -536,10 +568,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
           entry.versionId === "version-cat-000" &&
           entry.targetPath === "gallery/cat.png"
       )
-    )
+  )
     .toBe(true);
   await expect(page.getByText('"target_path": "gallery/cat.png"')).toBeVisible();
   await page.keyboard.press("Escape");
+  await expect(page.locator(".mantine-Drawer-overlay")).toHaveCount(0);
   await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
   await page.getByRole("button", { name: "Version history" }).click();
   await expect(page.getByRole("button", { name: "Thumbnail for gallery/cat.png" })).toBeVisible();
@@ -566,8 +599,11 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     .filter({ has: page.getByLabel("Media viewer thumbnails") });
   await expect(mediaViewerDialog.getByRole("button", { name: "Version history" })).toBeVisible();
   await mediaViewerDialog.getByRole("button", { name: "Version history" }).click();
-  await expect(page.getByLabel("Key")).toHaveValue("gallery/cat.png");
-  await page.keyboard.press("Escape");
+  const versionHistoryDrawer = page.getByRole("dialog", { name: "Version history" });
+  await expect(versionHistoryDrawer.getByLabel("Key")).toHaveValue("gallery/cat.png");
+  await versionHistoryDrawer.getByRole("banner").getByRole("button").click();
+  await expect(versionHistoryDrawer).toHaveCount(0);
+  await expect(page.locator(".mantine-Drawer-overlay")).toHaveCount(0);
   await expect(page.getByLabel("Media viewer thumbnails")).toBeVisible();
   await expect(mediaViewerDialog.getByRole("button", { name: "Start slideshow" })).toBeVisible();
   const mediaViewerZoomSurface = page.locator('[data-media-zoom-surface="true"]').first();
@@ -595,6 +631,7 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
     "true"
   );
   await page.keyboard.press("Escape");
+  await expect(mediaViewerDialog).toHaveCount(0);
   await page.getByRole("row", { name: /docs\/readme\.txt/ }).getByRole("button", { name: "Read" }).click();
   await expect(page.getByText("hello from the mocked store")).toBeVisible();
   const explorerDownload = page.waitForEvent("download");
@@ -630,6 +667,8 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByRole("button", { name: "Uploads 4/5 · 1 canceled" })).toBeVisible();
   await page.getByText("Explorer", { exact: true }).click();
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   await page.getByRole("row", { name: /docs\/\s+prefix/i }).getByRole("button", { name: "Open" }).click();
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("row", { name: /scratch\/\s+prefix/i }).getByRole("button", { name: "Delete" }).click();
@@ -1279,6 +1318,8 @@ test("client-ui Android explorer resolves the preferred current version before s
   });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/?page=explorer&embedded_client=android");
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
 
   const dialog = page.getByRole("dialog");
@@ -1425,6 +1466,7 @@ test("client-ui gallery visibly replaces restored data after background revalida
   await expect(page.getByText("gallery/cat.png", { exact: true })).toBeVisible();
   await expect(page.getByText("gallery/revalidated.png", { exact: true })).toBeVisible();
   await expect(page.getByText("gallery/cat.png", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("revalidated-folder/", { exact: true })).toBeVisible();
   expect(mocks.galleryStoreListRequestCount()).toBe(initialRequestCount + 2);
 });
 
@@ -1709,6 +1751,8 @@ test("client-ui gallery and explorer lightboxes prefer the mobile viewer thumbna
   await page.goto("/?page=explorer");
   await expect(page.getByRole("heading", { name: "Explorer" })).toBeVisible();
   await expect(page.getByRole("switch", { name: "Show thumbnails" })).toBeChecked();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   await page.getByRole("button", { name: "Thumbnail for gallery/cat.png" }).click();
   await expect(
     page.getByRole("dialog").locator('img[src*="profile=mobile_viewer"]').first()
@@ -1800,8 +1844,8 @@ test("client-ui gallery reuses an evicted virtual page without requesting it aga
   expect(pageOffsets.filter((offset) => offset === "0")).toHaveLength(initialPageRequestCount);
 });
 
-test("client-ui explorer fetches result pages instead of the complete index", async ({ page }) => {
-  const requestPages: Array<{ offset: string | null; limit: string | null }> = [];
+test("client-ui explorer requests paged children instead of the complete index", async ({ page }) => {
+  const requestPages: Array<{ offset: string | null; limit: string | null; view: string | null }> = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
     if (url.pathname !== apiV1("/store/list") || !url.searchParams.has("limit")) {
@@ -1809,7 +1853,8 @@ test("client-ui explorer fetches result pages instead of the complete index", as
     }
     requestPages.push({
       offset: url.searchParams.get("offset"),
-      limit: url.searchParams.get("limit")
+      limit: url.searchParams.get("limit"),
+      view: url.searchParams.get("view")
     });
   });
 
@@ -1818,6 +1863,8 @@ test("client-ui explorer fetches result pages instead of the complete index", as
   });
   await page.goto("/");
   await page.getByText("Explorer", { exact: true }).click();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   await expect(page.locator('[data-explorer-pagination="true"]')).toContainText("Showing 1–100 of");
 
   const pagination = page.locator('[data-explorer-pagination="true"]');
@@ -1827,6 +1874,40 @@ test("client-ui explorer fetches result pages instead of the complete index", as
     .toBe(true);
   await expect(pagination).toContainText("Showing 101–200 of");
   expect(requestPages.every((request) => request.limit === "100")).toBe(true);
+  expect(requestPages.every((request) => request.view === "children")).toBe(true);
+});
+
+test("client-ui explorer ignores a late response for a previous prefix", async ({ page }) => {
+  const mocks = await installClientUiMocks(page, {
+    storeEntries: [
+      { path: "a/", entry_type: "prefix" },
+      { path: "a/only-a.txt", entry_type: "key", size_bytes: 1 },
+      { path: "b/", entry_type: "prefix" },
+      { path: "b/only-b.txt", entry_type: "key", size_bytes: 1 }
+    ]
+  });
+  mocks.setGalleryStoreListDelayForPrefix("a/", 1_000);
+
+  await page.goto("/");
+  await page.getByText("Explorer", { exact: true }).click();
+  const firstPrefixRow = page.getByRole("cell", { name: "a/", exact: true }).locator("..");
+  const secondPrefixRow = page.getByRole("cell", { name: "b/", exact: true }).locator("..");
+  const firstPrefixResponse = page.waitForResponse((response) => {
+    const requestUrl = new URL(response.url());
+    return requestUrl.pathname === apiV1("/store/list") && requestUrl.searchParams.get("prefix") === "a/";
+  });
+  const firstPrefixRequest = page.waitForRequest((request) => {
+    const requestUrl = new URL(request.url());
+    return requestUrl.pathname === apiV1("/store/list") && requestUrl.searchParams.get("prefix") === "a/";
+  });
+  await firstPrefixRow.getByRole("button", { name: "Open" }).evaluate((button) => button.click());
+  await firstPrefixRequest;
+  await secondPrefixRow.getByRole("button", { name: "Open" }).evaluate((button) => button.click());
+  await expect(page.getByRole("cell", { name: "only-b.txt", exact: true })).toBeVisible();
+
+  await firstPrefixResponse;
+  await expect(page.getByRole("cell", { name: "only-a.txt", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("cell", { name: "only-b.txt", exact: true })).toBeVisible();
 });
 
 test("client-ui explorer refreshes history while paging current entries", async ({ page }) => {
@@ -1853,6 +1934,8 @@ test("client-ui explorer refreshes history while paging current entries", async 
   });
   await page.goto("/");
   await page.getByText("Explorer", { exact: true }).click();
+  await page.getByRole("textbox", { name: "Depth" }).fill("64");
+  await page.getByRole("button", { name: "Load entries" }).click();
   await page.getByText("Show deleted or moved files", { exact: true }).click();
   await expect(page.getByRole("cell", { name: "deleted.txt", exact: true })).toBeVisible();
   await expect.poll(() => historyRequestCount).toBe(1);
@@ -2167,6 +2250,7 @@ test("client-ui mobile drawer reveals and navigates its menu items", async ({ pa
 type InstallClientUiMocksOptions = {
   storeEntries?: MockStoreEntry[];
   historyEntries?: MockHistoryEntry[];
+  uploadChunkDelayMsByKey?: Record<string, number>;
   historyRestoreFailureAtCall?: number;
   cacheScope?: string | null;
   mapMetadataStatus?: number;
@@ -2236,6 +2320,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const galleryMapMock = new GalleryMapMockSession<MockStoreEntry>();
   let galleryStoreListDelayMs = 0;
   const galleryStoreListDelayByMediaFilter = new Map<string, number>();
+  const galleryStoreListDelayByPrefix = new Map<string, number>();
   const restoredVersions: Array<{ key: string; versionId: string; targetPath: string }> = [];
   const restoredHistoryEntries: MockHistoryEntry[][] = [];
   let historyRestoreRequestCount = 0;
@@ -2853,7 +2938,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     }
 
     if (pathname === apiV1("/store/list") && method === "GET") {
-      expect(searchParams.get("view")).toBe("tree");
+      expect(["tree", "children"]).toContain(searchParams.get("view"));
       galleryStoreListRequestCount += 1;
       if (galleryOffline) {
         await route.fulfill({
@@ -2864,6 +2949,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         return;
       }
       const storeListDelay =
+        galleryStoreListDelayByPrefix.get(searchParams.get("prefix") ?? "") ??
         galleryStoreListDelayByMediaFilter.get(searchParams.get("media_filter") ?? "") ??
         galleryStoreListDelayMs;
       if (storeListDelay > 0) {
@@ -2959,7 +3045,9 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
       activeUploadIds.add(uploadId);
       maxConcurrentUploadIds = Math.max(maxConcurrentUploadIds, activeUploadIds.size);
       try {
-        await new Promise((resolve) => setTimeout(resolve, 75));
+        const uploadKey = uploadKeys.get(uploadId) ?? "";
+        const uploadChunkDelayMs = options?.uploadChunkDelayMsByKey?.[uploadKey] ?? 75;
+        await new Promise((resolve) => setTimeout(resolve, uploadChunkDelayMs));
         await json(route, {
           stored: true,
           received_index: index
@@ -3067,6 +3155,9 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
     },
     setGalleryStoreListDelayForMediaFilter: (mediaFilter: string, delayMs: number) => {
       galleryStoreListDelayByMediaFilter.set(mediaFilter, delayMs);
+    },
+    setGalleryStoreListDelayForPrefix: (prefix: string, delayMs: number) => {
+      galleryStoreListDelayByPrefix.set(prefix, delayMs);
     },
     setCacheScope: (scope: string | null) => {
       cacheScope = scope;
@@ -3196,27 +3287,30 @@ function createMockStoreEntries(): MockStoreEntry[] {
 }
 
 function createRevalidatedGalleryMockStoreEntries(): MockStoreEntry[] {
-  return createMockStoreEntries().map((entry) => {
-    if (entry.path !== "gallery/cat.png" || !entry.media) {
-      return entry;
-    }
-    return {
-      ...entry,
-      path: "gallery/revalidated.png",
-      media: {
-        ...entry.media,
-        content_fingerprint: "fingerprint-revalidated",
-        thumbnail: {
-          url: "/media/thumbnail?key=gallery%2Frevalidated.png",
-          profile: "grid",
-          width: 256,
-          height: 192,
-          format: "jpeg",
-          size_bytes: 1234
-        }
+  return [
+    ...createMockStoreEntries().map((entry) => {
+      if (entry.path !== "gallery/cat.png" || !entry.media) {
+        return entry;
       }
-    };
-  });
+      return {
+        ...entry,
+        path: "gallery/revalidated.png",
+        media: {
+          ...entry.media,
+          content_fingerprint: "fingerprint-revalidated",
+          thumbnail: {
+            url: "/media/thumbnail?key=gallery%2Frevalidated.png",
+            profile: "grid",
+            width: 256,
+            height: 192,
+            format: "jpeg",
+            size_bytes: 1234
+          }
+        }
+      };
+    }),
+    { path: "revalidated-folder/", entry_type: "prefix" }
+  ];
 }
 
 async function expireGalleryCacheSchema(page: Page): Promise<void> {
@@ -3328,15 +3422,13 @@ function buildMockStoreListResponse(entries: MockStoreEntry[], searchParams: URL
   const prefix = searchParams.get("prefix") ?? "";
   const depth = Number(searchParams.get("depth") ?? "1");
   const mediaFilter = searchParams.get("media_filter");
-  const isTreeNavigationRequest =
-    searchParams.get("view") === "tree" &&
-    !searchParams.has("offset") &&
-    !searchParams.has("limit") &&
-    !searchParams.has("sort") &&
-    !mediaFilter;
-  const scopedEntries = isTreeNavigationRequest
-    ? projectMockStoreTreeEntries(entries, prefix, depth)
-    : filterMockStoreEntriesToPrefix(entries, prefix);
+  const view = searchParams.get("view");
+  const scopedEntries =
+    view === "children"
+      ? projectMockStoreChildrenEntries(entries, prefix, depth)
+      : view === "tree"
+        ? projectMockStoreTreeEntries(entries, prefix, depth)
+        : filterMockStoreEntriesToPrefix(entries, prefix);
   const filteredEntries = mediaFilter
     ? scopedEntries.filter((entry) => matchesMockMediaFilter(entry, mediaFilter))
     : scopedEntries;

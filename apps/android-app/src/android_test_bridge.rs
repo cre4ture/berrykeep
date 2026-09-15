@@ -202,12 +202,21 @@ fn android_test_store_index_response(request_path: &str) -> StoreIndexResponse {
     } else {
         ""
     };
-    let is_tree_view = android_test_query_matches(request_path, "view", "tree");
+    let is_children_view = android_test_query_matches(request_path, "view", "children");
+    let is_tree_shaped_view =
+        android_test_query_matches(request_path, "view", "tree") || is_children_view;
     let entries = if prefix == "docs" {
-        vec![android_test_document_entry()]
+        let mut entries = vec![
+            android_test_folder_entry("docs/", "prefix"),
+            android_test_document_entry(),
+        ];
+        if is_children_view {
+            entries.retain(|entry| entry.path != "docs/");
+        }
+        entries
     } else {
         let mut entries = android_test_folder_entries();
-        if is_tree_view {
+        if is_tree_shaped_view {
             entries = android_test_collapse_entries_for_tree_view(entries);
         } else {
             entries.push(android_test_document_entry());
@@ -231,8 +240,8 @@ fn android_test_store_index_response(request_path: &str) -> StoreIndexResponse {
 }
 
 // Mirrors server-node-sdk's `collapse_store_index_entries_for_tree_view`, which the real
-// server applies whenever `view=tree` is requested: trailing-slash and "prefix" entries for
-// the same path are deduplicated into a single canonical "prefix" entry.
+// server applies for tree-shaped views: trailing-slash and "prefix" entries for the same path
+// are deduplicated into a single canonical "prefix" entry.
 fn android_test_collapse_entries_for_tree_view(
     entries: Vec<StoreIndexEntry>,
 ) -> Vec<StoreIndexEntry> {

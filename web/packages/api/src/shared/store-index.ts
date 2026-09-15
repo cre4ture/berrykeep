@@ -172,7 +172,7 @@ export function galleryMapClusterCellSizeParameter(cellSizePx: number | undefine
   return typeof cellSizePx === "number" && Number.isFinite(cellSizePx) ? cellSizePx : null;
 }
 
-export type StoreListView = "raw" | "tree";
+export type StoreListView = "raw" | "tree" | "children";
 
 export type StoreListSortOrder =
   | "captured_asc"
