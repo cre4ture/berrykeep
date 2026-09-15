@@ -320,9 +320,73 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
     state: &ServerState,
     subjects: Vec<String>,
     batch_size_override: Option<usize>,
-    _run_id: Option<&str>,
+    run_id: Option<&str>,
 ) -> ReplicationRepairReport {
-    content_recovery::repair_subjects(state, subjects, batch_size_override).await
+    let repair_run_id = run_id.unwrap_or("untracked");
+    let subject_count = subjects.len();
+    let mut lifecycle_log = Vec::new();
+    info!(
+        repair_run_id,
+        subject_count,
+        batch_size_override = ?batch_size_override,
+        "targeted scrub repair run started"
+    );
+    push_repair_log_entry(
+        &mut lifecycle_log,
+        state.node_id,
+        "targeted_repair_started",
+        "starting targeted scrub repair run",
+        None,
+        None,
+        None,
+        None,
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "repair_run_id": repair_run_id,
+            "subject_count": subject_count,
+            "batch_size_override": batch_size_override,
+        })),
+    );
+
+    let mut report = content_recovery::repair_subjects(state, subjects, batch_size_override).await;
+    // Keep both lifecycle brackets when a content-recovery pass reaches the
+    // bounded report-log capacity.
+    report
+        .detailed_log
+        .truncate(MAX_REPAIR_REPORT_LOG_ENTRIES.saturating_sub(2));
+    report.detailed_log.insert(
+        0,
+        lifecycle_log
+            .pop()
+            .expect("targeted repair start entry was recorded"),
+    );
+    info!(
+        repair_run_id,
+        attempted_transfers = report.attempted_transfers,
+        successful_transfers = report.successful_transfers,
+        failed_transfers = report.failed_transfers,
+        skipped_items = report.skipped_items,
+        "targeted scrub repair run finished"
+    );
+    push_repair_log_entry(
+        &mut report.detailed_log,
+        state.node_id,
+        "targeted_repair_finished",
+        "targeted scrub repair run finished",
+        None,
+        None,
+        None,
+        None,
+        Some(state.node_id),
+        Some(serde_json::json!({
+            "repair_run_id": repair_run_id,
+            "attempted_transfers": report.attempted_transfers,
+            "successful_transfers": report.successful_transfers,
+            "failed_transfers": report.failed_transfers,
+            "skipped_items": report.skipped_items,
+        })),
+    );
+    report
 }
 
 pub(crate) async fn execute_replication_repair_plan(
@@ -1763,6 +1827,13 @@ fn requires_content_repair_claim(manifest_hash: &str) -> bool {
     manifest_hash != TOMBSTONE_MANIFEST_HASH
 }
 
+fn should_persist_replication_pull_repair_pin(
+    manifest_hash: &str,
+    automatic_repair_enabled: bool,
+) -> bool {
+    automatic_repair_enabled && requires_content_repair_claim(manifest_hash)
+}
+
 async fn pull_bundle_from_source(
     source_node: &NodeDescriptor,
     key: &str,
@@ -1867,35 +1938,40 @@ async fn pull_bundle_from_source(
             manifest_hash: bundle.manifest_hash.clone(),
             snapshot_only: false,
         };
-        // A replication pull can race the durable worker. Preserve its retry
-        // deadline, source fingerprint, and recovered progress instead of
-        // replacing the task with a newly-due empty one.
+        let chunks = manifest.chunks;
+        // A replication pull can race the durable worker. Preserve an existing
+        // task's retry deadline, source fingerprint, and recovered progress.
+        // When automatic repair is disabled, do not create a pin that no worker
+        // can drain; an already persisted task is still finished on success.
         let existing = read_store(state, "replication_pull.existing_pin")
             .await
             .content_repair_tasks_for_manifests(std::slice::from_ref(&bundle.manifest_hash))
             .await?
             .into_iter()
             .next();
-        let pin = retained_repair_pin_for_replication_pull(existing, reference, manifest.chunks);
-        read_store(state, "replication_pull.pin")
-            .await
-            .persist_content_repair_task(&pin)
-            .await?;
-        let recovered = content_recovery::recover_chunks(
-            state,
-            &subject,
-            &pin.chunks,
-            Some(source_node),
-            false,
-        )
-        .await;
+        let pin = if should_persist_replication_pull_repair_pin(
+            &bundle.manifest_hash,
+            state.repair_config.enabled,
+        ) {
+            let pin = retained_repair_pin_for_replication_pull(existing, reference, chunks.clone());
+            read_store(state, "replication_pull.pin")
+                .await
+                .persist_content_repair_task(&pin)
+                .await?;
+            Some(pin)
+        } else {
+            existing
+        };
+        let recovered =
+            content_recovery::recover_chunks(state, &subject, &chunks, Some(source_node), false)
+                .await;
         if !recovered.remaining.is_empty() {
             bail!(
                 "replication content recovery incomplete: {}",
                 recovered.errors.join("; ")
             );
         }
-        Some(pin)
+        pin
     } else {
         None
     };
@@ -2407,12 +2483,24 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_manifest_does_not_require_a_content_repair_claim() {
+    fn replication_pull_pins_only_drainable_non_tombstone_repair_work() {
         assert!(
             !requires_content_repair_claim(TOMBSTONE_MANIFEST_HASH),
             "the shared tombstone sentinel must not serialize unrelated deletes"
         );
         assert!(requires_content_repair_claim("immutable-manifest-hash"));
+        assert!(should_persist_replication_pull_repair_pin(
+            "immutable-manifest-hash",
+            true
+        ));
+        assert!(
+            !should_persist_replication_pull_repair_pin("immutable-manifest-hash", false),
+            "disabled automatic repair must not create a pin that no worker can drain"
+        );
+        assert!(!should_persist_replication_pull_repair_pin(
+            TOMBSTONE_MANIFEST_HASH,
+            true
+        ));
     }
 
     #[test]
