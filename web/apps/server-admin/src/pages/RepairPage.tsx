@@ -1693,6 +1693,8 @@ function formatRepairStatus(status: string): string {
       return "partially repaired";
     case "waiting_for_source":
       return "waiting for source";
+    case "unresolved":
+      return "unresolved repair";
     case "completed":
       return "completed";
     case "skipped_no_gaps":
