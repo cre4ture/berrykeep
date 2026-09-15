@@ -53,7 +53,7 @@ async fn persist_snapshot_fixture(
 }
 
 async fn snapshot_ids_chronological(store: &PersistentStore) -> Vec<String> {
-    let mut snapshots = store.load_all_snapshots().await.unwrap();
+    let mut snapshots = store.metadata_store.load_all_snapshots().await.unwrap();
     snapshots.sort_by(|a, b| {
         a.created_at_unix
             .cmp(&b.created_at_unix)
@@ -3172,6 +3172,63 @@ run_on_all_metadata_backends!(
     cleanup_unreferenced_dry_run_reports_without_deleting_turso
 );
 
+async fn cleanup_snapshot_allows_repair_pin_registration_during_sweep_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend.init_store("cleanup-repair-pin-concurrency").await;
+    let put = store
+        .put_object_versioned(
+            "live.bin",
+            Bytes::from_static(b"live content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let reference = store
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject("live.bin")
+        .unwrap()
+        .clone();
+    let task = content_recovery::ContentRepairTask::new(reference, true);
+    let hook = CleanupUnreferencedTestHook::new();
+    store.set_cleanup_unreferenced_test_hook(Some(hook.clone()));
+
+    let cleanup = store.cleanup_unreferenced(0, false);
+    tokio::pin!(cleanup);
+    tokio::select! {
+        _ = hook.wait_until_started() => {},
+        result = &mut cleanup => panic!("cleanup completed before its test hook: {result:?}"),
+    }
+
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        store.persist_content_repair_task(&task),
+    )
+    .await
+    .expect("repair pin registration must not wait for the file sweep")
+    .unwrap();
+    hook.release_sweep();
+    cleanup.await.unwrap();
+    assert!(
+        store
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .any(|pending| pending.reference.manifest_hash == put.manifest_hash)
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_snapshot_allows_repair_pin_registration_during_sweep_impl,
+    cleanup_snapshot_allows_repair_pin_registration_during_sweep,
+    cleanup_snapshot_allows_repair_pin_registration_during_sweep_turso
+);
+
 async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("cleanup-delete").await;
 
@@ -3228,6 +3285,42 @@ run_on_all_metadata_backends!(
     cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl,
     cleanup_unreferenced_deletes_orphan_manifest_and_chunk,
     cleanup_unreferenced_deletes_orphan_manifest_and_chunk_turso
+);
+
+async fn cleanup_unreferenced_reaps_stale_chunk_temp_files_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cleanup-stale-chunk-temp").await;
+    let hash = hash_hex(b"abandoned atomic chunk write");
+    let chunk_path = store.chunk_path_for_test(&hash);
+    let temp_path = chunk_path.with_extension("tmp-crashed-install");
+    fs::create_dir_all(temp_path.parent().unwrap())
+        .await
+        .unwrap();
+    fs::write(&temp_path, b"incomplete atomic chunk")
+        .await
+        .unwrap();
+    std::fs::File::open(&temp_path)
+        .unwrap()
+        .set_modified(
+            std::time::SystemTime::now()
+                - Duration::from_secs(CHUNK_ATOMIC_TEMP_MIN_RETENTION_SECS + 1),
+        )
+        .unwrap();
+
+    let report = store.cleanup_unreferenced(0, false).await.unwrap();
+    assert!(report.deleted_chunks >= 1);
+    assert!(
+        !fs::try_exists(&temp_path).await.unwrap(),
+        "a stale atomic-write scratch file must not leak indefinitely"
+    );
+    assert_eq!(store.current_chunk_store_bytes(None).await.unwrap(), 0);
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_unreferenced_reaps_stale_chunk_temp_files_impl,
+    cleanup_unreferenced_reaps_stale_chunk_temp_files,
+    cleanup_unreferenced_reaps_stale_chunk_temp_files_turso
 );
 
 async fn cleanup_unreferenced_processes_retained_manifests_across_batches_impl(
@@ -3919,6 +4012,68 @@ run_on_all_metadata_backends!(
     list_replication_subjects_includes_all_heads_for_divergent_versions_impl,
     list_replication_subjects_includes_all_heads_for_divergent_versions,
     list_replication_subjects_includes_all_heads_for_divergent_versions_turso
+);
+
+async fn list_replication_subjects_excludes_non_head_retained_history_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("replication-subjects-bounded-retained-history")
+        .await;
+    let key = "history/deep.bin";
+    let first = store
+        .put_object_versioned(key, Bytes::from_static(b"first"), PutOptions::default())
+        .await
+        .unwrap();
+    let second = store
+        .put_object_versioned(
+            key,
+            Bytes::from_static(b"second"),
+            PutOptions {
+                parent_version_ids: vec![first.version_id.clone()],
+                state: VersionConsistencyState::Confirmed,
+                inherit_preferred_parent: false,
+                create_snapshot: true,
+                explicit_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let head = store
+        .put_object_versioned(
+            key,
+            Bytes::from_static(b"head"),
+            PutOptions {
+                parent_version_ids: vec![second.version_id.clone()],
+                state: VersionConsistencyState::Confirmed,
+                inherit_preferred_parent: false,
+                create_snapshot: true,
+                explicit_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let subjects = store.list_replication_subjects().await.unwrap();
+    assert!(subjects.contains(&key.to_string()), "{subjects:?}");
+    assert!(
+        subjects.contains(&format!("{key}@{}", head.version_id)),
+        "{subjects:?}"
+    );
+    assert!(
+        !subjects.contains(&format!("{key}@{}", first.version_id))
+            && !subjects.contains(&format!("{key}@{}", second.version_id)),
+        "availability must stay bounded by current objects and heads, not retained depth: {subjects:?}"
+    );
+    assert_eq!(subjects.len(), 2, "{subjects:?}");
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    list_replication_subjects_excludes_non_head_retained_history_impl,
+    list_replication_subjects_excludes_non_head_retained_history,
+    list_replication_subjects_excludes_non_head_retained_history_turso
 );
 
 // Regression test: a corrupt manifest (0-byte or invalid JSON) used to make
@@ -7685,6 +7840,33 @@ run_on_all_metadata_backends!(
     persist_and_load_cluster_replicas_roundtrip_turso
 );
 
+async fn persist_and_load_cluster_replica_views_roundtrip_impl(backend: StorageTestBackend) {
+    let (root, store) = backend.init_store("cluster-replica-views-roundtrip").await;
+    let node_id = NodeId::new_v4();
+    let replicas = HashMap::from([
+        ("subject-a".to_string(), vec![node_id]),
+        ("subject-a@historical".to_string(), vec![node_id]),
+    ]);
+    let available = HashMap::from([("subject-a".to_string(), vec![node_id])]);
+
+    store
+        .persist_cluster_replica_views(&replicas, &available)
+        .await
+        .unwrap();
+
+    assert_eq!(store.load_cluster_replicas().await.unwrap(), replicas);
+    assert_eq!(store.load_cluster_availability().await.unwrap(), available);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    persist_and_load_cluster_replica_views_roundtrip_impl,
+    persist_and_load_cluster_replica_views_roundtrip,
+    persist_and_load_cluster_replica_views_roundtrip_turso
+);
+
 async fn persist_cluster_replicas_rolls_back_on_duplicate_rows_impl(backend: StorageTestBackend) {
     let (root, store) = backend.init_store("cluster-replicas-rollback").await;
     let original = HashMap::from([("subject-original".to_string(), vec![NodeId::new_v4()])]);
@@ -9318,6 +9500,41 @@ async fn metadata_only_cached_chunks_are_evicted_by_cleanup_impl(backend: Storag
             .is_empty()
     );
 
+    // A cache-only integrity repair must pin its bytes without promoting them
+    // out of cache tracking. Once the task finishes, ordinary cache eviction
+    // may reclaim both the file and its record.
+    let reference = target
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject("docs/cached-range.bin")
+        .unwrap()
+        .clone();
+    let mut task = content_recovery::ContentRepairTask::new(reference, false);
+    task.chunks.push(ReplicationChunkInfo {
+        hash: first_chunk.hash.clone(),
+        size_bytes: first_chunk.size_bytes,
+    });
+    target.persist_content_repair_task(&task).await.unwrap();
+
+    let pinned_report = target.cleanup_unreferenced(0, false).await.unwrap();
+    assert_eq!(pinned_report.deleted_cached_chunks, 0);
+    assert_eq!(
+        target
+            .list_cached_chunk_records_for_test()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a repair pin must preserve cache tracking until ownership changes"
+    );
+    let first_chunk_path = target.chunk_path_for_test(&first_chunk.hash);
+    assert!(fs::try_exists(&first_chunk_path).await.unwrap());
+    target
+        .discard_content_repair_task(&task.reference.manifest_hash)
+        .await
+        .unwrap();
+
     let report = target.cleanup_unreferenced(0, false).await.unwrap();
     assert_eq!(report.deleted_cached_chunks, 1);
     assert!(report.deleted_cached_chunk_records >= 1);
@@ -9329,7 +9546,6 @@ async fn metadata_only_cached_chunks_are_evicted_by_cleanup_impl(backend: Storag
             .is_empty()
     );
 
-    let first_chunk_path = target.chunk_path_for_test(&first_chunk.hash);
     assert!(!fs::try_exists(&first_chunk_path).await.unwrap());
 
     let metadata_subjects = target.list_metadata_subjects().await.unwrap();
@@ -9452,9 +9668,7 @@ run_on_all_metadata_backends!(
     put_object_from_chunks_rejects_corrupt_chunk_payload_turso
 );
 
-async fn data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_impl(
-    backend: StorageTestBackend,
-) {
+async fn data_scrub_only_requires_assigned_or_owned_chunks_impl(backend: StorageTestBackend) {
     let (source_root, mut source) = backend
         .init_store("scrub-metadata-only-incomplete-source")
         .await;
@@ -9491,21 +9705,34 @@ async fn data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_i
     );
 
     let report = target.run_data_scrub().await.unwrap();
+    assert_eq!(
+        report.issue_count, 0,
+        "unassigned cache misses are expected"
+    );
+    assert!(report.chunks_not_required_locally > 0);
+    let required = bundle
+        .manifests
+        .iter()
+        .map(|m| m.manifest_hash.clone())
+        .collect();
+    let assigned = target
+        .data_scrubber()
+        .await
+        .unwrap()
+        .with_required_manifests(required)
+        .run_with_repair_subjects()
+        .await
+        .unwrap();
     assert!(
-        report
+        assigned
+            .report
             .issues
             .iter()
-            .any(|issue| issue.kind == super::DataScrubIssueKind::ReplicaIncomplete),
-        "metadata-only replica gaps should be reported as replica_incomplete, issues={:?}",
-        report.issues
+            .any(|issue| issue.kind == super::DataScrubIssueKind::ChunkMissing)
     );
     assert!(
-        !report
-            .issues
-            .iter()
-            .any(|issue| issue.kind == super::DataScrubIssueKind::ChunkMissing),
-        "metadata-only replica gaps should not be reported as chunk_missing, issues={:?}",
-        report.issues
+        !assigned.repair_subjects.is_empty(),
+        "an assigned but never hydrated replica must be repaired"
     );
 
     let _ = fs::remove_dir_all(source_root).await;
@@ -9513,9 +9740,9 @@ async fn data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_i
 }
 
 run_on_all_metadata_backends!(
-    data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_impl,
-    data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete,
-    data_scrub_reports_metadata_only_missing_chunks_as_replica_incomplete_turso
+    data_scrub_only_requires_assigned_or_owned_chunks_impl,
+    data_scrub_only_requires_assigned_or_owned_chunks,
+    data_scrub_only_requires_assigned_or_owned_chunks_turso
 );
 
 async fn importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl(
@@ -10054,6 +10281,7 @@ async fn data_scrub_history_roundtrip_and_prune_impl(backend: StorageTestBackend
         finished_at_unix: 1_000,
         duration_ms: 100,
         summary: super::DataScrubReport {
+            chunks_not_required_locally: 0,
             current_keys_scanned: 1,
             version_indexes_scanned: 1,
             version_records_scanned: 1,
@@ -10084,6 +10312,7 @@ async fn data_scrub_history_roundtrip_and_prune_impl(backend: StorageTestBackend
         finished_at_unix: 2_000,
         duration_ms: 200,
         summary: super::DataScrubReport {
+            chunks_not_required_locally: 0,
             current_keys_scanned: 2,
             version_indexes_scanned: 2,
             version_records_scanned: 2,
@@ -12103,3 +12332,6 @@ run_on_all_metadata_backends!(
     media_labels_reject_a_sidecar_key,
     media_labels_reject_a_sidecar_key_turso
 );
+
+#[path = "retained_content_tests.rs"]
+mod retained_content_tests;

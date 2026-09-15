@@ -21,6 +21,58 @@ pub(crate) struct ReplicationRepairReport {
     pub(crate) last_error: Option<String>,
 }
 
+impl ReplicationRepairReport {
+    pub(crate) fn run_status(&self) -> RepairRunStatus {
+        let chunk_progress = self.detailed_log.iter().any(|entry| {
+            entry
+                .context
+                .as_ref()
+                .and_then(|c| c.get("chunks_recovered"))
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|n| n > 0)
+        });
+        let waiting_for_source = self
+            .detailed_log
+            .iter()
+            .any(|entry| entry.event == "repair_waiting");
+        let unresolved = self
+            .detailed_log
+            .iter()
+            .any(|entry| entry.event == "repair_unresolved");
+        let deferred_transfer = self.skipped_backoff > 0 || self.skipped_max_retries > 0;
+
+        if self.failed_transfers > 0 {
+            if self.successful_transfers > 0 || chunk_progress {
+                return RepairRunStatus::PartiallyRepaired;
+            }
+            if unresolved {
+                return RepairRunStatus::Unresolved;
+            }
+            if waiting_for_source {
+                return RepairRunStatus::WaitingForSource;
+            }
+            return RepairRunStatus::Unresolved;
+        }
+
+        // Plan execution runs on every node. A node that is not an owned source
+        // for an under-replicated subject correctly skips that bundle; it did not
+        // fail a repair and must not turn the run red. Only a transfer skipped
+        // for retry backoff or exhausted retries remains unfinished here.
+        // Content recovery records its durable pending state explicitly through
+        // its own events.
+        if unresolved {
+            return RepairRunStatus::Unresolved;
+        }
+        if waiting_for_source {
+            return RepairRunStatus::WaitingForSource;
+        }
+        if deferred_transfer {
+            return RepairRunStatus::PartiallyRepaired;
+        }
+        RepairRunStatus::Completed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReplicationRepairLogEntry {
     pub(crate) captured_at_unix: u64,
@@ -45,6 +97,8 @@ pub(crate) struct ReplicationRepairLogEntry {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReplicationRepairSkipReason {
     InvalidSubject,
+    RetainedReferenceUnavailable,
+    LocalContentUnavailable,
     SourceNodeUnavailable,
     BundleUnavailable,
     BackoffActive,
@@ -264,49 +318,21 @@ pub(crate) async fn execute_targeted_replication_repair_inner(
 
 pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
     state: &ServerState,
-    mut subjects: Vec<String>,
+    subjects: Vec<String>,
     batch_size_override: Option<usize>,
     run_id: Option<&str>,
 ) -> ReplicationRepairReport {
-    let mut attempted_transfers = 0usize;
-    let mut successful_transfers = 0usize;
-    let mut failed_transfers = 0usize;
-    let mut skipped_items = 0usize;
-    let mut skipped_backoff = 0usize;
-    let mut skipped_max_retries = 0usize;
-    let mut skipped_details = Vec::new();
-    let mut detailed_log = Vec::new();
-    let mut last_error = None;
-    let mut repair_state_dirty = false;
-    let mut local_availability_refresh_needed = false;
-
-    let max_attempts = state.repair_config.max_retries;
-    let backoff_secs = state.repair_config.backoff_secs;
-    let max_transfers = batch_size_override.unwrap_or(subjects.len().max(1));
-    let now = unix_ts();
-
-    subjects.sort_by(|a, b| {
-        let a_versioned = parse_replication_subject(a)
-            .and_then(|(_, version_id)| version_id)
-            .is_some();
-        let b_versioned = parse_replication_subject(b)
-            .and_then(|(_, version_id)| version_id)
-            .is_some();
-        b_versioned.cmp(&a_versioned).then_with(|| a.cmp(b))
-    });
-    subjects.dedup();
-
     let repair_run_id = run_id.unwrap_or("untracked");
+    let subject_count = subjects.len();
+    let mut lifecycle_log = Vec::new();
     info!(
         repair_run_id,
-        subject_count = subjects.len(),
-        max_transfers,
-        max_retries = max_attempts,
-        backoff_secs,
+        subject_count,
+        batch_size_override = ?batch_size_override,
         "targeted scrub repair run started"
     );
     push_repair_log_entry(
-        &mut detailed_log,
+        &mut lifecycle_log,
         state.node_id,
         "targeted_repair_started",
         "starting targeted scrub repair run",
@@ -316,483 +342,54 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
         None,
         Some(state.node_id),
         Some(serde_json::json!({
-            "subject_count": subjects.len(),
-            "max_transfers": max_transfers,
-            "max_retries": max_attempts,
-            "backoff_secs": backoff_secs,
+            "repair_run_id": repair_run_id,
+            "subject_count": subject_count,
+            "batch_size_override": batch_size_override,
         })),
     );
 
-    for subject in subjects {
-        if attempted_transfers >= max_transfers {
-            push_repair_log_entry(
-                &mut detailed_log,
-                state.node_id,
-                "batch_limit_reached",
-                "stopping targeted scrub repair because the transfer batch limit was reached",
-                Some(subject.clone()),
-                None,
-                None,
-                None,
-                Some(state.node_id),
-                Some(serde_json::json!({
-                    "attempted_transfers": attempted_transfers,
-                    "max_transfers": max_transfers,
-                })),
-            );
-            break;
-        }
-
-        let Some((key, version_id)) = parse_replication_subject(&subject) else {
-            skipped_items += 1;
-            push_repair_log_entry(
-                &mut detailed_log,
-                state.node_id,
-                "subject_skipped",
-                "replication subject could not be parsed into key and version components",
-                Some(subject.clone()),
-                None,
-                None,
-                None,
-                Some(state.node_id),
-                Some(serde_json::json!({
-                    "reason": "invalid_subject",
-                })),
-            );
-            push_repair_skipped_detail(
-                &mut skipped_details,
-                state.node_id,
-                subject.clone(),
-                None,
-                None,
-                None,
-                Some(state.node_id),
-                ReplicationRepairSkipReason::InvalidSubject,
-                "replication subject could not be parsed into key and version components",
-            );
-            continue;
-        };
-
-        push_repair_log_entry(
-            &mut detailed_log,
-            state.node_id,
-            "subject_selected",
-            "evaluating targeted scrub repair subject",
-            Some(subject.clone()),
-            Some(key.clone()),
-            version_id.clone(),
-            None,
-            Some(state.node_id),
-            None,
-        );
-
-        let source_node = {
-            let mut cluster = state.cluster.lock().await;
-            cluster.update_health_and_detect_offline_transition();
-            cluster
-                .available_nodes_for_subject(&subject)
-                .into_iter()
-                .find(|node| node.node_id != state.node_id)
-        };
-
-        let Some(source_node) = source_node else {
-            skipped_items += 1;
-            push_repair_log_entry(
-                &mut detailed_log,
-                state.node_id,
-                "subject_skipped",
-                "targeted scrub repair could not find a healthy online source node",
-                Some(subject.clone()),
-                Some(key.clone()),
-                version_id.clone(),
-                None,
-                Some(state.node_id),
-                Some(serde_json::json!({
-                    "reason": "source_node_unavailable",
-                })),
-            );
-            push_repair_skipped_detail(
-                &mut skipped_details,
-                state.node_id,
-                subject.clone(),
-                Some(key.clone()),
-                version_id.clone(),
-                None,
-                Some(state.node_id),
-                ReplicationRepairSkipReason::SourceNodeUnavailable,
-                "targeted scrub repair could not find a healthy online source node",
-            );
-            continue;
-        };
-
-        let transfer_key = format!("{subject}|{}", state.node_id);
-        {
-            let repair_state = state.maintenance.repair_state.lock().await;
-            if let Some(previous) = repair_state.attempts.get(&transfer_key) {
-                if previous.attempts > max_attempts {
-                    skipped_max_retries += 1;
-                    push_repair_log_entry(
-                        &mut detailed_log,
-                        state.node_id,
-                        "subject_skipped",
-                        format!(
-                            "transfer skipped after {} failed attempts (max_retries={max_attempts})",
-                            previous.attempts
-                        ),
-                        Some(subject.clone()),
-                        Some(key.clone()),
-                        version_id.clone(),
-                        Some(source_node.node_id),
-                        Some(state.node_id),
-                        Some(serde_json::json!({
-                            "reason": "max_retries_exhausted",
-                            "failed_attempts": previous.attempts,
-                            "max_retries": max_attempts,
-                            "last_failure_unix": previous.last_failure_unix,
-                        })),
-                    );
-                    push_repair_skipped_detail(
-                        &mut skipped_details,
-                        state.node_id,
-                        subject.clone(),
-                        Some(key.clone()),
-                        version_id.clone(),
-                        Some(source_node.node_id),
-                        Some(state.node_id),
-                        ReplicationRepairSkipReason::MaxRetriesExhausted,
-                        format!(
-                            "transfer skipped after {} failed attempts (max_retries={max_attempts})",
-                            previous.attempts
-                        ),
-                    );
-                    continue;
-                }
-
-                let elapsed = now.saturating_sub(previous.last_failure_unix);
-                let required_backoff =
-                    jittered_backoff_secs(backoff_secs, &transfer_key, previous.attempts);
-                if elapsed < required_backoff {
-                    skipped_backoff += 1;
-                    push_repair_log_entry(
-                        &mut detailed_log,
-                        state.node_id,
-                        "subject_skipped",
-                        format!(
-                            "retry backoff active for another {}s after {} failed attempts",
-                            required_backoff.saturating_sub(elapsed),
-                            previous.attempts
-                        ),
-                        Some(subject.clone()),
-                        Some(key.clone()),
-                        version_id.clone(),
-                        Some(source_node.node_id),
-                        Some(state.node_id),
-                        Some(serde_json::json!({
-                            "reason": "backoff_active",
-                            "failed_attempts": previous.attempts,
-                            "last_failure_unix": previous.last_failure_unix,
-                            "elapsed_since_failure_secs": elapsed,
-                            "required_backoff_secs": required_backoff,
-                        })),
-                    );
-                    push_repair_skipped_detail(
-                        &mut skipped_details,
-                        state.node_id,
-                        subject.clone(),
-                        Some(key.clone()),
-                        version_id.clone(),
-                        Some(source_node.node_id),
-                        Some(state.node_id),
-                        ReplicationRepairSkipReason::BackoffActive,
-                        format!(
-                            "retry backoff active for another {}s after {} failed attempts",
-                            required_backoff.saturating_sub(elapsed),
-                            previous.attempts
-                        ),
-                    );
-                    continue;
-                }
-            }
-        }
-
-        await_repair_busy_threshold(state).await;
-        attempted_transfers += 1;
-        info!(
-            repair_run_id,
-            subject = %subject,
-            key = %key,
-            version_id = ?version_id,
-            source_node_id = %source_node.node_id,
-            target_node_id = %state.node_id,
-            attempted_transfers,
-            "targeted scrub repair starting local pull"
-        );
-        push_repair_log_entry(
-            &mut detailed_log,
-            state.node_id,
-            "local_pull_started",
-            "starting targeted scrub repair local pull",
-            Some(subject.clone()),
-            Some(key.clone()),
-            version_id.clone(),
-            Some(source_node.node_id),
-            Some(state.node_id),
-            Some(serde_json::json!({
-                "attempted_transfers": attempted_transfers,
-            })),
-        );
-
-        match pull_bundle_from_source(
-            &source_node,
-            &key,
-            version_id.as_deref(),
-            state,
-            run_id,
-            &mut detailed_log,
-        )
-        .await
-        {
-            Ok(imported_version_id) => {
-                push_repair_log_entry(
-                    &mut detailed_log,
-                    state.node_id,
-                    "local_verify_started",
-                    "starting targeted scrub repair post-pull verification",
-                    Some(subject.clone()),
-                    Some(key.clone()),
-                    version_id.clone(),
-                    Some(source_node.node_id),
-                    Some(state.node_id),
-                    Some(serde_json::json!({
-                        "imported_version_id": imported_version_id,
-                    })),
-                );
-                match verify_local_repair_subject(state, &subject).await {
-                    Ok(()) => {
-                        successful_transfers += 1;
-                        publish_namespace_change(state);
-
-                        let mut repair_state = state.maintenance.repair_state.lock().await;
-                        repair_state.attempts.remove(&transfer_key);
-                        drop(repair_state);
-                        repair_state_dirty = true;
-                        local_availability_refresh_needed = true;
-
-                        info!(
-                            repair_run_id,
-                            subject = %subject,
-                            key = %key,
-                            version_id = ?version_id,
-                            source_node_id = %source_node.node_id,
-                            target_node_id = %state.node_id,
-                            imported_version_id = %imported_version_id,
-                            "targeted scrub repair completed local pull"
-                        );
-                        push_repair_log_entry(
-                            &mut detailed_log,
-                            state.node_id,
-                            "local_pull_completed",
-                            "targeted scrub repair local pull and verification completed",
-                            Some(subject.clone()),
-                            Some(key.clone()),
-                            version_id.clone(),
-                            Some(source_node.node_id),
-                            Some(state.node_id),
-                            Some(serde_json::json!({
-                                "imported_version_id": imported_version_id,
-                            })),
-                        );
-                    }
-                    Err(err) => {
-                        let error_text = format!("{err:#}");
-                        failed_transfers += 1;
-                        last_error = Some(error_text.clone());
-                        warn!(
-                            repair_run_id,
-                            subject = %subject,
-                            key = %key,
-                            version_id = ?version_id,
-                            source_node_id = %source_node.node_id,
-                            target_node_id = %state.node_id,
-                            error = %error_text,
-                            "targeted scrub repair verification failed"
-                        );
-                        push_repair_log_entry(
-                            &mut detailed_log,
-                            state.node_id,
-                            "local_verify_failed",
-                            "targeted scrub repair verification failed after local pull",
-                            Some(subject.clone()),
-                            Some(key.clone()),
-                            version_id.clone(),
-                            Some(source_node.node_id),
-                            Some(state.node_id),
-                            Some(serde_json::json!({
-                                "imported_version_id": imported_version_id,
-                                "error": error_text,
-                            })),
-                        );
-
-                        let mut repair_state = state.maintenance.repair_state.lock().await;
-                        let entry = repair_state.attempts.entry(transfer_key).or_insert(
-                            RepairAttemptEntry {
-                                attempts: 0,
-                                last_failure_unix: now,
-                            },
-                        );
-                        entry.attempts = entry.attempts.saturating_add(1);
-                        entry.last_failure_unix = now;
-                        drop(repair_state);
-                        repair_state_dirty = true;
-                    }
-                }
-            }
-            Err(err) => {
-                let error_text = format!("{err:#}");
-                failed_transfers += 1;
-                last_error = Some(error_text.clone());
-                warn!(
-                    repair_run_id,
-                    subject = %subject,
-                    key = %key,
-                    version_id = ?version_id,
-                    source_node_id = %source_node.node_id,
-                    target_node_id = %state.node_id,
-                    error = %error_text,
-                    "targeted scrub repair local pull failed"
-                );
-                push_repair_log_entry(
-                    &mut detailed_log,
-                    state.node_id,
-                    "local_pull_failed",
-                    "targeted scrub repair local pull failed",
-                    Some(subject.clone()),
-                    Some(key.clone()),
-                    version_id.clone(),
-                    Some(source_node.node_id),
-                    Some(state.node_id),
-                    Some(serde_json::json!({
-                        "error": error_text,
-                    })),
-                );
-
-                let mut repair_state = state.maintenance.repair_state.lock().await;
-                let entry =
-                    repair_state
-                        .attempts
-                        .entry(transfer_key)
-                        .or_insert(RepairAttemptEntry {
-                            attempts: 0,
-                            last_failure_unix: now,
-                        });
-                entry.attempts = entry.attempts.saturating_add(1);
-                entry.last_failure_unix = now;
-                drop(repair_state);
-                repair_state_dirty = true;
-            }
-        }
-    }
-
-    if local_availability_refresh_needed {
-        refresh_local_availability_view_once(state).await;
-        push_repair_log_entry(
-            &mut detailed_log,
-            state.node_id,
-            "local_availability_refreshed",
-            "refreshed local availability view after targeted scrub repair",
-            None,
-            None,
-            None,
-            None,
-            Some(state.node_id),
-            None,
-        );
-    }
-
-    if repair_state_dirty {
-        match persist_repair_state(state).await {
-            Ok(()) => {
-                push_repair_log_entry(
-                    &mut detailed_log,
-                    state.node_id,
-                    "repair_attempt_state_persisted",
-                    "persisted targeted scrub repair attempt state",
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(state.node_id),
-                    None,
-                );
-            }
-            Err(err) => {
-                warn!(
-                    repair_run_id,
-                    error = %err,
-                    "failed persisting repair attempts after targeted scrub repair"
-                );
-                push_repair_log_entry(
-                    &mut detailed_log,
-                    state.node_id,
-                    "repair_attempt_state_persist_failed",
-                    "failed persisting targeted scrub repair attempt state",
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(state.node_id),
-                    Some(serde_json::json!({
-                        "error": err.to_string(),
-                    })),
-                );
-            }
-        }
-    }
-
+    let mut report = content_recovery::repair_subjects(state, subjects, batch_size_override).await;
+    // Keep both lifecycle brackets when a content-recovery pass reaches the
+    // bounded report-log capacity.
+    report
+        .detailed_log
+        .truncate(MAX_REPAIR_REPORT_LOG_ENTRIES.saturating_sub(2));
+    report.detailed_log.insert(
+        0,
+        lifecycle_log
+            .pop()
+            .expect("targeted repair start entry was recorded"),
+    );
     info!(
         repair_run_id,
-        attempted_transfers,
-        successful_transfers,
-        failed_transfers,
-        skipped_items,
-        skipped_backoff,
-        skipped_max_retries,
-        "targeted scrub repair local phase finished"
+        attempted_transfers = report.attempted_transfers,
+        successful_transfers = report.successful_transfers,
+        failed_transfers = report.failed_transfers,
+        skipped_items = report.skipped_items,
+        "targeted scrub repair run finished"
     );
     push_repair_log_entry(
-        &mut detailed_log,
+        &mut report.detailed_log,
         state.node_id,
         "targeted_repair_finished",
-        "finished targeted scrub repair run",
+        "targeted scrub repair run finished",
         None,
         None,
         None,
         None,
         Some(state.node_id),
         Some(serde_json::json!({
-            "attempted_transfers": attempted_transfers,
-            "successful_transfers": successful_transfers,
-            "failed_transfers": failed_transfers,
-            "skipped_items": skipped_items,
-            "skipped_backoff": skipped_backoff,
-            "skipped_max_retries": skipped_max_retries,
+            "repair_run_id": repair_run_id,
+            "attempted_transfers": report.attempted_transfers,
+            "successful_transfers": report.successful_transfers,
+            "failed_transfers": report.failed_transfers,
+            "skipped_items": report.skipped_items,
         })),
     );
-
-    ReplicationRepairReport {
-        attempted_transfers,
-        successful_transfers,
-        failed_transfers,
-        skipped_items,
-        skipped_backoff,
-        skipped_max_retries,
-        skipped_details,
-        detailed_log,
-        last_error,
-    }
+    report
 }
 
-async fn execute_replication_repair_plan(
+pub(crate) async fn execute_replication_repair_plan(
     state: &ServerState,
     plan: &ReplicationPlan,
     nodes: Vec<NodeDescriptor>,
@@ -825,6 +422,10 @@ async fn execute_replication_repair_plan(
     let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
     let now = unix_ts();
     let repair_run_id = run_id.unwrap_or("untracked");
+    let locally_available = cached_local_cluster_available_subjects(state)
+        .await
+        .into_iter()
+        .collect::<HashSet<_>>();
 
     let mut plan_items = plan.items.iter().collect::<Vec<_>>();
     let plan_item_count = plan_items.len();
@@ -987,42 +588,48 @@ async fn execute_replication_repair_plan(
                 .export_replication_bundle(&key, version_id.as_deref(), ObjectReadMode::Preferred)
                 .await
             {
-                Ok(Some(bundle)) => Some(bundle),
+                Ok(Some(bundle))
+                    if store
+                        .check_owned_replica_presence(&bundle.manifest_hash)
+                        .await
+                        .is_ok() =>
+                {
+                    Some(bundle)
+                }
                 _ => None,
             }
         };
 
-        if bundle.is_some() && local_missing {
-            // The local store already has this version but the cluster replica map doesn't know
-            // about it (e.g. the version was received through a path that bypassed note_replica,
-            // or it's a non-head version that list_replication_subjects doesn't surface). Register
-            // it now so future repair plans stop treating this node as missing.
-            info!(
-                repair_run_id,
-                subject = %item.key,
-                key = %key,
-                version_id = ?version_id,
-                "replication repair found local replica not reflected in cluster state; registering"
-            );
+        if bundle.is_some() && !locally_available.contains(&item.key) {
+            // A persisted remote view can retain a historical source hint while
+            // that peer is offline. Do not turn a locally retained, non-head
+            // bundle back into legacy availability or replicate it from here;
+            // durable manifest-hash recovery owns retained-history work.
+            skipped_items += 1;
             push_repair_log_entry(
                 &mut detailed_log,
                 state.node_id,
-                "local_replica_registered",
-                "local replica was present but not reflected in cluster state; registering",
+                "subject_skipped",
+                "local content is outside the current availability view",
                 Some(item.key.clone()),
                 Some(key.clone()),
                 version_id.clone(),
                 None,
                 Some(state.node_id),
-                None,
+                Some(serde_json::json!({"reason": "local_content_unavailable"})),
             );
-            let mut cluster = state.cluster.lock().await;
-            cluster.note_replica(&key, state.node_id);
-            if let Some(vid) = &version_id {
-                cluster.note_replica(format!("{key}@{vid}"), state.node_id);
-            }
-            drop(cluster);
-            replicas_state_dirty = true;
+            push_repair_skipped_detail(
+                &mut skipped_details,
+                state.node_id,
+                item.key.clone(),
+                Some(key.clone()),
+                version_id.clone(),
+                None,
+                Some(state.node_id),
+                ReplicationRepairSkipReason::LocalContentUnavailable,
+                "local content is outside the current availability view",
+            );
+            continue;
         }
 
         if bundle.is_none() && local_missing {
@@ -2118,7 +1725,7 @@ fn accumulate_repair_report(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_repair_log_entry(
+pub(crate) fn push_repair_log_entry(
     detailed_log: &mut Vec<ReplicationRepairLogEntry>,
     report_node_id: NodeId,
     event: impl Into<String>,
@@ -2150,7 +1757,7 @@ fn push_repair_log_entry(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn push_repair_skipped_detail(
+pub(crate) fn push_repair_skipped_detail(
     skipped_details: &mut Vec<ReplicationRepairSkippedItem>,
     report_node_id: NodeId,
     subject: String,
@@ -2200,6 +1807,31 @@ fn should_log_repair_chunk_progress(chunk_index: usize, chunk_count: usize) -> b
         || chunk_index == 1
         || chunk_index == chunk_count
         || chunk_index.is_multiple_of(REPAIR_PROGRESS_CHUNK_LOG_INTERVAL)
+}
+
+fn retained_repair_pin_for_replication_pull(
+    existing: Option<storage::content_recovery::ContentRepairTask>,
+    reference: storage::retained_content::RetainedReference,
+    chunks: Vec<storage::ReplicationChunkInfo>,
+) -> storage::content_recovery::ContentRepairTask {
+    let mut pin = existing.unwrap_or_else(|| {
+        storage::content_recovery::ContentRepairTask::new(reference.clone(), true)
+    });
+    pin.reference = reference;
+    pin.repair_chunks = true;
+    pin.chunks = chunks;
+    pin
+}
+
+fn requires_content_repair_claim(manifest_hash: &str) -> bool {
+    manifest_hash != TOMBSTONE_MANIFEST_HASH
+}
+
+fn should_persist_replication_pull_repair_pin(
+    manifest_hash: &str,
+    automatic_repair_enabled: bool,
+) -> bool {
+    automatic_repair_enabled && requires_content_repair_claim(manifest_hash)
 }
 
 async fn pull_bundle_from_source(
@@ -2279,52 +1911,70 @@ async fn pull_bundle_from_source(
         })),
     );
 
-    if bundle.manifest_hash != TOMBSTONE_MANIFEST_HASH {
-        for (chunk_offset, chunk) in bundle.manifest.chunks.iter().enumerate() {
-            let chunk_index = chunk_offset + 1;
-            if should_log_repair_chunk_progress(chunk_index, chunk_count) {
-                info!(
-                    repair_run_id,
-                    source_node_id = %source_node.node_id,
-                    key = %bundle.key,
-                    version_id = ?bundle.version_id,
-                    chunk_index,
-                    chunk_count,
-                    chunk_hash = %chunk.hash,
-                    "replication repair pull chunk progress"
-                );
-                push_repair_log_entry(
-                    detailed_log,
-                    state.node_id,
-                    "pull_chunk_progress",
-                    "downloading replica chunk from source node",
-                    Some(subject.clone()),
-                    Some(bundle.key.clone()),
-                    bundle.version_id.clone(),
-                    Some(source_node.node_id),
-                    Some(state.node_id),
-                    Some(serde_json::json!({
-                        "chunk_index": chunk_index,
-                        "chunk_count": chunk_count,
-                        "chunk_hash": chunk.hash.clone(),
-                    })),
-                );
-            }
-            let payload = execute_peer_request(
-                state,
-                source_node,
-                reqwest::Method::GET,
-                &format!("/cluster/v2/replication/chunk/{}", chunk.hash),
-                Vec::new(),
-                Vec::new(),
-            )
+    // Tombstones share one sentinel manifest hash and have no chunk recovery
+    // work. Do not serialize unrelated deletes behind a claim for that shared
+    // sentinel.
+    let needs_content_repair = requires_content_repair_claim(&bundle.manifest_hash);
+    let _content_repair = if needs_content_repair {
+        Some(
+            state
+                .maintenance
+                .content_repair_claims
+                .claim(&bundle.manifest_hash)
+                .await,
+        )
+    } else {
+        None
+    };
+    let repair_pin = if needs_content_repair {
+        let manifest = storage::content_recovery::validate_manifest(
+            &bundle.manifest_hash,
+            &bundle.manifest_bytes,
+        )?;
+        let reference = storage::retained_content::RetainedReference {
+            key: Some(bundle.key.clone()),
+            object_id: bundle.object_id.clone(),
+            version_id: bundle.version_id.clone(),
+            manifest_hash: bundle.manifest_hash.clone(),
+            snapshot_only: false,
+        };
+        let chunks = manifest.chunks;
+        // A replication pull can race the durable worker. Preserve an existing
+        // task's retry deadline, source fingerprint, and recovered progress.
+        // When automatic repair is disabled, do not create a pin that no worker
+        // can drain; an already persisted task is still finished on success.
+        let existing = read_store(state, "replication_pull.existing_pin")
+            .await
+            .content_repair_tasks_for_manifests(std::slice::from_ref(&bundle.manifest_hash))
             .await?
-            .body;
-
-            let store = lock_store(state, "replication_pull.ingest_chunk").await;
-            store.ingest_chunk(&chunk.hash, payload.as_ref()).await?;
+            .into_iter()
+            .next();
+        let pin = if should_persist_replication_pull_repair_pin(
+            &bundle.manifest_hash,
+            state.repair_config.enabled,
+        ) {
+            let pin = retained_repair_pin_for_replication_pull(existing, reference, chunks.clone());
+            read_store(state, "replication_pull.pin")
+                .await
+                .persist_content_repair_task(&pin)
+                .await?;
+            Some(pin)
+        } else {
+            existing
+        };
+        let recovered =
+            content_recovery::recover_chunks(state, &subject, &chunks, Some(source_node), false)
+                .await;
+        if !recovered.remaining.is_empty() {
+            bail!(
+                "replication content recovery incomplete: {}",
+                recovered.errors.join("; ")
+            );
         }
-    }
+        pin
+    } else {
+        None
+    };
 
     info!(
         repair_run_id,
@@ -2350,6 +2000,11 @@ async fn pull_bundle_from_source(
     );
     let mut store = lock_store(state, "replication_pull.import_manifest").await;
     let imported_version_id = store.import_replication_bundle(&bundle).await?;
+    if let Some(pin) = &repair_pin {
+        // `recover_chunks` validated each retained chunk before this import;
+        // do not turn an already verified pull into a second full-object hash.
+        store.finish_verified_content_repair(pin).await?;
+    }
     info!(
         repair_run_id,
         source_node_id = %source_node.node_id,
@@ -2665,6 +2320,193 @@ mod tests {
             detailed_log.last().map(|entry| entry.detail.as_str()),
             Some(expected_last.as_str())
         );
+    }
+
+    #[test]
+    fn repair_status_treats_a_non_source_bundle_skip_with_other_successes_as_completed() {
+        let node_id = NodeId::new_v4();
+        let mut report = empty_report();
+        report.successful_transfers = 1;
+        report.skipped_items = 1;
+        report.skipped_details.push(ReplicationRepairSkippedItem {
+            report_node_id: node_id,
+            subject: "retained-version@ver-1".to_string(),
+            key: Some("retained-version".to_string()),
+            version_id: Some("ver-1".to_string()),
+            source_node_id: None,
+            target_node_id: None,
+            reason: ReplicationRepairSkipReason::BundleUnavailable,
+            detail: "replication bundle was not available on the reporting node".to_string(),
+        });
+        push_repair_log_entry(
+            &mut report.detailed_log,
+            node_id,
+            "subject_skipped",
+            "replication bundle was not available on the reporting node",
+            Some("retained-version@ver-1".to_string()),
+            Some("retained-version".to_string()),
+            Some("ver-1".to_string()),
+            None,
+            None,
+            Some(serde_json::json!({"reason": "bundle_unavailable", "local_missing": false})),
+        );
+
+        assert_eq!(report.run_status(), RepairRunStatus::Completed);
+    }
+
+    #[test]
+    fn repair_status_treats_scheduling_deferral_with_other_successes_as_completed() {
+        let node_id = NodeId::new_v4();
+        let mut report = empty_report();
+        report.successful_transfers = 1;
+        push_repair_log_entry(
+            &mut report.detailed_log,
+            node_id,
+            "repair_deferred",
+            "repair remains queued while another operation owns its manifest".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(serde_json::json!({"pending": true, "reason": "manifest_repair_in_progress"})),
+        );
+
+        assert_eq!(report.run_status(), RepairRunStatus::Completed);
+    }
+
+    #[test]
+    fn repair_status_marks_deferred_transfers_partial_with_or_without_progress() {
+        for (successful_transfers, skipped_backoff, skipped_max_retries) in
+            [(0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1)]
+        {
+            let mut report = empty_report();
+            report.successful_transfers = successful_transfers;
+            report.skipped_backoff = skipped_backoff;
+            report.skipped_max_retries = skipped_max_retries;
+
+            assert_eq!(
+                report.run_status(),
+                RepairRunStatus::PartiallyRepaired,
+                "deferred transfer must remain visible with successful_transfers={successful_transfers}"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_status_does_not_mask_an_unresolved_task_with_another_waiting_task() {
+        let node_id = NodeId::new_v4();
+        for failed_transfers in [0, 1] {
+            let mut report = empty_report();
+            report.failed_transfers = failed_transfers;
+            for event in ["repair_waiting", "repair_unresolved"] {
+                push_repair_log_entry(
+                    &mut report.detailed_log,
+                    node_id,
+                    event,
+                    event.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+            assert_eq!(report.run_status(), RepairRunStatus::Unresolved);
+        }
+    }
+
+    #[test]
+    fn repair_status_uses_this_attempt_progress_not_durable_total() {
+        let node_id = NodeId::new_v4();
+        let mut report = empty_report();
+        report.failed_transfers = 1;
+        push_repair_log_entry(
+            &mut report.detailed_log,
+            node_id,
+            "repair_waiting",
+            "source still unavailable".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(serde_json::json!({
+                "chunks_recovered": 0,
+                "total_chunks_recovered": 3,
+            })),
+        );
+
+        assert_eq!(report.run_status(), RepairRunStatus::WaitingForSource);
+    }
+
+    #[test]
+    fn replication_pull_preserves_existing_retained_repair_progress_and_backoff() {
+        let old_reference = storage::retained_content::RetainedReference {
+            key: Some("old-key".to_string()),
+            object_id: None,
+            version_id: Some("ver-old".to_string()),
+            manifest_hash: "old-manifest".to_string(),
+            snapshot_only: false,
+        };
+        let mut existing = storage::content_recovery::ContentRepairTask::new(old_reference, false);
+        existing.attempts = 4;
+        existing.next_attempt_unix = 9_999;
+        existing.last_error = Some("previous source timeout".to_string());
+        existing.waiting_for_source = true;
+        existing.source_fingerprint = "previous-sources".to_string();
+        existing.recovered_chunks = 3;
+
+        let reference = storage::retained_content::RetainedReference {
+            key: Some("new-key".to_string()),
+            object_id: Some("object-id".to_string()),
+            version_id: Some("ver-new".to_string()),
+            manifest_hash: "new-manifest".to_string(),
+            snapshot_only: false,
+        };
+        let chunks = vec![storage::ReplicationChunkInfo {
+            hash: "new-chunk".to_string(),
+            size_bytes: 42,
+        }];
+
+        let pin = retained_repair_pin_for_replication_pull(
+            Some(existing),
+            reference.clone(),
+            chunks.clone(),
+        );
+        assert_eq!(pin.reference, reference);
+        assert!(pin.repair_chunks);
+        assert_eq!(pin.chunks.len(), 1);
+        assert_eq!(pin.chunks[0].hash, chunks[0].hash);
+        assert_eq!(pin.chunks[0].size_bytes, chunks[0].size_bytes);
+        assert_eq!(pin.attempts, 4);
+        assert_eq!(pin.next_attempt_unix, 9_999);
+        assert_eq!(pin.last_error.as_deref(), Some("previous source timeout"));
+        assert!(pin.waiting_for_source);
+        assert_eq!(pin.source_fingerprint, "previous-sources");
+        assert_eq!(pin.recovered_chunks, 3);
+    }
+
+    #[test]
+    fn replication_pull_pins_only_drainable_non_tombstone_repair_work() {
+        assert!(
+            !requires_content_repair_claim(TOMBSTONE_MANIFEST_HASH),
+            "the shared tombstone sentinel must not serialize unrelated deletes"
+        );
+        assert!(requires_content_repair_claim("immutable-manifest-hash"));
+        assert!(should_persist_replication_pull_repair_pin(
+            "immutable-manifest-hash",
+            true
+        ));
+        assert!(
+            !should_persist_replication_pull_repair_pin("immutable-manifest-hash", false),
+            "disabled automatic repair must not create a pin that no worker can drain"
+        );
+        assert!(!should_persist_replication_pull_repair_pin(
+            TOMBSTONE_MANIFEST_HASH,
+            true
+        ));
     }
 
     #[test]

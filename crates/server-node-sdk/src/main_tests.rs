@@ -14425,15 +14425,11 @@ run_on_main_metadata_backends!(
     replication_repair_records_max_retry_skip_details_turso
 );
 
-async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
-    backend: MainTestBackend,
-) {
-    // Scenario: the local store has data for an old (non-head) version, but the cluster's replica
-    // map only records the remote node as having it. This mirrors production cases where a node
-    // receives the current head directly without going through the full version chain, leaving
-    // ancestor versions locally present but untracked in the replica map. The repair should detect
-    // that the bundle is already local, register the replica, and do so without attempting any
-    // network transfer.
+async fn repair_skips_unavailable_local_retained_history_impl(backend: MainTestBackend) {
+    // An offline peer can leave a stale historical availability claim behind.
+    // Retained non-head content must not be re-registered through legacy
+    // replication just because it remains locally readable; hash-based durable
+    // recovery is responsible for that history.
     let state = build_test_state(2, false, backend).await;
 
     let remote_node_id = {
@@ -14450,8 +14446,8 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
     let version_old = "ver-local-reg-v1".to_string();
     let version_new = "ver-local-reg-v2".to_string();
 
-    // Write both versions to the local store. v2 is a child of v1, making v1 a non-head version
-    // that list_replication_subjects() will not surface in availability syncs.
+    // Write both versions. Availability intentionally surfaces only the current
+    // head, not v1.
     seed_subject_version(
         &state,
         &key,
@@ -14469,8 +14465,7 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
     )
     .await;
 
-    // Set up the replica map to reflect the inconsistency: local node is known to have v2 (head)
-    // but NOT v1 (the old version), even though the local store actually has v1's data.
+    // Model a stale remote claim for v1 while the local node retains its bytes.
     {
         let mut cluster = state.cluster.lock().await;
         cluster.note_replica(&key, state.node_id);
@@ -14480,68 +14475,36 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
         cluster.note_replica(format!("{key}@{version_new}"), remote_node_id);
     }
 
-    // Confirm the plan sees the local node as missing v1.
     let old_version_subject = format!("{key}@{version_old}");
-    {
-        let plan = {
-            let mut cluster = state.cluster.lock().await;
-            cluster.update_health_and_detect_offline_transition();
-            cluster.replication_plan(&[
-                key.clone(),
-                old_version_subject.clone(),
-                format!("{key}@{version_new}"),
-            ])
-        };
-        assert!(
-            plan.items.iter().any(|item| {
-                item.key == old_version_subject && item.missing_nodes.contains(&state.node_id)
-            }),
-            "pre-repair plan should identify local node as missing the old version, items={:?}",
-            plan.items
-        );
-    }
-
     let report = super::replication::execute_replication_repair_inner(&state, None).await;
 
     assert_eq!(
         report.attempted_transfers, 0,
-        "no network transfer should be needed: local store already has v1"
+        "a stale historical source hint must not trigger legacy replication"
     );
     assert_eq!(report.failed_transfers, 0);
-    assert_eq!(report.skipped_items, 0);
     assert!(
-        report.detailed_log.iter().any(|entry| {
-            entry.event == "local_replica_registered"
-                && entry.subject.as_deref() == Some(old_version_subject.as_str())
+        report.skipped_details.iter().any(|detail| {
+            detail.subject == old_version_subject
+                && detail.reason
+                    == super::replication::ReplicationRepairSkipReason::LocalContentUnavailable
         }),
-        "repair should emit local_replica_registered for the old version, log={:?}",
-        report.detailed_log
+        "the historical subject must be explicitly skipped: {report:?}"
+    );
+    assert!(
+        !state
+            .cluster
+            .lock()
+            .await
+            .available_nodes_for_subject(&old_version_subject)
+            .iter()
+            .any(|node| node.node_id == state.node_id),
+        "a non-head retained version must stay outside local availability"
     );
 
-    // After repair the cluster plan should no longer list v1 as a gap.
-    {
-        let plan = {
-            let mut cluster = state.cluster.lock().await;
-            cluster.update_health_and_detect_offline_transition();
-            cluster.replication_plan(&[
-                key.clone(),
-                old_version_subject.clone(),
-                format!("{key}@{version_new}"),
-            ])
-        };
-        assert!(
-            !plan.items.iter().any(|item| {
-                item.key == old_version_subject && item.missing_nodes.contains(&state.node_id)
-            }),
-            "post-repair plan should no longer show local node as missing v1, items={:?}",
-            plan.items
-        );
-    }
-
-    // Running repair a second time should produce no work for this subject.
+    // A second pass must retain the same boundary rather than re-registering v1.
     let report2 = super::replication::execute_replication_repair_inner(&state, None).await;
     assert_eq!(report2.attempted_transfers, 0);
-    assert_eq!(report2.skipped_items, 0);
     assert!(
         !report2.detailed_log.iter().any(|entry| {
             entry.event == "local_replica_registered"
@@ -14554,9 +14517,9 @@ async fn repair_registers_local_replica_when_present_but_not_tracked_impl(
 }
 
 run_on_main_metadata_backends!(
-    repair_registers_local_replica_when_present_but_not_tracked_impl,
-    repair_registers_local_replica_when_present_but_not_tracked,
-    repair_registers_local_replica_when_present_but_not_tracked_turso
+    repair_skips_unavailable_local_retained_history_impl,
+    repair_skips_unavailable_local_retained_history,
+    repair_skips_unavailable_local_retained_history_turso
 );
 
 async fn autonomous_post_write_replication_pushes_to_missing_remote_nodes_impl(
@@ -14650,6 +14613,100 @@ run_on_main_metadata_backends!(
     autonomous_post_write_replication_pushes_to_missing_remote_nodes_impl,
     autonomous_post_write_replication_pushes_to_missing_remote_nodes,
     autonomous_post_write_replication_pushes_to_missing_remote_nodes_turso
+);
+
+async fn replication_audit_syncs_availability_before_planning_repairs_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(2, false, backend).await;
+    let mut target = build_test_state(1, false, backend).await;
+    target.cluster_id = source.cluster_id;
+    let placeholder_node_id = {
+        let cluster = source.cluster.lock().await;
+        cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id != source.node_id)
+            .map(|node| node.node_id)
+            .expect("expected seeded remote placeholder")
+    };
+    assert!(source.cluster.lock().await.remove_node(placeholder_node_id));
+
+    let (peer_base_url, handle) =
+        spawn_internal_peer_api_server_for_caller(target.clone(), &source).await;
+    register_online_source_node(&source, &target, &peer_base_url).await;
+    let key = "auditor-availability-sync.bin";
+    let version = "ver-auditor-availability-sync";
+    for node in [&source, &target] {
+        seed_subject_version(node, key, version, b"already replicated".to_vec(), vec![]).await;
+    }
+    super::refresh_local_availability_view_once(&target).await;
+
+    assert!(
+        source
+            .cluster
+            .lock()
+            .await
+            .available_nodes_for_subject(key)
+            .iter()
+            .all(|node| node.node_id != target.node_id),
+        "the test requires an initially stale remote availability view"
+    );
+
+    let target_descriptor = source
+        .cluster
+        .lock()
+        .await
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == target.node_id)
+        .expect("target should be registered with the auditor");
+    let response = super::execute_peer_request(
+        &source,
+        &target_descriptor,
+        reqwest::Method::GET,
+        "/cluster/availability/subjects/local",
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    .expect("auditor should reach the target availability endpoint");
+    let advertised = response
+        .json::<super::LocalAvailableSubjectsResponse>()
+        .expect("target availability response should decode");
+    assert!(
+        advertised.subjects.iter().any(|subject| subject == key),
+        "target must advertise its healthy subject: {advertised:?}"
+    );
+
+    super::run_replication_audit_once(&source).await;
+
+    assert!(
+        source
+            .cluster
+            .lock()
+            .await
+            .available_nodes_for_subject(key)
+            .iter()
+            .any(|node| node.node_id == target.node_id),
+        "the auditor must synchronize the remote view before its plan snapshot"
+    );
+    let history = repair_run_history(&source).await;
+    assert!(
+        history.is_empty(),
+        "a remote node that already advertises the subject must not receive a duplicate auditor repair: {history:?}"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    replication_audit_syncs_availability_before_planning_repairs_impl,
+    replication_audit_syncs_availability_before_planning_repairs,
+    replication_audit_syncs_availability_before_planning_repairs_turso
 );
 
 async fn expected_revision_compare_and_swap_rejects_stale_put_and_delete_impl(
@@ -16936,13 +16993,17 @@ async fn list_store_index_skips_invalid_manifest_metadata_impl(backend: MainTest
             .unwrap()
     };
 
-    apply_data_scrub_corruption_to_subject(
-        &state,
-        "docs/report.txt",
-        None,
-        DataScrubAutoRepairCorruptionKind::ManifestInvalid,
-    )
-    .await;
+    // Change the referenced identity as well, so this exercises a listing cache
+    // miss. Byte-repair fixtures deliberately preserve the authoritative hash.
+    lock_store(&state, "tests.invalid_manifest_listing")
+        .await
+        .replace_manifest_bytes_for_subject_for_test(
+            "docs/report.txt",
+            None,
+            br#"{invalid-manifest-json"#,
+        )
+        .await
+        .unwrap();
 
     let response = axum::response::IntoResponse::into_response(
         super::list_store_index(
@@ -18722,22 +18783,22 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(after_payload["subject_count"].as_u64().unwrap(), 2);
+    assert_eq!(after_payload["subject_count"].as_u64().unwrap(), 0);
     let after_subject_list = after_payload["subjects"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|value| value.as_str())
         .collect::<Vec<_>>();
-    assert!(after_subject_list.contains(&"photos/cat.png"));
-    assert!(after_subject_list.contains(&format!("photos/cat.png@{}", put.version_id).as_str()));
+    assert!(
+        after_subject_list.is_empty(),
+        "a complete read-through cache is not a durable replica"
+    );
 
     {
         let cluster = target.cluster.lock().await;
         let cluster_subjects = cluster.subjects_for_node(target.node_id);
-        assert_eq!(cluster_subjects.len(), 2);
-        assert!(cluster_subjects.contains(&"photos/cat.png".to_string()));
-        assert!(cluster_subjects.contains(&format!("photos/cat.png@{}", put.version_id)));
+        assert!(cluster_subjects.is_empty());
     }
 
     handle.abort();
@@ -20040,6 +20101,8 @@ async fn build_test_state(
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+            content_repair_claims: Arc::new(crate::ContentRepairClaims::default()),
+            content_repair_notify: Arc::new(tokio::sync::Notify::new()),
             repair_activity: Arc::new(Mutex::new(super::RepairActivityRuntime::default())),
             manual_repair_activity: Arc::new(Mutex::new(
                 super::ManualRepairActionActivityRuntime::default(),
@@ -20057,6 +20120,8 @@ async fn build_test_state(
             repair_run_history_retention_secs: super::REPAIR_RUN_HISTORY_RETENTION_SECS,
             local_availability_refresh_lock: Arc::new(Mutex::new(())),
             local_availability_refresh_notify: Arc::new(tokio::sync::Notify::new()),
+            local_availability_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_availability_cache: Arc::new(Mutex::new(None)),
         },
         metadata_commit_mode: MetadataCommitMode::Local,
         autonomous_replication_on_put_enabled: false,
@@ -20630,6 +20695,9 @@ async fn seed_subject_version(
         .expect("test subject version should store");
 }
 
+#[path = "content_recovery_tests.rs"]
+mod content_recovery_tests;
+
 async fn spawn_internal_peer_api_server(
     state: ServerState,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -20766,12 +20834,7 @@ async fn apply_data_scrub_corruption_to_subject(
             fs::create_dir(&manifest_path).await.unwrap();
         }
         DataScrubAutoRepairCorruptionKind::ManifestInvalid => {
-            store
-                .replace_manifest_bytes_for_subject_for_test(
-                    key,
-                    version_id,
-                    br#"{invalid-manifest-json"#,
-                )
+            fs::write(&manifest_path, br#"{invalid-manifest-json"#)
                 .await
                 .unwrap();
         }
@@ -20796,10 +20859,7 @@ async fn apply_data_scrub_corruption_to_subject(
                 .expect("manifest should expose total_size_bytes");
             mutated["total_size_bytes"] = serde_json::Value::from(current_total + 7);
             let payload = serde_json::to_vec(&mutated).unwrap();
-            store
-                .replace_manifest_bytes_for_subject_for_test(key, version_id, &payload)
-                .await
-                .unwrap();
+            fs::write(&manifest_path, payload).await.unwrap();
         }
         DataScrubAutoRepairCorruptionKind::ChunkMissing => {
             fs::remove_file(&chunk_path).await.unwrap();
@@ -21099,13 +21159,8 @@ async fn data_scrub_auto_repair_repairs_exact_historical_version_subject_impl(
         vec![version_a.clone()],
     )
     .await;
-    note_subject_replicas(
-        &target,
-        source.node_id,
-        &key,
-        &[version_a.clone(), version_b.clone()],
-    )
-    .await;
+    super::refresh_local_availability_view_once(&source).await;
+    super::sync_availability_views_once(&target).await;
 
     let baseline_repair_history_len = repair_run_history(&target).await.len();
     apply_data_scrub_corruption_to_subject(

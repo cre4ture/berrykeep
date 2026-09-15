@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -57,6 +57,8 @@ pub struct DataScrubReport {
     pub version_records_scanned: usize,
     pub manifests_scanned: usize,
     pub chunks_scanned: usize,
+    #[serde(default)]
+    pub chunks_not_required_locally: usize,
     pub bytes_scanned: u64,
     pub issue_count: usize,
     pub sampled_issue_count: usize,
@@ -65,11 +67,12 @@ pub struct DataScrubReport {
     pub issues: Vec<DataScrubIssue>,
 }
 
-#[derive(Clone)]
 pub(crate) struct DataScrubber {
     pub(super) current_state: CurrentState,
     pub(super) storage_pool: StoragePool,
     pub(super) metadata_store: Arc<dyn MetadataStore>,
+    retained_content: Option<RetainedContent>,
+    required_manifests: HashSet<String>,
     #[cfg(test)]
     pub(super) run_test_hook: Option<DataScrubRunTestHook>,
 }
@@ -114,22 +117,7 @@ impl DataScrubRunTestHook {
     }
 }
 
-#[derive(Debug, Clone)]
-struct DataScrubReference {
-    key: Option<String>,
-    object_id: Option<String>,
-    version_id: Option<String>,
-}
-
-impl DataScrubReference {
-    fn subject(&self) -> Option<String> {
-        let key = self.key.as_ref()?;
-        if let Some(version_id) = &self.version_id {
-            return Some(format!("{key}@{version_id}"));
-        }
-        Some(key.clone())
-    }
-}
+use super::retained_content::{RetainedContent, RetainedReference as DataScrubReference};
 
 #[derive(Debug, Default)]
 pub(crate) struct DataScrubRunOutput {
@@ -251,9 +239,24 @@ impl DataScrubber {
             current_state,
             storage_pool,
             metadata_store,
+            retained_content: None,
+            required_manifests: HashSet::new(),
             #[cfg(test)]
             run_test_hook: None,
         }
+    }
+
+    pub(crate) fn with_required_manifests(mut self, required: HashSet<String>) -> Self {
+        self.required_manifests = required;
+        self
+    }
+
+    /// Reuse the retained catalog that computed placement obligations for this
+    /// scrub. It is a single-use runner, so ownership avoids reloading every
+    /// version and snapshot payload for the same run.
+    pub(crate) fn with_retained_content(mut self, retained: RetainedContent) -> Self {
+        self.retained_content = Some(retained);
+        self
     }
 
     #[cfg(test)]
@@ -263,23 +266,23 @@ impl DataScrubber {
     }
 
     #[cfg(test)]
-    pub(crate) async fn run(&self) -> Result<DataScrubReport> {
+    pub(crate) async fn run(self) -> Result<DataScrubReport> {
         Ok(self.run_internal(None).await?.report)
     }
 
-    pub(crate) async fn run_with_repair_subjects(&self) -> Result<DataScrubRunOutput> {
+    pub(crate) async fn run_with_repair_subjects(self) -> Result<DataScrubRunOutput> {
         self.run_internal(None).await
     }
 
     pub(crate) async fn run_for_subjects(
-        &self,
+        self,
         subject_filter: &BTreeSet<String>,
     ) -> Result<DataScrubReport> {
         Ok(self.run_internal(Some(subject_filter)).await?.report)
     }
 
     async fn run_internal(
-        &self,
+        mut self,
         subject_filter: Option<&BTreeSet<String>>,
     ) -> Result<DataScrubRunOutput> {
         #[cfg(test)]
@@ -292,102 +295,40 @@ impl DataScrubber {
             repair_subjects: BTreeSet::new(),
             degraded_subjects: BTreeSet::new(),
         };
-        if subject_filter.is_none() {
-            output.report.current_keys_scanned = self.current_state.objects.len();
-        }
-        let mut manifest_references = HashMap::<String, Vec<DataScrubReference>>::new();
-        let mut reverse_current_keys = HashMap::<String, String>::new();
-        for (key, object_id) in &self.current_state.object_ids {
-            reverse_current_keys.insert(object_id.clone(), key.clone());
-        }
-
-        let mut current_keys: Vec<_> = self.current_state.objects.keys().cloned().collect();
-        current_keys.sort();
-        for key in current_keys {
-            if let Some(subject_filter) = subject_filter
-                && !subject_filter.contains(&key)
-            {
-                continue;
+        let retained = match self.retained_content.take() {
+            Some(retained) => retained,
+            None => {
+                RetainedContent::load(self.metadata_store.as_ref(), &self.current_state).await?
             }
-            let Some(manifest_hash) = self.current_state.objects.get(&key) else {
-                continue;
-            };
-            if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-                continue;
-            }
-            if subject_filter.is_some() {
-                output.report.current_keys_scanned =
-                    output.report.current_keys_scanned.saturating_add(1);
-            }
-            manifest_references
-                .entry(manifest_hash.clone())
-                .or_default()
-                .push(DataScrubReference {
-                    key: Some(key.clone()),
-                    object_id: self.current_state.object_ids.get(&key).cloned(),
-                    version_id: None,
-                });
-        }
-
-        let version_index_object_ids = self.metadata_store.list_version_index_object_ids().await?;
-        if subject_filter.is_none() {
-            output.report.version_indexes_scanned = version_index_object_ids.len();
-        }
-
-        for object_id in version_index_object_ids {
-            let Some(index) = self
-                .metadata_store
-                .load_version_index_by_object_id(&object_id)
-                .await?
-            else {
-                continue;
-            };
-            let mut records: Vec<_> = index.versions.values().cloned().collect();
-            records.sort_by(|a, b| {
-                a.created_at_unix
-                    .cmp(&b.created_at_unix)
-                    .then_with(|| a.version_id.cmp(&b.version_id))
+        };
+        let mut manifest_references = retained.manifests;
+        manifest_references.remove(TOMBSTONE_MANIFEST_HASH);
+        if let Some(filter) = subject_filter {
+            manifest_references.retain(|_, references| {
+                references.retain(|subject, _| filter.contains(subject));
+                !references.is_empty()
             });
-            if subject_filter.is_none() {
-                output.report.version_records_scanned = output
-                    .report
-                    .version_records_scanned
-                    .saturating_add(records.len());
-            }
-            let mut scanned_index = false;
-            for record in records {
-                if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-                    continue;
-                }
-                let key = record
-                    .logical_path
-                    .clone()
-                    .or_else(|| reverse_current_keys.get(&index.object_id).cloned());
-                if let Some(subject_filter) = subject_filter {
-                    let Some(key) = key.as_deref() else {
-                        continue;
-                    };
-                    let subject = format!("{key}@{}", record.version_id);
-                    if !subject_filter.contains(&subject) {
-                        continue;
-                    }
-                    scanned_index = true;
-                    output.report.version_records_scanned =
-                        output.report.version_records_scanned.saturating_add(1);
-                }
-                manifest_references
-                    .entry(record.manifest_hash.clone())
-                    .or_default()
-                    .push(DataScrubReference {
-                        key,
-                        object_id: Some(index.object_id.clone()),
-                        version_id: Some(record.version_id.clone()),
-                    });
-            }
-            if subject_filter.is_some() && scanned_index {
-                output.report.version_indexes_scanned =
-                    output.report.version_indexes_scanned.saturating_add(1);
-            }
+            output.report.current_keys_scanned = manifest_references
+                .values()
+                .flat_map(BTreeMap::values)
+                .filter(|r| r.version_id.is_none() && !r.snapshot_only)
+                .count();
+            output.report.version_records_scanned = manifest_references
+                .values()
+                .flat_map(BTreeMap::values)
+                .filter(|r| r.version_id.is_some())
+                .count();
+            output.report.version_indexes_scanned = manifest_references
+                .values()
+                .flat_map(BTreeMap::values)
+                .filter(|r| r.version_id.is_some())
+                .filter_map(|r| r.object_id.as_ref())
+                .collect::<HashSet<_>>()
+                .len();
+        } else {
+            output.report.current_keys_scanned = retained.current_keys;
+            output.report.version_indexes_scanned = retained.version_indexes;
+            output.report.version_records_scanned = retained.version_records;
         }
 
         let mut manifest_hashes: Vec<_> = manifest_references.keys().cloned().collect();
@@ -402,12 +343,13 @@ impl DataScrubber {
         for manifest_hash in manifest_hashes {
             output.report.manifests_scanned = output.report.manifests_scanned.saturating_add(1);
             let contexts = manifest_references
-                .remove(&manifest_hash)
-                .unwrap_or_default();
+                .get(&manifest_hash)
+                .expect("manifest hash was collected from retained references");
             self.verify_manifest(
                 &manifest_hash,
-                &contexts,
-                locally_owned_manifests.contains(&manifest_hash),
+                contexts,
+                locally_owned_manifests.contains(&manifest_hash)
+                    || self.required_manifests.contains(&manifest_hash),
                 &mut verified_chunks,
                 &mut chunk_hash_buffer,
                 &mut output,
@@ -424,8 +366,8 @@ impl DataScrubber {
     async fn verify_manifest(
         &self,
         manifest_hash: &str,
-        contexts: &[DataScrubReference],
-        manifest_locally_owned: bool,
+        contexts: &BTreeMap<String, DataScrubReference>,
+        manifest_required_locally: bool,
         verified_chunks: &mut VerifiedChunkCache,
         chunk_hash_buffer: &mut [u8],
         output: &mut DataScrubRunOutput,
@@ -503,7 +445,7 @@ impl DataScrubber {
         };
 
         let expected_keys = contexts
-            .iter()
+            .values()
             .filter_map(|context| context.key.as_deref())
             .collect::<BTreeSet<_>>();
         if !expected_keys.is_empty() && !expected_keys.contains(manifest.key.as_str()) {
@@ -583,27 +525,20 @@ impl DataScrubber {
                         );
                     }
                 }
+                VerifiedChunkState::Missing if !manifest_required_locally => {
+                    output.report.chunks_not_required_locally += 1;
+                }
                 VerifiedChunkState::Missing => {
-                    let issue_kind = if manifest_locally_owned {
-                        DataScrubIssueKind::ChunkMissing
-                    } else {
-                        DataScrubIssueKind::ReplicaIncomplete
-                    };
-                    let detail = if manifest_locally_owned {
-                        format!("chunk {} is missing from local storage", chunk.hash)
-                    } else {
-                        format!(
-                            "replica is incomplete locally: chunk {} is referenced by metadata manifest {manifest_hash} but is not present in local storage",
-                            chunk.hash
-                        )
-                    };
                     self.push_issue(
                         output,
                         contexts,
-                        issue_kind,
+                        DataScrubIssueKind::ChunkMissing,
                         Some(manifest_hash.to_string()),
                         Some(chunk.hash.clone()),
-                        detail,
+                        format!(
+                            "required chunk {} is missing from local storage",
+                            chunk.hash
+                        ),
                     );
                 }
                 VerifiedChunkState::ReadError(read_error) => {
@@ -693,7 +628,7 @@ impl DataScrubber {
     fn push_issue(
         &self,
         output: &mut DataScrubRunOutput,
-        contexts: &[DataScrubReference],
+        contexts: &BTreeMap<String, DataScrubReference>,
         kind: DataScrubIssueKind,
         manifest_hash: Option<String>,
         chunk_hash: Option<String>,
@@ -714,7 +649,7 @@ impl DataScrubber {
             return;
         }
 
-        let context = contexts.first();
+        let context = contexts.values().next();
         report.issues.push(DataScrubIssue {
             kind,
             key: context.and_then(|context| context.key.clone()),
@@ -731,15 +666,21 @@ fn data_scrub_issue_requires_auto_repair(kind: &DataScrubIssueKind) -> bool {
     !matches!(kind, DataScrubIssueKind::ManifestKeyMismatch)
 }
 
-fn data_scrub_repair_subjects_for_contexts(contexts: &[DataScrubReference]) -> BTreeSet<String> {
+fn data_scrub_repair_subjects_for_contexts(
+    contexts: &BTreeMap<String, DataScrubReference>,
+) -> BTreeSet<String> {
     let mut subjects = BTreeSet::new();
     let versioned_base_keys = contexts
-        .iter()
+        .values()
         .filter(|context| context.version_id.is_some())
         .filter_map(|context| context.key.clone())
         .collect::<HashSet<_>>();
 
-    for context in contexts {
+    for context in contexts.values() {
+        if context.snapshot_only || context.key.is_none() {
+            subjects.extend(context.subject());
+            continue;
+        }
         match (&context.key, &context.version_id) {
             (Some(key), Some(version_id)) => {
                 subjects.insert(format!("{key}@{version_id}"));
@@ -754,9 +695,11 @@ fn data_scrub_repair_subjects_for_contexts(contexts: &[DataScrubReference]) -> B
     subjects
 }
 
-fn data_scrub_all_subjects_for_contexts(contexts: &[DataScrubReference]) -> BTreeSet<String> {
+fn data_scrub_all_subjects_for_contexts(
+    contexts: &BTreeMap<String, DataScrubReference>,
+) -> BTreeSet<String> {
     contexts
-        .iter()
+        .values()
         .filter_map(DataScrubReference::subject)
         .collect()
 }

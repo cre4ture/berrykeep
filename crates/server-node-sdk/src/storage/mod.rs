@@ -12,6 +12,7 @@ const STORE_INDEX_VERSION_LOOKUP_CONCURRENCY: usize = 32;
 const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID + 1;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION;
+pub(super) const CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT: &str = "__legacy__";
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";
@@ -97,6 +98,7 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+pub(crate) mod content_recovery;
 pub(super) mod data_scrub;
 mod gallery_capture_time;
 mod gallery_labels;
@@ -104,11 +106,13 @@ mod gallery_summary_cache;
 pub(super) mod manifest_reader;
 pub(super) mod media_cache;
 pub(super) mod media_tools;
+pub(crate) mod retained_content;
 mod sqlite_impl;
 mod systemd_mount_protection;
 #[cfg(feature = "turso-metadata")]
 mod turso_impl;
 
+use self::content_recovery::ContentRepairTask;
 use self::gallery_summary_cache::GallerySummaryCache;
 pub(crate) use self::gallery_summary_cache::{
     GalleryCaptureSummaryBusyError, GallerySummaryCacheValue, GallerySummaryMiss,
@@ -165,6 +169,10 @@ use media_tools::MediaToolPaths;
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
+// GC deliberately has no global lock while walking a large chunk store. Keep
+// atomic-write scratch files for this minimum period so the sweep cannot race a
+// slow live write, while still reclaiming leftovers from interrupted installs.
+const CHUNK_ATOMIC_TEMP_MIN_RETENTION_SECS: u64 = 10 * 60;
 const SLOW_MEDIA_CACHE_LOOKUP_LOG_THRESHOLD_MS: u128 = 250;
 const READ_THROUGH_CACHE_CLASS: &str = "read_through";
 const LEGACY_RENAME_RECONCILE_UPDATE_SAMPLE_LIMIT: usize = 64;
@@ -2572,6 +2580,10 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
         tracked_columns: &["subject"],
     },
     MetadataDbLogicalTableSpec {
+        table: "content_repair_tasks",
+        tracked_columns: &["manifest_hash", "task_json"],
+    },
+    MetadataDbLogicalTableSpec {
         table: "repair_run_history",
         tracked_columns: &["run_id", "record_json"],
     },
@@ -2593,6 +2605,10 @@ const METADATA_DB_LOGICAL_TABLE_SPECS: &[MetadataDbLogicalTableSpec] = &[
     },
     MetadataDbLogicalTableSpec {
         table: "cluster_replicas",
+        tracked_columns: &["subject", "node_id"],
+    },
+    MetadataDbLogicalTableSpec {
+        table: "cluster_available",
         tracked_columns: &["subject", "node_id"],
     },
     MetadataDbLogicalTableSpec {
@@ -2710,6 +2726,7 @@ pub(super) fn metadata_db_logical_summary_query(spec: MetadataDbLogicalTableSpec
 }
 
 pub struct PersistentStore {
+    content_gc_gate: Arc<tokio::sync::RwLock<()>>,
     root_dir: PathBuf,
     storage_pool: StoragePool,
     metadata_backend_kind: MetadataBackendKind,
@@ -2726,10 +2743,63 @@ pub struct PersistentStore {
     media_tools: MediaToolPaths,
     #[cfg(test)]
     data_scrub_run_test_hook: Option<DataScrubRunTestHook>,
+    #[cfg(test)]
+    cleanup_unreferenced_test_hook: Option<CleanupUnreferencedTestHook>,
+}
+
+/// Content reachability captured atomically before a GC sweep. New repair
+/// pins registered after this snapshot are handled by a later sweep; they are
+/// never mistaken for part of the snapshot that this sweep protects.
+struct CleanupProtectionSnapshot {
+    recovery_tasks: Vec<ContentRepairTask>,
+    referenced_manifests: HashSet<String>,
+    owned_referenced_manifests: HashSet<String>,
+    cached_chunk_records: Vec<CachedChunkRecord>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct CleanupUnreferencedTestHook {
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+impl CleanupUnreferencedTestHook {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    async fn block_after_snapshot(&self) {
+        self.started.add_permits(1);
+        let permit = self
+            .release
+            .acquire()
+            .await
+            .expect("cleanup test hook should remain open");
+        permit.forget();
+    }
+
+    pub(crate) async fn wait_until_started(&self) {
+        let permit = self
+            .started
+            .acquire()
+            .await
+            .expect("cleanup test hook should remain open");
+        permit.forget();
+    }
+
+    pub(crate) fn release_sweep(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct ChunkIngestor {
+    content_gc_gate: Arc<tokio::sync::RwLock<()>>,
     storage_pool: StoragePool,
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
@@ -2805,6 +2875,21 @@ struct ArchivedTombstoneIndexRecord {
 
 #[async_trait]
 trait MetadataStore: Send + Sync {
+    async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>>;
+    async fn load_content_repair_tasks_for_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<Vec<ContentRepairTask>>;
+    async fn content_repair_task_hashes(&self) -> Result<Vec<String>>;
+    async fn due_content_repair_task_hashes(
+        &self,
+        now_unix: u64,
+        source_fingerprint: &str,
+        limit: usize,
+    ) -> Result<Vec<String>>;
+    async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()>;
+    async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()>;
+    async fn content_repair_pending(&self, manifest_hash: &str) -> Result<bool>;
     /// Whether legacy current rows, snapshots, and version payloads still need
     /// their one-time stable object identity backfill.
     async fn object_id_backfill_needed(&self) -> Result<bool>;
@@ -2932,8 +3017,12 @@ trait MetadataStore: Send + Sync {
     async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>>;
     async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()>;
     async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>>;
-    async fn persist_cluster_replicas(&self, replicas: &HashMap<String, Vec<NodeId>>)
-    -> Result<()>;
+    async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>>;
+    async fn persist_cluster_replica_views(
+        &self,
+        replicas: &HashMap<String, Vec<NodeId>>,
+        available: &HashMap<String, Vec<NodeId>>,
+    ) -> Result<()>;
     async fn load_client_credential_state(&self) -> Result<ClientCredentialState>;
     async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()>;
     async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState>;
@@ -3040,6 +3129,7 @@ trait MetadataStore: Send + Sync {
     async fn clear_history_head_projections_for_test(&self) -> Result<()>;
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>>;
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()>;
+    #[cfg(test)]
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>>;
     async fn load_snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>>;
     async fn list_uncompressed_snapshot_ids(&self) -> Result<Vec<String>>;
@@ -3110,8 +3200,10 @@ impl ChunkIngestor {
         storage_pool: StoragePool,
         metadata_store: Arc<dyn MetadataStore>,
         storage_stats_lock: Arc<AsyncMutex<()>>,
+        content_gc_gate: Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
         Self {
+            content_gc_gate,
             storage_pool,
             metadata_store,
             storage_stats_lock,
@@ -3123,6 +3215,16 @@ impl ChunkIngestor {
         if actual_hash != hash {
             bail!("chunk hash mismatch: expected={hash} actual={actual_hash}");
         }
+
+        self.ingest_verified_chunk(hash, payload).await
+    }
+
+    /// Stores bytes whose BLAKE3 digest was already checked by the caller.
+    /// Keep this private to recovery/transport internals so untrusted input
+    /// always continues through `ingest_chunk`.
+    pub(crate) async fn ingest_verified_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
+        // GC must not inspect or remove the temporary file of an active install.
+        let _guard = self.content_gc_gate.read().await;
 
         let outcome = persist_storage_content(
             &self.storage_pool,
@@ -4106,11 +4208,14 @@ impl ClusterReplicasPersister {
         Self { metadata_store }
     }
 
-    pub(crate) async fn persist_cluster_replicas(
+    pub(crate) async fn persist_cluster_replica_views(
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
+        available: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
-        self.metadata_store.persist_cluster_replicas(replicas).await
+        self.metadata_store
+            .persist_cluster_replica_views(replicas, available)
+            .await
     }
 }
 
@@ -4138,202 +4243,100 @@ impl ReplicationSubjectInspector {
     }
 
     pub(crate) async fn list_replication_subjects(&self) -> Result<Vec<String>> {
-        let mut subjects: HashSet<String> = HashSet::new();
-        let mut indexed_object_ids = HashSet::new();
-
+        // Availability is a bounded, current-state hint. Durable manifest-hash
+        // recovery covers retained history by querying online peers directly;
+        // advertising every historical reference would make this peer payload
+        // and its persisted cluster view grow with history depth.
+        let mut candidates = BTreeMap::new();
         for (key, manifest_hash) in &self.current_state.objects {
-            if self.manifest_is_fully_local(manifest_hash).await? {
-                subjects.insert(key.clone());
-            }
+            candidates.insert(key.clone(), manifest_hash.clone());
         }
 
+        let mut indexed_object_ids = HashSet::new();
         for (path, object_id) in &self.current_state.object_ids {
-            if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
+            if let Some(index) = self
+                .metadata_store
+                .load_version_index_by_object_id(object_id)
+                .await?
+            {
                 indexed_object_ids.insert(object_id.clone());
                 for head_version_id in &index.head_version_ids {
                     let Some(record) = index.versions.get(head_version_id) else {
                         continue;
                     };
-                    if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
-                        || self.manifest_is_fully_local(&record.manifest_hash).await?
-                    {
-                        subjects.insert(format!("{path}@{head_version_id}"));
-                    }
+                    candidates.insert(
+                        format!("{path}@{head_version_id}"),
+                        record.manifest_hash.clone(),
+                    );
                 }
             }
         }
 
-        for index in self.load_all_version_indexes().await? {
+        let history =
+            StoreHistoryInspector::new(self.storage_pool.clone(), self.metadata_store.clone());
+        for index in self.metadata_store.load_all_version_indexes().await? {
             if indexed_object_ids.contains(&index.object_id) {
                 continue;
             }
-
             for head_version_id in &index.head_version_ids {
                 let Some(record) = index.versions.get(head_version_id) else {
                     continue;
                 };
-                let Some(key) = self.resolve_key_for_version_record(&index, record).await? else {
+                let Some(key) = history
+                    .resolve_key_for_version_record(&index, record)
+                    .await?
+                else {
                     continue;
                 };
-                if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
-                    || self.manifest_is_fully_local(&record.manifest_hash).await?
-                {
-                    subjects.insert(format!("{key}@{head_version_id}"));
-                }
+                candidates.insert(
+                    format!("{key}@{head_version_id}"),
+                    record.manifest_hash.clone(),
+                );
             }
         }
 
-        let mut output: Vec<String> = subjects.into_iter().collect();
-        output.sort();
-        Ok(output)
+        let hashes = candidates
+            .values()
+            .filter(|hash| hash.as_str() != TOMBSTONE_MANIFEST_HASH)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut subjects = BTreeSet::new();
+        let owned = self
+            .metadata_store
+            .filter_locally_owned_manifests(&hashes)
+            .await?;
+        let pending = self
+            .metadata_store
+            .content_repair_task_hashes()
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut availability_by_hash = HashMap::new();
+        for hash in hashes {
+            if pending.contains(&hash) {
+                availability_by_hash.insert(hash, false);
+                continue;
+            }
+            let available = owned.contains(&hash)
+                && content_recovery::manifest_is_fully_local(&self.storage_pool, &hash).await?;
+            availability_by_hash.insert(hash, available);
+        }
+        for (subject, hash) in candidates {
+            if hash == TOMBSTONE_MANIFEST_HASH
+                || availability_by_hash.get(&hash).copied().unwrap_or(false)
+            {
+                subjects.insert(subject);
+            }
+        }
+        Ok(subjects.into_iter().collect())
     }
 
     pub(crate) fn current_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = self.current_state.objects.keys().cloned().collect();
         keys.sort();
         keys
-    }
-
-    async fn manifest_is_fully_local(&self, manifest_hash: &str) -> Result<bool> {
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(true);
-        }
-
-        let manifest = match self.load_manifest_by_hash(manifest_hash).await {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => return Ok(false),
-            Err(err) => {
-                // A single corrupt/unreadable manifest must not abort availability
-                // checks for every other object on this node: treat it as not
-                // locally available (so it gets queued for repair) and keep going
-                // rather than propagating the error out of the whole scan.
-                warn!(
-                    manifest_hash = %manifest_hash,
-                    error = %err,
-                    "manifest unreadable or invalid; treating as not locally available"
-                );
-                return Ok(false);
-            }
-        };
-
-        for chunk in &manifest.chunks {
-            let chunk_path = self
-                .storage_pool
-                .content_path(StorageContentKind::Chunk, &chunk.hash)?;
-            let metadata = match fs::metadata(&chunk_path).await {
-                Ok(metadata) => metadata,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(err) => return Err(err.into()),
-            };
-            if metadata.len() != chunk.size_bytes as u64 {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
-    async fn load_manifest_by_hash(&self, manifest_hash: &str) -> Result<Option<ObjectManifest>> {
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(None);
-        }
-
-        let manifest_path = self
-            .storage_pool
-            .content_path(StorageContentKind::Manifest, manifest_hash)?;
-        if !fs::try_exists(&manifest_path).await? {
-            return Ok(None);
-        }
-
-        let payload = fs::read(&manifest_path).await?;
-        let manifest = serde_json::from_slice::<ObjectManifest>(&payload)
-            .with_context(|| format!("invalid manifest {}", manifest_path.display()))?;
-        Ok(Some(manifest))
-    }
-
-    async fn load_version_index_by_object_id(
-        &self,
-        object_id: &str,
-    ) -> Result<Option<FileVersionIndex>> {
-        self.metadata_store
-            .load_version_index_by_object_id(object_id)
-            .await
-    }
-
-    async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
-        self.metadata_store.load_all_version_indexes().await
-    }
-
-    async fn resolve_key_for_version_index(
-        &self,
-        index: &FileVersionIndex,
-    ) -> Result<Option<String>> {
-        if let Some(preferred_head) = index
-            .preferred_head_version_id
-            .as_ref()
-            .and_then(|version_id| index.versions.get(version_id))
-            .and_then(|record| record.logical_path.clone())
-        {
-            return Ok(Some(preferred_head));
-        }
-
-        if let Some(any_logical_path) = index
-            .versions
-            .values()
-            .find_map(|record| record.logical_path.clone())
-        {
-            return Ok(Some(any_logical_path));
-        }
-
-        for record in index.versions.values() {
-            if record.manifest_hash == TOMBSTONE_MANIFEST_HASH {
-                continue;
-            }
-
-            match self.load_manifest_by_hash(&record.manifest_hash).await {
-                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
-                Ok(None) => continue,
-                Err(err) => {
-                    warn!(
-                        manifest_hash = %record.manifest_hash,
-                        object_id = %index.object_id,
-                        version_id = %record.version_id,
-                        error = %err,
-                        "manifest unreadable or invalid while resolving replication subject key; skipping record"
-                    );
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn resolve_key_for_version_record(
-        &self,
-        index: &FileVersionIndex,
-        record: &FileVersionRecord,
-    ) -> Result<Option<String>> {
-        if let Some(logical_path) = record.logical_path.clone() {
-            return Ok(Some(logical_path));
-        }
-
-        if record.manifest_hash != TOMBSTONE_MANIFEST_HASH {
-            match self.load_manifest_by_hash(&record.manifest_hash).await {
-                Ok(Some(manifest)) => return Ok(Some(manifest.key)),
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(
-                        manifest_hash = %record.manifest_hash,
-                        object_id = %index.object_id,
-                        version_id = %record.version_id,
-                        error = %err,
-                        "manifest unreadable or invalid while resolving replication subject key; falling back to index lookup"
-                    );
-                }
-            }
-        }
-
-        self.resolve_key_for_version_index(index).await
     }
 }
 
@@ -4396,6 +4399,7 @@ impl PersistentStore {
             std::sync::Mutex::new(RangeChunkCache::new(current_objects_cache_capacity()));
         let snapshot_batch = metadata_store.load_snapshot_batch_state().await?;
         let storage_stats_lock = Arc::new(AsyncMutex::new(()));
+        let content_gc_gate = Arc::new(tokio::sync::RwLock::new(()));
         let media_cache_build_config = MediaCacheBuildConfig::default();
         let media_cache_build_permits = Arc::new(Semaphore::new(
             media_cache_build_config.total_permits as usize,
@@ -4404,9 +4408,11 @@ impl PersistentStore {
             storage_pool.clone(),
             metadata_store.clone(),
             storage_stats_lock.clone(),
+            content_gc_gate.clone(),
         );
 
         let store = Self {
+            content_gc_gate,
             root_dir,
             storage_pool,
             metadata_backend_kind: backend,
@@ -4423,6 +4429,8 @@ impl PersistentStore {
             media_tools: MediaToolPaths::default(),
             #[cfg(test)]
             data_scrub_run_test_hook: None,
+            #[cfg(test)]
+            cleanup_unreferenced_test_hook: None,
         };
         let object_id_migration_started = Instant::now();
         let object_id_migration_needed =
@@ -5053,6 +5061,14 @@ impl PersistentStore {
     }
 
     #[cfg(test)]
+    pub fn set_cleanup_unreferenced_test_hook(
+        &mut self,
+        hook: Option<CleanupUnreferencedTestHook>,
+    ) {
+        self.cleanup_unreferenced_test_hook = hook;
+    }
+
+    #[cfg(test)]
     pub fn set_current_objects_cache_capacity_for_test(&mut self, capacity: usize) {
         self.current_objects_cache = std::sync::Mutex::new(RangeChunkCache::new(capacity));
     }
@@ -5383,6 +5399,10 @@ impl PersistentStore {
         self.metadata_store.load_cluster_replicas().await
     }
 
+    pub async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>> {
+        self.metadata_store.load_cluster_availability().await
+    }
+
     pub async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>> {
         self.metadata_store.load_cluster_nodes().await
     }
@@ -5397,7 +5417,20 @@ impl PersistentStore {
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
-        self.metadata_store.persist_cluster_replicas(replicas).await
+        self.metadata_store
+            .persist_cluster_replica_views(replicas, &HashMap::new())
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn persist_cluster_replica_views(
+        &self,
+        replicas: &HashMap<String, Vec<NodeId>>,
+        available: &HashMap<String, Vec<NodeId>>,
+    ) -> Result<()> {
+        self.metadata_store
+            .persist_cluster_replica_views(replicas, available)
+            .await
     }
 
     pub async fn load_client_credential_state(&self) -> Result<ClientCredentialState> {
@@ -5888,55 +5921,10 @@ impl PersistentStore {
 
     #[cfg(test)]
     pub async fn list_replication_subjects(&self) -> Result<Vec<String>> {
-        let snapshot = self.metadata_store.load_current_state().await?;
-        let mut subjects: HashSet<String> = HashSet::new();
-        let mut indexed_object_ids = HashSet::new();
-
-        for (key, manifest_hash) in &snapshot.objects {
-            if self.manifest_is_fully_local(manifest_hash).await? {
-                subjects.insert(key.clone());
-            }
-        }
-
-        for (path, object_id) in &snapshot.object_ids {
-            if let Some(index) = self.load_version_index_by_object_id(object_id).await? {
-                indexed_object_ids.insert(object_id.clone());
-                for head_version_id in &index.head_version_ids {
-                    let Some(record) = index.versions.get(head_version_id) else {
-                        continue;
-                    };
-                    if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
-                        || self.manifest_is_fully_local(&record.manifest_hash).await?
-                    {
-                        subjects.insert(format!("{path}@{head_version_id}"));
-                    }
-                }
-            }
-        }
-
-        for index in self.load_all_version_indexes().await? {
-            if indexed_object_ids.contains(&index.object_id) {
-                continue;
-            }
-
-            for head_version_id in &index.head_version_ids {
-                let Some(record) = index.versions.get(head_version_id) else {
-                    continue;
-                };
-                let Some(key) = self.resolve_key_for_version_record(&index, record).await? else {
-                    continue;
-                };
-                if record.manifest_hash == TOMBSTONE_MANIFEST_HASH
-                    || self.manifest_is_fully_local(&record.manifest_hash).await?
-                {
-                    subjects.insert(format!("{key}@{head_version_id}"));
-                }
-            }
-        }
-
-        let mut output: Vec<String> = subjects.into_iter().collect();
-        output.sort();
-        Ok(output)
+        self.replication_subject_inspector()
+            .await?
+            .list_replication_subjects()
+            .await
     }
 
     pub async fn put_object_versioned(
@@ -7352,20 +7340,14 @@ impl PersistentStore {
         Ok(())
     }
 
-    async fn collect_owned_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
-        let referenced = self.collect_referenced_manifest_hashes().await?;
-        if referenced.is_empty() {
-            return Ok(HashSet::new());
-        }
-
-        let referenced_vec = referenced.into_iter().collect::<Vec<_>>();
-        self.metadata_store
-            .filter_locally_owned_manifests(&referenced_vec)
-            .await
-    }
-
     pub async fn ingest_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
         self.chunk_ingestor.ingest_chunk(hash, payload).await
+    }
+
+    pub(crate) async fn ingest_verified_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
+        self.chunk_ingestor
+            .ingest_verified_chunk(hash, payload)
+            .await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -8059,44 +8041,6 @@ impl PersistentStore {
             .await?,
             LocalChunkIntegrity::Valid
         ))
-    }
-
-    #[cfg(test)]
-    async fn manifest_is_fully_local(&self, manifest_hash: &str) -> Result<bool> {
-        if manifest_hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(true);
-        }
-
-        let manifest = match self.load_manifest_by_hash(manifest_hash).await {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => return Ok(false),
-            Err(err) => {
-                warn!(
-                    manifest_hash = %manifest_hash,
-                    error = %err,
-                    "manifest unreadable or invalid; treating as not locally available"
-                );
-                return Ok(false);
-            }
-        };
-
-        for chunk in &manifest.chunks {
-            if !matches!(
-                validate_chunk_path_integrity(
-                    &self
-                        .storage_pool
-                        .content_path(StorageContentKind::Chunk, &chunk.hash)?,
-                    &chunk.hash,
-                    chunk.size_bytes,
-                )
-                .await?,
-                LocalChunkIntegrity::Valid
-            ) {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
     }
 
     async fn clone_manifest_for_key(&self, manifest_hash: &str, key: &str) -> Result<String> {
@@ -9387,18 +9331,40 @@ impl PersistentStore {
         retention_secs: u64,
         dry_run: bool,
     ) -> Result<CleanupReport> {
+        // The exclusive gate only protects the reachability snapshot. Keeping
+        // it through directory walks and file deletion would block durable
+        // task registration and verified chunk installation for the duration
+        // of a store-sized sweep.
+        let protection = {
+            let _gc_guard = self.content_gc_gate.write().await;
+            self.cleanup_protection_snapshot().await?
+        };
+        let CleanupProtectionSnapshot {
+            recovery_tasks,
+            referenced_manifests,
+            owned_referenced_manifests,
+            cached_chunk_records,
+        } = protection;
+        #[cfg(test)]
+        if let Some(hook) = &self.cleanup_unreferenced_test_hook {
+            hook.block_after_snapshot().await;
+        }
         let now = unix_ts();
-        let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
-        let owned_referenced_manifests = self.collect_owned_referenced_manifest_hashes().await?;
         let manifest_paths = self.list_manifest_paths().await?;
-        let cached_chunk_records = self.metadata_store.list_cached_chunk_records().await?;
         let tracked_cached_chunks = cached_chunk_records.len();
         let cached_chunk_hashes = cached_chunk_records
             .iter()
             .map(|record| record.hash.clone())
             .collect::<HashSet<_>>();
 
-        let mut retained_manifests = referenced_manifests.clone();
+        let recovery_manifests: HashSet<_> = recovery_tasks
+            .iter()
+            .map(|task| task.reference.manifest_hash.clone())
+            .collect();
+        let mut retained_manifests = referenced_manifests
+            .union(&recovery_manifests)
+            .cloned()
+            .collect::<HashSet<_>>();
         let mut skipped_recent_manifests = 0usize;
         let mut deleted_manifests = 0usize;
 
@@ -9407,7 +9373,9 @@ impl PersistentStore {
             else {
                 continue;
             };
-            if referenced_manifests.contains(manifest_hash) {
+            if referenced_manifests.contains(manifest_hash)
+                || recovery_manifests.contains(manifest_hash)
+            {
                 continue;
             }
 
@@ -9453,7 +9421,14 @@ impl PersistentStore {
         // content inspected, and even that is read one bounded batch at a time so peak
         // resident manifest data stays flat as the store grows instead of scaling with
         // total manifest count (see docs/node-memory-footprint-reduction-plan.md Slice 3).
-        let mut protected_chunks = HashSet::<String>::new();
+        // A repair task pins its current work set so a sweep cannot remove
+        // bytes while verification is in progress. Cache records remain cache
+        // records until an owned referenced manifest protects the same chunk.
+        let mut protected_chunks: HashSet<String> = recovery_tasks
+            .iter()
+            .flat_map(|task| task.chunks.iter().map(|chunk| chunk.hash.clone()))
+            .collect();
+        let mut owned_referenced_chunks = HashSet::<String>::new();
         let mut protected_media_fingerprints = HashSet::<String>::new();
         let mut peak_manifest_batch_size = 0usize;
         let retained_manifest_hashes: Vec<&String> = retained_manifests.iter().collect();
@@ -9466,11 +9441,12 @@ impl PersistentStore {
                 protected_media_fingerprints.insert(content_fingerprint_from_manifest(&manifest));
                 if owned_referenced_manifests.contains(*manifest_hash) {
                     for chunk in &manifest.chunks {
-                        protected_chunks.insert(chunk.hash.clone());
+                        owned_referenced_chunks.insert(chunk.hash.clone());
                     }
                 }
             }
         }
+        protected_chunks.extend(owned_referenced_chunks.iter().cloned());
 
         let mut skipped_recent_chunks = 0usize;
         let mut deleted_chunks = 0usize;
@@ -9478,24 +9454,34 @@ impl PersistentStore {
         let mut deleted_cached_chunk_records = 0usize;
 
         let chunk_files = self.collect_chunk_file_paths().await?;
-        for chunk_path in chunk_files {
-            let chunk_hash = match chunk_path.file_name().and_then(|n| n.to_str()) {
-                Some(hash) => hash.to_string(),
-                None => continue,
-            };
-
-            if protected_chunks.contains(&chunk_hash) {
+        for (chunk_path, chunk_hash) in chunk_files {
+            if chunk_hash
+                .as_ref()
+                .is_some_and(|hash| protected_chunks.contains(hash))
+            {
                 continue;
             }
 
-            let metadata = fs::metadata(&chunk_path).await?;
+            // A live atomic install can finish its rename after this sweep
+            // enumerates the temporary file. In that case there is no longer
+            // anything here to reap.
+            let metadata = match fs::metadata(&chunk_path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
             let age_secs = modified
                 .duration_since(UNIX_EPOCH)
                 .map(|d| now.saturating_sub(d.as_secs()))
                 .unwrap_or(0);
 
-            if age_secs < retention_secs {
+            let required_retention_secs = if chunk_hash.is_some() {
+                retention_secs
+            } else {
+                retention_secs.max(CHUNK_ATOMIC_TEMP_MIN_RETENTION_SECS)
+            };
+            if age_secs < required_retention_secs {
                 skipped_recent_chunks += 1;
                 continue;
             }
@@ -9505,32 +9491,38 @@ impl PersistentStore {
             }
 
             let chunk_size_bytes = metadata.len();
-            fs::remove_file(&chunk_path).await?;
-            let removed_indexed_location = self.storage_pool.forget_location_at_path(
-                StorageContentKind::Chunk,
-                &chunk_hash,
-                &chunk_path,
-            );
-            if removed_indexed_location {
-                self.metadata_store
-                    .delete_storage_location(StorageContentKind::Chunk, &chunk_hash)
-                    .await?;
+            match fs::remove_file(&chunk_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             }
-            self.note_chunk_store_delta(-(chunk_size_bytes as i64))
-                .await?;
-            if removed_indexed_location && cached_chunk_hashes.contains(&chunk_hash) {
-                self.metadata_store
-                    .delete_cached_chunk_record(&chunk_hash)
+            if let Some(chunk_hash) = chunk_hash {
+                let removed_indexed_location = self.storage_pool.forget_location_at_path(
+                    StorageContentKind::Chunk,
+                    &chunk_hash,
+                    &chunk_path,
+                );
+                if removed_indexed_location {
+                    self.metadata_store
+                        .delete_storage_location(StorageContentKind::Chunk, &chunk_hash)
+                        .await?;
+                }
+                self.note_chunk_store_delta(-(chunk_size_bytes as i64))
                     .await?;
-                deleted_cached_chunks += 1;
-                deleted_cached_chunk_records += 1;
+                if removed_indexed_location && cached_chunk_hashes.contains(&chunk_hash) {
+                    self.metadata_store
+                        .delete_cached_chunk_record(&chunk_hash)
+                        .await?;
+                    deleted_cached_chunks += 1;
+                    deleted_cached_chunk_records += 1;
+                }
             }
             deleted_chunks += 1;
         }
 
         if !dry_run {
             for record in cached_chunk_records {
-                if protected_chunks.contains(&record.hash) {
+                if owned_referenced_chunks.contains(&record.hash) {
                     self.metadata_store
                         .delete_cached_chunk_record(&record.hash)
                         .await?;
@@ -9583,6 +9575,25 @@ impl PersistentStore {
             deleted_cached_chunk_records,
             retained_manifests_processed: retained_manifest_hashes.len(),
             peak_manifest_batch_size,
+        })
+    }
+
+    async fn cleanup_protection_snapshot(&self) -> Result<CleanupProtectionSnapshot> {
+        let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
+        let owned_referenced_manifests = if referenced_manifests.is_empty() {
+            HashSet::new()
+        } else {
+            self.metadata_store
+                .filter_locally_owned_manifests(
+                    &referenced_manifests.iter().cloned().collect::<Vec<_>>(),
+                )
+                .await?
+        };
+        Ok(CleanupProtectionSnapshot {
+            recovery_tasks: self.metadata_store.load_content_repair_tasks().await?,
+            referenced_manifests,
+            owned_referenced_manifests,
+            cached_chunk_records: self.metadata_store.list_cached_chunk_records().await?,
         })
     }
 
@@ -11353,31 +11364,12 @@ impl PersistentStore {
     }
 
     async fn collect_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
-        let mut referenced = HashSet::<String>::new();
-
-        for manifest_hash in self
-            .metadata_store
-            .load_current_state()
+        Ok(self
+            .retained_content()
             .await?
-            .objects
-            .values()
-        {
-            referenced.insert(manifest_hash.clone());
-        }
-
-        for snapshot in self.load_all_snapshots().await? {
-            for manifest_hash in snapshot.objects.values() {
-                referenced.insert(manifest_hash.clone());
-            }
-        }
-
-        for index in self.load_all_version_indexes().await? {
-            for version in index.versions.values() {
-                referenced.insert(version.manifest_hash.clone());
-            }
-        }
-
-        Ok(referenced)
+            .manifests
+            .into_keys()
+            .collect())
     }
 
     /// Lists manifest files present in the manifest store without parsing their
@@ -11411,8 +11403,8 @@ impl PersistentStore {
         Ok(paths)
     }
 
-    async fn collect_chunk_file_paths(&self) -> Result<Vec<PathBuf>> {
-        let mut files = Vec::<PathBuf>::new();
+    async fn collect_chunk_file_paths(&self) -> Result<Vec<(PathBuf, Option<String>)>> {
+        let mut files = Vec::<(PathBuf, Option<String>)>::new();
         let mut dirs = self
             .storage_pool
             .path_stats_roots()
@@ -11432,7 +11424,18 @@ impl PersistentStore {
                 if ftype.is_dir() {
                     dirs.push(path);
                 } else if ftype.is_file() {
-                    files.push(path);
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    let hash = manifest_hash_looks_safe_filename(name).then(|| name.to_string());
+                    if hash.is_none() && !is_atomic_chunk_temp_file_name(name) {
+                        continue;
+                    }
+                    // Temp files are unindexed and absent from store-byte
+                    // accounting. Keep only the atomic-write form so a
+                    // crashed install is reaped without treating arbitrary
+                    // files in the chunk tree as content.
+                    files.push((path, hash));
                 }
             }
         }
@@ -11454,10 +11457,6 @@ impl PersistentStore {
 
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
         self.metadata_store.load_all_version_indexes().await
-    }
-
-    async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
-        self.metadata_store.load_all_snapshots().await
     }
 
     async fn delete_snapshots_by_id(&self, snapshot_ids: &[String]) -> Result<()> {
@@ -11519,6 +11518,13 @@ impl PersistentStore {
         }
         Ok(path)
     }
+}
+
+fn is_atomic_chunk_temp_file_name(name: &str) -> bool {
+    let Some((hash, suffix)) = name.split_once(".tmp-") else {
+        return false;
+    };
+    manifest_hash_looks_safe_filename(hash) && !suffix.is_empty()
 }
 
 impl MetadataDbDistributionLoader {

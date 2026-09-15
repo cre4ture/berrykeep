@@ -211,6 +211,15 @@ pub(crate) struct ReplicationPlanSnapshot {
     current_replicas_by_key: HashMap<String, HashSet<NodeId>>,
 }
 
+/// Immutable topology captured while holding the cluster lock. Callers that
+/// need many placement decisions can release the lock before rendezvous
+/// scoring, sorting, and label-constraint evaluation.
+#[derive(Debug, Clone)]
+pub(crate) struct PlacementSnapshot {
+    policy: ReplicationPolicy,
+    nodes: HashMap<NodeId, NodeDescriptor>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterSummary {
     pub local_node_id: NodeId,
@@ -582,12 +591,28 @@ impl ClusterService {
         changed
     }
 
-    pub fn import_replicas_by_key(&mut self, replicas: HashMap<String, Vec<NodeId>>) {
+    /// Restores durable source hints separately from the last advertised
+    /// availability view. Historical source hints must survive restart without
+    /// becoming current durability claims again.
+    pub fn import_replica_views(
+        &mut self,
+        replicas: HashMap<String, Vec<NodeId>>,
+        available: HashMap<String, Vec<NodeId>>,
+    ) {
         self.replicas_by_key.clear();
         self.available_by_key.clear();
         self.replica_subjects_by_node.clear();
         self.available_subjects_by_node.clear();
 
+        // `cluster_available` was introduced after replica hints were already
+        // durable. On the first restart after that upgrade, retain those hints
+        // as availability until peers can publish their fresh views; otherwise
+        // an offline peer is spuriously backfilled immediately.
+        let available = if available.is_empty() {
+            replicas.clone()
+        } else {
+            available
+        };
         for (key, nodes) in replicas {
             for node_id in nodes {
                 Self::insert_subject_membership(
@@ -596,6 +621,10 @@ impl ClusterService {
                     key.clone(),
                     node_id,
                 );
+            }
+        }
+        for (key, nodes) in available {
+            for node_id in nodes {
                 Self::insert_subject_membership(
                     &mut self.available_by_key,
                     &mut self.available_subjects_by_node,
@@ -617,6 +646,18 @@ impl ClusterService {
             .collect()
     }
 
+    pub fn export_available_by_key(&self) -> HashMap<String, Vec<NodeId>> {
+        self.available_by_key
+            .iter()
+            .map(|(key, nodes)| {
+                let mut ordered: Vec<NodeId> = nodes.iter().copied().collect();
+                ordered.sort();
+                (key.clone(), ordered)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn known_replication_subjects(&self) -> Vec<String> {
         let mut subjects = self
             .replicas_by_key
@@ -631,11 +672,17 @@ impl ClusterService {
     }
 
     fn current_replica_nodes_for_subject(&self, key: &str) -> HashSet<NodeId> {
-        let mut current = self.replicas_by_key.get(key).cloned().unwrap_or_default();
-        if let Some(available) = self.available_by_key.get(key) {
-            current.extend(available.iter().copied());
-        }
-        current
+        // Remembered historical claims remain useful for source discovery, but
+        // only a current availability claim can satisfy a durability obligation.
+        // Keep that claim while its peer is temporarily offline: placement itself
+        // already excludes offline targets, and dropping the claim here would
+        // turn a restart into an immediate backfill/cleanup cycle.
+        self.available_by_key
+            .get(key)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -720,6 +767,13 @@ impl ClusterService {
         }
     }
 
+    pub(crate) fn placement_snapshot(&self) -> PlacementSnapshot {
+        PlacementSnapshot {
+            policy: self.policy.clone(),
+            nodes: self.nodes.clone(),
+        }
+    }
+
     pub fn replication_plan(&self, keys: &[String]) -> ReplicationPlan {
         self.replication_plan_snapshot(keys).plan()
     }
@@ -735,6 +789,17 @@ impl ClusterService {
             policy: self.policy.clone(),
             nodes: self.nodes.clone(),
             current_replicas_by_key,
+        }
+    }
+}
+
+impl PlacementSnapshot {
+    pub(crate) fn placement_for_key(&self, key: &str) -> PlacementDecision {
+        let placement_key = replication_placement_key(key);
+        PlacementDecision {
+            key: key.to_string(),
+            selected_nodes: select_nodes_by_rendezvous(placement_key, &self.nodes, &self.policy),
+            replication_factor: self.policy.replication_factor,
         }
     }
 }
@@ -936,7 +1001,7 @@ fn select_nodes_by_rendezvous(
     selected
 }
 
-fn replication_placement_key(key: &str) -> &str {
+pub(crate) fn replication_placement_key(key: &str) -> &str {
     key.split_once("@ver-").map(|(base, _)| base).unwrap_or(key)
 }
 
@@ -1031,6 +1096,27 @@ mod tests {
         let p1 = svc.placement_for_key("alpha");
         let p2 = svc.placement_for_key("alpha");
         assert_eq!(p1.selected_nodes, p2.selected_nodes);
+    }
+
+    #[test]
+    fn placement_snapshot_matches_live_service_for_retained_subjects() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+        for (dc, rack) in [("dc-a", "rack-1"), ("dc-a", "rack-2"), ("dc-b", "rack-7")] {
+            svc.register_node(mk_node(NodeId::new_v4(), dc, rack, 900));
+        }
+
+        let snapshot = svc.placement_snapshot();
+        for subject in [
+            "current.bin",
+            "current.bin@ver-001",
+            "cas-manifest:immutable-history",
+        ] {
+            assert_eq!(
+                snapshot.placement_for_key(subject).selected_nodes,
+                svc.placement_for_key(subject).selected_nodes,
+            );
+        }
     }
 
     #[test]
@@ -1290,6 +1376,8 @@ mod tests {
         let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
 
         let node_a = NodeId::new_v4();
+        svc.register_node(mk_node(local, "dc-local", "rack-1", 1000));
+        svc.register_node(mk_node(node_a, "dc-a", "rack-2", 900));
         svc.note_replica("subject-a", node_a);
 
         let before = svc.replication_plan(&["subject-a".to_string()]);
@@ -1308,7 +1396,8 @@ mod tests {
         svc.remove_available("subject-a", node_a);
 
         let after_availability_removal = svc.replication_plan(&["subject-a".to_string()]);
-        assert!(after_availability_removal.items.is_empty());
+        assert!(after_availability_removal.items[0].current_nodes.is_empty());
+        assert_eq!(after_availability_removal.items[0].missing_nodes.len(), 2);
     }
 
     #[test]
@@ -1322,7 +1411,7 @@ mod tests {
         let mut replicas = HashMap::new();
         replicas.insert("subject-a".to_string(), vec![node_b, node_a]);
 
-        svc.import_replicas_by_key(replicas);
+        svc.import_replica_views(replicas, HashMap::new());
         let exported = svc.export_replicas_by_key();
 
         assert_eq!(exported.get("subject-a").map(Vec::len), Some(2));
@@ -1332,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn import_replicas_rebuilds_node_subject_indexes() {
+    fn import_replica_views_rebuilds_node_subject_indexes() {
         let local = NodeId::new_v4();
         let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
 
@@ -1343,7 +1432,11 @@ mod tests {
         replicas.insert("subject-a".to_string(), vec![node_b, node_a]);
         replicas.insert("subject-b".to_string(), vec![node_a]);
 
-        svc.import_replicas_by_key(replicas);
+        let available = HashMap::from([
+            ("subject-a".to_string(), vec![node_a]),
+            ("subject-b".to_string(), vec![node_a]),
+        ]);
+        svc.import_replica_views(replicas, available);
 
         assert_eq!(
             svc.subjects_for_node(node_a),
@@ -1354,8 +1447,27 @@ mod tests {
             vec!["subject-a".to_string(), "subject-b".to_string()]
         );
         assert_eq!(svc.subjects_for_node(node_b), vec!["subject-a".to_string()]);
+        assert!(svc.available_subjects_for_node(node_b).is_empty());
+    }
+
+    #[test]
+    fn import_replica_views_seeds_empty_availability_from_legacy_replicas() {
+        let local = NodeId::new_v4();
+        let offline = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        svc.import_replica_views(
+            HashMap::from([("subject-a".to_string(), vec![offline])]),
+            HashMap::new(),
+        );
+
         assert_eq!(
-            svc.available_subjects_for_node(node_b),
+            svc.current_replica_nodes_for_subject("subject-a"),
+            HashSet::from([offline]),
+            "an upgrade must retain an offline replica until it can publish availability"
+        );
+        assert_eq!(
+            svc.available_subjects_for_node(offline),
             vec!["subject-a".to_string()]
         );
     }
@@ -1509,6 +1621,45 @@ mod tests {
             svc.available_subjects_for_node(node_a),
             vec!["subject-a".to_string(), "subject-a@ver-new".to_string()]
         );
+        assert!(
+            svc.current_replica_nodes_for_subject("subject-a@ver-old")
+                .is_empty(),
+            "historical source hints must not count as currently healthy replicas"
+        );
+    }
+
+    #[test]
+    fn import_replica_views_keeps_historical_claims_out_of_current_availability() {
+        let local = NodeId::new_v4();
+        let node_a = NodeId::new_v4();
+        let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
+
+        svc.import_replica_views(
+            HashMap::from([
+                ("subject-a".to_string(), vec![node_a]),
+                ("subject-a@ver-old".to_string(), vec![node_a]),
+                ("subject-a@ver-new".to_string(), vec![node_a]),
+            ]),
+            HashMap::from([
+                ("subject-a".to_string(), vec![node_a]),
+                ("subject-a@ver-new".to_string(), vec![node_a]),
+            ]),
+        );
+
+        assert_eq!(
+            svc.export_replicas_by_key().get("subject-a@ver-old"),
+            Some(&vec![node_a]),
+            "the historical source hint survives restart"
+        );
+        assert!(
+            svc.current_replica_nodes_for_subject("subject-a@ver-old")
+                .is_empty(),
+            "the historical source hint must not become a current availability claim"
+        );
+        assert_eq!(
+            svc.current_replica_nodes_for_subject("subject-a@ver-new"),
+            HashSet::from([node_a])
+        );
     }
 
     #[test]
@@ -1557,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn replication_plan_unions_available_and_persisted_version_replicas() {
+    fn replication_plan_does_not_count_unadvertised_historical_claims() {
         let local = NodeId::new_v4();
         let mut svc = ClusterService::new(
             local,
@@ -1589,11 +1740,59 @@ mod tests {
         );
 
         let plan = svc.replication_plan(&["subject-a@ver-old".to_string()]);
+        assert_eq!(plan.under_replicated, 1);
+        assert_eq!(plan.items[0].current_nodes, vec![node_a]);
+        assert_eq!(plan.items[0].missing_nodes, vec![node_b]);
         assert!(
-            plan.items.is_empty(),
-            "historical version subject should not remain under-replicated once both nodes are known to store it"
+            svc.replica_nodes_for_subject("subject-a@ver-old")
+                .iter()
+                .any(|n| n.node_id == node_b),
+            "the stale claim is still useful for hash-level source discovery"
         );
-        assert_eq!(plan.under_replicated, 0);
+    }
+
+    #[test]
+    fn replication_plan_keeps_current_offline_availability_until_the_claim_is_removed() {
+        let local = NodeId::new_v4();
+        let mut svc = ClusterService::new(
+            local,
+            ReplicationPolicy {
+                replication_factor: 2,
+                ..ReplicationPolicy::default()
+            },
+            60,
+        );
+
+        let node_a = NodeId::new_v4();
+        let node_b = NodeId::new_v4();
+        let node_c = NodeId::new_v4();
+        svc.register_node(mk_node(node_a, "dc-a", "rack-1", 900));
+        svc.register_node(mk_node(node_b, "dc-b", "rack-2", 800));
+        svc.register_node(mk_node(node_c, "dc-c", "rack-3", 700));
+
+        let key = (0..10_000)
+            .map(|index| format!("offline-availability-{index}"))
+            .find(|candidate| {
+                let selected = svc.placement_for_key(candidate).selected_nodes;
+                selected.contains(&node_a) && selected.contains(&node_b)
+            })
+            .expect("failed to find a key initially placed on node_a and node_b");
+        svc.replace_node_available_view(node_a, std::slice::from_ref(&key));
+        svc.replace_node_available_view(node_b, std::slice::from_ref(&key));
+        svc.nodes.get_mut(&node_b).unwrap().status = NodeStatus::Offline;
+
+        let while_unreachable = svc.replication_plan(std::slice::from_ref(&key));
+        assert_eq!(while_unreachable.under_replicated, 0);
+        assert!(
+            while_unreachable.items.is_empty(),
+            "a temporarily unreachable node with a current availability claim must not trigger a backfill: {:#?}",
+            while_unreachable.items
+        );
+
+        svc.replace_node_available_view(node_b, &[]);
+        let after_claim_removed = svc.replication_plan(std::slice::from_ref(&key));
+        assert_eq!(after_claim_removed.under_replicated, 1);
+        assert_eq!(after_claim_removed.items[0].missing_nodes, vec![node_c]);
     }
 
     #[test]

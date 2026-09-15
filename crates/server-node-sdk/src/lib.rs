@@ -124,6 +124,9 @@ const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
 const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
+/// Avoid rescanning every historical manifest on each five-second repair tick,
+/// while still detecting out-of-band disk loss without a namespace event.
+const LOCAL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_secs(30);
 const HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE: Duration = Duration::from_millis(25);
 const HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const GALLERY_MAX_DEPTH: usize = 64;
@@ -146,6 +149,7 @@ use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 
 mod cluster;
+mod content_recovery;
 mod embedded_rendezvous;
 mod gallery_map;
 mod gallery_sync;
@@ -423,6 +427,8 @@ struct ServerNetworkRuntime {
 
 #[derive(Clone)]
 struct ServerMaintenanceRuntime {
+    content_repair_claims: Arc<ContentRepairClaims>,
+    content_repair_notify: Arc<Notify>,
     inflight_requests: Arc<AtomicUsize>,
     startup_repair_status: Arc<Mutex<StartupRepairStatus>>,
     repair_state: Arc<Mutex<RepairExecutorState>>,
@@ -437,6 +443,119 @@ struct ServerMaintenanceRuntime {
     repair_run_history_retention_secs: u64,
     local_availability_refresh_lock: Arc<Mutex<()>>,
     local_availability_refresh_notify: Arc<Notify>,
+    local_availability_generation: Arc<AtomicU64>,
+    local_availability_cache: Arc<Mutex<Option<LocalAvailabilityCache>>>,
+}
+
+/// Serializes repair activity for one immutable manifest without allowing a
+/// stalled source for that manifest to block unrelated replication work.
+#[derive(Default)]
+struct ContentRepairClaims {
+    active_manifests: StdMutex<HashSet<String>>,
+    released: Notify,
+    #[cfg(test)]
+    wait_after_failed_claim: StdMutex<Option<ContentRepairClaimWaitHook>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ContentRepairClaimWaitHook {
+    waiting: Arc<Notify>,
+    resume: Arc<Notify>,
+}
+
+#[cfg(test)]
+impl ContentRepairClaimWaitHook {
+    fn new() -> Self {
+        Self {
+            waiting: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn wait_until_failed_claim(&self) {
+        self.waiting.notified().await;
+    }
+
+    fn resume_claim(&self) {
+        self.resume.notify_one();
+    }
+}
+
+struct ContentRepairClaim {
+    claims: Arc<ContentRepairClaims>,
+    manifest_hash: String,
+}
+
+impl ContentRepairClaims {
+    fn try_claim(self: &Arc<Self>, manifest_hash: &str) -> Option<ContentRepairClaim> {
+        self.active_manifests
+            .lock()
+            .expect("content repair claim lock poisoned")
+            .insert(manifest_hash.to_string())
+            .then(|| ContentRepairClaim {
+                claims: self.clone(),
+                manifest_hash: manifest_hash.to_string(),
+            })
+    }
+
+    async fn claim(self: &Arc<Self>, manifest_hash: &str) -> ContentRepairClaim {
+        loop {
+            // Register the waiter before checking the set so a concurrent
+            // release cannot be missed between the check and the await.
+            let notified = self.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(claim) = self.try_claim(manifest_hash) {
+                return claim;
+            }
+            #[cfg(test)]
+            let hook = {
+                self.wait_after_failed_claim
+                    .lock()
+                    .expect("content repair claim lock poisoned")
+                    .clone()
+            };
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook.waiting.notify_one();
+                hook.resume.notified().await;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_wait_after_failed_claim(&self, hook: Option<ContentRepairClaimWaitHook>) {
+        *self
+            .wait_after_failed_claim
+            .lock()
+            .expect("content repair claim lock poisoned") = hook;
+    }
+}
+
+impl Drop for ContentRepairClaim {
+    fn drop(&mut self) {
+        self.claims
+            .active_manifests
+            .lock()
+            .expect("content repair claim lock poisoned")
+            .remove(&self.manifest_hash);
+        self.claims.released.notify_waiters();
+    }
+}
+
+#[derive(Clone)]
+struct LocalAvailabilityCache {
+    generation: u64,
+    computed_at: Instant,
+    subjects: Arc<Vec<String>>,
+}
+
+impl LocalAvailabilityCache {
+    fn is_valid_for(&self, generation: u64) -> bool {
+        self.generation == generation && self.computed_at.elapsed() < LOCAL_AVAILABILITY_CACHE_TTL
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -721,7 +840,25 @@ fn log_server_startup_phase_end(
     }
 }
 
+pub(crate) fn invalidate_local_availability_cache(state: &ServerState) {
+    state
+        .maintenance
+        .local_availability_generation
+        .fetch_add(1, Ordering::SeqCst);
+}
+
 fn request_local_availability_refresh(state: &ServerState) {
+    invalidate_local_availability_cache(state);
+    state
+        .maintenance
+        .local_availability_refresh_notify
+        .notify_one();
+}
+
+/// Lets the availability cache's TTL detect out-of-band storage changes without
+/// invalidating it on every replication-auditor tick. The refresher performs a
+/// cheap cache hit until the TTL expires, then recomputes from local storage.
+fn request_ttl_bounded_local_availability_refresh(state: &ServerState) {
     state
         .maintenance
         .local_availability_refresh_notify
@@ -950,6 +1087,7 @@ pub(crate) fn publish_namespace_change(state: &ServerState) {
         .fetch_add(1, Ordering::SeqCst)
         .saturating_add(1);
     let _ = state.storage.namespace_change_tx.send(sequence);
+    invalidate_local_availability_cache(state);
 }
 
 #[derive(Debug, Clone)]
@@ -3289,6 +3427,9 @@ enum RepairRunTrigger {
 #[serde(rename_all = "snake_case")]
 enum RepairRunStatus {
     Completed,
+    PartiallyRepaired,
+    WaitingForSource,
+    Unresolved,
     SkippedNoGaps,
 }
 
@@ -7180,6 +7321,16 @@ async fn run_inner(
         startup_phase_anchor,
         load_cluster_replicas_phase_started_at,
     );
+    let persisted_cluster_availability = {
+        let store_guard = store.read("server.init.load_cluster_availability").await;
+        match store_guard.load_cluster_availability().await {
+            Ok(availability) => availability,
+            Err(err) => {
+                warn!(error = %err, "failed to load cluster availability state; starting empty");
+                HashMap::new()
+            }
+        }
+    };
     let persisted_cluster_nodes = backfill_cluster_nodes_from_replica_rows(
         persisted_cluster_nodes,
         &persisted_cluster_replicas,
@@ -7226,7 +7377,17 @@ async fn run_inner(
             (!nodes.is_empty()).then_some((subject, nodes))
         })
         .collect::<HashMap<_, _>>();
-    cluster.import_replicas_by_key(filtered_cluster_replicas);
+    let filtered_cluster_availability = persisted_cluster_availability
+        .into_iter()
+        .filter_map(|(subject, nodes)| {
+            let nodes = nodes
+                .into_iter()
+                .filter(|node_id| known_node_ids.contains(node_id))
+                .collect::<Vec<_>>();
+            (!nodes.is_empty()).then_some((subject, nodes))
+        })
+        .collect::<HashMap<_, _>>();
+    cluster.import_replica_views(filtered_cluster_replicas, filtered_cluster_availability);
 
     let load_client_credentials_phase_started_at =
         log_server_startup_phase_begin("load_client_credentials", startup_phase_anchor);
@@ -7613,6 +7774,8 @@ async fn run_inner(
             inflight_requests: Arc::new(AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(startup_repair_status)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
+            content_repair_claims: Arc::new(ContentRepairClaims::default()),
+            content_repair_notify: Arc::new(Notify::new()),
             repair_activity: Arc::new(Mutex::new(RepairActivityRuntime::default())),
             manual_repair_activity: Arc::new(Mutex::new(
                 ManualRepairActionActivityRuntime::default(),
@@ -7630,6 +7793,8 @@ async fn run_inner(
             repair_run_history_retention_secs,
             local_availability_refresh_lock: Arc::new(Mutex::new(())),
             local_availability_refresh_notify: Arc::new(Notify::new()),
+            local_availability_generation: Arc::new(AtomicU64::new(0)),
+            local_availability_cache: Arc::new(Mutex::new(None)),
         },
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
@@ -7695,6 +7860,7 @@ async fn start_background_runtimes(
     hardware_health::spawn_hardware_health_sampler(state.clone());
     reliability_telemetry::spawn_reliability_telemetry_sender(state.clone());
     spawn_data_scrubber(state.clone());
+    content_recovery::spawn_worker(state.clone());
     spawn_media_metadata_backfill(state.clone(), "startup");
     spawn_history_head_projection_backfill(state.clone());
     spawn_direct_quic_multiplex_agent(state.clone());
@@ -9682,6 +9848,10 @@ pub(crate) fn build_internal_peer_api() -> Router<ServerState> {
             get(get_replication_chunk),
         )
         .route(
+            "/cluster/v2/replication/manifest/{hash}",
+            get(content_recovery::get_manifest),
+        )
+        .route(
             "/cluster/v2/replication/push/chunk/{hash}",
             post(push_replication_chunk),
         )
@@ -11666,46 +11836,68 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 
         loop {
             ticker.tick().await;
-
-            let keys = planning_replication_subjects(&state).await;
-
-            let (node_transitioned_offline, plan) = {
-                let mut cluster = state.cluster.lock().await;
-                let node_transitioned_offline =
-                    cluster.update_health_and_detect_offline_transition();
-                let plan = cluster.replication_plan(&keys);
-                (node_transitioned_offline, plan)
-            };
-
-            if node_transitioned_offline || !plan.items.is_empty() {
-                info!(
-                    under_replicated = plan.under_replicated,
-                    over_replicated = plan.over_replicated,
-                    items = plan.items.len(),
-                    "replication audit result"
-                );
-            }
-
-            if state.repair_config.enabled && !plan.items.is_empty() {
-                let report = execute_tracked_local_replication_repair(
-                    &state,
-                    None,
-                    RepairRunTrigger::BackgroundAudit,
-                    Some(RepairPlanSummary::from_plan(&plan)),
-                )
-                .await;
-                info!(
-                    attempted = report.attempted_transfers,
-                    success = report.successful_transfers,
-                    failed = report.failed_transfers,
-                    skipped = report.skipped_items,
-                    skipped_backoff = report.skipped_backoff,
-                    skipped_max_retries = report.skipped_max_retries,
-                    "replication repair executor run"
-                );
-            }
+            run_replication_audit_once(&state).await;
         }
     });
+}
+
+async fn run_replication_audit_once(state: &ServerState) {
+    request_ttl_bounded_local_availability_refresh(state);
+    // A plan snapshot is only meaningful after both the local and remote
+    // availability views have been reconciled. The plan executor intentionally
+    // consumes this snapshot directly to avoid recomputing retained history, so
+    // it cannot supply this synchronization on the auditor's behalf.
+    if state.repair_config.enabled {
+        sync_availability_views_once(state).await;
+    }
+
+    let retained = {
+        let store = read_store(state, "replication_auditor.retained_snapshot").await;
+        store.retained_content().await
+    };
+    if let Err(error) = &retained {
+        warn!(error = %error, "failed to enumerate retained replication obligations");
+    }
+    if state.repair_config.enabled
+        && let Ok(retained) = retained.as_ref()
+        && let Err(error) = content_recovery::audit_assigned_from_retained(state, retained).await
+    {
+        warn!(error = %error, "failed to audit retained content assignments");
+    }
+
+    let keys = planning_replication_subjects_for_auditor(state).await;
+
+    let (node_transitioned_offline, plan_snapshot) = {
+        let mut cluster = state.cluster.lock().await;
+        let node_transitioned_offline = cluster.update_health_and_detect_offline_transition();
+        let plan_snapshot = cluster.replication_plan_snapshot(&keys);
+        (node_transitioned_offline, plan_snapshot)
+    };
+    let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
+
+    if node_transitioned_offline || !plan.items.is_empty() {
+        info!(
+            under_replicated = plan.under_replicated,
+            over_replicated = plan.over_replicated,
+            items = plan.items.len(),
+            "replication audit result"
+        );
+    }
+
+    if state.repair_config.enabled && !plan.items.is_empty() {
+        let report =
+            execute_tracked_replication_plan(state, plan, nodes, RepairRunTrigger::BackgroundAudit)
+                .await;
+        info!(
+            attempted = report.attempted_transfers,
+            success = report.successful_transfers,
+            failed = report.failed_transfers,
+            skipped = report.skipped_items,
+            skipped_backoff = report.skipped_backoff,
+            skipped_max_retries = report.skipped_max_retries,
+            "replication repair executor run"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12185,16 +12377,44 @@ async fn record_server_request_timing(request: Request, next: Next) -> Response 
 }
 
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
+    planning_replication_subjects_from_availability(state).await
+}
+
+async fn planning_replication_subjects_from_availability(state: &ServerState) -> Vec<String> {
     let local_subjects = cached_local_cluster_available_subjects(state).await;
     let cluster_subjects = {
         let cluster = state.cluster.lock().await;
-        cluster.known_replication_subjects()
+        cluster
+            .export_available_by_key()
+            .into_keys()
+            .collect::<Vec<_>>()
     };
 
     let mut subjects = BTreeSet::new();
     subjects.extend(local_subjects);
     subjects.extend(cluster_subjects);
+    // Historical durability obligations are scheduled by the manifest-hash
+    // worker. Keeping them out of legacy object/version planning prevents a
+    // deep retained history from expanding each availability or repair pass.
+    subjects
+        .retain(|subject| !subject.starts_with(storage::retained_content::MANIFEST_SUBJECT_PREFIX));
     subjects.into_iter().collect()
+}
+
+/// Bounds the periodic background audit to one legacy plan item per placement
+/// key. Explicit/manual plans keep their branch-aware version subjects.
+async fn planning_replication_subjects_for_auditor(state: &ServerState) -> Vec<String> {
+    planning_replication_subjects_from_availability(state)
+        .await
+        .into_iter()
+        .fold(BTreeMap::new(), |mut by_placement_key, subject| {
+            by_placement_key
+                .entry(cluster::replication_placement_key(&subject).to_string())
+                .or_insert(subject);
+            by_placement_key
+        })
+        .into_values()
+        .collect()
 }
 
 async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
@@ -12234,20 +12454,55 @@ async fn cached_local_cluster_available_subjects(state: &ServerState) -> Vec<Str
     cluster.available_subjects_for_node(state.node_id)
 }
 
+async fn cached_or_recompute_local_cluster_available_subjects(
+    state: &ServerState,
+) -> Arc<Vec<String>> {
+    let generation = state
+        .maintenance
+        .local_availability_generation
+        .load(Ordering::SeqCst);
+    if let Some(subjects) = state
+        .maintenance
+        .local_availability_cache
+        .lock()
+        .await
+        .as_ref()
+        .filter(|cache| cache.is_valid_for(generation))
+        .map(|cache| Arc::clone(&cache.subjects))
+    {
+        return subjects;
+    }
+
+    let subjects = Arc::new(recompute_local_cluster_available_subjects(state).await);
+    if state
+        .maintenance
+        .local_availability_generation
+        .load(Ordering::SeqCst)
+        == generation
+    {
+        *state.maintenance.local_availability_cache.lock().await = Some(LocalAvailabilityCache {
+            generation,
+            computed_at: Instant::now(),
+            subjects: Arc::clone(&subjects),
+        });
+    }
+    subjects
+}
+
 async fn refresh_local_availability_view_once(state: &ServerState) -> usize {
     let _refresh_guard = state
         .maintenance
         .local_availability_refresh_lock
         .lock()
         .await;
-    let local_subjects = recompute_local_cluster_available_subjects(state).await;
+    let local_subjects = cached_or_recompute_local_cluster_available_subjects(state).await;
     let subject_count = local_subjects.len();
     let replicas_changed = {
         let mut cluster = state.cluster.lock().await;
-        cluster.reconcile_node_subjects(state.node_id, &local_subjects)
+        cluster.reconcile_node_subjects(state.node_id, local_subjects.as_slice())
     };
 
-    if replicas_changed && let Err(err) = persist_cluster_replicas_state(state).await {
+    if replicas_changed && let Err(err) = persist_local_availability_reconciliation(state).await {
         warn!(
             error = %err,
             subject_count,
@@ -12643,10 +12898,7 @@ async fn execute_data_scrub_follow_on_repair(
 
 async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker) {
     info!(run_id = %tracker.run_id, trigger = ?tracker.trigger, "data scrub run started");
-    let scrubber = {
-        let store = read_store(&state, "data_scrub.clone_worker").await;
-        store.data_scrubber().await
-    };
+    let scrubber = content_recovery::scrubber(&state).await;
     let result = match scrubber {
         Ok(scrubber) => scrubber.run_with_repair_subjects().await,
         Err(err) => Err(err),
@@ -12654,6 +12906,24 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
 
     match result {
         Ok(output) => {
+            // Persist integrity findings before publishing scrub completion.
+            // A zero execution budget enqueues all intent without fetching bytes,
+            // including when automatic repair is disabled. It also prevents a
+            // later availability refresh from undoing the degraded state.
+            let enqueue_error = if output.repair_subjects.is_empty() {
+                None
+            } else {
+                content_recovery::repair_subjects(
+                    &state,
+                    output.repair_subjects.iter().cloned().collect(),
+                    Some(0),
+                )
+                .await
+                .last_error
+            };
+            if let Some(error) = &enqueue_error {
+                warn!(error, "failed persisting scrub repair intent");
+            }
             let summary = output.report;
             let status = if summary.issue_count > 0 {
                 DataScrubRunStatus::IssuesDetected
@@ -12670,7 +12940,8 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
                 "data scrub run finished"
             );
             let record =
-                finish_data_scrub_run_tracking(&state, tracker, status, summary, None).await;
+                finish_data_scrub_run_tracking(&state, tracker, status, summary, enqueue_error)
+                    .await;
             if !output.repair_subjects.is_empty() {
                 let state_clone = state.clone();
                 tokio::spawn(async move {
@@ -12775,7 +13046,42 @@ async fn execute_tracked_local_replication_repair(
         state,
         tracker,
         plan_summary,
-        RepairRunStatus::Completed,
+        report.run_status(),
+        Some(RepairRunSummary::from_local_report(&report)),
+        serialize_repair_run_report(&report),
+    )
+    .await;
+    report
+}
+
+/// Records a repair run for a plan already assembled by the background
+/// auditor, preserving the one retained-content snapshot used for that tick.
+async fn execute_tracked_replication_plan(
+    state: &ServerState,
+    plan: ReplicationPlan,
+    nodes: Vec<NodeDescriptor>,
+    trigger: RepairRunTrigger,
+) -> replication::ReplicationRepairReport {
+    let plan_summary = RepairPlanSummary::from_plan(&plan);
+    let tracker =
+        begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
+    let report = with_active_repair_log_tracking(&tracker, async {
+        replication::execute_replication_repair_plan(
+            state,
+            &plan,
+            nodes,
+            None,
+            false,
+            Some(&tracker.run_id),
+        )
+        .await
+    })
+    .await;
+    finish_repair_run_tracking(
+        state,
+        tracker,
+        plan_summary,
+        report.run_status(),
         Some(RepairRunSummary::from_local_report(&report)),
         serialize_repair_run_report(&report),
     )
@@ -12812,7 +13118,7 @@ async fn execute_tracked_targeted_local_replication_repair(
         state,
         tracker,
         plan_summary,
-        RepairRunStatus::Completed,
+        report.run_status(),
         Some(RepairRunSummary::from_local_report(&report)),
         serialize_repair_run_report(&report),
     )
@@ -12841,7 +13147,7 @@ async fn execute_tracked_targeted_replication_repair(
         state,
         tracker,
         RepairPlanSummary::from_plan(&plan),
-        RepairRunStatus::Completed,
+        report.run_status(),
         Some(RepairRunSummary::from_local_report(&report)),
         serialize_repair_run_report(&report),
     )
@@ -12875,7 +13181,7 @@ async fn execute_tracked_cluster_replication_repair(
         state,
         tracker,
         plan_summary,
-        RepairRunStatus::Completed,
+        report.totals.run_status(),
         Some(RepairRunSummary::from_cluster_report(&report)),
         serialize_repair_run_report(&report),
     )
@@ -12941,7 +13247,7 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
             &state,
             tracker,
             plan_summary,
-            RepairRunStatus::Completed,
+            report.run_status(),
             Some(RepairRunSummary::from_local_report(&report)),
             serialize_repair_run_report(&report),
         )
@@ -20051,15 +20357,6 @@ fn read_through_replication_subject(
     Some(key.to_string())
 }
 
-async fn read_through_source_nodes(state: &ServerState, subject: &str) -> Vec<NodeDescriptor> {
-    let cluster = state.cluster.lock().await;
-    cluster
-        .available_nodes_for_subject(subject)
-        .into_iter()
-        .filter(|node| node.node_id != state.node_id)
-        .collect()
-}
-
 async fn media_artifact_source_nodes(
     state: &ServerState,
     subject_hint: Option<&str>,
@@ -20316,64 +20613,19 @@ async fn hydrate_missing_chunks_for_range(
     subject: &str,
     missing_chunks: &[ReplicationChunkInfo],
 ) -> Result<()> {
-    let sources = read_through_source_nodes(state, subject).await;
-    if sources.is_empty() {
-        bail!("no readable replica source available for subject={subject}");
+    let result = content_recovery::recover_chunks_for_read(
+        state,
+        subject,
+        missing_chunks,
+        content_recovery::READ_THROUGH_RECOVERY_BUDGET,
+    )
+    .await?;
+    if !result.remaining.is_empty() {
+        bail!(
+            "failed read-through chunk recovery for subject={subject}: {}",
+            result.errors.join("; ")
+        );
     }
-
-    for chunk in missing_chunks {
-        let mut fetched = false;
-        let chunk_path = format!("/cluster/v2/replication/chunk/{}", chunk.hash);
-
-        for source in &sources {
-            let response = match execute_peer_request(
-                state,
-                source,
-                reqwest::Method::GET,
-                &chunk_path,
-                Vec::new(),
-                Vec::new(),
-            )
-            .await
-            {
-                Ok(response) if response.is_success() => response,
-                Ok(_) => continue,
-                Err(err) => {
-                    tracing::debug!(
-                        node_id = %source.node_id,
-                        chunk_hash = %chunk.hash,
-                        error = %err,
-                        "failed read-through chunk fetch"
-                    );
-                    continue;
-                }
-            };
-
-            {
-                let store = lock_store(state, "object_read.hydrate_missing_chunk").await;
-                store
-                    .ingest_chunk(&chunk.hash, response.body.as_ref())
-                    .await?;
-                store
-                    .note_cached_chunk_fetch(
-                        &chunk.hash,
-                        chunk.size_bytes,
-                        Some(&source.node_id.to_string()),
-                    )
-                    .await?;
-            }
-            fetched = true;
-            break;
-        }
-
-        if !fetched {
-            bail!(
-                "failed read-through chunk fetch for subject={subject} chunk_hash={}",
-                chunk.hash
-            );
-        }
-    }
-
     Ok(())
 }
 
@@ -30827,16 +31079,41 @@ async fn persist_repair_state(state: &ServerState) -> Result<()> {
 }
 
 async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
-    let replicas = {
+    persist_cluster_replicas_state_inner(state, true).await
+}
+
+/// Persists the local availability set computed in this refresh. It is already
+/// tied to the current generation, so invalidating it here would discard the
+/// fresh cache immediately and force another full retained-history scan.
+async fn persist_local_availability_reconciliation(state: &ServerState) -> Result<()> {
+    persist_cluster_replicas_state_inner(state, false).await
+}
+
+async fn persist_cluster_replicas_state_inner(
+    state: &ServerState,
+    invalidate_local_availability: bool,
+) -> Result<()> {
+    if invalidate_local_availability {
+        // Cluster membership can change through imports and remote availability
+        // syncs without a namespace mutation. Force the next local view to use
+        // a fresh snapshot instead of replaying an older cached subject set.
+        invalidate_local_availability_cache(state);
+    }
+    let (replicas, available) = {
         let cluster = state.cluster.lock().await;
-        cluster.export_replicas_by_key()
+        (
+            cluster.export_replicas_by_key(),
+            cluster.export_available_by_key(),
+        )
     };
 
     let persister = {
         let store = read_store(state, "cluster_replicas.clone_persister").await;
         store.cluster_replicas_persister()
     };
-    persister.persist_cluster_replicas(&replicas).await
+    persister
+        .persist_cluster_replica_views(&replicas, &available)
+        .await
 }
 
 async fn persist_cluster_nodes_state(state: &ServerState) -> Result<()> {
@@ -30853,9 +31130,13 @@ async fn persist_cluster_nodes_state(state: &ServerState) -> Result<()> {
 }
 
 async fn persist_cluster_topology_state(state: &ServerState) -> Result<()> {
-    let (nodes, replicas) = {
+    let (nodes, replicas, available) = {
         let cluster = state.cluster.lock().await;
-        (cluster.export_nodes(), cluster.export_replicas_by_key())
+        (
+            cluster.export_nodes(),
+            cluster.export_replicas_by_key(),
+            cluster.export_available_by_key(),
+        )
     };
 
     let (node_persister, replica_persister) = {
@@ -30866,7 +31147,9 @@ async fn persist_cluster_topology_state(state: &ServerState) -> Result<()> {
         )
     };
     node_persister.persist_cluster_nodes(&nodes).await?;
-    replica_persister.persist_cluster_replicas(&replicas).await
+    replica_persister
+        .persist_cluster_replica_views(&replicas, &available)
+        .await
 }
 
 #[cfg(test)]

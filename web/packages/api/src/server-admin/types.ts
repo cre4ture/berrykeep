@@ -300,7 +300,7 @@ export type RepairRunTrigger =
   | "autonomous_post_write"
   | "peer_cluster_request";
 
-export type RepairRunStatus = "completed" | "skipped_no_gaps";
+export type RepairRunStatus = "completed" | "skipped_no_gaps" | "partially_repaired" | "waiting_for_source" | "unresolved";
 
 export type RepairActivityState = "idle" | "scheduled" | "running";
 
@@ -478,6 +478,7 @@ export type DataScrubReport = {
   version_records_scanned: number;
   manifests_scanned: number;
   chunks_scanned: number;
+  chunks_not_required_locally?: number;
   bytes_scanned: number;
   issue_count: number;
   sampled_issue_count: number;
