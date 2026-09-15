@@ -232,7 +232,7 @@ struct GalleryMapApiRoutes {
 
 #[derive(Debug, Default)]
 struct StoreIndexChildrenViewCapability {
-    unsupported_until: Option<Instant>,
+    unsupported_until_by_route: HashMap<RouteId, Instant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5808,13 +5808,21 @@ impl BerryKeepClient {
         let can_fallback_to_tree = options.view == Some(StoreIndexView::Children)
             && options.cursor.is_none()
             && options.page_size.is_none();
-        if can_fallback_to_tree && self.store_index_children_view_is_known_unsupported() {
+        if can_fallback_to_tree
+            && let Some(route_id) = self.store_index_children_view_unsupported_route()
+        {
             return self
-                .store_index_with_legacy_tree_projection(prefix, depth, snapshot, &options)
+                .store_index_with_legacy_tree_projection(
+                    prefix,
+                    depth,
+                    snapshot,
+                    &options,
+                    Some(&route_id),
+                )
                 .await;
         }
 
-        let response = self
+        let routed_response = self
             .request_store_index(prefix, depth, snapshot, &options)
             .await?;
 
@@ -5825,41 +5833,61 @@ impl BerryKeepClient {
         // server must apply the children projection before pagination for its
         // offset and total to remain meaningful.
         let children_view_was_rejected = options.view == Some(StoreIndexView::Children)
-            && store_index_view_was_rejected(&response, StoreIndexView::Children);
+            && store_index_view_was_rejected(&routed_response.response, StoreIndexView::Children);
         if children_view_was_rejected {
-            self.remember_store_index_children_view_is_unsupported();
+            let rejected_route_id = routed_response.route_affinity.preferred_route_id.clone();
+            if let Some(route_id) = rejected_route_id.as_ref() {
+                self.remember_store_index_children_view_is_unsupported(route_id);
+            }
             if can_fallback_to_tree {
                 return self
-                    .store_index_with_legacy_tree_projection(prefix, depth, snapshot, &options)
+                    .store_index_with_legacy_tree_projection(
+                        prefix,
+                        depth,
+                        snapshot,
+                        &options,
+                        rejected_route_id.as_ref(),
+                    )
                     .await;
             }
         }
 
-        decode_store_index_response(response, &options)
+        decode_store_index_response(routed_response.response, &options)
     }
 
-    fn store_index_children_view_is_known_unsupported(&self) -> bool {
+    fn store_index_children_view_unsupported_route(&self) -> Option<RouteId> {
+        let route_id = self
+            .transport_router
+            .foreground_route_ids()
+            .into_iter()
+            .next()?;
         let mut capability = self
             .store_index_children_view_capability
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(unsupported_until) = capability.unsupported_until else {
-            return false;
-        };
-        if Instant::now() < unsupported_until {
-            return true;
+        let now = Instant::now();
+        capability
+            .unsupported_until_by_route
+            .retain(|_, unsupported_until| now < *unsupported_until);
+        if capability
+            .unsupported_until_by_route
+            .contains_key(&route_id)
+        {
+            Some(route_id)
+        } else {
+            None
         }
-        capability.unsupported_until = None;
-        false
     }
 
-    fn remember_store_index_children_view_is_unsupported(&self) {
+    fn remember_store_index_children_view_is_unsupported(&self, route_id: &RouteId) {
         let mut capability = self
             .store_index_children_view_capability
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        capability.unsupported_until =
-            Some(Instant::now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER);
+        capability.unsupported_until_by_route.insert(
+            route_id.clone(),
+            Instant::now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER,
+        );
     }
 
     async fn store_index_with_legacy_tree_projection(
@@ -5868,6 +5896,7 @@ impl BerryKeepClient {
         depth: usize,
         snapshot: Option<&str>,
         options: &StoreIndexRequestOptions,
+        route_id: Option<&RouteId>,
     ) -> Result<StoreIndexResponse> {
         let mut fallback_options = options.clone();
         fallback_options.view = Some(StoreIndexView::Tree);
@@ -5887,9 +5916,9 @@ impl BerryKeepClient {
         // rejected capability itself is cached above, so this does not repeat
         // the doomed `children` request until the reprobe window expires.
         let fallback_response = self
-            .request_store_index(prefix, depth, snapshot, &fallback_options)
+            .request_store_index_on_route(prefix, depth, snapshot, &fallback_options, route_id)
             .await?;
-        let response = decode_store_index_response(fallback_response, &fallback_options)?;
+        let response = decode_store_index_response(fallback_response.response, &fallback_options)?;
         let mut response = project_store_index_children_response(&response, prefix, options);
         synthesize_missing_folder_markers_for_page(&mut response, options);
         Ok(response)
@@ -5901,12 +5930,37 @@ impl BerryKeepClient {
         depth: usize,
         snapshot: Option<&str>,
         options: &StoreIndexRequestOptions,
-    ) -> Result<BufferedTransportResponse> {
-        let url = self.store_index_request_url(prefix, depth, snapshot, options)?;
-
-        self.execute_buffered_request(Method::GET, url, Vec::new(), None)
+    ) -> Result<RoutedBufferedTransportResponse> {
+        self.request_store_index_on_route(prefix, depth, snapshot, options, None)
             .await
-            .context("failed to request /store/index")
+    }
+
+    async fn request_store_index_on_route(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        snapshot: Option<&str>,
+        options: &StoreIndexRequestOptions,
+        route_id: Option<&RouteId>,
+    ) -> Result<RoutedBufferedTransportResponse> {
+        let url = self.store_index_request_url(prefix, depth, snapshot, options)?;
+        match route_id {
+            Some(route_id) => {
+                self.execute_buffered_request_on_routes(
+                    Method::GET,
+                    url,
+                    Vec::new(),
+                    None,
+                    std::slice::from_ref(route_id),
+                )
+                .await
+            }
+            None => {
+                self.execute_buffered_request_with_route(Method::GET, url, Vec::new(), None)
+                    .await
+            }
+        }
+        .context("failed to request /store/index")
     }
 
     fn store_index_request_url(

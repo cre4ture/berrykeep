@@ -216,6 +216,134 @@ async fn store_index_children_retries_the_tree_view_once_on_an_older_node() {
 }
 
 #[tokio::test]
+async fn store_index_children_legacy_capability_is_scoped_to_the_serving_route() {
+    let legacy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("legacy listener should bind");
+    let legacy_address = legacy_listener
+        .local_addr()
+        .expect("legacy listener should expose its address");
+    let legacy_queries = Arc::new(Mutex::new(Vec::new()));
+    let legacy_route_queries = Arc::clone(&legacy_queries);
+    let legacy_router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let legacy_route_queries = Arc::clone(&legacy_route_queries);
+            async move {
+                let query = query.unwrap_or_default();
+                legacy_route_queries.lock().await.push(query.clone());
+                if query.contains("view=children") {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "unknown variant `children`" })),
+                    )
+                        .into_response();
+                }
+
+                Json(serde_json::json!({
+                    "prefix": "docs",
+                    "depth": 1,
+                    "entry_count": 2,
+                    "total_entry_count": 2,
+                    "entries": [
+                        { "path": "docs/", "entry_type": "prefix" },
+                        { "path": "docs/legacy.txt", "entry_type": "key" },
+                    ],
+                }))
+                .into_response()
+            }
+        }),
+    );
+    let legacy_server = tokio::spawn(async move {
+        axum::serve(legacy_listener, legacy_router.into_make_service())
+            .await
+            .expect("legacy fallback server should run");
+    });
+
+    let modern_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("modern listener should bind");
+    let modern_address = modern_listener
+        .local_addr()
+        .expect("modern listener should expose its address");
+    let modern_queries = Arc::new(Mutex::new(Vec::new()));
+    let modern_route_queries = Arc::clone(&modern_queries);
+    let modern_router = Router::new().route(
+        "/api/v1/store/index",
+        get(move |RawQuery(query): RawQuery| {
+            let modern_route_queries = Arc::clone(&modern_route_queries);
+            async move {
+                let query = query.unwrap_or_default();
+                modern_route_queries.lock().await.push(query);
+                Json(serde_json::json!({
+                    "prefix": "docs",
+                    "depth": 1,
+                    "entry_count": 1,
+                    "total_entry_count": 1,
+                    "entries": [
+                        { "path": "docs/modern.txt", "entry_type": "key" },
+                    ],
+                }))
+            }
+        }),
+    );
+    let modern_server = tokio::spawn(async move {
+        axum::serve(modern_listener, modern_router.into_make_service())
+            .await
+            .expect("modern projection server should run");
+    });
+
+    let client = BerryKeepClient::combine(vec![
+        BerryKeepClient::from_direct_base_url(format!("http://{legacy_address}")),
+        BerryKeepClient::from_direct_base_url(format!("http://{modern_address}")),
+    ])
+    .expect("clients should combine");
+    let requested_options = StoreIndexRequestOptions {
+        view: Some(StoreIndexView::Children),
+        offset: Some(0),
+        limit: Some(100),
+        ..StoreIndexRequestOptions::default()
+    };
+
+    let legacy_response = client
+        .store_index_with_options(Some("docs"), 1, None, requested_options.clone())
+        .await
+        .expect("legacy route should use its tree fallback");
+    assert_eq!(legacy_response.entries[0].path, "docs/legacy.txt");
+
+    let modern_endpoint = client
+        .transport_router
+        .endpoints_snapshot()
+        .into_iter()
+        .nth(1)
+        .expect("combined client should retain the modern route");
+    *client
+        .transport_router
+        .endpoints
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![modern_endpoint];
+
+    let modern_response = client
+        .store_index_with_options(Some("docs"), 1, None, requested_options)
+        .await
+        .expect("modern route must retain the children projection");
+    assert_eq!(modern_response.entries[0].path, "docs/modern.txt");
+
+    let legacy_queries = legacy_queries.lock().await.clone();
+    assert_eq!(legacy_queries.len(), 2);
+    assert!(legacy_queries[0].contains("view=children"));
+    assert!(legacy_queries[1].contains("view=tree"));
+    let modern_queries = modern_queries.lock().await.clone();
+    assert_eq!(modern_queries.len(), 1);
+    assert!(modern_queries[0].contains("view=children"));
+    assert!(modern_queries[0].contains("offset=0"));
+    assert!(modern_queries[0].contains("limit=100"));
+
+    legacy_server.abort();
+    modern_server.abort();
+}
+
+#[tokio::test]
 async fn store_index_children_legacy_fallback_synthesizes_only_the_requested_page() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
