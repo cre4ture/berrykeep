@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2607,18 +2607,51 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<Vec<String>> {
         let now_unix = i64::try_from(now_unix).context("repair task due timestamp overflow")?;
         let source_fingerprint = source_fingerprint.to_string();
-        let limit = i64::try_from(limit.max(1)).context("repair task query limit overflow")?;
+        let limit = limit.max(1);
         self.read(move |db| {
             let mut statement = db.prepare(
                 "SELECT manifest_hash FROM content_repair_tasks
-                 WHERE next_attempt_unix <= ?1 OR source_fingerprint != ?2
+                 WHERE next_attempt_unix <= ?1
                  ORDER BY next_attempt_unix ASC, manifest_hash ASC
-                 LIMIT ?3",
+                 LIMIT ?2",
             )?;
-            let mut rows = statement.query(params![now_unix, source_fingerprint, limit])?;
+            let mut rows = statement.query(params![
+                now_unix,
+                i64::try_from(limit).context("repair task query limit overflow")?
+            ])?;
             let mut hashes = Vec::new();
+            let mut seen = HashSet::new();
             while let Some(row) = rows.next()? {
-                hashes.push(row.get(0)?);
+                let hash = row.get::<_, String>(0)?;
+                seen.insert(hash.clone());
+                hashes.push(hash);
+            }
+            drop(rows);
+            drop(statement);
+
+            // A source topology change makes a task eligible before its retry
+            // deadline. Query the two B-tree ranges separately: `!=` would
+            // force a table scan, while each range can stop at this pass's
+            // bounded batch size.
+            for comparison in ["<", ">"] {
+                if hashes.len() >= limit {
+                    break;
+                }
+                let statement = format!(
+                    "SELECT manifest_hash FROM content_repair_tasks \
+                     WHERE source_fingerprint {comparison} ?1 \
+                     ORDER BY source_fingerprint ASC, manifest_hash ASC LIMIT ?2"
+                );
+                let mut statement = db.prepare(&statement)?;
+                let remaining = i64::try_from(limit.saturating_sub(hashes.len()))
+                    .context("repair task query limit overflow")?;
+                let mut rows = statement.query(params![source_fingerprint, remaining])?;
+                while let Some(row) = rows.next()? {
+                    let hash = row.get::<_, String>(0)?;
+                    if seen.insert(hash.clone()) {
+                        hashes.push(hash);
+                    }
+                }
             }
             Ok(hashes)
         })
@@ -5843,8 +5876,13 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     )?;
     backfill_content_repair_task_schedule(db)?;
     db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_due
-         ON content_repair_tasks(next_attempt_unix, source_fingerprint, manifest_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_due_v2
+         ON content_repair_tasks(next_attempt_unix, manifest_hash)",
+        [],
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_source_fingerprint
+         ON content_repair_tasks(source_fingerprint, manifest_hash)",
         [],
     )?;
 

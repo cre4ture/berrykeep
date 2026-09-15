@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -565,20 +565,54 @@ impl MetadataStore for TursoMetadataStore {
         limit: usize,
     ) -> Result<Vec<String>> {
         let now_unix = i64::try_from(now_unix).context("repair task due timestamp overflow")?;
-        let limit = i64::try_from(limit.max(1)).context("repair task query limit overflow")?;
+        let limit = limit.max(1);
         let mut rows = self
             .connection
             .query(
                 "SELECT manifest_hash FROM content_repair_tasks
-                 WHERE next_attempt_unix <= ?1 OR source_fingerprint != ?2
+                 WHERE next_attempt_unix <= ?1
                  ORDER BY next_attempt_unix ASC, manifest_hash ASC
-                 LIMIT ?3",
-                (now_unix, source_fingerprint, limit),
+                 LIMIT ?2",
+                (
+                    now_unix,
+                    i64::try_from(limit).context("repair task query limit overflow")?,
+                ),
             )
             .await?;
         let mut hashes = Vec::new();
+        let mut seen = HashSet::new();
         while let Some(row) = rows.next().await? {
-            hashes.push(row_string(&row, 0, "content_repair_tasks.manifest_hash")?);
+            let hash = row_string(&row, 0, "content_repair_tasks.manifest_hash")?;
+            seen.insert(hash.clone());
+            hashes.push(hash);
+        }
+        drop(rows);
+        // A source topology change makes a task eligible before its retry
+        // deadline. Query the two B-tree ranges separately: `!=` would force
+        // a table scan, while each range stops at this pass's bounded batch.
+        for comparison in ["<", ">"] {
+            if hashes.len() >= limit {
+                break;
+            }
+            let remaining = i64::try_from(limit.saturating_sub(hashes.len()))
+                .context("repair task query limit overflow")?;
+            let mut rows = self
+                .connection
+                .query(
+                    &format!(
+                        "SELECT manifest_hash FROM content_repair_tasks \
+                         WHERE source_fingerprint {comparison} ?1 \
+                         ORDER BY source_fingerprint ASC, manifest_hash ASC LIMIT ?2"
+                    ),
+                    (source_fingerprint, remaining),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let hash = row_string(&row, 0, "content_repair_tasks.manifest_hash")?;
+                if seen.insert(hash.clone()) {
+                    hashes.push(hash);
+                }
+            }
         }
         Ok(hashes)
     }
@@ -3679,8 +3713,15 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
     backfill_content_repair_task_schedule(connection).await?;
     connection
         .execute(
-            "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_due
-             ON content_repair_tasks(next_attempt_unix, source_fingerprint, manifest_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_due_v2
+             ON content_repair_tasks(next_attempt_unix, manifest_hash)",
+            (),
+        )
+        .await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_source_fingerprint
+             ON content_repair_tasks(source_fingerprint, manifest_hash)",
             (),
         )
         .await?;
