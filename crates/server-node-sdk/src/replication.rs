@@ -66,7 +66,7 @@ impl ReplicationRepairReport {
         if waiting_for_source {
             return RepairRunStatus::WaitingForSource;
         }
-        if deferred_transfer && (self.successful_transfers > 0 || chunk_progress) {
+        if deferred_transfer {
             return RepairRunStatus::PartiallyRepaired;
         }
         RepairRunStatus::Completed
@@ -2376,14 +2376,20 @@ mod tests {
     }
 
     #[test]
-    fn repair_status_marks_deferred_transfers_partial_after_other_successes() {
-        for (skipped_backoff, skipped_max_retries) in [(1, 0), (0, 1)] {
+    fn repair_status_marks_deferred_transfers_partial_with_or_without_progress() {
+        for (successful_transfers, skipped_backoff, skipped_max_retries) in
+            [(0, 1, 0), (0, 0, 1), (1, 1, 0), (1, 0, 1)]
+        {
             let mut report = empty_report();
-            report.successful_transfers = 1;
+            report.successful_transfers = successful_transfers;
             report.skipped_backoff = skipped_backoff;
             report.skipped_max_retries = skipped_max_retries;
 
-            assert_eq!(report.run_status(), RepairRunStatus::PartiallyRepaired);
+            assert_eq!(
+                report.run_status(),
+                RepairRunStatus::PartiallyRepaired,
+                "deferred transfer must remain visible with successful_transfers={successful_transfers}"
+            );
         }
     }
 
