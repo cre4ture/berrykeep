@@ -5809,7 +5809,7 @@ impl BerryKeepClient {
             && options.cursor.is_none()
             && options.page_size.is_none();
         if can_fallback_to_tree
-            && let Some(route_id) = self.store_index_children_view_unsupported_route()
+            && let Some(route_id) = self.store_index_children_view_unsupported_route(snapshot)?
         {
             return self
                 .store_index_with_legacy_tree_projection(
@@ -5855,12 +5855,19 @@ impl BerryKeepClient {
         decode_store_index_response(routed_response.response, &options)
     }
 
-    fn store_index_children_view_unsupported_route(&self) -> Option<RouteId> {
+    fn store_index_children_view_unsupported_route(
+        &self,
+        snapshot: Option<&str>,
+    ) -> Result<Option<RouteId>> {
+        let mut url = self.store_index_url()?;
+        append_optional_query(&mut url, "snapshot", snapshot);
         let route_id = self
-            .transport_router
-            .foreground_route_ids()
+            .normalized_request_route_ids(&mut url, None)?
             .into_iter()
-            .next()?;
+            .next();
+        let Some(route_id) = route_id else {
+            return Ok(None);
+        };
         let mut capability = self
             .store_index_children_view_capability
             .lock()
@@ -5873,9 +5880,9 @@ impl BerryKeepClient {
             .unsupported_until_by_route
             .contains_key(&route_id)
         {
-            Some(route_id)
+            Ok(Some(route_id))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -5943,15 +5950,19 @@ impl BerryKeepClient {
         options: &StoreIndexRequestOptions,
         route_id: Option<&RouteId>,
     ) -> Result<RoutedBufferedTransportResponse> {
-        let url = self.store_index_request_url(prefix, depth, snapshot, options)?;
+        let mut url = self.store_index_request_url(prefix, depth, snapshot, options)?;
         match route_id {
             Some(route_id) => {
+                let route_ids = self.normalized_request_route_ids(&mut url, Some(route_id))?;
+                if route_ids.is_empty() {
+                    bail!("no client transport endpoints are available for /store/index");
+                }
                 self.execute_buffered_request_on_routes(
                     Method::GET,
                     url,
                     Vec::new(),
                     None,
-                    std::slice::from_ref(route_id),
+                    &route_ids,
                 )
                 .await
             }
@@ -5961,6 +5972,27 @@ impl BerryKeepClient {
             }
         }
         .context("failed to request /store/index")
+    }
+
+    fn normalized_request_route_ids(
+        &self,
+        url: &mut Url,
+        preferred_route_id: Option<&RouteId>,
+    ) -> Result<Vec<RouteId>> {
+        let snapshot_owner_node_id = normalize_client_snapshot_selector_in_url(url)?;
+        let mut route_ids = match snapshot_owner_node_id {
+            Some(node_id) => self.route_ids_for_target_node(node_id)?,
+            None => self.transport_router.foreground_route_ids(),
+        };
+        if let Some(preferred_route_id) = preferred_route_id
+            && let Some(position) = route_ids
+                .iter()
+                .position(|route_id| route_id == preferred_route_id)
+        {
+            let route_id = route_ids.remove(position);
+            route_ids.insert(0, route_id);
+        }
+        Ok(route_ids)
     }
 
     fn store_index_request_url(

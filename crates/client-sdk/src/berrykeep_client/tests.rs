@@ -225,10 +225,13 @@ async fn store_index_children_legacy_capability_is_scoped_to_the_serving_route()
         .expect("legacy listener should expose its address");
     let legacy_queries = Arc::new(Mutex::new(Vec::new()));
     let legacy_route_queries = Arc::clone(&legacy_queries);
+    let legacy_tree_request_count = Arc::new(AtomicUsize::new(0));
+    let legacy_route_tree_request_count = Arc::clone(&legacy_tree_request_count);
     let legacy_router = Router::new().route(
         "/api/v1/store/index",
         get(move |RawQuery(query): RawQuery| {
             let legacy_route_queries = Arc::clone(&legacy_route_queries);
+            let legacy_route_tree_request_count = Arc::clone(&legacy_route_tree_request_count);
             async move {
                 let query = query.unwrap_or_default();
                 legacy_route_queries.lock().await.push(query.clone());
@@ -238,6 +241,9 @@ async fn store_index_children_legacy_capability_is_scoped_to_the_serving_route()
                         Json(serde_json::json!({ "error": "unknown variant `children`" })),
                     )
                         .into_response();
+                }
+                if legacy_route_tree_request_count.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
 
                 Json(serde_json::json!({
@@ -311,6 +317,12 @@ async fn store_index_children_legacy_capability_is_scoped_to_the_serving_route()
         .expect("legacy route should use its tree fallback");
     assert_eq!(legacy_response.entries[0].path, "docs/legacy.txt");
 
+    let failover_response = client
+        .store_index_with_options(Some("docs"), 1, None, requested_options.clone())
+        .await
+        .expect("cached legacy fallback should retain foreground failover");
+    assert_eq!(failover_response.entries[0].path, "docs/modern.txt");
+
     let modern_endpoint = client
         .transport_router
         .endpoints_snapshot()
@@ -330,14 +342,16 @@ async fn store_index_children_legacy_capability_is_scoped_to_the_serving_route()
     assert_eq!(modern_response.entries[0].path, "docs/modern.txt");
 
     let legacy_queries = legacy_queries.lock().await.clone();
-    assert_eq!(legacy_queries.len(), 2);
+    assert_eq!(legacy_queries.len(), 3);
     assert!(legacy_queries[0].contains("view=children"));
     assert!(legacy_queries[1].contains("view=tree"));
+    assert!(legacy_queries[2].contains("view=tree"));
     let modern_queries = modern_queries.lock().await.clone();
-    assert_eq!(modern_queries.len(), 1);
-    assert!(modern_queries[0].contains("view=children"));
-    assert!(modern_queries[0].contains("offset=0"));
-    assert!(modern_queries[0].contains("limit=100"));
+    assert_eq!(modern_queries.len(), 2);
+    assert!(modern_queries[0].contains("view=tree"));
+    assert!(modern_queries[1].contains("view=children"));
+    assert!(modern_queries[1].contains("offset=0"));
+    assert!(modern_queries[1].contains("limit=100"));
 
     legacy_server.abort();
     modern_server.abort();
@@ -2330,9 +2344,11 @@ struct SnapshotHttpRouteState {
     restore_hits: Arc<AtomicUsize>,
     object_hits: Arc<AtomicUsize>,
     status: StatusCode,
+    reject_children_view: bool,
     response_body: Vec<u8>,
     snapshot_list_body: Vec<u8>,
     last_index_query: Arc<Mutex<Option<String>>>,
+    index_queries: Arc<Mutex<Vec<String>>>,
     last_restore_request: Arc<Mutex<Option<serde_json::Value>>>,
     last_object_query: Arc<Mutex<Option<String>>>,
 }
@@ -2341,6 +2357,33 @@ async fn spawn_snapshot_http_route_server(
     status: StatusCode,
     response_body: Vec<u8>,
     snapshot_list_body: Vec<u8>,
+) -> (String, SnapshotHttpRouteState, tokio::task::JoinHandle<()>) {
+    spawn_snapshot_http_route_server_with_children_view_support(
+        status,
+        response_body,
+        snapshot_list_body,
+        true,
+    )
+    .await
+}
+
+async fn spawn_legacy_snapshot_http_route_server(
+    response_body: Vec<u8>,
+) -> (String, SnapshotHttpRouteState, tokio::task::JoinHandle<()>) {
+    spawn_snapshot_http_route_server_with_children_view_support(
+        StatusCode::OK,
+        response_body,
+        Vec::new(),
+        false,
+    )
+    .await
+}
+
+async fn spawn_snapshot_http_route_server_with_children_view_support(
+    status: StatusCode,
+    response_body: Vec<u8>,
+    snapshot_list_body: Vec<u8>,
+    supports_children_view: bool,
 ) -> (String, SnapshotHttpRouteState, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -2352,9 +2395,11 @@ async fn spawn_snapshot_http_route_server(
         restore_hits: Arc::new(AtomicUsize::new(0)),
         object_hits: Arc::new(AtomicUsize::new(0)),
         status,
+        reject_children_view: !supports_children_view,
         response_body,
         snapshot_list_body,
         last_index_query: Arc::new(Mutex::new(None)),
+        index_queries: Arc::new(Mutex::new(Vec::new())),
         last_restore_request: Arc::new(Mutex::new(None)),
         last_object_query: Arc::new(Mutex::new(None)),
     };
@@ -2366,7 +2411,20 @@ async fn spawn_snapshot_http_route_server(
                     |State(state): State<SnapshotHttpRouteState>,
                      RawQuery(query): RawQuery| async move {
                         state.hits.fetch_add(1, Ordering::SeqCst);
-                        *state.last_index_query.lock().await = query;
+                        let query = query.unwrap_or_default();
+                        *state.last_index_query.lock().await = Some(query.clone());
+                        state.index_queries.lock().await.push(query.clone());
+                        if state.reject_children_view && query.contains("view=children") {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                [(header::CONTENT_TYPE, "application/json")],
+                                serde_json::to_vec(&serde_json::json!({
+                                    "error": "unknown variant `children`"
+                                }))
+                                .expect("legacy error should serialize"),
+                            )
+                                .into_response();
+                        }
                         (
                             state.status,
                             [(header::CONTENT_TYPE, "application/json")],
@@ -6322,6 +6380,57 @@ async fn qualified_snapshot_store_index_targets_owner_and_strips_qualifier() {
         .expect("owner should receive a query");
     assert!(query.contains("snapshot=snapshot-local-7"));
     assert!(!query.contains("snapshot-v1"));
+
+    other_server.abort();
+    owner_server.abort();
+}
+
+#[tokio::test]
+async fn qualified_snapshot_children_fallback_targets_owner_and_strips_qualifier() {
+    let (other_url, other_state, other_server) = spawn_snapshot_http_route_server(
+        StatusCode::OK,
+        snapshot_index_response_body("wrong-node.jpg"),
+        Vec::new(),
+    )
+    .await;
+    let (owner_url, owner_state, owner_server) =
+        spawn_legacy_snapshot_http_route_server(snapshot_index_response_body("snapshot-owner.jpg"))
+            .await;
+    let other_node_id = NodeId::new_v4();
+    let owner_node_id = NodeId::new_v4();
+    let client = BerryKeepClient::combine(vec![
+        direct_http_test_client_for_node(other_url, other_node_id),
+        direct_http_test_client_for_node(owner_url, owner_node_id),
+    ])
+    .expect("combined direct client should build");
+    let selector = client_snapshot_selector(owner_node_id, "snapshot-local-7");
+    let options = StoreIndexRequestOptions {
+        view: Some(StoreIndexView::Children),
+        ..StoreIndexRequestOptions::default()
+    };
+
+    let first_response = client
+        .store_index_with_options(None, 1, Some(&selector), options.clone())
+        .await
+        .expect("qualified snapshot should fall back on its owner");
+    assert_eq!(first_response.entries[0].path, "snapshot-owner.jpg");
+
+    let cached_response = client
+        .store_index_with_options(None, 1, Some(&selector), options)
+        .await
+        .expect("cached fallback should keep targeting the snapshot owner");
+    assert_eq!(cached_response.entries[0].path, "snapshot-owner.jpg");
+
+    assert_eq!(other_state.hits.load(Ordering::SeqCst), 0);
+    let owner_queries = owner_state.index_queries.lock().await.clone();
+    assert_eq!(owner_queries.len(), 3);
+    assert!(owner_queries[0].contains("view=children"));
+    assert!(owner_queries[1].contains("view=tree"));
+    assert!(owner_queries[2].contains("view=tree"));
+    for query in owner_queries {
+        assert!(query.contains("snapshot=snapshot-local-7"));
+        assert!(!query.contains("snapshot-v1"));
+    }
 
     other_server.abort();
     owner_server.abort();
