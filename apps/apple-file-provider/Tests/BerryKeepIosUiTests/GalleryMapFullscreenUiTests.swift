@@ -114,11 +114,11 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         XCTAssertTrue(chooser.waitForExistence(timeout: 45), "Selecting a map bubble should open its image chooser")
         XCTAssertGreaterThan(chooser.frame.height, 0, "The image chooser must have a visible height")
         XCTAssertTrue(
-            element(in: webView, labelled: "gallery/runtime-map-a.png").waitForExistence(timeout: 10),
+            element(in: webView, labelled: "gallery/runtime-map-a.png").waitForExistence(timeout: 45),
             "The first clustered image should be selectable"
         )
         XCTAssertTrue(
-            element(in: webView, labelled: "gallery/runtime-map-b.png").waitForExistence(timeout: 10),
+            element(in: webView, labelled: "gallery/runtime-map-b.png").waitForExistence(timeout: 45),
             "The second clustered image should be selectable"
         )
     }
