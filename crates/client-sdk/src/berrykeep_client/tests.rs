@@ -317,11 +317,11 @@ async fn store_index_children_legacy_capability_is_scoped_to_the_serving_route()
         .expect("legacy route should use its tree fallback");
     assert_eq!(legacy_response.entries[0].path, "docs/legacy.txt");
 
-    let failover_response = client
+    let modern_children_response = client
         .store_index_with_options(Some("docs"), 1, None, requested_options.clone())
         .await
-        .expect("cached legacy fallback should retain foreground failover");
-    assert_eq!(failover_response.entries[0].path, "docs/modern.txt");
+        .expect("a modern route should retain the children projection");
+    assert_eq!(modern_children_response.entries[0].path, "docs/modern.txt");
 
     let modern_endpoint = client
         .transport_router
@@ -342,13 +342,12 @@ async fn store_index_children_legacy_capability_is_scoped_to_the_serving_route()
     assert_eq!(modern_response.entries[0].path, "docs/modern.txt");
 
     let legacy_queries = legacy_queries.lock().await.clone();
-    assert_eq!(legacy_queries.len(), 3);
+    assert_eq!(legacy_queries.len(), 2);
     assert!(legacy_queries[0].contains("view=children"));
     assert!(legacy_queries[1].contains("view=tree"));
-    assert!(legacy_queries[2].contains("view=tree"));
     let modern_queries = modern_queries.lock().await.clone();
     assert_eq!(modern_queries.len(), 2);
-    assert!(modern_queries[0].contains("view=tree"));
+    assert!(modern_queries[0].contains("view=children"));
     assert!(modern_queries[1].contains("view=children"));
     assert!(modern_queries[1].contains("offset=0"));
     assert!(modern_queries[1].contains("limit=100"));

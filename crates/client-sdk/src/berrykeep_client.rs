@@ -235,6 +235,12 @@ struct StoreIndexChildrenViewCapability {
     unsupported_until_by_route: HashMap<RouteId, Instant>,
 }
 
+#[derive(Debug)]
+enum StoreIndexChildrenViewRoutePlan {
+    Children(Option<RouteId>),
+    LegacyTree(RouteId),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WebServiceSummary {
@@ -5808,22 +5814,33 @@ impl BerryKeepClient {
         let can_fallback_to_tree = options.view == Some(StoreIndexView::Children)
             && options.cursor.is_none()
             && options.page_size.is_none();
-        if can_fallback_to_tree
-            && let Some(route_id) = self.store_index_children_view_unsupported_route(snapshot)?
-        {
-            return self
-                .store_index_with_legacy_tree_projection(
-                    prefix,
-                    depth,
-                    snapshot,
-                    &options,
-                    Some(&route_id),
-                )
-                .await;
-        }
+        let preferred_children_route = if can_fallback_to_tree {
+            match self.store_index_children_view_route_plan(snapshot)? {
+                StoreIndexChildrenViewRoutePlan::Children(route_id) => route_id,
+                StoreIndexChildrenViewRoutePlan::LegacyTree(route_id) => {
+                    return self
+                        .store_index_with_legacy_tree_projection(
+                            prefix,
+                            depth,
+                            snapshot,
+                            &options,
+                            Some(&route_id),
+                        )
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
 
         let routed_response = self
-            .request_store_index(prefix, depth, snapshot, &options)
+            .request_store_index_on_route(
+                prefix,
+                depth,
+                snapshot,
+                &options,
+                preferred_children_route.as_ref(),
+            )
             .await?;
 
         // `children` was introduced after the original tree projection. Older
@@ -5855,19 +5872,13 @@ impl BerryKeepClient {
         decode_store_index_response(routed_response.response, &options)
     }
 
-    fn store_index_children_view_unsupported_route(
+    fn store_index_children_view_route_plan(
         &self,
         snapshot: Option<&str>,
-    ) -> Result<Option<RouteId>> {
+    ) -> Result<StoreIndexChildrenViewRoutePlan> {
         let mut url = self.store_index_url()?;
         append_optional_query(&mut url, "snapshot", snapshot);
-        let route_id = self
-            .normalized_request_route_ids(&mut url, None)?
-            .into_iter()
-            .next();
-        let Some(route_id) = route_id else {
-            return Ok(None);
-        };
+        let route_ids = self.normalized_request_route_ids(&mut url, None)?;
         let mut capability = self
             .store_index_children_view_capability
             .lock()
@@ -5876,14 +5887,20 @@ impl BerryKeepClient {
         capability
             .unsupported_until_by_route
             .retain(|_, unsupported_until| now < *unsupported_until);
-        if capability
-            .unsupported_until_by_route
-            .contains_key(&route_id)
-        {
-            Ok(Some(route_id))
-        } else {
-            Ok(None)
+        if let Some(route_id) = route_ids.iter().find(|route_id| {
+            !capability
+                .unsupported_until_by_route
+                .contains_key(*route_id)
+        }) {
+            return Ok(StoreIndexChildrenViewRoutePlan::Children(Some(
+                route_id.clone(),
+            )));
         }
+        Ok(route_ids
+            .into_iter()
+            .next()
+            .map(StoreIndexChildrenViewRoutePlan::LegacyTree)
+            .unwrap_or(StoreIndexChildrenViewRoutePlan::Children(None)))
     }
 
     fn remember_store_index_children_view_is_unsupported(&self, route_id: &RouteId) {
@@ -5929,17 +5946,6 @@ impl BerryKeepClient {
         let mut response = project_store_index_children_response(&response, prefix, options);
         synthesize_missing_folder_markers_for_page(&mut response, options);
         Ok(response)
-    }
-
-    async fn request_store_index(
-        &self,
-        prefix: Option<&str>,
-        depth: usize,
-        snapshot: Option<&str>,
-        options: &StoreIndexRequestOptions,
-    ) -> Result<RoutedBufferedTransportResponse> {
-        self.request_store_index_on_route(prefix, depth, snapshot, options, None)
-            .await
     }
 
     async fn request_store_index_on_route(
