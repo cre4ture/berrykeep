@@ -1,4 +1,4 @@
-import { HttpError, fetchJson, isHttpErrorStatus } from "../shared/http";
+import { fetchJson, isHttpErrorStatus } from "../shared/http";
 import {
   galleryMapClusterCellSizeParameter,
   galleryMapClusterZoomParameters
@@ -120,8 +120,6 @@ const galleryMapEndpointPaths = {
 } as const;
 
 const galleryMapEndpointRoutes = new Map<GalleryMapEndpoint, "canonical" | "legacy">();
-const STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS = 5 * 60 * 1_000;
-let storeIndexChildrenViewUnsupportedUntil = 0;
 
 function apiV1(path: string): string {
   return `${API_V1_PREFIX}${path}`;
@@ -356,107 +354,6 @@ export async function listAdminStoreEntries(
   options: StoreListRequestOptions = {}
 ): Promise<AdminStoreListResponse> {
   const view: StoreListView = options.view ?? "tree";
-  if (view === "children" && Date.now() >= storeIndexChildrenViewUnsupportedUntil) {
-    storeIndexChildrenViewUnsupportedUntil = 0;
-  }
-  if (view === "children" && Date.now() < storeIndexChildrenViewUnsupportedUntil) {
-    return fetchAdminStoreIndexLegacyChildrenProjection(
-      prefix,
-      depth,
-      snapshot,
-      adminTokenOverride,
-      options
-    );
-  }
-  try {
-    return await fetchAdminStoreEntries(
-      prefix,
-      depth,
-      snapshot,
-      adminTokenOverride,
-      options,
-      view,
-      true
-    );
-  } catch (error) {
-    if (view !== "children" || !storeIndexViewWasRejected(error, view)) {
-      throw error;
-    }
-
-    storeIndexChildrenViewUnsupportedUntil =
-      Date.now() + STORE_INDEX_CHILDREN_VIEW_REPROBE_AFTER_MS;
-    return fetchAdminStoreIndexLegacyChildrenProjection(
-      prefix,
-      depth,
-      snapshot,
-      adminTokenOverride,
-      options
-    );
-  }
-}
-
-async function fetchAdminStoreIndexLegacyChildrenProjection(
-  prefix: string | undefined,
-  depth: number,
-  snapshot: string | null | undefined,
-  adminTokenOverride: string | undefined,
-  options: StoreListRequestOptions
-): Promise<AdminStoreListResponse> {
-  // An older node's consistency token is process-local, so it cannot validate
-  // a complete cached tree after request routing changes or a node restart.
-  // Keep only the rejected-capability cache and fetch fresh legacy tree data.
-  const treeResponse = await fetchAdminStoreEntries(
-    prefix,
-    depth,
-    snapshot,
-    adminTokenOverride,
-    options,
-    "tree",
-    false
-  );
-  return projectAdminStoreIndexChildren(treeResponse, prefix, options);
-}
-
-function storeIndexViewWasRejected(error: unknown, requestedView: StoreListView): boolean {
-  if (!(error instanceof HttpError) || error.status !== 400) {
-    return false;
-  }
-
-  const payload =
-    typeof error.payload === "string" ? error.payload : JSON.stringify(error.payload ?? null);
-  return payload.includes("unknown variant") && payload.includes(requestedView);
-}
-
-async function fetchAdminStoreEntries(
-  prefix: string | undefined,
-  depth: number,
-  snapshot: string | null | undefined,
-  adminTokenOverride: string | undefined,
-  options: StoreListRequestOptions,
-  view: StoreListView,
-  includePagination: boolean
-): Promise<AdminStoreListResponse> {
-  const query = buildAdminStoreEntriesQuery(
-    prefix,
-    depth,
-    snapshot,
-    options,
-    view,
-    includePagination
-  );
-  return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
-    adminTokenOverride
-  });
-}
-
-function buildAdminStoreEntriesQuery(
-  prefix: string | undefined,
-  depth: number,
-  snapshot: string | null | undefined,
-  options: StoreListRequestOptions,
-  view: StoreListView,
-  includePagination: boolean
-): URLSearchParams {
   const query = new URLSearchParams({
     depth: String(Math.max(1, depth))
   });
@@ -467,20 +364,10 @@ function buildAdminStoreEntriesQuery(
     query.set("snapshot", snapshot.trim());
   }
   query.set("view", view);
-  if (
-    includePagination &&
-    typeof options.offset === "number" &&
-    Number.isFinite(options.offset) &&
-    options.offset >= 0
-  ) {
+  if (typeof options.offset === "number" && Number.isFinite(options.offset) && options.offset >= 0) {
     query.set("offset", String(Math.floor(options.offset)));
   }
-  if (
-    includePagination &&
-    typeof options.limit === "number" &&
-    Number.isFinite(options.limit) &&
-    options.limit > 0
-  ) {
+  if (typeof options.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
     query.set("limit", String(Math.max(1, Math.floor(options.limit))));
   }
   if (options.sort) {
@@ -503,71 +390,9 @@ function buildAdminStoreEntriesQuery(
   }
   appendLabelFilter(query, "require_labels", options.requireLabels);
   appendLabelFilter(query, "exclude_labels", options.excludeLabels);
-  return query;
-}
-
-function projectAdminStoreIndexChildren(
-  response: AdminStoreListResponse,
-  prefix: string | undefined,
-  options: StoreListRequestOptions
-): AdminStoreListResponse {
-  const normalizedPrefix = prefix ? normalizeStoreIndexPath(prefix) : "";
-  const offset = normalizedStoreIndexOffset(options.offset);
-  const limit = normalizedStoreIndexLimit(options.limit);
-  const isVisibleEntry = (entry: AdminStoreListResponse["entries"][number]) =>
-    !normalizedPrefix || normalizeStoreIndexPath(entry.path) !== normalizedPrefix;
-  const totalEntryCount = response.entries.reduce(
-    (count, entry) => count + (isVisibleEntry(entry) ? 1 : 0),
-    0
-  );
-  const pageEnd = limit === null ? totalEntryCount : Math.min(totalEntryCount, offset + limit);
-  const pageEntries: AdminStoreListResponse["entries"] = [];
-  let visibleEntryIndex = 0;
-  for (const entry of response.entries) {
-    if (!isVisibleEntry(entry)) {
-      continue;
-    }
-    if (visibleEntryIndex >= offset && visibleEntryIndex < pageEnd) {
-      pageEntries.push(entry);
-    }
-    visibleEntryIndex += 1;
-  }
-
-  return {
-    ...response,
-    entries: pageEntries,
-    entry_count: pageEntries.length,
-    total_entry_count: totalEntryCount,
-    offset,
-    limit,
-    has_more: pageEnd < totalEntryCount,
-    next_cursor: null
-  };
-}
-
-function normalizeStoreIndexPath(path: string): string {
-  const trimmed = path.trim();
-  let start = 0;
-  let end = trimmed.length;
-  while (start < end && trimmed.charCodeAt(start) === 47) {
-    start += 1;
-  }
-  while (end > start && trimmed.charCodeAt(end - 1) === 47) {
-    end -= 1;
-  }
-  return trimmed.slice(start, end);
-}
-
-function normalizedStoreIndexOffset(offset: number | undefined): number {
-  return typeof offset === "number" && Number.isFinite(offset) && offset >= 0
-    ? Math.floor(offset)
-    : 0;
-}
-
-function normalizedStoreIndexLimit(limit: number | undefined): number | null {
-  return typeof limit === "number" && Number.isFinite(limit) && limit > 0
-    ? Math.max(1, Math.floor(limit))
-    : null;
+  return fetchAdminJson<AdminStoreListResponse>(`${apiV1("/auth/store/index")}?${query.toString()}`, {
+    adminTokenOverride
+  });
 }
 
 export async function listAdminStoreHistoryEntries(
