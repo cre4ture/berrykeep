@@ -520,7 +520,7 @@ jobs:
 
       - name: Resolve iOS Simulator destination
         run: |
-          DESTINATION="$(BERRYKEEP_IOS_SIMULATOR_APP_BUNDLE_ID=dev.ironmesh.apple.iosapp BERRYKEEP_IOS_SIMULATOR_RESET=1 apps/apple-file-provider/scripts/prepare-ios-simulator.sh "$IOS_PROJECT_PATH" "$IOS_TEST_SCHEME")"
+          DESTINATION="$(BERRYKEEP_IOS_SIMULATOR_APP_BUNDLE_ID=dev.berrykeep.apple.iosapp BERRYKEEP_IOS_SIMULATOR_RESET=1 apps/apple-file-provider/scripts/prepare-ios-simulator.sh "$IOS_PROJECT_PATH" "$IOS_TEST_SCHEME")"
           echo "IOS_SIMULATOR_DESTINATION=${DESTINATION}" >> "$GITHUB_ENV"
 
       - name: Run iOS simulator tests
@@ -590,9 +590,9 @@ jobs:
             <string>${BERRYKEEP_IOS_EXPORT_METHOD}</string>
             <key>provisioningProfiles</key>
             <dict>
-              <key>dev.ironmesh.apple.iosapp</key>
+              <key>dev.berrykeep.apple.iosapp</key>
               <string>${BERRYKEEP_IOS_APP_PROFILE_UUID}</string>
-              <key>dev.ironmesh.apple.iosapp.fileprovider</key>
+              <key>dev.berrykeep.apple.iosapp.fileprovider</key>
               <string>${BERRYKEEP_IOS_EXTENSION_PROFILE_UUID}</string>
             </dict>
             <key>signingStyle</key>

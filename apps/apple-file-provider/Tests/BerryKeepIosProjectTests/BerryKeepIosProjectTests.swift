@@ -98,7 +98,7 @@ final class BerryKeepIosProjectTests: XCTestCase {
             manager: MockFileProviderDomainManager()
         )
 
-        let state = await coordinator.refresh(expectedIdentifier: "dev.ironmesh.default")
+        let state = await coordinator.refresh(expectedIdentifier: "dev.berrykeep.default")
 
         XCTAssertEqual(state, .missing)
     }
@@ -108,7 +108,7 @@ final class BerryKeepIosProjectTests: XCTestCase {
         let coordinator = AppleFileProviderDomainCoordinator(manager: manager)
 
         let result = await coordinator.register(
-            identifier: "dev.ironmesh.default",
+            identifier: "dev.berrykeep.default",
             displayName: "BerryKeep"
         )
 
@@ -116,14 +116,14 @@ final class BerryKeepIosProjectTests: XCTestCase {
             result,
             AppleFileProviderDomainRegistrationResult(
                 state: .registered(displayName: "BerryKeep"),
-                identifier: "dev.ironmesh.default",
+                identifier: "dev.berrykeep.default",
                 wasCreated: true
             )
         )
         let addedDomains = await manager.recordedAdds()
         XCTAssertEqual(
             addedDomains,
-            [AppleRegisteredFileProviderDomain(identifier: "dev.ironmesh.default", displayName: "BerryKeep")]
+            [AppleRegisteredFileProviderDomain(identifier: "dev.berrykeep.default", displayName: "BerryKeep")]
         )
     }
 
@@ -131,7 +131,7 @@ final class BerryKeepIosProjectTests: XCTestCase {
         let manager = MockFileProviderDomainManager(
             domainsToReturn: [
                 AppleRegisteredFileProviderDomain(
-                    identifier: "dev.ironmesh.default",
+                    identifier: "dev.berrykeep.default",
                     displayName: "Existing BerryKeep"
                 )
             ]
@@ -139,7 +139,7 @@ final class BerryKeepIosProjectTests: XCTestCase {
         let coordinator = AppleFileProviderDomainCoordinator(manager: manager)
 
         let result = await coordinator.register(
-            identifier: "dev.ironmesh.default",
+            identifier: "dev.berrykeep.default",
             displayName: "BerryKeep"
         )
 
@@ -147,7 +147,7 @@ final class BerryKeepIosProjectTests: XCTestCase {
             result,
             AppleFileProviderDomainRegistrationResult(
                 state: .registered(displayName: "Existing BerryKeep"),
-                identifier: "dev.ironmesh.default",
+                identifier: "dev.berrykeep.default",
                 wasCreated: false
             )
         )
@@ -160,7 +160,7 @@ final class BerryKeepIosProjectTests: XCTestCase {
             addError: MockDomainError("Domain already exists."),
             postAddDomains: [
                 AppleRegisteredFileProviderDomain(
-                    identifier: "dev.ironmesh.default",
+                    identifier: "dev.berrykeep.default",
                     displayName: "BerryKeep"
                 )
             ]
@@ -168,7 +168,7 @@ final class BerryKeepIosProjectTests: XCTestCase {
         let coordinator = AppleFileProviderDomainCoordinator(manager: manager)
 
         let result = await coordinator.register(
-            identifier: "dev.ironmesh.default",
+            identifier: "dev.berrykeep.default",
             displayName: "BerryKeep"
         )
 
@@ -176,7 +176,7 @@ final class BerryKeepIosProjectTests: XCTestCase {
             result,
             AppleFileProviderDomainRegistrationResult(
                 state: .registered(displayName: "BerryKeep"),
-                identifier: "dev.ironmesh.default",
+                identifier: "dev.berrykeep.default",
                 wasCreated: false
             )
         )

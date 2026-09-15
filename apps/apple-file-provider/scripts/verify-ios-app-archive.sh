@@ -10,7 +10,7 @@ ARCHIVE_PATH="$1"
 APP_PATH="$ARCHIVE_PATH/Products/Applications/BerryKeepIosApp.app"
 EXTENSION_PATH="$APP_PATH/PlugIns/BerryKeepIosFileProviderExtension.appex"
 EXTENSION_INFO_PLIST="$EXTENSION_PATH/Info.plist"
-EXPECTED_EXTENSION_BUNDLE_ID="dev.ironmesh.apple.iosapp.fileprovider"
+EXPECTED_EXTENSION_BUNDLE_ID="dev.berrykeep.apple.iosapp.fileprovider"
 PLIST_BUDDY="/usr/libexec/PlistBuddy"
 
 fail() {
