@@ -595,6 +595,9 @@ async fn repair_subjects_inner(
     }
     let availability_may_have_changed = !tasks.is_empty();
     for (index, mut task) in tasks.into_values().enumerate() {
+        // Do not hold a manifest claim while waiting for foreground load to
+        // drain: foreground pulls need that same claim to make progress.
+        await_repair_busy_threshold(state).await;
         let Some(_claim) = state
             .maintenance
             .content_repair_claims
@@ -663,7 +666,6 @@ async fn repair_subjects_inner(
         }
         task.source_fingerprint = fingerprint.clone();
         report.attempted_transfers += 1;
-        await_repair_busy_threshold(state).await;
         let recovered_before_attempt = task.recovered_chunks;
         match recover_task(state, &mut task).await {
             Ok(recovered) => {

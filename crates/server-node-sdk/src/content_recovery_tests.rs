@@ -406,6 +406,15 @@ async fn recovery_targeted_repair_respects_busy_throttle_impl(backend: MainTestB
             .is_err(),
         "targeted retained-content recovery ignored the busy throttle"
     );
+    let claim = target
+        .maintenance
+        .content_repair_claims
+        .try_claim(&manifest.manifest_hash);
+    assert!(
+        claim.is_some(),
+        "a busy-throttled repair must not block a foreground pull's manifest claim"
+    );
+    drop(claim);
     inflight.store(0, std::sync::atomic::Ordering::Relaxed);
     let report = repair.await;
     assert_eq!(report.successful_transfers, 1, "{report:?}");
