@@ -2,9 +2,9 @@ export class HttpError extends Error {
   readonly status: number;
   readonly payload: unknown;
 
-  constructor(status: number, payload: unknown) {
+  constructor(status: number, payload: unknown, messagePayload = payload) {
     super(
-      `HTTP ${status}: ${JSON.stringify(payload ?? { message: "no JSON body returned" })}`
+      `HTTP ${status}: ${JSON.stringify(messagePayload ?? { message: "no JSON body returned" })}`
     );
     this.name = "HttpError";
     this.status = status;
@@ -32,12 +32,14 @@ export async function fetchJson<T>(
 
   const text = await response.text();
   let payload: unknown = null;
+  let isPlainTextError = false;
   if (text) {
     try {
       payload = JSON.parse(text);
     } catch {
-      // Preserve enough plain-text detail for narrow compatibility probes,
-      // without rendering a complete proxy error page in a UI error banner.
+      // Compatibility probes need this detail, but it must not become a
+      // user-visible error message for arbitrary upstream responses.
+      isPlainTextError = true;
       payload =
         text.length > NON_JSON_ERROR_PAYLOAD_MAX_LENGTH
           ? `${text.slice(0, NON_JSON_ERROR_PAYLOAD_MAX_LENGTH)}…`
@@ -45,5 +47,5 @@ export async function fetchJson<T>(
     }
   }
 
-  throw new HttpError(response.status, payload);
+  throw new HttpError(response.status, payload, isPlainTextError ? null : payload);
 }

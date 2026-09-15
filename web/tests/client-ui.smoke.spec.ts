@@ -95,7 +95,8 @@ test("shared fetch helper bounds plain-text error payloads", async () => {
     const httpError = error as HttpError;
     const excerpt = `${errorBody.slice(0, 512)}…`;
     expect(httpError.payload).toBe(excerpt);
-    expect(httpError.message).toContain("unknown variant `children`");
+    expect(httpError.message).toBe('HTTP 400: {"message":"no JSON body returned"}');
+    expect(httpError.message).not.toContain("unknown variant `children`");
     expect(httpError.message).not.toContain(omittedTail);
   } finally {
     await new Promise<void>((resolve, reject) => {
@@ -467,7 +468,7 @@ async function androidShareMessages(page: Page): Promise<string[]> {
 }
 
 test("client-ui smoke flow renders and performs core operations", async ({ page }) => {
-  test.setTimeout(180_000);
+  test.setTimeout(75_000);
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
     origin: "http://127.0.0.1:4174"
   });
@@ -554,10 +555,9 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
   await expect(page.getByText("images/beta.bin", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /Uploads 0\/2|Uploads 1\/2|Uploads 2\/2/ })).toBeVisible();
   await expect(page.getByText(/Starting|Uploading/).first()).toBeVisible();
-  await page
-    .getByRole("row", { name: /alpha\.bin/ })
-    .getByRole("button", { name: "Cancel" })
-    .click();
+  const alphaUploadRow = page.getByRole("row", { name: /alpha\.bin/ });
+  await alphaUploadRow.getByRole("button", { name: "Cancel" }).click();
+  await expect(alphaUploadRow).toContainText("Canceled");
   await expect.poll(() => uploadMetrics.deletedUploadSessionIds()).toContain("upload-1");
   await page.locator('input[type="file"]').setInputFiles({
     name: "gamma.bin",
