@@ -139,14 +139,30 @@ async fn durable_recovery_replaces_same_size_corrupt_chunks_impl(backend: MainTe
     let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
     register_online_source_node(&target, &source, &url).await;
 
-    let report = crate::replication::execute_targeted_replication_repair_inner(
+    let repair_run_id = "targeted-recovery-observability";
+    let report = crate::replication::execute_targeted_replication_repair_inner_with_context(
         &target,
         vec![format!("{key}@v1")],
         None,
+        Some(repair_run_id),
     )
     .await;
 
     assert_eq!(report.successful_transfers, 1, "{report:?}");
+    for event in ["targeted_repair_started", "targeted_repair_finished"] {
+        assert!(
+            report.detailed_log.iter().any(|entry| {
+                entry.event == event
+                    && entry
+                        .context
+                        .as_ref()
+                        .and_then(|context| context.get("repair_run_id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(repair_run_id)
+            }),
+            "missing run-scoped lifecycle event {event}: {report:?}"
+        );
+    }
     assert_eq!(
         read_store(&target, "test.recovery.same_size_result")
             .await
