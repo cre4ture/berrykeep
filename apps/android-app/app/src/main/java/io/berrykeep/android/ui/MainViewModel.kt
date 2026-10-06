@@ -111,6 +111,7 @@ class MainViewModel(
     private val titleLatencyNativeControlMutex = ProcessTitleLatencyNativeControl.mutex
     private val titleLatencyNativeControlGate = ProcessTitleLatencyNativeControl.gate
     private val webUiNativeLifecycle = ProcessWebUiNativeLifecycle.coordinator
+    private val webUiStartLoadingOwnership = WebUiStartLoadingOwnership()
     private val clearedWebUiCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
@@ -1323,6 +1324,7 @@ class MainViewModel(
             uiState.value = uiState.value.copy(status = "Web UI ready.")
             return
         }
+        webUiStartLoadingOwnership.begin(operationGeneration)
         uiState.value = uiState.value.copy(
             loading = true,
             webUiSession = null,
@@ -1331,21 +1333,25 @@ class MainViewModel(
         viewModelScope.launch {
             val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
                 .getOrElse { error ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        webUiSession = null,
-                        status = "Device identity unavailable: ${error.message}",
-                    )
+                    finishWebUiStartIfOwner(operationGeneration) {
+                        it.copy(
+                            loading = false,
+                            webUiSession = null,
+                            status = "Device identity unavailable: ${error.message}",
+                        )
+                    }
                     return@launch
                 }
             val connectionInput = deviceAuth.connectionBootstrapJson()
             val clientIdentityJson = deviceAuth.toClientIdentityJson()
             if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-                uiState.value = uiState.value.copy(
-                    loading = false,
-                    webUiSession = null,
-                    status = "Enroll this device before opening the Web UI.",
-                )
+                finishWebUiStartIfOwner(operationGeneration) {
+                    it.copy(
+                        loading = false,
+                        webUiSession = null,
+                        status = "Enroll this device before opening the Web UI.",
+                    )
+                }
                 return@launch
             }
             var startedSession: EmbeddedWebUiSession? = null
@@ -1360,6 +1366,9 @@ class MainViewModel(
                     }
                 }
                 if (!started || !webUiNativeLifecycle.isCurrent(operationGeneration)) {
+                    finishWebUiStartIfOwner(operationGeneration) { state ->
+                        state.copy(loading = false)
+                    }
                     return@launch
                 }
                 Result.success(requireNotNull(startedSession))
@@ -1369,31 +1378,55 @@ class MainViewModel(
                 Result.failure(error)
             }
             if (!webUiNativeLifecycle.isCurrent(operationGeneration)) {
+                finishWebUiStartIfOwner(operationGeneration) { state ->
+                    state.copy(loading = false)
+                }
                 return@launch
             }
             runCatching { refreshPersistedDeviceAuthState() }
                 .onFailure { error ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        status = "Device identity unavailable: ${error.message}",
-                    )
+                    finishWebUiStartIfOwner(operationGeneration) {
+                        it.copy(
+                            loading = false,
+                            status = "Device identity unavailable: ${error.message}",
+                        )
+                    }
                     return@launch
                 }
+            if (!webUiNativeLifecycle.isCurrent(operationGeneration)) {
+                finishWebUiStartIfOwner(operationGeneration) { state ->
+                    state.copy(loading = false)
+                }
+                return@launch
+            }
             result
                 .onSuccess { session ->
-                    EmbeddedWebUiSessionRegistry.activate(session)
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        webUiSession = session,
-                        status = "Web UI ready.",
-                    )
+                    finishWebUiStartIfOwner(operationGeneration) {
+                        EmbeddedWebUiSessionRegistry.activate(session)
+                        it.copy(
+                            loading = false,
+                            webUiSession = session,
+                            status = "Web UI ready.",
+                        )
+                    }
                 }
                 .onFailure { error ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        status = "Error: ${error.message}",
-                    )
+                    finishWebUiStartIfOwner(operationGeneration) {
+                        it.copy(
+                            loading = false,
+                            status = "Error: ${error.message}",
+                        )
+                    }
                 }
+        }
+    }
+
+    private fun finishWebUiStartIfOwner(
+        operationGeneration: Long,
+        update: (MainUiState) -> MainUiState,
+    ) {
+        if (webUiStartLoadingOwnership.releaseIfOwner(operationGeneration)) {
+            uiState.value = update(uiState.value)
         }
     }
 
