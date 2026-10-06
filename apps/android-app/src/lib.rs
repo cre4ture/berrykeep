@@ -522,6 +522,55 @@ mod tests {
     }
 
     #[test]
+    fn folder_sync_registration_stops_an_unregistered_worker_when_manager_is_poisoned() {
+        let lifecycle = Arc::new(AndroidFolderSyncLifecycle::new());
+        let lifecycle_to_poison = lifecycle.clone();
+        assert!(
+            thread::spawn(move || {
+                let _manager = lifecycle_to_poison
+                    .manager
+                    .lock()
+                    .expect("manager must be lockable before poisoning");
+                panic!("poison manager lock");
+            })
+            .join()
+            .is_err()
+        );
+
+        let running = Arc::new(AtomicBool::new(true));
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let worker_running = running.clone();
+        let worker = thread::spawn(move || {
+            while worker_running.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            stopped_tx
+                .send(())
+                .expect("test must observe worker cancellation");
+        });
+
+        let error = register_folder_sync_run(
+            &lifecycle.manager,
+            "photos".to_string(),
+            AndroidFolderSyncRun {
+                running,
+                thread: worker,
+            },
+        )
+        .expect_err("poisoned manager must reject run registration");
+
+        assert!(
+            error
+                .to_string()
+                .contains("folder sync manager lock poisoned")
+        );
+        stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("registration failure must stop the unregistered worker");
+        assert!(!lifecycle.has_active_profiles());
+    }
+
+    #[test]
     fn android_client_rejects_legacy_direct_server_url() {
         let error = normalized_bootstrap_json("https://storage.example.test")
             .expect_err("a direct server URL must not be accepted as app configuration");
@@ -1495,12 +1544,7 @@ impl AndroidFolderSyncLifecycle {
         }
 
         let run = start_folder_sync_run(&self.status, profile_id.clone(), label, options)?;
-        self.manager
-            .lock()
-            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-            .runs
-            .insert(profile_id, run);
-        Ok(())
+        register_folder_sync_run(&self.manager, profile_id, run)
     }
 
     fn stop_profile(&self, profile_id: &str) -> Result<()> {
@@ -1691,6 +1735,24 @@ fn start_folder_sync_run(
         .context("failed to spawn continuous folder sync thread")?;
 
     Ok(AndroidFolderSyncRun { running, thread })
+}
+
+fn register_folder_sync_run(
+    manager: &Mutex<AndroidFolderSyncManager>,
+    profile_id: String,
+    run: AndroidFolderSyncRun,
+) -> Result<()> {
+    match manager.lock() {
+        Ok(mut manager) => {
+            manager.runs.insert(profile_id, run);
+            Ok(())
+        }
+        Err(_) => {
+            // An unregistered run cannot be reached by stop_profile or stop_all.
+            stop_folder_sync_run(run);
+            Err(anyhow::anyhow!("folder sync manager lock poisoned"))
+        }
+    }
 }
 
 fn folder_sync_lifecycle() -> &'static AndroidFolderSyncLifecycle {
