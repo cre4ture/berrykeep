@@ -1643,30 +1643,30 @@ impl AndroidFolderSyncLifecycle {
             .lock()
             .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
             .take_run_for_stop(&profile_id);
-        let replacing_active_profile = previous.is_some();
         if let Some(previous) = previous {
             stop_folder_sync_run(previous);
         }
+        self.manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .stopping_profiles
+            .insert(profile_id.clone());
 
         let run = match start_folder_sync_run(&self.status, profile_id.clone(), label, options) {
             Ok(run) => run,
             Err(error) => {
-                if replacing_active_profile {
-                    self.manager
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-                        .finished_stopping(&profile_id);
-                }
+                self.manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+                    .finished_stopping(&profile_id);
                 return Err(error);
             }
         };
         register_folder_sync_run(&self.manager, profile_id.clone(), run)?;
-        if replacing_active_profile {
-            self.manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-                .finished_stopping(&profile_id);
-        }
+        self.manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .finished_stopping(&profile_id);
         Ok(())
     }
 
