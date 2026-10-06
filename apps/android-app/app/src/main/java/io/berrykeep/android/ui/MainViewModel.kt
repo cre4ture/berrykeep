@@ -1527,6 +1527,7 @@ class MainViewModel(
             try {
                 withContext(Dispatchers.IO) {
                     EmbeddedWebUiSessionRegistry.clear()
+                    webUiNativeLifecycle.invalidatePendingOperations()
                     webUiNativeLifecycle.run {
                         repository.stopWebUi()
                     }

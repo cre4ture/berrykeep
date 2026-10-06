@@ -60,4 +60,38 @@ class NativeLifecycleOperationCoordinatorTest {
         assertFalse(stopRan)
         assertTrue(startRan)
     }
+
+    @Test
+    fun invalidatePendingOperations_preventsAnInFlightStartFromPublishingAfterForcedStop() =
+        runTest {
+            val coordinator = NativeLifecycleOperationCoordinator()
+            val startGeneration = coordinator.nextGeneration()
+            val startEntered = CompletableDeferred<Unit>()
+            val allowStartToFinish = CompletableDeferred<Unit>()
+            var forcedStopRan = false
+
+            val start = async {
+                coordinator.runIfCurrent(startGeneration) {
+                    startEntered.complete(Unit)
+                    allowStartToFinish.await()
+                }
+            }
+            startEntered.await()
+
+            coordinator.invalidatePendingOperations()
+            val forcedStop = async {
+                coordinator.run {
+                    forcedStopRan = true
+                }
+            }
+            assertFalse(forcedStop.isCompleted)
+            allowStartToFinish.complete(Unit)
+            assertTrue(start.await())
+            forcedStop.await()
+
+            val staleStartPublished = coordinator.isCurrent(startGeneration)
+
+            assertTrue(forcedStopRan)
+            assertFalse(staleStartPublished)
+        }
 }

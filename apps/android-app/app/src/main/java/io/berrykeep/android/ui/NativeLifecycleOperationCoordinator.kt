@@ -14,6 +14,11 @@ internal class NativeLifecycleOperationCoordinator {
 
     fun nextGeneration(): Long = latestOperation.next()
 
+    /** Invalidates an in-flight result before a forced lifecycle transition. */
+    fun invalidatePendingOperations() {
+        latestOperation.next()
+    }
+
     fun isCurrent(generation: Long): Boolean = latestOperation.isCurrent(generation)
 
     suspend fun <T> run(operation: suspend () -> T): T = operationMutex.withLock {
