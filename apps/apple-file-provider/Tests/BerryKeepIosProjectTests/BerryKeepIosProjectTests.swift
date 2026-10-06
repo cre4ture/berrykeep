@@ -264,7 +264,7 @@ final class BerryKeepIosProjectTests: XCTestCase {
         XCTAssertTrue(operations.isEmpty)
     }
 
-    func testRegisteredProfilesDeduplicatesLegacyDomainsDeterministically() async throws {
+    func testRegisteredProfilesDeduplicatesDomainsDeterministically() async throws {
         let profile = AppleSyncProfile(id: "duplicate", displayName: "Duplicate")
         let manager = MockFileProviderDomainManager(
             domainsToReturn: [

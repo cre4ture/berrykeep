@@ -78,16 +78,16 @@ ci-required:
     just ci-web-smoke
     just static-server-node-x86-64
     just test-system-nightly
-    if [[ "$$(uname -s)" == "Linux" ]]; then just test-quic-network; fi
+    if [[ "$(uname -s)" == "Linux" ]]; then just test-quic-network; fi
 
 ci-ios:
     cargo test --locked -p ios-app
     cd apps/apple-file-provider && swift test
-    DEST="$$(BERRYKEEP_IOS_SIMULATOR_APP_BUNDLE_ID=dev.ironmesh.apple.iosapp apps/apple-file-provider/scripts/prepare-ios-simulator.sh apps/apple-file-provider/BerryKeepAppleFileProvider.xcodeproj BerryKeepIosProject)" && \
+    DEST="$(BERRYKEEP_IOS_SIMULATOR_APP_BUNDLE_ID=dev.berrykeep.apple.iosapp apps/apple-file-provider/scripts/prepare-ios-simulator.sh apps/apple-file-provider/BerryKeepAppleFileProvider.xcodeproj BerryKeepIosProject)" && \
         xcodebuild test \
             -project apps/apple-file-provider/BerryKeepAppleFileProvider.xcodeproj \
             -scheme BerryKeepIosProject \
-            -destination "$$DEST" \
+            -destination "$DEST" \
             -destination-timeout 180
 
 ci-required-macos:
@@ -115,10 +115,10 @@ web-typecheck:
 context-refresh:
     @test -f docs/agent-context.md
     @echo "==> Context refresh helper"
-    @changed="$$(git diff --name-only -- README.md docs apps/server-node tests/system-tests .cargo rust-toolchain.toml Cargo.toml justfile)"; \
-    if [ -n "$$changed" ]; then \
+    @changed="$(git diff --name-only -- README.md docs apps/server-node tests/system-tests .cargo rust-toolchain.toml Cargo.toml justfile)"; \
+    if [ -n "$changed" ]; then \
         echo "Potentially context-impacting changes:"; \
-        echo "$$changed"; \
+        echo "$changed"; \
     else \
         echo "No staged/unstaged context-impacting changes detected in tracked areas."; \
     fi

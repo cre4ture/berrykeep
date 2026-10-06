@@ -9,39 +9,24 @@ public protocol AppleSecretStore: Sendable {
 
 public struct AppleKeychainSecretStore: AppleSecretStore, Sendable {
     public static let defaultService = "dev.berrykeep.apple.client-identity"
-    public static let legacyDefaultService = "dev.ironmesh.apple.client-identity"
     public static let defaultAccount = "clientIdentityJSON"
 
     private let service: String
-    private let legacyService: String?
     private let account: String
     let accessGroup: String?
 
     public init(
         service: String = defaultService,
         account: String = defaultAccount,
-        accessGroup: String? = nil,
-        legacyService: String? = legacyDefaultService
+        accessGroup: String? = nil
     ) {
         self.service = service
-        self.legacyService = legacyService?.nilIfBlank
         self.account = account
         self.accessGroup = accessGroup?.nilIfBlank
     }
 
     public func load() throws -> String? {
-        if let secret = try load(service: service) {
-            return secret
-        }
-        guard let legacyService, legacyService != service,
-              let legacySecret = try load(service: legacyService)
-        else {
-            return nil
-        }
-
-        try save(legacySecret)
-        try delete(service: legacyService)
-        return legacySecret
+        try load(service: service)
     }
 
     public func save(_ secret: String) throws {
@@ -80,9 +65,6 @@ public struct AppleKeychainSecretStore: AppleSecretStore, Sendable {
 
     public func clear() throws {
         try delete(service: service)
-        if let legacyService, legacyService != service {
-            try delete(service: legacyService)
-        }
     }
 
     private func load(service: String) throws -> String? {

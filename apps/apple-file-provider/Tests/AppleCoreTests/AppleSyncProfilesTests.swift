@@ -10,7 +10,7 @@ final class AppleSyncProfilesTests: XCTestCase {
                 domainIdentifier: "dev.berrykeep.profile.orphaned",
                 storedProfile: nil,
                 configuredProfile: nil,
-                legacyDisplayName: "Orphaned"
+                fallbackDisplayName: "Orphaned"
             )
         ) { error in
             XCTAssertEqual(
@@ -28,7 +28,7 @@ final class AppleSyncProfilesTests: XCTestCase {
                 domainIdentifier: staleProfile.domainIdentifier,
                 storedProfile: nil,
                 configuredProfile: staleProfile,
-                legacyDisplayName: staleProfile.displayName
+                fallbackDisplayName: staleProfile.displayName
             )
         ) { error in
             XCTAssertEqual(
@@ -38,12 +38,12 @@ final class AppleSyncProfilesTests: XCTestCase {
         }
     }
 
-    func testLegacyDomainRetainsExplicitUnrestrictedFallback() throws {
+    func testDefaultDomainRetainsExplicitUnrestrictedFallback() throws {
         let profile = try AppleSyncProfileResolution.resolve(
-            domainIdentifier: "dev.ironmesh.default",
+            domainIdentifier: "dev.berrykeep.default",
             storedProfile: nil,
             configuredProfile: nil,
-            legacyDisplayName: "Legacy"
+            fallbackDisplayName: "BerryKeep"
         )
 
         XCTAssertEqual(profile.remotePrefix, "")
@@ -97,27 +97,6 @@ final class AppleSyncProfilesTests: XCTestCase {
         try restartedStore.remove(profileID: documents.id)
         XCTAssertEqual(try restartedStore.load().map(\.id), ["photos"])
         XCTAssertEqual(try restartedStore.load().first?.lifecycle, .active)
-    }
-
-    func testProfileStoreMigratesFormerProfilesWithoutChangingTheirDomain() throws {
-        let suiteName = "AppleSyncProfilesTests.FormerProfiles.\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        let canonicalKey = "berrykeep.test.profiles"
-        let legacyKey = "ironmesh.test.profiles"
-        let legacyProfile = AppleSyncProfile(id: "documents", displayName: "Documents")
-        defaults.set(try JSONEncoder().encode([legacyProfile]), forKey: legacyKey)
-        let store = AppleSyncProfileStore(
-            defaults: defaults,
-            profilesKey: canonicalKey,
-            legacyProfilesKey: legacyKey
-        )
-
-        let migrated = try XCTUnwrap(store.load().first)
-
-        XCTAssertEqual(migrated.domainIdentifier, "dev.ironmesh.profile.documents")
-        XCTAssertNotNil(defaults.data(forKey: canonicalKey))
-        XCTAssertNil(defaults.data(forKey: legacyKey))
     }
 
     func testProfilePathMapperKeepsEachDomainInsideItsRemotePrefix() throws {

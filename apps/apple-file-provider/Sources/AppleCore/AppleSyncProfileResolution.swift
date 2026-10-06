@@ -16,21 +16,20 @@ public enum AppleSyncProfileResolution {
         domainIdentifier: String,
         storedProfile: AppleSyncProfile?,
         configuredProfile: AppleSyncProfile?,
-        legacyDisplayName: String
+        fallbackDisplayName: String
     ) throws -> AppleSyncProfile {
         if let storedProfile {
             return storedProfile
         }
-        if domainIdentifier.hasPrefix(AppleSyncProfile.managedDomainPrefix) ||
-            domainIdentifier.hasPrefix(AppleSyncProfile.legacyManagedDomainPrefix) {
+        if domainIdentifier.hasPrefix(AppleSyncProfile.managedDomainPrefix) {
             throw AppleSyncProfileResolutionError.missingManagedProfile(domainIdentifier)
         }
         if let configuredProfile {
             return configuredProfile
         }
         return AppleSyncProfile(
-            id: "legacy-default",
-            displayName: legacyDisplayName,
+            id: "default-domain",
+            displayName: fallbackDisplayName,
             networkPolicy: AppleSyncProfileNetworkPolicy(
                 allowsExpensiveNetwork: true,
                 allowsConstrainedNetwork: true

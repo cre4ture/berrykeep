@@ -68,112 +68,60 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
         XCTAssertEqual(decodedDraft.clientIdentityJSON, "")
     }
 
-    func testLoadMigratesLegacyIdentityFromBothPreferencesStores() throws {
-        let sharedDefaults = try IsolatedDefaults(label: "SharedMigration")
-        let draftDefaults = try IsolatedDefaults(label: "DraftMigration")
-        defer {
-            sharedDefaults.clear()
-            draftDefaults.clear()
-        }
-        let appliedIdentity = #"{"private_key_pem":"applied-secret"}"#
-        let draftIdentity = #"{"private_key_pem":"unapplied-draft-secret"}"#
-        let legacyState = AppleStoredConnectionState(
-            connectionInput: #"{"version":1}"#,
-            clientIdentityJSON: appliedIdentity,
-            deviceID: "device-1"
-        )
-        sharedDefaults.defaults.set(
-            try JSONEncoder().encode(legacyState),
-            forKey: AppleConnectionSettingsStore.defaultStateKey
-        )
-        draftDefaults.defaults.set(
-            try legacyDraftData(identity: draftIdentity),
-            forKey: AppleConnectionSettingsStore.defaultLegacyDraftStateKey
-        )
-        let secretStore = InMemorySecretStore()
-        let store = AppleConnectionSettingsStore(
-            defaults: sharedDefaults.defaults,
-            secretStore: secretStore
-        )
-
-        let loaded = try store.load(legacyDraftDefaults: draftDefaults.defaults)
-
-        XCTAssertEqual(loaded?.clientIdentityJSON, appliedIdentity)
-        XCTAssertEqual(loaded?.deviceID, "device-1")
-        XCTAssertEqual(secretStore.secret, appliedIdentity)
-        XCTAssertEqual(secretStore.saveCount, 1)
-        try assertPreferencesDoNotContainClientIdentity(
-            defaults: sharedDefaults.defaults,
-            secret: appliedIdentity
-        )
-        try assertPreferencesDoNotContainClientIdentity(
-            defaults: draftDefaults.defaults,
-            stateKey: AppleConnectionSettingsStore.defaultLegacyDraftStateKey,
-            secret: draftIdentity
-        )
-    }
-
-    func testLoadMigratesTheFormerConnectionStateKey() throws {
-        let testDefaults = try IsolatedDefaults(label: "FormerStateKey")
+    func testLoadMovesEmbeddedIdentityIntoTheKeychain() throws {
+        let testDefaults = try IsolatedDefaults(label: "EmbeddedIdentity")
         defer { testDefaults.clear() }
-        let state = AppleStoredConnectionState(
-            connectionInput: "storage.example.test:443",
+        let identity = #"{"private_key_pem":"embedded-secret"}"#
+        let storedState = AppleStoredConnectionState(
+            connectionInput: #"{"version":1}"#,
+            clientIdentityJSON: identity,
             deviceID: "device-1"
         )
         testDefaults.defaults.set(
-            try JSONEncoder().encode(state),
-            forKey: AppleConnectionSettingsStore.legacyStateKey
+            try JSONEncoder().encode(storedState),
+            forKey: AppleConnectionSettingsStore.defaultStateKey
         )
+        let secretStore = InMemorySecretStore()
         let store = AppleConnectionSettingsStore(
             defaults: testDefaults.defaults,
-            secretStore: InMemorySecretStore()
+            secretStore: secretStore
         )
 
-        XCTAssertEqual(try store.load(), state)
-        XCTAssertNotNil(
-            testDefaults.defaults.data(forKey: AppleConnectionSettingsStore.defaultStateKey)
-        )
-        XCTAssertNil(
-            testDefaults.defaults.data(forKey: AppleConnectionSettingsStore.legacyStateKey)
+        let loaded = try store.load()
+
+        XCTAssertEqual(loaded?.clientIdentityJSON, identity)
+        XCTAssertEqual(loaded?.deviceID, "device-1")
+        XCTAssertEqual(secretStore.secret, identity)
+        XCTAssertEqual(secretStore.saveCount, 1)
+        try assertPreferencesDoNotContainClientIdentity(
+            defaults: testDefaults.defaults,
+            secret: identity
         )
     }
 
-    func testLegacyIdentityRemainsWhenKeychainMigrationFails() throws {
-        let sharedDefaults = try IsolatedDefaults(label: "SharedMigrationFailure")
-        let draftDefaults = try IsolatedDefaults(label: "DraftMigrationFailure")
-        defer {
-            sharedDefaults.clear()
-            draftDefaults.clear()
-        }
-        let identity = #"{"private_key_pem":"legacy-secret"}"#
-        sharedDefaults.defaults.set(
+    func testEmbeddedIdentityRemainsWhenKeychainMigrationFails() throws {
+        let testDefaults = try IsolatedDefaults(label: "EmbeddedIdentityFailure")
+        defer { testDefaults.clear() }
+        let identity = #"{"private_key_pem":"embedded-secret"}"#
+        testDefaults.defaults.set(
             try JSONEncoder().encode(
                 AppleStoredConnectionState(clientIdentityJSON: identity)
             ),
             forKey: AppleConnectionSettingsStore.defaultStateKey
         )
-        draftDefaults.defaults.set(
-            try legacyDraftData(identity: identity),
-            forKey: AppleConnectionSettingsStore.defaultLegacyDraftStateKey
-        )
         let secretStore = InMemorySecretStore(saveError: .saveFailed)
         let store = AppleConnectionSettingsStore(
-            defaults: sharedDefaults.defaults,
+            defaults: testDefaults.defaults,
             secretStore: secretStore
         )
 
         XCTAssertThrowsError(
-            try store.load(legacyDraftDefaults: draftDefaults.defaults)
+            try store.load()
         ) { error in
             XCTAssertEqual(error as? InMemorySecretStore.TestError, .saveFailed)
         }
         try assertPreferencesContainClientIdentity(
-            defaults: sharedDefaults.defaults,
-            identity: identity
-        )
-        try assertPreferencesContainClientIdentity(
-            defaults: draftDefaults.defaults,
-            stateKey: AppleConnectionSettingsStore.defaultLegacyDraftStateKey,
+            defaults: testDefaults.defaults,
             identity: identity
         )
     }
@@ -244,10 +192,10 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
         XCTAssertNotNil(storedData)
     }
 
-    func testLoadFailureLeavesLegacyPreferencesUntouched() throws {
+    func testLoadFailureLeavesEmbeddedIdentityUntouched() throws {
         let testDefaults = try IsolatedDefaults(label: "LoadFailure")
         defer { testDefaults.clear() }
-        let identity = #"{"private_key_pem":"legacy-secret"}"#
+        let identity = #"{"private_key_pem":"embedded-secret"}"#
         testDefaults.defaults.set(
             try JSONEncoder().encode(
                 AppleStoredConnectionState(clientIdentityJSON: identity)
@@ -265,16 +213,6 @@ final class AppleConnectionSettingsStoreTests: XCTestCase {
         try assertPreferencesContainClientIdentity(
             defaults: testDefaults.defaults,
             identity: identity
-        )
-    }
-
-    private func legacyDraftData(identity: String) throws -> Data {
-        try JSONSerialization.data(
-            withJSONObject: [
-                "clientIdentityJSON": identity,
-                "bootstrapInput": #"{"version":1}"#,
-            ],
-            options: [.sortedKeys]
         )
     }
 
