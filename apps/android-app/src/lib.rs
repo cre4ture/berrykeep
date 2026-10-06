@@ -1870,7 +1870,11 @@ fn register_folder_sync_run(
 ) -> Result<()> {
     match manager.lock() {
         Ok(mut manager) => {
-            manager.runs.insert(profile_id, run);
+            let displaced = manager.runs.insert(profile_id, run);
+            drop(manager);
+            if let Some(displaced) = displaced {
+                stop_folder_sync_run(displaced);
+            }
             Ok(())
         }
         Err(poisoned) => {
