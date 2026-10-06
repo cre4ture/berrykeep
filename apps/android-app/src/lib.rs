@@ -571,6 +571,48 @@ mod tests {
     }
 
     #[test]
+    fn replacement_registration_keeps_a_stopping_profile_active_without_a_visibility_gap() {
+        let lifecycle = AndroidFolderSyncLifecycle::new();
+        lifecycle
+            .manager
+            .lock()
+            .expect("manager lock must be available")
+            .stopping_profiles
+            .insert("photos".to_string());
+        assert!(lifecycle.has_active_profiles());
+
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = running.clone();
+        let worker = thread::spawn(move || {
+            while worker_running.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+        });
+        register_folder_sync_run(
+            &lifecycle.manager,
+            "photos".to_string(),
+            AndroidFolderSyncRun {
+                running,
+                thread: worker,
+            },
+        )
+        .expect("replacement run must register");
+        assert!(lifecycle.has_active_profiles());
+
+        lifecycle
+            .manager
+            .lock()
+            .expect("manager lock must be available")
+            .finished_stopping("photos");
+        assert!(lifecycle.has_active_profiles());
+
+        lifecycle
+            .stop_profile("photos")
+            .expect("replacement run must stop");
+        assert!(!lifecycle.has_active_profiles());
+    }
+
+    #[test]
     fn android_client_rejects_legacy_direct_server_url() {
         let error = normalized_bootstrap_json("https://storage.example.test")
             .expect_err("a direct server URL must not be accepted as app configuration");
@@ -1535,16 +1577,31 @@ impl AndroidFolderSyncLifecycle {
             .lock()
             .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
             .take_run_for_stop(&profile_id);
+        let replacing_active_profile = previous.is_some();
         if let Some(previous) = previous {
             stop_folder_sync_run(previous);
+        }
+
+        let run = match start_folder_sync_run(&self.status, profile_id.clone(), label, options) {
+            Ok(run) => run,
+            Err(error) => {
+                if replacing_active_profile {
+                    self.manager
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+                        .finished_stopping(&profile_id);
+                }
+                return Err(error);
+            }
+        };
+        register_folder_sync_run(&self.manager, profile_id.clone(), run)?;
+        if replacing_active_profile {
             self.manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
                 .finished_stopping(&profile_id);
         }
-
-        let run = start_folder_sync_run(&self.status, profile_id.clone(), label, options)?;
-        register_folder_sync_run(&self.manager, profile_id, run)
+        Ok(())
     }
 
     fn stop_profile(&self, profile_id: &str) -> Result<()> {
