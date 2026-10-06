@@ -478,6 +478,10 @@ mod tests {
         cancellation_observed_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("stop must signal the worker before waiting for it");
+        assert!(
+            lifecycle.has_active_profiles(),
+            "a stopping worker must remain visible to one-shot admission"
+        );
 
         let (status_tx, status_rx) = mpsc::channel();
         let lifecycle_for_status = lifecycle.clone();
@@ -514,6 +518,7 @@ mod tests {
             .join()
             .expect("stop thread must not panic")
             .expect("stop must not fail");
+        assert!(!lifecycle.has_active_profiles());
     }
 
     #[test]
@@ -546,7 +551,7 @@ use mobile_client_core::{
     MobileIdentityPersistence, MobileWebUiSession, MobileWebUiSurface,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1393,6 +1398,7 @@ struct AndroidFolderSyncRun {
 
 struct AndroidFolderSyncManager {
     runs: BTreeMap<String, AndroidFolderSyncRun>,
+    stopping_profiles: BTreeSet<String>,
     profile_operations: BTreeMap<String, Weak<Mutex<()>>>,
 }
 
@@ -1400,8 +1406,21 @@ impl AndroidFolderSyncManager {
     fn new() -> Self {
         Self {
             runs: BTreeMap::new(),
+            stopping_profiles: BTreeSet::new(),
             profile_operations: BTreeMap::new(),
         }
+    }
+
+    fn take_run_for_stop(&mut self, profile_id: &str) -> Option<AndroidFolderSyncRun> {
+        let run = self.runs.remove(profile_id);
+        if run.is_some() {
+            self.stopping_profiles.insert(profile_id.to_string());
+        }
+        run
+    }
+
+    fn finished_stopping(&mut self, profile_id: &str) {
+        self.stopping_profiles.remove(profile_id);
     }
 
     fn profile_operation_lock(&mut self, profile_id: &str) -> Arc<Mutex<()>> {
@@ -1466,10 +1485,13 @@ impl AndroidFolderSyncLifecycle {
             .manager
             .lock()
             .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-            .runs
-            .remove(&profile_id);
+            .take_run_for_stop(&profile_id);
         if let Some(previous) = previous {
             stop_folder_sync_run(previous);
+            self.manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+                .finished_stopping(&profile_id);
         }
 
         let run = start_folder_sync_run(&self.status, profile_id.clone(), label, options)?;
@@ -1498,10 +1520,13 @@ impl AndroidFolderSyncLifecycle {
             .manager
             .lock()
             .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-            .runs
-            .remove(profile_id);
+            .take_run_for_stop(profile_id);
         if let Some(previous) = previous {
             stop_folder_sync_run(previous);
+            self.manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+                .finished_stopping(profile_id);
         }
         if let Ok(mut status) = self.status.lock() {
             status
@@ -1518,16 +1543,23 @@ impl AndroidFolderSyncLifecycle {
             .operation_gate
             .write()
             .map_err(|_| anyhow::anyhow!("folder sync lifecycle gate poisoned"))?;
-        let runs = std::mem::take(
-            &mut self
+        let runs = {
+            let mut manager = self
                 .manager
                 .lock()
-                .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-                .runs,
-        );
+                .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?;
+            let runs = std::mem::take(&mut manager.runs);
+            manager.stopping_profiles.extend(runs.keys().cloned());
+            runs
+        };
         for (_, run) in runs {
             stop_folder_sync_run(run);
         }
+        self.manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .stopping_profiles
+            .clear();
         if let Ok(mut status) = self.status.lock() {
             *status = AndroidFolderSyncServiceStatus {
                 service_state: "stopped".to_string(),
@@ -1551,7 +1583,7 @@ impl AndroidFolderSyncLifecycle {
     fn has_active_profiles(&self) -> bool {
         self.manager
             .lock()
-            .map(|manager| !manager.runs.is_empty())
+            .map(|manager| !manager.runs.is_empty() || !manager.stopping_profiles.is_empty())
             .unwrap_or(false)
     }
 }
