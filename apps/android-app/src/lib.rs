@@ -522,6 +522,61 @@ mod tests {
     }
 
     #[test]
+    fn stop_all_signals_every_worker_before_waiting_for_any_worker() {
+        let lifecycle = Arc::new(AndroidFolderSyncLifecycle::new());
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut runs = BTreeMap::new();
+        for profile_id in ["photos", "documents"] {
+            let running = Arc::new(AtomicBool::new(true));
+            let worker_running = running.clone();
+            let worker_stopped_tx = stopped_tx.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            releases.push(release_tx);
+            let profile_id = profile_id.to_string();
+            let worker_profile_id = profile_id.clone();
+            let worker = thread::spawn(move || {
+                while worker_running.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                worker_stopped_tx
+                    .send(worker_profile_id)
+                    .expect("test must observe worker cancellation");
+                release_rx.recv().expect("test must release worker");
+            });
+            runs.insert(
+                profile_id.clone(),
+                AndroidFolderSyncRun {
+                    running,
+                    thread: worker,
+                },
+            );
+        }
+        lifecycle
+            .manager
+            .lock()
+            .expect("manager lock must be available")
+            .runs = runs;
+
+        let lifecycle_to_stop = lifecycle.clone();
+        let stopping = thread::spawn(move || lifecycle_to_stop.stop_all());
+        let first = stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first worker must be cancelled");
+        let second = stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("all workers must be cancelled before joining");
+        assert_ne!(first, second);
+        for release in releases {
+            release.send(()).expect("worker must await release");
+        }
+        stopping
+            .join()
+            .expect("stop-all thread must not panic")
+            .expect("stop-all must not fail");
+    }
+
+    #[test]
     fn folder_sync_registration_stops_an_unregistered_worker_when_manager_is_poisoned() {
         let lifecycle = Arc::new(AndroidFolderSyncLifecycle::new());
         lifecycle
@@ -1664,6 +1719,9 @@ impl AndroidFolderSyncLifecycle {
             manager.stopping_profiles.extend(runs.keys().cloned());
             runs
         };
+        for run in runs.values() {
+            request_folder_sync_stop(run);
+        }
         for (_, run) in runs {
             stop_folder_sync_run(run);
         }
@@ -1830,8 +1888,12 @@ fn folder_sync_lifecycle() -> &'static AndroidFolderSyncLifecycle {
 }
 
 fn stop_folder_sync_run(run: AndroidFolderSyncRun) {
-    run.running.store(false, Ordering::SeqCst);
+    request_folder_sync_stop(&run);
     let _ = run.thread.join();
+}
+
+fn request_folder_sync_stop(run: &AndroidFolderSyncRun) {
+    run.running.store(false, Ordering::SeqCst);
 }
 
 fn update_profile_status(
