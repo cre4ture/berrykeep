@@ -176,7 +176,7 @@ class MainViewModel(
             },
             "berrykeep-title-latency-stop",
         ).start()
-        repository.stopWebUi()
+        stopWebUiInBackground()
         super.onCleared()
     }
 
@@ -477,29 +477,40 @@ class MainViewModel(
     }
 
     fun putObject() {
-        execute("Uploading object...") { deviceAuth ->
-            val statusCode = repository.putObject(
-                deviceAuth.connectionBootstrapJson(),
-                uiState.value.key,
-                uiState.value.payload,
-                deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
-                deviceAuth.toClientIdentityJson(),
-            )
-            "PUT ok: HTTP $statusCode"
-        }
+        val key = uiState.value.key
+        val payload = uiState.value.payload
+        execute(
+            loadingMessage = "Uploading object...",
+            action = { deviceAuth ->
+                repository.putObject(
+                    deviceAuth.connectionBootstrapJson(),
+                    key,
+                    payload,
+                    deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                    deviceAuth.toClientIdentityJson(),
+                )
+            },
+            successMessage = { statusCode -> "PUT ok: HTTP $statusCode" },
+        )
     }
 
     fun getObject() {
-        execute("Downloading object...") { deviceAuth ->
-            val body = repository.getObject(
-                deviceAuth.connectionBootstrapJson(),
-                uiState.value.key,
-                serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
-                clientIdentityJson = deviceAuth.toClientIdentityJson(),
-            )
-            uiState.value = uiState.value.copy(objectBody = body)
-            "GET ok: ${body.length} bytes"
-        }
+        val key = uiState.value.key
+        execute(
+            loadingMessage = "Downloading object...",
+            action = { deviceAuth ->
+                repository.getObject(
+                    deviceAuth.connectionBootstrapJson(),
+                    key,
+                    serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                    clientIdentityJson = deviceAuth.toClientIdentityJson(),
+                )
+            },
+            successMessage = { body -> "GET ok: ${body.length} bytes" },
+            onSuccess = { body ->
+                uiState.value = uiState.value.copy(objectBody = body)
+            },
+        )
     }
 
     fun clearCachedData() {
@@ -1366,8 +1377,21 @@ class MainViewModel(
             return
         }
         EmbeddedWebUiSessionRegistry.clear()
-        repository.stopWebUi()
+        stopWebUiInBackground()
         uiState.value = uiState.value.copy(webUiSession = null)
+    }
+
+    private fun stopWebUiInBackground() {
+        Thread(
+            {
+                runCatching {
+                    repository.stopWebUi()
+                }.onFailure { error ->
+                    Log.w("MainViewModel", "Failed to stop Web UI", error)
+                }
+            },
+            "berrykeep-web-ui-stop",
+        ).start()
     }
 
     fun enrollDevice() {
@@ -1515,9 +1539,11 @@ class MainViewModel(
         )
     }
 
-    private fun execute(
+    private fun <T> execute(
         loadingMessage: String,
-        action: suspend (DeviceAuthState) -> String,
+        action: suspend (DeviceAuthState) -> T,
+        successMessage: (T) -> String,
+        onSuccess: (T) -> Unit = {},
     ) {
         uiState.value = uiState.value.copy(loading = true, status = loadingMessage)
         viewModelScope.launch {
@@ -1529,7 +1555,17 @@ class MainViewModel(
                     )
                     return@launch
                 }
-            val result = runCatching { action(deviceAuth) }
+            val result = try {
+                Result.success(
+                    withContext(Dispatchers.IO) {
+                        action(deviceAuth)
+                    },
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Result.failure(error)
+            }
             runCatching { refreshPersistedDeviceAuthState() }
                 .onFailure { error ->
                     uiState.value = uiState.value.copy(
@@ -1539,8 +1575,12 @@ class MainViewModel(
                     return@launch
                 }
             result
-                .onSuccess { message ->
-                    uiState.value = uiState.value.copy(loading = false, status = message)
+                .onSuccess { value ->
+                    onSuccess(value)
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = successMessage(value),
+                    )
                 }
                 .onFailure { error ->
                     uiState.value = uiState.value.copy(
