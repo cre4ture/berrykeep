@@ -23,6 +23,7 @@ import io.berrykeep.android.data.AndroidDiagnosticLog as Log
 import io.berrykeep.android.data.writeAndroidDiagnosticLogExport
 import io.berrykeep.android.data.DeviceAuthState
 import io.berrykeep.android.data.EnrollmentAccessVerification
+import io.berrykeep.android.data.EmbeddedWebUiSession
 import io.berrykeep.android.data.EmbeddedWebUiSessionRegistry
 import io.berrykeep.android.data.PrivateWebServiceBrowserSession
 import io.berrykeep.android.data.DeviceIdentityStorageException
@@ -42,9 +43,12 @@ import io.berrykeep.android.ui.theme.normalizeBerryKeepAccentColorHex
 import io.berrykeep.android.work.FolderSyncScheduler
 import io.berrykeep.android.work.FolderSyncNetworkGate
 import io.berrykeep.android.work.FolderSyncExecutionCoordinator
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.filterNotNull
@@ -99,12 +103,15 @@ class MainViewModel(
     private var titleLatencyConfigurationJob: Job? = null
     private var titleLatencyStatusMonitorJob: Job? = null
     private var titleLatencyBackgroundStopJob: Job? = null
+    private var webUiBackgroundStopJob: Job? = null
     private var enrollmentVerificationMonitorJob: Job? = null
     private val uiObservationGate = UiObservationGate()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val preferenceWriteMutex = Mutex()
     private val titleLatencyNativeControlMutex = Mutex()
     private val titleLatencyNativeControlGate = LatestOperationGate()
+    private val webUiNativeLifecycle = NativeLifecycleOperationCoordinator()
+    private val clearedWebUiCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
     private var deviceAuthState = DeviceAuthState()
@@ -153,6 +160,9 @@ class MainViewModel(
         unregisterProcessLifecycleObserver()
         PrivateWebServiceBrowserSession.clearBackgroundSessionEndedCallback()
         webUiSessionBackgroundGrace.cancel()
+        webUiNativeLifecycle.nextGeneration()
+        webUiBackgroundStopJob?.cancel()
+        webUiBackgroundStopJob = null
         titleLatencyBackgroundGrace.cancel()
         titleLatencyNativeControlGate.next()
         titleLatencyBackgroundStopJob?.cancel()
@@ -176,7 +186,7 @@ class MainViewModel(
             },
             "berrykeep-title-latency-stop",
         ).start()
-        stopWebUiInBackground()
+        stopWebUiAfterCleared()
         super.onCleared()
     }
 
@@ -1303,6 +1313,9 @@ class MainViewModel(
 
     fun startWebUi() {
         webUiSessionBackgroundGrace.cancel()
+        val operationGeneration = webUiNativeLifecycle.nextGeneration()
+        webUiBackgroundStopJob?.cancel()
+        webUiBackgroundStopJob = null
         uiState.value.webUiSession?.let { session ->
             EmbeddedWebUiSessionRegistry.activate(session)
             uiState.value = uiState.value.copy(status = "Web UI ready.")
@@ -1333,14 +1346,28 @@ class MainViewModel(
                 )
                 return@launch
             }
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
-                    repository.startWebUi(
-                        connectionInput,
-                        deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
-                        clientIdentityJson,
-                    )
+            var startedSession: EmbeddedWebUiSession? = null
+            val result = try {
+                val started = withContext(Dispatchers.IO) {
+                    webUiNativeLifecycle.runIfCurrent(operationGeneration) {
+                        startedSession = repository.startWebUi(
+                            connectionInput,
+                            deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                            clientIdentityJson,
+                        )
+                    }
                 }
+                if (!started || !webUiNativeLifecycle.isCurrent(operationGeneration)) {
+                    return@launch
+                }
+                Result.success(requireNotNull(startedSession))
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Result.failure(error)
+            }
+            if (!webUiNativeLifecycle.isCurrent(operationGeneration)) {
+                return@launch
             }
             runCatching { refreshPersistedDeviceAuthState() }
                 .onFailure { error ->
@@ -1377,21 +1404,38 @@ class MainViewModel(
             return
         }
         EmbeddedWebUiSessionRegistry.clear()
-        stopWebUiInBackground()
+        val operationGeneration = webUiNativeLifecycle.nextGeneration()
+        webUiBackgroundStopJob?.cancel()
+        webUiBackgroundStopJob = viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    webUiNativeLifecycle.runIfCurrent(operationGeneration) {
+                        repository.stopWebUi()
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w("MainViewModel", "Failed to stop Web UI", error)
+            }
+        }
         uiState.value = uiState.value.copy(webUiSession = null)
     }
 
-    private fun stopWebUiInBackground() {
-        Thread(
-            {
-                runCatching {
+    private fun stopWebUiAfterCleared() {
+        clearedWebUiCleanupScope.launch {
+            try {
+                webUiNativeLifecycle.run {
                     repository.stopWebUi()
-                }.onFailure { error ->
-                    Log.w("MainViewModel", "Failed to stop Web UI", error)
                 }
-            },
-            "berrykeep-web-ui-stop",
-        ).start()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w("MainViewModel", "Failed to stop cleared Web UI", error)
+            } finally {
+                clearedWebUiCleanupScope.cancel()
+            }
+        }
     }
 
     fun enrollDevice() {
@@ -1483,7 +1527,9 @@ class MainViewModel(
             try {
                 withContext(Dispatchers.IO) {
                     EmbeddedWebUiSessionRegistry.clear()
-                    repository.stopWebUi()
+                    webUiNativeLifecycle.run {
+                        repository.stopWebUi()
+                    }
                     BerryKeepPreferences.setDeviceAuthState(getApplication(), authState)
                     FolderSyncScheduler.reschedule(getApplication(), resetOutageBackoff = true)
                 }
