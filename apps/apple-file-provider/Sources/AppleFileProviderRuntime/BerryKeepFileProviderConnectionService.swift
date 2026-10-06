@@ -87,7 +87,7 @@ extension BerryKeepFileProviderService {
                     domainIdentifier: configuration.domainIdentifier
                 ),
                 configuredProfile: configuration.syncProfile,
-                legacyDisplayName: configuration.domainDisplayName
+                fallbackDisplayName: configuration.domainDisplayName
             )
         } catch let error as AppleSyncProfileResolutionError {
             throw berrykeepConstraintError(error.localizedDescription)

@@ -41,7 +41,6 @@ public enum AppleSyncProfileContentPolicy: String, Codable, CaseIterable, Sendab
 
 public struct AppleSyncProfile: Codable, Equatable, Identifiable, Sendable {
     public static let managedDomainPrefix = "dev.berrykeep.profile."
-    public static let legacyManagedDomainPrefix = "dev.ironmesh.profile."
 
     public var id: String
     public var displayName: String
@@ -52,7 +51,6 @@ public struct AppleSyncProfile: Codable, Equatable, Identifiable, Sendable {
     public var networkPolicy: AppleSyncProfileNetworkPolicy
     public var powerPolicy: AppleSyncProfilePowerPolicy
     public var contentPolicy: AppleSyncProfileContentPolicy
-    private var persistedDomainIdentifier: String?
 
     public init(
         id: String = UUID().uuidString.lowercased(),
@@ -74,11 +72,10 @@ public struct AppleSyncProfile: Codable, Equatable, Identifiable, Sendable {
         self.networkPolicy = networkPolicy
         self.powerPolicy = powerPolicy
         self.contentPolicy = contentPolicy
-        persistedDomainIdentifier = nil
     }
 
     public var domainIdentifier: String {
-        persistedDomainIdentifier ?? "\(Self.managedDomainPrefix)\(id)"
+        "\(Self.managedDomainPrefix)\(id)"
     }
 
     public var scopeSummary: String {
@@ -94,50 +91,37 @@ public struct AppleSyncProfile: Codable, Equatable, Identifiable, Sendable {
         let result = String(normalized).trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return result.nilIfBlank ?? UUID().uuidString.lowercased()
     }
-
-    fileprivate func retainingLegacyDomainIdentifier() -> AppleSyncProfile {
-        var profile = self
-        profile.persistedDomainIdentifier = "\(Self.legacyManagedDomainPrefix)\(id)"
-        return profile
-    }
 }
 
 public final class AppleSyncProfileStore: @unchecked Sendable {
     public static let defaultProfilesKey = "berrykeep.sync.profiles.v1"
-    public static let legacyProfilesKey = "ironmesh.sync.profiles.v1"
 
     private let defaults: UserDefaults
     private let profilesKey: String
-    private let legacyStorageKey: String?
     private let lock = NSLock()
 
     public init(
         defaults: UserDefaults = .standard,
-        profilesKey: String = defaultProfilesKey,
-        legacyProfilesKey: String? = AppleSyncProfileStore.legacyProfilesKey
+        profilesKey: String = defaultProfilesKey
     ) {
         self.defaults = defaults
         self.profilesKey = profilesKey
-        self.legacyStorageKey = legacyProfilesKey?.nilIfBlank
     }
 
     public convenience init(
         preferencesSuiteName: String?,
-        profilesKey: String = defaultProfilesKey,
-        legacyProfilesKey: String? = AppleSyncProfileStore.legacyProfilesKey
+        profilesKey: String = defaultProfilesKey
     ) {
         if let suiteName = preferencesSuiteName?.nilIfBlank,
            let defaults = UserDefaults(suiteName: suiteName) {
             self.init(
                 defaults: defaults,
-                profilesKey: profilesKey,
-                legacyProfilesKey: legacyProfilesKey
+                profilesKey: profilesKey
             )
         } else {
             self.init(
                 defaults: .standard,
-                profilesKey: profilesKey,
-                legacyProfilesKey: legacyProfilesKey
+                profilesKey: profilesKey
             )
         }
     }
@@ -196,20 +180,10 @@ public final class AppleSyncProfileStore: @unchecked Sendable {
     }
 
     private func loadLocked() throws -> [AppleSyncProfile] {
-        if let data = defaults.data(forKey: profilesKey) {
-            return Self.sorted(try JSONDecoder().decode([AppleSyncProfile].self, from: data))
-        }
-        guard let legacyStorageKey,
-              legacyStorageKey != profilesKey,
-              let data = defaults.data(forKey: legacyStorageKey)
-        else {
+        guard let data = defaults.data(forKey: profilesKey) else {
             return []
         }
-        let profiles = try JSONDecoder().decode([AppleSyncProfile].self, from: data)
-            .map { $0.retainingLegacyDomainIdentifier() }
-        try persistLocked(profiles)
-        defaults.removeObject(forKey: legacyStorageKey)
-        return Self.sorted(profiles)
+        return Self.sorted(try JSONDecoder().decode([AppleSyncProfile].self, from: data))
     }
 
     private func persistLocked(_ profiles: [AppleSyncProfile]) throws {
