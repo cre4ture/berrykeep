@@ -1,9 +1,7 @@
 name: BerryKeepAppleFileProvider
 
 options:
-  # These are installed application identities. Retaining them lets existing
-  # users receive the rebranded app as an update.
-  bundleIdPrefix: dev.ironmesh
+  bundleIdPrefix: dev.berrykeep
 
 settings:
   base:
@@ -50,7 +48,7 @@ targets:
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         MACOSX_DEPLOYMENT_TARGET: 14.0
         OTHER_LDFLAGS: $(inherited) -lios_app
-        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.macapp
+        PRODUCT_BUNDLE_IDENTIFIER: dev.berrykeep.apple.macapp
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
 
   BerryKeepMacFileProviderExtension:
@@ -81,7 +79,7 @@ targets:
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         MACOSX_DEPLOYMENT_TARGET: 14.0
         OTHER_LDFLAGS: $(inherited) -lios_app
-        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.macfileprovider
+        PRODUCT_BUNDLE_IDENTIFIER: dev.berrykeep.apple.macfileprovider
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
 
   BerryKeepIosApp:
@@ -117,7 +115,7 @@ targets:
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         OTHER_LDFLAGS: $(inherited) -lios_app -framework Network -framework SystemConfiguration
         CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/BerryKeepSharedAccess.entitlements
-        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosapp
+        PRODUCT_BUNDLE_IDENTIFIER: dev.berrykeep.apple.iosapp
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: 1,2
         CODE_SIGNING_ALLOWED: NO
@@ -155,7 +153,7 @@ targets:
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)
         OTHER_LDFLAGS: $(inherited) -lios_app -framework Network -framework SystemConfiguration
         CODE_SIGN_ENTITLEMENTS: Resources/Entitlements/BerryKeepSharedAccess.entitlements
-        PRODUCT_BUNDLE_IDENTIFIER: dev.ironmesh.apple.iosapp.fileprovider
+        PRODUCT_BUNDLE_IDENTIFIER: dev.berrykeep.apple.iosapp.fileprovider
         SWIFT_OBJC_BRIDGING_HEADER: Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: 1,2
         CODE_SIGNING_ALLOWED: NO

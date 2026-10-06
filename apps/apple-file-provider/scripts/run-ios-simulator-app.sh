@@ -6,7 +6,7 @@ APP_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$APP_DIR/../.." && pwd)
 PROJECT_PATH_INPUT="${BERRYKEEP_IOS_PROJECT_PATH:-$APP_DIR/BerryKeepAppleFileProvider.xcodeproj}"
 SCHEME="${BERRYKEEP_IOS_APP_SCHEME:-BerryKeepIosApp}"
-BUNDLE_ID="${BERRYKEEP_IOS_APP_BUNDLE_ID:-dev.ironmesh.apple.iosapp}"
+BUNDLE_ID="${BERRYKEEP_IOS_APP_BUNDLE_ID:-dev.berrykeep.apple.iosapp}"
 BUILD_CONFIGURATION="${BERRYKEEP_IOS_BUILD_CONFIGURATION:-Debug}"
 DERIVED_DATA_PATH="${BERRYKEEP_IOS_DERIVED_DATA_PATH:-/tmp/berrykeep-ios-app-sim-derived-data}"
 

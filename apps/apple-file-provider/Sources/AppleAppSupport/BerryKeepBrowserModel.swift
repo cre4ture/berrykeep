@@ -192,13 +192,10 @@ final class BerryKeepBrowserModel: ObservableObject {
     private let syncProfileDomains: AppleSyncProfileDomainCoordinator
     private let syncProfileStore: AppleSyncProfileStore
     private let userDefaults: UserDefaults
-    private let draftStorageKey = AppleConnectionSettingsStore.defaultLegacyDraftStateKey
+    private let draftStorageKey = AppleConnectionSettingsStore.defaultDraftStateKey
     private let onboardingStorageKey = "BerryKeepIosApp.hasCompletedOnboarding"
     private let themeAccentColorStorageKey = "BerryKeepIosApp.themeAccentColor"
     private let titleLatencyMonitorSettingsStorageKey = "BerryKeepIosApp.titleLatencyMonitorSettings"
-    private static let legacyOnboardingStorageKey = "IronmeshIosApp.hasCompletedOnboarding"
-    private static let legacyThemeAccentColorStorageKey = "IronmeshIosApp.themeAccentColor"
-    private static let legacyTitleLatencyMonitorSettingsStorageKey = "IronmeshIosApp.titleLatencyMonitorSettings"
     private let recentActionLimit = 6
     private let diagnosticActionLimit = 10_000
 
@@ -225,21 +222,6 @@ final class BerryKeepBrowserModel: ObservableObject {
         remoteSession: BerryKeepRemoteSession = BerryKeepRemoteSession()
     ) {
         self.userDefaults = userDefaults
-        Self.migratePreference(
-            in: userDefaults,
-            from: Self.legacyOnboardingStorageKey,
-            to: "BerryKeepIosApp.hasCompletedOnboarding"
-        )
-        Self.migratePreference(
-            in: userDefaults,
-            from: Self.legacyThemeAccentColorStorageKey,
-            to: "BerryKeepIosApp.themeAccentColor"
-        )
-        Self.migratePreference(
-            in: userDefaults,
-            from: Self.legacyTitleLatencyMonitorSettingsStorageKey,
-            to: "BerryKeepIosApp.titleLatencyMonitorSettings"
-        )
         themeAccentColorHex = AppleAccentColor.normalizedHex(
             userDefaults.string(forKey: "BerryKeepIosApp.themeAccentColor")
         ) ?? AppleAccentColor.defaultHex
@@ -263,7 +245,7 @@ final class BerryKeepBrowserModel: ObservableObject {
         let storedState: AppleStoredConnectionState?
         let settingsLoadError: Error?
         do {
-            storedState = try self.settingsStore.load(legacyDraftDefaults: userDefaults)
+            storedState = try self.settingsStore.load()
             settingsLoadError = nil
         } catch {
             storedState = nil
@@ -302,20 +284,6 @@ final class BerryKeepBrowserModel: ObservableObject {
             titleLatencyMonitorSettings = settings
         }
         addAction("Started app", detail: statusText)
-    }
-
-    private static func migratePreference(
-        in defaults: UserDefaults,
-        from legacyKey: String,
-        to canonicalKey: String
-    ) {
-        guard defaults.object(forKey: canonicalKey) == nil,
-              let legacyValue = defaults.object(forKey: legacyKey)
-        else {
-            return
-        }
-        defaults.set(legacyValue, forKey: canonicalKey)
-        defaults.removeObject(forKey: legacyKey)
     }
 
     var shouldShowOnboarding: Bool {
