@@ -576,7 +576,7 @@ mod tests {
         let manager = lifecycle
             .manager
             .lock()
-            .map_or_else(PoisonError::into_inner, |manager| manager);
+            .unwrap_or_else(PoisonError::into_inner);
         assert!(manager.runs.is_empty());
         assert!(manager.stopping_profiles.is_empty());
     }
