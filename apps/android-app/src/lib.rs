@@ -10,7 +10,7 @@ use bytes::Bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use std::sync::{PoisonError, mpsc};
     use std::time::Duration;
 
     #[test]
@@ -567,7 +567,12 @@ mod tests {
         stopped_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("registration failure must stop the unregistered worker");
-        assert!(!lifecycle.has_active_profiles());
+        let manager = lifecycle
+            .manager
+            .lock()
+            .map_or_else(PoisonError::into_inner, |manager| manager);
+        assert!(manager.runs.is_empty());
+        assert!(manager.stopping_profiles.is_empty());
     }
 
     #[test]
