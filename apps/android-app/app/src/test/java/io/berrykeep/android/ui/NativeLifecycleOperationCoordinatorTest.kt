@@ -94,4 +94,59 @@ class NativeLifecycleOperationCoordinatorTest {
             assertTrue(forcedStopRan)
             assertFalse(staleStartPublished)
         }
+
+    @Test
+    fun sharedCoordinator_skipsAnOldOwnersQueuedStopBeforeANewOwnersStart() = runTest {
+        val sharedLifecycle = NativeLifecycleOperationCoordinator()
+        val oldViewModel = WebUiLifecycleOwner(sharedLifecycle)
+        val newViewModel = WebUiLifecycleOwner(sharedLifecycle)
+        val oldStopGeneration = oldViewModel.beginLifecycleOperation()
+        val lifecycleCallEntered = CompletableDeferred<Unit>()
+        val allowLifecycleCallToFinish = CompletableDeferred<Unit>()
+        var oldStopRan = false
+        var newStartRan = false
+
+        val existingLifecycleCall = async {
+            sharedLifecycle.run {
+                lifecycleCallEntered.complete(Unit)
+                allowLifecycleCallToFinish.await()
+            }
+        }
+        lifecycleCallEntered.await()
+        val oldStop = async {
+            oldViewModel.stopIfCurrent(oldStopGeneration) {
+                oldStopRan = true
+            }
+        }
+        val newStartGeneration = newViewModel.beginLifecycleOperation()
+        val newStart = async {
+            newViewModel.startIfCurrent(newStartGeneration) {
+                newStartRan = true
+            }
+        }
+
+        allowLifecycleCallToFinish.complete(Unit)
+        existingLifecycleCall.await()
+
+        assertFalse(oldStop.await())
+        assertTrue(newStart.await())
+        assertFalse(oldStopRan)
+        assertTrue(newStartRan)
+    }
+
+    private class WebUiLifecycleOwner(
+        private val lifecycle: NativeLifecycleOperationCoordinator,
+    ) {
+        fun beginLifecycleOperation(): Long = lifecycle.nextGeneration()
+
+        suspend fun stopIfCurrent(
+            generation: Long,
+            stop: suspend () -> Unit,
+        ): Boolean = lifecycle.runIfCurrent(generation, stop)
+
+        suspend fun startIfCurrent(
+            generation: Long,
+            start: suspend () -> Unit,
+        ): Boolean = lifecycle.runIfCurrent(generation, start)
+    }
 }

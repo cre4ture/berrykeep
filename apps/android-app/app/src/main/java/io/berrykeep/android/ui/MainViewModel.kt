@@ -108,9 +108,9 @@ class MainViewModel(
     private val uiObservationGate = UiObservationGate()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val preferenceWriteMutex = Mutex()
-    private val titleLatencyNativeControlMutex = Mutex()
-    private val titleLatencyNativeControlGate = LatestOperationGate()
-    private val webUiNativeLifecycle = NativeLifecycleOperationCoordinator()
+    private val titleLatencyNativeControlMutex = ProcessTitleLatencyNativeControl.mutex
+    private val titleLatencyNativeControlGate = ProcessTitleLatencyNativeControl.gate
+    private val webUiNativeLifecycle = ProcessWebUiNativeLifecycle.coordinator
     private val clearedWebUiCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
@@ -160,11 +160,11 @@ class MainViewModel(
         unregisterProcessLifecycleObserver()
         PrivateWebServiceBrowserSession.clearBackgroundSessionEndedCallback()
         webUiSessionBackgroundGrace.cancel()
-        webUiNativeLifecycle.nextGeneration()
+        val cleanupGeneration = webUiNativeLifecycle.nextGeneration()
         webUiBackgroundStopJob?.cancel()
         webUiBackgroundStopJob = null
         titleLatencyBackgroundGrace.cancel()
-        titleLatencyNativeControlGate.next()
+        val titleLatencyCleanupGeneration = titleLatencyNativeControlGate.next()
         titleLatencyBackgroundStopJob?.cancel()
         titleLatencyBackgroundStopJob = null
         EmbeddedWebUiSessionRegistry.clear()
@@ -177,7 +177,9 @@ class MainViewModel(
                 runCatching {
                     runBlocking {
                         titleLatencyNativeControlMutex.withLock {
-                            repository.stopTitleLatencyMonitor()
+                            if (titleLatencyNativeControlGate.isCurrent(titleLatencyCleanupGeneration)) {
+                                repository.stopTitleLatencyMonitor()
+                            }
                         }
                     }
                 }.onFailure { error ->
@@ -186,7 +188,7 @@ class MainViewModel(
             },
             "berrykeep-title-latency-stop",
         ).start()
-        stopWebUiAfterCleared()
+        stopWebUiAfterCleared(cleanupGeneration)
         super.onCleared()
     }
 
@@ -1422,10 +1424,10 @@ class MainViewModel(
         uiState.value = uiState.value.copy(webUiSession = null)
     }
 
-    private fun stopWebUiAfterCleared() {
+    private fun stopWebUiAfterCleared(cleanupGeneration: Long) {
         clearedWebUiCleanupScope.launch {
             try {
-                webUiNativeLifecycle.run {
+                webUiNativeLifecycle.runIfCurrent(cleanupGeneration) {
                     repository.stopWebUi()
                 }
             } catch (error: CancellationException) {
