@@ -524,6 +524,12 @@ mod tests {
     #[test]
     fn folder_sync_registration_stops_an_unregistered_worker_when_manager_is_poisoned() {
         let lifecycle = Arc::new(AndroidFolderSyncLifecycle::new());
+        lifecycle
+            .manager
+            .lock()
+            .expect("manager lock must be available")
+            .stopping_profiles
+            .insert("photos".to_string());
         let lifecycle_to_poison = lifecycle.clone();
         assert!(
             thread::spawn(move || {
@@ -1809,8 +1815,9 @@ fn register_folder_sync_run(
             manager.runs.insert(profile_id, run);
             Ok(())
         }
-        Err(_) => {
+        Err(poisoned) => {
             // An unregistered run cannot be reached by stop_profile or stop_all.
+            poisoned.into_inner().finished_stopping(&profile_id);
             stop_folder_sync_run(run);
             Err(anyhow::anyhow!("folder sync manager lock poisoned"))
         }
