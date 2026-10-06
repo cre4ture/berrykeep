@@ -962,7 +962,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
 				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.iosapp;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -984,7 +984,7 @@
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				OTHER_LDFLAGS = "$(inherited) -lios_app";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macapp;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.macapp;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
 			};
@@ -1005,7 +1005,7 @@
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				OTHER_LDFLAGS = "$(inherited) -lios_app";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macapp;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.macapp;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
 			};
@@ -1108,7 +1108,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
 				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp.fileprovider;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.iosapp.fileprovider;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -1152,7 +1152,7 @@
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				OTHER_LDFLAGS = "$(inherited) -lios_app";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macfileprovider;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.macfileprovider;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
 			};
@@ -1178,7 +1178,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
 				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.iosapp;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -1237,7 +1237,7 @@
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				OTHER_LDFLAGS = "$(inherited) -lios_app";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.macfileprovider;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.macfileprovider;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
 			};
@@ -1282,7 +1282,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(PROJECT_DIR)/RustArtifacts/$(PLATFORM_NAME)";
 				OTHER_LDFLAGS = "$(inherited) -lios_app -framework Network -framework SystemConfiguration";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.ironmesh.apple.iosapp.fileprovider;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.berrykeep.apple.iosapp.fileprovider;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/AppleNativeBridge/BerryKeepAppleFFI-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";

@@ -82,7 +82,7 @@ final class BerryKeepWorkingSetSignalCoordinator: @unchecked Sendable {
             domainIdentifier: configuration.domainIdentifier,
             storedProfile: storedProfile,
             configuredProfile: configuration.syncProfile,
-            legacyDisplayName: configuration.domainDisplayName
+            fallbackDisplayName: configuration.domainDisplayName
         ), AppleSyncRecoverySignalPolicy.shouldSignal(
             profile: profile,
             previous: previous,
