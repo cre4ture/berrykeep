@@ -111,15 +111,16 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         }
 
         let chooser = element(in: webView, labelled: "2 items in map cluster")
-        guard chooser.waitForExistence(timeout: 45) else {
-            XCTFail("Selecting a map bubble should open its image chooser")
-            return
-        }
+        XCTAssertTrue(chooser.waitForExistence(timeout: 45), "Selecting a map bubble should open its image chooser")
         XCTAssertGreaterThan(chooser.frame.height, 0, "The image chooser must have a visible height")
-
-        // This helper verifies the fullscreen presentation contract shared by
-        // direct and client-UI embeddings. Selecting a loaded cluster item is
-        // exercised separately by testEmbeddedGalleryOffersNativeShareInsteadOfDownload.
+        XCTAssertTrue(
+            element(in: webView, labelled: "gallery/runtime-map-a.png").waitForExistence(timeout: 45),
+            "The first clustered image should be selectable"
+        )
+        XCTAssertTrue(
+            element(in: webView, labelled: "gallery/runtime-map-b.png").waitForExistence(timeout: 45),
+            "The second clustered image should be selectable"
+        )
     }
 
     private var galleryRuntimeURL: String {
