@@ -1,3 +1,17 @@
+berrykeep (2.0.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Update Rustls and web dependency security fixes across shipped clients and
+    services.
+  * Add server storage mount-protection diagnostics and shared store-index
+    children projection.
+  * Harden Windows Cloud Files synchronization and fresh-client compatibility
+    paths.
+  * Make the BerryKeep Apple apps a clean-install boundary with their own
+    bundle identifiers, shared storage, and Files domain.
+  * Roll the workspace release to 2.0.0.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Wed, 07 Oct 2026 01:19:02 +0200
+
 berrykeep (1.2.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Add persistent multimedia operations, geolocation workflows, and expanded

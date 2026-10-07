@@ -29,6 +29,16 @@ separate Files domain backed by the shared enrolled device connection.
 - For a local simulator build/install/launch loop, run `scripts/run-ios-simulator-app.sh` or `just ios-app-run`.
 - GitHub Actions can also archive the `BerryKeepIosApp` Release build and, when Apple signing secrets are configured, export a downloadable `.ipa` for manual device installs.
 
+## Release build numbers
+
+All Apple targets derive their marketing and build versions from the shared Xcode
+settings `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`; individual Info.plists
+must not be edited to change a version. The committed default build number is `1`
+for local development. CI supplies the monotonically increasing GitHub Actions
+workflow run number when archiving a release. For a local TestFlight archive, pass
+the next positive build number with `CURRENT_PROJECT_VERSION=<number>` to
+`xcodebuild archive`.
+
 ## iOS sync behavior
 
 - Profiles own their remote prefix, discovery depth, lifecycle, and network/power policy while
