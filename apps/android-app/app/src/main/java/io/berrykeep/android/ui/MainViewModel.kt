@@ -284,7 +284,9 @@ class MainViewModel(
         notifyManagedClientForegrounded()
         startAppConnectionStatusMonitor()
         startFolderSyncStatusMonitor()
-        startTaskQueueStatusMonitor()
+        if (uiState.value.selectedSection == MainSection.HOME) {
+            startTaskQueueStatusMonitor()
+        }
         if (uiState.value.titleLatencyMonitorSettings.enabled) {
             configureTitleLatencyMonitor()
         }
@@ -674,6 +676,11 @@ class MainViewModel(
 
     fun selectSection(section: MainSection) {
         uiState.value = uiState.value.copy(selectedSection = section)
+        if (section == MainSection.HOME) {
+            startTaskQueueStatusMonitor()
+        } else {
+            stopTaskQueueStatusMonitor()
+        }
         if (section.isConnectionDiagnosticsSection()) {
             startConnectionRoutesMonitor()
         } else {
@@ -1722,6 +1729,7 @@ class MainViewModel(
     private fun startTaskQueueStatusMonitor() {
         if (
             !uiObservationGate.observationJobsActive ||
+            uiState.value.selectedSection != MainSection.HOME ||
             taskQueueStatusMonitorJob?.isActive == true
         ) {
             return

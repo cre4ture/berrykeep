@@ -29,6 +29,8 @@ import io.berrykeep.android.ui.components.HeroTone
 import io.berrykeep.android.ui.components.MetricPill
 import io.berrykeep.android.ui.components.SectionCard
 import io.berrykeep.android.ui.components.StatusHeroCard
+import java.text.DateFormat
+import java.util.Date
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -163,6 +165,19 @@ fun HomeScreen(
                     ),
                 )
             }
+            state.clusterTaskQueues?.let { snapshot ->
+                Text(
+                    text = buildString {
+                        append("Server snapshot ")
+                        append(formatTaskQueueSnapshotTime(snapshot.generatedAtUnixMs))
+                        if (state.clusterTaskQueuesError != null) {
+                            append(" · stale")
+                        }
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             state.clusterTaskQueuesError?.let { error ->
                 Text(
                     text = error,
@@ -260,6 +275,9 @@ private fun TaskQueueRow(queue: TaskQueueEntry) {
 }
 
 private fun shortNodeId(nodeId: String): String = if (nodeId.length > 12) nodeId.take(8) else nodeId
+
+private fun formatTaskQueueSnapshotTime(generatedAtUnixMs: Long): String =
+    DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(generatedAtUnixMs))
 
 private fun totalUploadedCount(state: HomeUiState): Long {
     return state.folderSyncStatus.profiles.sumOf { it.metrics.uploadedFileCount }

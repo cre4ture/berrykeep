@@ -217,6 +217,17 @@ struct BerryKeepFilesView: View {
                     )
                 )
             }
+            if let snapshot = model.clusterTaskQueues {
+                let generatedAt = Date(
+                    timeIntervalSince1970: TimeInterval(snapshot.generatedAtUnixMs) / 1_000
+                )
+                Text(
+                    "Server snapshot \(generatedAt.formatted(date: .omitted, time: .standard))"
+                        + (model.clusterTaskQueuesErrorMessage == nil ? "" : " · stale")
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            }
             if let error = model.clusterTaskQueuesErrorMessage {
                 Text(error).font(.footnote).foregroundStyle(.red)
             }

@@ -465,6 +465,7 @@ final class BerryKeepBrowserModel: ObservableObject {
 
         if hasCompletedOnboarding {
             configureTitleLatencyMonitor()
+            restartTaskQueueStatusMonitor()
             refresh()
         } else {
             statusText = "Finish onboarding to start browsing the remote library."
@@ -565,6 +566,7 @@ final class BerryKeepBrowserModel: ObservableObject {
         addAction("Completed onboarding", detail: draft.enrollmentSummary)
         refreshDomainState()
         configureTitleLatencyMonitor()
+        restartTaskQueueStatusMonitor()
         reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after onboarding")
     }
 
@@ -601,6 +603,7 @@ final class BerryKeepBrowserModel: ObservableObject {
         addAction("Applied settings", detail: draft.setupSummary)
         refreshDomainState()
         configureTitleLatencyMonitor()
+        restartTaskQueueStatusMonitor()
         reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after reconnecting")
     }
 
@@ -922,6 +925,7 @@ final class BerryKeepBrowserModel: ObservableObject {
         addAction("Restored defaults", detail: draft.setupSummary)
         refreshDomainState()
         configureTitleLatencyMonitor()
+        restartTaskQueueStatusMonitor()
         if hasCompletedOnboarding, !draft.requiresEnrollment, draft.connectionConfiguration != nil {
             reloadRootAfterConnectionContextChange(actionTitle: "Loaded bundled root")
         } else {
@@ -1005,6 +1009,7 @@ final class BerryKeepBrowserModel: ObservableObject {
                 statusText = "Device enrolled: \(enrollment.deviceID)"
                 addAction("Enrolled device", detail: draft.deviceLabel.nilIfBlank ?? enrollment.deviceID)
                 configureTitleLatencyMonitor()
+                restartTaskQueueStatusMonitor()
 
                 if completesOnboarding {
                     hasCompletedOnboarding = true
@@ -1494,7 +1499,6 @@ final class BerryKeepBrowserModel: ObservableObject {
     }
 
     private func configureTitleLatencyMonitor() {
-        restartTaskQueueStatusMonitor()
         titleLatencyStatusTask?.cancel()
         titleLatencyStatusTask = nil
 
@@ -1554,6 +1558,7 @@ final class BerryKeepBrowserModel: ObservableObject {
         taskQueueStatusTask = nil
         guard let configuration = draft.connectionConfiguration else {
             clusterTaskQueues = nil
+            clusterTaskQueuesErrorMessage = nil
             return
         }
         let remoteSession = remoteSession

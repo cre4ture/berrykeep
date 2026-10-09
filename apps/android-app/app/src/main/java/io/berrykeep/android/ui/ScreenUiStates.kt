@@ -41,17 +41,13 @@ internal fun buildClientTaskQueues(state: MainUiState): List<TaskQueueEntry> {
         state.connectionRoutesLoading,
         state.timingMeasurementResetting,
         state.timingStoreIndexTestRunning,
-        state.galleryLoading,
     ).count { it }.toLong()
-    val foregroundPending = state.galleryPages.values.count { page ->
-        page.status == GalleryPageStatus.LOADING
-    }.toLong()
     val syncActive = state.globalFolderSyncStatus.syncingProfileCount
     val syncPending = state.globalFolderSyncStatus.waitingProfileCount +
         state.folderSyncStatus.startingProfileCount
     val probeActive = if (state.titleLatencyStatus.state == "pending") 1L else 0L
     return listOf(
-        taskQueueEntry("foreground", "Foreground operations", foregroundPending, foregroundActive),
+        taskQueueEntry("foreground", "Foreground operations", 0, foregroundActive),
         taskQueueEntry("folder_sync", "Folder sync", syncPending, syncActive),
         taskQueueEntry("latency_probe", "Connection probe", 0, probeActive),
     )
