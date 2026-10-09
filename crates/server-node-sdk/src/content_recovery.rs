@@ -846,6 +846,9 @@ async fn repair_subjects_inner(
             continue;
         };
         let now = unix_ts();
+        // A changed source view deliberately bypasses ordinary backoff. The
+        // due-task query applies the source-change rate limit before a task can
+        // reach this execution path.
         if task.next_attempt_unix > now && task.source_fingerprint == fingerprint {
             report.skipped_items += 1;
             report.skipped_backoff += 1;

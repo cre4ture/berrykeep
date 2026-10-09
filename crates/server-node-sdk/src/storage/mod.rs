@@ -13,8 +13,10 @@ const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID + 1;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION;
 pub(super) const CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT: &str = "__legacy__";
-/// A source-topology change can make a repair useful sooner, but must not
-/// repeatedly collapse a long exponential retry delay while peers flap.
+/// A source-topology change deliberately caps the ordinary exponential
+/// backoff at this interval so newly reachable content is retried promptly.
+/// This is a rate limit: flapping topology can trigger one attempt per
+/// interval instead of preserving the longer ordinary backoff.
 pub(super) const CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS: u64 = 60;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";

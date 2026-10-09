@@ -651,10 +651,9 @@ impl MetadataStore for TursoMetadataStore {
             hashes.push(hash);
         }
         drop(rows);
-        // A source topology change can wake a task before its ordinary retry
-        // deadline, but only after a minimum interval since its last transfer
-        // attempt. This preserves exponential backoff while peers flap. The
-        // last-attempt range keeps the query indexed.
+        // A source topology change deliberately caps ordinary backoff at the
+        // minimum interval. Flapping peers can therefore trigger one attempt
+        // per interval; the last-attempt range keeps that rate limit indexed.
         if hashes.len() < limit {
             let remaining = i64::try_from(limit.saturating_sub(hashes.len()))
                 .context("repair task query limit overflow")?;

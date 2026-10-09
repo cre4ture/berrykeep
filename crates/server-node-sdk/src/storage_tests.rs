@@ -9886,9 +9886,7 @@ run_on_all_metadata_backends!(
     data_scrub_ignores_unassigned_missing_and_unreadable_manifests_turso
 );
 
-async fn content_repair_source_change_respects_minimum_retry_interval_impl(
-    backend: StorageTestBackend,
-) {
+async fn content_repair_source_change_caps_backoff_at_rate_limit_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend
         .init_store("content-repair-source-change-minimum-retry")
         .await;
@@ -9936,16 +9934,16 @@ async fn content_repair_source_change_respects_minimum_retry_interval_impl(
             .await
             .unwrap(),
         vec![eligible.reference.manifest_hash],
-        "a source change must not retry a task before its minimum retry interval"
+        "a source change must cap backoff at, but not bypass, its rate-limit interval"
     );
 
     let _ = fs::remove_dir_all(root).await;
 }
 
 run_on_all_metadata_backends!(
-    content_repair_source_change_respects_minimum_retry_interval_impl,
-    content_repair_source_change_respects_minimum_retry_interval,
-    content_repair_source_change_respects_minimum_retry_interval_turso
+    content_repair_source_change_caps_backoff_at_rate_limit_impl,
+    content_repair_source_change_caps_backoff_at_rate_limit,
+    content_repair_source_change_caps_backoff_at_rate_limit_turso
 );
 
 async fn importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl(
