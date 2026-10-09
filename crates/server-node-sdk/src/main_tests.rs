@@ -19922,6 +19922,7 @@ async fn build_test_state(
                 sessions: HashMap::new(),
             }),
             upload_sessions_dirty: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            upload_sessions_persisted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             upload_sessions_persist_notify: Arc::new(tokio::sync::Notify::new()),
             map_dataset_import: Arc::new(Mutex::new(
                 super::map_dataset_import::MapDatasetImportRuntime::empty(
@@ -20609,6 +20610,10 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
         .storage
         .upload_sessions_dirty
         .store(3, std::sync::atomic::Ordering::Relaxed);
+    state
+        .storage
+        .upload_sessions_persisted
+        .store(2, std::sync::atomic::Ordering::Relaxed);
     {
         let mut repair = state.maintenance.autonomous_post_write_repair.lock().await;
         repair.pending_subjects.insert("photos/a.jpg".to_string());
@@ -20628,7 +20633,7 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
         .iter()
         .find(|queue| queue.id == "upload_session_persistence")
         .expect("persistence queue should be present");
-    assert_eq!(persistence.pending, 3);
+    assert_eq!(persistence.pending, 1);
     let repair = snapshot
         .queues
         .iter()

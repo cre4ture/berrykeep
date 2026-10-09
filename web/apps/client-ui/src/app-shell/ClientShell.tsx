@@ -342,6 +342,7 @@ export function ClientShell() {
           clusterTaskQueues={clusterTaskQueues}
           clusterTaskQueuesError={clusterTaskQueuesError}
           uploadSummary={binaryUpload.summary}
+          uploadConcurrency={binaryUpload.concurrency}
           loading={overviewLoading}
           error={overviewError}
           onRefresh={refreshOverview}
@@ -823,6 +824,7 @@ type OverviewPageProps = {
   clusterTaskQueues: ClusterTaskQueueSnapshot | null;
   clusterTaskQueuesError: string | null;
   uploadSummary: BinaryUploadSummary;
+  uploadConcurrency: number;
   loading: boolean;
   error: string | null;
   onRefresh: () => Promise<void>;
@@ -837,6 +839,7 @@ function OverviewPage({
   clusterTaskQueues,
   clusterTaskQueuesError,
   uploadSummary,
+  uploadConcurrency,
   loading,
   error,
   onRefresh
@@ -889,7 +892,7 @@ function OverviewPage({
                 label="Browser uploads"
                 pending={uploadSummary.queuedFiles}
                 active={uploadSummary.activeFiles}
-                state={queueState(uploadSummary.queuedFiles, uploadSummary.activeFiles, DEFAULT_BINARY_UPLOAD_CONCURRENCY)}
+                state={queueState(uploadSummary.queuedFiles, uploadSummary.activeFiles, uploadConcurrency)}
               />
               <Text size="xs" c="dimmed">
                 Best-effort browser work observed by this UI. Counts can lag briefly.

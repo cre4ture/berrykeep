@@ -344,6 +344,7 @@ struct ServerStorageRuntime {
     upload_chunk_ingestor: ChunkIngestor,
     upload_sessions: Arc<TracedRwLock<UploadSessionStore>>,
     upload_sessions_dirty: Arc<AtomicUsize>,
+    upload_sessions_persisted: Arc<AtomicUsize>,
     upload_sessions_persist_notify: Arc<Notify>,
     map_dataset_import: Arc<Mutex<map_dataset_import::MapDatasetImportRuntime>>,
     natural_earth_import: Arc<Mutex<natural_earth_import::NaturalEarthImportRuntime>>,
@@ -1326,9 +1327,12 @@ async fn persist_upload_session_store_now(state: &ServerState) -> Result<()> {
 }
 
 fn spawn_upload_session_store_persister(state: ServerState) {
+    let mut persisted_generation = state.storage.upload_sessions_dirty.load(Ordering::SeqCst);
+    state
+        .storage
+        .upload_sessions_persisted
+        .store(persisted_generation, Ordering::SeqCst);
     tokio::spawn(async move {
-        let mut persisted_generation = state.storage.upload_sessions_dirty.load(Ordering::SeqCst);
-
         loop {
             state
                 .storage
@@ -1351,6 +1355,10 @@ fn spawn_upload_session_store_persister(state: ServerState) {
                 match persist_upload_session_store_now(&state).await {
                     Ok(()) => {
                         persisted_generation = target_generation;
+                        state
+                            .storage
+                            .upload_sessions_persisted
+                            .store(persisted_generation, Ordering::SeqCst);
                     }
                     Err(err) => {
                         warn!(error = %err, "failed to persist debounced upload session state");
@@ -7519,6 +7527,7 @@ async fn run_inner(
             upload_chunk_ingestor,
             upload_sessions: new_upload_sessions_rwlock(upload_session_store),
             upload_sessions_dirty: Arc::new(AtomicUsize::new(0)),
+            upload_sessions_persisted: Arc::new(AtomicUsize::new(0)),
             upload_sessions_persist_notify: Arc::new(Notify::new()),
             map_dataset_import: Arc::new(Mutex::new(map_dataset_import_runtime)),
             natural_earth_import: Arc::new(Mutex::new(
@@ -28228,7 +28237,13 @@ async fn local_task_queue_snapshot(
     } else {
         observed_requests
     };
-    let upload_persistence_pending = state.storage.upload_sessions_dirty.load(Ordering::Relaxed);
+    let upload_persistence_dirty = state.storage.upload_sessions_dirty.load(Ordering::SeqCst);
+    let upload_persistence_persisted = state
+        .storage
+        .upload_sessions_persisted
+        .load(Ordering::SeqCst);
+    let upload_persistence_pending =
+        upload_persistence_dirty.saturating_sub(upload_persistence_persisted);
     let history_refresh_active = STORE_HISTORY_REFRESH_MAX_CONCURRENCY.saturating_sub(
         state
             .storage
