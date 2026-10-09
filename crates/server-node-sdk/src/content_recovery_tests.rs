@@ -987,6 +987,62 @@ run_on_main_metadata_backends!(
     repair_deferral_keeps_valid_local_availability_cache_turso
 );
 
+async fn repair_completion_invalidates_pending_availability_cache_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let key = choose_locally_placed_key(&target, "repair-completion-availability").await;
+    let payload = b"repair completion availability bytes".to_vec();
+    for state in [&source, &target] {
+        seed_subject_version(state, &key, "v1", payload.clone(), vec![]).await;
+    }
+    let manifest = bundle(&target, &key, "v1").await;
+    remove_chunks(&target, &manifest, &[0]).await;
+    let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &url).await;
+
+    let preparation =
+        crate::content_recovery::block_recovery_preparation_for_test(&manifest.manifest_hash);
+    let repair = crate::content_recovery::repair_subjects(&target, vec![format!("{key}@v1")], None);
+    tokio::pin!(repair);
+    tokio::select! {
+        () = preparation.wait_until_started() => {}
+        report = &mut repair => panic!("repair ended before preparation blocked: {report:?}"),
+        () = tokio::time::sleep(Duration::from_secs(5)) => {
+            panic!("repair did not reach task preparation")
+        }
+    }
+
+    crate::refresh_local_availability_view_once(&target).await;
+    assert!(
+        !crate::cached_local_cluster_available_subjects(&target)
+            .await
+            .contains(&format!("{key}@v1")),
+        "a pending repair must quarantine its manifest from local availability"
+    );
+
+    preparation.release();
+    let report = repair.await;
+    crate::content_recovery::clear_recovery_preparation_blocker_for_test(&manifest.manifest_hash);
+    assert_eq!(report.successful_transfers, 1, "{report:?}");
+    assert!(
+        crate::cached_local_cluster_available_subjects(&target)
+            .await
+            .contains(&format!("{key}@v1")),
+        "repair completion must invalidate the cached quarantine before its trailing refresh"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    repair_completion_invalidates_pending_availability_cache_impl,
+    repair_completion_invalidates_pending_availability_cache,
+    repair_completion_invalidates_pending_availability_cache_turso
+);
+
 async fn recovery_read_budget_bounds_slow_unadvertised_peers_impl(backend: MainTestBackend) {
     let target = build_test_state(1, false, backend).await;
     let source = build_test_state(1, false, backend).await;

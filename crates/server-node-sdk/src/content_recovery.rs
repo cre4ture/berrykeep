@@ -994,6 +994,11 @@ async fn repair_subjects_inner(
         let recovered_before_attempt = task.recovered_chunks;
         match recover_task(state, &mut task).await {
             Ok(recovered) => {
+                // Completing the task removes the quarantine that kept this
+                // manifest out of the local availability view. A refresh may
+                // already have cached that quarantined view after enqueue, so
+                // completion must always invalidate it again.
+                invalidate_local_availability_cache(state);
                 if !availability_changed {
                     request_local_availability_refresh(state);
                     availability_changed = true;
