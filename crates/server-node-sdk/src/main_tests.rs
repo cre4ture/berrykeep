@@ -14320,7 +14320,9 @@ async fn recompute_local_cluster_available_subjects_excludes_corrupt_manifests_i
         corrupt_keys.push(key);
     }
 
-    let subjects = super::recompute_local_cluster_available_subjects(&state).await;
+    let subjects = super::recompute_local_cluster_available_subjects(&state)
+        .await
+        .subjects;
 
     for key in &valid_keys {
         assert!(

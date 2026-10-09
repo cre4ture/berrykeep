@@ -502,6 +502,29 @@ impl LocalAvailabilityCache {
     }
 }
 
+struct RecomputedLocalAvailability {
+    subjects: Vec<String>,
+    /// A fallback based on namespace keys is useful for one refresh but lacks
+    /// ownership, integrity, and repair-pending checks. Never replay it from
+    /// the TTL cache.
+    cacheable: bool,
+}
+
+fn cache_local_availability_if_current(
+    cache: &mut Option<LocalAvailabilityCache>,
+    generation: u64,
+    current_generation: u64,
+    computed: &RecomputedLocalAvailability,
+) {
+    if computed.cacheable && current_generation == generation {
+        *cache = Some(LocalAvailabilityCache {
+            generation,
+            computed_at: Instant::now(),
+            subjects: Arc::new(computed.subjects.clone()),
+        });
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ClientConnectionTransportKind {
@@ -12364,14 +12387,19 @@ async fn planning_replication_subjects_for_auditor(state: &ServerState) -> Vec<S
         .collect()
 }
 
-async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
+async fn recompute_local_cluster_available_subjects(
+    state: &ServerState,
+) -> RecomputedLocalAvailability {
     let inspector = {
         let store = read_store(state, "availability.recompute_local_subjects.snapshot").await;
         match store.replication_subject_inspector().await {
             Ok(inspector) => inspector,
             Err(err) => {
                 warn!(error = %err, "failed to snapshot current state for replication subjects");
-                return Vec::new();
+                return RecomputedLocalAvailability {
+                    subjects: Vec::new(),
+                    cacheable: false,
+                };
             }
         }
     };
@@ -12382,18 +12410,21 @@ async fn recompute_local_cluster_available_subjects(state: &ServerState) -> Vec<
     // unreachable). Falling back to `current_keys()` in that case still risks
     // over-trusting local data, but it's the best information available; log it so
     // the fallback is visible instead of silent.
-    let mut subjects = match inspector.list_replication_subjects().await {
-        Ok(subjects) => subjects,
+    let (mut subjects, cacheable) = match inspector.list_replication_subjects().await {
+        Ok(subjects) => (subjects, true),
         Err(err) => {
             warn!(
                 error = %err,
                 "failed to compute replication subjects; falling back to current keys"
             );
-            inspector.current_keys()
+            (inspector.current_keys(), false)
         }
     };
     subjects.sort();
-    subjects
+    RecomputedLocalAvailability {
+        subjects,
+        cacheable,
+    }
 }
 
 async fn cached_local_cluster_available_subjects(state: &ServerState) -> Vec<String> {
@@ -12420,20 +12451,33 @@ async fn cached_or_recompute_local_cluster_available_subjects(
         return subjects;
     }
 
-    let subjects = Arc::new(recompute_local_cluster_available_subjects(state).await);
-    if state
+    let computed = recompute_local_cluster_available_subjects(state).await;
+    let subjects = Arc::new(computed.subjects.clone());
+    let current_generation = state
         .maintenance
         .local_availability_generation
-        .load(Ordering::SeqCst)
-        == generation
-    {
-        *state.maintenance.local_availability_cache.lock().await = Some(LocalAvailabilityCache {
-            generation,
-            computed_at: Instant::now(),
-            subjects: Arc::clone(&subjects),
-        });
-    }
+        .load(Ordering::SeqCst);
+    let mut cache = state.maintenance.local_availability_cache.lock().await;
+    cache_local_availability_if_current(&mut cache, generation, current_generation, &computed);
     subjects
+}
+
+#[cfg(test)]
+mod local_availability_cache_tests {
+    use super::*;
+
+    #[test]
+    fn degraded_local_availability_is_not_cached() {
+        let mut cache = None;
+        let computed = RecomputedLocalAvailability {
+            subjects: vec!["current-key".to_string()],
+            cacheable: false,
+        };
+
+        cache_local_availability_if_current(&mut cache, 7, 7, &computed);
+
+        assert!(cache.is_none());
+    }
 }
 
 async fn refresh_local_availability_view_once(state: &ServerState) -> usize {

@@ -11,6 +11,10 @@ pub(crate) const READ_THROUGH_RECOVERY_BUDGET: Duration = Duration::from_secs(30
 /// Bounds one durable repair pass. Its persisted task and any verified chunks
 /// survive cancellation, so a later pass resumes with a fresh peer snapshot.
 const DURABLE_CONTENT_REPAIR_BUDGET: Duration = Duration::from_secs(2 * 60);
+/// A worker pass processes one durable manifest at a time. Each manifest has
+/// its own recovery deadline, so this also bounds one persisted run and keeps
+/// notifications from being delayed behind a history-sized batch.
+const BACKGROUND_REPAIR_PASS_MAX_TRANSFERS: usize = 1;
 const MAX_RECOVERY_ERRORS: usize = 16;
 
 #[derive(Debug)]
@@ -779,12 +783,14 @@ pub(crate) fn spawn_worker(state: ServerState) {
 
 pub(crate) async fn resume_pending(state: &ServerState) -> Result<()> {
     let fingerprint = source_fingerprint(state).await;
+    // A single transfer can consume the full durable-recovery budget, so do
+    // not let one worker tick monopolize repair tracking with a large batch.
     let hashes = read_store(state, "content_recovery.pending_schedule")
         .await
         .due_content_repair_task_hashes(
             unix_ts(),
             &fingerprint,
-            state.repair_config.batch_size.max(1),
+            BACKGROUND_REPAIR_PASS_MAX_TRANSFERS,
         )
         .await?;
     let subjects = hashes

@@ -83,6 +83,9 @@ an earlier retry; ordinary heartbeat timestamp changes do not defeat backoff.
 The legacy `max_retries` setting continues to bound legacy metadata-bundle transfer attempts;
 retained content uses its durable retry record instead, so a retained repair is never silently
 abandoned. Before each retained transfer, the existing foreground-load throttle is honored.
+The background worker attempts one retained manifest per pass; the per-manifest recovery budget
+therefore also bounds one persisted repair-run outcome and prevents a large queued batch from
+monopolizing the worker for hours.
 
 A durable task pins its manifest and chunks. A shared GC gate serializes pin registration/release
 against cleanup snapshots; network waits do not hold that gate. Already recovered chunks remain

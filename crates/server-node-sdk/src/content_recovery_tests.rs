@@ -934,6 +934,67 @@ run_on_main_metadata_backends!(
     recovery_worker_skips_already_claimed_tasks_turso
 );
 
+async fn recovery_worker_bounds_one_background_pass_impl(backend: MainTestBackend) {
+    let mut target = build_test_state(1, false, backend).await;
+    target.repair_config.batch_size = 32;
+    let mut subjects = Vec::new();
+    for key in ["background-pass/one", "background-pass/two"] {
+        seed_subject_version(
+            &target,
+            key,
+            "v1",
+            format!("healthy bytes for {key}").into_bytes(),
+            vec![],
+        )
+        .await;
+        subjects.push(format!("{key}@v1"));
+    }
+    let retained = read_store(&target, "test.recovery.background_pass_references")
+        .await
+        .retained_content()
+        .await
+        .unwrap();
+    for subject in &subjects {
+        let task = crate::storage::content_recovery::ContentRepairTask::new(
+            retained.reference_for_subject(subject).unwrap().clone(),
+            true,
+        );
+        read_store(&target, "test.recovery.background_pass_persist")
+            .await
+            .persist_content_repair_task(&task)
+            .await
+            .unwrap();
+    }
+
+    crate::content_recovery::resume_pending(&target)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repair_run_history(&target).await.len(),
+        1,
+        "one bounded worker pass must publish one repair-run outcome"
+    );
+    assert_eq!(
+        read_store(&target, "test.recovery.background_pass_pending")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a large configured batch must not run every durable task in one pass"
+    );
+
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_worker_bounds_one_background_pass_impl,
+    recovery_worker_bounds_one_background_pass,
+    recovery_worker_bounds_one_background_pass_turso
+);
+
 async fn recovery_local_install_failure_is_unresolved_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let target = build_test_state(1, false, backend).await;
