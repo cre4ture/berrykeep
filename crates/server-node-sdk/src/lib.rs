@@ -12416,11 +12416,6 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
     let mut subjects = BTreeSet::new();
     subjects.extend(local_subjects);
     subjects.extend(cluster_subjects);
-    // Historical durability obligations are scheduled by the manifest-hash
-    // worker. Keeping them out of legacy object/version planning prevents a
-    // deep retained history from expanding each availability or repair pass.
-    subjects
-        .retain(|subject| !subject.starts_with(storage::retained_content::MANIFEST_SUBJECT_PREFIX));
     subjects.into_iter().collect()
 }
 
@@ -12897,9 +12892,9 @@ async fn execute_data_scrub_follow_on_repair(
     state: ServerState,
     scrub_run_id: String,
     degraded_subjects: BTreeSet<String>,
-    repair_subjects: BTreeSet<String>,
+    repair_manifest_hashes: BTreeSet<String>,
 ) {
-    if repair_subjects.is_empty() {
+    if repair_manifest_hashes.is_empty() {
         return;
     }
 
@@ -12908,29 +12903,29 @@ async fn execute_data_scrub_follow_on_repair(
     if !state.repair_config.enabled {
         info!(
             scrub_run_id = %scrub_run_id,
-            subject_count = repair_subjects.len(),
+            subject_count = repair_manifest_hashes.len(),
             "skipping scrub follow-on repair because repair execution is disabled"
         );
         return;
     }
 
-    let subjects = repair_subjects.into_iter().collect::<Vec<_>>();
+    let manifest_hashes = repair_manifest_hashes.into_iter().collect::<Vec<_>>();
     info!(
         scrub_run_id = %scrub_run_id,
-        subject_count = subjects.len(),
+        subject_count = manifest_hashes.len(),
         "starting scrub follow-on repair"
     );
 
-    let report = execute_tracked_targeted_local_replication_repair(
+    let report = execute_tracked_targeted_local_manifest_repair(
         &state,
-        subjects.clone(),
+        manifest_hashes.clone(),
         RepairRunTrigger::DataScrubAutoRepair,
     )
     .await;
 
     info!(
         scrub_run_id = %scrub_run_id,
-        subject_count = subjects.len(),
+        subject_count = manifest_hashes.len(),
         attempted = report.attempted_transfers,
         successful = report.successful_transfers,
         failed = report.failed_transfers,
@@ -12945,7 +12940,7 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
     info!(run_id = %tracker.run_id, trigger = ?tracker.trigger, "data scrub run started");
     let scrubber = content_recovery::scrubber(&state).await;
     let result = match scrubber {
-        Ok(scrubber) => scrubber.run_with_repair_subjects().await,
+        Ok(scrubber) => scrubber.run_with_repair_manifests().await,
         Err(err) => Err(err),
     };
 
@@ -12956,12 +12951,12 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
             // when automatic execution is disabled. The durable task suppresses
             // availability and protects the affected content until a later
             // manual repair or re-enabled worker can verify a replacement.
-            let enqueue_error = if output.repair_subjects.is_empty() {
+            let enqueue_error = if output.repair_manifest_hashes.is_empty() {
                 None
             } else {
-                content_recovery::repair_subjects(
+                content_recovery::repair_manifest_hashes(
                     &state,
-                    output.repair_subjects.iter().cloned().collect(),
+                    output.repair_manifest_hashes.iter().cloned().collect(),
                     Some(0),
                 )
                 .await
@@ -12988,14 +12983,14 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
             let record =
                 finish_data_scrub_run_tracking(&state, tracker, status, summary, enqueue_error)
                     .await;
-            if automatic_repair_enabled && !output.repair_subjects.is_empty() {
+            if automatic_repair_enabled && !output.repair_manifest_hashes.is_empty() {
                 let state_clone = state.clone();
                 tokio::spawn(async move {
                     execute_data_scrub_follow_on_repair(
                         state_clone,
                         record.run_id,
                         output.degraded_subjects,
-                        output.repair_subjects,
+                        output.repair_manifest_hashes,
                     )
                     .await;
                 });
@@ -13134,26 +13129,26 @@ async fn execute_tracked_replication_plan(
     report
 }
 
-async fn execute_tracked_targeted_local_replication_repair(
+async fn execute_tracked_targeted_local_manifest_repair(
     state: &ServerState,
-    subjects: Vec<String>,
+    manifest_hashes: Vec<String>,
     trigger: RepairRunTrigger,
 ) -> replication::ReplicationRepairReport {
     let plan_summary = RepairPlanSummary {
         generated_at_unix: unix_ts(),
-        under_replicated: subjects.len(),
+        under_replicated: manifest_hashes.len(),
         over_replicated: 0,
         cleanup_deferred_items: 0,
         cleanup_deferred_extra_nodes: 0,
-        item_count: subjects.len(),
+        item_count: manifest_hashes.len(),
     };
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
     let report = with_active_repair_log_tracking(&tracker, async {
-        replication::execute_targeted_replication_repair_inner_with_context(
+        replication::execute_targeted_manifest_repair_inner_with_context(
             state,
-            subjects.clone(),
-            Some(subjects.len().max(1)),
+            manifest_hashes.clone(),
+            Some(manifest_hashes.len().max(1)),
             Some(&tracker.run_id),
         )
         .await

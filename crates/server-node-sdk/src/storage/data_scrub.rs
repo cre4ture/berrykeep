@@ -127,7 +127,7 @@ use super::retained_content::{RetainedContent, RetainedReference as DataScrubRef
 #[derive(Debug, Default)]
 pub(crate) struct DataScrubRunOutput {
     pub(crate) report: DataScrubReport,
-    pub(crate) repair_subjects: BTreeSet<String>,
+    pub(crate) repair_manifest_hashes: BTreeSet<String>,
     pub(crate) degraded_subjects: BTreeSet<String>,
 }
 
@@ -275,7 +275,7 @@ impl DataScrubber {
         Ok(self.run_internal().await?.report)
     }
 
-    pub(crate) async fn run_with_repair_subjects(self) -> Result<DataScrubRunOutput> {
+    pub(crate) async fn run_with_repair_manifests(self) -> Result<DataScrubRunOutput> {
         self.run_internal().await
     }
 
@@ -287,7 +287,7 @@ impl DataScrubber {
 
         let mut output = DataScrubRunOutput {
             report: DataScrubReport::default(),
-            repair_subjects: BTreeSet::new(),
+            repair_manifest_hashes: BTreeSet::new(),
             degraded_subjects: BTreeSet::new(),
         };
         let retained = match self.retained_content.take() {
@@ -618,9 +618,9 @@ impl DataScrubber {
         detail: String,
     ) {
         if data_scrub_issue_requires_auto_repair(&kind) {
-            output
-                .repair_subjects
-                .extend(data_scrub_repair_subjects_for_contexts(contexts));
+            if let Some(manifest_hash) = &manifest_hash {
+                output.repair_manifest_hashes.insert(manifest_hash.clone());
+            }
             output
                 .degraded_subjects
                 .extend(data_scrub_all_subjects_for_contexts(contexts));
@@ -649,41 +649,12 @@ fn data_scrub_issue_requires_auto_repair(kind: &DataScrubIssueKind) -> bool {
     !matches!(kind, DataScrubIssueKind::ManifestKeyMismatch)
 }
 
-fn data_scrub_repair_subjects_for_contexts(
-    contexts: &BTreeMap<String, DataScrubReference>,
-) -> BTreeSet<String> {
-    let mut subjects = BTreeSet::new();
-    let versioned_base_keys = contexts
-        .values()
-        .filter(|context| context.version_id.is_some())
-        .filter_map(|context| context.key.clone())
-        .collect::<HashSet<_>>();
-
-    for context in contexts.values() {
-        if context.snapshot_only || context.key.is_none() {
-            subjects.extend(context.subject());
-            continue;
-        }
-        match (&context.key, &context.version_id) {
-            (Some(key), Some(version_id)) => {
-                subjects.insert(format!("{key}@{version_id}"));
-            }
-            (Some(key), None) if !versioned_base_keys.contains(key) => {
-                subjects.insert(key.clone());
-            }
-            _ => {}
-        }
-    }
-
-    subjects
-}
-
 fn data_scrub_all_subjects_for_contexts(
     contexts: &BTreeMap<String, DataScrubReference>,
 ) -> BTreeSet<String> {
     contexts
         .values()
-        .filter_map(DataScrubReference::subject)
+        .filter_map(DataScrubReference::replication_subject)
         .collect()
 }
 

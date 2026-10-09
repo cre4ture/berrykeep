@@ -31,8 +31,12 @@ async fn repair_logs_expired_retained_reference_skips() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let subject = format!("{MANIFEST_SUBJECT_PREFIX}expired-manifest");
 
-    let report =
-        crate::content_recovery::repair_subjects(&state, vec![subject.clone()], None).await;
+    let report = crate::content_recovery::repair_manifest_hashes(
+        &state,
+        vec!["expired-manifest".to_string()],
+        None,
+    )
+    .await;
 
     assert_eq!(report.skipped_items, 1, "{report:?}");
     assert!(
@@ -75,12 +79,9 @@ async fn fully_local_recovery_does_not_require_the_store_write_lock_impl(backend
     let reader = read_store(&state, "test.recovery.shared_store_reader").await;
     let report = tokio::time::timeout(
         Duration::from_secs(1),
-        crate::content_recovery::repair_subjects(
+        crate::content_recovery::repair_manifest_hashes(
             &state,
-            vec![format!(
-                "{MANIFEST_SUBJECT_PREFIX}{}",
-                manifest.manifest_hash
-            )],
+            vec![manifest.manifest_hash.clone()],
             None,
         ),
     )
@@ -465,6 +466,107 @@ run_on_main_metadata_backends!(
     planning_subjects_keep_divergent_head_versions_impl,
     planning_subjects_keep_divergent_head_versions,
     planning_subjects_keep_divergent_head_versions_turso
+);
+
+async fn planning_subjects_preserve_manifest_prefix_user_keys_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let key = format!("{MANIFEST_SUBJECT_PREFIX}notes.txt");
+    seed_subject_version(
+        &state,
+        &key,
+        "v1",
+        b"user key in the internal label namespace".to_vec(),
+        vec![],
+    )
+    .await;
+
+    crate::refresh_local_availability_view_once(&state).await;
+    let subjects = crate::planning_replication_subjects(&state).await;
+    assert!(
+        subjects.contains(&key),
+        "an internal-looking user key must remain in replication planning: {subjects:?}"
+    );
+    assert!(
+        subjects.contains(&format!("{key}@v1")),
+        "the user key's exact head must remain in replication planning: {subjects:?}"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    planning_subjects_preserve_manifest_prefix_user_keys_impl,
+    planning_subjects_preserve_manifest_prefix_user_keys,
+    planning_subjects_preserve_manifest_prefix_user_keys_turso
+);
+
+async fn manifest_hash_repair_cannot_collide_with_user_subject_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let intended_key = "typed-manifest-repair-target.bin";
+    let intended_payload = b"manifest selected by immutable hash".to_vec();
+    for state in [&source, &target] {
+        seed_subject_version(state, intended_key, "v1", intended_payload.clone(), vec![]).await;
+    }
+    let intended = bundle(&target, intended_key, "v1").await;
+    let colliding_key = format!("{MANIFEST_SUBJECT_PREFIX}{}", intended.manifest_hash);
+    for state in [&source, &target] {
+        seed_subject_version(
+            state,
+            &colliding_key,
+            "v1",
+            b"different user object".to_vec(),
+            vec![],
+        )
+        .await;
+    }
+    let colliding_manifest = bundle(&target, &colliding_key, "v1").await;
+    assert_ne!(colliding_manifest.manifest_hash, intended.manifest_hash);
+    assert_eq!(
+        read_store(&target, "test.recovery.colliding_user_subject")
+            .await
+            .retained_content()
+            .await
+            .unwrap()
+            .reference_for_subject(&colliding_key)
+            .unwrap()
+            .manifest_hash,
+        colliding_manifest.manifest_hash,
+        "the internal-looking string must retain its user-subject meaning"
+    );
+
+    remove_chunks(&target, &intended, &[0]).await;
+    let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &url).await;
+    let report = crate::content_recovery::repair_manifest_hashes(
+        &target,
+        vec![intended.manifest_hash.clone()],
+        None,
+    )
+    .await;
+
+    assert_eq!(report.successful_transfers, 1, "{report:?}");
+    assert_eq!(
+        read_store(&target, "test.recovery.typed_manifest_result")
+            .await
+            .get_object(intended_key, None, Some("v1"), ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .as_ref(),
+        intended_payload,
+        "manifest repair must not resolve the hash as a colliding user key"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    manifest_hash_repair_cannot_collide_with_user_subject_impl,
+    manifest_hash_repair_cannot_collide_with_user_subject,
+    manifest_hash_repair_cannot_collide_with_user_subject_turso
 );
 
 async fn replication_plan_defers_presence_check_failures_impl(backend: MainTestBackend) {
@@ -1693,12 +1795,9 @@ async fn recovery_enqueue_only_pass_bypasses_busy_throttle_impl(backend: MainTes
 
     let report = tokio::time::timeout(
         Duration::from_millis(100),
-        crate::content_recovery::repair_subjects(
+        crate::content_recovery::repair_manifest_hashes(
             &state,
-            vec![format!(
-                "{MANIFEST_SUBJECT_PREFIX}{}",
-                manifest.manifest_hash
-            )],
+            vec![manifest.manifest_hash.clone()],
             Some(0),
         ),
     )
@@ -1751,9 +1850,9 @@ async fn recovery_backoff_starts_after_a_slow_transfer_impl(backend: MainTestBac
     });
     register_online_source_node(&target, &source, &url).await;
 
-    let report = crate::execute_tracked_targeted_local_replication_repair(
+    let report = crate::execute_tracked_targeted_local_manifest_repair(
         &target,
-        vec![format!("{key}@{version}")],
+        vec![manifest.manifest_hash.clone()],
         crate::RepairRunTrigger::DataScrubAutoRepair,
     )
     .await;
@@ -2704,17 +2803,17 @@ async fn recovery_snapshot_only_uses_hash_without_version_export_impl(backend: M
     let output = crate::content_recovery::scrubber(&target)
         .await
         .unwrap()
-        .run_with_repair_subjects()
+        .run_with_repair_manifests()
         .await
         .unwrap();
     assert!(
         output
-            .repair_subjects
-            .contains(&format!("cas-manifest:{}", manifest.manifest_hash))
+            .repair_manifest_hashes
+            .contains(&manifest.manifest_hash)
     );
-    let report = crate::replication::execute_targeted_replication_repair_inner(
+    let report = crate::content_recovery::repair_manifest_hashes(
         &target,
-        output.repair_subjects.into_iter().collect(),
+        output.repair_manifest_hashes.into_iter().collect(),
         None,
     )
     .await;
@@ -2787,9 +2886,9 @@ async fn recovery_resumes_partial_work_after_restart_and_peer_reconnect_impl(
         .unwrap();
     remove_chunks(&source_a, &manifest, &[1]).await;
     remove_chunks(&source_b, &manifest, &[0]).await;
-    let first = crate::execute_tracked_targeted_local_replication_repair(
+    let first = crate::execute_tracked_targeted_local_manifest_repair(
         &target,
-        vec![format!("{key}@{version}")],
+        vec![manifest.manifest_hash.clone()],
         crate::RepairRunTrigger::DataScrubAutoRepair,
     )
     .await;
@@ -3041,11 +3140,11 @@ async fn recovery_audit_does_not_fill_metadata_only_nodes_impl(backend: MainTest
     let report = crate::content_recovery::scrubber(&target)
         .await
         .unwrap()
-        .run_with_repair_subjects()
+        .run_with_repair_manifests()
         .await
         .unwrap();
     assert_eq!(report.report.issue_count, 0);
-    assert!(report.repair_subjects.is_empty());
+    assert!(report.repair_manifest_hashes.is_empty());
     crate::content_recovery::audit_assigned(&target)
         .await
         .unwrap();

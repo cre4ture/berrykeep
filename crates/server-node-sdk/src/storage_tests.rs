@@ -9803,7 +9803,7 @@ async fn data_scrub_only_requires_assigned_or_owned_chunks_impl(backend: Storage
         .await
         .unwrap()
         .with_required_manifests(required)
-        .run_with_repair_subjects()
+        .run_with_repair_manifests()
         .await
         .unwrap();
     assert!(
@@ -9814,7 +9814,7 @@ async fn data_scrub_only_requires_assigned_or_owned_chunks_impl(backend: Storage
             .any(|issue| issue.kind == super::DataScrubIssueKind::ChunkMissing)
     );
     assert!(
-        !assigned.repair_subjects.is_empty(),
+        !assigned.repair_manifest_hashes.is_empty(),
         "an assigned but never hydrated replica must be repaired"
     );
 
@@ -9887,7 +9887,7 @@ async fn data_scrub_ignores_unassigned_missing_and_unreadable_manifests_impl(
             .await
             .unwrap()
             .with_required_manifests(required.clone())
-            .run_with_repair_subjects()
+            .run_with_repair_manifests()
             .await
             .unwrap();
         assert!(
@@ -9899,7 +9899,7 @@ async fn data_scrub_ignores_unassigned_missing_and_unreadable_manifests_impl(
             "an assigned {suffix} manifest must be reported: {assigned:?}"
         );
         assert!(
-            !assigned.repair_subjects.is_empty(),
+            !assigned.repair_manifest_hashes.is_empty(),
             "an assigned {suffix} manifest must queue repair"
         );
 

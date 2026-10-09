@@ -280,9 +280,10 @@ fn retained_content_identity_does_not_require_a_path() {
         snapshot_only: false,
     };
     assert_eq!(
-        reference.subject(),
-        Some(format!("cas-manifest:{}", reference.manifest_hash))
+        reference.repair_label(),
+        format!("cas-manifest:{}", reference.manifest_hash)
     );
+    assert_eq!(reference.replication_subject(), None);
 }
 
 async fn retained_content_advertises_tombstone_head_after_delete_impl(backend: StorageTestBackend) {
@@ -418,17 +419,14 @@ async fn retained_content_snapshot_only_is_scrubbed_impl(backend: StorageTestBac
         .data_scrubber()
         .await
         .unwrap()
-        .run_with_repair_subjects()
+        .run_with_repair_manifests()
         .await
         .unwrap();
-    assert!(
-        output
-            .repair_subjects
-            .contains(&format!("cas-manifest:{}", put.manifest_hash))
-    );
+    assert!(output.repair_manifest_hashes.contains(&put.manifest_hash));
     let catalog = store.retained_content().await.unwrap();
-    let reference = catalog
-        .reference_for_subject(&format!("cas-manifest:{}", put.manifest_hash))
+    let reference = catalog.manifests[&put.manifest_hash]
+        .values()
+        .next()
         .unwrap()
         .clone();
     let mut task = content_recovery::ContentRepairTask::new(reference, true);

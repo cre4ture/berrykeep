@@ -534,7 +534,7 @@ pub(crate) async fn recover_manifest(
             return Ok(bytes);
         }
     }
-    let subject = reference.subject().unwrap_or_default();
+    let subject = reference.repair_label();
     let sources = source_nodes(state, &subject, None).await;
     let path = format!(
         "/cluster/v2/replication/manifest/{}",
@@ -720,7 +720,7 @@ async fn recover_task_initial_transfer(
             .install_recovery_manifest(&task.reference.manifest_hash, &bytes)
             .await?;
     }
-    let subject = task.reference.subject().unwrap_or_default();
+    let subject = task.reference.repair_label();
     let result = recover_chunks_with_progress(
         state,
         &subject,
@@ -780,7 +780,7 @@ fn log_outcome(
         state.node_id,
         event,
         detail,
-        task.reference.subject(),
+        Some(task.reference.repair_label()),
         task.reference.key.clone(),
         task.reference.version_id.clone(),
         None,
@@ -794,17 +794,50 @@ pub(crate) async fn repair_subjects(
     subjects: Vec<String>,
     limit: Option<usize>,
 ) -> replication::ReplicationRepairReport {
+    let targets = subjects.into_iter().map(RepairTarget::Subject).collect();
     let mut report = empty_report();
-    if let Err(error) = repair_subjects_inner(state, subjects, limit, &mut report).await {
+    if let Err(error) = repair_targets_inner(state, targets, limit, &mut report).await {
         report.failed_transfers += 1;
         report.last_error = Some(format!("{error:#}"));
     }
     report
 }
 
-async fn repair_subjects_inner(
+pub(crate) async fn repair_manifest_hashes(
     state: &ServerState,
-    subjects: Vec<String>,
+    manifest_hashes: Vec<String>,
+    limit: Option<usize>,
+) -> replication::ReplicationRepairReport {
+    let targets = manifest_hashes
+        .into_iter()
+        .map(RepairTarget::ManifestHash)
+        .collect();
+    let mut report = empty_report();
+    if let Err(error) = repair_targets_inner(state, targets, limit, &mut report).await {
+        report.failed_transfers += 1;
+        report.last_error = Some(format!("{error:#}"));
+    }
+    report
+}
+
+#[derive(Debug, Clone)]
+enum RepairTarget {
+    Subject(String),
+    ManifestHash(String),
+}
+
+impl RepairTarget {
+    fn label(&self) -> String {
+        match self {
+            Self::Subject(subject) => subject.clone(),
+            Self::ManifestHash(hash) => format!("{MANIFEST_SUBJECT_PREFIX}{hash}"),
+        }
+    }
+}
+
+async fn repair_targets_inner(
+    state: &ServerState,
+    targets: Vec<RepairTarget>,
     limit: Option<usize>,
     report: &mut replication::ReplicationRepairReport,
 ) -> Result<()> {
@@ -812,13 +845,15 @@ async fn repair_subjects_inner(
     let required = required_manifests(state, retained.as_ref()).await;
     let fingerprint = source_fingerprint(state).await;
     let mut references = BTreeMap::new();
-    for subject in subjects {
-        let reference = retained.reference_for_subject(&subject).or_else(|| {
-            subject
-                .strip_prefix(MANIFEST_SUBJECT_PREFIX)
-                .and_then(|hash| retained.manifests.get(hash))
-                .and_then(|references| references.values().next())
-        });
+    for target in targets {
+        let subject = target.label();
+        let reference = match &target {
+            RepairTarget::Subject(subject) => retained.reference_for_subject(subject),
+            RepairTarget::ManifestHash(hash) => retained
+                .manifests
+                .get(hash)
+                .and_then(|references| references.values().next()),
+        };
         let Some(reference) =
             reference.filter(|r| r.manifest_hash != storage::TOMBSTONE_MANIFEST_HASH)
         else {
@@ -848,10 +883,10 @@ async fn repair_subjects_inner(
                 replication::ReplicationRepairSkipReason::RetainedReferenceUnavailable,
                 detail,
             );
-            if let Some(hash) = subject.strip_prefix(MANIFEST_SUBJECT_PREFIX) {
+            if let RepairTarget::ManifestHash(hash) = target {
                 read_store(state, "content_recovery.expired")
                     .await
-                    .discard_content_repair_task(hash)
+                    .discard_content_repair_task(&hash)
                     .await?;
             }
             continue;
@@ -1083,16 +1118,15 @@ pub(crate) async fn resume_pending(state: &ServerState) -> Result<()> {
             BACKGROUND_REPAIR_PASS_MAX_TRANSFERS.saturating_add(claimed_manifests.len()),
         )
         .await?;
-    let subjects = hashes
+    let hashes = hashes
         .into_iter()
         .filter(|hash| !claimed_manifests.contains(hash))
         .take(BACKGROUND_REPAIR_PASS_MAX_TRANSFERS)
-        .map(|hash| format!("{MANIFEST_SUBJECT_PREFIX}{hash}"))
         .collect::<Vec<_>>();
-    if !subjects.is_empty() {
-        execute_tracked_targeted_local_replication_repair(
+    if !hashes.is_empty() {
+        execute_tracked_targeted_local_manifest_repair(
             state,
-            subjects,
+            hashes,
             RepairRunTrigger::BackgroundAudit,
         )
         .await;

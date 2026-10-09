@@ -15,15 +15,20 @@ pub(crate) struct RetainedReference {
 }
 
 impl RetainedReference {
-    pub fn subject(&self) -> Option<String> {
+    pub fn replication_subject(&self) -> Option<String> {
         if self.snapshot_only || self.key.is_none() {
-            return Some(format!("{MANIFEST_SUBJECT_PREFIX}{}", self.manifest_hash));
+            return None;
         }
         let key = self.key.as_ref()?;
         Some(match &self.version_id {
             Some(version) => format!("{key}@{version}"),
             None => key.clone(),
         })
+    }
+
+    pub fn repair_label(&self) -> String {
+        self.replication_subject()
+            .unwrap_or_else(|| format!("{MANIFEST_SUBJECT_PREFIX}{}", self.manifest_hash))
     }
 }
 
@@ -114,16 +119,17 @@ impl RetainedContent {
     }
 
     fn insert(&mut self, reference: RetainedReference) {
-        let Some(subject) = reference.subject() else {
-            return;
-        };
+        let replication_subject = reference.replication_subject();
+        let catalog_key = reference.repair_label();
         let manifest_hash = reference.manifest_hash.clone();
         self.manifests
             .entry(manifest_hash.clone())
             .or_default()
-            .entry(subject.clone())
+            .entry(catalog_key)
             .or_insert(reference);
-        self.subjects.entry(subject).or_insert(manifest_hash);
+        if let Some(subject) = replication_subject {
+            self.subjects.entry(subject).or_insert(manifest_hash);
+        }
     }
 
     pub fn reference_for_subject(&self, subject: &str) -> Option<&RetainedReference> {

@@ -328,8 +328,32 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
     batch_size_override: Option<usize>,
     run_id: Option<&str>,
 ) -> ReplicationRepairReport {
-    let repair_run_id = run_id.unwrap_or("untracked");
-    let subject_count = subjects.len();
+    let (repair_run_id, start_entry) =
+        begin_targeted_content_repair(state, subjects.len(), batch_size_override, run_id);
+    let report = content_recovery::repair_subjects(state, subjects, batch_size_override).await;
+    finish_targeted_content_repair(state, &repair_run_id, start_entry, report)
+}
+
+pub(crate) async fn execute_targeted_manifest_repair_inner_with_context(
+    state: &ServerState,
+    manifest_hashes: Vec<String>,
+    batch_size_override: Option<usize>,
+    run_id: Option<&str>,
+) -> ReplicationRepairReport {
+    let (repair_run_id, start_entry) =
+        begin_targeted_content_repair(state, manifest_hashes.len(), batch_size_override, run_id);
+    let report =
+        content_recovery::repair_manifest_hashes(state, manifest_hashes, batch_size_override).await;
+    finish_targeted_content_repair(state, &repair_run_id, start_entry, report)
+}
+
+fn begin_targeted_content_repair(
+    state: &ServerState,
+    subject_count: usize,
+    batch_size_override: Option<usize>,
+    run_id: Option<&str>,
+) -> (String, ReplicationRepairLogEntry) {
+    let repair_run_id = run_id.unwrap_or("untracked").to_string();
     let mut lifecycle_log = Vec::new();
     info!(
         repair_run_id,
@@ -353,19 +377,26 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
             "batch_size_override": batch_size_override,
         })),
     );
+    (
+        repair_run_id,
+        lifecycle_log
+            .pop()
+            .expect("targeted repair start entry was recorded"),
+    )
+}
 
-    let mut report = content_recovery::repair_subjects(state, subjects, batch_size_override).await;
+fn finish_targeted_content_repair(
+    state: &ServerState,
+    repair_run_id: &str,
+    start_entry: ReplicationRepairLogEntry,
+    mut report: ReplicationRepairReport,
+) -> ReplicationRepairReport {
     // Keep both lifecycle brackets when a content-recovery pass reaches the
     // bounded report-log capacity.
     report
         .detailed_log
         .truncate(MAX_REPAIR_REPORT_LOG_ENTRIES.saturating_sub(2));
-    report.detailed_log.insert(
-        0,
-        lifecycle_log
-            .pop()
-            .expect("targeted repair start entry was recorded"),
-    );
+    report.detailed_log.insert(0, start_entry);
     info!(
         repair_run_id,
         attempted_transfers = report.attempted_transfers,
