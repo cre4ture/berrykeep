@@ -918,6 +918,28 @@ async fn cached_owned_replica_presence(state: &ServerState, hash: &str) -> bool 
         .maintenance
         .local_availability_generation
         .load(Ordering::SeqCst);
+    cache_owned_replica_presence_if_generation_matches(
+        &mut cache,
+        generation,
+        current_generation,
+        hash,
+    );
+    true
+}
+
+/// Caches a successful replica check only when it reflects the current local
+/// availability generation. A namespace change during the check leaves the
+/// cache invalidated so the next audit performs a fresh scan.
+fn cache_owned_replica_presence_if_generation_matches(
+    cache: &mut Option<LocalOwnedManifestPresenceCache>,
+    checked_generation: u64,
+    current_generation: u64,
+    hash: &str,
+) {
+    if checked_generation != current_generation {
+        return;
+    }
+
     if !cache
         .as_ref()
         .is_some_and(|cache| cache.is_valid_for(current_generation))
@@ -933,7 +955,6 @@ async fn cached_owned_replica_presence(state: &ServerState, hash: &str) -> bool 
         .expect("owned manifest presence cache was initialized")
         .manifest_hashes
         .insert(hash.to_string());
-    true
 }
 
 pub(crate) async fn get_manifest(
@@ -945,5 +966,38 @@ pub(crate) async fn get_manifest(
         Ok(Some(bytes)) => (StatusCode::OK, bytes).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn owned_replica_presence_scan_does_not_repopulate_changed_generation() {
+        let mut cache = None;
+
+        cache_owned_replica_presence_if_generation_matches(
+            &mut cache,
+            41,
+            42,
+            "manifest-checked-before-namespace-change",
+        );
+
+        assert!(
+            cache.is_none(),
+            "a scan from an earlier availability generation must not populate the new cache"
+        );
+    }
+
+    #[test]
+    fn owned_replica_presence_scan_populates_matching_generation() {
+        let mut cache = None;
+
+        cache_owned_replica_presence_if_generation_matches(&mut cache, 42, 42, "manifest-current");
+
+        assert!(cache.is_some_and(|cache| {
+            cache.is_valid_for(42) && cache.manifest_hashes.contains("manifest-current")
+        }));
     }
 }
