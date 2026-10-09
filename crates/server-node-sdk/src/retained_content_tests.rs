@@ -68,6 +68,41 @@ run_on_all_metadata_backends!(
     retained_content_source_presence_is_not_a_second_scrub_turso
 );
 
+async fn retained_content_presence_propagates_manifest_io_errors_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("source-presence-manifest-io-error")
+        .await;
+    let put = store
+        .put_object_versioned(
+            "owned.bin",
+            Bytes::from_static(b"known bytes"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let manifest_path = store.manifest_path_for_test(&put.manifest_hash);
+    fs::remove_file(&manifest_path).await.unwrap();
+    fs::create_dir(&manifest_path).await.unwrap();
+
+    let error = store
+        .check_owned_replica_presence(&put.manifest_hash)
+        .await
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<std::io::Error>().is_some(),
+        "an operational manifest read failure must not be reported as missing content: {error:#}"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).await.unwrap();
+}
+
+run_on_all_metadata_backends!(
+    retained_content_presence_propagates_manifest_io_errors_impl,
+    retained_content_presence_propagates_manifest_io_errors,
+    retained_content_presence_propagates_manifest_io_errors_turso
+);
+
 async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
     backend: StorageTestBackend,
 ) {

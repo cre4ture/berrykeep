@@ -181,15 +181,22 @@ pub(crate) fn validate_manifest(hash: &str, payload: &[u8]) -> Result<Replicatio
     })
 }
 
-async fn read_valid_manifest(
-    storage_pool: &StoragePool,
-    hash: &str,
-) -> Result<Option<(Vec<u8>, ReplicationManifestPayload)>> {
+async fn read_manifest_bytes(storage_pool: &StoragePool, hash: &str) -> Result<Option<Vec<u8>>> {
     let path = storage_pool.content_path(StorageContentKind::Manifest, hash)?;
     let bytes = match fs::read(path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
+    };
+    Ok(Some(bytes))
+}
+
+async fn read_valid_manifest(
+    storage_pool: &StoragePool,
+    hash: &str,
+) -> Result<Option<(Vec<u8>, ReplicationManifestPayload)>> {
+    let Some(bytes) = read_manifest_bytes(storage_pool, hash).await? else {
+        return Ok(None);
     };
     let manifest = validate_manifest(hash, &bytes)?;
     Ok(Some((bytes, manifest)))
@@ -204,9 +211,11 @@ pub(super) async fn manifest_is_fully_local(
     if hash == TOMBSTONE_MANIFEST_HASH {
         return Ok(true);
     }
-    let manifest = match read_valid_manifest(storage_pool, hash).await {
-        Ok(Some((_, manifest))) => manifest,
-        Ok(None) => return Ok(false),
+    let Some(bytes) = read_manifest_bytes(storage_pool, hash).await? else {
+        return Ok(false);
+    };
+    let manifest = match validate_manifest(hash, &bytes) {
+        Ok(manifest) => manifest,
         Err(error) => {
             warn!(manifest_hash = hash, error = %error, "invalid manifest is not locally available");
             return Ok(false);
