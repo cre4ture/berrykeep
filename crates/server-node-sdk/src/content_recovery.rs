@@ -1056,19 +1056,23 @@ pub(crate) fn spawn_worker(state: ServerState) {
 
 pub(crate) async fn resume_pending(state: &ServerState) -> Result<()> {
     let fingerprint = source_fingerprint(state).await;
+    let claimed_manifests = state.maintenance.content_repair_claims.claimed_manifests();
     // A single transfer can consume the full durable-recovery budget, so do
     // not let one worker tick monopolize repair tracking with a large batch.
+    // Over-fetch by the claim count so due tasks held by foreground work cannot
+    // hide an unclaimed task behind the storage query's limit.
     let hashes = read_store(state, "content_recovery.pending_schedule")
         .await
         .due_content_repair_task_hashes(
             unix_ts(),
             &fingerprint,
-            BACKGROUND_REPAIR_PASS_MAX_TRANSFERS,
+            BACKGROUND_REPAIR_PASS_MAX_TRANSFERS.saturating_add(claimed_manifests.len()),
         )
         .await?;
     let subjects = hashes
         .into_iter()
-        .filter(|hash| !state.maintenance.content_repair_claims.is_claimed(hash))
+        .filter(|hash| !claimed_manifests.contains(hash))
+        .take(BACKGROUND_REPAIR_PASS_MAX_TRANSFERS)
         .map(|hash| format!("{MANIFEST_SUBJECT_PREFIX}{hash}"))
         .collect::<Vec<_>>();
     if !subjects.is_empty() {

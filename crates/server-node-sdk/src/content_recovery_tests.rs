@@ -1870,6 +1870,77 @@ run_on_main_metadata_backends!(
     recovery_worker_skips_already_claimed_tasks_turso
 );
 
+async fn recovery_worker_skips_claimed_head_and_repairs_next_task_impl(backend: MainTestBackend) {
+    let target = build_test_state(1, false, backend).await;
+    let mut tasks = Vec::new();
+    for key in ["claimed-queue-head/one", "claimed-queue-head/two"] {
+        seed_subject_version(
+            &target,
+            key,
+            "v1",
+            format!("healthy bytes for {key}").into_bytes(),
+            vec![],
+        )
+        .await;
+        let reference = read_store(&target, "test.recovery.claimed_head_reference")
+            .await
+            .retained_content()
+            .await
+            .unwrap()
+            .reference_for_subject(&format!("{key}@v1"))
+            .unwrap()
+            .clone();
+        tasks.push(crate::storage::content_recovery::ContentRepairTask::new(
+            reference, true,
+        ));
+    }
+    tasks.sort_by(|left, right| {
+        left.reference
+            .manifest_hash
+            .cmp(&right.reference.manifest_hash)
+    });
+    for task in &tasks {
+        read_store(&target, "test.recovery.claimed_head_persist")
+            .await
+            .persist_content_repair_task(task)
+            .await
+            .unwrap();
+    }
+    let claim = target
+        .maintenance
+        .content_repair_claims
+        .try_claim(&tasks[0].reference.manifest_hash)
+        .expect("test must hold the first due task's manifest claim");
+
+    crate::content_recovery::resume_pending(&target)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repair_run_history(&target).await.len(),
+        1,
+        "a claimed queue head must not stall an unrelated due repair"
+    );
+    assert_eq!(
+        read_store(&target, "test.recovery.claimed_head_pending")
+            .await
+            .content_repair_task_hashes()
+            .await
+            .unwrap(),
+        vec![tasks[0].reference.manifest_hash.clone()],
+        "the worker must repair the next due task while preserving the claimed head"
+    );
+
+    drop(claim);
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_worker_skips_claimed_head_and_repairs_next_task_impl,
+    recovery_worker_skips_claimed_head_and_repairs_next_task,
+    recovery_worker_skips_claimed_head_and_repairs_next_task_turso
+);
+
 async fn recovery_worker_bounds_one_background_pass_impl(backend: MainTestBackend) {
     let mut target = build_test_state(1, false, backend).await;
     target.repair_config.batch_size = 32;

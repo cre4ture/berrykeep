@@ -478,11 +478,11 @@ struct ContentRepairClaim {
 }
 
 impl ContentRepairClaims {
-    fn is_claimed(&self, manifest_hash: &str) -> bool {
+    fn claimed_manifests(&self) -> HashSet<String> {
         self.active_manifests
             .lock()
             .expect("content repair claim lock poisoned")
-            .contains(manifest_hash)
+            .clone()
     }
 
     fn try_claim(self: &Arc<Self>, manifest_hash: &str) -> Option<ContentRepairClaim> {
