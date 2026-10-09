@@ -395,6 +395,40 @@ pub(crate) async fn execute_targeted_replication_repair_inner_with_context(
     report
 }
 
+async fn export_locally_owned_replication_bundle(
+    state: &ServerState,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<Option<ReplicationExportBundle>> {
+    let store = read_store(state, "replication_repair.export_bundle").await;
+    let Some(bundle) = store
+        .export_replication_bundle(key, version_id, ObjectReadMode::Preferred)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to export local replication bundle for key={key} version_id={version_id:?}"
+            )
+        })?
+    else {
+        return Ok(None);
+    };
+
+    if store
+        .check_owned_replica_presence(&bundle.manifest_hash)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to verify local replica presence for manifest {}",
+                bundle.manifest_hash
+            )
+        })?
+    {
+        Ok(Some(bundle))
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) async fn execute_replication_repair_plan(
     state: &ServerState,
     plan: &ReplicationPlan,
@@ -587,24 +621,43 @@ pub(crate) async fn execute_replication_repair_plan(
             })),
         );
 
-        let mut bundle = {
-            let store = read_store(state, "replication_repair.export_bundle").await;
-
-            match store
-                .export_replication_bundle(&key, version_id.as_deref(), ObjectReadMode::Preferred)
-                .await
-            {
-                Ok(Some(bundle))
-                    if matches!(
-                        store
-                            .check_owned_replica_presence(&bundle.manifest_hash)
-                            .await,
-                        Ok(true)
-                    ) =>
-                {
-                    Some(bundle)
-                }
-                _ => None,
+        let mut bundle = match export_locally_owned_replication_bundle(
+            state,
+            &key,
+            version_id.as_deref(),
+        )
+        .await
+        {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                let error_text = format!("{err:#}");
+                failed_transfers += 1;
+                last_error = Some(error_text.clone());
+                warn!(
+                    repair_run_id,
+                    subject = %item.key,
+                    key = %key,
+                    version_id = ?version_id,
+                    error = %error_text,
+                "replication repair deferred after local replica inspection failed"
+                );
+                push_repair_log_entry(
+                    &mut detailed_log,
+                    state.node_id,
+                    "local_replica_inspection_failed",
+                    "could not inspect the local replication bundle; deferring the subject for retry",
+                    Some(item.key.clone()),
+                    Some(key.clone()),
+                    version_id.clone(),
+                    None,
+                    Some(state.node_id),
+                    Some(serde_json::json!({
+                    "reason": "local_replica_inspection_failed",
+                        "retryable": true,
+                        "error": error_text,
+                    })),
+                );
+                continue;
             }
         };
 

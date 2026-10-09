@@ -365,6 +365,112 @@ run_on_main_metadata_backends!(
     planning_subjects_for_auditor_keep_divergent_head_versions_turso
 );
 
+async fn replication_plan_defers_presence_check_failures_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let key = "presence-check-failure.bin";
+    let version = "ver-presence-check-failure";
+    for state in [&source, &target] {
+        seed_subject_version(
+            state,
+            key,
+            version,
+            b"local presence check bytes".to_vec(),
+            vec![],
+        )
+        .await;
+    }
+    crate::refresh_local_availability_view_once(&target).await;
+
+    let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &url).await;
+    let source_node = target
+        .cluster
+        .lock()
+        .await
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == source.node_id)
+        .expect("registered source descriptor must be retained by the target");
+
+    let manifest = bundle(&target, key, version).await;
+    let chunk_path = read_store(&target, "test.recovery.presence_check_path")
+        .await
+        .chunk_path_for_test(&manifest.manifest.chunks[0].hash);
+    let shard = chunk_path
+        .parent()
+        .expect("chunk must have a shard directory")
+        .to_path_buf();
+    fs::remove_file(&chunk_path).await.unwrap();
+    fs::remove_dir(&shard).await.unwrap();
+    fs::write(&shard, b"local storage obstruction")
+        .await
+        .unwrap();
+
+    let plan = crate::cluster::ReplicationPlan {
+        generated_at_unix: 0,
+        under_replicated: 1,
+        over_replicated: 0,
+        cleanup_deferred_items: 0,
+        cleanup_deferred_extra_nodes: 0,
+        items: vec![crate::cluster::ReplicationPlanItem {
+            key: format!("{key}@{version}"),
+            desired_nodes: vec![source.node_id, target.node_id],
+            current_nodes: vec![source.node_id],
+            missing_nodes: vec![target.node_id],
+            extra_nodes: Vec::new(),
+            cleanup_option: crate::cluster::ReplicationCleanupOption::None,
+            deferred_extra_nodes: 0,
+        }],
+    };
+    let report = crate::replication::execute_replication_repair_plan(
+        &target,
+        &plan,
+        vec![source_node],
+        None,
+        false,
+        None,
+    )
+    .await;
+
+    assert_eq!(report.attempted_transfers, 0, "{report:?}");
+    assert_eq!(report.failed_transfers, 1, "{report:?}");
+    assert_eq!(
+        report.run_status(),
+        crate::RepairRunStatus::Unresolved,
+        "a transient local presence failure must be visible and retried: {report:?}"
+    );
+    assert!(
+        report.detailed_log.iter().any(|entry| {
+            entry.event == "local_replica_inspection_failed"
+                && entry
+                    .context
+                    .as_ref()
+                    .and_then(|context| context["retryable"].as_bool())
+                    == Some(true)
+        }),
+        "the presence failure must remain observable and retryable: {report:?}"
+    );
+    assert!(
+        !report
+            .detailed_log
+            .iter()
+            .any(|entry| entry.event == "local_pull_started"),
+        "a local presence check failure must not be treated as missing content: {report:?}"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    replication_plan_defers_presence_check_failures_impl,
+    replication_plan_defers_presence_check_failures,
+    replication_plan_defers_presence_check_failures_turso
+);
+
 async fn recovery_read_budget_bounds_slow_unadvertised_peers_impl(backend: MainTestBackend) {
     let target = build_test_state(1, false, backend).await;
     let source = build_test_state(1, false, backend).await;
