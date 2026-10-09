@@ -118,10 +118,6 @@ impl RetainedContent {
         let manifest_hash = self.subjects.get(subject)?;
         self.manifests.get(manifest_hash)?.get(subject)
     }
-
-    pub fn subjects(&self) -> Vec<String> {
-        self.subjects.keys().cloned().collect()
-    }
 }
 
 impl PersistentStore {

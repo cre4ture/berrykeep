@@ -471,6 +471,245 @@ run_on_main_metadata_backends!(
     replication_plan_defers_presence_check_failures_turso
 );
 
+async fn snapshot_only_retention_keeps_logical_key_placement_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let peer_a = build_test_state(1, false, backend).await;
+    let peer_b = build_test_state(1, false, backend).await;
+    for peer in [&peer_a, &peer_b] {
+        register_online_source_node(&state, peer, "http://127.0.0.1:9").await;
+    }
+
+    let mut selected = None;
+    for attempt in 0..64 {
+        let key = format!("snapshot-placement-{attempt}.bin");
+        let version = format!("ver-snapshot-placement-{attempt}");
+        seed_subject_version(
+            &state,
+            &key,
+            &version,
+            format!("snapshot placement bytes {attempt}").into_bytes(),
+            vec![],
+        )
+        .await;
+        let manifest = bundle(&state, &key, &version).await;
+        let legacy_subject = format!("{MANIFEST_SUBJECT_PREFIX}{}", manifest.manifest_hash);
+        let (path_assigned, legacy_subject_assigned) = {
+            let cluster = state.cluster.lock().await;
+            (
+                cluster
+                    .placement_for_key(&key)
+                    .selected_nodes
+                    .contains(&state.node_id),
+                cluster
+                    .placement_for_key(&legacy_subject)
+                    .selected_nodes
+                    .contains(&state.node_id),
+            )
+        };
+        if path_assigned != legacy_subject_assigned {
+            selected = Some((
+                key,
+                version,
+                manifest.manifest_hash,
+                path_assigned,
+                legacy_subject_assigned,
+            ));
+            break;
+        }
+    }
+    let (key, version, manifest_hash, path_assigned, legacy_subject_assigned) =
+        selected.expect("three nodes must yield a key whose path and hash placements differ");
+
+    {
+        let mut store = lock_store(&state, "test.recovery.snapshot_placement_compact").await;
+        store
+            .tombstone_object(&key, PutOptions::default())
+            .await
+            .unwrap();
+        store.compact_tombstone_indexes(0, false).await.unwrap();
+        assert!(
+            store
+                .export_replication_bundle(&key, Some(&version), ObjectReadMode::Preferred)
+                .await
+                .unwrap()
+                .is_none(),
+            "the reference must be available only through snapshot retention"
+        );
+    }
+
+    let retained = read_store(&state, "test.recovery.snapshot_placement_catalog")
+        .await
+        .retained_content()
+        .await
+        .unwrap();
+    assert!(
+        retained.manifests[&manifest_hash]
+            .values()
+            .all(|reference| reference.snapshot_only),
+        "the compacted reference must be represented only by snapshot retention"
+    );
+    let required = crate::content_recovery::required_manifests(&state, &retained).await;
+    assert_eq!(
+        required.contains(&manifest_hash),
+        path_assigned,
+        "snapshot-only retention must keep the logical path's placement"
+    );
+    assert_ne!(
+        path_assigned, legacy_subject_assigned,
+        "the regression must distinguish logical-path placement from the legacy hash subject"
+    );
+
+    cleanup_test_state(&peer_a).await;
+    cleanup_test_state(&peer_b).await;
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    snapshot_only_retention_keeps_logical_key_placement_impl,
+    snapshot_only_retention_keeps_logical_key_placement,
+    snapshot_only_retention_keeps_logical_key_placement_turso
+);
+
+async fn recovery_audit_pins_cached_chunks_before_first_worker_pass_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let key = "audit-pins-cache.bin";
+    let version = "ver-audit-pins-cache";
+    let payload = b"cached chunk retained before the first worker pass".to_vec();
+    seed_subject_version(&source, key, version, payload.clone(), vec![]).await;
+    let manifest = bundle(&source, key, version).await;
+    let metadata = read_store(&source, "test.recovery.audit_pin_metadata")
+        .await
+        .export_metadata_bundle(key, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+    lock_store(&target, "test.recovery.audit_pin_import")
+        .await
+        .import_metadata_bundle(&metadata)
+        .await
+        .unwrap();
+    read_store(&target, "test.recovery.audit_pin_cached_chunk")
+        .await
+        .ingest_chunk(&manifest.manifest.chunks[0].hash, &payload)
+        .await
+        .unwrap();
+
+    crate::content_recovery::audit_assigned(&target)
+        .await
+        .unwrap();
+    let task = read_store(&target, "test.recovery.audit_pin_task")
+        .await
+        .content_repair_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the assigned but unowned replica must enqueue durable repair");
+    assert_eq!(
+        task.chunks
+            .iter()
+            .map(|chunk| (&chunk.hash, chunk.size_bytes))
+            .collect::<Vec<_>>(),
+        manifest
+            .manifest
+            .chunks
+            .iter()
+            .map(|chunk| (&chunk.hash, chunk.size_bytes))
+            .collect::<Vec<_>>(),
+        "{task:?}"
+    );
+
+    read_store(&target, "test.recovery.audit_pin_gc")
+        .await
+        .cleanup_unreferenced(0, false)
+        .await
+        .unwrap();
+    assert!(
+        read_store(&target, "test.recovery.audit_pin_verify")
+            .await
+            .read_chunk_payload(&manifest.manifest.chunks[0].hash)
+            .await
+            .unwrap()
+            .is_some(),
+        "the audit task must pin reusable cache bytes before a worker starts"
+    );
+
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_audit_pins_cached_chunks_before_first_worker_pass_impl,
+    recovery_audit_pins_cached_chunks_before_first_worker_pass,
+    recovery_audit_pins_cached_chunks_before_first_worker_pass_turso
+);
+
+async fn cache_only_recovery_fails_closed_on_chunk_presence_error_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let key = "cache-only-presence-error.bin";
+    let version = "ver-cache-only-presence-error";
+    seed_subject_version(&source, key, version, b"cache-only bytes".to_vec(), vec![]).await;
+    let manifest = bundle(&source, key, version).await;
+    let metadata = read_store(&source, "test.recovery.cache_only_metadata")
+        .await
+        .export_metadata_bundle(key, None, ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .unwrap();
+    lock_store(&target, "test.recovery.cache_only_import")
+        .await
+        .import_metadata_bundle(&metadata)
+        .await
+        .unwrap();
+    let reference = read_store(&target, "test.recovery.cache_only_reference")
+        .await
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject(&format!("{key}@{version}"))
+        .unwrap()
+        .clone();
+    let chunk_path = read_store(&target, "test.recovery.cache_only_chunk_path")
+        .await
+        .chunk_path_for_test(&manifest.manifest.chunks[0].hash);
+    let shard = chunk_path
+        .parent()
+        .expect("chunk must have a shard directory")
+        .to_path_buf();
+    fs::create_dir_all(shard.parent().unwrap()).await.unwrap();
+    fs::write(&shard, b"local storage obstruction")
+        .await
+        .unwrap();
+
+    let mut task = crate::storage::content_recovery::ContentRepairTask::new(reference, false);
+    let error = crate::content_recovery::recover_task_with_budget(
+        &target,
+        &mut task,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("failed to inspect cached chunk"),
+        "a presence check error must be surfaced instead of hydrating metadata-only content: {error:#}"
+    );
+    assert!(
+        task.chunks.is_empty(),
+        "an unreadable cache path must not be scheduled for a cache-only download"
+    );
+
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    cache_only_recovery_fails_closed_on_chunk_presence_error_impl,
+    cache_only_recovery_fails_closed_on_chunk_presence_error,
+    cache_only_recovery_fails_closed_on_chunk_presence_error_turso
+);
+
 async fn recovery_read_budget_bounds_slow_unadvertised_peers_impl(backend: MainTestBackend) {
     let target = build_test_state(1, false, backend).await;
     let source = build_test_state(1, false, backend).await;

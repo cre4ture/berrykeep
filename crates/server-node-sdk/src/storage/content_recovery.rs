@@ -199,6 +199,31 @@ impl PersistentStore {
         self.metadata_store.persist_content_repair_task(task).await
     }
 
+    /// Registers a newly discovered repair task together with any chunks named
+    /// by an already-local manifest. Holding the GC gate across both steps
+    /// closes the enqueue-to-worker window: cache bytes that can be reused by
+    /// the first repair pass are pinned before cleanup can reclaim them.
+    pub(crate) async fn prepare_and_persist_content_repair_task(
+        &self,
+        task: &mut ContentRepairTask,
+    ) -> Result<()> {
+        let _guard = self.content_gc_gate.read().await;
+        if task.chunks.is_empty() {
+            match read_valid_manifest(&self.storage_pool, &task.reference.manifest_hash).await {
+                Ok(Some((_, manifest))) => task.chunks = manifest.chunks,
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        manifest_hash = %task.reference.manifest_hash,
+                        error = %error,
+                        "could not pin chunks for a locally unreadable repair manifest"
+                    );
+                }
+            }
+        }
+        self.metadata_store.persist_content_repair_task(task).await
+    }
+
     pub(crate) async fn discard_content_repair_task(&self, hash: &str) -> Result<()> {
         let _guard = self.content_gc_gate.read().await;
         self.metadata_store.delete_content_repair_task(hash).await

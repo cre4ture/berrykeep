@@ -123,28 +123,25 @@ pub(crate) async fn required_manifests(
     // heartbeats, peer requests, or availability updates behind the mutex.
     let placement = state.cluster.lock().await.placement_snapshot();
     let mut assigned_by_placement_key = HashMap::<String, bool>::new();
-    let assigned_subjects = retained
-        .subjects()
-        .into_iter()
-        .filter(|subject| {
-            let placement_key = cluster::replication_placement_key(subject);
-            *assigned_by_placement_key
-                .entry(placement_key.to_string())
-                .or_insert_with(|| {
-                    placement
-                        .placement_for_key(placement_key)
-                        .selected_nodes
-                        .contains(&state.node_id)
-                })
-        })
-        .collect::<HashSet<_>>();
     retained
         .manifests
         .iter()
         .filter(|(_, references)| {
-            references
-                .keys()
-                .any(|subject| assigned_subjects.contains(subject))
+            references.values().any(|reference| {
+                // Snapshot-only references use their manifest hash as an
+                // opaque recovery subject, but still retain their logical
+                // path. Placement must remain stable when a version index is
+                // compacted into such a snapshot-only reference.
+                let placement_key = reference.key.as_deref().unwrap_or(&reference.manifest_hash);
+                *assigned_by_placement_key
+                    .entry(placement_key.to_string())
+                    .or_insert_with(|| {
+                        placement
+                            .placement_for_key(placement_key)
+                            .selected_nodes
+                            .contains(&state.node_id)
+                    })
+            })
         })
         .map(|(hash, _)| hash.clone())
         .collect()
@@ -404,9 +401,17 @@ async fn recover_task_unbounded(
             // Metadata-only nodes repair damaged cached bytes without hydrating
             // absent cache entries or acquiring replica ownership. Durable
             // completion performs the single full-byte validation pass.
-            if task.repair_chunks
-                || !matches!(store.chunk_path_exists(&chunk.hash).await, Ok(false))
-            {
+            let cache_entry_exists =
+                store
+                    .chunk_path_exists(&chunk.hash)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to inspect cached chunk {} before durable recovery",
+                            chunk.hash
+                        )
+                    })?;
+            if task.repair_chunks || cache_entry_exists {
                 task.chunks.push(chunk);
             }
         }
@@ -639,7 +644,7 @@ async fn repair_subjects_inner(
         // The execution budget bounds this pass, not the lifetime of its work.
         read_store(state, "content_recovery.enqueue")
             .await
-            .persist_content_repair_task(&task)
+            .prepare_and_persist_content_repair_task(&mut task)
             .await?;
         if started_transfers >= transfer_limit {
             report.skipped_items += 1;
@@ -884,10 +889,10 @@ pub(crate) async fn audit_assigned_from_retained(
             .or_else(|| references.values().next())
             .cloned()
         {
-            let task = ContentRepairTask::new(reference, true);
+            let mut task = ContentRepairTask::new(reference, true);
             read_store(state, "content_recovery.audit_enqueue")
                 .await
-                .persist_content_repair_task(&task)
+                .prepare_and_persist_content_repair_task(&mut task)
                 .await?;
             enqueued = true;
         }
