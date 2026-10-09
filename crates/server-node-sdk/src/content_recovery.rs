@@ -357,6 +357,10 @@ pub(crate) async fn bounded_durable_recovery<T>(
         .map_err(|_| DurableRepairBudgetExceeded { budget })?
 }
 
+pub(crate) fn repair_waits_for_retry(error: &anyhow::Error) -> bool {
+    error.is::<NoContentSource>() || error.is::<DurableRepairBudgetExceeded>()
+}
+
 async fn recover_task(state: &ServerState, task: &mut ContentRepairTask) -> Result<usize> {
     recover_task_with_budget(state, task, DURABLE_CONTENT_REPAIR_BUDGET).await
 }
@@ -718,7 +722,7 @@ async fn repair_subjects_inner(
                 );
             }
             Err(error) => {
-                task.waiting_for_source = error.is::<NoContentSource>();
+                task.waiting_for_source = repair_waits_for_retry(&error);
                 let event = if task.waiting_for_source {
                     "repair_waiting"
                 } else {
@@ -910,12 +914,16 @@ async fn cached_owned_replica_presence(state: &ServerState, hash: &str) -> bool 
         .local_owned_manifest_presence_cache
         .lock()
         .await;
+    let current_generation = state
+        .maintenance
+        .local_availability_generation
+        .load(Ordering::SeqCst);
     if !cache
         .as_ref()
-        .is_some_and(|cache| cache.is_valid_for(generation))
+        .is_some_and(|cache| cache.is_valid_for(current_generation))
     {
         *cache = Some(LocalOwnedManifestPresenceCache {
-            generation,
+            generation: current_generation,
             computed_at: Instant::now(),
             manifest_hashes: HashSet::new(),
         });

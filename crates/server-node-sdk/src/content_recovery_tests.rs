@@ -449,7 +449,7 @@ run_on_main_metadata_backends!(
 );
 
 #[tokio::test]
-async fn durable_recovery_budget_keeps_stalled_work_unresolved() {
+async fn durable_recovery_budget_keeps_stalled_work_retryable() {
     let error =
         crate::content_recovery::bounded_durable_recovery(Duration::from_millis(5), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -459,7 +459,11 @@ async fn durable_recovery_budget_keeps_stalled_work_unresolved() {
         .unwrap_err();
     assert!(
         error.is::<crate::content_recovery::DurableRepairBudgetExceeded>(),
-        "a budget expiry is ambiguous and must stay on the unresolved path: {error:#}"
+        "the bounded pass must report its deadline distinctly: {error:#}"
+    );
+    assert!(
+        crate::content_recovery::repair_waits_for_retry(&error),
+        "a durable repair deadline must remain a queued retry rather than an unresolved failure"
     );
 }
 
