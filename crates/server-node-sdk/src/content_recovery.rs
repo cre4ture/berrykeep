@@ -35,6 +35,28 @@ impl std::fmt::Display for NoContentSource {
 impl std::error::Error for NoContentSource {}
 
 #[derive(Debug)]
+pub(crate) struct ReadThroughRecoveryBudgetExceeded {
+    budget: Duration,
+}
+
+impl std::fmt::Display for ReadThroughRecoveryBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "read-through recovery deadline exceeded after {} seconds",
+            self.budget.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for ReadThroughRecoveryBudgetExceeded {}
+
+pub(crate) fn full_object_recovery_budget(missing_chunk_count: usize) -> Duration {
+    let batches = missing_chunk_count.max(1).div_ceil(CHUNK_FETCH_CONCURRENCY);
+    READ_THROUGH_RECOVERY_BUDGET.saturating_mul(u32::try_from(batches).unwrap_or(u32::MAX))
+}
+
+#[derive(Debug)]
 pub(crate) struct DurableRepairBudgetExceeded {
     budget: Duration,
 }
@@ -382,9 +404,11 @@ pub(crate) async fn recover_chunks_for_read(
     // Bound the entire foreground operation, not just each peer request. A
     // larger cluster or missing range must not multiply request latency without
     // limit. Cancellation keeps already verified cache bytes reusable on retry.
-    tokio::time::timeout(budget, recover_chunks(state, subject, chunks, None, true))
-        .await
-        .context("read-through recovery deadline exceeded")
+    Ok(
+        tokio::time::timeout(budget, recover_chunks(state, subject, chunks, None, true))
+            .await
+            .map_err(|_| ReadThroughRecoveryBudgetExceeded { budget })?,
+    )
 }
 
 pub(crate) async fn recover_manifest(

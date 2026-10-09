@@ -20638,9 +20638,37 @@ async fn hydrate_missing_chunks_for_media_preview(
         return Ok(false);
     };
 
-    hydrate_missing_chunks_for_range(state, &subject, &missing_chunks).await?;
-    request_local_availability_refresh(state);
-    Ok(true)
+    recover_missing_chunks_for_media_preview(
+        state,
+        &subject,
+        &missing_chunks,
+        content_recovery::full_object_recovery_budget(missing_chunks.len()),
+    )
+    .await
+}
+
+async fn recover_missing_chunks_for_media_preview(
+    state: &ServerState,
+    subject: &str,
+    missing_chunks: &[ReplicationChunkInfo],
+    budget: Duration,
+) -> Result<bool> {
+    match hydrate_missing_chunks_with_budget(state, subject, missing_chunks, budget).await {
+        Ok(()) => {
+            request_local_availability_refresh(state);
+            Ok(true)
+        }
+        Err(error) if error.is::<content_recovery::ReadThroughRecoveryBudgetExceeded>() => {
+            tracing::info!(
+                subject,
+                missing_chunk_count = missing_chunks.len(),
+                budget_secs = budget.as_secs_f64(),
+                "media preview hydration remains incomplete after its recovery budget"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn hydrate_missing_chunks_for_range(
@@ -20648,13 +20676,23 @@ async fn hydrate_missing_chunks_for_range(
     subject: &str,
     missing_chunks: &[ReplicationChunkInfo],
 ) -> Result<()> {
-    let result = content_recovery::recover_chunks_for_read(
+    hydrate_missing_chunks_with_budget(
         state,
         subject,
         missing_chunks,
         content_recovery::READ_THROUGH_RECOVERY_BUDGET,
     )
-    .await?;
+    .await
+}
+
+async fn hydrate_missing_chunks_with_budget(
+    state: &ServerState,
+    subject: &str,
+    missing_chunks: &[ReplicationChunkInfo],
+    budget: Duration,
+) -> Result<()> {
+    let result =
+        content_recovery::recover_chunks_for_read(state, subject, missing_chunks, budget).await?;
     if !result.remaining.is_empty() {
         bail!(
             "failed read-through chunk recovery for subject={subject}: {}",

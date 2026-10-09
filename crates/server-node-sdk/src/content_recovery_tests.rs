@@ -824,6 +824,76 @@ run_on_main_metadata_backends!(
     recovery_read_budget_bounds_slow_unadvertised_peers_turso
 );
 
+#[test]
+fn full_object_recovery_budget_scales_with_parallel_chunk_batches() {
+    use crate::content_recovery::{READ_THROUGH_RECOVERY_BUDGET, full_object_recovery_budget};
+
+    assert_eq!(full_object_recovery_budget(0), READ_THROUGH_RECOVERY_BUDGET);
+    assert_eq!(full_object_recovery_budget(1), READ_THROUGH_RECOVERY_BUDGET);
+    assert_eq!(full_object_recovery_budget(4), READ_THROUGH_RECOVERY_BUDGET);
+    assert_eq!(
+        full_object_recovery_budget(5),
+        READ_THROUGH_RECOVERY_BUDGET.saturating_mul(2)
+    );
+    assert_eq!(
+        full_object_recovery_budget(40),
+        READ_THROUGH_RECOVERY_BUDGET.saturating_mul(10)
+    );
+}
+
+async fn media_preview_budget_exhaustion_is_retryable_impl(backend: MainTestBackend) {
+    let target = build_test_state(1, false, backend).await;
+    let source = build_test_state(1, false, backend).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let wait = release.clone();
+    let app = axum::Router::new().route(
+        "/cluster/v2/replication/chunk/{hash}",
+        axum::routing::get(move || {
+            let wait = wait.clone();
+            async move {
+                wait.notified().await;
+                StatusCode::NOT_FOUND
+            }
+        }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    register_online_source_node(&target, &source, &url).await;
+    let missing_chunk = crate::storage::ReplicationChunkInfo {
+        hash: blake3::hash(b"missing preview bytes").to_hex().to_string(),
+        size_bytes: 21,
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::recover_missing_chunks_for_media_preview(
+            &target,
+            "preview.bin@v1",
+            &[missing_chunk],
+            Duration::from_millis(50),
+        ),
+    )
+    .await
+    .expect("preview recovery must honor its budget")
+    .expect("budget exhaustion must not become an internal error");
+
+    release.notify_waiters();
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+    assert!(!result, "an incomplete preview must remain retryable");
+}
+
+run_on_main_metadata_backends!(
+    media_preview_budget_exhaustion_is_retryable_impl,
+    media_preview_budget_exhaustion_is_retryable,
+    media_preview_budget_exhaustion_is_retryable_turso
+);
+
 #[tokio::test]
 async fn recovery_manifest_checks_all_hash_sources_before_legacy_exports() {
     let source = build_test_state(1, false, MainTestBackend::Sqlite).await;
