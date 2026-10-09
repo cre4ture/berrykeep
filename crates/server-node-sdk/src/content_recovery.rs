@@ -785,6 +785,7 @@ pub(crate) async fn resume_pending(state: &ServerState) -> Result<()> {
         .await?;
     let subjects = hashes
         .into_iter()
+        .filter(|hash| !state.maintenance.content_repair_claims.is_claimed(hash))
         .map(|hash| format!("{MANIFEST_SUBJECT_PREFIX}{hash}"))
         .collect::<Vec<_>>();
     if !subjects.is_empty() {

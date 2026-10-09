@@ -150,20 +150,34 @@ impl TursoMetadataStore {
 
     async fn discard_invalid_content_repair_tasks(
         &self,
-        invalid_tasks: Vec<(String, Vec<u8>)>,
+        invalid_tasks: Vec<(String, Option<Vec<u8>>)>,
     ) -> Result<()> {
         if invalid_tasks.is_empty() {
             return Ok(());
         }
         let _writer = self.writer_lock.lock().await;
         for (manifest_hash, task_json) in invalid_tasks {
-            self.connection
-                .execute(
-                    "DELETE FROM content_repair_tasks
-                     WHERE manifest_hash = ?1 AND CAST(task_json AS BLOB) = ?2",
-                    (manifest_hash, task_json),
-                )
-                .await?;
+            match task_json {
+                Some(task_json) => {
+                    self.connection
+                        .execute(
+                            "DELETE FROM content_repair_tasks
+                             WHERE manifest_hash = ?1 AND CAST(task_json AS BLOB) = ?2",
+                            (manifest_hash, task_json),
+                        )
+                        .await?;
+                }
+                None => {
+                    // The database value itself could not be read, so there is no
+                    // byte sequence with which to perform a conditional delete.
+                    self.connection
+                        .execute(
+                            "DELETE FROM content_repair_tasks WHERE manifest_hash = ?1",
+                            [manifest_hash],
+                        )
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -523,14 +537,14 @@ impl MetadataStore for TursoMetadataStore {
                 Ok(task_json) => task_json,
                 Err(error) => {
                     warn!(manifest_hash, error = %error, "discarding unreadable content repair task");
-                    invalid_tasks.push((manifest_hash, Vec::new()));
+                    invalid_tasks.push((manifest_hash, None));
                     continue;
                 }
             };
             if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
                 tasks.push(task);
             } else {
-                invalid_tasks.push((manifest_hash, task_json));
+                invalid_tasks.push((manifest_hash, Some(task_json)));
             }
         }
         drop(rows);
@@ -568,14 +582,14 @@ impl MetadataStore for TursoMetadataStore {
                     Ok(task_json) => task_json,
                     Err(error) => {
                         warn!(manifest_hash, error = %error, "discarding unreadable content repair task");
-                        invalid_tasks.push((manifest_hash, Vec::new()));
+                        invalid_tasks.push((manifest_hash, None));
                         continue;
                     }
                 };
                 if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
                     tasks.push(task);
                 } else {
-                    invalid_tasks.push((manifest_hash, task_json));
+                    invalid_tasks.push((manifest_hash, Some(task_json)));
                 }
             }
         }
@@ -4102,6 +4116,44 @@ mod tests {
                 .await
                 .expect("corrupt queue rows should be removed")
                 .is_empty()
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn unreadable_raw_content_repair_task_is_discarded_by_hash() {
+        let metadata_db_path = turso_test_db_path("turso-unreadable-raw-content-repair-task");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let manifest_hash = "unreadable-raw-task";
+        store
+            .connection
+            .execute(
+                "INSERT INTO content_repair_tasks (
+                     manifest_hash, next_attempt_unix, source_fingerprint, task_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                (manifest_hash, 0, "current", b"{not valid json".to_vec()),
+            )
+            .await
+            .expect("broken current task should insert");
+
+        // A failed raw-value conversion has no bytes for the conditional
+        // delete used after a JSON decoding failure. It must still clear the
+        // regenerable task instead of leaving it permanently due.
+        store
+            .discard_invalid_content_repair_tasks(vec![(manifest_hash.to_string(), None)])
+            .await
+            .expect("raw-unreadable task should be discarded by manifest hash");
+        assert!(
+            store
+                .content_repair_task_hashes()
+                .await
+                .expect("remaining queue hashes should load")
+                .is_empty(),
+            "a task with unreadable raw bytes must not remain queued forever"
         );
 
         drop(store);

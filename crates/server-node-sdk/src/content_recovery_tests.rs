@@ -271,6 +271,92 @@ run_on_main_metadata_backends!(
     local_availability_refresh_keeps_its_fresh_cache_turso
 );
 
+async fn remote_availability_sync_keeps_local_presence_cache_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let target_key = choose_locally_placed_key(&target, "remote-sync-presence-cache").await;
+    seed_subject_version(
+        &target,
+        &target_key,
+        "v1",
+        b"local presence cache bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    crate::content_recovery::audit_assigned(&target)
+        .await
+        .unwrap();
+    let generation = target
+        .maintenance
+        .local_availability_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        target
+            .maintenance
+            .local_owned_manifest_presence_cache
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|cache| cache.is_valid_for(generation)),
+        "the local audit must have populated a valid owned-presence cache"
+    );
+
+    let source_key = choose_locally_placed_key(&source, "remote-availability-subject").await;
+    seed_subject_version(
+        &source,
+        &source_key,
+        "v1",
+        b"remote availability bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    crate::refresh_local_availability_view_once(&source).await;
+    let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &url).await;
+
+    crate::sync_remote_availability_views_once(&target).await;
+
+    assert_eq!(
+        target
+            .maintenance
+            .local_availability_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        generation,
+        "a remote peer's availability claim must not invalidate the local view"
+    );
+    assert!(
+        target
+            .maintenance
+            .local_owned_manifest_presence_cache
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|cache| cache.is_valid_for(generation)),
+        "a remote peer sync must retain the target's positive local presence cache"
+    );
+    assert!(
+        target
+            .cluster
+            .lock()
+            .await
+            .available_nodes_for_subject(&source_key)
+            .iter()
+            .any(|node| node.node_id == source.node_id),
+        "the remote availability claim must still be reconciled and persisted"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    remote_availability_sync_keeps_local_presence_cache_impl,
+    remote_availability_sync_keeps_local_presence_cache,
+    remote_availability_sync_keeps_local_presence_cache_turso
+);
+
 async fn planning_subjects_deduplicate_retained_history_by_placement_impl(
     backend: MainTestBackend,
 ) {
@@ -707,6 +793,66 @@ run_on_main_metadata_backends!(
     recovery_batch_limit_skips_contended_and_backoff_tasks_impl,
     recovery_batch_limit_skips_contended_and_backoff_tasks,
     recovery_batch_limit_skips_contended_and_backoff_tasks_turso
+);
+
+async fn recovery_worker_skips_already_claimed_tasks_impl(backend: MainTestBackend) {
+    let target = build_test_state(1, false, backend).await;
+    let key = choose_locally_placed_key(&target, "claimed-background-task").await;
+    seed_subject_version(
+        &target,
+        &key,
+        "v1",
+        b"claimed repair bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    let reference = read_store(&target, "test.recovery.claimed_task_reference")
+        .await
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject(&format!("{key}@v1"))
+        .unwrap()
+        .clone();
+    let task = crate::storage::content_recovery::ContentRepairTask::new(reference, true);
+    let manifest_hash = task.reference.manifest_hash.clone();
+    read_store(&target, "test.recovery.persist_claimed_task")
+        .await
+        .persist_content_repair_task(&task)
+        .await
+        .unwrap();
+    let claim = target
+        .maintenance
+        .content_repair_claims
+        .claim(&manifest_hash)
+        .await;
+
+    crate::content_recovery::resume_pending(&target)
+        .await
+        .unwrap();
+
+    assert!(
+        repair_run_history(&target).await.is_empty(),
+        "the background worker must not create a completed repair run while another repair owns the task"
+    );
+    assert_eq!(
+        read_store(&target, "test.recovery.claimed_task_pending")
+            .await
+            .content_repair_task_hashes()
+            .await
+            .unwrap(),
+        vec![manifest_hash],
+        "a contended task must remain durable for its existing owner"
+    );
+
+    drop(claim);
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_worker_skips_already_claimed_tasks_impl,
+    recovery_worker_skips_already_claimed_tasks,
+    recovery_worker_skips_already_claimed_tasks_turso
 );
 
 async fn recovery_local_install_failure_is_unresolved_impl(backend: MainTestBackend) {

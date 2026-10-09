@@ -489,6 +489,13 @@ struct ContentRepairClaim {
 }
 
 impl ContentRepairClaims {
+    fn is_claimed(&self, manifest_hash: &str) -> bool {
+        self.active_manifests
+            .lock()
+            .expect("content repair claim lock poisoned")
+            .contains(manifest_hash)
+    }
+
     fn try_claim(self: &Arc<Self>, manifest_hash: &str) -> Option<ContentRepairClaim> {
         self.active_manifests
             .lock()
@@ -12011,7 +12018,8 @@ async fn sync_remote_availability_views_once(state: &ServerState) {
                             cluster.reconcile_node_subjects(payload.node_id, &payload.subjects)
                         };
                         if replicas_changed
-                            && let Err(err) = persist_cluster_replicas_state(state).await
+                            && let Err(err) =
+                                persist_remote_availability_reconciliation(state).await
                         {
                             warn!(
                                 error = %err,
@@ -31109,14 +31117,20 @@ async fn persist_local_availability_reconciliation(state: &ServerState) -> Resul
     persist_cluster_replicas_state_inner(state, false).await
 }
 
+/// Remote peers' availability claims do not change this node's local storage
+/// view. Keep its TTL caches intact while durably recording the peer update.
+async fn persist_remote_availability_reconciliation(state: &ServerState) -> Result<()> {
+    persist_cluster_replicas_state_inner(state, false).await
+}
+
 async fn persist_cluster_replicas_state_inner(
     state: &ServerState,
     invalidate_local_availability: bool,
 ) -> Result<()> {
     if invalidate_local_availability {
-        // Cluster membership can change through imports and remote availability
-        // syncs without a namespace mutation. Force the next local view to use
-        // a fresh snapshot instead of replaying an older cached subject set.
+        // Local storage can change through imports without a namespace
+        // mutation. Force the next local view to use a fresh snapshot instead
+        // of replaying an older cached subject set.
         invalidate_local_availability_cache(state);
     }
     let (replicas, available) = {
