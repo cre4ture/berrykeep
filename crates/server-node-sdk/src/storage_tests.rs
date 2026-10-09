@@ -9786,6 +9786,89 @@ run_on_all_metadata_backends!(
     data_scrub_only_requires_assigned_or_owned_chunks_turso
 );
 
+async fn data_scrub_ignores_unassigned_missing_and_unreadable_manifests_impl(
+    backend: StorageTestBackend,
+) {
+    let (source_root, mut source) = backend
+        .init_store("scrub-metadata-only-manifest-source")
+        .await;
+    source
+        .put_object_versioned(
+            "docs/missing-manifest-replica.bin",
+            Bytes::from(sample_large_chunked_payload()),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let bundle = source
+        .export_metadata_bundle(
+            "docs/missing-manifest-replica.bin",
+            None,
+            ObjectReadMode::Preferred,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let required = bundle
+        .manifests
+        .iter()
+        .map(|manifest| manifest.manifest_hash.clone())
+        .collect::<HashSet<_>>();
+    let manifest_hash = bundle.manifests[0].manifest_hash.clone();
+
+    for (suffix, expected_kind) in [
+        ("missing", DataScrubIssueKind::ManifestMissing),
+        ("unreadable", DataScrubIssueKind::ManifestUnreadable),
+    ] {
+        let (target_root, mut target) = backend
+            .init_store(&format!("scrub-metadata-only-manifest-{suffix}"))
+            .await;
+        target.import_metadata_bundle(&bundle).await.unwrap();
+        let manifest_path = target.manifest_path_for_test(&manifest_hash);
+        fs::remove_file(&manifest_path).await.unwrap();
+        if expected_kind == DataScrubIssueKind::ManifestUnreadable {
+            fs::create_dir(&manifest_path).await.unwrap();
+        }
+
+        let unassigned = target.run_data_scrub().await.unwrap();
+        assert_eq!(
+            unassigned.issue_count, 0,
+            "unassigned {suffix} manifests must not degrade the local scrub"
+        );
+
+        let assigned = target
+            .data_scrubber()
+            .await
+            .unwrap()
+            .with_required_manifests(required.clone())
+            .run_with_repair_subjects()
+            .await
+            .unwrap();
+        assert!(
+            assigned
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == expected_kind),
+            "an assigned {suffix} manifest must be reported: {assigned:?}"
+        );
+        assert!(
+            !assigned.repair_subjects.is_empty(),
+            "an assigned {suffix} manifest must queue repair"
+        );
+
+        let _ = fs::remove_dir_all(target_root).await;
+    }
+
+    let _ = fs::remove_dir_all(source_root).await;
+}
+
+run_on_all_metadata_backends!(
+    data_scrub_ignores_unassigned_missing_and_unreadable_manifests_impl,
+    data_scrub_ignores_unassigned_missing_and_unreadable_manifests,
+    data_scrub_ignores_unassigned_missing_and_unreadable_manifests_turso
+);
+
 async fn importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl(
     backend: StorageTestBackend,
 ) {

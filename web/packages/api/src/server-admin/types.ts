@@ -456,6 +456,7 @@ export type DataScrubIssueKind =
   | "manifest_hash_mismatch"
   | "manifest_key_mismatch"
   | "manifest_size_mismatch"
+  /** Serialized by historical scrub records; new scrubs no longer emit it. */
   | "replica_incomplete"
   | "chunk_missing"
   | "chunk_unreadable"

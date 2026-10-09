@@ -594,7 +594,9 @@ async fn repair_subjects_inner(
         tasks.insert(reference.manifest_hash.clone(), task);
     }
     let availability_may_have_changed = !tasks.is_empty();
-    for (index, mut task) in tasks.into_values().enumerate() {
+    let transfer_limit = limit.unwrap_or(usize::MAX);
+    let mut started_transfers = 0;
+    for mut task in tasks.into_values() {
         let Some(_claim) = state
             .maintenance
             .content_repair_claims
@@ -631,7 +633,7 @@ async fn repair_subjects_inner(
             .await
             .persist_content_repair_task(&task)
             .await?;
-        if index >= limit.unwrap_or(usize::MAX) {
+        if started_transfers >= transfer_limit {
             report.skipped_items += 1;
             log_outcome(
                 state,
@@ -699,6 +701,7 @@ async fn repair_subjects_inner(
             continue;
         }
         task.source_fingerprint = fingerprint.clone();
+        started_transfers += 1;
         report.attempted_transfers += 1;
         let recovered_before_attempt = task.recovered_chunks;
         match recover_task(state, &mut task).await {

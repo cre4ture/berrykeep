@@ -627,6 +627,88 @@ run_on_main_metadata_backends!(
     recovery_batch_limit_keeps_all_intent_durable_turso
 );
 
+async fn recovery_batch_limit_skips_contended_and_backoff_tasks_impl(backend: MainTestBackend) {
+    let target = build_test_state(1, false, backend).await;
+    let mut manifests = Vec::new();
+    for prefix in ["batch-contention", "batch-backoff", "batch-ready"] {
+        let key = choose_locally_placed_key(&target, prefix).await;
+        seed_subject_version(
+            &target,
+            &key,
+            "v1",
+            format!("{prefix} bytes").into_bytes(),
+            vec![],
+        )
+        .await;
+        manifests.push((bundle(&target, &key, "v1").await.manifest_hash, key));
+    }
+    manifests.sort();
+    let contended = manifests[0].clone();
+    let backoff = manifests[1].clone();
+    let ready = manifests[2].clone();
+    let held_claim = target
+        .maintenance
+        .content_repair_claims
+        .claim(&contended.0)
+        .await;
+
+    let reference = read_store(&target, "test.recovery.batch_backoff_reference")
+        .await
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject(&format!("{}@v1", backoff.1))
+        .unwrap()
+        .clone();
+    let mut deferred = crate::storage::content_recovery::ContentRepairTask::new(reference, true);
+    deferred.next_attempt_unix = crate::unix_ts() + 60;
+    deferred.source_fingerprint = blake3::hash(b"[]").to_hex().to_string();
+    read_store(&target, "test.recovery.batch_backoff_persist")
+        .await
+        .persist_content_repair_task(&deferred)
+        .await
+        .unwrap();
+
+    let report = crate::content_recovery::repair_subjects(
+        &target,
+        manifests
+            .iter()
+            .map(|(_, key)| format!("{key}@v1"))
+            .collect(),
+        Some(1),
+    )
+    .await;
+
+    assert_eq!(report.attempted_transfers, 1, "{report:?}");
+    assert_eq!(report.successful_transfers, 1, "{report:?}");
+    assert_eq!(report.skipped_backoff, 1, "{report:?}");
+    assert_eq!(report.skipped_items, 2, "{report:?}");
+    let ready_subject = format!("{}@v1", ready.1);
+    assert!(
+        report.detailed_log.iter().any(|entry| {
+            entry.event == "repair_verified"
+                && entry.subject.as_deref() == Some(ready_subject.as_str())
+        }),
+        "the ready tail task must use the transfer slot after contended and backoff tasks: {report:?}"
+    );
+    let pending = read_store(&target, "test.recovery.batch_backoff_pending")
+        .await
+        .content_repair_tasks()
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].reference.manifest_hash, backoff.0);
+
+    drop(held_claim);
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_batch_limit_skips_contended_and_backoff_tasks_impl,
+    recovery_batch_limit_skips_contended_and_backoff_tasks,
+    recovery_batch_limit_skips_contended_and_backoff_tasks_turso
+);
+
 async fn recovery_local_install_failure_is_unresolved_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let target = build_test_state(1, false, backend).await;

@@ -27,6 +27,9 @@ pub enum DataScrubIssueKind {
     ManifestHashMismatch,
     ManifestKeyMismatch,
     ManifestSizeMismatch,
+    /// Retained only to deserialize scrub runs written before retained-content
+    /// repair became a durable, manifest-scoped workflow. New scrubs do not
+    /// emit this kind.
     ReplicaIncomplete,
     ChunkMissing,
     ChunkUnreadable,
@@ -378,39 +381,45 @@ impl DataScrubber {
         {
             Ok(path) => path,
             Err(err) => {
-                self.push_issue(
-                    output,
-                    contexts,
-                    DataScrubIssueKind::ManifestMissing,
-                    Some(manifest_hash.to_string()),
-                    None,
-                    format!("manifest location unavailable: {err}"),
-                );
+                if manifest_required_locally {
+                    self.push_issue(
+                        output,
+                        contexts,
+                        DataScrubIssueKind::ManifestMissing,
+                        Some(manifest_hash.to_string()),
+                        None,
+                        format!("manifest location unavailable: {err}"),
+                    );
+                }
                 return;
             }
         };
         let payload = match self.read_with_bounded_retry(&manifest_path).await {
             Ok(payload) => payload,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.push_issue(
-                    output,
-                    contexts,
-                    DataScrubIssueKind::ManifestMissing,
-                    Some(manifest_hash.to_string()),
-                    None,
-                    format!("manifest missing at {}", manifest_path.display()),
-                );
+                if manifest_required_locally {
+                    self.push_issue(
+                        output,
+                        contexts,
+                        DataScrubIssueKind::ManifestMissing,
+                        Some(manifest_hash.to_string()),
+                        None,
+                        format!("manifest missing at {}", manifest_path.display()),
+                    );
+                }
                 return;
             }
             Err(err) => {
-                self.push_issue(
-                    output,
-                    contexts,
-                    DataScrubIssueKind::ManifestUnreadable,
-                    Some(manifest_hash.to_string()),
-                    None,
-                    format!("failed reading manifest {}: {err}", manifest_path.display()),
-                );
+                if manifest_required_locally {
+                    self.push_issue(
+                        output,
+                        contexts,
+                        DataScrubIssueKind::ManifestUnreadable,
+                        Some(manifest_hash.to_string()),
+                        None,
+                        format!("failed reading manifest {}: {err}", manifest_path.display()),
+                    );
+                }
                 return;
             }
         };
@@ -702,4 +711,16 @@ fn data_scrub_all_subjects_for_contexts(
         .values()
         .filter_map(DataScrubReference::subject)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataScrubIssueKind;
+
+    #[test]
+    fn replica_incomplete_deserializes_legacy_scrub_reports() {
+        let kind = serde_json::from_str::<DataScrubIssueKind>(r#""replica_incomplete""#)
+            .expect("historical scrub records must remain readable");
+        assert_eq!(kind, DataScrubIssueKind::ReplicaIncomplete);
+    }
 }
