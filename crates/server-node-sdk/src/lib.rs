@@ -12934,11 +12934,11 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
 
     match result {
         Ok(output) => {
-            // Persist integrity findings before publishing scrub completion.
-            // A zero execution budget enqueues all intent without fetching bytes,
-            // including when automatic repair is disabled. It also prevents a
-            // later availability refresh from undoing the degraded state.
-            let enqueue_error = if output.repair_subjects.is_empty() {
+            let automatic_repair_enabled = state.repair_config.enabled;
+            // A disabled repair worker must leave scrub findings informational:
+            // durable repair tasks suppress availability and pin their content,
+            // but no worker can drain them in that configuration.
+            let enqueue_error = if !automatic_repair_enabled || output.repair_subjects.is_empty() {
                 None
             } else {
                 content_recovery::repair_subjects(
@@ -12970,7 +12970,7 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
             let record =
                 finish_data_scrub_run_tracking(&state, tracker, status, summary, enqueue_error)
                     .await;
-            if !output.repair_subjects.is_empty() {
+            if automatic_repair_enabled && !output.repair_subjects.is_empty() {
                 let state_clone = state.clone();
                 tokio::spawn(async move {
                     execute_data_scrub_follow_on_repair(

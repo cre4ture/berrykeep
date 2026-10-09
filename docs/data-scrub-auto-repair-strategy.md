@@ -70,8 +70,10 @@ SQLite and Turso persist `content_repair_tasks`, keyed by manifest hash. Each ta
 retained reference, full-replica versus cache-repair intent, protected chunk identities, retry
 count, retry time, cumulative recovered chunks, source-set fingerprint and last error.
 
-Scrub persists repair intent before publishing completion, even when automatic execution is
-disabled. The background worker resumes tasks after restart without another scrub or manual request.
+When automatic repair is enabled, scrub persists repair intent before publishing completion.
+The background worker resumes tasks after restart without another scrub or manual request. When it
+is disabled, scrub findings remain informational: no task is persisted, so unavailable work cannot
+permanently suppress availability or pin content that no worker can drain.
 Retries use capped exponential backoff (maximum one hour), not permanent abandonment when the
 legacy transfer retry budget is exhausted. A changed online source set or peer address allows
 an earlier retry; ordinary heartbeat timestamp changes do not defeat backoff.
@@ -123,6 +125,8 @@ Storage and runtime tests run on both metadata backends:
 - partial recovery, restart, peer reconnect and retry-budget exhaustion;
 - cancellation while a request is in flight, batch limits preserving all queued intent,
   and local installation failures distinct from missing sources;
+- disabled automatic repair leaves scrub findings informational without an undrainable task,
+  content pin or availability suppression;
 - concurrent GC, durable pins, verification and ownership-before-unpin ordering;
 - automatic discovery of an assigned gap with no advertised source;
 - stale historical claims and exportable metadata not counting as complete replicas;

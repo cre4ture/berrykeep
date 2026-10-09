@@ -9411,13 +9411,12 @@ impl PersistentStore {
     ) -> Result<CleanupReport> {
         // Decoding retained history is proportional to every version and
         // snapshot, and does not mutate the temporary pin set. Do it before
-        // taking the writer gate so foreground chunk installs stay responsive.
+        // taking the gate that snapshots mutable cleanup protection records.
         let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
 
-        // The exclusive gate only protects the mutable protection records.
-        // Keeping it through directory walks and file deletion would block
-        // durable task registration and verified chunk installation for the
-        // duration of a store-sized sweep.
+        // The gate makes the protection snapshot independent of the caller's
+        // store lock. It need not cover the later directory walks and file
+        // deletion, because those consume an immutable snapshot.
         let protection = {
             let _gc_guard = self.content_gc_gate.write().await;
             self.cleanup_protection_snapshot(referenced_manifests)

@@ -623,7 +623,9 @@ run_on_main_metadata_backends!(
     recovery_backoff_starts_after_a_slow_transfer_turso
 );
 
-async fn recovery_scrub_persists_intent_when_execution_is_disabled_impl(backend: MainTestBackend) {
+async fn recovery_scrub_does_not_pin_intent_when_execution_is_disabled_impl(
+    backend: MainTestBackend,
+) {
     let mut target = build_test_state(1, false, backend).await;
     target.repair_config.enabled = false;
     let key = "disabled-recovery.bin";
@@ -646,15 +648,15 @@ async fn recovery_scrub_persists_intent_when_execution_is_disabled_impl(backend:
             .await
             .unwrap()
             .len(),
-        1,
-        "scrub findings must be durable before completion, even when execution is disabled"
+        0,
+        "a disabled repair worker must not retain a task that no worker can drain"
     );
     crate::refresh_local_availability_view_once(&target).await;
     assert!(
-        crate::cached_local_cluster_available_subjects(&target)
+        !crate::cached_local_cluster_available_subjects(&target)
             .await
             .is_empty(),
-        "a refresh cannot undo the persistent integrity finding"
+        "an informational scrub finding must not permanently suppress availability"
     );
     assert!(
         repair_run_history(&target).await.is_empty(),
@@ -664,9 +666,9 @@ async fn recovery_scrub_persists_intent_when_execution_is_disabled_impl(backend:
 }
 
 run_on_main_metadata_backends!(
-    recovery_scrub_persists_intent_when_execution_is_disabled_impl,
-    recovery_scrub_persists_intent_when_execution_is_disabled,
-    recovery_scrub_persists_intent_when_execution_is_disabled_turso
+    recovery_scrub_does_not_pin_intent_when_execution_is_disabled_impl,
+    recovery_scrub_does_not_pin_intent_when_execution_is_disabled,
+    recovery_scrub_does_not_pin_intent_when_execution_is_disabled_turso
 );
 
 async fn recovery_batch_limit_keeps_all_intent_durable_impl(backend: MainTestBackend) {
