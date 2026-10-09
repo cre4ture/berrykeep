@@ -972,6 +972,99 @@ run_on_main_metadata_backends!(
     recovery_verification_can_outlive_transfer_budget_turso
 );
 
+async fn recovery_prepare_timeout_preserves_persisted_gc_pin_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let key = format!("prepare-timeout-gc-pin-{}.bin", backend.suffix());
+    let version = "ver-prepare-timeout-gc-pin";
+    seed_subject_version(
+        &state,
+        &key,
+        version,
+        format!("prepare timeout bytes for {}", backend.suffix()).into_bytes(),
+        vec![],
+    )
+    .await;
+    let manifest = bundle(&state, &key, version).await;
+    let reference = read_store(&state, "test.recovery.prepare_timeout_reference")
+        .await
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject(&format!("{key}@{version}"))
+        .unwrap()
+        .clone();
+    let expected_chunks = manifest.manifest.chunks.clone();
+    let mut task = crate::storage::content_recovery::ContentRepairTask::new(reference, true);
+    task.chunks = expected_chunks.clone();
+    read_store(&state, "test.recovery.prepare_timeout_initial_pin")
+        .await
+        .persist_content_repair_task(&task)
+        .await
+        .unwrap();
+
+    let preparation =
+        crate::content_recovery::block_recovery_preparation_for_test(&manifest.manifest_hash);
+    let error = {
+        let recovery = crate::content_recovery::recover_task_with_budget(
+            &state,
+            &mut task,
+            Duration::from_millis(500),
+        );
+        tokio::pin!(recovery);
+        tokio::select! {
+            () = preparation.wait_until_started() => {}
+            outcome = &mut recovery => panic!("recovery ended before preparation blocked: {outcome:?}"),
+            () = tokio::time::sleep(Duration::from_secs(5)) => {
+                panic!("recovery did not reach task preparation")
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), &mut recovery)
+            .await
+            .expect("the internal transfer deadline should end preparation")
+            .unwrap_err()
+    };
+    assert!(
+        error.is::<crate::content_recovery::DurableRepairBudgetExceeded>(),
+        "the artificial deadline must cancel task preparation: {error:#}"
+    );
+    preparation.release();
+    crate::content_recovery::clear_recovery_preparation_blocker_for_test(&manifest.manifest_hash);
+
+    task.defer("repair preparation timed out".to_string(), 100, 30, false);
+    read_store(&state, "test.recovery.prepare_timeout_defer")
+        .await
+        .persist_content_repair_task(&task)
+        .await
+        .unwrap();
+    let persisted = read_store(&state, "test.recovery.prepare_timeout_persisted")
+        .await
+        .content_repair_tasks()
+        .await
+        .unwrap();
+    assert_eq!(persisted.len(), 1, "{persisted:?}");
+    assert_eq!(persisted[0].chunks.len(), expected_chunks.len());
+    assert_eq!(
+        persisted[0]
+            .chunks
+            .iter()
+            .map(|chunk| (&chunk.hash, chunk.size_bytes))
+            .collect::<Vec<_>>(),
+        expected_chunks
+            .iter()
+            .map(|chunk| (&chunk.hash, chunk.size_bytes))
+            .collect::<Vec<_>>(),
+        "a cancelled prepare pass must preserve the complete durable GC pin"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_prepare_timeout_preserves_persisted_gc_pin_impl,
+    recovery_prepare_timeout_preserves_persisted_gc_pin,
+    recovery_prepare_timeout_preserves_persisted_gc_pin_turso
+);
+
 #[tokio::test]
 async fn durable_recovery_budget_keeps_stalled_work_retryable() {
     let error =

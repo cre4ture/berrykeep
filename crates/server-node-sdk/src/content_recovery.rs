@@ -51,6 +51,77 @@ impl std::fmt::Display for DurableRepairBudgetExceeded {
 
 impl std::error::Error for DurableRepairBudgetExceeded {}
 
+#[cfg(test)]
+pub(crate) struct RecoveryPreparationBlocker {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl RecoveryPreparationBlocker {
+    pub(crate) async fn wait_until_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn recovery_preparation_blockers()
+-> &'static StdMutex<HashMap<String, Arc<RecoveryPreparationBlocker>>> {
+    static BLOCKERS: std::sync::OnceLock<
+        StdMutex<HashMap<String, Arc<RecoveryPreparationBlocker>>>,
+    > = std::sync::OnceLock::new();
+    BLOCKERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn block_recovery_preparation_for_test(
+    manifest_hash: &str,
+) -> Arc<RecoveryPreparationBlocker> {
+    let blocker = Arc::new(RecoveryPreparationBlocker {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        released: std::sync::atomic::AtomicBool::new(false),
+    });
+    recovery_preparation_blockers()
+        .lock()
+        .expect("recovery preparation blocker lock should not be poisoned")
+        .insert(manifest_hash.to_string(), blocker.clone());
+    blocker
+}
+
+#[cfg(test)]
+pub(crate) fn clear_recovery_preparation_blocker_for_test(manifest_hash: &str) {
+    recovery_preparation_blockers()
+        .lock()
+        .expect("recovery preparation blocker lock should not be poisoned")
+        .remove(manifest_hash);
+}
+
+#[cfg(test)]
+async fn wait_for_recovery_preparation_test_blocker(manifest_hash: &str) {
+    let blocker = recovery_preparation_blockers()
+        .lock()
+        .expect("recovery preparation blocker lock should not be poisoned")
+        .get(manifest_hash)
+        .cloned();
+    if let Some(blocker) = blocker {
+        blocker.started.notify_one();
+        loop {
+            let notified = blocker.release.notified();
+            if blocker.released.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+}
+
 async fn source_fingerprint(state: &ServerState) -> String {
     let sources = source_nodes(state, "", None).await;
     let identities = sources
@@ -476,7 +547,9 @@ async fn recover_task_initial_transfer(
         // store lock shared lets ordinary reads proceed while large manifests
         // are prepared for recovery.
         let store = read_store(state, "content_recovery.prepare").await;
-        task.chunks.clear();
+        let mut prepared_chunks = Vec::with_capacity(manifest.chunks.len());
+        #[cfg(test)]
+        wait_for_recovery_preparation_test_blocker(&task.reference.manifest_hash).await;
         for chunk in manifest.chunks {
             // Metadata-only nodes repair damaged cached bytes without hydrating
             // absent cache entries or acquiring replica ownership. Durable
@@ -492,9 +565,13 @@ async fn recover_task_initial_transfer(
                         )
                     })?;
             if task.repair_chunks || cache_entry_exists {
-                task.chunks.push(chunk);
+                prepared_chunks.push(chunk);
             }
         }
+        // A transfer deadline may cancel this future at any await above. Only
+        // replace the durable GC pin after the complete manifest has been
+        // inspected, so the outer failure path cannot persist a partial list.
+        task.chunks = prepared_chunks;
         store.persist_content_repair_task(task).await?;
         store
             .install_recovery_manifest(&task.reference.manifest_hash, &bytes)
