@@ -254,11 +254,9 @@ impl ContentRecoveryInspector {
     ) -> Result<Vec<ReplicationChunkInfo>> {
         #[cfg(test)]
         wait_for_recovery_verification_test_blocker(&task.reference.manifest_hash).await;
-        let payload = read_valid_manifest(&self.storage_pool, &task.reference.manifest_hash)
+        let (_, manifest) = read_valid_manifest(&self.storage_pool, &task.reference.manifest_hash)
             .await?
-            .map(|(bytes, _)| bytes)
             .context("repaired manifest missing")?;
-        let manifest = validate_manifest(&task.reference.manifest_hash, &payload)?;
         let chunks = if task.repair_chunks {
             &manifest.chunks
         } else {
