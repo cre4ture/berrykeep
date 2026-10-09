@@ -12371,20 +12371,14 @@ async fn planning_replication_subjects_from_availability(state: &ServerState) ->
     subjects.into_iter().collect()
 }
 
-/// Bounds the periodic background audit to one legacy plan item per placement
-/// key. Explicit/manual plans keep their branch-aware version subjects.
+/// Returns every current replication subject for the periodic background audit.
+///
+/// Availability intentionally excludes non-head retained history, so this stays
+/// bounded without collapsing concurrent heads. Collapsing by placement key
+/// would hide a divergent current version whenever the base subject already
+/// has enough replicas.
 async fn planning_replication_subjects_for_auditor(state: &ServerState) -> Vec<String> {
-    planning_replication_subjects_from_availability(state)
-        .await
-        .into_iter()
-        .fold(BTreeMap::new(), |mut by_placement_key, subject| {
-            by_placement_key
-                .entry(cluster::replication_placement_key(&subject).to_string())
-                .or_insert(subject);
-            by_placement_key
-        })
-        .into_values()
-        .collect()
+    planning_replication_subjects_from_availability(state).await
 }
 
 async fn recompute_local_cluster_available_subjects(
