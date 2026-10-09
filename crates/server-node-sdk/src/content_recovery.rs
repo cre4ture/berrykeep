@@ -8,6 +8,7 @@ use storage::retained_content::{MANIFEST_SUBJECT_PREFIX, RetainedContent, Retain
 const CHUNK_FETCH_CONCURRENCY: usize = 4;
 const PEER_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const READ_THROUGH_RECOVERY_BUDGET: Duration = Duration::from_secs(30);
+pub(crate) const FULL_OBJECT_RECOVERY_BUDGET_MAX: Duration = Duration::from_secs(2 * 60);
 /// Bounds network transfer work in one durable repair pass. Its persisted task
 /// and any verified chunks survive cancellation, so a later pass resumes with
 /// a fresh peer snapshot. Full local verification is deliberately outside this
@@ -53,7 +54,9 @@ impl std::error::Error for ReadThroughRecoveryBudgetExceeded {}
 
 pub(crate) fn full_object_recovery_budget(missing_chunk_count: usize) -> Duration {
     let batches = missing_chunk_count.max(1).div_ceil(CHUNK_FETCH_CONCURRENCY);
-    READ_THROUGH_RECOVERY_BUDGET.saturating_mul(u32::try_from(batches).unwrap_or(u32::MAX))
+    READ_THROUGH_RECOVERY_BUDGET
+        .saturating_mul(u32::try_from(batches).unwrap_or(u32::MAX))
+        .min(FULL_OBJECT_RECOVERY_BUDGET_MAX)
 }
 
 #[derive(Debug)]
@@ -170,7 +173,7 @@ pub(crate) async fn scrubber(state: &ServerState) -> Result<storage::DataScrubbe
         .with_retained_content(retained))
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ChunkRecoveryResult {
     pub recovered: usize,
     pub remaining: Vec<String>,
@@ -189,6 +192,27 @@ enum ExistingChunkCheck {
     /// Completion identified a corrupt chunk; replace it from a verified peer
     /// even when the local file still has the expected size.
     Replace,
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryErrorPolicy {
+    /// Durable repair should retain every chunk it can while the task's
+    /// transfer budget remains. Its persisted task makes partial progress
+    /// reusable by a later pass.
+    CollectAll,
+    /// A foreground read cannot complete after any requested chunk fails.
+    /// Dropping the buffered stream also cancels the other in-flight probes,
+    /// preventing one unavailable object from occupying peer capacity for
+    /// every remaining chunk.
+    StopAfterFirst,
+}
+
+struct ChunkRecoveryOptions<'a> {
+    preferred: Option<&'a NodeDescriptor>,
+    cache: bool,
+    existing_chunk_check: ExistingChunkCheck,
+    recovered_progress: Option<Arc<AtomicUsize>>,
+    error_policy: RecoveryErrorPolicy,
 }
 
 pub(crate) async fn source_nodes(
@@ -402,10 +426,13 @@ pub(crate) async fn recover_chunks(
         state,
         subject,
         chunks,
-        preferred,
-        cache,
-        ExistingChunkCheck::VerifyContent,
-        None,
+        ChunkRecoveryOptions {
+            preferred,
+            cache,
+            existing_chunk_check: ExistingChunkCheck::VerifyContent,
+            recovered_progress: None,
+            error_policy: RecoveryErrorPolicy::CollectAll,
+        },
     )
     .await
 }
@@ -414,20 +441,23 @@ async fn recover_chunks_with_progress(
     state: &ServerState,
     subject: &str,
     chunks: &[ReplicationChunkInfo],
-    preferred: Option<&NodeDescriptor>,
-    cache: bool,
-    existing_chunk_check: ExistingChunkCheck,
-    recovered_progress: Option<Arc<AtomicUsize>>,
+    options: ChunkRecoveryOptions<'_>,
 ) -> ChunkRecoveryResult {
-    let sources = Arc::new(source_nodes(state, subject, preferred).await);
+    let sources = Arc::new(source_nodes(state, subject, options.preferred).await);
     let unique: BTreeMap<_, _> = chunks.iter().map(|c| (c.hash.clone(), c.clone())).collect();
     let mut work = stream::iter(unique.into_values().map(|chunk| {
         let state = state.clone();
         let sources = sources.clone();
-        let recovered_progress = recovered_progress.clone();
+        let recovered_progress = options.recovered_progress.clone();
         async move {
-            let outcome =
-                recover_chunk(&state, &chunk, &sources, cache, existing_chunk_check).await;
+            let outcome = recover_chunk(
+                &state,
+                &chunk,
+                &sources,
+                options.cache,
+                options.existing_chunk_check,
+            )
+            .await;
             if matches!(&outcome, Ok(true))
                 && let Some(recovered_progress) = recovered_progress
             {
@@ -448,6 +478,9 @@ async fn recover_chunks_with_progress(
                 if result.errors.len() < MAX_RECOVERY_ERRORS {
                     result.errors.push(format!("{error:#}"));
                 }
+                if matches!(options.error_policy, RecoveryErrorPolicy::StopAfterFirst) {
+                    break;
+                }
             }
         }
     }
@@ -463,11 +496,23 @@ pub(crate) async fn recover_chunks_for_read(
     // Bound the entire foreground operation, not just each peer request. A
     // larger cluster or missing range must not multiply request latency without
     // limit. Cancellation keeps already verified cache bytes reusable on retry.
-    Ok(
-        tokio::time::timeout(budget, recover_chunks(state, subject, chunks, None, true))
-            .await
-            .map_err(|_| ReadThroughRecoveryBudgetExceeded { budget })?,
+    Ok(tokio::time::timeout(
+        budget,
+        recover_chunks_with_progress(
+            state,
+            subject,
+            chunks,
+            ChunkRecoveryOptions {
+                preferred: None,
+                cache: true,
+                existing_chunk_check: ExistingChunkCheck::VerifyContent,
+                recovered_progress: None,
+                error_policy: RecoveryErrorPolicy::StopAfterFirst,
+            },
+        ),
     )
+    .await
+    .map_err(|_| ReadThroughRecoveryBudgetExceeded { budget })?)
 }
 
 pub(crate) async fn recover_manifest(
@@ -590,10 +635,13 @@ async fn recover_task_with_transfer_budget(
             state,
             &subject,
             &invalid_chunks,
-            None,
-            !task.repair_chunks,
-            ExistingChunkCheck::Replace,
-            Some(recovered_progress),
+            ChunkRecoveryOptions {
+                preferred: None,
+                cache: !task.repair_chunks,
+                existing_chunk_check: ExistingChunkCheck::Replace,
+                recovered_progress: Some(recovered_progress),
+                error_policy: RecoveryErrorPolicy::CollectAll,
+            },
         )
         .await)
     })
@@ -668,10 +716,13 @@ async fn recover_task_initial_transfer(
         state,
         &subject,
         &task.chunks,
-        None,
-        !task.repair_chunks,
-        ExistingChunkCheck::MatchMetadata,
-        Some(recovered_progress.clone()),
+        ChunkRecoveryOptions {
+            preferred: None,
+            cache: !task.repair_chunks,
+            existing_chunk_check: ExistingChunkCheck::MatchMetadata,
+            recovered_progress: Some(recovered_progress.clone()),
+            error_policy: RecoveryErrorPolicy::CollectAll,
+        },
     )
     .await;
     if !result.remaining.is_empty() {

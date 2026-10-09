@@ -961,9 +961,67 @@ run_on_main_metadata_backends!(
     recovery_read_budget_bounds_slow_unadvertised_peers_turso
 );
 
+async fn foreground_recovery_stops_after_first_unavailable_chunk_impl(backend: MainTestBackend) {
+    let target = build_test_state(1, false, backend).await;
+    let source = build_test_state(1, false, backend).await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed_requests = requests.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/cluster/v2/replication/chunk/{hash}",
+        axum::routing::get(move || {
+            observed_requests.fetch_add(1, Ordering::SeqCst);
+            async { StatusCode::NOT_FOUND }
+        }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    register_online_source_node(&target, &source, &url).await;
+    let chunks = (0..32)
+        .map(|index| {
+            let bytes = format!("unavailable chunk {index}");
+            crate::storage::ReplicationChunkInfo {
+                hash: blake3::hash(bytes.as_bytes()).to_hex().to_string(),
+                size_bytes: bytes.len(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let result = crate::content_recovery::recover_chunks_for_read(
+        &target,
+        "unavailable-large-object.bin",
+        &chunks,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.remaining.len(), 1, "{result:?}");
+    assert_eq!(result.errors.len(), 1, "{result:?}");
+    assert!(requests.load(Ordering::SeqCst) > 0);
+    assert!(
+        requests.load(Ordering::SeqCst) <= 4,
+        "foreground recovery must cancel the remaining chunk probes after the first failure"
+    );
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    foreground_recovery_stops_after_first_unavailable_chunk_impl,
+    foreground_recovery_stops_after_first_unavailable_chunk,
+    foreground_recovery_stops_after_first_unavailable_chunk_turso
+);
+
 #[test]
 fn full_object_recovery_budget_scales_with_parallel_chunk_batches() {
-    use crate::content_recovery::{READ_THROUGH_RECOVERY_BUDGET, full_object_recovery_budget};
+    use crate::content_recovery::{
+        FULL_OBJECT_RECOVERY_BUDGET_MAX, READ_THROUGH_RECOVERY_BUDGET, full_object_recovery_budget,
+    };
 
     assert_eq!(full_object_recovery_budget(0), READ_THROUGH_RECOVERY_BUDGET);
     assert_eq!(full_object_recovery_budget(1), READ_THROUGH_RECOVERY_BUDGET);
@@ -974,7 +1032,12 @@ fn full_object_recovery_budget_scales_with_parallel_chunk_batches() {
     );
     assert_eq!(
         full_object_recovery_budget(40),
-        READ_THROUGH_RECOVERY_BUDGET.saturating_mul(10)
+        FULL_OBJECT_RECOVERY_BUDGET_MAX
+    );
+    assert_eq!(
+        full_object_recovery_budget(usize::MAX),
+        FULL_OBJECT_RECOVERY_BUDGET_MAX,
+        "even pathological manifests must retain a bounded foreground deadline"
     );
 }
 
@@ -987,8 +1050,8 @@ fn object_read_recovery_budget_scales_only_full_object_reads() {
     );
     assert_eq!(
         crate::object_read_recovery_budget(false, 40),
-        crate::content_recovery::READ_THROUGH_RECOVERY_BUDGET.saturating_mul(10),
-        "a whole-object read must have enough budget for every parallel chunk batch"
+        crate::content_recovery::FULL_OBJECT_RECOVERY_BUDGET_MAX,
+        "a whole-object read may scale for useful progress but must remain bounded"
     );
 }
 
