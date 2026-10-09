@@ -40,8 +40,9 @@ impl ContentRepairTask {
         if made_progress {
             // A bounded repair pass can make durable progress before it runs
             // out of time or sources. Start its next pass at the base interval
-            // instead of exponentially delaying an actively recovering object.
-            self.attempts = 0;
+            // instead of exponentially delaying an actively recovering object,
+            // but retain the failure history so recurring verification errors
+            // cannot turn into an unbounded full-object retry loop.
             self.next_attempt_unix = now.saturating_add(base_delay.max(1));
             self.last_error = Some(error);
             return;
@@ -159,6 +160,15 @@ impl PersistentStore {
         self.metadata_store.content_repair_task_hashes().await
     }
 
+    pub(crate) async fn filter_locally_owned_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<HashSet<String>> {
+        self.metadata_store
+            .filter_locally_owned_manifests(manifest_hashes)
+            .await
+    }
+
     pub(crate) async fn due_content_repair_task_hashes(
         &self,
         now_unix: u64,
@@ -259,8 +269,8 @@ impl PersistentStore {
 
     /// Confirms a retained manifest and all of its chunks are present with the
     /// cheap metadata contract used by availability and ordinary replication.
-    #[cfg(test)]
     pub(crate) async fn manifest_is_fully_local(&self, hash: &str) -> Result<bool> {
+        let _guard = self.content_gc_gate.read().await;
         manifest_is_fully_local(&self.storage_pool, hash).await
     }
 
@@ -375,7 +385,7 @@ mod tests {
 
         task.defer("remaining chunk unavailable".to_string(), 100, 30, true);
 
-        assert_eq!(task.attempts, 0);
+        assert_eq!(task.attempts, 6);
         assert_eq!(task.next_attempt_unix, 130);
         assert_eq!(
             task.last_error.as_deref(),

@@ -445,6 +445,7 @@ struct ServerMaintenanceRuntime {
     local_availability_refresh_notify: Arc<Notify>,
     local_availability_generation: Arc<AtomicU64>,
     local_availability_cache: Arc<Mutex<Option<LocalAvailabilityCache>>>,
+    retained_audit_cursor: Arc<Mutex<Option<String>>>,
 }
 
 /// Serializes repair activity for one immutable manifest without allowing a
@@ -7762,6 +7763,7 @@ async fn run_inner(
             local_availability_refresh_notify: Arc::new(Notify::new()),
             local_availability_generation: Arc::new(AtomicU64::new(0)),
             local_availability_cache: Arc::new(Mutex::new(None)),
+            retained_audit_cursor: Arc::new(Mutex::new(None)),
         },
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,

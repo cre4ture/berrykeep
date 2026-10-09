@@ -15,6 +15,9 @@ const DURABLE_CONTENT_REPAIR_BUDGET: Duration = Duration::from_secs(2 * 60);
 /// its own recovery deadline, so this also bounds one persisted run and keeps
 /// notifications from being delayed behind a history-sized batch.
 const BACKGROUND_REPAIR_PASS_MAX_TRANSFERS: usize = 1;
+/// Bounds expensive owned-replica checks during one periodic retained-history
+/// audit. The cursor below rotates this budget across the whole history.
+pub(crate) const RETAINED_AUDIT_PRESENCE_CHECK_BATCH_SIZE: usize = 64;
 const MAX_RECOVERY_ERRORS: usize = 16;
 
 #[derive(Debug)]
@@ -495,6 +498,9 @@ fn empty_report() -> replication::ReplicationRepairReport {
         skipped_details: Vec::new(),
         detailed_log: Vec::new(),
         last_error: None,
+        had_chunk_progress: false,
+        waiting_for_source: false,
+        unresolved: false,
     }
 }
 
@@ -506,6 +512,7 @@ fn log_outcome(
     detail: String,
     context: serde_json::Value,
 ) {
+    report.record_status_event(event, &context);
     replication::push_repair_log_entry(
         &mut report.detailed_log,
         state.node_id,
@@ -841,61 +848,83 @@ pub(crate) async fn audit_assigned_from_retained(
         .into_iter()
         .collect::<HashSet<_>>();
     let pending = pending.into_iter().collect::<HashSet<_>>();
-    let mut enqueued = false;
-    for (hash, references) in &retained.manifests {
-        if hash == storage::TOMBSTONE_MANIFEST_HASH
-            || !required.contains(hash)
-            || pending.contains(hash)
-            || references.keys().any(|subject| available.contains(subject))
-        {
-            continue;
+    let cursor = state.maintenance.retained_audit_cursor.lock().await.clone();
+    let mut candidates = Vec::<(String, RetainedReference)>::new();
+    let pass_count = usize::from(cursor.is_some()) + 1;
+    'candidate_scan: for pass in 0..pass_count {
+        for (hash, references) in &retained.manifests {
+            let in_this_pass = match (&cursor, pass) {
+                (Some(cursor), 0) => hash > cursor,
+                (Some(cursor), _) => hash <= cursor,
+                (None, _) => true,
+            };
+            if !in_this_pass
+                || hash == storage::TOMBSTONE_MANIFEST_HASH
+                || !required.contains(hash)
+                || pending.contains(hash)
+                || references.keys().any(|subject| available.contains(subject))
+            {
+                continue;
+            }
+            let Some(reference) = references
+                .values()
+                .find(|reference| reference.version_id.is_some() || reference.snapshot_only)
+                .or_else(|| references.values().next())
+                .cloned()
+            else {
+                continue;
+            };
+            candidates.push((hash.clone(), reference));
+            if candidates.len() == RETAINED_AUDIT_PRESENCE_CHECK_BATCH_SIZE {
+                break 'candidate_scan;
+            }
         }
-        let Some(_claim) = state.maintenance.content_repair_claims.try_claim(hash) else {
+    }
+    if let Some((last_hash, _)) = candidates.last() {
+        *state.maintenance.retained_audit_cursor.lock().await = Some(last_hash.clone());
+    }
+
+    // The durable-task hashes were read above and manifest claims serialize
+    // local enqueue paths, so a single batched ownership lookup is sufficient
+    // here. Avoid per-manifest task and ownership queries on deep history.
+    let candidate_hashes = candidates
+        .iter()
+        .map(|(hash, _)| hash.clone())
+        .collect::<Vec<_>>();
+    let store = read_store(state, "content_recovery.audit_candidates").await;
+    let locally_owned = store
+        .filter_locally_owned_manifests(&candidate_hashes)
+        .await?;
+    let mut enqueued = false;
+    for (hash, reference) in candidates {
+        let Some(_claim) = state.maintenance.content_repair_claims.try_claim(&hash) else {
             // A repair already owns this manifest. Leave it to finish rather
             // than letting one slow source hold up the rest of this audit.
             continue;
         };
-        if !read_store(state, "content_recovery.audit_claimed_task")
-            .await
-            .content_repair_tasks_for_manifests(std::slice::from_ref(hash))
-            .await?
-            .is_empty()
-        {
-            continue;
-        }
         // Availability can be empty during first-start convergence (or stale
         // after an out-of-band change). Do not turn a healthy owned replica
         // into pending repair work solely because that distributed view has
         // not caught up yet; a cache-only copy still needs ownership promotion.
-        match read_store(state, "content_recovery.audit_local_replica")
-            .await
-            .check_owned_replica_presence(hash)
-            .await
-        {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(error) => {
-                warn!(
-                    manifest_hash = %hash,
-                    error = %error,
-                    "skipping retained-content repair enqueue after local presence check failed"
-                );
-                continue;
+        if locally_owned.contains(&hash) {
+            match store.manifest_is_fully_local(&hash).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        manifest_hash = %hash,
+                        error = %error,
+                        "skipping retained-content repair enqueue after local presence check failed"
+                    );
+                    continue;
+                }
             }
         }
-        if let Some(reference) = references
-            .values()
-            .find(|reference| reference.version_id.is_some() || reference.snapshot_only)
-            .or_else(|| references.values().next())
-            .cloned()
-        {
-            let mut task = ContentRepairTask::new(reference, true);
-            read_store(state, "content_recovery.audit_enqueue")
-                .await
-                .prepare_and_persist_content_repair_task(&mut task)
-                .await?;
-            enqueued = true;
-        }
+        let mut task = ContentRepairTask::new(reference, true);
+        store
+            .prepare_and_persist_content_repair_task(&mut task)
+            .await?;
+        enqueued = true;
     }
     if enqueued {
         invalidate_local_availability_cache(state);

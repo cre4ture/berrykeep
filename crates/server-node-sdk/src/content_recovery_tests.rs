@@ -1568,6 +1568,71 @@ run_on_main_metadata_backends!(
     recovery_audit_rechecks_complete_retained_history_presence_turso
 );
 
+async fn recovery_audit_bounds_and_rotates_retained_history_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    for index in 0..=crate::content_recovery::RETAINED_AUDIT_PRESENCE_CHECK_BATCH_SIZE {
+        let key = format!("bounded-audit-{index}.bin");
+        let version = format!("ver-bounded-audit-{index}");
+        seed_subject_version(
+            &source,
+            &key,
+            &version,
+            format!("bounded audit bytes {index}").into_bytes(),
+            vec![],
+        )
+        .await;
+        let metadata = read_store(&source, "test.recovery.bounded_audit_metadata")
+            .await
+            .export_metadata_bundle(&key, None, ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .unwrap();
+        lock_store(&target, "test.recovery.bounded_audit_import")
+            .await
+            .import_metadata_bundle(&metadata)
+            .await
+            .unwrap();
+    }
+
+    crate::content_recovery::audit_assigned(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_store(&target, "test.recovery.bounded_audit_first_pass")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .len(),
+        crate::content_recovery::RETAINED_AUDIT_PRESENCE_CHECK_BATCH_SIZE,
+        "one audit pass must not inspect and enqueue an unbounded retained history"
+    );
+
+    crate::content_recovery::audit_assigned(&target)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_store(&target, "test.recovery.bounded_audit_second_pass")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .len(),
+        crate::content_recovery::RETAINED_AUDIT_PRESENCE_CHECK_BATCH_SIZE + 1,
+        "the next audit pass must rotate to retained manifests beyond its first batch"
+    );
+
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_audit_bounds_and_rotates_retained_history_impl,
+    recovery_audit_bounds_and_rotates_retained_history,
+    recovery_audit_bounds_and_rotates_retained_history_turso
+);
+
 async fn recovery_audit_claims_complete_cached_assigned_content_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let target = build_test_state(1, false, backend).await;

@@ -19,36 +19,38 @@ pub(crate) struct ReplicationRepairReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) detailed_log: Vec<ReplicationRepairLogEntry>,
     pub(crate) last_error: Option<String>,
+    #[serde(skip)]
+    pub(crate) had_chunk_progress: bool,
+    #[serde(skip)]
+    pub(crate) waiting_for_source: bool,
+    #[serde(skip)]
+    pub(crate) unresolved: bool,
 }
 
 impl ReplicationRepairReport {
+    pub(crate) fn record_status_event(&mut self, event: &str, context: &serde_json::Value) {
+        self.had_chunk_progress |= context
+            .get("chunks_recovered")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0);
+        match event {
+            "repair_waiting" => self.waiting_for_source = true,
+            "repair_unresolved" => self.unresolved = true,
+            _ => {}
+        }
+    }
+
     pub(crate) fn run_status(&self) -> RepairRunStatus {
-        let chunk_progress = self.detailed_log.iter().any(|entry| {
-            entry
-                .context
-                .as_ref()
-                .and_then(|c| c.get("chunks_recovered"))
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|n| n > 0)
-        });
-        let waiting_for_source = self
-            .detailed_log
-            .iter()
-            .any(|entry| entry.event == "repair_waiting");
-        let unresolved = self
-            .detailed_log
-            .iter()
-            .any(|entry| entry.event == "repair_unresolved");
         let deferred_transfer = self.skipped_backoff > 0 || self.skipped_max_retries > 0;
 
         if self.failed_transfers > 0 {
-            if self.successful_transfers > 0 || chunk_progress {
+            if self.successful_transfers > 0 || self.had_chunk_progress {
                 return RepairRunStatus::PartiallyRepaired;
             }
-            if unresolved {
+            if self.unresolved {
                 return RepairRunStatus::Unresolved;
             }
-            if waiting_for_source {
+            if self.waiting_for_source {
                 return RepairRunStatus::WaitingForSource;
             }
             return RepairRunStatus::Unresolved;
@@ -60,10 +62,10 @@ impl ReplicationRepairReport {
         // for retry backoff or exhausted retries remains unfinished here.
         // Content recovery records its durable pending state explicitly through
         // its own events.
-        if unresolved {
+        if self.unresolved {
             return RepairRunStatus::Unresolved;
         }
-        if waiting_for_source {
+        if self.waiting_for_source {
             return RepairRunStatus::WaitingForSource;
         }
         if deferred_transfer {
@@ -1446,6 +1448,9 @@ pub(crate) async fn execute_replication_repair_plan(
         skipped_details,
         detailed_log,
         last_error,
+        had_chunk_progress: false,
+        waiting_for_source: false,
+        unresolved: false,
     }
 }
 
@@ -1473,6 +1478,9 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         skipped_details: Vec::new(),
         detailed_log: Vec::new(),
         last_error: None,
+        had_chunk_progress: false,
+        waiting_for_source: false,
+        unresolved: false,
     };
     let mut failed_nodes = 0usize;
     let repair_run_id = run_id.unwrap_or("untracked");
@@ -1783,6 +1791,9 @@ fn accumulate_repair_report(
     totals.skipped_max_retries = totals
         .skipped_max_retries
         .saturating_add(report.skipped_max_retries);
+    totals.had_chunk_progress |= report.had_chunk_progress;
+    totals.waiting_for_source |= report.waiting_for_source;
+    totals.unresolved |= report.unresolved;
     let skipped_detail_capacity =
         MAX_REPAIR_REPORT_SKIPPED_DETAILS.saturating_sub(totals.skipped_details.len());
     totals.skipped_details.extend(
@@ -2388,6 +2399,9 @@ mod tests {
             skipped_details: Vec::new(),
             detailed_log: Vec::new(),
             last_error: None,
+            had_chunk_progress: false,
+            waiting_for_source: false,
+            unresolved: false,
         }
     }
 
@@ -2496,48 +2510,58 @@ mod tests {
 
     #[test]
     fn repair_status_does_not_mask_an_unresolved_task_with_another_waiting_task() {
-        let node_id = NodeId::new_v4();
         for failed_transfers in [0, 1] {
             let mut report = empty_report();
             report.failed_transfers = failed_transfers;
-            for event in ["repair_waiting", "repair_unresolved"] {
-                push_repair_log_entry(
-                    &mut report.detailed_log,
-                    node_id,
-                    event,
-                    event.to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-            }
+            report.waiting_for_source = true;
+            report.unresolved = true;
             assert_eq!(report.run_status(), RepairRunStatus::Unresolved);
         }
     }
 
     #[test]
-    fn repair_status_uses_this_attempt_progress_not_durable_total() {
+    fn repair_status_keeps_unresolved_state_after_log_capacity_is_reached() {
         let node_id = NodeId::new_v4();
         let mut report = empty_report();
         report.failed_transfers = 1;
+        for _ in 0..MAX_REPAIR_REPORT_LOG_ENTRIES {
+            push_repair_log_entry(
+                &mut report.detailed_log,
+                node_id,
+                "diagnostic",
+                "fills the bounded log",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        report.record_status_event("repair_waiting", &serde_json::json!({}));
+        report.record_status_event("repair_unresolved", &serde_json::json!({}));
         push_repair_log_entry(
             &mut report.detailed_log,
             node_id,
-            "repair_waiting",
-            "source still unavailable".to_string(),
+            "repair_unresolved",
+            "this diagnostic entry is intentionally dropped",
             None,
             None,
             None,
             None,
             None,
-            Some(serde_json::json!({
-                "chunks_recovered": 0,
-                "total_chunks_recovered": 3,
-            })),
+            None,
         );
+
+        assert_eq!(report.detailed_log.len(), MAX_REPAIR_REPORT_LOG_ENTRIES);
+        assert_eq!(report.run_status(), RepairRunStatus::Unresolved);
+    }
+
+    #[test]
+    fn repair_status_uses_this_attempt_progress_not_durable_total() {
+        let mut report = empty_report();
+        report.failed_transfers = 1;
+        report.waiting_for_source = true;
 
         assert_eq!(report.run_status(), RepairRunStatus::WaitingForSource);
     }
@@ -2647,6 +2671,9 @@ mod tests {
                 })
                 .collect(),
             last_error: Some("boom".to_string()),
+            had_chunk_progress: true,
+            waiting_for_source: true,
+            unresolved: true,
         };
 
         let mut totals = empty_report();
@@ -2665,5 +2692,8 @@ mod tests {
         );
         assert_eq!(totals.detailed_log.len(), MAX_REPAIR_REPORT_LOG_ENTRIES);
         assert_eq!(totals.last_error.as_deref(), Some("boom"));
+        assert!(totals.had_chunk_progress);
+        assert!(totals.waiting_for_source);
+        assert!(totals.unresolved);
     }
 }
