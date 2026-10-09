@@ -280,21 +280,21 @@ impl PersistentStore {
         Ok(())
     }
 
-    pub(crate) async fn check_owned_replica_presence(&self, hash: &str) -> Result<()> {
+    /// Returns whether this is a healthy owned replica. Operational failures
+    /// remain errors so callers do not mistake a transient store failure for
+    /// missing content and schedule destructive-looking repair work.
+    pub(crate) async fn check_owned_replica_presence(&self, hash: &str) -> Result<bool> {
         if hash == TOMBSTONE_MANIFEST_HASH {
-            return Ok(());
+            return Ok(true);
         }
         let _guard = self.content_gc_gate.read().await;
         if !self.manifest_is_owned(hash).await? {
-            bail!("manifest is not an owned replica: {hash}");
+            return Ok(false);
         }
         if self.metadata_store.content_repair_pending(hash).await? {
-            bail!("manifest has pending integrity findings: {hash}");
+            return Ok(false);
         }
-        if !manifest_is_fully_local(&self.storage_pool, hash).await? {
-            bail!("owned replica content is incomplete: {hash}");
-        }
-        Ok(())
+        manifest_is_fully_local(&self.storage_pool, hash).await
     }
 
     pub(crate) async fn finish_content_repair(&self, task: &ContentRepairTask) -> Result<()> {

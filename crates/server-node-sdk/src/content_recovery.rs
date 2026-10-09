@@ -856,8 +856,21 @@ pub(crate) async fn audit_assigned_from_retained(
         // after an out-of-band change). Do not turn a healthy owned replica
         // into pending repair work solely because that distributed view has
         // not caught up yet; a cache-only copy still needs ownership promotion.
-        if cached_owned_replica_presence(state, hash).await {
-            continue;
+        match read_store(state, "content_recovery.audit_local_replica")
+            .await
+            .check_owned_replica_presence(hash)
+            .await
+        {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    manifest_hash = %hash,
+                    error = %error,
+                    "skipping retained-content repair enqueue after local presence check failed"
+                );
+                continue;
+            }
         }
         if let Some(reference) = references
             .values()
@@ -880,83 +893,6 @@ pub(crate) async fn audit_assigned_from_retained(
     Ok(())
 }
 
-/// Avoid rescanning every chunk of healthy retained history on each auditor
-/// tick. A repair claim serializes concurrent checks for the same manifest;
-/// only complete owned replicas enter this cache, so repairs are never hidden
-/// behind a stale negative result.
-async fn cached_owned_replica_presence(state: &ServerState, hash: &str) -> bool {
-    let generation = state
-        .maintenance
-        .local_availability_generation
-        .load(Ordering::SeqCst);
-    if state
-        .maintenance
-        .local_owned_manifest_presence_cache
-        .lock()
-        .await
-        .as_ref()
-        .is_some_and(|cache| cache.is_valid_for(generation) && cache.manifest_hashes.contains(hash))
-    {
-        return true;
-    }
-
-    if read_store(state, "content_recovery.audit_local_replica")
-        .await
-        .check_owned_replica_presence(hash)
-        .await
-        .is_err()
-    {
-        return false;
-    }
-
-    let mut cache = state
-        .maintenance
-        .local_owned_manifest_presence_cache
-        .lock()
-        .await;
-    let current_generation = state
-        .maintenance
-        .local_availability_generation
-        .load(Ordering::SeqCst);
-    cache_owned_replica_presence_if_generation_matches(
-        &mut cache,
-        generation,
-        current_generation,
-        hash,
-    );
-    true
-}
-
-/// Caches a successful replica check only when it reflects the current local
-/// availability generation. A namespace change during the check leaves the
-/// cache invalidated so the next audit performs a fresh scan.
-fn cache_owned_replica_presence_if_generation_matches(
-    cache: &mut Option<LocalOwnedManifestPresenceCache>,
-    checked_generation: u64,
-    current_generation: u64,
-    hash: &str,
-) {
-    if checked_generation != current_generation {
-        return;
-    }
-
-    if !cache
-        .as_ref()
-        .is_some_and(|cache| cache.is_valid_for(current_generation))
-    {
-        *cache = Some(LocalOwnedManifestPresenceCache {
-            generation: current_generation,
-            computed_at: Instant::now(),
-            manifest_hashes: HashSet::new(),
-        });
-    }
-    cache
-        .as_mut()
-        .expect("owned manifest presence cache was initialized")
-        .manifest_hashes
-        .insert(hash.to_string());
-}
-
 pub(crate) async fn get_manifest(
     State(state): State<ServerState>,
     Path(hash): Path<String>,
@@ -966,38 +902,5 @@ pub(crate) async fn get_manifest(
         Ok(Some(bytes)) => (StatusCode::OK, bytes).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::BAD_REQUEST.into_response(),
-    }
-}
-
-#[cfg(test)]
-mod cache_tests {
-    use super::*;
-
-    #[test]
-    fn owned_replica_presence_scan_does_not_repopulate_changed_generation() {
-        let mut cache = None;
-
-        cache_owned_replica_presence_if_generation_matches(
-            &mut cache,
-            41,
-            42,
-            "manifest-checked-before-namespace-change",
-        );
-
-        assert!(
-            cache.is_none(),
-            "a scan from an earlier availability generation must not populate the new cache"
-        );
-    }
-
-    #[test]
-    fn owned_replica_presence_scan_populates_matching_generation() {
-        let mut cache = None;
-
-        cache_owned_replica_presence_if_generation_matches(&mut cache, 42, 42, "manifest-current");
-
-        assert!(cache.is_some_and(|cache| {
-            cache.is_valid_for(42) && cache.manifest_hashes.contains("manifest-current")
-        }));
     }
 }

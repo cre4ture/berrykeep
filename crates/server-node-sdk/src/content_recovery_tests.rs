@@ -251,21 +251,19 @@ run_on_main_metadata_backends!(
     local_availability_refresh_keeps_its_fresh_cache_turso
 );
 
-async fn remote_availability_sync_keeps_local_presence_cache_impl(backend: MainTestBackend) {
+async fn remote_availability_sync_keeps_local_availability_cache_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let target = build_test_state(1, false, backend).await;
-    let target_key = choose_locally_placed_key(&target, "remote-sync-presence-cache").await;
+    let target_key = choose_locally_placed_key(&target, "remote-sync-local-cache").await;
     seed_subject_version(
         &target,
         &target_key,
         "v1",
-        b"local presence cache bytes".to_vec(),
+        b"local availability cache bytes".to_vec(),
         vec![],
     )
     .await;
-    crate::content_recovery::audit_assigned(&target)
-        .await
-        .unwrap();
+    crate::refresh_local_availability_view_once(&target).await;
     let generation = target
         .maintenance
         .local_availability_generation
@@ -273,12 +271,12 @@ async fn remote_availability_sync_keeps_local_presence_cache_impl(backend: MainT
     assert!(
         target
             .maintenance
-            .local_owned_manifest_presence_cache
+            .local_availability_cache
             .lock()
             .await
             .as_ref()
             .is_some_and(|cache| cache.is_valid_for(generation)),
-        "the local audit must have populated a valid owned-presence cache"
+        "the local refresh must populate a valid availability cache"
     );
 
     let source_key = choose_locally_placed_key(&source, "remote-availability-subject").await;
@@ -307,12 +305,12 @@ async fn remote_availability_sync_keeps_local_presence_cache_impl(backend: MainT
     assert!(
         target
             .maintenance
-            .local_owned_manifest_presence_cache
+            .local_availability_cache
             .lock()
             .await
             .as_ref()
             .is_some_and(|cache| cache.is_valid_for(generation)),
-        "a remote peer sync must retain the target's positive local presence cache"
+        "a remote peer sync must retain the target's local availability cache"
     );
     assert!(
         target
@@ -332,9 +330,9 @@ async fn remote_availability_sync_keeps_local_presence_cache_impl(backend: MainT
 }
 
 run_on_main_metadata_backends!(
-    remote_availability_sync_keeps_local_presence_cache_impl,
-    remote_availability_sync_keeps_local_presence_cache,
-    remote_availability_sync_keeps_local_presence_cache_turso
+    remote_availability_sync_keeps_local_availability_cache_impl,
+    remote_availability_sync_keeps_local_availability_cache,
+    remote_availability_sync_keeps_local_availability_cache_turso
 );
 
 async fn planning_subjects_deduplicate_retained_history_by_placement_impl(
@@ -1113,7 +1111,7 @@ run_on_main_metadata_backends!(
     recovery_audit_skips_complete_local_content_with_empty_availability_turso
 );
 
-async fn recovery_audit_caches_complete_retained_history_presence_impl(backend: MainTestBackend) {
+async fn recovery_audit_rechecks_complete_retained_history_presence_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let key = choose_locally_placed_key(&state, "cached-retained-history").await;
     seed_subject_version(&state, &key, "v1", b"older retained bytes".to_vec(), vec![]).await;
@@ -1130,69 +1128,39 @@ async fn recovery_audit_caches_complete_retained_history_presence_impl(backend: 
     crate::content_recovery::audit_assigned(&state)
         .await
         .unwrap();
-    let generation = state
-        .maintenance
-        .local_availability_generation
-        .load(std::sync::atomic::Ordering::SeqCst);
     assert!(
-        state
-            .maintenance
-            .local_owned_manifest_presence_cache
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|cache| {
-                cache.is_valid_for(generation)
-                    && cache.manifest_hashes.contains(&old.manifest_hash)
-                    && cache.manifest_hashes.len() >= 2
-            }),
-        "the first audit must retain positive checks for both current and historical manifests"
-    );
-
-    // A second audit must use the positive cache instead of statting every
-    // historical chunk again. Model out-of-band loss after that first pass.
-    remove_chunks(&state, &old, &[0]).await;
-    crate::content_recovery::audit_assigned(&state)
-        .await
-        .unwrap();
-    assert!(
-        read_store(&state, "test.recovery.cached_history_before_ttl")
+        read_store(&state, "test.recovery.complete_history")
             .await
             .content_repair_tasks()
             .await
             .unwrap()
             .is_empty(),
-        "a valid positive presence cache must avoid another history-wide content scan"
+        "complete current and historical replicas must not be queued for repair"
     );
 
-    state
-        .maintenance
-        .local_owned_manifest_presence_cache
-        .lock()
-        .await
-        .as_mut()
-        .unwrap()
-        .computed_at = std::time::Instant::now() - crate::LOCAL_AVAILABILITY_CACHE_TTL;
+    // Model out-of-band loss after the first audit. Retained history is
+    // rechecked on every audit, rather than hidden behind a short-lived cache.
+    remove_chunks(&state, &old, &[0]).await;
     crate::content_recovery::audit_assigned(&state)
         .await
         .unwrap();
     assert!(
-        read_store(&state, "test.recovery.cached_history_after_ttl")
+        read_store(&state, "test.recovery.rechecked_history")
             .await
             .content_repair_tasks()
             .await
             .unwrap()
             .iter()
             .any(|task| task.reference.manifest_hash == old.manifest_hash),
-        "the bounded TTL must eventually detect out-of-band loss and queue repair"
+        "the next audit must detect out-of-band loss in retained history and queue repair"
     );
     cleanup_test_state(&state).await;
 }
 
 run_on_main_metadata_backends!(
-    recovery_audit_caches_complete_retained_history_presence_impl,
-    recovery_audit_caches_complete_retained_history_presence,
-    recovery_audit_caches_complete_retained_history_presence_turso
+    recovery_audit_rechecks_complete_retained_history_presence_impl,
+    recovery_audit_rechecks_complete_retained_history_presence,
+    recovery_audit_rechecks_complete_retained_history_presence_turso
 );
 
 async fn recovery_audit_claims_complete_cached_assigned_content_impl(backend: MainTestBackend) {

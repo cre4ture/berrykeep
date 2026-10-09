@@ -445,7 +445,6 @@ struct ServerMaintenanceRuntime {
     local_availability_refresh_notify: Arc<Notify>,
     local_availability_generation: Arc<AtomicU64>,
     local_availability_cache: Arc<Mutex<Option<LocalAvailabilityCache>>>,
-    local_owned_manifest_presence_cache: Arc<Mutex<Option<LocalOwnedManifestPresenceCache>>>,
 }
 
 /// Serializes repair activity for one immutable manifest without allowing a
@@ -498,24 +497,6 @@ struct LocalAvailabilityCache {
 }
 
 impl LocalAvailabilityCache {
-    fn is_valid_for(&self, generation: u64) -> bool {
-        self.generation == generation && self.computed_at.elapsed() < LOCAL_AVAILABILITY_CACHE_TTL
-    }
-}
-
-/// Positive owned-replica checks for retained history. The cache intentionally
-/// records no negative results: a repair can make a previously incomplete
-/// manifest healthy at any time. Positive entries share the local availability
-/// generation and TTL, so namespace changes are immediate while out-of-band
-/// storage loss is observed by the next bounded refresh.
-#[derive(Clone)]
-struct LocalOwnedManifestPresenceCache {
-    generation: u64,
-    computed_at: Instant,
-    manifest_hashes: HashSet<String>,
-}
-
-impl LocalOwnedManifestPresenceCache {
     fn is_valid_for(&self, generation: u64) -> bool {
         self.generation == generation && self.computed_at.elapsed() < LOCAL_AVAILABILITY_CACHE_TTL
     }
@@ -7758,7 +7739,6 @@ async fn run_inner(
             local_availability_refresh_notify: Arc::new(Notify::new()),
             local_availability_generation: Arc::new(AtomicU64::new(0)),
             local_availability_cache: Arc::new(Mutex::new(None)),
-            local_owned_manifest_presence_cache: Arc::new(Mutex::new(None)),
         },
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,
@@ -11813,20 +11793,22 @@ async fn run_replication_audit_once(state: &ServerState) {
     // it cannot supply this synchronization on the auditor's behalf.
     if state.repair_config.enabled {
         sync_availability_views_once(state).await;
-    }
-
-    let retained = {
-        let store = read_store(state, "replication_auditor.retained_snapshot").await;
-        store.retained_content().await
-    };
-    if let Err(error) = &retained {
-        warn!(error = %error, "failed to enumerate retained replication obligations");
-    }
-    if state.repair_config.enabled
-        && let Ok(retained) = retained.as_ref()
-        && let Err(error) = content_recovery::audit_assigned_from_retained(state, retained).await
-    {
-        warn!(error = %error, "failed to audit retained content assignments");
+        let retained = {
+            let store = read_store(state, "replication_auditor.retained_snapshot").await;
+            store.retained_content().await
+        };
+        match retained {
+            Ok(retained) => {
+                if let Err(error) =
+                    content_recovery::audit_assigned_from_retained(state, &retained).await
+                {
+                    warn!(error = %error, "failed to audit retained content assignments");
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "failed to enumerate retained replication obligations");
+            }
+        }
     }
 
     let keys = planning_replication_subjects_for_auditor(state).await;

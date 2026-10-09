@@ -595,10 +595,12 @@ pub(crate) async fn execute_replication_repair_plan(
                 .await
             {
                 Ok(Some(bundle))
-                    if store
-                        .check_owned_replica_presence(&bundle.manifest_hash)
-                        .await
-                        .is_ok() =>
+                    if matches!(
+                        store
+                            .check_owned_replica_presence(&bundle.manifest_hash)
+                            .await,
+                        Ok(true)
+                    ) =>
                 {
                     Some(bundle)
                 }

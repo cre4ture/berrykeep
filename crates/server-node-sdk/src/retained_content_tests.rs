@@ -23,7 +23,7 @@ async fn retained_content_source_presence_is_not_a_second_scrub_impl(backend: St
         store
             .check_owned_replica_presence(&put.manifest_hash)
             .await
-            .is_ok(),
+            .unwrap(),
         "routine source checks must inspect sizes, not rehash owned chunk payloads"
     );
     assert!(store.run_data_scrub().await.unwrap().issue_count > 0);
@@ -37,10 +37,10 @@ async fn retained_content_source_presence_is_not_a_second_scrub_impl(backend: St
     let task = content_recovery::ContentRepairTask::new(reference, true);
     store.persist_content_repair_task(&task).await.unwrap();
     assert!(
-        store
+        !store
             .check_owned_replica_presence(&put.manifest_hash)
             .await
-            .is_err(),
+            .unwrap(),
         "a pending integrity finding overrides matching sizes"
     );
     assert!(
@@ -56,7 +56,7 @@ async fn retained_content_source_presence_is_not_a_second_scrub_impl(backend: St
         store
             .check_owned_replica_presence(&put.manifest_hash)
             .await
-            .is_ok()
+            .unwrap()
     );
     drop(store);
     fs::remove_dir_all(root).await.unwrap();
@@ -332,7 +332,7 @@ async fn retained_content_metadata_only_is_not_a_broken_replica_impl(backend: St
         .manifest_hash
         .clone();
     assert!(
-        target.check_owned_replica_presence(&hash).await.is_err(),
+        !target.check_owned_replica_presence(&hash).await.unwrap(),
         "a cheap replica presence check must not accept unowned cache content"
     );
     drop(source);
