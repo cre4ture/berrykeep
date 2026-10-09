@@ -2,6 +2,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   clearAdminMediaCache,
   getClusterNodes,
+  getClusterTaskQueues,
   getHostDependencyReport,
   getRepairActivityStatus,
   getRendezvousConfig,
@@ -18,7 +19,9 @@ import {
   type ChildProcessStat,
   type HostDependencyCheck,
   type TemperatureComponentStat,
-  type MemoryAttributionSample
+  type MemoryAttributionSample,
+  type ClusterTaskQueueSnapshot,
+  type TaskQueueState
 } from "@berrykeep/api";
 import { berrykeepUiRevision, berrykeepUiVersion } from "@berrykeep/config";
 import {
@@ -176,6 +179,12 @@ export function DashboardPage() {
     enabled: canInspectCluster,
     refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
   });
+  const taskQueuesQuery = useQuery({
+    queryKey: ["dashboard", "cluster-task-queues", normalizedAdminTokenOverride],
+    queryFn: () => getClusterTaskQueues(normalizedAdminTokenOverride || undefined),
+    enabled: canInspectCluster,
+    refetchInterval: DASHBOARD_SUMMARY_REFRESH_INTERVAL_MS
+  });
   const replicationPlanQuery = useQuery({
     queryKey: ["dashboard", "replication-plan", normalizedAdminTokenOverride],
     queryFn: () => getReplicationPlan(normalizedAdminTokenOverride || undefined),
@@ -211,6 +220,7 @@ export function DashboardPage() {
             storageHistoryQuery.refetch(),
             clusterSummaryQuery.refetch(),
             nodesQuery.refetch(),
+            taskQueuesQuery.refetch(),
             replicationPlanQuery.refetch(),
             repairActivityQuery.refetch(),
             processStatsCurrentQuery.refetch(),
@@ -243,6 +253,7 @@ export function DashboardPage() {
   const clusterSummary =
     canInspectCluster ? clusterSummaryQuery.data ?? null : null;
   const nodes = canInspectCluster ? nodesQuery.data ?? [] : [];
+  const taskQueues = canInspectCluster ? taskQueuesQuery.data ?? null : null;
   const replicationPlan =
     canInspectCluster ? replicationPlanQuery.data ?? null : null;
   const repairActivity =
@@ -426,6 +437,12 @@ export function DashboardPage() {
           </Grid.Col>
         ))}
       </Grid>
+
+      <ClusterTaskQueuesCard
+        snapshot={taskQueues}
+        loading={accessLoading || (canInspectCluster && taskQueuesQuery.isPending)}
+        error={canInspectCluster ? taskQueuesQuery.error : null}
+      />
 
       <Grid>
         <Grid.Col span={{ base: 12, xl: 6 }}>
@@ -1142,6 +1159,105 @@ export function DashboardPage() {
       </Modal>
     </Stack>
   );
+}
+
+function ClusterTaskQueuesCard({
+  snapshot,
+  loading,
+  error
+}: {
+  snapshot: ClusterTaskQueueSnapshot | null;
+  loading: boolean;
+  error: unknown;
+}) {
+  return (
+    <Card withBorder radius="md" padding="lg">
+      <Stack gap="sm">
+        <Group justify="space-between">
+          <div>
+            <Text fw={700}>Server cluster task queues</Text>
+            <Text size="sm" c="dimmed">
+              Best-effort work observed on each node; refreshed every 30 seconds.
+            </Text>
+          </div>
+          <Badge variant="light">
+            {snapshot
+              ? `${snapshot.nodes.length} reporting · ${snapshot.unavailable_nodes.length} unavailable`
+              : loading
+                ? "loading"
+                : "unavailable"}
+          </Badge>
+        </Group>
+        {snapshot ? (
+          <ScrollArea>
+            <Table striped highlightOnHover miw={720}>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Node</Table.Th>
+                  <Table.Th>Queue</Table.Th>
+                  <Table.Th>Status</Table.Th>
+                  <Table.Th ta="right">Pending</Table.Th>
+                  <Table.Th ta="right">Active</Table.Th>
+                  <Table.Th>Detail</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {snapshot.nodes.flatMap((node) =>
+                  node.queues.map((queue) => (
+                    <Table.Tr key={`${node.node_id}-${queue.id}`}>
+                      <Table.Td><Code>{shortTaskQueueNodeId(node.node_id)}</Code></Table.Td>
+                      <Table.Td>{queue.label}</Table.Td>
+                      <Table.Td>
+                        <Badge color={taskQueueStateColor(queue.state)} variant="light">
+                          {queue.state}
+                        </Badge>
+                      </Table.Td>
+                      <Table.Td ta="right">{queue.pending}</Table.Td>
+                      <Table.Td ta="right">{queue.active}</Table.Td>
+                      <Table.Td><Text size="xs" c="dimmed">{queue.detail ?? "—"}</Text></Table.Td>
+                    </Table.Tr>
+                  ))
+                )}
+                {snapshot.unavailable_nodes.map((node) => (
+                  <Table.Tr key={`unavailable-${node.node_id}`}>
+                    <Table.Td><Code>{shortTaskQueueNodeId(node.node_id)}</Code></Table.Td>
+                    <Table.Td>Node snapshot</Table.Td>
+                    <Table.Td><Badge color="yellow" variant="light">unavailable</Badge></Table.Td>
+                    <Table.Td ta="right">—</Table.Td>
+                    <Table.Td ta="right">—</Table.Td>
+                    <Table.Td><Text size="xs" c="dimmed">{node.error}</Text></Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          </ScrollArea>
+        ) : (
+          <Text c={error ? "yellow" : "dimmed"}>
+            {loading
+              ? "Loading queue snapshot…"
+              : error instanceof Error
+                ? error.message
+                : "Queue snapshot is unavailable."}
+          </Text>
+        )}
+        {snapshot ? (
+          <Text size="xs" c="dimmed">
+            Snapshot generated {new Date(snapshot.generated_at_unix_ms).toLocaleTimeString()}.
+          </Text>
+        ) : null}
+      </Stack>
+    </Card>
+  );
+}
+
+function taskQueueStateColor(state: TaskQueueState): string {
+  if (state === "backlogged" || state === "unavailable") return "yellow";
+  if (state === "waiting" || state === "running") return berrykeepPrimaryColor;
+  return "gray";
+}
+
+function shortTaskQueueNodeId(nodeId: string): string {
+  return nodeId.length > 12 ? nodeId.slice(0, 8) : nodeId;
 }
 
 function formatFullVersion(version: string | null | undefined, revision: string | null | undefined): string {

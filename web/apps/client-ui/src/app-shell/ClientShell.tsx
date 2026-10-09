@@ -47,6 +47,7 @@ import {
   getClientHealth,
   getClientClusterNodes,
   getClientClusterStatus,
+  getClientClusterTaskQueues,
   type ClientLatencyTestResponse,
   type ClientLatencyProbeTargetResult,
   type ClientDeviceIdentityView,
@@ -67,6 +68,8 @@ import {
   type BinaryUploadProgress,
   type ClientRendezvousView,
   type ClientUiPingResponse,
+  type ClusterTaskQueueSnapshot,
+  type TaskQueueState,
   type JsonObject,
   type SnapshotSummary,
   type StoreEntry,
@@ -242,6 +245,8 @@ export function ClientShell() {
   const [ping, setPing] = useState<ClientUiPingResponse | null>(null);
   const [health, setHealth] = useState<JsonObject | null>(null);
   const [clusterStatus, setClusterStatus] = useState<JsonObject | null>(null);
+  const [clusterTaskQueues, setClusterTaskQueues] = useState<ClusterTaskQueueSnapshot | null>(null);
+  const [clusterTaskQueuesError, setClusterTaskQueuesError] = useState<string | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<ClientRendezvousView | null>(null);
   const [deviceIdentity, setDeviceIdentity] = useState<ClientDeviceIdentityView | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(true);
@@ -251,6 +256,8 @@ export function ClientShell() {
 
   useEffect(() => {
     void refreshOverview();
+    const interval = window.setInterval(() => void refreshTaskQueues(), 30_000);
+    return () => window.clearInterval(interval);
   }, []);
 
   if (launchState.embeddedSurface === "gallery_map") {
@@ -274,10 +281,26 @@ export function ClientShell() {
       setClusterStatus(nextClusterStatus);
       setConnectionStatus(nextConnectionStatus);
       setDeviceIdentity(nextDeviceIdentity);
+      void refreshTaskQueues(diagnosticContext);
     } catch (error) {
       setOverviewError(error instanceof Error ? error.message : "Failed to refresh client overview");
     } finally {
       setOverviewLoading(false);
+    }
+  }
+
+  async function refreshTaskQueues(diagnosticContext?: string) {
+    try {
+      setClusterTaskQueues(
+        await getClientClusterTaskQueues({
+          diagnosticContext: diagnosticContext ?? `task-queues-${Date.now()}`
+        })
+      );
+      setClusterTaskQueuesError(null);
+    } catch (error) {
+      setClusterTaskQueuesError(
+        error instanceof Error ? error.message : "Task queue status is unavailable"
+      );
     }
   }
 
@@ -316,6 +339,9 @@ export function ClientShell() {
           clusterStatus={clusterStatus}
           connectionStatus={connectionStatus}
           deviceIdentity={deviceIdentity}
+          clusterTaskQueues={clusterTaskQueues}
+          clusterTaskQueuesError={clusterTaskQueuesError}
+          uploadSummary={binaryUpload.summary}
           loading={overviewLoading}
           error={overviewError}
           onRefresh={refreshOverview}
@@ -794,6 +820,9 @@ type OverviewPageProps = {
   clusterStatus: JsonObject | null;
   connectionStatus: ClientRendezvousView | null;
   deviceIdentity: ClientDeviceIdentityView | null;
+  clusterTaskQueues: ClusterTaskQueueSnapshot | null;
+  clusterTaskQueuesError: string | null;
+  uploadSummary: BinaryUploadSummary;
   loading: boolean;
   error: string | null;
   onRefresh: () => Promise<void>;
@@ -805,6 +834,9 @@ function OverviewPage({
   clusterStatus,
   connectionStatus,
   deviceIdentity,
+  clusterTaskQueues,
+  clusterTaskQueuesError,
+  uploadSummary,
   loading,
   error,
   onRefresh
@@ -841,6 +873,78 @@ function OverviewPage({
           hint="Policy advertised by the upstream cluster."
         />
       </SimpleGrid>
+
+      <Grid>
+        <Grid.Col span={{ base: 12, lg: 4 }}>
+          <Card withBorder radius="md" padding="lg" h="100%">
+            <Stack gap="sm">
+              <Text fw={700}>Client task queue</Text>
+              <TaskQueueRow
+                label="Overview refresh"
+                pending={0}
+                active={loading ? 1 : 0}
+                state={loading ? "running" : "idle"}
+              />
+              <TaskQueueRow
+                label="Browser uploads"
+                pending={uploadSummary.queuedFiles}
+                active={uploadSummary.activeFiles}
+                state={queueState(uploadSummary.queuedFiles, uploadSummary.activeFiles, DEFAULT_BINARY_UPLOAD_CONCURRENCY)}
+              />
+              <Text size="xs" c="dimmed">
+                Best-effort browser work observed by this UI. Counts can lag briefly.
+              </Text>
+            </Stack>
+          </Card>
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, lg: 8 }}>
+          <Card withBorder radius="md" padding="lg" h="100%">
+            <Stack gap="sm">
+              <Group justify="space-between">
+                <Text fw={700}>Server cluster task queues</Text>
+                <Badge variant="light">
+                  {clusterTaskQueues
+                    ? `${clusterTaskQueues.nodes.length} reporting`
+                    : clusterTaskQueuesError
+                      ? "unavailable"
+                      : "loading"}
+                </Badge>
+              </Group>
+              {clusterTaskQueuesError ? (
+                <Alert color="yellow" variant="light">{clusterTaskQueuesError}</Alert>
+              ) : null}
+              {clusterTaskQueues?.nodes.flatMap((node) =>
+                node.queues
+                  .filter((queue) => queue.pending > 0 || queue.active > 0)
+                  .map((queue) => (
+                    <TaskQueueRow
+                      key={`${node.node_id}-${queue.id}`}
+                      label={`${queue.label} · ${shortNodeId(node.node_id)}`}
+                      pending={queue.pending}
+                      active={queue.active}
+                      state={queue.state}
+                    />
+                  ))
+              )}
+              {clusterTaskQueues && !clusterHasActiveQueues(clusterTaskQueues) ? (
+                <Text size="sm" c="dimmed">No pending or active server work observed.</Text>
+              ) : null}
+              {clusterTaskQueues?.unavailable_nodes.map((node) => (
+                <TaskQueueRow
+                  key={node.node_id}
+                  label={`Server node ${shortNodeId(node.node_id)}`}
+                  pending={0}
+                  active={0}
+                  state="unavailable"
+                />
+              ))}
+              <Text size="xs" c="dimmed">
+                Snapshot {clusterTaskQueues ? formatTaskQueueAge(clusterTaskQueues.generated_at_unix_ms) : "pending"}; refreshed every 30 seconds.
+              </Text>
+            </Stack>
+          </Card>
+        </Grid.Col>
+      </Grid>
 
       <Grid>
         <Grid.Col span={{ base: 12, lg: 6 }}>
@@ -987,6 +1091,56 @@ function OverviewPage({
       </Grid>
     </>
   );
+}
+
+function TaskQueueRow({
+  label,
+  pending,
+  active,
+  state
+}: {
+  label: string;
+  pending: number;
+  active: number;
+  state: TaskQueueState;
+}) {
+  const color = state === "backlogged" || state === "unavailable"
+    ? "yellow"
+    : state === "running" || state === "waiting"
+      ? berrykeepPrimaryColor
+      : "gray";
+  return (
+    <Group justify="space-between" wrap="nowrap">
+      <Text size="sm" lineClamp={1}>{label}</Text>
+      <Group gap={6} wrap="nowrap">
+        <Badge color={color} variant="light">{state}</Badge>
+        <Badge variant="outline">{pending} pending</Badge>
+        <Badge variant="outline">{active} active</Badge>
+      </Group>
+    </Group>
+  );
+}
+
+function queueState(pending: number, active: number, capacity: number): TaskQueueState {
+  if (pending === 0 && active === 0) return "idle";
+  if (pending > 0 && active === 0) return "waiting";
+  if (pending > 0 && active >= capacity) return "backlogged";
+  return "running";
+}
+
+function clusterHasActiveQueues(snapshot: ClusterTaskQueueSnapshot): boolean {
+  return snapshot.nodes.some((node) =>
+    node.queues.some((queue) => queue.pending > 0 || queue.active > 0)
+  );
+}
+
+function shortNodeId(nodeId: string): string {
+  return nodeId.length > 12 ? nodeId.slice(0, 8) : nodeId;
+}
+
+function formatTaskQueueAge(generatedAtUnixMs: number): string {
+  const ageSeconds = Math.max(0, Math.round((Date.now() - generatedAtUnixMs) / 1000));
+  return ageSeconds < 2 ? "just now" : `${ageSeconds}s ago`;
 }
 
 function RendezvousPage() {

@@ -1,4 +1,5 @@
 import { fetchJson, isHttpErrorStatus } from "../shared/http";
+import type { ClusterTaskQueueSnapshot } from "../shared/task-queue";
 import {
   galleryMapClusterCellSizeParameter,
   galleryMapClusterZoomParameters
@@ -752,6 +753,14 @@ export async function getClusterNodes(
   adminTokenOverride?: string
 ): Promise<NodeDescriptor[]> {
   return fetchAdminJson<NodeDescriptor[]>(apiV1("/cluster/nodes"), {
+    adminTokenOverride
+  });
+}
+
+export async function getClusterTaskQueues(
+  adminTokenOverride?: string
+): Promise<ClusterTaskQueueSnapshot> {
+  return fetchAdminJson<ClusterTaskQueueSnapshot>(apiV1("/cluster/task-queues"), {
     adminTokenOverride
   });
 }
