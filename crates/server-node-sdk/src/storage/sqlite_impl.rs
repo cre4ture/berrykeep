@@ -21,14 +21,15 @@ use crate::operations::{OperationPriority, OperationProgress};
 use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 
 use super::{
-    ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT,
-    CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentObjectEntry,
-    CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
-    GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY, GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION,
-    GALLERY_SIDECAR_GPS_BACKFILL_KEY, GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange,
-    GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope,
-    GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage,
-    GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
+    ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS,
+    CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT, CachedChunkRecord, CachedMediaMetadata,
+    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
+    DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
+    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
+    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange, GalleryDeltaCursorError,
+    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
+    GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery,
+    GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
     GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue, GallerySummaryMiss,
     GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
     GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
@@ -2654,6 +2655,10 @@ impl MetadataStore for SqliteMetadataStore {
         source_fingerprint: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let source_change_retry_before_unix = i64::try_from(
+            now_unix.saturating_sub(CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS),
+        )
+        .expect("source retry timestamp cannot exceed the current timestamp");
         let now_unix = i64::try_from(now_unix).context("repair task due timestamp overflow")?;
         let source_fingerprint = source_fingerprint.to_string();
         let limit = limit.max(1);
@@ -2678,23 +2683,23 @@ impl MetadataStore for SqliteMetadataStore {
             drop(rows);
             drop(statement);
 
-            // A source topology change makes a task eligible before its retry
-            // deadline. Query the two B-tree ranges separately: `!=` would
-            // force a table scan, while each range can stop at this pass's
-            // bounded batch size.
-            for comparison in ["<", ">"] {
-                if hashes.len() >= limit {
-                    break;
-                }
-                let statement = format!(
-                    "SELECT manifest_hash FROM content_repair_tasks \
-                     WHERE source_fingerprint {comparison} ?1 \
-                     ORDER BY source_fingerprint ASC, manifest_hash ASC LIMIT ?2"
-                );
-                let mut statement = db.prepare(&statement)?;
+            // A source topology change can wake a task before its ordinary
+            // retry deadline, but only after a minimum interval since its last
+            // transfer attempt. This preserves exponential backoff while peers
+            // flap. The last-attempt range keeps the query indexed.
+            if hashes.len() < limit {
                 let remaining = i64::try_from(limit.saturating_sub(hashes.len()))
                     .context("repair task query limit overflow")?;
-                let mut rows = statement.query(params![source_fingerprint, remaining])?;
+                let mut statement = db.prepare(
+                    "SELECT manifest_hash FROM content_repair_tasks
+                     WHERE source_fingerprint <> ?1 AND last_attempt_unix <= ?2
+                     ORDER BY last_attempt_unix ASC, manifest_hash ASC LIMIT ?3",
+                )?;
+                let mut rows = statement.query(params![
+                    source_fingerprint,
+                    source_change_retry_before_unix,
+                    remaining
+                ])?;
                 while let Some(row) = rows.next()? {
                     let hash = row.get::<_, String>(0)?;
                     if seen.insert(hash.clone()) {
@@ -2711,18 +2716,27 @@ impl MetadataStore for SqliteMetadataStore {
         let hash = task.reference.manifest_hash.clone();
         let next_attempt_unix =
             i64::try_from(task.next_attempt_unix).context("repair task timestamp overflow")?;
+        let last_attempt_unix =
+            i64::try_from(task.last_attempt_unix).context("repair task timestamp overflow")?;
         let source_fingerprint = task.source_fingerprint.clone();
         let payload = serde_json::to_vec(task)?;
         self.write_tx(move |db| {
             db.execute(
                 "INSERT INTO content_repair_tasks (
-                     manifest_hash, next_attempt_unix, source_fingerprint, task_json
-                 ) VALUES (?1, ?2, ?3, ?4)
+                     manifest_hash, next_attempt_unix, last_attempt_unix, source_fingerprint, task_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(manifest_hash) DO UPDATE SET
                      next_attempt_unix=excluded.next_attempt_unix,
+                     last_attempt_unix=excluded.last_attempt_unix,
                      source_fingerprint=excluded.source_fingerprint,
                      task_json=excluded.task_json",
-                params![hash, next_attempt_unix, source_fingerprint, payload],
+                params![
+                    hash,
+                    next_attempt_unix,
+                    last_attempt_unix,
+                    source_fingerprint,
+                    payload
+                ],
             )?;
             Ok(())
         })
@@ -5584,6 +5598,7 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS content_repair_tasks (
             manifest_hash TEXT PRIMARY KEY,
             next_attempt_unix INTEGER NOT NULL DEFAULT 0,
+            last_attempt_unix INTEGER NOT NULL DEFAULT 0,
             source_fingerprint TEXT NOT NULL DEFAULT '__legacy__',
             task_json BLOB NOT NULL
         );
@@ -5920,6 +5935,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
     add_sqlite_column_if_missing(
         db,
         "content_repair_tasks",
+        "last_attempt_unix",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_sqlite_column_if_missing(
+        db,
+        "content_repair_tasks",
         "source_fingerprint",
         "TEXT NOT NULL DEFAULT '__legacy__'",
     )?;
@@ -5930,11 +5951,10 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         [],
     )?;
     db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_source_fingerprint
-         ON content_repair_tasks(source_fingerprint, manifest_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_last_attempt
+         ON content_repair_tasks(last_attempt_unix, manifest_hash)",
         [],
     )?;
-
     let stored_version = db
         .query_row(
             "SELECT value FROM metadata_meta WHERE key = ?1",
@@ -6016,10 +6036,12 @@ fn backfill_content_repair_task_schedule(db: &Connection) -> Result<()> {
     for (manifest_hash, task) in tasks {
         db.execute(
             "UPDATE content_repair_tasks
-             SET next_attempt_unix = ?1, source_fingerprint = ?2
-             WHERE manifest_hash = ?3",
+             SET next_attempt_unix = ?1, last_attempt_unix = ?2, source_fingerprint = ?3
+             WHERE manifest_hash = ?4",
             params![
                 i64::try_from(task.next_attempt_unix)
+                    .context("repair task backfill timestamp overflow")?,
+                i64::try_from(task.last_attempt_unix)
                     .context("repair task backfill timestamp overflow")?,
                 task.source_fingerprint,
                 manifest_hash,

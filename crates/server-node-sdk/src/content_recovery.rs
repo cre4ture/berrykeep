@@ -700,6 +700,7 @@ async fn repair_subjects_inner(
             );
             continue;
         }
+        task.last_attempt_unix = now;
         task.source_fingerprint = fingerprint.clone();
         started_transfers += 1;
         report.attempted_transfers += 1;

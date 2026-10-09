@@ -114,6 +114,7 @@ async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
         true,
     );
     second_task.next_attempt_unix = 200;
+    second_task.last_attempt_unix = 0;
     second_task.source_fingerprint = "changed-sources".to_string();
     let mut third_task = content_recovery::ContentRepairTask::new(
         retained
@@ -123,6 +124,7 @@ async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
         true,
     );
     third_task.next_attempt_unix = 300;
+    third_task.last_attempt_unix = 0;
     third_task.source_fingerprint = "z-sources".to_string();
     // Keep a large pin list in the inactive task. Scheduling must inspect its
     // indexed deadline/fingerprint rather than deserialize this payload.
@@ -157,21 +159,23 @@ async fn retained_content_repair_task_schedule_uses_indexed_summaries_impl(
         expected.sort();
         expected
     });
+    let mut source_changed_hashes = vec![second.manifest_hash.clone(), third.manifest_hash.clone()];
+    source_changed_hashes.sort();
     assert_eq!(
         store
-            .due_content_repair_task_hashes(50, "same-sources", 1)
+            .due_content_repair_task_hashes(60, "same-sources", 1)
             .await
             .unwrap(),
-        vec![second.manifest_hash.clone()],
-        "a changed source fingerprint is due without loading every task"
+        source_changed_hashes[..1].to_vec(),
+        "an old-enough changed source fingerprint is due without loading every task"
     );
     assert_eq!(
         store
-            .due_content_repair_task_hashes(50, "same-sources", 2)
+            .due_content_repair_task_hashes(60, "same-sources", 2)
             .await
             .unwrap(),
-        vec![second.manifest_hash.clone(), third.manifest_hash.clone()],
-        "fingerprint changes on either B-tree range must be selected without a full queue scan"
+        source_changed_hashes,
+        "changed source fingerprints must be selected through the indexed schedule"
     );
     let selected = store
         .content_repair_tasks_for_manifests(std::slice::from_ref(&first.manifest_hash))

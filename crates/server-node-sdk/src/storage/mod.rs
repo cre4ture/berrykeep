@@ -13,6 +13,9 @@ const METADATA_SCHEMA_VERSION_OBJECT_ID: i64 = 2;
 const METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION: i64 = METADATA_SCHEMA_VERSION_OBJECT_ID + 1;
 const METADATA_SCHEMA_VERSION_CURRENT: i64 = METADATA_SCHEMA_VERSION_HISTORY_HEAD_PROJECTION;
 pub(super) const CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT: &str = "__legacy__";
+/// A source-topology change can make a repair useful sooner, but must not
+/// repeatedly collapse a long exponential retry delay while peers flap.
+pub(super) const CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS: u64 = 60;
 pub(super) const OBJECT_ID_BACKFILL_KEY: &str = "object_id_backfill_v2";
 pub(super) const GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY: &str = "gallery_capture_fallback_v1";
 pub(super) const GALLERY_SIDECAR_LABEL_BACKFILL_KEY: &str = "gallery_sidecar_labels_v1";

@@ -604,20 +604,9 @@ impl ClusterService {
         self.replica_subjects_by_node.clear();
         self.available_subjects_by_node.clear();
 
-        // `cluster_available` was introduced after replica hints were already
-        // durable. On the first restart after that upgrade, retain head hints
-        // as availability until peers can publish their fresh views; otherwise
-        // an offline peer is spuriously backfilled immediately. Versioned hints
-        // are historical source-discovery records, never current availability.
-        let available = if available.is_empty() {
-            replicas
-                .iter()
-                .filter(|(subject, _)| !is_versioned_replication_subject(subject))
-                .map(|(subject, nodes)| (subject.clone(), nodes.clone()))
-                .collect()
-        } else {
-            available
-        };
+        // Older stores have no durable availability view. Leave it empty until
+        // peers publish fresh state: replica hints include offline and
+        // historical sources, neither of which can satisfy current durability.
         for (key, nodes) in replicas {
             for node_id in nodes {
                 Self::insert_subject_membership(
@@ -1456,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn import_replica_views_seeds_empty_availability_from_legacy_replicas() {
+    fn import_replica_views_leaves_empty_legacy_availability_unclaimed() {
         let local = NodeId::new_v4();
         let offline = NodeId::new_v4();
         let mut svc = ClusterService::new(local, ReplicationPolicy::default(), 60);
@@ -1468,12 +1457,12 @@ mod tests {
 
         assert_eq!(
             svc.current_replica_nodes_for_subject("subject-a"),
-            HashSet::from([offline]),
-            "an upgrade must retain an offline replica until it can publish availability"
+            HashSet::new(),
+            "legacy replica hints must not become current availability claims"
         );
-        assert_eq!(
-            svc.available_subjects_for_node(offline),
-            vec!["subject-a".to_string()]
+        assert!(
+            svc.available_subjects_for_node(offline).is_empty(),
+            "peers converge current availability through their normal sync"
         );
     }
 
@@ -1492,10 +1481,9 @@ mod tests {
             HashMap::new(),
         );
 
-        assert_eq!(
-            svc.current_replica_nodes_for_subject("subject-a"),
-            HashSet::from([offline]),
-            "legacy head hints avoid an immediate backfill while availability converges"
+        assert!(
+            svc.current_replica_nodes_for_subject("subject-a")
+                .is_empty()
         );
         assert!(
             svc.current_replica_nodes_for_subject("subject-a@ver-old")
@@ -1507,8 +1495,8 @@ mod tests {
         );
         assert_eq!(
             svc.export_available_by_key(),
-            HashMap::from([("subject-a".to_string(), vec![offline])]),
-            "persisting a legacy upgrade must not turn historical source hints into availability"
+            HashMap::new(),
+            "persisting a legacy upgrade must not turn any replica hint into availability"
         );
     }
 

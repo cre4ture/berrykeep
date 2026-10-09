@@ -21,18 +21,18 @@ const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
 const DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT: usize = 1;
 
 use super::{
-    ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT,
-    CachedChunkRecord, CachedMediaMetadata, ClientCredentialState, CurrentObjectEntry,
-    CurrentState, DataChangeEvent, DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
-    GALLERY_SIDECAR_GPS_BACKFILL_KEY, GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaCursorError,
-    GalleryDeltaPage, GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery,
-    GalleryMapClusterEntriesQuery, GalleryMapClusterPage, GalleryMapClusterQuery,
-    GallerySummaryCache, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
-    HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY, HistoryHeadProjectionBackfillState,
-    METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary, ManualRepairActionRunRecord,
-    MediaGpsCoordinates, MetadataDbLogicalProgress, MetadataDbLogicalProgressCallback,
-    MetadataDbTableLogicalBreakdown, MetadataStore, OBJECT_ID_BACKFILL_KEY,
-    ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
+    ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS,
+    CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT, CachedChunkRecord, CachedMediaMetadata,
+    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
+    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
+    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaCursorError, GalleryDeltaPage,
+    GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, GalleryMapClusterEntriesQuery,
+    GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache,
+    HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY, HISTORY_HEAD_PROJECTION_BACKFILL_CURSOR_KEY,
+    HistoryHeadProjectionBackfillState, METADATA_SCHEMA_VERSION_CURRENT, ManifestSummary,
+    ManualRepairActionRunRecord, MediaGpsCoordinates, MetadataDbLogicalProgress,
+    MetadataDbLogicalProgressCallback, MetadataDbTableLogicalBreakdown, MetadataStore,
+    OBJECT_ID_BACKFILL_KEY, ObjectVersionMetadataRecord, ReconcileMarker, RecoverableHistoryEntry,
     RecoverableHistoryListing, RecoverableHistoryListingEntry, RepairAttemptRecord,
     RepairRunRecord, S3AccessKeyRecord, S3BucketRecord, S3BucketVersioningStatus,
     S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
@@ -610,6 +610,10 @@ impl MetadataStore for TursoMetadataStore {
         source_fingerprint: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let source_change_retry_before_unix = i64::try_from(
+            now_unix.saturating_sub(CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS),
+        )
+        .expect("source retry timestamp cannot exceed the current timestamp");
         let now_unix = i64::try_from(now_unix).context("repair task due timestamp overflow")?;
         let limit = limit.max(1);
         let mut rows = self
@@ -633,24 +637,24 @@ impl MetadataStore for TursoMetadataStore {
             hashes.push(hash);
         }
         drop(rows);
-        // A source topology change makes a task eligible before its retry
-        // deadline. Query the two B-tree ranges separately: `!=` would force
-        // a table scan, while each range stops at this pass's bounded batch.
-        for comparison in ["<", ">"] {
-            if hashes.len() >= limit {
-                break;
-            }
+        // A source topology change can wake a task before its ordinary retry
+        // deadline, but only after a minimum interval since its last transfer
+        // attempt. This preserves exponential backoff while peers flap. The
+        // last-attempt range keeps the query indexed.
+        if hashes.len() < limit {
             let remaining = i64::try_from(limit.saturating_sub(hashes.len()))
                 .context("repair task query limit overflow")?;
             let mut rows = self
                 .connection
                 .query(
-                    &format!(
-                        "SELECT manifest_hash FROM content_repair_tasks \
-                         WHERE source_fingerprint {comparison} ?1 \
-                         ORDER BY source_fingerprint ASC, manifest_hash ASC LIMIT ?2"
+                    "SELECT manifest_hash FROM content_repair_tasks
+                     WHERE source_fingerprint <> ?1 AND last_attempt_unix <= ?2
+                     ORDER BY last_attempt_unix ASC, manifest_hash ASC LIMIT ?3",
+                    (
+                        source_fingerprint,
+                        source_change_retry_before_unix,
+                        remaining,
                     ),
-                    (source_fingerprint, remaining),
                 )
                 .await?;
             while let Some(row) = rows.next().await? {
@@ -668,15 +672,18 @@ impl MetadataStore for TursoMetadataStore {
         self.connection
             .execute(
                 "INSERT INTO content_repair_tasks (
-                 manifest_hash, next_attempt_unix, source_fingerprint, task_json
-             ) VALUES (?1, ?2, ?3, ?4)
+                 manifest_hash, next_attempt_unix, last_attempt_unix, source_fingerprint, task_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(manifest_hash) DO UPDATE SET
                  next_attempt_unix=excluded.next_attempt_unix,
+                 last_attempt_unix=excluded.last_attempt_unix,
                  source_fingerprint=excluded.source_fingerprint,
                  task_json=excluded.task_json",
                 (
                     task.reference.manifest_hash.as_str(),
                     i64::try_from(task.next_attempt_unix)
+                        .context("repair task timestamp overflow")?,
+                    i64::try_from(task.last_attempt_unix)
                         .context("repair task timestamp overflow")?,
                     task.source_fingerprint.as_str(),
                     serde_json::to_vec(task)?,
@@ -3329,10 +3336,12 @@ async fn backfill_content_repair_task_schedule(connection: &turso::Connection) -
         connection
             .execute(
                 "UPDATE content_repair_tasks
-                 SET next_attempt_unix = ?1, source_fingerprint = ?2
-                 WHERE manifest_hash = ?3",
+                 SET next_attempt_unix = ?1, last_attempt_unix = ?2, source_fingerprint = ?3
+                 WHERE manifest_hash = ?4",
                 (
                     i64::try_from(task.next_attempt_unix)
+                        .context("repair task backfill timestamp overflow")?,
+                    i64::try_from(task.last_attempt_unix)
                         .context("repair task backfill timestamp overflow")?,
                     task.source_fingerprint.as_str(),
                     manifest_hash.as_str(),
@@ -3511,6 +3520,7 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS content_repair_tasks (
                 manifest_hash TEXT PRIMARY KEY,
                 next_attempt_unix INTEGER NOT NULL DEFAULT 0,
+                last_attempt_unix INTEGER NOT NULL DEFAULT 0,
                 source_fingerprint TEXT NOT NULL DEFAULT '__legacy__',
                 task_json BLOB NOT NULL
             );
@@ -3767,6 +3777,13 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
     add_column_if_missing(
         connection,
         "content_repair_tasks",
+        "last_attempt_unix",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        connection,
+        "content_repair_tasks",
         "source_fingerprint",
         "TEXT NOT NULL DEFAULT '__legacy__'",
     )
@@ -3781,8 +3798,8 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
         .await?;
     connection
         .execute(
-            "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_source_fingerprint
-             ON content_repair_tasks(source_fingerprint, manifest_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_last_attempt
+             ON content_repair_tasks(last_attempt_unix, manifest_hash)",
             (),
         )
         .await?;

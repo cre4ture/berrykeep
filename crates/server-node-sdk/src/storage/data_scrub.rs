@@ -62,6 +62,8 @@ pub struct DataScrubReport {
     pub chunks_scanned: usize,
     #[serde(default)]
     pub chunks_not_required_locally: usize,
+    #[serde(default)]
+    pub manifests_not_required_locally: usize,
     pub bytes_scanned: u64,
     pub issue_count: usize,
     pub sampled_issue_count: usize,
@@ -390,6 +392,8 @@ impl DataScrubber {
                         None,
                         format!("manifest location unavailable: {err}"),
                     );
+                } else {
+                    output.report.manifests_not_required_locally += 1;
                 }
                 return;
             }
@@ -406,6 +410,8 @@ impl DataScrubber {
                         None,
                         format!("manifest missing at {}", manifest_path.display()),
                     );
+                } else {
+                    output.report.manifests_not_required_locally += 1;
                 }
                 return;
             }
@@ -419,6 +425,8 @@ impl DataScrubber {
                         None,
                         format!("failed reading manifest {}: {err}", manifest_path.display()),
                     );
+                } else {
+                    output.report.manifests_not_required_locally += 1;
                 }
                 return;
             }

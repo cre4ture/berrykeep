@@ -9835,6 +9835,10 @@ async fn data_scrub_ignores_unassigned_missing_and_unreadable_manifests_impl(
             unassigned.issue_count, 0,
             "unassigned {suffix} manifests must not degrade the local scrub"
         );
+        assert_eq!(
+            unassigned.manifests_not_required_locally, 1,
+            "the skipped {suffix} manifest must remain observable"
+        );
 
         let assigned = target
             .data_scrubber()
@@ -9867,6 +9871,68 @@ run_on_all_metadata_backends!(
     data_scrub_ignores_unassigned_missing_and_unreadable_manifests_impl,
     data_scrub_ignores_unassigned_missing_and_unreadable_manifests,
     data_scrub_ignores_unassigned_missing_and_unreadable_manifests_turso
+);
+
+async fn content_repair_source_change_respects_minimum_retry_interval_impl(
+    backend: StorageTestBackend,
+) {
+    let (root, mut store) = backend
+        .init_store("content-repair-source-change-minimum-retry")
+        .await;
+    for key in [
+        "docs/retry-interval-eligible.bin",
+        "docs/retry-interval-recent.bin",
+    ] {
+        store
+            .put_object_versioned(
+                key,
+                Bytes::from_static(b"retry grace payload"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let retained = store.retained_content().await.unwrap();
+    let now = 1_000;
+    let mut eligible = content_recovery::ContentRepairTask::new(
+        retained
+            .reference_for_subject("docs/retry-interval-eligible.bin")
+            .unwrap()
+            .clone(),
+        true,
+    );
+    eligible.next_attempt_unix = now + 3_600;
+    eligible.last_attempt_unix = now - CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS;
+    eligible.source_fingerprint = "old-source-view".to_string();
+    let mut recent = content_recovery::ContentRepairTask::new(
+        retained
+            .reference_for_subject("docs/retry-interval-recent.bin")
+            .unwrap()
+            .clone(),
+        true,
+    );
+    recent.next_attempt_unix = now + 3_600;
+    recent.last_attempt_unix = eligible.last_attempt_unix + 1;
+    recent.source_fingerprint = "old-source-view".to_string();
+    store.persist_content_repair_task(&eligible).await.unwrap();
+    store.persist_content_repair_task(&recent).await.unwrap();
+
+    assert_eq!(
+        store
+            .due_content_repair_task_hashes(now, "new-source-view", 8)
+            .await
+            .unwrap(),
+        vec![eligible.reference.manifest_hash],
+        "a source change must not retry a task before its minimum retry interval"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    content_repair_source_change_respects_minimum_retry_interval_impl,
+    content_repair_source_change_respects_minimum_retry_interval,
+    content_repair_source_change_respects_minimum_retry_interval_turso
 );
 
 async fn importing_replica_manifest_marks_manifest_owned_and_clears_cached_records_impl(
@@ -10406,6 +10472,7 @@ async fn data_scrub_history_roundtrip_and_prune_impl(backend: StorageTestBackend
         duration_ms: 100,
         summary: super::DataScrubReport {
             chunks_not_required_locally: 0,
+            manifests_not_required_locally: 0,
             current_keys_scanned: 1,
             version_indexes_scanned: 1,
             version_records_scanned: 1,
@@ -10437,6 +10504,7 @@ async fn data_scrub_history_roundtrip_and_prune_impl(backend: StorageTestBackend
         duration_ms: 200,
         summary: super::DataScrubReport {
             chunks_not_required_locally: 0,
+            manifests_not_required_locally: 0,
             current_keys_scanned: 2,
             version_indexes_scanned: 2,
             version_records_scanned: 2,

@@ -9,6 +9,8 @@ pub(crate) struct ContentRepairTask {
     pub chunks: Vec<ReplicationChunkInfo>,
     pub attempts: u32,
     pub next_attempt_unix: u64,
+    #[serde(default)]
+    pub last_attempt_unix: u64,
     pub last_error: Option<String>,
     #[serde(default)]
     pub waiting_for_source: bool,
@@ -26,6 +28,7 @@ impl ContentRepairTask {
             chunks: Vec::new(),
             attempts: 0,
             next_attempt_unix: 0,
+            last_attempt_unix: 0,
             last_error: None,
             waiting_for_source: false,
             source_fingerprint: String::new(),

@@ -1336,6 +1336,10 @@ async fn recovery_resumes_partial_work_after_restart_and_peer_reconnect_impl(
         assert_eq!(pending[0].recovered_chunks, 1);
         let mut waiting = pending[0].clone();
         waiting.attempts = 100; // A retry budget must not permanently abandon retained bytes.
+        // A new source wakes a deferred task only after the topology-retry
+        // floor, so a flapping peer cannot collapse its backoff every tick.
+        waiting.last_attempt_unix = crate::unix_ts()
+            .saturating_sub(crate::storage::CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS);
         store.persist_content_repair_task(&waiting).await.unwrap();
         store.cleanup_unreferenced(0, false).await.unwrap();
         assert!(

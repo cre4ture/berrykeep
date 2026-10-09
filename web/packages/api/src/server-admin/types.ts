@@ -480,6 +480,7 @@ export type DataScrubReport = {
   manifests_scanned: number;
   chunks_scanned: number;
   chunks_not_required_locally?: number;
+  manifests_not_required_locally?: number;
   bytes_scanned: number;
   issue_count: number;
   sampled_issue_count: number;
