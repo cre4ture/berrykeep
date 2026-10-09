@@ -256,6 +256,9 @@ export function ClientShell() {
 
   useEffect(() => {
     void refreshOverview();
+    if (launchState.embeddedSurface === "gallery_map") {
+      return;
+    }
     const interval = window.setInterval(() => void refreshTaskQueues(), 30_000);
     return () => window.clearInterval(interval);
   }, []);
@@ -281,7 +284,9 @@ export function ClientShell() {
       setClusterStatus(nextClusterStatus);
       setConnectionStatus(nextConnectionStatus);
       setDeviceIdentity(nextDeviceIdentity);
-      void refreshTaskQueues(diagnosticContext);
+      if (launchState.embeddedSurface !== "gallery_map") {
+        void refreshTaskQueues();
+      }
     } catch (error) {
       setOverviewError(error instanceof Error ? error.message : "Failed to refresh client overview");
     } finally {
@@ -289,13 +294,9 @@ export function ClientShell() {
     }
   }
 
-  async function refreshTaskQueues(diagnosticContext?: string) {
+  async function refreshTaskQueues() {
     try {
-      setClusterTaskQueues(
-        await getClientClusterTaskQueues({
-          diagnosticContext: diagnosticContext ?? `task-queues-${Date.now()}`
-        })
-      );
+      setClusterTaskQueues(await getClientClusterTaskQueues());
       setClusterTaskQueuesError(null);
     } catch (error) {
       setClusterTaskQueuesError(

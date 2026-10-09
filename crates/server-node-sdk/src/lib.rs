@@ -193,6 +193,8 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
 const RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS: u64 = 1;
 const RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS: u64 = 5;
 const DIRECT_PEER_REQUEST_TIMEOUT_SECS: u64 = 30;
+const CLUSTER_TASK_QUEUE_CACHE_TTL_SECS: u64 = 30;
+const CLUSTER_TASK_QUEUE_PEER_TIMEOUT_SECS: u64 = 3;
 const DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS: u64 = 300;
 const REPAIR_LOCAL_AVAILABILITY_SYNC_TIMEOUT_SECS: u64 = 30;
 const OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES: usize = 64 * 1024;
@@ -315,6 +317,12 @@ struct MetadataBundleImportObserver {
 }
 
 #[derive(Clone)]
+struct CachedClusterTaskQueueSnapshot {
+    captured_at: Instant,
+    snapshot: ClusterTaskQueueSnapshot,
+}
+
+#[derive(Clone)]
 struct ServerState {
     managed_paths: ManagedPaths,
     cluster_id: ClusterId,
@@ -322,6 +330,7 @@ struct ServerState {
     node_hostname: Option<String>,
     store: Arc<TracedRwLock<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
+    cluster_task_queue_cache: Arc<Mutex<Option<CachedClusterTaskQueueSnapshot>>>,
     storage: ServerStorageRuntime,
     access: ServerAccessRuntime,
     web_services: web_service_proxy::WebServiceRegistry,
@@ -7523,6 +7532,7 @@ async fn run_inner(
         node_hostname,
         store,
         cluster: Arc::new(Mutex::new(cluster)),
+        cluster_task_queue_cache: Arc::new(Mutex::new(None)),
         storage: ServerStorageRuntime {
             upload_chunk_ingestor,
             upload_sessions: new_upload_sessions_rwlock(upload_session_store),
@@ -28307,7 +28317,7 @@ async fn local_task_queue_snapshot(
                 "Replication repair",
                 repair_pending,
                 repair_worker_active,
-                Some(1),
+                None,
                 Some(format!("startup state: {startup_repair_status:?}")),
             ),
             TaskQueueEntry::observed(
@@ -28350,7 +28360,30 @@ async fn local_task_queues(State(state): State<ServerState>) -> impl IntoRespons
 }
 
 async fn cluster_task_queues(State(state): State<ServerState>) -> impl IntoResponse {
-    let local = local_task_queue_snapshot(&state, true).await;
+    (
+        StatusCode::OK,
+        Json(cached_cluster_task_queue_snapshot(&state).await),
+    )
+}
+
+async fn cached_cluster_task_queue_snapshot(state: &ServerState) -> ClusterTaskQueueSnapshot {
+    let mut cache = state.cluster_task_queue_cache.lock().await;
+    if let Some(cached) = cache.as_ref()
+        && cached.captured_at.elapsed() < Duration::from_secs(CLUSTER_TASK_QUEUE_CACHE_TTL_SECS)
+    {
+        return cached.snapshot.clone();
+    }
+
+    let snapshot = collect_cluster_task_queue_snapshot(state).await;
+    *cache = Some(CachedClusterTaskQueueSnapshot {
+        captured_at: Instant::now(),
+        snapshot: snapshot.clone(),
+    });
+    snapshot
+}
+
+async fn collect_cluster_task_queue_snapshot(state: &ServerState) -> ClusterTaskQueueSnapshot {
+    let local = local_task_queue_snapshot(state, true).await;
     let cluster_nodes = {
         let mut cluster = state.cluster.lock().await;
         cluster.update_health_and_detect_offline_transition();
@@ -28373,13 +28406,16 @@ async fn cluster_task_queues(State(state): State<ServerState>) -> impl IntoRespo
     let peer_results = futures_util::future::join_all(online_peers.into_iter().map(|peer| {
         let state = state.clone();
         async move {
-            let result = execute_peer_request(
-                &state,
-                &peer,
-                reqwest::Method::GET,
-                "/cluster/task-queues/local",
-                Vec::new(),
-                Vec::new(),
+            let result = tokio::time::timeout(
+                Duration::from_secs(CLUSTER_TASK_QUEUE_PEER_TIMEOUT_SECS),
+                execute_peer_request(
+                    &state,
+                    &peer,
+                    reqwest::Method::GET,
+                    "/cluster/task-queues/local",
+                    Vec::new(),
+                    Vec::new(),
+                ),
             )
             .await;
             (peer.node_id, result)
@@ -28389,7 +28425,7 @@ async fn cluster_task_queues(State(state): State<ServerState>) -> impl IntoRespo
 
     for (node_id, result) in peer_results {
         match result {
-            Ok(response) if response.is_success() => {
+            Ok(Ok(response)) if response.is_success() => {
                 match response.json::<ClusterTaskQueueNodeSnapshot>() {
                     Ok(snapshot) => nodes.push(snapshot),
                     Err(error) => {
@@ -28401,30 +28437,33 @@ async fn cluster_task_queues(State(state): State<ServerState>) -> impl IntoRespo
                     }
                 }
             }
-            Ok(response) => unavailable_nodes.push(UnavailableTaskQueueNode {
+            Ok(Ok(response)) => unavailable_nodes.push(UnavailableTaskQueueNode {
                 node_id: node_id.to_string(),
                 error: format!("task queue request returned HTTP {}", response.status),
             }),
-            Err(error) => {
+            Ok(Err(error)) => {
                 warn!(%node_id, %error, "peer task queue request failed");
                 unavailable_nodes.push(UnavailableTaskQueueNode {
                     node_id: node_id.to_string(),
                     error: "task queue request failed".to_string(),
                 });
             }
+            Err(_) => unavailable_nodes.push(UnavailableTaskQueueNode {
+                node_id: node_id.to_string(),
+                error: format!(
+                    "task queue request timed out after {CLUSTER_TASK_QUEUE_PEER_TIMEOUT_SECS}s"
+                ),
+            }),
         }
     }
 
     nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     unavailable_nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-    (
-        StatusCode::OK,
-        Json(ClusterTaskQueueSnapshot {
-            generated_at_unix_ms: unix_ts_ms(),
-            nodes,
-            unavailable_nodes,
-        }),
-    )
+    ClusterTaskQueueSnapshot {
+        generated_at_unix_ms: unix_ts_ms(),
+        nodes,
+        unavailable_nodes,
+    }
 }
 
 async fn storage_stats_current(

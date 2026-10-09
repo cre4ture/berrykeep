@@ -19915,6 +19915,7 @@ async fn build_test_state(
         node_hostname: None,
         store: store.clone(),
         cluster: Arc::new(Mutex::new(service)),
+        cluster_task_queue_cache: Arc::new(Mutex::new(None)),
         storage: super::ServerStorageRuntime {
             upload_chunk_ingestor,
             upload_sessions: super::new_upload_sessions_rwlock(super::UploadSessionStore {
@@ -20641,6 +20642,14 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
         .expect("repair queue should be present");
     assert_eq!(repair.pending, 2);
     assert_eq!(repair.active, 1);
+
+    let first_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
+    state
+        .maintenance
+        .inflight_requests
+        .store(9, std::sync::atomic::Ordering::Relaxed);
+    let cached_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
+    assert_eq!(cached_cluster_snapshot, first_cluster_snapshot);
 
     cleanup_test_state(&state).await;
 }
