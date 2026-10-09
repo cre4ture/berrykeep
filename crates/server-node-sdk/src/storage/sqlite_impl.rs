@@ -42,11 +42,12 @@ use super::{
     S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
     TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
-    current_media_cache_metadata, decode_gallery_labels, decode_version_index,
-    decompress_snapshot_json, effective_gallery_captured_at_unix, effective_gallery_gps,
-    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
-    gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
+    current_media_cache_metadata, decode_content_repair_task, decode_gallery_labels,
+    decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
+    effective_gallery_gps, encode_gallery_labels, gallery_index_media_status,
+    gallery_index_media_type_from_metadata, gallery_label_filter_matches_json,
+    gallery_label_predicates, gallery_map_bounded_resolution, gallery_media_type_for_path,
+    gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
     recoverable_history_listing_query, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload, version_index_head_projection,
@@ -254,6 +255,26 @@ impl SqliteMetadataStore {
                 )
             })?;
         Ok(db)
+    }
+
+    async fn discard_invalid_content_repair_tasks(
+        &self,
+        invalid_tasks: Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
+        if invalid_tasks.is_empty() {
+            return Ok(());
+        }
+        self.write_tx(move |db| {
+            let mut delete = db.prepare(
+                "DELETE FROM content_repair_tasks
+                 WHERE manifest_hash = ?1 AND CAST(task_json AS BLOB) = ?2",
+            )?;
+            for (manifest_hash, task_json) in invalid_tasks {
+                delete.execute(params![manifest_hash, task_json])?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn in_metadata_tx<T, F>(&self, f: F) -> Result<T>
@@ -2540,13 +2561,30 @@ impl MetadataStore for SqliteMetadataStore {
     }
 
     async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
-        self.read(|db| {
-            let mut statement =
-                db.prepare("SELECT task_json FROM content_repair_tasks ORDER BY manifest_hash")?;
-            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            rows.map(|row| Ok(serde_json::from_slice(&row?)?)).collect()
-        })
-        .await
+        let (tasks, invalid_tasks) = self
+            .read(|db| {
+                let mut statement = db.prepare(
+                    "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks
+                     ORDER BY manifest_hash",
+                )?;
+                let mut rows = statement.query([])?;
+                let mut tasks = Vec::new();
+                let mut invalid_tasks = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let manifest_hash = row.get::<_, String>(0)?;
+                    let task_json = row.get::<_, Vec<u8>>(1)?;
+                    if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
+                        tasks.push(task);
+                    } else {
+                        invalid_tasks.push((manifest_hash, task_json));
+                    }
+                }
+                Ok((tasks, invalid_tasks))
+            })
+            .await?;
+        self.discard_invalid_content_repair_tasks(invalid_tasks)
+            .await?;
+        Ok(tasks)
     }
 
     async fn load_content_repair_tasks_for_manifests(
@@ -2559,30 +2597,41 @@ impl MetadataStore for SqliteMetadataStore {
             return Ok(Vec::new());
         }
         let hashes = manifest_hashes.to_vec();
-        self.read(move |db| {
-            let mut tasks = Vec::<ContentRepairTask>::new();
-            for batch in hashes.chunks(CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE) {
-                let placeholders = std::iter::repeat_n("?", batch.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let statement = format!(
-                    "SELECT task_json FROM content_repair_tasks \
+        let (tasks, invalid_tasks) = self
+            .read(move |db| {
+                let mut tasks = Vec::<ContentRepairTask>::new();
+                let mut invalid_tasks = Vec::new();
+                for batch in hashes.chunks(CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE) {
+                    let placeholders = std::iter::repeat_n("?", batch.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let statement = format!(
+                        "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks \
                      WHERE manifest_hash IN ({placeholders}) ORDER BY manifest_hash"
-                );
-                let mut statement = db.prepare(&statement)?;
-                let mut rows = statement.query(params_from_iter(batch.iter()))?;
-                while let Some(row) = rows.next()? {
-                    tasks.push(serde_json::from_slice(&row.get::<_, Vec<u8>>(0)?)?);
+                    );
+                    let mut statement = db.prepare(&statement)?;
+                    let mut rows = statement.query(params_from_iter(batch.iter()))?;
+                    while let Some(row) = rows.next()? {
+                        let manifest_hash = row.get::<_, String>(0)?;
+                        let task_json = row.get::<_, Vec<u8>>(1)?;
+                        if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
+                            tasks.push(task);
+                        } else {
+                            invalid_tasks.push((manifest_hash, task_json));
+                        }
+                    }
                 }
-            }
-            tasks.sort_by(|left, right| {
-                left.reference
-                    .manifest_hash
-                    .cmp(&right.reference.manifest_hash)
-            });
-            Ok(tasks)
-        })
-        .await
+                tasks.sort_by(|left, right| {
+                    left.reference
+                        .manifest_hash
+                        .cmp(&right.reference.manifest_hash)
+                });
+                Ok((tasks, invalid_tasks))
+            })
+            .await?;
+        self.discard_invalid_content_repair_tasks(invalid_tasks)
+            .await?;
+        Ok(tasks)
     }
 
     async fn content_repair_task_hashes(&self) -> Result<Vec<String>> {
@@ -5939,21 +5988,31 @@ fn add_sqlite_column_if_missing(
 }
 
 fn backfill_content_repair_task_schedule(db: &Connection) -> Result<()> {
-    let tasks = {
+    let (tasks, invalid_hashes) = {
         let mut statement = db.prepare(
-            "SELECT manifest_hash, task_json FROM content_repair_tasks
+            "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks
              WHERE source_fingerprint = ?1",
         )?;
         let mut rows = statement.query([CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT])?;
         let mut tasks = Vec::new();
+        let mut invalid_hashes = Vec::new();
         while let Some(row) = rows.next()? {
-            tasks.push((
-                row.get::<_, String>(0)?,
-                serde_json::from_slice::<ContentRepairTask>(&row.get::<_, Vec<u8>>(1)?)?,
-            ));
+            let manifest_hash = row.get::<_, String>(0)?;
+            let task_json = row.get::<_, Vec<u8>>(1)?;
+            if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
+                tasks.push((manifest_hash, task));
+            } else {
+                invalid_hashes.push(manifest_hash);
+            }
         }
-        tasks
+        (tasks, invalid_hashes)
     };
+    for manifest_hash in invalid_hashes {
+        db.execute(
+            "DELETE FROM content_repair_tasks WHERE manifest_hash = ?1",
+            [manifest_hash],
+        )?;
+    }
     for (manifest_hash, task) in tasks {
         db.execute(
             "UPDATE content_repair_tasks
@@ -6385,6 +6444,90 @@ mod tests {
             )
             .expect("schema version should be restored");
         assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
+    }
+
+    #[test]
+    fn init_metadata_db_discards_unreadable_legacy_content_repair_tasks() {
+        let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+        init_metadata_db(&db).expect("metadata schema should initialize");
+        db.execute(
+            "INSERT INTO content_repair_tasks (
+                 manifest_hash, next_attempt_unix, source_fingerprint, task_json
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "broken-repair-task",
+                0,
+                CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT,
+                b"{not valid json".to_vec(),
+            ],
+        )
+        .expect("broken legacy task should insert");
+
+        init_metadata_db(&db).expect("a broken legacy task must not block startup");
+
+        let remaining: usize = db
+            .query_row("SELECT COUNT(*) FROM content_repair_tasks", [], |row| {
+                row.get(0)
+            })
+            .expect("repair task count should load");
+        assert_eq!(
+            remaining, 0,
+            "the regenerable corrupt task must be discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_content_repair_tasks_do_not_block_queue_reads() {
+        let metadata_db_path = sqlite_test_db_path("unreadable-content-repair-task");
+        let store = SqliteMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("sqlite metadata store should open");
+
+        for manifest_hash in ["broken-selected-task", "broken-all-task"] {
+            let db = store
+                .metadata_conn()
+                .expect("metadata connection should open");
+            db.execute(
+                "INSERT INTO content_repair_tasks (
+                     manifest_hash, next_attempt_unix, source_fingerprint, task_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![manifest_hash, 0, "current", b"{not valid json".to_vec()],
+            )
+            .expect("broken current task should insert");
+        }
+
+        assert!(
+            store
+                .load_content_repair_tasks_for_manifests(&["broken-selected-task".to_string()])
+                .await
+                .expect("a broken selected task must be skipped")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .content_repair_task_hashes()
+                .await
+                .expect("remaining queue hashes should load"),
+            vec!["broken-all-task".to_string()],
+            "the selected-task reader must discard only the row it decoded"
+        );
+        assert!(
+            store
+                .load_content_repair_tasks()
+                .await
+                .expect("a broken queue task must be skipped")
+                .is_empty()
+        );
+        assert!(
+            store
+                .content_repair_task_hashes()
+                .await
+                .expect("corrupt queue rows should be removed")
+                .is_empty()
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
     }
 
     #[test]

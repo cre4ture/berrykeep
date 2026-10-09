@@ -166,6 +166,31 @@ pub(crate) use media_cache::{MediaCacheWorker, current_media_cache_metadata};
 pub(crate) use media_cache::{grid_thumbnail_profile, thumbnail_profile_from_query};
 use media_tools::MediaToolPaths;
 
+pub(super) fn decode_content_repair_task(
+    manifest_hash: &str,
+    task_json: &[u8],
+) -> Option<ContentRepairTask> {
+    match serde_json::from_slice::<ContentRepairTask>(task_json) {
+        Ok(task) if task.reference.manifest_hash == manifest_hash => Some(task),
+        Ok(task) => {
+            warn!(
+                manifest_hash,
+                task_manifest_hash = task.reference.manifest_hash,
+                "discarding content repair task with a mismatched manifest hash"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                manifest_hash,
+                error = %error,
+                "discarding unreadable content repair task"
+            );
+            None
+        }
+    }
+}
+
 const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TOMBSTONE_MANIFEST_HASH: &str = "__tombstone__";
 const SLOW_STORAGE_WRITE_LOG_THRESHOLD_MS: u128 = 100;
