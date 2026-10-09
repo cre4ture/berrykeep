@@ -35,6 +35,10 @@ use base64::engine::general_purpose::{
     STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
 };
 use bytes::Bytes;
+use common::task_queue::{
+    ClusterTaskQueueNodeSnapshot, ClusterTaskQueueSnapshot, TaskQueueEntry,
+    UnavailableTaskQueueNode,
+};
 use common::traced_rwlock::{
     TracedRwLock, TracedRwLockConfig, TracedRwLockReadGuard, TracedRwLockWriteGuard,
 };
@@ -7878,6 +7882,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
     let public_cluster_info_api = Router::new()
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
+        .route("/cluster/task-queues", get(cluster_task_queues))
         .route("/cluster/replication/plan", get(replication_plan))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -8293,6 +8298,7 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/auth/device/enroll", post(enroll_client_device))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/nodes", get(list_nodes))
+        .route("/cluster/task-queues/local", get(local_task_queues))
         .route(
             "/cluster/scrub/activity",
             get(data_scrub_activity_status_internal),
@@ -28210,6 +28216,200 @@ async fn list_nodes(State(state): State<ServerState>) -> Json<Vec<NodeDescriptor
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
     Json(cluster.list_nodes())
+}
+
+async fn local_task_queue_snapshot(
+    state: &ServerState,
+    exclude_observer_request: bool,
+) -> ClusterTaskQueueNodeSnapshot {
+    let observed_requests = state.maintenance.inflight_requests.load(Ordering::Relaxed);
+    let observed_requests = if exclude_observer_request {
+        observed_requests.saturating_sub(1)
+    } else {
+        observed_requests
+    };
+    let upload_persistence_pending = state.storage.upload_sessions_dirty.load(Ordering::Relaxed);
+    let history_refresh_active = STORE_HISTORY_REFRESH_MAX_CONCURRENCY.saturating_sub(
+        state
+            .storage
+            .store_history_refresh_permits
+            .available_permits(),
+    );
+    let storage_stats_active =
+        usize::from(state.storage.storage_stats_runtime.lock().await.collecting);
+    let repair_activity = state.maintenance.repair_activity.lock().await;
+    let repair_active = repair_activity.active_runs.len();
+    drop(repair_activity);
+    let startup_repair_status = *state.maintenance.startup_repair_status.lock().await;
+    let autonomous_repair = state.maintenance.autonomous_post_write_repair.lock().await;
+    let repair_pending = autonomous_repair.pending_subjects.len()
+        + usize::from(startup_repair_status == StartupRepairStatus::Scheduled);
+    let repair_worker_active = repair_active
+        .max(usize::from(autonomous_repair.active))
+        .max(usize::from(
+            startup_repair_status == StartupRepairStatus::Running,
+        ));
+    drop(autonomous_repair);
+    let scrub_active = state
+        .maintenance
+        .data_scrub_activity
+        .lock()
+        .await
+        .active_runs
+        .len();
+    let map_import_active = usize::from(map_dataset_import::has_running_job(state).await)
+        + usize::from(natural_earth_import::is_running(state).await);
+
+    ClusterTaskQueueNodeSnapshot {
+        node_id: state.node_id.to_string(),
+        queues: vec![
+            TaskQueueEntry::observed(
+                "requests",
+                "API requests",
+                0,
+                observed_requests,
+                None,
+                Some("Requests currently executing on this node".to_string()),
+            ),
+            TaskQueueEntry::observed(
+                "upload_session_persistence",
+                "Upload session persistence",
+                upload_persistence_pending,
+                0,
+                Some(1),
+                Some("Dirty upload-session revisions waiting for durable persistence".to_string()),
+            ),
+            TaskQueueEntry::observed(
+                "store_history_refresh",
+                "Store history refresh",
+                0,
+                history_refresh_active,
+                Some(STORE_HISTORY_REFRESH_MAX_CONCURRENCY),
+                None,
+            ),
+            TaskQueueEntry::observed(
+                "replication_repair",
+                "Replication repair",
+                repair_pending,
+                repair_worker_active,
+                Some(1),
+                Some(format!("startup state: {startup_repair_status:?}")),
+            ),
+            TaskQueueEntry::observed(
+                "data_scrub",
+                "Data scrub",
+                0,
+                scrub_active,
+                Some(1),
+                Some(if state.maintenance.data_scrub_enabled {
+                    "Scheduled background scrub is enabled".to_string()
+                } else {
+                    "Scheduled background scrub is disabled".to_string()
+                }),
+            ),
+            TaskQueueEntry::observed(
+                "storage_stats",
+                "Storage statistics",
+                0,
+                storage_stats_active,
+                Some(1),
+                None,
+            ),
+            TaskQueueEntry::observed(
+                "map_imports",
+                "Map imports",
+                0,
+                map_import_active,
+                Some(2),
+                Some("Dataset and Natural Earth import workers".to_string()),
+            ),
+        ],
+    }
+}
+
+async fn local_task_queues(State(state): State<ServerState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(local_task_queue_snapshot(&state, false).await),
+    )
+}
+
+async fn cluster_task_queues(State(state): State<ServerState>) -> impl IntoResponse {
+    let local = local_task_queue_snapshot(&state, true).await;
+    let cluster_nodes = {
+        let mut cluster = state.cluster.lock().await;
+        cluster.update_health_and_detect_offline_transition();
+        cluster.list_nodes()
+    };
+    let mut nodes = vec![local];
+    let mut unavailable_nodes = cluster_nodes
+        .iter()
+        .filter(|node| node.node_id != state.node_id && node.status != cluster::NodeStatus::Online)
+        .map(|node| UnavailableTaskQueueNode {
+            node_id: node.node_id.to_string(),
+            error: "node is offline".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let online_peers = cluster_nodes
+        .into_iter()
+        .filter(|node| node.node_id != state.node_id && node.status == cluster::NodeStatus::Online)
+        .collect::<Vec<_>>();
+
+    let peer_results = futures_util::future::join_all(online_peers.into_iter().map(|peer| {
+        let state = state.clone();
+        async move {
+            let result = execute_peer_request(
+                &state,
+                &peer,
+                reqwest::Method::GET,
+                "/cluster/task-queues/local",
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+            (peer.node_id, result)
+        }
+    }))
+    .await;
+
+    for (node_id, result) in peer_results {
+        match result {
+            Ok(response) if response.is_success() => {
+                match response.json::<ClusterTaskQueueNodeSnapshot>() {
+                    Ok(snapshot) => nodes.push(snapshot),
+                    Err(error) => {
+                        warn!(%node_id, %error, "failed decoding peer task queue snapshot");
+                        unavailable_nodes.push(UnavailableTaskQueueNode {
+                            node_id: node_id.to_string(),
+                            error: "invalid task queue response".to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(response) => unavailable_nodes.push(UnavailableTaskQueueNode {
+                node_id: node_id.to_string(),
+                error: format!("task queue request returned HTTP {}", response.status),
+            }),
+            Err(error) => {
+                warn!(%node_id, %error, "peer task queue request failed");
+                unavailable_nodes.push(UnavailableTaskQueueNode {
+                    node_id: node_id.to_string(),
+                    error: "task queue request failed".to_string(),
+                });
+            }
+        }
+    }
+
+    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    unavailable_nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    (
+        StatusCode::OK,
+        Json(ClusterTaskQueueSnapshot {
+            generated_at_unix_ms: unix_ts_ms(),
+            nodes,
+            unavailable_nodes,
+        }),
+    )
 }
 
 async fn storage_stats_current(

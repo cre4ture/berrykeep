@@ -20598,6 +20598,48 @@ impl DataScrubAutoRepairCorruptionKind {
     }
 }
 
+#[tokio::test]
+async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state
+        .maintenance
+        .inflight_requests
+        .store(4, std::sync::atomic::Ordering::Relaxed);
+    state
+        .storage
+        .upload_sessions_dirty
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut repair = state.maintenance.autonomous_post_write_repair.lock().await;
+        repair.pending_subjects.insert("photos/a.jpg".to_string());
+        repair.active = true;
+    }
+
+    let snapshot = super::local_task_queue_snapshot(&state, false).await;
+
+    let requests = snapshot
+        .queues
+        .iter()
+        .find(|queue| queue.id == "requests")
+        .expect("request queue should be present");
+    assert_eq!(requests.active, 4);
+    let persistence = snapshot
+        .queues
+        .iter()
+        .find(|queue| queue.id == "upload_session_persistence")
+        .expect("persistence queue should be present");
+    assert_eq!(persistence.pending, 3);
+    let repair = snapshot
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(repair.pending, 2);
+    assert_eq!(repair.active, 1);
+
+    cleanup_test_state(&state).await;
+}
+
 async fn choose_locally_placed_key(state: &ServerState, prefix: &str) -> String {
     let cluster = state.cluster.lock().await;
     (0..256)
