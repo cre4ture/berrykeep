@@ -3,6 +3,8 @@ package io.berrykeep.android.ui
 import androidx.compose.runtime.Immutable
 import io.berrykeep.android.data.AppConnectionStatus
 import io.berrykeep.android.data.ConnectionRouteSnapshot
+import io.berrykeep.android.data.ClusterTaskQueueSnapshot
+import io.berrykeep.android.data.TaskQueueEntry
 import io.berrykeep.android.data.EmbeddedWebUiSession
 import io.berrykeep.android.data.FolderSyncConfig
 import io.berrykeep.android.data.FolderSyncServiceStatus
@@ -16,6 +18,9 @@ data class HomeUiState(
     val folderSyncStatus: FolderSyncServiceStatus,
     val globalFolderSyncStatus: GlobalFolderSyncStatus,
     val appConnectionStatus: AppConnectionStatus,
+    val clientTaskQueues: List<TaskQueueEntry>,
+    val clusterTaskQueues: ClusterTaskQueueSnapshot?,
+    val clusterTaskQueuesError: String?,
 )
 
 internal fun MainUiState.toHomeUiState(): HomeUiState =
@@ -25,7 +30,37 @@ internal fun MainUiState.toHomeUiState(): HomeUiState =
         folderSyncStatus = folderSyncStatus,
         globalFolderSyncStatus = globalFolderSyncStatus,
         appConnectionStatus = appConnectionStatus,
+        clientTaskQueues = buildClientTaskQueues(this),
+        clusterTaskQueues = clusterTaskQueues,
+        clusterTaskQueuesError = clusterTaskQueuesError,
     )
+
+internal fun buildClientTaskQueues(state: MainUiState): List<TaskQueueEntry> {
+    val foregroundActive = listOf(
+        state.loading,
+        state.connectionRoutesLoading,
+        state.timingMeasurementResetting,
+        state.timingStoreIndexTestRunning,
+    ).count { it }.toLong()
+    val syncActive = state.globalFolderSyncStatus.syncingProfileCount
+    val syncPending = state.globalFolderSyncStatus.waitingProfileCount +
+        state.folderSyncStatus.startingProfileCount
+    val probeActive = if (state.titleLatencyStatus.state == "pending") 1L else 0L
+    return listOf(
+        taskQueueEntry("foreground", "Foreground operations", 0, foregroundActive),
+        taskQueueEntry("folder_sync", "Folder sync", syncPending, syncActive),
+        taskQueueEntry("latency_probe", "Connection probe", 0, probeActive),
+    )
+}
+
+private fun taskQueueEntry(id: String, label: String, pending: Long, active: Long): TaskQueueEntry {
+    val state = when {
+        pending == 0L && active == 0L -> "idle"
+        pending > 0L && active == 0L -> "waiting"
+        else -> "running"
+    }
+    return TaskQueueEntry(id = id, label = label, pending = pending, active = active, state = state)
+}
 
 @Immutable
 data class SyncUiState(

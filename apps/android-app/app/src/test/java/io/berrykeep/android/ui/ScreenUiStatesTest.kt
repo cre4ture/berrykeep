@@ -18,6 +18,17 @@ class ScreenUiStatesTest {
     }
 
     @Test
+    fun homeProjectionIncludesObservableNonLibraryClientWork() {
+        val projected = base.copy(
+            connectionRoutesLoading = true,
+            timingStoreIndexTestRunning = true,
+        ).toHomeUiState()
+
+        assertEquals(2L, projected.clientTaskQueues.first { it.id == "foreground" }.active)
+        assertEquals("running", projected.clientTaskQueues.first { it.id == "foreground" }.state)
+    }
+
+    @Test
     fun syncProjectionIgnoresConnectionChanges() {
         assertEquals(
             base.toSyncUiState(),

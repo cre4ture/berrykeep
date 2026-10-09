@@ -1,5 +1,6 @@
 import { fetchJson, isHttpErrorStatus } from "../shared/http";
 import type { GalleryMapConfigurationResponse } from "../shared/map-config";
+import type { ClusterTaskQueueSnapshot } from "../shared/task-queue";
 import {
   galleryMapClusterCellSizeParameter,
   galleryMapClusterZoomParameters
@@ -145,6 +146,15 @@ export async function getClientHealth(options?: ClientDiagnosticRequestOptions):
 
 export async function getClientClusterStatus(options?: ClientDiagnosticRequestOptions): Promise<JsonObject> {
   return fetchJson<JsonObject>(apiV1("/cluster/status"), diagnosticRequestInit(options));
+}
+
+export async function getClientClusterTaskQueues(
+  options?: ClientDiagnosticRequestOptions
+): Promise<ClusterTaskQueueSnapshot> {
+  return fetchJson<ClusterTaskQueueSnapshot>(
+    apiV1("/cluster/task-queues"),
+    diagnosticRequestInit(options)
+  );
 }
 
 export async function getClientConnectionRoutes(): Promise<ClientConnectionRouteSnapshot> {
