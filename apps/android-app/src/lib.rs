@@ -10,6 +10,8 @@ use bytes::Bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{PoisonError, mpsc};
+    use std::time::Duration;
 
     #[test]
     fn embedded_web_ui_diagnostic_is_normalized_before_native_log_export() {
@@ -441,6 +443,242 @@ mod tests {
     }
 
     #[test]
+    fn folder_sync_status_and_other_lifecycle_calls_remain_available_while_stopping_worker_joins() {
+        let lifecycle = Arc::new(AndroidFolderSyncLifecycle::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let (cancellation_observed_tx, cancellation_observed_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        let worker_running = running.clone();
+        let worker = thread::spawn(move || {
+            while worker_running.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            cancellation_observed_tx
+                .send(())
+                .expect("test must wait for cancellation");
+            release_worker_rx
+                .recv()
+                .expect("test must release the worker before joining");
+        });
+        lifecycle
+            .manager
+            .lock()
+            .expect("manager lock must be available")
+            .runs
+            .insert(
+                "photos".to_string(),
+                AndroidFolderSyncRun {
+                    running,
+                    thread: worker,
+                },
+            );
+
+        let lifecycle_to_stop = lifecycle.clone();
+        let stopping = thread::spawn(move || lifecycle_to_stop.stop_profile("photos"));
+        cancellation_observed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop must signal the worker before waiting for it");
+        assert!(
+            lifecycle.has_active_profiles(),
+            "a stopping worker must remain visible to one-shot admission"
+        );
+
+        let (status_tx, status_rx) = mpsc::channel();
+        let lifecycle_for_status = lifecycle.clone();
+        thread::spawn(move || {
+            status_tx
+                .send(lifecycle_for_status.status_json())
+                .expect("test must wait for the status result");
+        });
+        assert!(
+            status_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("status lookup must not wait for worker termination")
+                .is_ok()
+        );
+
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel();
+        let lifecycle_for_other_profile = lifecycle.clone();
+        thread::spawn(move || {
+            lifecycle_tx
+                .send(lifecycle_for_other_profile.stop_profile("documents"))
+                .expect("test must wait for the other lifecycle result");
+        });
+        assert!(
+            lifecycle_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("other profile lifecycle call must not wait for worker termination")
+                .is_ok()
+        );
+
+        release_worker_tx
+            .send(())
+            .expect("worker must still be waiting for release");
+        stopping
+            .join()
+            .expect("stop thread must not panic")
+            .expect("stop must not fail");
+        assert!(!lifecycle.has_active_profiles());
+    }
+
+    #[test]
+    fn stop_all_signals_every_worker_before_waiting_for_any_worker() {
+        let lifecycle = Arc::new(AndroidFolderSyncLifecycle::new());
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut runs = BTreeMap::new();
+        for profile_id in ["photos", "documents"] {
+            let running = Arc::new(AtomicBool::new(true));
+            let worker_running = running.clone();
+            let worker_stopped_tx = stopped_tx.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            releases.push(release_tx);
+            let profile_id = profile_id.to_string();
+            let worker_profile_id = profile_id.clone();
+            let worker = thread::spawn(move || {
+                while worker_running.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                worker_stopped_tx
+                    .send(worker_profile_id)
+                    .expect("test must observe worker cancellation");
+                release_rx.recv().expect("test must release worker");
+            });
+            runs.insert(
+                profile_id.clone(),
+                AndroidFolderSyncRun {
+                    running,
+                    thread: worker,
+                },
+            );
+        }
+        lifecycle
+            .manager
+            .lock()
+            .expect("manager lock must be available")
+            .runs = runs;
+
+        let lifecycle_to_stop = lifecycle.clone();
+        let stopping = thread::spawn(move || lifecycle_to_stop.stop_all());
+        let first = stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first worker must be cancelled");
+        let second = stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("all workers must be cancelled before joining");
+        assert_ne!(first, second);
+        for release in releases {
+            release.send(()).expect("worker must await release");
+        }
+        stopping
+            .join()
+            .expect("stop-all thread must not panic")
+            .expect("stop-all must not fail");
+    }
+
+    #[test]
+    fn folder_sync_registration_stops_an_unregistered_worker_when_manager_is_poisoned() {
+        let lifecycle = Arc::new(AndroidFolderSyncLifecycle::new());
+        lifecycle
+            .manager
+            .lock()
+            .expect("manager lock must be available")
+            .stopping_profiles
+            .insert("photos".to_string());
+        let lifecycle_to_poison = lifecycle.clone();
+        assert!(
+            thread::spawn(move || {
+                let _manager = lifecycle_to_poison
+                    .manager
+                    .lock()
+                    .expect("manager must be lockable before poisoning");
+                panic!("poison manager lock");
+            })
+            .join()
+            .is_err()
+        );
+
+        let running = Arc::new(AtomicBool::new(true));
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let worker_running = running.clone();
+        let worker = thread::spawn(move || {
+            while worker_running.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+            stopped_tx
+                .send(())
+                .expect("test must observe worker cancellation");
+        });
+
+        let error = register_folder_sync_run(
+            &lifecycle.manager,
+            "photos".to_string(),
+            AndroidFolderSyncRun {
+                running,
+                thread: worker,
+            },
+        )
+        .expect_err("poisoned manager must reject run registration");
+
+        assert!(
+            error
+                .to_string()
+                .contains("folder sync manager lock poisoned")
+        );
+        stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("registration failure must stop the unregistered worker");
+        let manager = lifecycle
+            .manager
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(manager.runs.is_empty());
+        assert!(manager.stopping_profiles.is_empty());
+    }
+
+    #[test]
+    fn replacement_registration_keeps_a_stopping_profile_active_without_a_visibility_gap() {
+        let lifecycle = AndroidFolderSyncLifecycle::new();
+        lifecycle
+            .manager
+            .lock()
+            .expect("manager lock must be available")
+            .stopping_profiles
+            .insert("photos".to_string());
+        assert!(lifecycle.has_active_profiles());
+
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = running.clone();
+        let worker = thread::spawn(move || {
+            while worker_running.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+        });
+        register_folder_sync_run(
+            &lifecycle.manager,
+            "photos".to_string(),
+            AndroidFolderSyncRun {
+                running,
+                thread: worker,
+            },
+        )
+        .expect("replacement run must register");
+        assert!(lifecycle.has_active_profiles());
+
+        lifecycle
+            .manager
+            .lock()
+            .expect("manager lock must be available")
+            .finished_stopping("photos");
+        assert!(lifecycle.has_active_profiles());
+
+        lifecycle
+            .stop_profile("photos")
+            .expect("replacement run must stop");
+        assert!(!lifecycle.has_active_profiles());
+    }
+
+    #[test]
     fn android_client_rejects_legacy_direct_server_url() {
         let error = normalized_bootstrap_json("https://storage.example.test")
             .expect_err("a direct server URL must not be accepted as app configuration");
@@ -470,11 +708,11 @@ use mobile_client_core::{
     MobileIdentityPersistence, MobileWebUiSession, MobileWebUiSurface,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use sync_agent_core::{
     FolderAgentRuntimeMetrics, FolderAgentRuntimeOptions, FolderAgentRuntimeStatus,
@@ -1317,141 +1555,145 @@ struct AndroidFolderSyncRun {
 
 struct AndroidFolderSyncManager {
     runs: BTreeMap<String, AndroidFolderSyncRun>,
-    status: Arc<Mutex<AndroidFolderSyncServiceStatus>>,
+    stopping_profiles: BTreeSet<String>,
+    profile_operations: BTreeMap<String, Weak<Mutex<()>>>,
 }
 
 impl AndroidFolderSyncManager {
     fn new() -> Self {
         Self {
             runs: BTreeMap::new(),
+            stopping_profiles: BTreeSet::new(),
+            profile_operations: BTreeMap::new(),
+        }
+    }
+
+    fn take_run_for_stop(&mut self, profile_id: &str) -> Option<AndroidFolderSyncRun> {
+        let run = self.runs.remove(profile_id);
+        if run.is_some() {
+            self.stopping_profiles.insert(profile_id.to_string());
+        }
+        run
+    }
+
+    fn finished_stopping(&mut self, profile_id: &str) {
+        self.stopping_profiles.remove(profile_id);
+    }
+
+    fn profile_operation_lock(&mut self, profile_id: &str) -> Arc<Mutex<()>> {
+        self.profile_operations
+            .retain(|_, operation| operation.strong_count() > 0);
+        if let Some(operation) = self
+            .profile_operations
+            .get(profile_id)
+            .and_then(Weak::upgrade)
+        {
+            return operation;
+        }
+
+        let operation = Arc::new(Mutex::new(()));
+        self.profile_operations
+            .insert(profile_id.to_string(), Arc::downgrade(&operation));
+        operation
+    }
+}
+
+struct AndroidFolderSyncLifecycle {
+    manager: Mutex<AndroidFolderSyncManager>,
+    status: Arc<Mutex<AndroidFolderSyncServiceStatus>>,
+    operation_gate: RwLock<()>,
+}
+
+impl AndroidFolderSyncLifecycle {
+    fn new() -> Self {
+        Self {
+            manager: Mutex::new(AndroidFolderSyncManager::new()),
             status: Arc::new(Mutex::new(AndroidFolderSyncServiceStatus {
                 service_state: "stopped".to_string(),
                 service_message: "Continuous sync is stopped".to_string(),
                 updated_unix_ms: now_unix_ms(),
                 ..AndroidFolderSyncServiceStatus::default()
             })),
+            operation_gate: RwLock::new(()),
         }
     }
 
     fn start_profile(
-        &mut self,
+        &self,
         profile_id: String,
         label: String,
         options: FolderAgentRuntimeOptions,
     ) -> Result<()> {
         init_android_tracing();
 
-        let previous = self.runs.remove(&profile_id);
+        let _operation_gate = self
+            .operation_gate
+            .read()
+            .map_err(|_| anyhow::anyhow!("folder sync lifecycle gate poisoned"))?;
+        let profile_operation = self
+            .manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .profile_operation_lock(&profile_id);
+        let _profile_operation = profile_operation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync profile operation lock poisoned"))?;
+        let previous = self
+            .manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .take_run_for_stop(&profile_id);
         if let Some(previous) = previous {
             stop_folder_sync_run(previous);
         }
+        self.manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .stopping_profiles
+            .insert(profile_id.clone());
 
-        let connection_target = describe_connection_target(
-            options.server_base_url.as_deref(),
-            options.client_bootstrap_json.as_deref(),
-        )
-        .ok();
-
-        update_profile_status(
-            &self.status,
-            build_profile_status(
-                profile_id.clone(),
-                label.clone(),
-                &options,
-                connection_target.as_deref(),
-                "starting",
-                "startup",
-                "initializing",
-                "Starting continuous sync",
-                None,
-                None,
-            ),
-        );
-        refresh_service_summary(&self.status);
-
-        let running = Arc::new(AtomicBool::new(true));
-        let status_store = self.status.clone();
-        let callback_profile_id = profile_id.clone();
-        let callback_label = label.clone();
-        let status_callback: FolderAgentStatusCallback =
-            Arc::new(move |status: FolderAgentRuntimeStatus| {
-                update_profile_status(
-                    &status_store,
-                    profile_status_from_runtime(
-                        callback_profile_id.clone(),
-                        callback_label.clone(),
-                        status,
-                    ),
-                );
-                refresh_service_summary(&status_store);
-            });
-
-        let thread_profile_id = profile_id.clone();
-        let thread_label = label.clone();
-        let thread_connection_target = connection_target.clone();
-        let thread_running = running.clone();
-        let status_store = self.status.clone();
-        let thread = thread::Builder::new()
-            .name(format!("berrykeep-folder-sync-{profile_id}"))
-            .spawn(move || {
-                let result = if options.local_tree_uri.is_some() {
-                    android_saf_backend::run_backend_with_control(
-                        &options,
-                        thread_running,
-                        Some(status_callback),
-                    )
-                } else {
-                    run_folder_agent_with_control(
-                        &options,
-                        thread_running,
-                        false,
-                        Some(status_callback),
-                    )
-                };
-                if let Err(error) = result {
-                    let needs_fallback_error = status_store
-                        .lock()
-                        .ok()
-                        .and_then(|status| {
-                            status
-                                .profiles
-                                .iter()
-                                .find(|profile| profile.profile_id == thread_profile_id)
-                                .cloned()
-                        })
-                        .is_none_or(|profile| profile.state != "error");
-                    if needs_fallback_error {
-                        update_profile_status(
-                            &status_store,
-                            build_profile_status(
-                                thread_profile_id,
-                                thread_label,
-                                &options,
-                                thread_connection_target.as_deref(),
-                                "error",
-                                "error",
-                                "failed",
-                                format!("{error:#}"),
-                                None,
-                                Some(format!("{error:#}")),
-                            ),
-                        );
-                    }
-                    refresh_service_summary(&status_store);
-                }
-            })
-            .context("failed to spawn continuous folder sync thread")?;
-
-        self.runs
-            .insert(profile_id, AndroidFolderSyncRun { running, thread });
-        refresh_service_summary(&self.status);
+        let run = match start_folder_sync_run(&self.status, profile_id.clone(), label, options) {
+            Ok(run) => run,
+            Err(error) => {
+                self.manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+                    .finished_stopping(&profile_id);
+                return Err(error);
+            }
+        };
+        register_folder_sync_run(&self.manager, profile_id.clone(), run)?;
+        self.manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .finished_stopping(&profile_id);
         Ok(())
     }
 
-    fn stop_profile(&mut self, profile_id: &str) {
-        let previous = self.runs.remove(profile_id);
+    fn stop_profile(&self, profile_id: &str) -> Result<()> {
+        let _operation_gate = self
+            .operation_gate
+            .read()
+            .map_err(|_| anyhow::anyhow!("folder sync lifecycle gate poisoned"))?;
+        let profile_operation = self
+            .manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .profile_operation_lock(profile_id);
+        let _profile_operation = profile_operation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync profile operation lock poisoned"))?;
+        let previous = self
+            .manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .take_run_for_stop(profile_id);
         if let Some(previous) = previous {
             stop_folder_sync_run(previous);
+            self.manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+                .finished_stopping(profile_id);
         }
         if let Ok(mut status) = self.status.lock() {
             status
@@ -1460,13 +1702,34 @@ impl AndroidFolderSyncManager {
             status.updated_unix_ms = now_unix_ms();
         }
         refresh_service_summary(&self.status);
+        Ok(())
     }
 
-    fn stop_all(&mut self) {
-        let runs = std::mem::take(&mut self.runs);
+    fn stop_all(&self) -> Result<()> {
+        let _operation_gate = self
+            .operation_gate
+            .write()
+            .map_err(|_| anyhow::anyhow!("folder sync lifecycle gate poisoned"))?;
+        let runs = {
+            let mut manager = self
+                .manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?;
+            let runs = std::mem::take(&mut manager.runs);
+            manager.stopping_profiles.extend(runs.keys().cloned());
+            runs
+        };
+        for run in runs.values() {
+            request_folder_sync_stop(run);
+        }
         for (_, run) in runs {
             stop_folder_sync_run(run);
         }
+        self.manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
+            .stopping_profiles
+            .clear();
         if let Ok(mut status) = self.status.lock() {
             *status = AndroidFolderSyncServiceStatus {
                 service_state: "stopped".to_string(),
@@ -1475,17 +1738,166 @@ impl AndroidFolderSyncManager {
                 ..AndroidFolderSyncServiceStatus::default()
             };
         }
+        Ok(())
+    }
+
+    fn status_json(&self) -> Result<String> {
+        let status = self
+            .status
+            .lock()
+            .map_err(|_| anyhow::anyhow!("folder sync status lock poisoned"))?
+            .clone();
+        serde_json::to_string(&status).context("failed to serialize continuous folder sync status")
+    }
+
+    fn has_active_profiles(&self) -> bool {
+        self.manager
+            .lock()
+            .map(|manager| !manager.runs.is_empty() || !manager.stopping_profiles.is_empty())
+            .unwrap_or(false)
     }
 }
 
-fn folder_sync_manager() -> &'static Mutex<AndroidFolderSyncManager> {
-    static MANAGER: OnceLock<Mutex<AndroidFolderSyncManager>> = OnceLock::new();
-    MANAGER.get_or_init(|| Mutex::new(AndroidFolderSyncManager::new()))
+fn start_folder_sync_run(
+    status_store: &Arc<Mutex<AndroidFolderSyncServiceStatus>>,
+    profile_id: String,
+    label: String,
+    options: FolderAgentRuntimeOptions,
+) -> Result<AndroidFolderSyncRun> {
+    let connection_target = describe_connection_target(
+        options.server_base_url.as_deref(),
+        options.client_bootstrap_json.as_deref(),
+    )
+    .ok();
+
+    update_profile_status(
+        status_store,
+        build_profile_status(
+            profile_id.clone(),
+            label.clone(),
+            &options,
+            connection_target.as_deref(),
+            "starting",
+            "startup",
+            "initializing",
+            "Starting continuous sync",
+            None,
+            None,
+        ),
+    );
+    refresh_service_summary(status_store);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let callback_status_store = status_store.clone();
+    let callback_profile_id = profile_id.clone();
+    let callback_label = label.clone();
+    let status_callback: FolderAgentStatusCallback =
+        Arc::new(move |status: FolderAgentRuntimeStatus| {
+            update_profile_status(
+                &callback_status_store,
+                profile_status_from_runtime(
+                    callback_profile_id.clone(),
+                    callback_label.clone(),
+                    status,
+                ),
+            );
+            refresh_service_summary(&callback_status_store);
+        });
+
+    let thread_profile_id = profile_id.clone();
+    let thread_label = label.clone();
+    let thread_connection_target = connection_target.clone();
+    let thread_running = running.clone();
+    let status_store = status_store.clone();
+    let thread = thread::Builder::new()
+        .name(format!("berrykeep-folder-sync-{profile_id}"))
+        .spawn(move || {
+            let result = if options.local_tree_uri.is_some() {
+                android_saf_backend::run_backend_with_control(
+                    &options,
+                    thread_running,
+                    Some(status_callback),
+                )
+            } else {
+                run_folder_agent_with_control(
+                    &options,
+                    thread_running,
+                    false,
+                    Some(status_callback),
+                )
+            };
+            if let Err(error) = result {
+                let needs_fallback_error = status_store
+                    .lock()
+                    .ok()
+                    .and_then(|status| {
+                        status
+                            .profiles
+                            .iter()
+                            .find(|profile| profile.profile_id == thread_profile_id)
+                            .cloned()
+                    })
+                    .is_none_or(|profile| profile.state != "error");
+                if needs_fallback_error {
+                    update_profile_status(
+                        &status_store,
+                        build_profile_status(
+                            thread_profile_id,
+                            thread_label,
+                            &options,
+                            thread_connection_target.as_deref(),
+                            "error",
+                            "error",
+                            "failed",
+                            format!("{error:#}"),
+                            None,
+                            Some(format!("{error:#}")),
+                        ),
+                    );
+                }
+                refresh_service_summary(&status_store);
+            }
+        })
+        .context("failed to spawn continuous folder sync thread")?;
+
+    Ok(AndroidFolderSyncRun { running, thread })
+}
+
+fn register_folder_sync_run(
+    manager: &Mutex<AndroidFolderSyncManager>,
+    profile_id: String,
+    run: AndroidFolderSyncRun,
+) -> Result<()> {
+    match manager.lock() {
+        Ok(mut manager) => {
+            let displaced = manager.runs.insert(profile_id, run);
+            drop(manager);
+            if let Some(displaced) = displaced {
+                stop_folder_sync_run(displaced);
+            }
+            Ok(())
+        }
+        Err(poisoned) => {
+            // An unregistered run cannot be reached by stop_profile or stop_all.
+            poisoned.into_inner().finished_stopping(&profile_id);
+            stop_folder_sync_run(run);
+            Err(anyhow::anyhow!("folder sync manager lock poisoned"))
+        }
+    }
+}
+
+fn folder_sync_lifecycle() -> &'static AndroidFolderSyncLifecycle {
+    static LIFECYCLE: OnceLock<AndroidFolderSyncLifecycle> = OnceLock::new();
+    LIFECYCLE.get_or_init(AndroidFolderSyncLifecycle::new)
 }
 
 fn stop_folder_sync_run(run: AndroidFolderSyncRun) {
-    run.running.store(false, Ordering::SeqCst);
+    request_folder_sync_stop(&run);
     let _ = run.thread.join();
+}
+
+fn request_folder_sync_stop(run: &AndroidFolderSyncRun) {
+    run.running.store(false, Ordering::SeqCst);
 }
 
 fn update_profile_status(
@@ -1627,16 +2039,7 @@ fn usize_to_u64(value: usize) -> u64 {
 }
 
 fn current_folder_sync_status_json() -> Result<String> {
-    let status_store = folder_sync_manager()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-        .status
-        .clone();
-    let status = status_store
-        .lock()
-        .map_err(|_| anyhow::anyhow!("folder sync status lock poisoned"))?
-        .clone();
-    serde_json::to_string(&status).context("failed to serialize continuous folder sync status")
+    folder_sync_lifecycle().status_json()
 }
 
 fn start_embedded_web_ui(
@@ -3179,10 +3582,7 @@ pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_st
             ui_bind: None,
         };
 
-        folder_sync_manager()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-            .start_profile(profile_id, label, options)
+        folder_sync_lifecycle().start_profile(profile_id, label, options)
     })();
 
     if let Err(err) = result {
@@ -3204,11 +3604,7 @@ pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_st
 ) {
     let result = (|| -> Result<()> {
         let profile_id: String = env.get_string(&profile_id)?.into();
-        folder_sync_manager()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-            .stop_profile(&profile_id);
-        Ok(())
+        folder_sync_lifecycle().stop_profile(&profile_id)
     })();
 
     if let Err(err) = result {
@@ -3227,13 +3623,7 @@ pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_st
     mut env: JNIEnv,
     _class: JClass,
 ) {
-    let result = (|| -> Result<()> {
-        folder_sync_manager()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("folder sync manager lock poisoned"))?
-            .stop_all();
-        Ok(())
-    })();
+    let result = folder_sync_lifecycle().stop_all();
 
     if let Err(err) = result {
         throw_java_error(
@@ -3347,10 +3737,6 @@ pub unsafe extern "system" fn Java_io_berrykeep_android_data_RustClientBridge_ha
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
-    let active = folder_sync_manager()
-        .lock()
-        .ok()
-        .map(|manager| !manager.runs.is_empty())
-        .unwrap_or(false);
+    let active = folder_sync_lifecycle().has_active_profiles();
     if active { 1 } else { 0 }
 }
