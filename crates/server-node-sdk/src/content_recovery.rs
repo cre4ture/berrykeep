@@ -247,6 +247,65 @@ pub(crate) async fn required_manifests(
         .collect()
 }
 
+pub(crate) async fn retained_content_snapshot(state: &ServerState) -> Result<Arc<RetainedContent>> {
+    let generation = state
+        .maintenance
+        .retained_content_generation
+        .load(Ordering::SeqCst);
+    if let Some(content) = state
+        .maintenance
+        .retained_content_cache
+        .lock()
+        .await
+        .as_ref()
+        .filter(|cache| cache.is_valid_for(generation))
+        .map(|cache| Arc::clone(&cache.content))
+    {
+        return Ok(content);
+    }
+
+    // Serialize only catalog recomputation, never the global store. The
+    // metadata loader is cloneable and performs its I/O outside that guard.
+    let _refresh_guard = state.maintenance.retained_content_refresh_lock.lock().await;
+    let generation = state
+        .maintenance
+        .retained_content_generation
+        .load(Ordering::SeqCst);
+    if let Some(content) = state
+        .maintenance
+        .retained_content_cache
+        .lock()
+        .await
+        .as_ref()
+        .filter(|cache| cache.is_valid_for(generation))
+        .map(|cache| Arc::clone(&cache.content))
+    {
+        return Ok(content);
+    }
+
+    let loader = {
+        let store = read_store(state, "content_recovery.catalog_snapshot").await;
+        store.retained_content_loader()
+    };
+    let content = Arc::new(loader.load().await?);
+    if state
+        .maintenance
+        .retained_content_generation
+        .load(Ordering::SeqCst)
+        != generation
+    {
+        // The loaded snapshot is still self-consistent for this caller, but a
+        // concurrent mutation made it unsuitable for reuse. Avoid starving
+        // repair behind a continuously changing namespace.
+        return Ok(content);
+    }
+    *state.maintenance.retained_content_cache.lock().await = Some(RetainedContentCache {
+        generation,
+        content: Arc::clone(&content),
+    });
+    Ok(content)
+}
+
 async fn request_bytes(state: &ServerState, peer: &NodeDescriptor, path: &str) -> Result<Vec<u8>> {
     let response = tokio::time::timeout(
         PEER_FETCH_TIMEOUT,
@@ -688,12 +747,8 @@ async fn repair_subjects_inner(
     limit: Option<usize>,
     report: &mut replication::ReplicationRepairReport,
 ) -> Result<()> {
-    let retained_loader = {
-        let store = read_store(state, "content_recovery.catalog").await;
-        store.retained_content_loader()
-    };
-    let retained = retained_loader.load().await?;
-    let required = required_manifests(state, &retained).await;
+    let retained = retained_content_snapshot(state).await?;
+    let required = required_manifests(state, retained.as_ref()).await;
     let fingerprint = source_fingerprint(state).await;
     let mut references = BTreeMap::new();
     for subject in subjects {
@@ -971,12 +1026,8 @@ pub(crate) async fn resume_pending(state: &ServerState) -> Result<()> {
 /// Queue them independently of the legacy replica map; the worker discovers bytes.
 #[cfg(test)]
 pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
-    let retained_loader = {
-        let store = read_store(state, "content_recovery.audit").await;
-        store.retained_content_loader()
-    };
-    let retained = retained_loader.load().await?;
-    audit_assigned_from_retained(state, &retained).await
+    let retained = retained_content_snapshot(state).await?;
+    audit_assigned_from_retained(state, retained.as_ref()).await
 }
 
 /// Audits a caller-owned retained-content snapshot so one background pass does

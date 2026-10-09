@@ -137,6 +137,54 @@ run_on_main_metadata_backends!(
     retained_catalog_loading_does_not_hold_the_store_lock_turso
 );
 
+async fn retained_catalog_snapshot_is_reused_until_invalidated_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let key = format!("retained-catalog-cache-{}", backend.suffix());
+    seed_subject_version(
+        &state,
+        &key,
+        "v1",
+        b"retained catalog cache bytes".to_vec(),
+        vec![],
+    )
+    .await;
+
+    let first = crate::content_recovery::retained_content_snapshot(&state)
+        .await
+        .unwrap();
+    let writer = lock_store(&state, "test.recovery.retained_catalog_cached_writer").await;
+    let second = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::content_recovery::retained_content_snapshot(&state),
+    )
+    .await
+    .expect("a cached catalog must not wait for the global store lock")
+    .unwrap();
+    drop(writer);
+
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "repair passes in one cache generation must share the decoded catalog"
+    );
+
+    crate::publish_namespace_change(&state);
+    let refreshed = crate::content_recovery::retained_content_snapshot(&state)
+        .await
+        .unwrap();
+    assert!(
+        !Arc::ptr_eq(&first, &refreshed),
+        "namespace changes must invalidate the decoded retained catalog"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    retained_catalog_snapshot_is_reused_until_invalidated_impl,
+    retained_catalog_snapshot_is_reused_until_invalidated,
+    retained_catalog_snapshot_is_reused_until_invalidated_turso
+);
+
 async fn durable_recovery_replaces_same_size_corrupt_chunks_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let target = build_test_state(1, false, backend).await;

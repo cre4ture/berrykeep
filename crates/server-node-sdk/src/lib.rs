@@ -459,6 +459,9 @@ struct ServerMaintenanceRuntime {
     local_availability_refresh_notify: Arc<Notify>,
     local_availability_generation: Arc<AtomicU64>,
     local_availability_cache: Arc<Mutex<Option<LocalAvailabilityCache>>>,
+    retained_content_refresh_lock: Arc<Mutex<()>>,
+    retained_content_generation: Arc<AtomicU64>,
+    retained_content_cache: Arc<Mutex<Option<RetainedContentCache>>>,
     retained_audit_cursor: Arc<Mutex<Option<String>>>,
 }
 
@@ -509,6 +512,18 @@ struct LocalAvailabilityCache {
     generation: u64,
     computed_at: Instant,
     subjects: Arc<Vec<String>>,
+}
+
+#[derive(Clone)]
+struct RetainedContentCache {
+    generation: u64,
+    content: Arc<storage::retained_content::RetainedContent>,
+}
+
+impl RetainedContentCache {
+    fn is_valid_for(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
 }
 
 impl LocalAvailabilityCache {
@@ -834,6 +849,13 @@ pub(crate) fn invalidate_local_availability_cache(state: &ServerState) {
         .fetch_add(1, Ordering::SeqCst);
 }
 
+fn invalidate_retained_content_cache(state: &ServerState) {
+    state
+        .maintenance
+        .retained_content_generation
+        .fetch_add(1, Ordering::SeqCst);
+}
+
 fn request_local_availability_refresh(state: &ServerState) {
     invalidate_local_availability_cache(state);
     state
@@ -1075,6 +1097,7 @@ pub(crate) fn publish_namespace_change(state: &ServerState) {
         .saturating_add(1);
     let _ = state.storage.namespace_change_tx.send(sequence);
     invalidate_local_availability_cache(state);
+    invalidate_retained_content_cache(state);
 }
 
 #[derive(Debug, Clone)]
@@ -7791,6 +7814,9 @@ async fn run_inner(
             local_availability_refresh_notify: Arc::new(Notify::new()),
             local_availability_generation: Arc::new(AtomicU64::new(0)),
             local_availability_cache: Arc::new(Mutex::new(None)),
+            retained_content_refresh_lock: Arc::new(Mutex::new(())),
+            retained_content_generation: Arc::new(AtomicU64::new(0)),
+            retained_content_cache: Arc::new(Mutex::new(None)),
             retained_audit_cursor: Arc::new(Mutex::new(None)),
         },
         metadata_commit_mode: config.metadata_commit_mode,
@@ -11848,14 +11874,10 @@ async fn run_replication_audit_once(state: &ServerState) {
     // it cannot supply this synchronization on the auditor's behalf.
     if state.repair_config.enabled {
         sync_availability_views_once(state).await;
-        let retained_loader = {
-            let store = read_store(state, "replication_auditor.retained_snapshot").await;
-            store.retained_content_loader()
-        };
-        match retained_loader.load().await {
+        match content_recovery::retained_content_snapshot(state).await {
             Ok(retained) => {
                 if let Err(error) =
-                    content_recovery::audit_assigned_from_retained(state, &retained).await
+                    content_recovery::audit_assigned_from_retained(state, retained.as_ref()).await
                 {
                     warn!(error = %error, "failed to audit retained content assignments");
                 }
@@ -31417,6 +31439,7 @@ async fn persist_cluster_replicas_state_inner(
         // mutation. Force the next local view to use a fresh snapshot instead
         // of replaying an older cached subject set.
         invalidate_local_availability_cache(state);
+        invalidate_retained_content_cache(state);
     }
     let (replicas, available) = {
         let cluster = state.cluster.lock().await;
