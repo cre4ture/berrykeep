@@ -1286,6 +1286,16 @@ fn full_object_recovery_budget_scales_with_parallel_chunk_batches() {
 }
 
 #[test]
+fn peer_fetch_timeout_preserves_the_direct_transport_phase_budgets() {
+    let direct_phase_budget = Duration::from_secs(crate::DIRECT_PEER_REQUEST_TIMEOUT_SECS);
+
+    assert!(
+        crate::content_recovery::PEER_FETCH_TIMEOUT >= direct_phase_budget.saturating_mul(2),
+        "the recovery wrapper must not shorten the direct transport's request and response phases"
+    );
+}
+
+#[test]
 fn object_read_recovery_budget_scales_only_full_object_reads() {
     assert_eq!(
         crate::object_read_recovery_budget(true, 40),

@@ -6,7 +6,12 @@ use storage::content_recovery::{ContentRepairTask, validate_manifest};
 use storage::retained_content::{MANIFEST_SUBJECT_PREFIX, RetainedContent, RetainedReference};
 
 const CHUNK_FETCH_CONCURRENCY: usize = 4;
-const PEER_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds transports such as QUIC and relay that do not carry the direct HTTP
+/// client's per-phase deadline. Direct HTTP allows this much time for both
+/// sending the request and reading the response body, so the recovery wrapper
+/// must cover both phases instead of silently tightening either one.
+pub(crate) const PEER_FETCH_TIMEOUT: Duration =
+    Duration::from_secs(DIRECT_PEER_REQUEST_TIMEOUT_SECS * 2);
 pub(crate) const READ_THROUGH_RECOVERY_BUDGET: Duration = Duration::from_secs(30);
 pub(crate) const FULL_OBJECT_RECOVERY_BUDGET_MAX: Duration = Duration::from_secs(2 * 60);
 /// Bounds network transfer work in one durable repair pass. Its persisted task
