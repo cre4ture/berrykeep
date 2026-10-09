@@ -595,9 +595,6 @@ async fn repair_subjects_inner(
     }
     let availability_may_have_changed = !tasks.is_empty();
     for (index, mut task) in tasks.into_values().enumerate() {
-        // Do not hold a manifest claim while waiting for foreground load to
-        // drain: foreground pulls need that same claim to make progress.
-        await_repair_busy_threshold(state).await;
         let Some(_claim) = state
             .maintenance
             .content_repair_claims
@@ -646,6 +643,43 @@ async fn repair_subjects_inner(
             );
             continue;
         }
+
+        // Register the durable task before yielding to foreground traffic. A
+        // scrub's enqueue-only pass uses a zero transfer limit and must still
+        // publish its findings while a node is busy.
+        drop(_claim);
+
+        // Foreground load throttles byte transfer only. Do not retain the
+        // manifest claim while waiting: a foreground pull may complete this
+        // task in the meantime.
+        await_repair_busy_threshold(state).await;
+        let Some(_claim) = state
+            .maintenance
+            .content_repair_claims
+            .try_claim(&task.reference.manifest_hash)
+        else {
+            report.skipped_items += 1;
+            log_outcome(
+                state,
+                report,
+                &task,
+                "repair_deferred",
+                "repair remains queued while another operation owns its manifest".to_string(),
+                json!({"pending": true, "reason": "manifest_repair_in_progress"}),
+            );
+            continue;
+        };
+        let Some(mut task) = read_store(state, "content_recovery.reclaimed_task")
+            .await
+            .content_repair_tasks_for_manifests(std::slice::from_ref(&task.reference.manifest_hash))
+            .await?
+            .into_iter()
+            .next()
+        else {
+            // A foreground or concurrent repair completed this manifest while
+            // the background worker yielded its claim.
+            continue;
+        };
         let now = unix_ts();
         if task.next_attempt_unix > now && task.source_fingerprint == fingerprint {
             report.skipped_items += 1;

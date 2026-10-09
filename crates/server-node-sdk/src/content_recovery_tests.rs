@@ -430,6 +430,60 @@ run_on_main_metadata_backends!(
     recovery_targeted_repair_respects_busy_throttle_turso
 );
 
+async fn recovery_enqueue_only_pass_bypasses_busy_throttle_impl(backend: MainTestBackend) {
+    let mut state = build_test_state(1, false, backend).await;
+    state.repair_config.busy_throttle_enabled = true;
+    state.repair_config.busy_inflight_threshold = 1;
+    state.repair_config.busy_wait_millis = 5;
+    let key = choose_locally_placed_key(&state, "busy-enqueue-only").await;
+    seed_subject_version(
+        &state,
+        &key,
+        "v1",
+        b"durable finding bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    let manifest = bundle(&state, &key, "v1").await;
+    state
+        .maintenance
+        .inflight_requests
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+
+    let report = tokio::time::timeout(
+        Duration::from_millis(100),
+        crate::content_recovery::repair_subjects(
+            &state,
+            vec![format!(
+                "{MANIFEST_SUBJECT_PREFIX}{}",
+                manifest.manifest_hash
+            )],
+            Some(0),
+        ),
+    )
+    .await
+    .expect("enqueue-only repair work must not wait for foreground load");
+
+    assert_eq!(report.skipped_items, 1, "{report:?}");
+    assert!(
+        read_store(&state, "test.recovery.busy_enqueue_only")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.reference.manifest_hash == manifest.manifest_hash),
+        "the enqueue-only pass must durably publish its repair finding"
+    );
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_enqueue_only_pass_bypasses_busy_throttle_impl,
+    recovery_enqueue_only_pass_bypasses_busy_throttle,
+    recovery_enqueue_only_pass_bypasses_busy_throttle_turso
+);
+
 async fn recovery_backoff_starts_after_a_slow_transfer_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let mut target = build_test_state(1, false, backend).await;
