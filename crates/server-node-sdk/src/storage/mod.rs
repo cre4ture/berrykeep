@@ -2762,6 +2762,9 @@ struct CleanupProtectionSnapshot {
 pub(crate) struct CleanupUnreferencedTestHook {
     started: Arc<Semaphore>,
     release: Arc<Semaphore>,
+    block_after_snapshot: bool,
+    history_started: Option<Arc<Semaphore>>,
+    history_release: Option<Arc<Semaphore>>,
 }
 
 #[cfg(test)]
@@ -2770,10 +2773,38 @@ impl CleanupUnreferencedTestHook {
         Self {
             started: Arc::new(Semaphore::new(0)),
             release: Arc::new(Semaphore::new(0)),
+            block_after_snapshot: true,
+            history_started: None,
+            history_release: None,
         }
     }
 
+    pub(crate) fn blocking_history_collection() -> Self {
+        Self {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            block_after_snapshot: false,
+            history_started: Some(Arc::new(Semaphore::new(0))),
+            history_release: Some(Arc::new(Semaphore::new(0))),
+        }
+    }
+
+    async fn block_during_history_collection(&self) {
+        let (Some(started), Some(release)) = (&self.history_started, &self.history_release) else {
+            return;
+        };
+        started.add_permits(1);
+        let permit = release
+            .acquire()
+            .await
+            .expect("cleanup history test hook should remain open");
+        permit.forget();
+    }
+
     async fn block_after_snapshot(&self) {
+        if !self.block_after_snapshot {
+            return;
+        }
         self.started.add_permits(1);
         let permit = self
             .release
@@ -2792,8 +2823,27 @@ impl CleanupUnreferencedTestHook {
         permit.forget();
     }
 
+    pub(crate) async fn wait_until_history_collection_started(&self) {
+        let started = self
+            .history_started
+            .as_ref()
+            .expect("history collection hook was not configured");
+        let permit = started
+            .acquire()
+            .await
+            .expect("cleanup history test hook should remain open");
+        permit.forget();
+    }
+
     pub(crate) fn release_sweep(&self) {
         self.release.add_permits(1);
+    }
+
+    pub(crate) fn release_history_collection(&self) {
+        self.history_release
+            .as_ref()
+            .expect("history collection hook was not configured")
+            .add_permits(1);
     }
 }
 
@@ -9331,13 +9381,19 @@ impl PersistentStore {
         retention_secs: u64,
         dry_run: bool,
     ) -> Result<CleanupReport> {
-        // The exclusive gate only protects the reachability snapshot. Keeping
-        // it through directory walks and file deletion would block durable
-        // task registration and verified chunk installation for the duration
-        // of a store-sized sweep.
+        // Decoding retained history is proportional to every version and
+        // snapshot, and does not mutate the temporary pin set. Do it before
+        // taking the writer gate so foreground chunk installs stay responsive.
+        let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
+
+        // The exclusive gate only protects the mutable protection records.
+        // Keeping it through directory walks and file deletion would block
+        // durable task registration and verified chunk installation for the
+        // duration of a store-sized sweep.
         let protection = {
             let _gc_guard = self.content_gc_gate.write().await;
-            self.cleanup_protection_snapshot().await?
+            self.cleanup_protection_snapshot(referenced_manifests)
+                .await?
         };
         let CleanupProtectionSnapshot {
             recovery_tasks,
@@ -9578,8 +9634,10 @@ impl PersistentStore {
         })
     }
 
-    async fn cleanup_protection_snapshot(&self) -> Result<CleanupProtectionSnapshot> {
-        let referenced_manifests = self.collect_referenced_manifest_hashes().await?;
+    async fn cleanup_protection_snapshot(
+        &self,
+        referenced_manifests: HashSet<String>,
+    ) -> Result<CleanupProtectionSnapshot> {
         let owned_referenced_manifests = if referenced_manifests.is_empty() {
             HashSet::new()
         } else {
@@ -11364,6 +11422,10 @@ impl PersistentStore {
     }
 
     async fn collect_referenced_manifest_hashes(&self) -> Result<HashSet<String>> {
+        #[cfg(test)]
+        if let Some(hook) = &self.cleanup_unreferenced_test_hook {
+            hook.block_during_history_collection().await;
+        }
         Ok(self
             .retained_content()
             .await?

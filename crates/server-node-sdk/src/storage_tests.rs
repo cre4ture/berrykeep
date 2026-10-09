@@ -3229,6 +3229,47 @@ run_on_all_metadata_backends!(
     cleanup_snapshot_allows_repair_pin_registration_during_sweep_turso
 );
 
+async fn cleanup_history_collection_does_not_block_chunk_ingest_impl(backend: StorageTestBackend) {
+    let (root, mut store) = backend
+        .init_store("cleanup-history-ingest-concurrency")
+        .await;
+    store
+        .put_object_versioned(
+            "live.bin",
+            Bytes::from_static(b"retained history content"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let hook = CleanupUnreferencedTestHook::blocking_history_collection();
+    store.set_cleanup_unreferenced_test_hook(Some(hook.clone()));
+
+    let cleanup = store.cleanup_unreferenced(0, false);
+    tokio::pin!(cleanup);
+    tokio::select! {
+        _ = hook.wait_until_history_collection_started() => {},
+        result = &mut cleanup => panic!("cleanup completed before reaching its history hook: {result:?}"),
+    }
+
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        store.ingest_chunk_auto(b"upload while retained history is decoded"),
+    )
+    .await
+    .expect("chunk ingest must not wait for retained-history collection")
+    .unwrap();
+    hook.release_history_collection();
+    cleanup.await.unwrap();
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_history_collection_does_not_block_chunk_ingest_impl,
+    cleanup_history_collection_does_not_block_chunk_ingest,
+    cleanup_history_collection_does_not_block_chunk_ingest_turso
+);
+
 async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("cleanup-delete").await;
 
