@@ -12854,10 +12854,11 @@ async fn execute_data_scrub_run(state: ServerState, tracker: DataScrubRunTracker
     match result {
         Ok(output) => {
             let automatic_repair_enabled = state.repair_config.enabled;
-            // A disabled repair worker must leave scrub findings informational:
-            // durable repair tasks suppress availability and pin their content,
-            // but no worker can drain them in that configuration.
-            let enqueue_error = if !automatic_repair_enabled || output.repair_subjects.is_empty() {
+            // A scrub-confirmed defect must quarantine the local replica even
+            // when automatic execution is disabled. The durable task suppresses
+            // availability and protects the affected content until a later
+            // manual repair or re-enabled worker can verify a replacement.
+            let enqueue_error = if output.repair_subjects.is_empty() {
                 None
             } else {
                 content_recovery::repair_subjects(
