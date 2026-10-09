@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.compose.runtime.Immutable
 import io.berrykeep.android.data.AppConnectionStatus
 import io.berrykeep.android.data.ConnectionRouteSnapshot
+import io.berrykeep.android.data.ClusterTaskQueueSnapshot
 import io.berrykeep.android.data.EmbeddedWebUiSession
 import io.berrykeep.android.data.FolderSyncConfig
 import io.berrykeep.android.data.FolderSyncModificationRecord
@@ -179,4 +180,6 @@ data class MainUiState(
     val galleryLoading: Boolean = false,
     val galleryError: GalleryLoadError? = null,
     val loading: Boolean = false,
+    val clusterTaskQueues: ClusterTaskQueueSnapshot? = null,
+    val clusterTaskQueuesError: String? = null,
 )

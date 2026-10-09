@@ -23,6 +23,7 @@ import io.berrykeep.android.data.AndroidDiagnosticLog as Log
 import io.berrykeep.android.data.writeAndroidDiagnosticLogExport
 import io.berrykeep.android.data.DeviceAuthState
 import io.berrykeep.android.data.EnrollmentAccessVerification
+import io.berrykeep.android.data.EmbeddedWebUiSession
 import io.berrykeep.android.data.EmbeddedWebUiSessionRegistry
 import io.berrykeep.android.data.PrivateWebServiceBrowserSession
 import io.berrykeep.android.data.DeviceIdentityStorageException
@@ -42,9 +43,12 @@ import io.berrykeep.android.ui.theme.normalizeBerryKeepAccentColorHex
 import io.berrykeep.android.work.FolderSyncScheduler
 import io.berrykeep.android.work.FolderSyncNetworkGate
 import io.berrykeep.android.work.FolderSyncExecutionCoordinator
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.filterNotNull
@@ -64,6 +68,7 @@ private const val FOLDER_SYNC_HISTORY_PAGE_SIZE = 20
 private const val FOLDER_SYNC_HISTORY_REFRESH_MS = 5_000L
 private const val CONNECTION_ROUTE_SNAPSHOT_POLL_MS = 1_000L
 private const val TITLE_LATENCY_STATUS_POLL_MS = 1_000L
+private const val TASK_QUEUE_STATUS_POLL_MS = 30_000L
 internal const val TITLE_LATENCY_BACKGROUND_GRACE_PERIOD_MILLIS = 5_000L
 private const val ENROLLMENT_VERIFICATION_POLL_MS = 5_000L
 private const val ENROLLMENT_LOG_TAG = "EnrollmentDiagnostics"
@@ -98,13 +103,18 @@ class MainViewModel(
     private var connectionRoutesMonitorJob: Job? = null
     private var titleLatencyConfigurationJob: Job? = null
     private var titleLatencyStatusMonitorJob: Job? = null
+    private var taskQueueStatusMonitorJob: Job? = null
     private var titleLatencyBackgroundStopJob: Job? = null
+    private var webUiBackgroundStopJob: Job? = null
     private var enrollmentVerificationMonitorJob: Job? = null
     private val uiObservationGate = UiObservationGate()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val preferenceWriteMutex = Mutex()
-    private val titleLatencyNativeControlMutex = Mutex()
-    private val titleLatencyNativeControlGate = LatestOperationGate()
+    private val titleLatencyNativeControlMutex = ProcessTitleLatencyNativeControl.mutex
+    private val titleLatencyNativeControlGate = ProcessTitleLatencyNativeControl.gate
+    private val webUiNativeLifecycle = ProcessWebUiNativeLifecycle.coordinator
+    private val webUiStartLoadingOwnership = WebUiStartLoadingOwnership()
+    private val clearedWebUiCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
     private var deviceAuthState = DeviceAuthState()
@@ -153,8 +163,11 @@ class MainViewModel(
         unregisterProcessLifecycleObserver()
         PrivateWebServiceBrowserSession.clearBackgroundSessionEndedCallback()
         webUiSessionBackgroundGrace.cancel()
+        val cleanupGeneration = webUiNativeLifecycle.nextGeneration()
+        webUiBackgroundStopJob?.cancel()
+        webUiBackgroundStopJob = null
         titleLatencyBackgroundGrace.cancel()
-        titleLatencyNativeControlGate.next()
+        val titleLatencyCleanupGeneration = titleLatencyNativeControlGate.next()
         titleLatencyBackgroundStopJob?.cancel()
         titleLatencyBackgroundStopJob = null
         EmbeddedWebUiSessionRegistry.clear()
@@ -167,7 +180,9 @@ class MainViewModel(
                 runCatching {
                     runBlocking {
                         titleLatencyNativeControlMutex.withLock {
-                            repository.stopTitleLatencyMonitor()
+                            if (titleLatencyNativeControlGate.isCurrent(titleLatencyCleanupGeneration)) {
+                                repository.stopTitleLatencyMonitor()
+                            }
                         }
                     }
                 }.onFailure { error ->
@@ -176,7 +191,7 @@ class MainViewModel(
             },
             "berrykeep-title-latency-stop",
         ).start()
-        repository.stopWebUi()
+        stopWebUiAfterCleared(cleanupGeneration)
         super.onCleared()
     }
 
@@ -269,6 +284,9 @@ class MainViewModel(
         notifyManagedClientForegrounded()
         startAppConnectionStatusMonitor()
         startFolderSyncStatusMonitor()
+        if (uiState.value.selectedSection == MainSection.HOME) {
+            startTaskQueueStatusMonitor()
+        }
         if (uiState.value.titleLatencyMonitorSettings.enabled) {
             configureTitleLatencyMonitor()
         }
@@ -377,6 +395,7 @@ class MainViewModel(
         titleLatencyConfigurationJob = null
         stopAppConnectionStatusMonitor()
         stopFolderSyncStatusMonitor()
+        stopTaskQueueStatusMonitor()
         stopTitleLatencyStatusMonitor()
         stopConnectionRoutesMonitor()
     }
@@ -477,29 +496,40 @@ class MainViewModel(
     }
 
     fun putObject() {
-        execute("Uploading object...") { deviceAuth ->
-            val statusCode = repository.putObject(
-                deviceAuth.connectionBootstrapJson(),
-                uiState.value.key,
-                uiState.value.payload,
-                deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
-                deviceAuth.toClientIdentityJson(),
-            )
-            "PUT ok: HTTP $statusCode"
-        }
+        val key = uiState.value.key
+        val payload = uiState.value.payload
+        execute(
+            loadingMessage = "Uploading object...",
+            action = { deviceAuth ->
+                repository.putObject(
+                    deviceAuth.connectionBootstrapJson(),
+                    key,
+                    payload,
+                    deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                    deviceAuth.toClientIdentityJson(),
+                )
+            },
+            successMessage = { statusCode -> "PUT ok: HTTP $statusCode" },
+        )
     }
 
     fun getObject() {
-        execute("Downloading object...") { deviceAuth ->
-            val body = repository.getObject(
-                deviceAuth.connectionBootstrapJson(),
-                uiState.value.key,
-                serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
-                clientIdentityJson = deviceAuth.toClientIdentityJson(),
-            )
-            uiState.value = uiState.value.copy(objectBody = body)
-            "GET ok: ${body.length} bytes"
-        }
+        val key = uiState.value.key
+        execute(
+            loadingMessage = "Downloading object...",
+            action = { deviceAuth ->
+                repository.getObject(
+                    deviceAuth.connectionBootstrapJson(),
+                    key,
+                    serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                    clientIdentityJson = deviceAuth.toClientIdentityJson(),
+                )
+            },
+            successMessage = { body -> "GET ok: ${body.length} bytes" },
+            onSuccess = { body ->
+                uiState.value = uiState.value.copy(objectBody = body)
+            },
+        )
     }
 
     fun clearCachedData() {
@@ -646,6 +676,11 @@ class MainViewModel(
 
     fun selectSection(section: MainSection) {
         uiState.value = uiState.value.copy(selectedSection = section)
+        if (section == MainSection.HOME) {
+            startTaskQueueStatusMonitor()
+        } else {
+            stopTaskQueueStatusMonitor()
+        }
         if (section.isConnectionDiagnosticsSection()) {
             startConnectionRoutesMonitor()
         } else {
@@ -1292,11 +1327,15 @@ class MainViewModel(
 
     fun startWebUi() {
         webUiSessionBackgroundGrace.cancel()
+        val operationGeneration = webUiNativeLifecycle.nextGeneration()
+        webUiBackgroundStopJob?.cancel()
+        webUiBackgroundStopJob = null
         uiState.value.webUiSession?.let { session ->
             EmbeddedWebUiSessionRegistry.activate(session)
             uiState.value = uiState.value.copy(status = "Web UI ready.")
             return
         }
+        webUiStartLoadingOwnership.begin(operationGeneration)
         uiState.value = uiState.value.copy(
             loading = true,
             webUiSession = null,
@@ -1305,55 +1344,100 @@ class MainViewModel(
         viewModelScope.launch {
             val deviceAuth = runCatching { refreshPersistedDeviceAuthState() }
                 .getOrElse { error ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        webUiSession = null,
-                        status = "Device identity unavailable: ${error.message}",
-                    )
+                    finishWebUiStartIfOwner(operationGeneration) {
+                        it.copy(
+                            loading = false,
+                            webUiSession = null,
+                            status = "Device identity unavailable: ${error.message}",
+                        )
+                    }
                     return@launch
                 }
             val connectionInput = deviceAuth.connectionBootstrapJson()
             val clientIdentityJson = deviceAuth.toClientIdentityJson()
             if (connectionInput.isBlank() || clientIdentityJson.isNullOrBlank()) {
-                uiState.value = uiState.value.copy(
-                    loading = false,
-                    webUiSession = null,
-                    status = "Enroll this device before opening the Web UI.",
-                )
-                return@launch
-            }
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
-                    repository.startWebUi(
-                        connectionInput,
-                        deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
-                        clientIdentityJson,
+                finishWebUiStartIfOwner(operationGeneration) {
+                    it.copy(
+                        loading = false,
+                        webUiSession = null,
+                        status = "Enroll this device before opening the Web UI.",
                     )
                 }
+                return@launch
+            }
+            var startedSession: EmbeddedWebUiSession? = null
+            val result = try {
+                val started = withContext(Dispatchers.IO) {
+                    webUiNativeLifecycle.runIfCurrent(operationGeneration) {
+                        startedSession = repository.startWebUi(
+                            connectionInput,
+                            deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                            clientIdentityJson,
+                        )
+                    }
+                }
+                if (!started || !webUiNativeLifecycle.isCurrent(operationGeneration)) {
+                    finishWebUiStartIfOwner(operationGeneration) { state ->
+                        state.copy(loading = false)
+                    }
+                    return@launch
+                }
+                Result.success(requireNotNull(startedSession))
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Result.failure(error)
+            }
+            if (!webUiNativeLifecycle.isCurrent(operationGeneration)) {
+                finishWebUiStartIfOwner(operationGeneration) { state ->
+                    state.copy(loading = false)
+                }
+                return@launch
             }
             runCatching { refreshPersistedDeviceAuthState() }
                 .onFailure { error ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        status = "Device identity unavailable: ${error.message}",
-                    )
+                    finishWebUiStartIfOwner(operationGeneration) {
+                        it.copy(
+                            loading = false,
+                            status = "Device identity unavailable: ${error.message}",
+                        )
+                    }
                     return@launch
                 }
+            if (!webUiNativeLifecycle.isCurrent(operationGeneration)) {
+                finishWebUiStartIfOwner(operationGeneration) { state ->
+                    state.copy(loading = false)
+                }
+                return@launch
+            }
             result
                 .onSuccess { session ->
-                    EmbeddedWebUiSessionRegistry.activate(session)
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        webUiSession = session,
-                        status = "Web UI ready.",
-                    )
+                    finishWebUiStartIfOwner(operationGeneration) {
+                        EmbeddedWebUiSessionRegistry.activate(session)
+                        it.copy(
+                            loading = false,
+                            webUiSession = session,
+                            status = "Web UI ready.",
+                        )
+                    }
                 }
                 .onFailure { error ->
-                    uiState.value = uiState.value.copy(
-                        loading = false,
-                        status = "Error: ${error.message}",
-                    )
+                    finishWebUiStartIfOwner(operationGeneration) {
+                        it.copy(
+                            loading = false,
+                            status = "Error: ${error.message}",
+                        )
+                    }
                 }
+        }
+    }
+
+    private fun finishWebUiStartIfOwner(
+        operationGeneration: Long,
+        update: (MainUiState) -> MainUiState,
+    ) {
+        if (webUiStartLoadingOwnership.releaseIfOwner(operationGeneration)) {
+            uiState.value = update(uiState.value)
         }
     }
 
@@ -1366,8 +1450,38 @@ class MainViewModel(
             return
         }
         EmbeddedWebUiSessionRegistry.clear()
-        repository.stopWebUi()
+        val operationGeneration = webUiNativeLifecycle.nextGeneration()
+        webUiBackgroundStopJob?.cancel()
+        webUiBackgroundStopJob = viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    webUiNativeLifecycle.runIfCurrent(operationGeneration) {
+                        repository.stopWebUi()
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w("MainViewModel", "Failed to stop Web UI", error)
+            }
+        }
         uiState.value = uiState.value.copy(webUiSession = null)
+    }
+
+    private fun stopWebUiAfterCleared(cleanupGeneration: Long) {
+        clearedWebUiCleanupScope.launch {
+            try {
+                webUiNativeLifecycle.runIfCurrent(cleanupGeneration) {
+                    repository.stopWebUi()
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w("MainViewModel", "Failed to stop cleared Web UI", error)
+            } finally {
+                clearedWebUiCleanupScope.cancel()
+            }
+        }
     }
 
     fun enrollDevice() {
@@ -1459,7 +1573,10 @@ class MainViewModel(
             try {
                 withContext(Dispatchers.IO) {
                     EmbeddedWebUiSessionRegistry.clear()
-                    repository.stopWebUi()
+                    webUiNativeLifecycle.invalidatePendingOperations()
+                    webUiNativeLifecycle.run {
+                        repository.stopWebUi()
+                    }
                     BerryKeepPreferences.setDeviceAuthState(getApplication(), authState)
                     FolderSyncScheduler.reschedule(getApplication(), resetOutageBackoff = true)
                 }
@@ -1515,9 +1632,11 @@ class MainViewModel(
         )
     }
 
-    private fun execute(
+    private fun <T> execute(
         loadingMessage: String,
-        action: suspend (DeviceAuthState) -> String,
+        action: suspend (DeviceAuthState) -> T,
+        successMessage: (T) -> String,
+        onSuccess: (T) -> Unit = {},
     ) {
         uiState.value = uiState.value.copy(loading = true, status = loadingMessage)
         viewModelScope.launch {
@@ -1529,7 +1648,17 @@ class MainViewModel(
                     )
                     return@launch
                 }
-            val result = runCatching { action(deviceAuth) }
+            val result = try {
+                Result.success(
+                    withContext(Dispatchers.IO) {
+                        action(deviceAuth)
+                    },
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Result.failure(error)
+            }
             runCatching { refreshPersistedDeviceAuthState() }
                 .onFailure { error ->
                     uiState.value = uiState.value.copy(
@@ -1539,8 +1668,12 @@ class MainViewModel(
                     return@launch
                 }
             result
-                .onSuccess { message ->
-                    uiState.value = uiState.value.copy(loading = false, status = message)
+                .onSuccess { value ->
+                    onSuccess(value)
+                    uiState.value = uiState.value.copy(
+                        loading = false,
+                        status = successMessage(value),
+                    )
                 }
                 .onFailure { error ->
                     uiState.value = uiState.value.copy(
@@ -1591,6 +1724,50 @@ class MainViewModel(
     private fun stopFolderSyncStatusMonitor() {
         folderSyncStatusMonitorJob?.cancel()
         folderSyncStatusMonitorJob = null
+    }
+
+    private fun startTaskQueueStatusMonitor() {
+        if (
+            !uiObservationGate.observationJobsActive ||
+            uiState.value.selectedSection != MainSection.HOME ||
+            taskQueueStatusMonitorJob?.isActive == true
+        ) {
+            return
+        }
+        taskQueueStatusMonitorJob = viewModelScope.launch {
+            while (isActive) {
+                val authState = deviceAuthState
+                val connectionInput = authState.connectionBootstrapJson()
+                val clientIdentityJson = authState.toClientIdentityJson()
+                if (connectionInput.isNotBlank() && !clientIdentityJson.isNullOrBlank()) {
+                    val snapshot = withContext(Dispatchers.IO) {
+                        runCatching {
+                            repository.getClusterTaskQueueStatus(
+                                connectionInput = connectionInput,
+                                serverCaPem = authState.serverCaPem?.takeIf { it.isNotBlank() },
+                                clientIdentityJson = clientIdentityJson,
+                            )
+                        }
+                    }
+                    snapshot.onSuccess { taskQueues ->
+                        uiState.value = uiState.value.copy(
+                            clusterTaskQueues = taskQueues,
+                            clusterTaskQueuesError = null,
+                        )
+                    }.onFailure { error ->
+                        uiState.value = uiState.value.copy(
+                            clusterTaskQueuesError = error.message ?: "Task queue status is unavailable",
+                        )
+                    }
+                }
+                delay(TASK_QUEUE_STATUS_POLL_MS)
+            }
+        }
+    }
+
+    private fun stopTaskQueueStatusMonitor() {
+        taskQueueStatusMonitorJob?.cancel()
+        taskQueueStatusMonitorJob = null
     }
 
     private fun startAppConnectionStatusMonitor() {
