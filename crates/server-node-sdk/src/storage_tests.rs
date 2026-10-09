@@ -3270,6 +3270,35 @@ run_on_all_metadata_backends!(
     cleanup_history_collection_does_not_block_chunk_ingest_turso
 );
 
+async fn cleanup_protection_snapshot_does_not_block_chunk_ingest_impl(backend: StorageTestBackend) {
+    let (root, store) = backend
+        .init_store("cleanup-protection-snapshot-ingest-concurrency")
+        .await;
+    let snapshot_guard = store.content_gc_gate.write().await;
+
+    let (hash, stored) = tokio::time::timeout(
+        Duration::from_millis(250),
+        store.ingest_chunk_auto(b"upload while cleanup snapshots protection metadata"),
+    )
+    .await
+    .expect("chunk ingest must not wait for the cleanup protection snapshot")
+    .unwrap();
+
+    assert!(stored);
+    assert!(
+        store.read_chunk_payload(&hash).await.unwrap().is_some(),
+        "ingest must publish its atomic chunk while cleanup metadata is gated"
+    );
+    drop(snapshot_guard);
+    let _ = fs::remove_dir_all(root).await;
+}
+
+run_on_all_metadata_backends!(
+    cleanup_protection_snapshot_does_not_block_chunk_ingest_impl,
+    cleanup_protection_snapshot_does_not_block_chunk_ingest,
+    cleanup_protection_snapshot_does_not_block_chunk_ingest_turso
+);
+
 async fn cleanup_unreferenced_deletes_orphan_manifest_and_chunk_impl(backend: StorageTestBackend) {
     let (root, mut store) = backend.init_store("cleanup-delete").await;
 

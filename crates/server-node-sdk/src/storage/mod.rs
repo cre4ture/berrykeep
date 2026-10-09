@@ -2879,7 +2879,6 @@ impl CleanupUnreferencedTestHook {
 
 #[derive(Clone)]
 pub(crate) struct ChunkIngestor {
-    content_gc_gate: Arc<tokio::sync::RwLock<()>>,
     storage_pool: StoragePool,
     metadata_store: Arc<dyn MetadataStore>,
     storage_stats_lock: Arc<AsyncMutex<()>>,
@@ -3280,10 +3279,8 @@ impl ChunkIngestor {
         storage_pool: StoragePool,
         metadata_store: Arc<dyn MetadataStore>,
         storage_stats_lock: Arc<AsyncMutex<()>>,
-        content_gc_gate: Arc<tokio::sync::RwLock<()>>,
     ) -> Self {
         Self {
-            content_gc_gate,
             storage_pool,
             metadata_store,
             storage_stats_lock,
@@ -3303,9 +3300,6 @@ impl ChunkIngestor {
     /// Keep this private to recovery/transport internals so untrusted input
     /// always continues through `ingest_chunk`.
     pub(crate) async fn ingest_verified_chunk(&self, hash: &str, payload: &[u8]) -> Result<bool> {
-        // GC must not inspect or remove the temporary file of an active install.
-        let _guard = self.content_gc_gate.read().await;
-
         let outcome = persist_storage_content(
             &self.storage_pool,
             self.metadata_store.as_ref(),
@@ -4498,7 +4492,6 @@ impl PersistentStore {
             storage_pool.clone(),
             metadata_store.clone(),
             storage_stats_lock.clone(),
-            content_gc_gate.clone(),
         );
 
         let store = Self {
