@@ -482,7 +482,6 @@ async fn replication_plan_defers_presence_check_failures_impl(backend: MainTestB
         &plan,
         vec![source_node],
         None,
-        false,
         None,
     )
     .await;
@@ -1276,7 +1275,6 @@ async fn recovery_targeted_repair_defers_claimed_manifest_impl(backend: MainTest
             &plan,
             vec![source_node],
             None,
-            false,
             None,
         )
         .await

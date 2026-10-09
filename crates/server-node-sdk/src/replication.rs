@@ -1,5 +1,4 @@
 use super::*;
-use std::collections::BTreeSet;
 use storage::{ReplicationExportBundle, TOMBSTONE_MANIFEST_HASH};
 
 const REPAIR_PROGRESS_CHUNK_LOG_INTERVAL: usize = 128;
@@ -254,7 +253,7 @@ pub(crate) async fn execute_replication_repair_inner_with_context(
     };
     let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
 
-    execute_replication_repair_plan(state, &plan, nodes, batch_size_override, false, run_id).await
+    execute_replication_repair_plan(state, &plan, nodes, batch_size_override, run_id).await
 }
 
 #[allow(dead_code)]
@@ -303,8 +302,7 @@ pub(crate) async fn execute_planned_targeted_replication_repair_inner_with_conte
         )
     });
     let report =
-        execute_replication_repair_plan(state, &plan, nodes, batch_size_override, false, run_id)
-            .await;
+        execute_replication_repair_plan(state, &plan, nodes, batch_size_override, run_id).await;
 
     (plan, report)
 }
@@ -436,7 +434,6 @@ pub(crate) async fn execute_replication_repair_plan(
     plan: &ReplicationPlan,
     nodes: Vec<NodeDescriptor>,
     batch_size_override: Option<usize>,
-    verify_local_pulls: bool,
     run_id: Option<&str>,
 ) -> ReplicationRepairReport {
     let node_by_id: HashMap<NodeId, NodeDescriptor> =
@@ -494,7 +491,6 @@ pub(crate) async fn execute_replication_repair_plan(
         max_transfers,
         max_retries = max_attempts,
         backoff_secs,
-        verify_local_pulls,
         "replication repair run started"
     );
     push_repair_log_entry(
@@ -517,7 +513,6 @@ pub(crate) async fn execute_replication_repair_plan(
             "max_transfers": max_transfers,
             "max_retries": max_attempts,
             "backoff_secs": backoff_secs,
-            "verify_local_pulls": verify_local_pulls,
         })),
     );
 
@@ -864,52 +859,6 @@ pub(crate) async fn execute_replication_repair_plan(
             .await
             {
                 Ok(PullBundleOutcome::Imported(imported_version_id)) => {
-                    if verify_local_pulls
-                        && let Err(err) = verify_local_repair_subject(state, &item.key).await
-                    {
-                        let error_text = format!("{err:#}");
-                        failed_transfers += 1;
-                        last_error = Some(error_text.clone());
-                        warn!(
-                            repair_run_id,
-                            subject = %item.key,
-                            key = %key,
-                            version_id = ?version_id,
-                            source_node_id = %source_node.node_id,
-                            target_node_id = %state.node_id,
-                            error = %error_text,
-                            "replication repair local pull verification failed"
-                        );
-                        push_repair_log_entry(
-                            &mut detailed_log,
-                            state.node_id,
-                            "local_verify_failed",
-                            "replication repair local pull verification failed",
-                            Some(item.key.clone()),
-                            Some(key.clone()),
-                            version_id.clone(),
-                            Some(source_node.node_id),
-                            Some(state.node_id),
-                            Some(serde_json::json!({
-                                "imported_version_id": imported_version_id,
-                                "error": error_text,
-                            })),
-                        );
-
-                        let mut repair_state = state.maintenance.repair_state.lock().await;
-                        let entry = repair_state.attempts.entry(transfer_key).or_insert(
-                            RepairAttemptEntry {
-                                attempts: 0,
-                                last_failure_unix: now,
-                            },
-                        );
-                        entry.attempts = entry.attempts.saturating_add(1);
-                        entry.last_failure_unix = now;
-                        drop(repair_state);
-                        repair_state_dirty = true;
-                        continue;
-                    }
-
                     successful_transfers += 1;
                     info!(
                         repair_run_id,
@@ -2144,31 +2093,6 @@ async fn pull_bundle_from_source(
         })),
     );
     Ok(PullBundleOutcome::Imported(imported_version_id))
-}
-
-async fn verify_local_repair_subject(state: &ServerState, subject: &str) -> Result<()> {
-    let scrubber = {
-        let store = read_store(state, "replication_repair.verify_subject").await;
-        store.data_scrubber().await?
-    };
-    let subjects = BTreeSet::from([subject.to_string()]);
-    let report = scrubber.run_for_subjects(&subjects).await?;
-    if report.current_keys_scanned == 0 && report.version_records_scanned == 0 {
-        bail!("post-repair verification did not resolve subject={subject}");
-    }
-    if report.issue_count == 0 {
-        return Ok(());
-    }
-
-    let first_issue = report
-        .issues
-        .first()
-        .map(|issue| format!("{:?}: {}", issue.kind, issue.detail))
-        .unwrap_or_else(|| format!("{} issue(s) without sampled details", report.issue_count));
-    bail!(
-        "post-repair scrub verification found {} issue(s) for subject={subject}: {first_issue}",
-        report.issue_count
-    );
 }
 
 async fn replicate_bundle_to_target(

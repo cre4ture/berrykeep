@@ -272,24 +272,14 @@ impl DataScrubber {
 
     #[cfg(test)]
     pub(crate) async fn run(self) -> Result<DataScrubReport> {
-        Ok(self.run_internal(None).await?.report)
+        Ok(self.run_internal().await?.report)
     }
 
     pub(crate) async fn run_with_repair_subjects(self) -> Result<DataScrubRunOutput> {
-        self.run_internal(None).await
+        self.run_internal().await
     }
 
-    pub(crate) async fn run_for_subjects(
-        self,
-        subject_filter: &BTreeSet<String>,
-    ) -> Result<DataScrubReport> {
-        Ok(self.run_internal(Some(subject_filter)).await?.report)
-    }
-
-    async fn run_internal(
-        mut self,
-        subject_filter: Option<&BTreeSet<String>>,
-    ) -> Result<DataScrubRunOutput> {
+    async fn run_internal(mut self) -> Result<DataScrubRunOutput> {
         #[cfg(test)]
         if let Some(run_test_hook) = &self.run_test_hook {
             run_test_hook.block_run().await;
@@ -308,33 +298,9 @@ impl DataScrubber {
         };
         let mut manifest_references = retained.manifests;
         manifest_references.remove(TOMBSTONE_MANIFEST_HASH);
-        if let Some(filter) = subject_filter {
-            manifest_references.retain(|_, references| {
-                references.retain(|subject, _| filter.contains(subject));
-                !references.is_empty()
-            });
-            output.report.current_keys_scanned = manifest_references
-                .values()
-                .flat_map(BTreeMap::values)
-                .filter(|r| r.version_id.is_none() && !r.snapshot_only)
-                .count();
-            output.report.version_records_scanned = manifest_references
-                .values()
-                .flat_map(BTreeMap::values)
-                .filter(|r| r.version_id.is_some())
-                .count();
-            output.report.version_indexes_scanned = manifest_references
-                .values()
-                .flat_map(BTreeMap::values)
-                .filter(|r| r.version_id.is_some())
-                .filter_map(|r| r.object_id.as_ref())
-                .collect::<HashSet<_>>()
-                .len();
-        } else {
-            output.report.current_keys_scanned = retained.current_keys;
-            output.report.version_indexes_scanned = retained.version_indexes;
-            output.report.version_records_scanned = retained.version_records;
-        }
+        output.report.current_keys_scanned = retained.current_keys;
+        output.report.version_indexes_scanned = retained.version_indexes;
+        output.report.version_records_scanned = retained.version_records;
 
         let mut manifest_hashes: Vec<_> = manifest_references.keys().cloned().collect();
         manifest_hashes.sort();
