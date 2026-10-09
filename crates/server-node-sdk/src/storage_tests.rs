@@ -4178,6 +4178,19 @@ async fn list_replication_subjects_excludes_only_corrupt_manifests_impl(
             .unwrap();
         corrupt_keys.push(key);
     }
+    let unreadable_key = "docs/unreadable-manifest.txt".to_string();
+    let unreadable_put = store
+        .put_object_versioned(
+            &unreadable_key,
+            Bytes::from_static(b"unreadable-manifest-payload"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let unreadable_path = store.manifest_path_for_test(&unreadable_put.manifest_hash);
+    fs::remove_file(&unreadable_path).await.unwrap();
+    fs::create_dir(&unreadable_path).await.unwrap();
+    corrupt_keys.push(unreadable_key);
 
     let orphan_corrupt_key = "docs/corrupt-orphan-head.txt";
     let orphan_head = store

@@ -12424,27 +12424,30 @@ async fn recompute_local_cluster_available_subjects(
             }
         }
     };
-    // Per-manifest corruption is already handled inside `list_replication_subjects`
-    // (a single unreadable/invalid manifest is excluded from the result rather than
-    // aborting the scan), so an `Err` here reflects a genuinely unexpected failure
-    // unrelated to any specific manifest (e.g. the metadata store itself being
-    // unreachable). Falling back to `current_keys()` in that case still risks
-    // over-trusting local data, but it's the best information available; log it so
-    // the fallback is visible instead of silent.
-    let (mut subjects, cacheable) = match inspector.list_replication_subjects().await {
-        Ok(subjects) => (subjects, true),
-        Err(err) => {
-            warn!(
-                error = %err,
-                "failed to compute replication subjects; falling back to current keys"
-            );
-            (inspector.current_keys(), false)
+    local_availability_from_subject_scan(inspector.list_replication_subjects().await)
+}
+
+fn local_availability_from_subject_scan(
+    result: Result<Vec<String>>,
+) -> RecomputedLocalAvailability {
+    match result {
+        Ok(mut subjects) => {
+            subjects.sort();
+            RecomputedLocalAvailability {
+                subjects,
+                cacheable: true,
+            }
         }
-    };
-    subjects.sort();
-    RecomputedLocalAvailability {
-        subjects,
-        cacheable,
+        Err(error) => {
+            // Per-manifest filesystem failures are degraded inside the scan.
+            // Any remaining error means the complete view is untrustworthy;
+            // advertising every indexed key would hide under-replication.
+            warn!(error = %error, "failed to compute replication subjects");
+            RecomputedLocalAvailability {
+                subjects: Vec::new(),
+                cacheable: false,
+            }
+        }
     }
 }
 
@@ -12498,6 +12501,15 @@ mod local_availability_cache_tests {
         cache_local_availability_if_current(&mut cache, 7, 7, &computed);
 
         assert!(cache.is_none());
+    }
+
+    #[test]
+    fn failed_local_availability_scan_is_empty_and_not_cached() {
+        let computed =
+            local_availability_from_subject_scan(Err(anyhow!("metadata backend unavailable")));
+
+        assert!(computed.subjects.is_empty());
+        assert!(!computed.cacheable);
     }
 }
 

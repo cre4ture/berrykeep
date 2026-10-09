@@ -4397,8 +4397,24 @@ impl ReplicationSubjectInspector {
                 availability_by_hash.insert(hash, false);
                 continue;
             }
-            let available = owned.contains(&hash)
-                && content_recovery::manifest_is_fully_local(&self.storage_pool, &hash).await?;
+            let available = if owned.contains(&hash) {
+                match content_recovery::manifest_is_fully_local(&self.storage_pool, &hash).await {
+                    Ok(available) => available,
+                    Err(error) => {
+                        // Availability is a per-manifest claim. One obstructed
+                        // path must neither abort the other claims nor make the
+                        // caller fall back to a fail-open current-key view.
+                        warn!(
+                            manifest_hash = %hash,
+                            error = %error,
+                            "unreadable manifest is not locally available"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
             availability_by_hash.insert(hash, available);
         }
         for (subject, hash) in candidates {
@@ -4409,12 +4425,6 @@ impl ReplicationSubjectInspector {
             }
         }
         Ok(subjects.into_iter().collect())
-    }
-
-    pub(crate) fn current_keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self.current_state.objects.keys().cloned().collect();
-        keys.sort();
-        keys
     }
 }
 
