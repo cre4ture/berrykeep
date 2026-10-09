@@ -1230,6 +1230,70 @@ run_on_main_metadata_backends!(
     recovery_read_budget_bounds_slow_unadvertised_peers_turso
 );
 
+async fn replication_pull_budget_bounds_slow_peer_fanout_impl(backend: MainTestBackend) {
+    let target = build_test_state(1, false, backend).await;
+    let source = build_test_state(1, false, backend).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let wait = release.clone();
+    let app = axum::Router::new().route(
+        "/cluster/v2/replication/chunk/{hash}",
+        axum::routing::get(move || {
+            let wait = wait.clone();
+            async move {
+                wait.notified().await;
+                StatusCode::NOT_FOUND
+            }
+        }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    register_online_source_node(&target, &source, &url).await;
+    let chunks = (0..32)
+        .map(|index| {
+            let bytes = format!("absent replication chunk {index}");
+            crate::storage::ReplicationChunkInfo {
+                hash: blake3::hash(bytes.as_bytes()).to_hex().to_string(),
+                size_bytes: bytes.len(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::content_recovery::recover_chunks_with_budget(
+            &target,
+            "replication-pull-budget.bin",
+            &chunks,
+            None,
+            false,
+            Duration::from_millis(50),
+        ),
+    )
+    .await;
+    release.notify_waiters();
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+
+    let error = result
+        .expect("replication pull recovery ignored its total time budget")
+        .expect_err("the stalled peer should exhaust the replication pull budget");
+    assert!(
+        error.is::<crate::content_recovery::DurableRepairBudgetExceeded>(),
+        "replication pull must report a retryable durable deadline: {error:#}"
+    );
+}
+
+run_on_main_metadata_backends!(
+    replication_pull_budget_bounds_slow_peer_fanout_impl,
+    replication_pull_budget_bounds_slow_peer_fanout,
+    replication_pull_budget_bounds_slow_peer_fanout_turso
+);
+
 async fn foreground_recovery_stops_after_first_unavailable_chunk_impl(backend: MainTestBackend) {
     let target = build_test_state(1, false, backend).await;
     let source = build_test_state(1, false, backend).await;

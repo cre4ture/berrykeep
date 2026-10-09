@@ -2059,9 +2059,15 @@ async fn pull_bundle_from_source(
         } else {
             existing
         };
-        let recovered =
-            content_recovery::recover_chunks(state, &subject, &chunks, Some(source_node), false)
-                .await;
+        let recovered = content_recovery::recover_chunks_with_budget(
+            state,
+            &subject,
+            &chunks,
+            Some(source_node),
+            false,
+            content_recovery::DURABLE_CONTENT_REPAIR_BUDGET,
+        )
+        .await?;
         if !recovered.remaining.is_empty() {
             bail!(
                 "replication content recovery incomplete: {}",

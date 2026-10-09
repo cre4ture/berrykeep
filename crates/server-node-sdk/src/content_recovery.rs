@@ -18,7 +18,7 @@ pub(crate) const FULL_OBJECT_RECOVERY_BUDGET_MAX: Duration = Duration::from_secs
 /// and any verified chunks survive cancellation, so a later pass resumes with
 /// a fresh peer snapshot. Full local verification is deliberately outside this
 /// budget: a large, locally complete object must always be able to finish.
-const DURABLE_CONTENT_REPAIR_BUDGET: Duration = Duration::from_secs(2 * 60);
+pub(crate) const DURABLE_CONTENT_REPAIR_BUDGET: Duration = Duration::from_secs(2 * 60);
 /// A worker pass processes one durable manifest at a time. Each manifest has
 /// its own transfer deadline, so this keeps notifications from being delayed
 /// behind a history-sized batch while still allowing local verification to
@@ -480,6 +480,24 @@ pub(crate) async fn recover_chunks(
             error_policy: RecoveryErrorPolicy::CollectAll,
         },
     )
+    .await
+}
+
+pub(crate) async fn recover_chunks_with_budget(
+    state: &ServerState,
+    subject: &str,
+    chunks: &[ReplicationChunkInfo],
+    preferred: Option<&NodeDescriptor>,
+    cache: bool,
+    budget: Duration,
+) -> Result<ChunkRecoveryResult> {
+    // Replication pulls persist their GC pin before reaching this helper. Bound
+    // their fan-out across chunks and peers so a partition cannot occupy an
+    // audit plan item indefinitely; verified bytes remain reusable by the
+    // durable worker after cancellation.
+    bounded_durable_recovery(budget, async {
+        Ok(recover_chunks(state, subject, chunks, preferred, cache).await)
+    })
     .await
 }
 
