@@ -21,8 +21,9 @@ These are different facts:
   local replica.
 - Placement assigns local durability obligations. Existing owned replicas remain protected
   during handoff. A periodic audit queues assigned gaps even if no peer advertises them.
-- Availability advertises owned, locally complete retained content, including historical
-  versions. A remembered historical replica claim is only a source hint, not a healthy replica.
+- Availability advertises owned, locally complete current keys and head versions. Historical
+  versions are reachable through durable manifest-hash recovery; a remembered historical replica
+  claim is only a source hint, not a healthy replica.
   Cache-only content can serve a hash request but does not satisfy durable replication.
 - Scrub verifies hashes as well as sizes. Pending repairs suppress availability until final
   verification succeeds. Ordinary availability refresh checks manifest integrity and chunk

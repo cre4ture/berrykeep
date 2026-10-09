@@ -2,48 +2,28 @@ use super::*;
 use crate::storage::ReplicationExportBundle;
 use crate::storage::retained_content::MANIFEST_SUBJECT_PREFIX;
 
-#[tokio::test]
-async fn content_repair_claims_are_manifest_scoped() {
+#[test]
+fn content_repair_claims_are_manifest_scoped() {
     let claims = Arc::new(crate::ContentRepairClaims::default());
-    let held = claims.claim("manifest-a").await;
+    let held = claims
+        .try_claim("manifest-a")
+        .expect("first claim for a manifest must succeed");
     assert!(
         claims.try_claim("manifest-a").is_none(),
         "audits must skip manifests an active repair already owns"
     );
 
-    let (different_ready_tx, different_ready) = tokio::sync::oneshot::channel();
-    let different_claims = claims.clone();
-    let different = tokio::spawn(async move {
-        let _claim = different_claims.claim("manifest-b").await;
-        different_ready_tx.send(()).unwrap();
-    });
-    tokio::time::timeout(Duration::from_millis(100), different_ready)
-        .await
-        .expect("a stalled manifest must not block unrelated replication")
-        .unwrap();
-    different.await.unwrap();
-
-    let hook = crate::ContentRepairClaimWaitHook::new();
-    claims.set_wait_after_failed_claim(Some(hook.clone()));
-    let (same_ready_tx, same_ready) = tokio::sync::oneshot::channel();
-    let same_claims = claims.clone();
-    let same = tokio::spawn(async move {
-        let _claim = same_claims.claim("manifest-a").await;
-        same_ready_tx.send(()).unwrap();
-    });
-    tokio::time::timeout(Duration::from_secs(1), hook.wait_until_failed_claim())
-        .await
-        .expect("waiting repair did not reach the claim wait point");
-    // This release falls between the failed claim and the await. `Notified::enable`
-    // must retain it; `notify_waiters` otherwise loses it and strands the waiter.
+    let different = claims.try_claim("manifest-b");
+    assert!(
+        different.is_some(),
+        "a stalled manifest must not block unrelated replication"
+    );
+    drop(different);
     drop(held);
-    hook.resume_claim();
-    tokio::time::timeout(Duration::from_secs(1), same_ready)
-        .await
-        .expect("waiting repair did not resume after the matching claim released")
-        .unwrap();
-    same.await.unwrap();
-    claims.set_wait_after_failed_claim(None);
+    assert!(
+        claims.try_claim("manifest-a").is_some(),
+        "releasing a claim must permit a later repair for the same manifest"
+    );
 }
 
 #[tokio::test]
@@ -520,6 +500,101 @@ run_on_main_metadata_backends!(
     recovery_targeted_repair_respects_busy_throttle_turso
 );
 
+async fn recovery_targeted_repair_defers_claimed_manifest_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &url).await;
+    let key = "claimed-targeted-recovery.bin";
+    let version = "v1";
+    for state in [&source, &target] {
+        seed_subject_version(
+            state,
+            key,
+            version,
+            b"claimed targeted repair payload".to_vec(),
+            vec![],
+        )
+        .await;
+    }
+    let manifest = bundle(&target, key, version).await;
+    remove_chunks(&target, &manifest, &[0]).await;
+    let source_node = target
+        .cluster
+        .lock()
+        .await
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == source.node_id)
+        .expect("registered source descriptor must be retained by the target");
+    let plan = crate::cluster::ReplicationPlan {
+        generated_at_unix: 0,
+        under_replicated: 1,
+        over_replicated: 0,
+        cleanup_deferred_items: 0,
+        cleanup_deferred_extra_nodes: 0,
+        items: vec![crate::cluster::ReplicationPlanItem {
+            key: format!("{key}@{version}"),
+            desired_nodes: vec![target.node_id],
+            current_nodes: vec![source.node_id],
+            missing_nodes: vec![target.node_id],
+            extra_nodes: Vec::new(),
+            cleanup_option: crate::cluster::ReplicationCleanupOption::None,
+            deferred_extra_nodes: 0,
+        }],
+    };
+    let claim = target
+        .maintenance
+        .content_repair_claims
+        .try_claim(&manifest.manifest_hash)
+        .expect("test must hold the manifest claim");
+
+    let report = tokio::time::timeout(Duration::from_secs(1), async {
+        crate::replication::execute_replication_repair_plan(
+            &target,
+            &plan,
+            vec![source_node],
+            None,
+            false,
+            None,
+        )
+        .await
+    })
+    .await
+    .expect("a claimed manifest must not block the rest of the repair plan");
+
+    assert_eq!(report.attempted_transfers, 0, "{report:?}");
+    assert_eq!(report.successful_transfers, 0, "{report:?}");
+    assert_eq!(report.failed_transfers, 0, "{report:?}");
+    assert_eq!(report.skipped_items, 1, "{report:?}");
+    assert!(
+        report.detailed_log.iter().any(|entry| {
+            entry.event == "repair_deferred"
+                && entry
+                    .context
+                    .as_ref()
+                    .and_then(|context| context["reason"].as_str())
+                    == Some("manifest_repair_in_progress")
+        }),
+        "claim contention must remain observable without being marked as a failed transfer: {report:?}"
+    );
+    assert!(report.skipped_details.iter().any(|detail| {
+        detail.reason == crate::replication::ReplicationRepairSkipReason::RepairInProgress
+    }));
+
+    drop(claim);
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_targeted_repair_defers_claimed_manifest_impl,
+    recovery_targeted_repair_defers_claimed_manifest,
+    recovery_targeted_repair_defers_claimed_manifest_turso
+);
+
 async fn recovery_enqueue_only_pass_bypasses_busy_throttle_impl(backend: MainTestBackend) {
     let mut state = build_test_state(1, false, backend).await;
     state.repair_config.busy_throttle_enabled = true;
@@ -741,8 +816,8 @@ async fn recovery_batch_limit_skips_contended_and_backoff_tasks_impl(backend: Ma
     let held_claim = target
         .maintenance
         .content_repair_claims
-        .claim(&contended.0)
-        .await;
+        .try_claim(&contended.0)
+        .expect("test must hold the contended manifest claim");
 
     let reference = read_store(&target, "test.recovery.batch_backoff_reference")
         .await
@@ -830,8 +905,8 @@ async fn recovery_worker_skips_already_claimed_tasks_impl(backend: MainTestBacke
     let claim = target
         .maintenance
         .content_repair_claims
-        .claim(&manifest_hash)
-        .await;
+        .try_claim(&manifest_hash)
+        .expect("test must hold the pending manifest claim");
 
     crate::content_recovery::resume_pending(&target)
         .await

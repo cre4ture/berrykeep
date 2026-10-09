@@ -453,34 +453,6 @@ struct ServerMaintenanceRuntime {
 #[derive(Default)]
 struct ContentRepairClaims {
     active_manifests: StdMutex<HashSet<String>>,
-    released: Notify,
-    #[cfg(test)]
-    wait_after_failed_claim: StdMutex<Option<ContentRepairClaimWaitHook>>,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-struct ContentRepairClaimWaitHook {
-    waiting: Arc<Notify>,
-    resume: Arc<Notify>,
-}
-
-#[cfg(test)]
-impl ContentRepairClaimWaitHook {
-    fn new() -> Self {
-        Self {
-            waiting: Arc::new(Notify::new()),
-            resume: Arc::new(Notify::new()),
-        }
-    }
-
-    async fn wait_until_failed_claim(&self) {
-        self.waiting.notified().await;
-    }
-
-    fn resume_claim(&self) {
-        self.resume.notify_one();
-    }
 }
 
 struct ContentRepairClaim {
@@ -506,40 +478,6 @@ impl ContentRepairClaims {
                 manifest_hash: manifest_hash.to_string(),
             })
     }
-
-    async fn claim(self: &Arc<Self>, manifest_hash: &str) -> ContentRepairClaim {
-        loop {
-            // Register the waiter before checking the set so a concurrent
-            // release cannot be missed between the check and the await.
-            let notified = self.released.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(claim) = self.try_claim(manifest_hash) {
-                return claim;
-            }
-            #[cfg(test)]
-            let hook = {
-                self.wait_after_failed_claim
-                    .lock()
-                    .expect("content repair claim lock poisoned")
-                    .clone()
-            };
-            #[cfg(test)]
-            if let Some(hook) = hook {
-                hook.waiting.notify_one();
-                hook.resume.notified().await;
-            }
-            notified.await;
-        }
-    }
-
-    #[cfg(test)]
-    fn set_wait_after_failed_claim(&self, hook: Option<ContentRepairClaimWaitHook>) {
-        *self
-            .wait_after_failed_claim
-            .lock()
-            .expect("content repair claim lock poisoned") = hook;
-    }
 }
 
 impl Drop for ContentRepairClaim {
@@ -549,7 +487,6 @@ impl Drop for ContentRepairClaim {
             .lock()
             .expect("content repair claim lock poisoned")
             .remove(&self.manifest_hash);
-        self.claims.released.notify_waiters();
     }
 }
 

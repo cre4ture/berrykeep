@@ -101,8 +101,14 @@ pub(crate) enum ReplicationRepairSkipReason {
     LocalContentUnavailable,
     SourceNodeUnavailable,
     BundleUnavailable,
+    RepairInProgress,
     BackoffActive,
     MaxRetriesExhausted,
+}
+
+enum PullBundleOutcome {
+    Imported(String),
+    Deferred { manifest_hash: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -800,7 +806,7 @@ pub(crate) async fn execute_replication_repair_plan(
             )
             .await
             {
-                Ok(imported_version_id) => {
+                Ok(PullBundleOutcome::Imported(imported_version_id)) => {
                     if verify_local_pulls
                         && let Err(err) = verify_local_repair_subject(state, &item.key).await
                     {
@@ -897,6 +903,27 @@ pub(crate) async fn execute_replication_repair_plan(
                             .ok()
                             .flatten()
                     };
+                }
+                Ok(PullBundleOutcome::Deferred { manifest_hash }) => {
+                    // Claim contention means another operation is already
+                    // recovering this immutable manifest. No transfer started,
+                    // so leave capacity for the rest of this repair batch.
+                    attempted_transfers = attempted_transfers.saturating_sub(1);
+                    skipped_items += 1;
+                    push_repair_skipped_detail(
+                        &mut skipped_details,
+                        state.node_id,
+                        item.key.clone(),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        Some(source_node.node_id),
+                        Some(state.node_id),
+                        ReplicationRepairSkipReason::RepairInProgress,
+                        format!(
+                            "replication pull deferred while another operation repairs manifest {manifest_hash}"
+                        ),
+                    );
+                    continue;
                 }
                 Err(err) => {
                     let error_text = format!("{err:#}");
@@ -1841,7 +1868,7 @@ async fn pull_bundle_from_source(
     state: &ServerState,
     run_id: Option<&str>,
     detailed_log: &mut Vec<ReplicationRepairLogEntry>,
-) -> Result<String> {
+) -> Result<PullBundleOutcome> {
     let transfer_started = Instant::now();
     let export_path = build_replication_export_path(key, version_id);
     let repair_run_id = run_id.unwrap_or("untracked");
@@ -1916,13 +1943,32 @@ async fn pull_bundle_from_source(
     // sentinel.
     let needs_content_repair = requires_content_repair_claim(&bundle.manifest_hash);
     let _content_repair = if needs_content_repair {
-        Some(
-            state
-                .maintenance
-                .content_repair_claims
-                .claim(&bundle.manifest_hash)
-                .await,
-        )
+        let Some(claim) = state
+            .maintenance
+            .content_repair_claims
+            .try_claim(&bundle.manifest_hash)
+        else {
+            push_repair_log_entry(
+                detailed_log,
+                state.node_id,
+                "repair_deferred",
+                "replication pull deferred while another operation owns the manifest repair",
+                Some(subject),
+                Some(bundle.key),
+                bundle.version_id,
+                Some(source_node.node_id),
+                Some(state.node_id),
+                Some(serde_json::json!({
+                    "pending": true,
+                    "reason": "manifest_repair_in_progress",
+                    "manifest_hash": bundle.manifest_hash,
+                })),
+            );
+            return Ok(PullBundleOutcome::Deferred {
+                manifest_hash: bundle.manifest_hash,
+            });
+        };
+        Some(claim)
     } else {
         None
     };
@@ -2031,7 +2077,7 @@ async fn pull_bundle_from_source(
             "elapsed_ms": transfer_started.elapsed().as_millis(),
         })),
     );
-    Ok(imported_version_id)
+    Ok(PullBundleOutcome::Imported(imported_version_id))
 }
 
 async fn verify_local_repair_subject(state: &ServerState, subject: &str) -> Result<()> {
