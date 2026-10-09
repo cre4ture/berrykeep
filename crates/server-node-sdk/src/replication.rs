@@ -1912,6 +1912,37 @@ fn should_persist_replication_pull_repair_pin(
     automatic_repair_enabled && requires_content_repair_claim(manifest_hash)
 }
 
+fn replication_pull_recovery_budget(automatic_repair_enabled: bool) -> Option<Duration> {
+    automatic_repair_enabled.then_some(content_recovery::DURABLE_CONTENT_REPAIR_BUDGET)
+}
+
+async fn recover_replication_pull_chunks(
+    state: &ServerState,
+    subject: &str,
+    chunks: &[storage::ReplicationChunkInfo],
+    source_node: &NodeDescriptor,
+) -> Result<content_recovery::ChunkRecoveryResult> {
+    match replication_pull_recovery_budget(state.repair_config.enabled) {
+        Some(budget) => {
+            content_recovery::recover_chunks_with_budget(
+                state,
+                subject,
+                chunks,
+                Some(source_node),
+                false,
+                budget,
+            )
+            .await
+        }
+        None => {
+            Ok(
+                content_recovery::recover_chunks(state, subject, chunks, Some(source_node), false)
+                    .await,
+            )
+        }
+    }
+}
+
 pub(crate) async fn complete_pending_replication_import(
     state: &ServerState,
     task: &storage::content_recovery::ContentRepairTask,
@@ -2113,14 +2144,16 @@ async fn pull_bundle_from_source(
         } else {
             existing
         };
-        let recovered = content_recovery::recover_chunks_with_budget(
+        // A total deadline is safe only when a durable worker can resume the
+        // persisted pin. With automatic repair disabled, retain the legacy
+        // behavior: peer requests remain individually bounded, but a large
+        // available bundle is not abandoned after a fixed number of passes.
+        let recovered = Box::pin(recover_replication_pull_chunks(
             state,
             &subject,
             &chunks,
-            Some(source_node),
-            false,
-            content_recovery::DURABLE_CONTENT_REPAIR_BUDGET,
-        )
+            source_node,
+        ))
         .await?;
         if !recovered.remaining.is_empty() {
             bail!(
@@ -2728,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn replication_pull_pins_only_drainable_non_tombstone_repair_work() {
+    fn replication_pull_pins_and_budgets_only_drainable_non_tombstone_repair_work() {
         assert!(
             !requires_content_repair_claim(TOMBSTONE_MANIFEST_HASH),
             "the shared tombstone sentinel must not serialize unrelated deletes"
@@ -2746,6 +2779,16 @@ mod tests {
             TOMBSTONE_MANIFEST_HASH,
             true
         ));
+        assert_eq!(
+            replication_pull_recovery_budget(true),
+            Some(content_recovery::DURABLE_CONTENT_REPAIR_BUDGET),
+            "a durable worker may resume a pull after its total transfer budget"
+        );
+        assert_eq!(
+            replication_pull_recovery_budget(false),
+            None,
+            "without a durable worker, only per-request deadlines may bound a legacy pull"
+        );
     }
 
     #[test]
