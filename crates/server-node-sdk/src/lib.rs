@@ -519,10 +519,15 @@ impl LocalAvailabilityCache {
 
 struct RecomputedLocalAvailability {
     subjects: Vec<String>,
-    /// A fallback based on namespace keys is useful for one refresh but lacks
-    /// ownership, integrity, and repair-pending checks. Never replay it from
-    /// the TTL cache.
+    /// Failed scans contain no authoritative availability information. They
+    /// must neither be cached nor reconciled as an empty local view.
     cacheable: bool,
+}
+
+impl RecomputedLocalAvailability {
+    fn into_trustworthy_subjects(self) -> Option<Vec<String>> {
+        self.cacheable.then_some(self.subjects)
+    }
 }
 
 fn cache_local_availability_if_current(
@@ -12458,7 +12463,7 @@ async fn cached_local_cluster_available_subjects(state: &ServerState) -> Vec<Str
 
 async fn cached_or_recompute_local_cluster_available_subjects(
     state: &ServerState,
-) -> Arc<Vec<String>> {
+) -> Option<Arc<Vec<String>>> {
     let generation = state
         .maintenance
         .local_availability_generation
@@ -12472,18 +12477,17 @@ async fn cached_or_recompute_local_cluster_available_subjects(
         .filter(|cache| cache.is_valid_for(generation))
         .map(|cache| Arc::clone(&cache.subjects))
     {
-        return subjects;
+        return Some(subjects);
     }
 
     let computed = recompute_local_cluster_available_subjects(state).await;
-    let subjects = Arc::new(computed.subjects.clone());
     let current_generation = state
         .maintenance
         .local_availability_generation
         .load(Ordering::SeqCst);
     let mut cache = state.maintenance.local_availability_cache.lock().await;
     cache_local_availability_if_current(&mut cache, generation, current_generation, &computed);
-    subjects
+    computed.into_trustworthy_subjects().map(Arc::new)
 }
 
 #[cfg(test)]
@@ -12504,12 +12508,13 @@ mod local_availability_cache_tests {
     }
 
     #[test]
-    fn failed_local_availability_scan_is_empty_and_not_cached() {
+    fn failed_local_availability_scan_cannot_be_reconciled_or_cached() {
         let computed =
             local_availability_from_subject_scan(Err(anyhow!("metadata backend unavailable")));
 
         assert!(computed.subjects.is_empty());
         assert!(!computed.cacheable);
+        assert!(computed.into_trustworthy_subjects().is_none());
     }
 }
 
@@ -12519,7 +12524,12 @@ async fn refresh_local_availability_view_once(state: &ServerState) -> usize {
         .local_availability_refresh_lock
         .lock()
         .await;
-    let local_subjects = cached_or_recompute_local_cluster_available_subjects(state).await;
+    let Some(local_subjects) = cached_or_recompute_local_cluster_available_subjects(state).await
+    else {
+        // A failed scan is an absence of new information, not evidence that
+        // every previously advertised local subject disappeared.
+        return cached_local_cluster_available_subjects(state).await.len();
+    };
     let subject_count = local_subjects.len();
     let replicas_changed = {
         let mut cluster = state.cluster.lock().await;

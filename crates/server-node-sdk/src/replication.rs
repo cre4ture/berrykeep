@@ -19,11 +19,11 @@ pub(crate) struct ReplicationRepairReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) detailed_log: Vec<ReplicationRepairLogEntry>,
     pub(crate) last_error: Option<String>,
-    #[serde(skip)]
+    #[serde(default)]
     pub(crate) had_chunk_progress: bool,
-    #[serde(skip)]
+    #[serde(default)]
     pub(crate) waiting_for_source: bool,
-    #[serde(skip)]
+    #[serde(default)]
     pub(crate) unresolved: bool,
 }
 
@@ -2517,6 +2517,52 @@ mod tests {
             report.unresolved = true;
             assert_eq!(report.run_status(), RepairRunStatus::Unresolved);
         }
+    }
+
+    #[test]
+    fn repair_status_flags_survive_peer_json_and_cluster_aggregation() {
+        for (had_chunk_progress, waiting_for_source, unresolved, expected_status) in [
+            (true, false, false, RepairRunStatus::PartiallyRepaired),
+            (false, true, false, RepairRunStatus::WaitingForSource),
+            (false, false, true, RepairRunStatus::Unresolved),
+        ] {
+            let mut peer_report = empty_report();
+            peer_report.failed_transfers = 1;
+            peer_report.had_chunk_progress = had_chunk_progress;
+            peer_report.waiting_for_source = waiting_for_source;
+            peer_report.unresolved = unresolved;
+
+            let wire_report: ReplicationRepairReport = serde_json::from_value(
+                serde_json::to_value(peer_report).expect("serialize peer repair report"),
+            )
+            .expect("deserialize peer repair report");
+            let mut aggregate = empty_report();
+            accumulate_repair_report(&mut aggregate, &wire_report);
+
+            assert_eq!(aggregate.had_chunk_progress, had_chunk_progress);
+            assert_eq!(aggregate.waiting_for_source, waiting_for_source);
+            assert_eq!(aggregate.unresolved, unresolved);
+            assert_eq!(aggregate.run_status(), expected_status);
+        }
+    }
+
+    #[test]
+    fn repair_status_flags_default_for_older_peer_json() {
+        let mut legacy_report = serde_json::to_value(empty_report())
+            .expect("serialize repair report")
+            .as_object()
+            .expect("repair report JSON object")
+            .clone();
+        legacy_report.remove("had_chunk_progress");
+        legacy_report.remove("waiting_for_source");
+        legacy_report.remove("unresolved");
+
+        let report: ReplicationRepairReport =
+            serde_json::from_value(legacy_report.into()).expect("deserialize legacy peer report");
+
+        assert!(!report.had_chunk_progress);
+        assert!(!report.waiting_for_source);
+        assert!(!report.unresolved);
     }
 
     #[test]
