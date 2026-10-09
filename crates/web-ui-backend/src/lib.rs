@@ -455,6 +455,7 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/cluster/status", get(web_cluster_status))
         .route("/cluster/nodes", get(web_cluster_nodes))
+        .route("/cluster/task-queues", get(web_cluster_task_queues))
         .route("/cluster/replication/plan", get(web_replication_plan))
         .route("/store/list", get(web_store_list))
         .route("/store/history", get(web_store_history))
@@ -545,6 +546,7 @@ pub fn router(config: WebUiConfig) -> Router {
         )
         .route("/api/cluster/status", get(web_cluster_status))
         .route("/api/cluster/nodes", get(web_cluster_nodes))
+        .route("/api/cluster/task-queues", get(web_cluster_task_queues))
         .route("/api/cluster/replication/plan", get(web_replication_plan))
         .route("/api/store/list", get(web_store_list))
         .route("/api/store/history", get(web_store_history))
@@ -2981,6 +2983,28 @@ async fn web_cluster_nodes(State(state): State<WebState>) -> impl IntoResponse {
             &state,
             StatusCode::BAD_GATEWAY,
             "cluster nodes request failed",
+            err.to_string(),
+        ),
+    }
+}
+
+async fn web_cluster_task_queues(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let diagnostic_context = diagnostic_context_from_headers(&headers);
+    match fetch_server_json_with_diagnostic_context(
+        &state,
+        "/cluster/task-queues",
+        diagnostic_context.as_deref(),
+    )
+    .await
+    {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(err) => logged_error_response(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            "cluster task queue request failed",
             err.to_string(),
         ),
     }

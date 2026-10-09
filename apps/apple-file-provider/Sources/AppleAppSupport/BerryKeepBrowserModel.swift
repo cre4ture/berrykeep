@@ -182,6 +182,8 @@ final class BerryKeepBrowserModel: ObservableObject {
     @Published var galleryMapPresentation: BerryKeepWebUIPresentation?
     @Published var titleLatencyMonitorSettings = AppleTitleLatencyMonitorSettings()
     @Published var titleLatencyStatus = AppleTitleLatencyStatus()
+    @Published var clusterTaskQueues: AppleClusterTaskQueueSnapshot?
+    @Published var clusterTaskQueuesErrorMessage: String?
 
     let bundleDefaults: BerryKeepConnectionDraft
 
@@ -206,10 +208,22 @@ final class BerryKeepBrowserModel: ObservableObject {
     private var connectionRouteRequests = AppleLatestRequestCoordinator()
     private var directoryLoadCoordinator = AppleDirectoryLoadCoordinator()
     private var titleLatencyStatusTask: Task<Void, Never>?
+    private var taskQueueStatusTask: Task<Void, Never>?
     private var diagnosticActions: [BerryKeepRecentAction] = []
 
     var isSyncProfileMutationInProgress: Bool {
         syncProfileOperationState.isMutationInProgress
+    }
+
+    var clientTaskQueues: [AppleTaskQueueEntry] {
+        let foregroundActive = UInt64(max(0, pendingOperations))
+        let profileActive: UInt64 = isSyncProfileMutationInProgress ? 1 : 0
+        let probeActive: UInt64 = titleLatencyStatus.state == "pending" ? 1 : 0
+        return [
+            appTaskQueue(id: "foreground", label: "Foreground operations", active: foregroundActive),
+            appTaskQueue(id: "sync_profiles", label: "Sync profile changes", active: profileActive),
+            appTaskQueue(id: "latency_probe", label: "Connection probe", active: probeActive),
+        ]
     }
 
     init(
@@ -451,6 +465,7 @@ final class BerryKeepBrowserModel: ObservableObject {
 
         if hasCompletedOnboarding {
             configureTitleLatencyMonitor()
+            restartTaskQueueStatusMonitor()
             refresh()
         } else {
             statusText = "Finish onboarding to start browsing the remote library."
@@ -551,6 +566,7 @@ final class BerryKeepBrowserModel: ObservableObject {
         addAction("Completed onboarding", detail: draft.enrollmentSummary)
         refreshDomainState()
         configureTitleLatencyMonitor()
+        restartTaskQueueStatusMonitor()
         reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after onboarding")
     }
 
@@ -587,6 +603,7 @@ final class BerryKeepBrowserModel: ObservableObject {
         addAction("Applied settings", detail: draft.setupSummary)
         refreshDomainState()
         configureTitleLatencyMonitor()
+        restartTaskQueueStatusMonitor()
         reloadRootAfterConnectionContextChange(actionTitle: "Loaded root after reconnecting")
     }
 
@@ -908,6 +925,7 @@ final class BerryKeepBrowserModel: ObservableObject {
         addAction("Restored defaults", detail: draft.setupSummary)
         refreshDomainState()
         configureTitleLatencyMonitor()
+        restartTaskQueueStatusMonitor()
         if hasCompletedOnboarding, !draft.requiresEnrollment, draft.connectionConfiguration != nil {
             reloadRootAfterConnectionContextChange(actionTitle: "Loaded bundled root")
         } else {
@@ -991,6 +1009,7 @@ final class BerryKeepBrowserModel: ObservableObject {
                 statusText = "Device enrolled: \(enrollment.deviceID)"
                 addAction("Enrolled device", detail: draft.deviceLabel.nilIfBlank ?? enrollment.deviceID)
                 configureTitleLatencyMonitor()
+                restartTaskQueueStatusMonitor()
 
                 if completesOnboarding {
                     hasCompletedOnboarding = true
@@ -1534,6 +1553,38 @@ final class BerryKeepBrowserModel: ObservableObject {
         }
     }
 
+    private func restartTaskQueueStatusMonitor() {
+        taskQueueStatusTask?.cancel()
+        taskQueueStatusTask = nil
+        guard let configuration = draft.connectionConfiguration else {
+            clusterTaskQueues = nil
+            clusterTaskQueuesErrorMessage = nil
+            return
+        }
+        let remoteSession = remoteSession
+        taskQueueStatusTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    let snapshot = try await Task.detached(priority: .utility) {
+                        try remoteSession.clusterTaskQueues(configuration: configuration)
+                    }.value
+                    try Task.checkCancellation()
+                    self?.clusterTaskQueues = snapshot
+                    self?.clusterTaskQueuesErrorMessage = nil
+                } catch is CancellationError {
+                    return
+                } catch {
+                    self?.clusterTaskQueuesErrorMessage = error.localizedDescription
+                }
+                do {
+                    try await Task.sleep(nanoseconds: 30_000_000_000)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
     private func loadDirectory(request: AppleDirectoryLoadRequest, actionTitle: String) {
         guard let configuration = draft.connectionConfiguration else {
             let message = "A connection bootstrap bundle is required."
@@ -1648,6 +1699,16 @@ final class BerryKeepBrowserModel: ObservableObject {
         pendingOperations = max(0, pendingOperations - 1)
         isBusy = pendingOperations > 0
     }
+
+    private func appTaskQueue(id: String, label: String, active: UInt64) -> AppleTaskQueueEntry {
+        AppleTaskQueueEntry(
+            id: id,
+            label: label,
+            pending: 0,
+            active: active,
+            state: active > 0 ? "running" : "idle"
+        )
+    }
 }
 
 private func clearBerryKeepCachedFiles() {
@@ -1727,6 +1788,16 @@ final class BerryKeepRemoteSession: @unchecked Sendable {
             try bridge.connectionDiagnosticsJSON()
         }
         return try decode(BerryKeepConnectionDiagnosticsSnapshot.self, from: json)
+    }
+
+    func clusterTaskQueues(
+        configuration: AppleConnectionConfiguration
+    ) throws -> AppleClusterTaskQueueSnapshot {
+        let data = try fetchRelativeBytes(
+            path: "/api/v1/cluster/task-queues",
+            configuration: configuration
+        )
+        return try JSONDecoder().decode(AppleClusterTaskQueueSnapshot.self, from: data)
     }
 
     func connectionRouteSnapshot(

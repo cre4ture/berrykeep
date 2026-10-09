@@ -56,6 +56,8 @@ struct BerryKeepFilesView: View {
 
                     connectionDiagnostics
 
+                    taskQueues
+
                     if !model.items.isEmpty {
                         BerryKeepCard(title: "Root snapshot", subtitle: "Latest items visible at the top of the remote tree.") {
                             ForEach(model.items.prefix(5), id: \.identifier.serialized) { item in
@@ -165,6 +167,95 @@ struct BerryKeepFilesView: View {
                 }
             }
         }
+    }
+
+    private var taskQueues: some View {
+        BerryKeepCard(
+            title: "Task queues",
+            subtitle: "Best-effort client and server work; server counts refresh about every 30 seconds."
+        ) {
+            Text("This client").font(.headline)
+            ForEach(model.clientTaskQueues) { queue in
+                taskQueueRow(queue)
+            }
+            Text("Server cluster").font(.headline).padding(.top, 4)
+            let activeServerQueues = (model.clusterTaskQueues?.nodes ?? []).flatMap { node in
+                node.queues
+                    .filter { $0.pending > 0 || $0.active > 0 }
+                    .map { queue in
+                        AppleTaskQueueEntry(
+                            id: "\(node.nodeID)-\(queue.id)",
+                            label: "\(queue.label) · \(shortNodeID(node.nodeID))",
+                            pending: queue.pending,
+                            active: queue.active,
+                            capacity: queue.capacity,
+                            state: queue.state,
+                            detail: queue.detail
+                        )
+                    }
+            }
+            if activeServerQueues.isEmpty {
+                Text(model.clusterTaskQueues == nil
+                    ? "Waiting for a server snapshot."
+                    : "No pending or active server work observed.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(activeServerQueues) { queue in
+                    taskQueueRow(queue)
+                }
+            }
+            ForEach(model.clusterTaskQueues?.unavailableNodes ?? [], id: \.nodeID) { node in
+                taskQueueRow(
+                    AppleTaskQueueEntry(
+                        id: "unavailable-\(node.nodeID)",
+                        label: "Server node \(shortNodeID(node.nodeID))",
+                        pending: 0,
+                        active: 0,
+                        state: "unavailable",
+                        detail: node.error
+                    )
+                )
+            }
+            if let snapshot = model.clusterTaskQueues {
+                let generatedAt = Date(
+                    timeIntervalSince1970: TimeInterval(snapshot.generatedAtUnixMs) / 1_000
+                )
+                Text(
+                    "Server snapshot \(generatedAt.formatted(date: .omitted, time: .standard))"
+                        + (model.clusterTaskQueuesErrorMessage == nil ? "" : " · stale")
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            }
+            if let error = model.clusterTaskQueuesErrorMessage {
+                Text(error).font(.footnote).foregroundStyle(.red)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func taskQueueRow(_ queue: AppleTaskQueueEntry) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(queue.label).font(.subheadline)
+                Spacer()
+                Text("\(queue.state) · \(queue.pending) pending · \(queue.active) active")
+                    .font(.caption)
+                    .foregroundStyle(
+                        queue.state == "backlogged" || queue.state == "unavailable"
+                            ? Color.red
+                            : Color.secondary
+                    )
+            }
+            if let detail = queue.detail, !detail.isEmpty {
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func shortNodeID(_ nodeID: String) -> String {
+        nodeID.count > 12 ? String(nodeID.prefix(8)) : nodeID
     }
 }
 

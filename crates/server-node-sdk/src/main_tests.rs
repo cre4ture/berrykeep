@@ -19915,6 +19915,7 @@ async fn build_test_state(
         node_hostname: None,
         store: store.clone(),
         cluster: Arc::new(Mutex::new(service)),
+        cluster_task_queue_cache: Arc::new(Mutex::new(None)),
         storage: super::ServerStorageRuntime {
             upload_chunk_ingestor,
             upload_sessions: super::new_upload_sessions_rwlock(super::UploadSessionStore {
@@ -19922,6 +19923,7 @@ async fn build_test_state(
                 sessions: HashMap::new(),
             }),
             upload_sessions_dirty: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            upload_sessions_persisted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             upload_sessions_persist_notify: Arc::new(tokio::sync::Notify::new()),
             map_dataset_import: Arc::new(Mutex::new(
                 super::map_dataset_import::MapDatasetImportRuntime::empty(
@@ -20596,6 +20598,60 @@ impl DataScrubAutoRepairCorruptionKind {
             Self::ChunkHashMismatch => super::storage::DataScrubIssueKind::ChunkHashMismatch,
         }
     }
+}
+
+#[tokio::test]
+async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state
+        .maintenance
+        .inflight_requests
+        .store(4, std::sync::atomic::Ordering::Relaxed);
+    state
+        .storage
+        .upload_sessions_dirty
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    state
+        .storage
+        .upload_sessions_persisted
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut repair = state.maintenance.autonomous_post_write_repair.lock().await;
+        repair.pending_subjects.insert("photos/a.jpg".to_string());
+        repair.active = true;
+    }
+
+    let snapshot = super::local_task_queue_snapshot(&state, false).await;
+
+    let requests = snapshot
+        .queues
+        .iter()
+        .find(|queue| queue.id == "requests")
+        .expect("request queue should be present");
+    assert_eq!(requests.active, 4);
+    let persistence = snapshot
+        .queues
+        .iter()
+        .find(|queue| queue.id == "upload_session_persistence")
+        .expect("persistence queue should be present");
+    assert_eq!(persistence.pending, 1);
+    let repair = snapshot
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(repair.pending, 2);
+    assert_eq!(repair.active, 1);
+
+    let first_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
+    state
+        .maintenance
+        .inflight_requests
+        .store(9, std::sync::atomic::Ordering::Relaxed);
+    let cached_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
+    assert_eq!(cached_cluster_snapshot, first_cluster_snapshot);
+
+    cleanup_test_state(&state).await;
 }
 
 async fn choose_locally_placed_key(state: &ServerState, prefix: &str) -> String {

@@ -9,6 +9,7 @@ import io.berrykeep.android.api.StoreIndexView
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.Json
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -440,6 +441,22 @@ class BerryKeepRepository {
             serverCaPem,
             normalizedClientIdentityJson(clientIdentityJson),
         )
+    }
+
+    suspend fun getClusterTaskQueueStatus(
+        connectionInput: String,
+        serverCaPem: String? = null,
+        clientIdentityJson: String? = null,
+    ): ClusterTaskQueueSnapshot {
+        val output = ByteArrayOutputStream()
+        streamRelativeUrlTo(
+            connectionInput = connectionInput,
+            relativeUrl = "/api/v1/cluster/task-queues",
+            output = output,
+            serverCaPem = serverCaPem,
+            clientIdentityJson = clientIdentityJson,
+        )
+        return decodeJson(output.toString(Charsets.UTF_8.name()), ClusterTaskQueueSnapshot::class.java)
     }
 
     fun startWebUi(

@@ -3,6 +3,7 @@ export * from "./shared/errors";
 export * from "./shared/logs";
 export * from "./shared/map-config";
 export * from "./shared/store-index";
+export * from "./shared/task-queue";
 export * from "./client-ui/client";
 export * from "./server-admin/client";
 export * from "./client-ui/types";
