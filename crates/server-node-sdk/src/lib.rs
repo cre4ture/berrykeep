@@ -11888,7 +11888,7 @@ async fn run_replication_audit_once(state: &ServerState) {
         }
     }
 
-    let keys = planning_replication_subjects_for_auditor(state).await;
+    let keys = planning_replication_subjects(state).await;
 
     let (node_transitioned_offline, plan_snapshot) = {
         let mut cluster = state.cluster.lock().await;
@@ -12400,11 +12400,10 @@ async fn record_server_request_timing(request: Request, next: Next) -> Response 
     response
 }
 
+/// Returns every current replication subject without collapsing concurrent
+/// heads by placement key. Historical non-head obligations use the separate
+/// manifest-hash repair worker and are excluded here.
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
-    planning_replication_subjects_from_availability(state).await
-}
-
-async fn planning_replication_subjects_from_availability(state: &ServerState) -> Vec<String> {
     let local_subjects = cached_local_cluster_available_subjects(state).await;
     let cluster_subjects = {
         let cluster = state.cluster.lock().await;
@@ -12423,16 +12422,6 @@ async fn planning_replication_subjects_from_availability(state: &ServerState) ->
     subjects
         .retain(|subject| !subject.starts_with(storage::retained_content::MANIFEST_SUBJECT_PREFIX));
     subjects.into_iter().collect()
-}
-
-/// Returns every current replication subject for the periodic background audit.
-///
-/// Availability intentionally excludes non-head retained history, so this stays
-/// bounded without collapsing concurrent heads. Collapsing by placement key
-/// would hide a divergent current version whenever the base subject already
-/// has enough replicas.
-async fn planning_replication_subjects_for_auditor(state: &ServerState) -> Vec<String> {
-    planning_replication_subjects_from_availability(state).await
 }
 
 async fn recompute_local_cluster_available_subjects(

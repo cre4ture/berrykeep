@@ -437,14 +437,14 @@ run_on_main_metadata_backends!(
     remote_availability_sync_keeps_local_availability_cache_turso
 );
 
-async fn planning_subjects_for_auditor_keep_divergent_head_versions_impl(backend: MainTestBackend) {
+async fn planning_subjects_keep_divergent_head_versions_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let key = choose_locally_placed_key(&state, "planning-divergent-heads").await;
     seed_subject_version(&state, &key, "ver-planning-a", b"first".to_vec(), vec![]).await;
     seed_subject_version(&state, &key, "ver-planning-b", b"second".to_vec(), vec![]).await;
 
     crate::refresh_local_availability_view_once(&state).await;
-    let subjects = crate::planning_replication_subjects_for_auditor(&state).await;
+    let subjects = crate::planning_replication_subjects(&state).await;
     let matching = subjects
         .iter()
         .filter(|subject| crate::cluster::replication_placement_key(subject) == key)
@@ -456,15 +456,15 @@ async fn planning_subjects_for_auditor_keep_divergent_head_versions_impl(backend
             &format!("{key}@ver-planning-a"),
             &format!("{key}@ver-planning-b"),
         ],
-        "the periodic auditor must not collapse concurrent heads behind the base subject"
+        "replication planning must not collapse concurrent heads behind the base subject"
     );
     cleanup_test_state(&state).await;
 }
 
 run_on_main_metadata_backends!(
-    planning_subjects_for_auditor_keep_divergent_head_versions_impl,
-    planning_subjects_for_auditor_keep_divergent_head_versions,
-    planning_subjects_for_auditor_keep_divergent_head_versions_turso
+    planning_subjects_keep_divergent_head_versions_impl,
+    planning_subjects_keep_divergent_head_versions,
+    planning_subjects_keep_divergent_head_versions_turso
 );
 
 async fn replication_plan_defers_presence_check_failures_impl(backend: MainTestBackend) {
