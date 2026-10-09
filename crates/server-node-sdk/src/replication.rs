@@ -61,6 +61,11 @@ impl ReplicationRepairReport {
         // for retry backoff or exhausted retries remains unfinished here.
         // Content recovery records its durable pending state explicitly through
         // its own events.
+        if (self.unresolved || self.waiting_for_source)
+            && (self.successful_transfers > 0 || self.had_chunk_progress)
+        {
+            return RepairRunStatus::PartiallyRepaired;
+        }
         if self.unresolved {
             return RepairRunStatus::Unresolved;
         }
@@ -2471,6 +2476,29 @@ mod tests {
             report.waiting_for_source = true;
             report.unresolved = true;
             assert_eq!(report.run_status(), RepairRunStatus::Unresolved);
+        }
+    }
+
+    #[test]
+    fn repair_status_reports_progress_with_pending_work_as_partial() {
+        for (successful_transfers, had_chunk_progress, waiting_for_source, unresolved) in [
+            (1, false, false, true),
+            (1, false, true, false),
+            (0, true, false, true),
+            (0, true, true, false),
+            (1, false, true, true),
+        ] {
+            let mut report = empty_report();
+            report.successful_transfers = successful_transfers;
+            report.had_chunk_progress = had_chunk_progress;
+            report.waiting_for_source = waiting_for_source;
+            report.unresolved = unresolved;
+
+            assert_eq!(
+                report.run_status(),
+                RepairRunStatus::PartiallyRepaired,
+                "completed work must remain visible when another task is still pending"
+            );
         }
     }
 
