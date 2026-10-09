@@ -88,6 +88,63 @@ async fn wait_for_recovery_verification_test_blocker(manifest_hash: &str) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PendingReplicationImport {
+    key: String,
+    object_id: Option<String>,
+    version_id: Option<String>,
+    logical_path: Option<String>,
+    parent_version_ids: Vec<String>,
+    state: VersionConsistencyState,
+    created_at_unix: Option<u64>,
+    copied_from_object_id: Option<String>,
+    copied_from_version_id: Option<String>,
+    copied_from_path: Option<String>,
+    selected_is_preferred_head: bool,
+}
+
+impl PendingReplicationImport {
+    pub(crate) fn from_bundle(bundle: &ReplicationExportBundle) -> Self {
+        Self {
+            key: bundle.key.clone(),
+            object_id: bundle.object_id.clone(),
+            version_id: bundle.version_id.clone(),
+            logical_path: bundle.logical_path.clone(),
+            parent_version_ids: bundle.parent_version_ids.clone(),
+            state: bundle.state.clone(),
+            created_at_unix: bundle.created_at_unix,
+            copied_from_object_id: bundle.copied_from_object_id.clone(),
+            copied_from_version_id: bundle.copied_from_version_id.clone(),
+            copied_from_path: bundle.copied_from_path.clone(),
+            selected_is_preferred_head: bundle.selected_is_preferred_head,
+        }
+    }
+
+    pub(crate) fn restore_bundle(
+        &self,
+        manifest_hash: String,
+        manifest_bytes: Vec<u8>,
+    ) -> Result<ReplicationExportBundle> {
+        let manifest = validate_manifest(&manifest_hash, &manifest_bytes)?;
+        Ok(ReplicationExportBundle {
+            key: self.key.clone(),
+            object_id: self.object_id.clone(),
+            version_id: self.version_id.clone(),
+            logical_path: self.logical_path.clone(),
+            parent_version_ids: self.parent_version_ids.clone(),
+            state: self.state.clone(),
+            created_at_unix: self.created_at_unix,
+            copied_from_object_id: self.copied_from_object_id.clone(),
+            copied_from_version_id: self.copied_from_version_id.clone(),
+            copied_from_path: self.copied_from_path.clone(),
+            selected_is_preferred_head: self.selected_is_preferred_head,
+            manifest_hash,
+            manifest_bytes,
+            manifest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ContentRepairTask {
     pub reference: RetainedReference,
     pub repair_chunks: bool,
@@ -103,6 +160,12 @@ pub(crate) struct ContentRepairTask {
     pub source_fingerprint: String,
     #[serde(default)]
     pub recovered_chunks: usize,
+    /// A replication pull persists this intent before downloading chunks. If
+    /// the foreground pull is cancelled, the durable worker can finish both
+    /// content recovery and the namespace import instead of treating the pin
+    /// as stale merely because the version is not locally referenced yet.
+    #[serde(default)]
+    pub pending_replication_import: Option<PendingReplicationImport>,
 }
 
 impl ContentRepairTask {
@@ -118,6 +181,7 @@ impl ContentRepairTask {
             waiting_for_source: false,
             source_fingerprint: String::new(),
             recovered_chunks: 0,
+            pending_replication_import: None,
         }
     }
 
@@ -344,6 +408,28 @@ impl PersistentStore {
         // Registration must precede the next GC snapshot. Transfers need not hold
         // this lock while waiting for network I/O: the durable task pins content.
         let _guard = self.content_gc_gate.read().await;
+        self.metadata_store.persist_content_repair_task(task).await
+    }
+
+    /// Persists the immutable manifest and its pending import intent under one
+    /// GC gate. A cancelled replication pull can then be resumed without
+    /// fetching the manifest again, and cleanup cannot observe the manifest
+    /// without the task that protects its partially recovered chunks.
+    pub(crate) async fn install_recovery_manifest_and_persist_content_repair_task(
+        &self,
+        task: &ContentRepairTask,
+        manifest_bytes: &[u8],
+    ) -> Result<()> {
+        validate_manifest(&task.reference.manifest_hash, manifest_bytes)?;
+        let _guard = self.content_gc_gate.read().await;
+        persist_storage_content(
+            &self.storage_pool,
+            self.metadata_store.as_ref(),
+            StorageContentKind::Manifest,
+            &task.reference.manifest_hash,
+            manifest_bytes,
+        )
+        .await?;
         self.metadata_store.persist_content_repair_task(task).await
     }
 

@@ -100,6 +100,129 @@ run_on_main_metadata_backends!(
     fully_local_recovery_does_not_require_the_store_write_lock_turso
 );
 
+async fn pending_replication_import_completes_without_local_retained_reference_impl(
+    backend: MainTestBackend,
+) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let key = format!("pending-replication-import-{}.bin", backend.suffix());
+    let version = "v1";
+    seed_subject_version(
+        &source,
+        &key,
+        version,
+        b"durable pending replication import".to_vec(),
+        vec![],
+    )
+    .await;
+    let exported = bundle(&source, &key, version).await;
+    let reference = crate::storage::retained_content::RetainedReference {
+        key: Some(exported.key.clone()),
+        object_id: exported.object_id.clone(),
+        version_id: exported.version_id.clone(),
+        manifest_hash: exported.manifest_hash.clone(),
+        snapshot_only: false,
+    };
+    let mut task = crate::storage::content_recovery::ContentRepairTask::new(reference, true);
+    task.chunks = exported.manifest.chunks.clone();
+    task.pending_replication_import =
+        Some(crate::storage::content_recovery::PendingReplicationImport::from_bundle(&exported));
+    read_store(&target, "test.recovery.pending_import.persist")
+        .await
+        .install_recovery_manifest_and_persist_content_repair_task(&task, &exported.manifest_bytes)
+        .await
+        .unwrap();
+    let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &url).await;
+
+    let report = crate::content_recovery::repair_manifest_hashes(
+        &target,
+        vec![exported.manifest_hash.clone()],
+        Some(1),
+    )
+    .await;
+
+    assert_eq!(report.successful_transfers, 1, "{report:?}");
+    assert_eq!(report.failed_transfers, 0, "{report:?}");
+    let imported = read_store(&target, "test.recovery.pending_import.export")
+        .await
+        .export_replication_bundle(&key, Some(version), ObjectReadMode::Preferred)
+        .await
+        .unwrap()
+        .expect("the durable worker must finish the pending bundle import");
+    assert_eq!(imported.manifest_hash, exported.manifest_hash);
+    assert!(
+        read_store(&target, "test.recovery.pending_import.completed")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .is_empty(),
+        "the temporary pin must be removed only after the namespace import succeeds"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    pending_replication_import_completes_without_local_retained_reference_impl,
+    pending_replication_import_completes_without_local_retained_reference,
+    pending_replication_import_completes_without_local_retained_reference_turso
+);
+
+async fn unreferenced_repair_task_is_not_discarded_while_claimed_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let reference = crate::storage::retained_content::RetainedReference {
+        key: Some("claim-protected-stale-task.bin".to_string()),
+        object_id: None,
+        version_id: Some("v1".to_string()),
+        manifest_hash: "claim-protected-stale-manifest".to_string(),
+        snapshot_only: false,
+    };
+    let task = crate::storage::content_recovery::ContentRepairTask::new(reference, true);
+    read_store(&state, "test.recovery.claim_protected.persist")
+        .await
+        .persist_content_repair_task(&task)
+        .await
+        .unwrap();
+    let claim = state
+        .maintenance
+        .content_repair_claims
+        .try_claim(&task.reference.manifest_hash)
+        .expect("the test must own the manifest claim");
+
+    let report = crate::content_recovery::repair_manifest_hashes(
+        &state,
+        vec![task.reference.manifest_hash.clone()],
+        Some(1),
+    )
+    .await;
+
+    assert_eq!(report.skipped_items, 1, "{report:?}");
+    assert!(
+        read_store(&state, "test.recovery.claim_protected.retained")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .any(|pending| pending.reference.manifest_hash == task.reference.manifest_hash),
+        "a worker must not delete a pin owned by an in-flight replication pull"
+    );
+
+    drop(claim);
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    unreferenced_repair_task_is_not_discarded_while_claimed_impl,
+    unreferenced_repair_task_is_not_discarded_while_claimed,
+    unreferenced_repair_task_is_not_discarded_while_claimed_turso
+);
+
 async fn retained_catalog_loading_does_not_hold_the_store_lock_impl(backend: MainTestBackend) {
     let state = build_test_state(1, false, backend).await;
     let key = format!("retained-catalog-lock-{}", backend.suffix());
@@ -1292,6 +1415,95 @@ run_on_main_metadata_backends!(
     replication_pull_budget_bounds_slow_peer_fanout_impl,
     replication_pull_budget_bounds_slow_peer_fanout,
     replication_pull_budget_bounds_slow_peer_fanout_turso
+);
+
+async fn failed_replication_pull_persists_pending_import_intent_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let key = format!("failed-pull-pending-import-{}.bin", backend.suffix());
+    let version = "v1";
+    seed_subject_version(
+        &source,
+        &key,
+        version,
+        b"replication pull must persist its import intent".to_vec(),
+        vec![],
+    )
+    .await;
+    let exported = bundle(&source, &key, version).await;
+    let served_bundle = exported.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new()
+        .route(
+            "/cluster/v2/replication/export",
+            axum::routing::get(move || {
+                let bundle = served_bundle.clone();
+                async move { axum::Json(bundle) }
+            }),
+        )
+        .route(
+            "/cluster/v2/replication/chunk/{hash}",
+            axum::routing::get(|| async { StatusCode::NOT_FOUND }),
+        );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    register_online_source_node(&target, &source, &url).await;
+    let source_node = target
+        .cluster
+        .lock()
+        .await
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == source.node_id)
+        .expect("registered source descriptor must be retained by the target");
+
+    let error = crate::replication::pull_bundle_from_source_for_test(
+        &source_node,
+        &key,
+        Some(version),
+        &target,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("replication content recovery incomplete"),
+        "the synthetic source should fail only at chunk recovery: {error:#}"
+    );
+    let pending = read_store(&target, "test.recovery.failed_pull.pending")
+        .await
+        .content_repair_tasks()
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].reference.manifest_hash, exported.manifest_hash);
+    assert!(
+        pending[0].pending_replication_import.is_some(),
+        "a failed pull must retain enough metadata for the worker to finish the import"
+    );
+    assert!(
+        read_store(&target, "test.recovery.failed_pull.manifest")
+            .await
+            .read_recovery_manifest(&exported.manifest_hash)
+            .await
+            .unwrap()
+            .is_some(),
+        "the pending import must retain its validated manifest locally"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    failed_replication_pull_persists_pending_import_intent_impl,
+    failed_replication_pull_persists_pending_import_intent,
+    failed_replication_pull_persists_pending_import_intent_turso
 );
 
 async fn foreground_recovery_stops_after_first_unavailable_chunk_impl(backend: MainTestBackend) {

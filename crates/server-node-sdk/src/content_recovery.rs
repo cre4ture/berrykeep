@@ -644,6 +644,32 @@ async fn recover_task(state: &ServerState, task: &mut ContentRepairTask) -> Resu
     recover_task_with_budget(state, task, DURABLE_CONTENT_REPAIR_BUDGET).await
 }
 
+async fn finish_verified_recovery(state: &ServerState, task: &ContentRepairTask) -> Result<()> {
+    if let Some(pending) = &task.pending_replication_import {
+        // Turso's import future is large. Poll it as a separate task so the
+        // already deep repair/verification call chain does not overflow a
+        // Tokio worker stack. The scoped JoinSet preserves completion and
+        // error semantics and aborts the import if its owning claim is dropped.
+        let import_state = state.clone();
+        let import_task = task.clone();
+        let pending = pending.clone();
+        let mut imports = tokio::task::JoinSet::new();
+        imports.spawn(async move {
+            replication::complete_pending_replication_import(&import_state, &import_task, &pending)
+                .await
+        });
+        imports
+            .join_next()
+            .await
+            .context("pending replication import task did not run")?
+            .context("pending replication import task failed")??;
+    } else {
+        let store = read_store(state, "content_recovery.finish_verified").await;
+        store.finish_verified_content_repair(task).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn recover_task_with_budget(
     state: &ServerState,
     task: &mut ContentRepairTask,
@@ -690,8 +716,7 @@ async fn recover_task_with_transfer_budget(
     };
     let invalid_chunks = inspector.invalid_recovered_chunks(task).await?;
     if invalid_chunks.is_empty() {
-        let store = read_store(state, "content_recovery.finish_verified").await;
-        store.finish_verified_content_repair(task).await?;
+        finish_verified_recovery(state, task).await?;
         return Ok(recovered);
     }
     let replacement = bounded_durable_transfer(&mut remaining_budget, async {
@@ -725,8 +750,7 @@ async fn recover_task_with_transfer_budget(
     // `invalid_recovered_chunks` validated every retained byte, and replacement
     // responses were hash-checked before installation. Finalize under the GC
     // gate without re-reading the entire object a second time.
-    let store = read_store(state, "content_recovery.finish_verified").await;
-    store.finish_verified_content_repair(task).await?;
+    finish_verified_recovery(state, task).await?;
     Ok(recovered.saturating_add(replacement.recovered))
 }
 
@@ -899,18 +923,57 @@ async fn repair_targets_inner(
     let retained = retained_content_snapshot(state).await?;
     let fingerprint = source_fingerprint(state).await;
     let mut references = BTreeMap::new();
+    let mut pending_import_hashes = HashSet::new();
     for target in targets {
         let subject = target.label();
-        let reference = match &target {
+        let retained_reference = match &target {
             RepairTarget::Subject(subject) => retained.reference_for_subject(subject),
             RepairTarget::ManifestHash(hash) => retained
                 .manifests
                 .get(hash)
                 .and_then(|references| references.values().next()),
         };
-        let Some(reference) =
-            reference.filter(|r| r.manifest_hash != storage::TOMBSTONE_MANIFEST_HASH)
-        else {
+        let mut reference = retained_reference
+            .filter(|reference| reference.manifest_hash != storage::TOMBSTONE_MANIFEST_HASH)
+            .cloned();
+        if reference.is_none()
+            && let RepairTarget::ManifestHash(hash) = &target
+        {
+            let Some(_claim) = state.maintenance.content_repair_claims.try_claim(hash) else {
+                report.skipped_items += 1;
+                replication::push_repair_log_entry(
+                    &mut report.detailed_log,
+                    state.node_id,
+                    "repair_deferred",
+                    "repair task ownership changed while checking its retained reference",
+                    Some(subject.clone()),
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    Some(json!({"pending": true, "reason": "manifest_repair_in_progress"})),
+                );
+                continue;
+            };
+            let existing = read_store(state, "content_recovery.unreferenced_task")
+                .await
+                .content_repair_tasks_for_manifests(std::slice::from_ref(hash))
+                .await?
+                .into_iter()
+                .next();
+            if let Some(task) = existing
+                && task.pending_replication_import.is_some()
+            {
+                reference = Some(task.reference);
+                pending_import_hashes.insert(hash.clone());
+            } else {
+                read_store(state, "content_recovery.expired")
+                    .await
+                    .discard_content_repair_task(hash)
+                    .await?;
+            }
+        }
+        let Some(reference) = reference else {
             report.skipped_items += 1;
             let detail =
                 "retained content reference is no longer present; discarding stale repair task";
@@ -937,12 +1000,6 @@ async fn repair_targets_inner(
                 replication::ReplicationRepairSkipReason::RetainedReferenceUnavailable,
                 detail,
             );
-            if let RepairTarget::ManifestHash(hash) = target {
-                read_store(state, "content_recovery.expired")
-                    .await
-                    .discard_content_repair_task(&hash)
-                    .await?;
-            }
             continue;
         };
         references.insert(reference.manifest_hash.clone(), reference);
@@ -1003,6 +1060,13 @@ async fn repair_targets_inner(
             .await?
             .into_iter()
             .next();
+        if existing.is_none() && pending_import_hashes.contains(&requested_reference.manifest_hash)
+        {
+            // A foreground pull completed and removed the pending import after
+            // target selection released its claim. Do not recreate it as an
+            // ordinary retained-content task from the stale catalog snapshot.
+            continue;
+        }
         let task_is_new = existing.is_none();
         task = existing.unwrap_or_else(|| {
             ContentRepairTask::new(requested_reference.clone(), requested_repair_chunks)

@@ -1912,6 +1912,53 @@ fn should_persist_replication_pull_repair_pin(
     automatic_repair_enabled && requires_content_repair_claim(manifest_hash)
 }
 
+pub(crate) async fn complete_pending_replication_import(
+    state: &ServerState,
+    task: &storage::content_recovery::ContentRepairTask,
+    pending: &storage::content_recovery::PendingReplicationImport,
+) -> Result<String> {
+    let manifest_bytes = read_store(state, "replication_pending_import.manifest")
+        .await
+        .read_recovery_manifest(&task.reference.manifest_hash)
+        .await?
+        .with_context(|| {
+            format!(
+                "pending replication import manifest is missing: {}",
+                task.reference.manifest_hash
+            )
+        })?;
+    let bundle = pending.restore_bundle(task.reference.manifest_hash.clone(), manifest_bytes)?;
+    let mut store = lock_store(state, "replication_pending_import.commit").await;
+    let imported_version_id = store.import_replication_bundle(&bundle).await?;
+    store.finish_verified_content_repair(task).await?;
+    drop(store);
+
+    publish_namespace_change(state);
+    let mut cluster = state.cluster.lock().await;
+    cluster.note_replica(&bundle.key, state.node_id);
+    cluster.note_replica(
+        format!("{}@{imported_version_id}", bundle.key),
+        state.node_id,
+    );
+    drop(cluster);
+    if let Err(error) = persist_cluster_replicas_state(state).await {
+        warn!(error = %error, "failed persisting replicas after pending replication import");
+    }
+
+    let transfer_key = format!("{}|{}", task.reference.repair_label(), state.node_id);
+    state
+        .maintenance
+        .repair_state
+        .lock()
+        .await
+        .attempts
+        .remove(&transfer_key);
+    if let Err(error) = persist_repair_state(state).await {
+        warn!(error = %error, "failed clearing repair attempts after pending replication import");
+    }
+    Ok(imported_version_id)
+}
+
 async fn pull_bundle_from_source(
     source_node: &NodeDescriptor,
     key: &str,
@@ -2050,10 +2097,16 @@ async fn pull_bundle_from_source(
             &bundle.manifest_hash,
             state.repair_config.enabled,
         ) {
-            let pin = retained_repair_pin_for_replication_pull(existing, reference, chunks.clone());
+            let mut pin =
+                retained_repair_pin_for_replication_pull(existing, reference, chunks.clone());
+            pin.pending_replication_import =
+                Some(storage::content_recovery::PendingReplicationImport::from_bundle(&bundle));
             read_store(state, "replication_pull.pin")
                 .await
-                .persist_content_repair_task(&pin)
+                .install_recovery_manifest_and_persist_content_repair_task(
+                    &pin,
+                    &bundle.manifest_bytes,
+                )
                 .await?;
             Some(pin)
         } else {
@@ -2135,6 +2188,31 @@ async fn pull_bundle_from_source(
         })),
     );
     Ok(PullBundleOutcome::Imported(imported_version_id))
+}
+
+#[cfg(test)]
+pub(crate) async fn pull_bundle_from_source_for_test(
+    source_node: &NodeDescriptor,
+    key: &str,
+    version_id: Option<&str>,
+    state: &ServerState,
+) -> Result<()> {
+    let mut detailed_log = Vec::new();
+    match pull_bundle_from_source(
+        source_node,
+        key,
+        version_id,
+        state,
+        Some("test-pull"),
+        &mut detailed_log,
+    )
+    .await?
+    {
+        PullBundleOutcome::Imported(_) => Ok(()),
+        PullBundleOutcome::Deferred { manifest_hash } => {
+            bail!("replication pull unexpectedly deferred for manifest {manifest_hash}")
+        }
+    }
 }
 
 async fn replicate_bundle_to_target(
