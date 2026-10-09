@@ -300,7 +300,7 @@ export type RepairRunTrigger =
   | "autonomous_post_write"
   | "peer_cluster_request";
 
-export type RepairRunStatus = "completed" | "skipped_no_gaps";
+export type RepairRunStatus = "completed" | "skipped_no_gaps" | "partially_repaired" | "waiting_for_source" | "unresolved";
 
 export type RepairActivityState = "idle" | "scheduled" | "running";
 
@@ -456,6 +456,7 @@ export type DataScrubIssueKind =
   | "manifest_hash_mismatch"
   | "manifest_key_mismatch"
   | "manifest_size_mismatch"
+  /** Serialized by historical scrub records; new scrubs no longer emit it. */
   | "replica_incomplete"
   | "chunk_missing"
   | "chunk_unreadable"
@@ -478,6 +479,8 @@ export type DataScrubReport = {
   version_records_scanned: number;
   manifests_scanned: number;
   chunks_scanned: number;
+  chunks_not_required_locally?: number;
+  manifests_not_required_locally?: number;
   bytes_scanned: number;
   issue_count: number;
   sampled_issue_count: number;

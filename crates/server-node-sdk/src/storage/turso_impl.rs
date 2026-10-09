@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,6 +9,7 @@ use common::xmp::XmpGeoLocation;
 use tracing::warn;
 use turso::params_from_iter;
 
+use super::content_recovery::ContentRepairTask;
 use crate::cluster::NodeDescriptor;
 #[cfg(test)]
 use crate::operations::{OperationPriority, OperationProgress};
@@ -20,7 +21,8 @@ const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
 const DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT: usize = 1;
 
 use super::{
-    ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
+    ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS,
+    CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
     GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaCursorError, GalleryDeltaPage,
@@ -36,8 +38,8 @@ use super::{
     S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
     TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
-    decode_gallery_labels, decode_version_index, decompress_snapshot_json,
-    metadata_db_logical_summary_query, metadata_db_logical_table_specs,
+    decode_content_repair_task, decode_gallery_labels, decode_version_index,
+    decompress_snapshot_json, metadata_db_logical_summary_query, metadata_db_logical_table_specs,
     normalize_snapshot_manifest_object_ids, recoverable_history_listing_query,
 };
 
@@ -144,6 +146,40 @@ impl TursoMetadataStore {
         };
         store.backfill_gallery_objects().await?;
         Ok(store)
+    }
+
+    async fn discard_invalid_content_repair_tasks(
+        &self,
+        invalid_tasks: Vec<(String, Option<Vec<u8>>)>,
+    ) -> Result<()> {
+        if invalid_tasks.is_empty() {
+            return Ok(());
+        }
+        let _writer = self.writer_lock.lock().await;
+        for (manifest_hash, task_json) in invalid_tasks {
+            match task_json {
+                Some(task_json) => {
+                    self.connection
+                        .execute(
+                            "DELETE FROM content_repair_tasks
+                             WHERE manifest_hash = ?1 AND CAST(task_json AS BLOB) = ?2",
+                            (manifest_hash, task_json),
+                        )
+                        .await?;
+                }
+                None => {
+                    // The database value itself could not be read, so there is no
+                    // byte sequence with which to perform a conditional delete.
+                    self.connection
+                        .execute(
+                            "DELETE FROM content_repair_tasks WHERE manifest_hash = ?1",
+                            [manifest_hash],
+                        )
+                        .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn rollback(&self) {
@@ -471,6 +507,214 @@ impl MetadataStore for TursoMetadataStore {
             keys.push(row_string(&row, 0, "current_objects.key")?);
         }
         Ok(keys)
+    }
+
+    async fn content_repair_pending(&self, manifest_hash: &str) -> Result<bool> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT 1 FROM content_repair_tasks WHERE manifest_hash=?1",
+                [manifest_hash],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks
+                 ORDER BY manifest_hash",
+                (),
+            )
+            .await?;
+        let mut tasks = Vec::<ContentRepairTask>::new();
+        let mut invalid_tasks = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let manifest_hash = row_string(&row, 0, "content_repair_tasks.manifest_hash")?;
+            let task_json = match row_blob(&row, 1, "content_repair_tasks.task_json") {
+                Ok(task_json) => task_json,
+                Err(error) => {
+                    warn!(manifest_hash, error = %error, "discarding unreadable content repair task");
+                    invalid_tasks.push((manifest_hash, None));
+                    continue;
+                }
+            };
+            if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
+                tasks.push(task);
+            } else {
+                invalid_tasks.push((manifest_hash, Some(task_json)));
+            }
+        }
+        drop(rows);
+        self.discard_invalid_content_repair_tasks(invalid_tasks)
+            .await?;
+        Ok(tasks)
+    }
+
+    async fn load_content_repair_tasks_for_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<Vec<ContentRepairTask>> {
+        const CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE: usize = 500;
+
+        if manifest_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tasks = Vec::<ContentRepairTask>::new();
+        let mut invalid_tasks = Vec::new();
+        for batch in manifest_hashes.chunks(CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE) {
+            let placeholders = (0..batch.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+            let mut rows = self
+                .connection
+                .query(
+                    &format!(
+                        "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks \
+                         WHERE manifest_hash IN ({placeholders}) ORDER BY manifest_hash"
+                    ),
+                    params_from_iter(batch.iter().cloned()),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let manifest_hash = row_string(&row, 0, "content_repair_tasks.manifest_hash")?;
+                let task_json = match row_blob(&row, 1, "content_repair_tasks.task_json") {
+                    Ok(task_json) => task_json,
+                    Err(error) => {
+                        warn!(manifest_hash, error = %error, "discarding unreadable content repair task");
+                        invalid_tasks.push((manifest_hash, None));
+                        continue;
+                    }
+                };
+                if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
+                    tasks.push(task);
+                } else {
+                    invalid_tasks.push((manifest_hash, Some(task_json)));
+                }
+            }
+        }
+        tasks.sort_by(|left, right| {
+            left.reference
+                .manifest_hash
+                .cmp(&right.reference.manifest_hash)
+        });
+        self.discard_invalid_content_repair_tasks(invalid_tasks)
+            .await?;
+        Ok(tasks)
+    }
+
+    async fn content_repair_task_hashes(&self) -> Result<Vec<String>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT manifest_hash FROM content_repair_tasks ORDER BY manifest_hash",
+                (),
+            )
+            .await?;
+        let mut hashes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            hashes.push(row_string(&row, 0, "content_repair_tasks.manifest_hash")?);
+        }
+        Ok(hashes)
+    }
+
+    async fn due_content_repair_task_hashes(
+        &self,
+        now_unix: u64,
+        source_fingerprint: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let source_change_retry_before_unix = i64::try_from(
+            now_unix.saturating_sub(CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS),
+        )
+        .expect("source retry timestamp cannot exceed the current timestamp");
+        let now_unix = i64::try_from(now_unix).context("repair task due timestamp overflow")?;
+        let limit = limit.max(1);
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT manifest_hash FROM content_repair_tasks
+                 WHERE next_attempt_unix <= ?1
+                 ORDER BY next_attempt_unix ASC, manifest_hash ASC
+                 LIMIT ?2",
+                (
+                    now_unix,
+                    i64::try_from(limit).context("repair task query limit overflow")?,
+                ),
+            )
+            .await?;
+        let mut hashes = Vec::new();
+        let mut seen = HashSet::new();
+        while let Some(row) = rows.next().await? {
+            let hash = row_string(&row, 0, "content_repair_tasks.manifest_hash")?;
+            seen.insert(hash.clone());
+            hashes.push(hash);
+        }
+        drop(rows);
+        // A source topology change deliberately caps ordinary backoff at the
+        // minimum interval. Flapping peers can therefore trigger one attempt
+        // per interval; the last-attempt range keeps that rate limit indexed.
+        if hashes.len() < limit {
+            let remaining = i64::try_from(limit.saturating_sub(hashes.len()))
+                .context("repair task query limit overflow")?;
+            let mut rows = self
+                .connection
+                .query(
+                    "SELECT manifest_hash FROM content_repair_tasks
+                     WHERE source_fingerprint <> ?1 AND last_attempt_unix <= ?2
+                     ORDER BY last_attempt_unix ASC, manifest_hash ASC LIMIT ?3",
+                    (
+                        source_fingerprint,
+                        source_change_retry_before_unix,
+                        remaining,
+                    ),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let hash = row_string(&row, 0, "content_repair_tasks.manifest_hash")?;
+                if seen.insert(hash.clone()) {
+                    hashes.push(hash);
+                }
+            }
+        }
+        Ok(hashes)
+    }
+
+    async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "INSERT INTO content_repair_tasks (
+                 manifest_hash, next_attempt_unix, last_attempt_unix, source_fingerprint, task_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(manifest_hash) DO UPDATE SET
+                 next_attempt_unix=excluded.next_attempt_unix,
+                 last_attempt_unix=excluded.last_attempt_unix,
+                 source_fingerprint=excluded.source_fingerprint,
+                 task_json=excluded.task_json",
+                (
+                    task.reference.manifest_hash.as_str(),
+                    i64::try_from(task.next_attempt_unix)
+                        .context("repair task timestamp overflow")?,
+                    i64::try_from(task.last_attempt_unix)
+                        .context("repair task timestamp overflow")?,
+                    task.source_fingerprint.as_str(),
+                    serde_json::to_vec(task)?,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()> {
+        let _writer = self.writer_lock.lock().await;
+        self.connection
+            .execute(
+                "DELETE FROM content_repair_tasks WHERE manifest_hash=?1",
+                [manifest_hash],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
@@ -1151,9 +1395,33 @@ impl MetadataStore for TursoMetadataStore {
         Ok(replicas)
     }
 
-    async fn persist_cluster_replicas(
+    async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT subject, node_id
+                 FROM cluster_available
+                 ORDER BY subject, node_id",
+                (),
+            )
+            .await?;
+        let mut available = HashMap::<String, Vec<NodeId>>::new();
+        while let Some(row) = rows.next().await? {
+            let subject = row_string(&row, 0, "cluster_available.subject")?;
+            let node_id = row_string(&row, 1, "cluster_available.node_id")?
+                .parse::<NodeId>()
+                .with_context(|| {
+                    format!("invalid node id in cluster availability for {subject}")
+                })?;
+            available.entry(subject).or_default().push(node_id);
+        }
+        Ok(available)
+    }
+
+    async fn persist_cluster_replica_views(
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
+        available: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
         let _writer = self.writer_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
@@ -1161,11 +1429,25 @@ impl MetadataStore for TursoMetadataStore {
             self.connection
                 .execute("DELETE FROM cluster_replicas", ())
                 .await?;
+            self.connection
+                .execute("DELETE FROM cluster_available", ())
+                .await?;
             for (subject, nodes) in replicas {
                 for node_id in nodes {
                     self.connection
                         .execute(
                             "INSERT INTO cluster_replicas (subject, node_id)
+                             VALUES (?1, ?2)",
+                            (subject.as_str(), node_id.to_string()),
+                        )
+                        .await?;
+                }
+            }
+            for (subject, nodes) in available {
+                for node_id in nodes {
+                    self.connection
+                        .execute(
+                            "INSERT INTO cluster_available (subject, node_id)
                              VALUES (?1, ?2)",
                             (subject.as_str(), node_id.to_string()),
                         )
@@ -2374,6 +2656,7 @@ impl MetadataStore for TursoMetadataStore {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
         let mut rows = self
             .connection
@@ -3027,6 +3310,61 @@ pub(super) async fn add_column_if_missing(
     Ok(())
 }
 
+async fn backfill_content_repair_task_schedule(connection: &turso::Connection) -> Result<()> {
+    let mut rows = connection
+        .query(
+            "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks
+             WHERE source_fingerprint = ?1",
+            (CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT,),
+        )
+        .await?;
+    let mut tasks = Vec::new();
+    let mut invalid_hashes = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let manifest_hash = row_string(&row, 0, "content_repair_tasks.manifest_hash")?;
+        let task_json = match row_blob(&row, 1, "content_repair_tasks.task_json") {
+            Ok(task_json) => task_json,
+            Err(error) => {
+                warn!(manifest_hash, error = %error, "discarding unreadable content repair task");
+                invalid_hashes.push(manifest_hash);
+                continue;
+            }
+        };
+        if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
+            tasks.push((manifest_hash, task));
+        } else {
+            invalid_hashes.push(manifest_hash);
+        }
+    }
+    drop(rows);
+    for manifest_hash in invalid_hashes {
+        connection
+            .execute(
+                "DELETE FROM content_repair_tasks WHERE manifest_hash = ?1",
+                (manifest_hash,),
+            )
+            .await?;
+    }
+    for (manifest_hash, task) in tasks {
+        connection
+            .execute(
+                "UPDATE content_repair_tasks
+                 SET next_attempt_unix = ?1, last_attempt_unix = ?2, source_fingerprint = ?3
+                 WHERE manifest_hash = ?4",
+                (
+                    i64::try_from(task.next_attempt_unix)
+                        .context("repair task backfill timestamp overflow")?,
+                    i64::try_from(task.last_attempt_unix)
+                        .context("repair task backfill timestamp overflow")?,
+                    task.source_fingerprint.as_str(),
+                    manifest_hash.as_str(),
+                ),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn upsert_version_index_head_projection(
     connection: &turso::Connection,
     projection: &VersionIndexHeadProjection,
@@ -3192,6 +3530,14 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 last_failure_unix INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS content_repair_tasks (
+                manifest_hash TEXT PRIMARY KEY,
+                next_attempt_unix INTEGER NOT NULL DEFAULT 0,
+                last_attempt_unix INTEGER NOT NULL DEFAULT 0,
+                source_fingerprint TEXT NOT NULL DEFAULT '__legacy__',
+                task_json BLOB NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS repair_run_history (
                 run_id TEXT PRIMARY KEY,
                 finished_at_unix INTEGER NOT NULL,
@@ -3234,6 +3580,11 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             );
 
             CREATE TABLE IF NOT EXISTS cluster_replicas (
+                subject TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                PRIMARY KEY(subject, node_id)
+            );
+            CREATE TABLE IF NOT EXISTS cluster_available (
                 subject TEXT NOT NULL,
                 node_id TEXT NOT NULL,
                 PRIMARY KEY(subject, node_id)
@@ -3384,6 +3735,8 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
                 ON data_change_events(actor_id);
             CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject
                 ON cluster_replicas(subject);
+            CREATE INDEX IF NOT EXISTS idx_cluster_available_subject
+                ON cluster_available(subject);
             CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
                 ON s3_object_versions(bucket_name, berrykeep_key, created_at_unix DESC, version_id DESC);
             ",
@@ -3424,6 +3777,42 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
         .execute(
             "CREATE INDEX IF NOT EXISTS idx_operation_runs_status_finished
              ON operation_runs(status, finished_at_unix DESC, run_id DESC)",
+            (),
+        )
+        .await?;
+    add_column_if_missing(
+        connection,
+        "content_repair_tasks",
+        "next_attempt_unix",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        connection,
+        "content_repair_tasks",
+        "last_attempt_unix",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        connection,
+        "content_repair_tasks",
+        "source_fingerprint",
+        "TEXT NOT NULL DEFAULT '__legacy__'",
+    )
+    .await?;
+    backfill_content_repair_task_schedule(connection).await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_due_v2
+             ON content_repair_tasks(next_attempt_unix, manifest_hash)",
+            (),
+        )
+        .await?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_last_attempt
+             ON content_repair_tasks(last_attempt_unix, manifest_hash)",
             (),
         )
         .await?;
@@ -3629,6 +4018,144 @@ mod tests {
 
         drop(connection);
         drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn init_metadata_db_discards_unreadable_legacy_content_repair_tasks() {
+        let (metadata_db_path, database, connection) =
+            open_test_database("turso-unreadable-legacy-content-repair-task").await;
+        init_metadata_db(&connection)
+            .await
+            .expect("metadata schema should initialize");
+        connection
+            .execute(
+                "INSERT INTO content_repair_tasks (
+                     manifest_hash, next_attempt_unix, source_fingerprint, task_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                (
+                    "broken-repair-task",
+                    0,
+                    CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT,
+                    b"{not valid json".to_vec(),
+                ),
+            )
+            .await
+            .expect("broken legacy task should insert");
+
+        init_metadata_db(&connection)
+            .await
+            .expect("a broken legacy task must not block startup");
+
+        let mut rows = connection
+            .query("SELECT COUNT(*) FROM content_repair_tasks", ())
+            .await
+            .expect("repair task count should query");
+        let row = rows
+            .next()
+            .await
+            .expect("repair task count should load")
+            .expect("repair task count should exist");
+        assert_eq!(
+            row_u64(&row, 0, "content_repair_tasks.count").expect("count should be an integer"),
+            0,
+            "the regenerable corrupt task must be discarded"
+        );
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn unreadable_content_repair_tasks_do_not_block_queue_reads() {
+        let metadata_db_path = turso_test_db_path("turso-unreadable-content-repair-task");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+
+        for manifest_hash in ["broken-selected-task", "broken-all-task"] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO content_repair_tasks (
+                         manifest_hash, next_attempt_unix, source_fingerprint, task_json
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    (manifest_hash, 0, "current", b"{not valid json".to_vec()),
+                )
+                .await
+                .expect("broken current task should insert");
+        }
+
+        assert!(
+            store
+                .load_content_repair_tasks_for_manifests(&["broken-selected-task".to_string()])
+                .await
+                .expect("a broken selected task must be skipped")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .content_repair_task_hashes()
+                .await
+                .expect("remaining queue hashes should load"),
+            vec!["broken-all-task".to_string()],
+            "the selected-task reader must discard only the row it decoded"
+        );
+        assert!(
+            store
+                .load_content_repair_tasks()
+                .await
+                .expect("a broken queue task must be skipped")
+                .is_empty()
+        );
+        assert!(
+            store
+                .content_repair_task_hashes()
+                .await
+                .expect("corrupt queue rows should be removed")
+                .is_empty()
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn unreadable_raw_content_repair_task_is_discarded_by_hash() {
+        let metadata_db_path = turso_test_db_path("turso-unreadable-raw-content-repair-task");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let manifest_hash = "unreadable-raw-task";
+        store
+            .connection
+            .execute(
+                "INSERT INTO content_repair_tasks (
+                     manifest_hash, next_attempt_unix, source_fingerprint, task_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                (manifest_hash, 0, "current", b"{not valid json".to_vec()),
+            )
+            .await
+            .expect("broken current task should insert");
+
+        // A failed raw-value conversion has no bytes for the conditional
+        // delete used after a JSON decoding failure. It must still clear the
+        // regenerable task instead of leaving it permanently due.
+        store
+            .discard_invalid_content_repair_tasks(vec![(manifest_hash.to_string(), None)])
+            .await
+            .expect("raw-unreadable task should be discarded by manifest hash");
+        assert!(
+            store
+                .content_repair_task_hashes()
+                .await
+                .expect("remaining queue hashes should load")
+                .is_empty(),
+            "a task with unreadable raw bytes must not remain queued forever"
+        );
+
+        drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
 

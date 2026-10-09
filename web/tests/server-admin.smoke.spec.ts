@@ -262,6 +262,7 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByText("photos/cover.jpg", { exact: true })).toBeVisible();
   await expect(page.getByText("1 / 2 desired nodes currently present", { exact: true })).toBeVisible();
   await expect(page.getByText("under replicated", { exact: true })).toBeVisible();
+  await expect(page.getByText("unresolved repair", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Live progress log", { exact: true })).toBeVisible();
   await expect(page.getByText("downloading replica chunk from source node")).toBeVisible();
   await page.getByRole("button", { name: "Run data scrub on this node" }).click();
@@ -2845,7 +2846,7 @@ async function installServerAdminMocks(
           reporting_node_id: "node-alpha",
           scope: "cluster",
           trigger: "manual_request",
-          status: "completed",
+          status: "unresolved",
           started_at_unix: 1_899_999_900,
           finished_at_unix: 1_899_999_960,
           duration_ms: 60_000,
@@ -2882,7 +2883,7 @@ async function installServerAdminMocks(
             reporting_node_id: "node-alpha",
             scope: "cluster",
             trigger: "manual_request",
-            status: "completed",
+            status: "unresolved",
             started_at_unix: 1_899_999_900,
             finished_at_unix: 1_899_999_960,
             duration_ms: 60_000,
