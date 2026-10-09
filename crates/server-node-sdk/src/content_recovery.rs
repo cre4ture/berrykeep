@@ -256,10 +256,28 @@ pub(crate) async fn required_manifests(
     // heartbeats, peer requests, or availability updates behind the mutex.
     let placement = state.cluster.lock().await.placement_snapshot();
     let now_unix = unix_ts();
+    required_manifests_from_entries(
+        state.node_id,
+        &placement,
+        now_unix,
+        retained.manifests.iter(),
+    )
+}
+
+fn required_manifests_from_entries<'a>(
+    local_node_id: NodeId,
+    placement: &cluster::PlacementSnapshot,
+    now_unix: u64,
+    entries: impl IntoIterator<
+        Item = (
+            &'a String,
+            &'a BTreeMap<String, storage::retained_content::RetainedReference>,
+        ),
+    >,
+) -> HashSet<String> {
     let mut assigned_by_placement_key = HashMap::<String, bool>::new();
-    retained
-        .manifests
-        .iter()
+    entries
+        .into_iter()
         .filter(|(_, references)| {
             references.values().any(|reference| {
                 // Snapshot-only references use their manifest hash as an
@@ -277,7 +295,7 @@ pub(crate) async fn required_manifests(
                                 RETAINED_PLACEMENT_OFFLINE_GRACE_SECS,
                             )
                             .selected_nodes
-                            .contains(&state.node_id)
+                            .contains(&local_node_id)
                     })
             })
         })
@@ -285,20 +303,29 @@ pub(crate) async fn required_manifests(
         .collect()
 }
 
+async fn cached_retained_content(
+    state: &ServerState,
+    generation: u64,
+) -> Option<Arc<RetainedContent>> {
+    let mut cache = state.maintenance.retained_content_cache.lock().await;
+    if cache
+        .as_ref()
+        .is_some_and(|entry| entry.is_valid_for(generation))
+    {
+        return cache.as_ref().map(|entry| Arc::clone(&entry.content));
+    }
+    // Release an expired or invalidated history before decoding its
+    // replacement, avoiding two history-sized catalogs at peak.
+    *cache = None;
+    None
+}
+
 pub(crate) async fn retained_content_snapshot(state: &ServerState) -> Result<Arc<RetainedContent>> {
     let generation = state
         .maintenance
         .retained_content_generation
         .load(Ordering::SeqCst);
-    if let Some(content) = state
-        .maintenance
-        .retained_content_cache
-        .lock()
-        .await
-        .as_ref()
-        .filter(|cache| cache.is_valid_for(generation))
-        .map(|cache| Arc::clone(&cache.content))
-    {
+    if let Some(content) = cached_retained_content(state, generation).await {
         return Ok(content);
     }
 
@@ -309,15 +336,7 @@ pub(crate) async fn retained_content_snapshot(state: &ServerState) -> Result<Arc
         .maintenance
         .retained_content_generation
         .load(Ordering::SeqCst);
-    if let Some(content) = state
-        .maintenance
-        .retained_content_cache
-        .lock()
-        .await
-        .as_ref()
-        .filter(|cache| cache.is_valid_for(generation))
-        .map(|cache| Arc::clone(&cache.content))
-    {
+    if let Some(content) = cached_retained_content(state, generation).await {
         return Ok(content);
     }
 
@@ -337,9 +356,22 @@ pub(crate) async fn retained_content_snapshot(state: &ServerState) -> Result<Arc
         // repair behind a continuously changing namespace.
         return Ok(content);
     }
+    let computed_at = Instant::now();
     *state.maintenance.retained_content_cache.lock().await = Some(RetainedContentCache {
         generation,
+        computed_at,
         content: Arc::clone(&content),
+    });
+    let cache = Arc::clone(&state.maintenance.retained_content_cache);
+    tokio::spawn(async move {
+        tokio::time::sleep(RETAINED_CONTENT_CACHE_TTL).await;
+        let mut cache = cache.lock().await;
+        if cache
+            .as_ref()
+            .is_some_and(|entry| entry.generation == generation && entry.computed_at == computed_at)
+        {
+            *cache = None;
+        }
     });
     Ok(content)
 }
@@ -847,7 +879,6 @@ async fn repair_targets_inner(
     report: &mut replication::ReplicationRepairReport,
 ) -> Result<()> {
     let retained = retained_content_snapshot(state).await?;
-    let required = required_manifests(state, retained.as_ref()).await;
     let fingerprint = source_fingerprint(state).await;
     let mut references = BTreeMap::new();
     for target in targets {
@@ -898,6 +929,18 @@ async fn repair_targets_inner(
         };
         references.insert(reference.manifest_hash.clone(), reference);
     }
+    // A worker pass repairs only a bounded target set. Score placement for
+    // those manifests instead of rebuilding the full history-sized required
+    // set every five seconds while the durable queue drains.
+    let placement = state.cluster.lock().await.placement_snapshot();
+    let required = required_manifests_from_entries(
+        state.node_id,
+        &placement,
+        unix_ts(),
+        references
+            .keys()
+            .filter_map(|hash| retained.manifests.get_key_value(hash)),
+    );
     let mut tasks = BTreeMap::new();
     for reference in references.into_values() {
         let owned = read_store(state, "content_recovery.ownership")

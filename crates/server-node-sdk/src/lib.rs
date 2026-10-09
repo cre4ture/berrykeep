@@ -131,6 +131,9 @@ const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
 /// Avoid rescanning every historical manifest on each five-second repair tick,
 /// while still detecting out-of-band disk loss without a namespace event.
 const LOCAL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Reuse the expensive decoded history briefly without pinning its full heap
+/// footprint for the lifetime of an otherwise idle node.
+const RETAINED_CONTENT_CACHE_TTL: Duration = Duration::from_secs(30);
 const HISTORY_HEAD_PROJECTION_BACKFILL_BATCH_PAUSE: Duration = Duration::from_millis(25);
 const HISTORY_HEAD_PROJECTION_BACKFILL_MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const GALLERY_MAX_DEPTH: usize = 64;
@@ -517,12 +520,13 @@ struct LocalAvailabilityCache {
 #[derive(Clone)]
 struct RetainedContentCache {
     generation: u64,
+    computed_at: Instant,
     content: Arc<storage::retained_content::RetainedContent>,
 }
 
 impl RetainedContentCache {
     fn is_valid_for(&self, generation: u64) -> bool {
-        self.generation == generation
+        self.generation == generation && self.computed_at.elapsed() < RETAINED_CONTENT_CACHE_TTL
     }
 }
 
@@ -854,6 +858,9 @@ fn invalidate_retained_content_cache(state: &ServerState) {
         .maintenance
         .retained_content_generation
         .fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut cache) = state.maintenance.retained_content_cache.try_lock() {
+        *cache = None;
+    }
 }
 
 fn request_local_availability_refresh(state: &ServerState) {

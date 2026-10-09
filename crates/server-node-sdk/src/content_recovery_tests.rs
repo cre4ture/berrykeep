@@ -168,7 +168,18 @@ async fn retained_catalog_snapshot_is_reused_until_invalidated_impl(backend: Mai
         "repair passes in one cache generation must share the decoded catalog"
     );
 
+    drop(second);
+    assert_eq!(
+        Arc::strong_count(&first),
+        2,
+        "the cache should be the only owner besides the active caller"
+    );
     crate::publish_namespace_change(&state);
+    assert_eq!(
+        Arc::strong_count(&first),
+        1,
+        "invalidation must release the potentially history-sized cached catalog immediately"
+    );
     let refreshed = crate::content_recovery::retained_content_snapshot(&state)
         .await
         .unwrap();
@@ -185,6 +196,20 @@ run_on_main_metadata_backends!(
     retained_catalog_snapshot_is_reused_until_invalidated,
     retained_catalog_snapshot_is_reused_until_invalidated_turso
 );
+
+#[test]
+fn retained_catalog_cache_entries_expire_by_age() {
+    let cache = crate::RetainedContentCache {
+        generation: 7,
+        computed_at: std::time::Instant::now() - crate::RETAINED_CONTENT_CACHE_TTL,
+        content: Arc::new(crate::storage::retained_content::RetainedContent::default()),
+    };
+
+    assert!(
+        !cache.is_valid_for(7),
+        "a quiet node must not retain a history-sized catalog indefinitely"
+    );
+}
 
 async fn durable_recovery_replaces_same_size_corrupt_chunks_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
