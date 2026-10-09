@@ -10,11 +10,14 @@ class ScreenUiStatesTest {
     private val base = MainUiState()
 
     @Test
-    fun homeProjectionIgnoresLibraryChanges() {
-        assertEquals(
-            base.toHomeUiState(),
-            base.copy(galleryLoading = true).toHomeUiState(),
-        )
+    fun homeProjectionIncludesObservableClientWork() {
+        val projected = base.copy(
+            galleryLoading = true,
+            connectionRoutesLoading = true,
+        ).toHomeUiState()
+
+        assertEquals(2L, projected.clientTaskQueues.first { it.id == "foreground" }.active)
+        assertEquals("running", projected.clientTaskQueues.first { it.id == "foreground" }.state)
     }
 
     @Test

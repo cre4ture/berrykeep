@@ -68,6 +68,7 @@ private const val FOLDER_SYNC_HISTORY_PAGE_SIZE = 20
 private const val FOLDER_SYNC_HISTORY_REFRESH_MS = 5_000L
 private const val CONNECTION_ROUTE_SNAPSHOT_POLL_MS = 1_000L
 private const val TITLE_LATENCY_STATUS_POLL_MS = 1_000L
+private const val TASK_QUEUE_STATUS_POLL_MS = 30_000L
 internal const val TITLE_LATENCY_BACKGROUND_GRACE_PERIOD_MILLIS = 5_000L
 private const val ENROLLMENT_VERIFICATION_POLL_MS = 5_000L
 private const val ENROLLMENT_LOG_TAG = "EnrollmentDiagnostics"
@@ -102,6 +103,7 @@ class MainViewModel(
     private var connectionRoutesMonitorJob: Job? = null
     private var titleLatencyConfigurationJob: Job? = null
     private var titleLatencyStatusMonitorJob: Job? = null
+    private var taskQueueStatusMonitorJob: Job? = null
     private var titleLatencyBackgroundStopJob: Job? = null
     private var webUiBackgroundStopJob: Job? = null
     private var enrollmentVerificationMonitorJob: Job? = null
@@ -282,6 +284,7 @@ class MainViewModel(
         notifyManagedClientForegrounded()
         startAppConnectionStatusMonitor()
         startFolderSyncStatusMonitor()
+        startTaskQueueStatusMonitor()
         if (uiState.value.titleLatencyMonitorSettings.enabled) {
             configureTitleLatencyMonitor()
         }
@@ -390,6 +393,7 @@ class MainViewModel(
         titleLatencyConfigurationJob = null
         stopAppConnectionStatusMonitor()
         stopFolderSyncStatusMonitor()
+        stopTaskQueueStatusMonitor()
         stopTitleLatencyStatusMonitor()
         stopConnectionRoutesMonitor()
     }
@@ -1713,6 +1717,49 @@ class MainViewModel(
     private fun stopFolderSyncStatusMonitor() {
         folderSyncStatusMonitorJob?.cancel()
         folderSyncStatusMonitorJob = null
+    }
+
+    private fun startTaskQueueStatusMonitor() {
+        if (
+            !uiObservationGate.observationJobsActive ||
+            taskQueueStatusMonitorJob?.isActive == true
+        ) {
+            return
+        }
+        taskQueueStatusMonitorJob = viewModelScope.launch {
+            while (isActive) {
+                val authState = deviceAuthState
+                val connectionInput = authState.connectionBootstrapJson()
+                val clientIdentityJson = authState.toClientIdentityJson()
+                if (connectionInput.isNotBlank() && !clientIdentityJson.isNullOrBlank()) {
+                    val snapshot = withContext(Dispatchers.IO) {
+                        runCatching {
+                            repository.getClusterTaskQueueStatus(
+                                connectionInput = connectionInput,
+                                serverCaPem = authState.serverCaPem?.takeIf { it.isNotBlank() },
+                                clientIdentityJson = clientIdentityJson,
+                            )
+                        }
+                    }
+                    snapshot.onSuccess { taskQueues ->
+                        uiState.value = uiState.value.copy(
+                            clusterTaskQueues = taskQueues,
+                            clusterTaskQueuesError = null,
+                        )
+                    }.onFailure { error ->
+                        uiState.value = uiState.value.copy(
+                            clusterTaskQueuesError = error.message ?: "Task queue status is unavailable",
+                        )
+                    }
+                }
+                delay(TASK_QUEUE_STATUS_POLL_MS)
+            }
+        }
+    }
+
+    private fun stopTaskQueueStatusMonitor() {
+        taskQueueStatusMonitorJob?.cancel()
+        taskQueueStatusMonitorJob = null
     }
 
     private fun startAppConnectionStatusMonitor() {

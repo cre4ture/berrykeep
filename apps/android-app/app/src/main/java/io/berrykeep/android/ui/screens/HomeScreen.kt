@@ -21,6 +21,7 @@ import io.berrykeep.android.R
 import io.berrykeep.android.data.GLOBAL_SYNC_STATE_ERROR
 import io.berrykeep.android.data.GLOBAL_SYNC_STATE_HEALTHY
 import io.berrykeep.android.data.GLOBAL_SYNC_STATE_WAITING
+import io.berrykeep.android.data.TaskQueueEntry
 import io.berrykeep.android.ui.HomeUiState
 import io.berrykeep.android.ui.MainSection
 import io.berrykeep.android.ui.components.EmptyStateCard
@@ -127,6 +128,50 @@ fun HomeScreen(
             )
         }
 
+        SectionCard(
+            title = "Task queues",
+            supportingText = "Best-effort client and server work; server counts refresh about every 30 seconds.",
+        ) {
+            Text("This client", style = MaterialTheme.typography.titleSmall)
+            state.clientTaskQueues.forEach { queue ->
+                TaskQueueRow(queue = queue)
+            }
+            Text("Server cluster", style = MaterialTheme.typography.titleSmall)
+            state.clusterTaskQueues?.nodes
+                ?.flatMap { node ->
+                    node.queues
+                        .filter { queue -> queue.pending > 0 || queue.active > 0 }
+                        .map { queue -> queue.copy(label = "${queue.label} · ${shortNodeId(node.nodeId)}") }
+                }
+                ?.takeIf { queues -> queues.isNotEmpty() }
+                ?.forEach { queue -> TaskQueueRow(queue = queue) }
+                ?: Text(
+                    text = if (state.clusterTaskQueues == null) {
+                        "Waiting for a server snapshot."
+                    } else {
+                        "No pending or active server work observed."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            state.clusterTaskQueues?.unavailableNodes?.forEach { node ->
+                TaskQueueRow(
+                    queue = TaskQueueEntry(
+                        label = "Server node ${shortNodeId(node.nodeId)}",
+                        state = "unavailable",
+                        detail = node.error,
+                    ),
+                )
+            }
+            state.clusterTaskQueuesError?.let { error ->
+                Text(
+                    text = error,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+
         if (!hasProfiles) {
             SectionCard(
                 title = stringResource(R.string.home_next_step),
@@ -185,6 +230,36 @@ fun HomeScreen(
         }
     }
 }
+
+@Composable
+private fun TaskQueueRow(queue: TaskQueueEntry) {
+    androidx.compose.foundation.layout.Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(queue.label, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                "${queue.state} · ${queue.pending} pending · ${queue.active} active",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (queue.state == "backlogged" || queue.state == "unavailable") {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+        queue.detail?.takeIf { it.isNotBlank() }?.let { detail ->
+            Text(
+                detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+private fun shortNodeId(nodeId: String): String = if (nodeId.length > 12) nodeId.take(8) else nodeId
 
 private fun totalUploadedCount(state: HomeUiState): Long {
     return state.folderSyncStatus.profiles.sumOf { it.metrics.uploadedFileCount }
