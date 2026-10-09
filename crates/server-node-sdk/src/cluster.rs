@@ -788,11 +788,24 @@ impl ClusterService {
 }
 
 impl PlacementSnapshot {
-    pub(crate) fn placement_for_key(&self, key: &str) -> PlacementDecision {
+    pub(crate) fn placement_for_key_with_offline_grace(
+        &self,
+        key: &str,
+        now_unix: u64,
+        offline_grace_secs: u64,
+    ) -> PlacementDecision {
         let placement_key = replication_placement_key(key);
         PlacementDecision {
             key: key.to_string(),
-            selected_nodes: select_nodes_by_rendezvous(placement_key, &self.nodes, &self.policy),
+            selected_nodes: select_nodes_by_rendezvous_matching(
+                placement_key,
+                &self.nodes,
+                &self.policy,
+                |node| {
+                    node.status == NodeStatus::Online
+                        || now_unix.saturating_sub(node.last_heartbeat_unix) <= offline_grace_secs
+                },
+            ),
             replication_factor: self.policy.replication_factor,
         }
     }
@@ -917,9 +930,20 @@ fn select_nodes_by_rendezvous(
     nodes: &HashMap<NodeId, NodeDescriptor>,
     policy: &ReplicationPolicy,
 ) -> Vec<NodeId> {
+    select_nodes_by_rendezvous_matching(key, nodes, policy, |node| {
+        node.status == NodeStatus::Online
+    })
+}
+
+fn select_nodes_by_rendezvous_matching(
+    key: &str,
+    nodes: &HashMap<NodeId, NodeDescriptor>,
+    policy: &ReplicationPolicy,
+    eligible: impl Fn(&NodeDescriptor) -> bool,
+) -> Vec<NodeId> {
     let mut ranked: Vec<(NodeId, u64)> = nodes
         .values()
-        .filter(|node| node.status == NodeStatus::Online)
+        .filter(|node| eligible(node))
         .map(|node| {
             let score = rendezvous_score(key, node.node_id);
             (node.node_id, score)
@@ -1107,7 +1131,9 @@ mod tests {
             "cas-manifest:immutable-history",
         ] {
             assert_eq!(
-                snapshot.placement_for_key(subject).selected_nodes,
+                snapshot
+                    .placement_for_key_with_offline_grace(subject, unix_ts(), 0)
+                    .selected_nodes,
                 svc.placement_for_key(subject).selected_nodes,
             );
         }

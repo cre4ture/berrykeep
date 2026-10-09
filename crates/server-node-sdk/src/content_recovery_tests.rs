@@ -671,6 +671,92 @@ run_on_main_metadata_backends!(
     snapshot_only_retention_keeps_logical_key_placement_turso
 );
 
+async fn retained_placement_waits_for_offline_grace_before_reassignment_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let peer = build_test_state(1, false, backend).await;
+    register_online_source_node(&state, &peer, "http://127.0.0.1:9").await;
+    let mut peer_key = None;
+    for attempt in 0..128 {
+        let key = format!("retained-offline-grace-{attempt}.bin");
+        if state
+            .cluster
+            .lock()
+            .await
+            .placement_for_key(&key)
+            .selected_nodes
+            == vec![peer.node_id]
+        {
+            peer_key = Some(key);
+            break;
+        }
+    }
+    let key = peer_key.expect("two nodes must yield a key assigned to the peer");
+    seed_subject_version(
+        &state,
+        &key,
+        "v1",
+        b"retained placement grace bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    let retained = read_store(&state, "test.recovery.offline_grace_catalog")
+        .await
+        .retained_content()
+        .await
+        .unwrap();
+    let manifest_hash = retained
+        .reference_for_subject(&format!("{key}@v1"))
+        .unwrap()
+        .manifest_hash
+        .clone();
+    let mut peer_descriptor = state
+        .cluster
+        .lock()
+        .await
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == peer.node_id)
+        .unwrap();
+    peer_descriptor.last_heartbeat_unix = crate::unix_ts();
+    state
+        .cluster
+        .lock()
+        .await
+        .import_nodes(vec![peer_descriptor.clone()]);
+
+    assert!(
+        !crate::content_recovery::required_manifests(&state, &retained)
+            .await
+            .contains(&manifest_hash),
+        "a transiently offline peer must retain its historical placement obligation"
+    );
+
+    peer_descriptor.last_heartbeat_unix = crate::unix_ts()
+        .saturating_sub(crate::content_recovery::RETAINED_PLACEMENT_OFFLINE_GRACE_SECS + 1);
+    state
+        .cluster
+        .lock()
+        .await
+        .import_nodes(vec![peer_descriptor]);
+    assert!(
+        crate::content_recovery::required_manifests(&state, &retained)
+            .await
+            .contains(&manifest_hash),
+        "retained history must fail over after the offline grace period"
+    );
+
+    cleanup_test_state(&peer).await;
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    retained_placement_waits_for_offline_grace_before_reassignment_impl,
+    retained_placement_waits_for_offline_grace_before_reassignment,
+    retained_placement_waits_for_offline_grace_before_reassignment_turso
+);
+
 async fn recovery_audit_pins_cached_chunks_before_first_worker_pass_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let target = build_test_state(1, false, backend).await;

@@ -22,6 +22,10 @@ const BACKGROUND_REPAIR_PASS_MAX_TRANSFERS: usize = 1;
 /// Bounds expensive owned-replica checks during one periodic retained-history
 /// audit. The cursor below rotates this budget across the whole history.
 pub(crate) const RETAINED_AUDIT_PRESENCE_CHECK_BATCH_SIZE: usize = 64;
+/// A heartbeat transition is not yet a durable topology change. Keep retained
+/// history on its stable placement through ordinary restarts and short network
+/// partitions; current heads still use immediate online-only placement.
+pub(crate) const RETAINED_PLACEMENT_OFFLINE_GRACE_SECS: u64 = 60 * 60;
 const MAX_RECOVERY_ERRORS: usize = 16;
 
 #[derive(Debug)]
@@ -246,6 +250,7 @@ pub(crate) async fn required_manifests(
     // mutable cluster view, then score distinct subjects without blocking
     // heartbeats, peer requests, or availability updates behind the mutex.
     let placement = state.cluster.lock().await.placement_snapshot();
+    let now_unix = unix_ts();
     let mut assigned_by_placement_key = HashMap::<String, bool>::new();
     retained
         .manifests
@@ -261,7 +266,11 @@ pub(crate) async fn required_manifests(
                     .entry(placement_key.to_string())
                     .or_insert_with(|| {
                         placement
-                            .placement_for_key(placement_key)
+                            .placement_for_key_with_offline_grace(
+                                placement_key,
+                                now_unix,
+                                RETAINED_PLACEMENT_OFFLINE_GRACE_SECS,
+                            )
                             .selected_nodes
                             .contains(&state.node_id)
                     })
