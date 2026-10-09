@@ -946,6 +946,13 @@ async fn recovery_verification_can_outlive_transfer_budget_impl(backend: MainTes
             panic!("recovery did not reach local verification")
         }
     }
+    let writer = tokio::time::timeout(
+        Duration::from_secs(1),
+        lock_store(&state, "test.recovery.verification_without_store_guard"),
+    )
+    .await
+    .expect("full-object verification must not retain the global store read guard");
+    drop(writer);
     assert!(
         tokio::time::timeout(Duration::from_millis(600), &mut recovery)
             .await
@@ -1018,6 +1025,13 @@ async fn recovery_prepare_timeout_preserves_persisted_gc_pin_impl(backend: MainT
                 panic!("recovery did not reach task preparation")
             }
         }
+        let writer = tokio::time::timeout(
+            Duration::from_secs(1),
+            lock_store(&state, "test.recovery.preparation_without_store_guard"),
+        )
+        .await
+        .expect("manifest preparation must not retain the global store read guard");
+        drop(writer);
         tokio::time::timeout(Duration::from_secs(2), &mut recovery)
             .await
             .expect("the internal transfer deadline should end preparation")

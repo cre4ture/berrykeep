@@ -492,10 +492,11 @@ async fn recover_task_with_transfer_budget(
     // the transfer budget guarantees that a large object whose bytes are all
     // present can eventually complete instead of timing out at the same point
     // on every pass.
-    let invalid_chunks = {
+    let inspector = {
         let store = read_store(state, "content_recovery.verify_selection").await;
-        store.invalid_recovered_chunks(task).await?
+        store.content_recovery_inspector()
     };
+    let invalid_chunks = inspector.invalid_recovered_chunks(task).await?;
     if invalid_chunks.is_empty() {
         let store = read_store(state, "content_recovery.finish_verified").await;
         store.finish_verified_content_repair(task).await?;
@@ -541,37 +542,38 @@ async fn recover_task_initial_transfer(
 ) -> Result<(String, usize)> {
     let bytes = recover_manifest(state, &task.reference).await?;
     let manifest = validate_manifest(&task.reference.manifest_hash, &bytes)?;
-    {
-        // This pass only reads chunk presence and persists metadata through
-        // `PersistentStore`'s interior synchronization. Keeping the global
-        // store lock shared lets ordinary reads proceed while large manifests
-        // are prepared for recovery.
+    // Inspect the storage-pool snapshot without retaining the global store
+    // guard across one filesystem stat per manifest chunk.
+    let inspector = {
         let store = read_store(state, "content_recovery.prepare").await;
-        let mut prepared_chunks = Vec::with_capacity(manifest.chunks.len());
-        #[cfg(test)]
-        wait_for_recovery_preparation_test_blocker(&task.reference.manifest_hash).await;
-        for chunk in manifest.chunks {
-            // Metadata-only nodes repair damaged cached bytes without hydrating
-            // absent cache entries or acquiring replica ownership. Durable
-            // completion performs the single full-byte validation pass.
-            let cache_entry_exists =
-                store
-                    .chunk_path_exists(&chunk.hash)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to inspect cached chunk {} before durable recovery",
-                            chunk.hash
-                        )
-                    })?;
-            if task.repair_chunks || cache_entry_exists {
-                prepared_chunks.push(chunk);
-            }
+        store.content_recovery_inspector()
+    };
+    let mut prepared_chunks = Vec::with_capacity(manifest.chunks.len());
+    #[cfg(test)]
+    wait_for_recovery_preparation_test_blocker(&task.reference.manifest_hash).await;
+    for chunk in manifest.chunks {
+        // Metadata-only nodes repair damaged cached bytes without hydrating
+        // absent cache entries or acquiring replica ownership. Durable
+        // completion performs the single full-byte validation pass.
+        let cache_entry_exists = inspector
+            .chunk_path_exists(&chunk.hash)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to inspect cached chunk {} before durable recovery",
+                    chunk.hash
+                )
+            })?;
+        if task.repair_chunks || cache_entry_exists {
+            prepared_chunks.push(chunk);
         }
-        // A transfer deadline may cancel this future at any await above. Only
-        // replace the durable GC pin after the complete manifest has been
-        // inspected, so the outer failure path cannot persist a partial list.
-        task.chunks = prepared_chunks;
+    }
+    // A transfer deadline may cancel this future at any await above. Only
+    // replace the durable GC pin after the complete manifest has been
+    // inspected, so the outer failure path cannot persist a partial list.
+    task.chunks = prepared_chunks;
+    {
+        let store = read_store(state, "content_recovery.persist_prepared").await;
         store.persist_content_repair_task(task).await?;
         store
             .install_recovery_manifest(&task.reference.manifest_hash, &bytes)
