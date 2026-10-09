@@ -63,13 +63,14 @@ async fn source_fingerprint(state: &ServerState) -> String {
 }
 
 pub(crate) async fn scrubber(state: &ServerState) -> Result<storage::DataScrubber> {
-    let (scrubber, retained) = {
+    let (scrubber, retained_loader) = {
         let store = read_store(state, "content_recovery.scrub_snapshot").await;
         (
             store.data_scrubber().await?,
-            store.retained_content().await?,
+            store.retained_content_loader(),
         )
     };
+    let retained = retained_loader.load().await?;
     let required = required_manifests(state, &retained).await;
     Ok(scrubber
         .with_required_manifests(required)
@@ -584,10 +585,11 @@ async fn repair_subjects_inner(
     limit: Option<usize>,
     report: &mut replication::ReplicationRepairReport,
 ) -> Result<()> {
-    let retained = {
+    let retained_loader = {
         let store = read_store(state, "content_recovery.catalog").await;
-        store.retained_content().await?
+        store.retained_content_loader()
     };
+    let retained = retained_loader.load().await?;
     let required = required_manifests(state, &retained).await;
     let fingerprint = source_fingerprint(state).await;
     let mut references = BTreeMap::new();
@@ -863,10 +865,11 @@ pub(crate) async fn resume_pending(state: &ServerState) -> Result<()> {
 /// Queue them independently of the legacy replica map; the worker discovers bytes.
 #[cfg(test)]
 pub(crate) async fn audit_assigned(state: &ServerState) -> Result<()> {
-    let retained = {
+    let retained_loader = {
         let store = read_store(state, "content_recovery.audit").await;
-        store.retained_content().await?
+        store.retained_content_loader()
     };
+    let retained = retained_loader.load().await?;
     audit_assigned_from_retained(state, &retained).await
 }
 
@@ -929,8 +932,8 @@ pub(crate) async fn audit_assigned_from_retained(
         .iter()
         .map(|(hash, _)| hash.clone())
         .collect::<Vec<_>>();
-    let store = read_store(state, "content_recovery.audit_candidates").await;
-    let locally_owned = store
+    let locally_owned = read_store(state, "content_recovery.audit_candidates")
+        .await
         .filter_locally_owned_manifests(&candidate_hashes)
         .await?;
     let mut enqueued = false;
@@ -945,7 +948,11 @@ pub(crate) async fn audit_assigned_from_retained(
         // into pending repair work solely because that distributed view has
         // not caught up yet; a cache-only copy still needs ownership promotion.
         if locally_owned.contains(&hash) {
-            match store.manifest_is_fully_local(&hash).await {
+            match read_store(state, "content_recovery.audit_local_presence")
+                .await
+                .manifest_is_fully_local(&hash)
+                .await
+            {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(error) => {
@@ -959,7 +966,8 @@ pub(crate) async fn audit_assigned_from_retained(
             }
         }
         let mut task = ContentRepairTask::new(reference, true);
-        store
+        read_store(state, "content_recovery.audit_enqueue")
+            .await
             .prepare_and_persist_content_repair_task(&mut task)
             .await?;
         enqueued = true;

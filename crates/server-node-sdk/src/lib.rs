@@ -11843,11 +11843,11 @@ async fn run_replication_audit_once(state: &ServerState) {
     // it cannot supply this synchronization on the auditor's behalf.
     if state.repair_config.enabled {
         sync_availability_views_once(state).await;
-        let retained = {
+        let retained_loader = {
             let store = read_store(state, "replication_auditor.retained_snapshot").await;
-            store.retained_content().await
+            store.retained_content_loader()
         };
-        match retained {
+        match retained_loader.load().await {
             Ok(retained) => {
                 if let Err(error) =
                     content_recovery::audit_assigned_from_retained(state, &retained).await

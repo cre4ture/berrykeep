@@ -39,6 +39,18 @@ pub(crate) struct RetainedContent {
     pub version_records: usize,
 }
 
+#[derive(Clone)]
+pub(crate) struct RetainedContentLoader {
+    metadata_store: Arc<dyn MetadataStore>,
+}
+
+impl RetainedContentLoader {
+    pub(crate) async fn load(&self) -> Result<RetainedContent> {
+        let current = self.metadata_store.load_current_state().await?;
+        RetainedContent::load(self.metadata_store.as_ref(), &current).await
+    }
+}
+
 impl RetainedContent {
     pub(super) async fn load(metadata: &dyn MetadataStore, current: &CurrentState) -> Result<Self> {
         let mut result = Self {
@@ -121,11 +133,13 @@ impl RetainedContent {
 }
 
 impl PersistentStore {
+    pub(crate) fn retained_content_loader(&self) -> RetainedContentLoader {
+        RetainedContentLoader {
+            metadata_store: self.metadata_store.clone(),
+        }
+    }
+
     pub(crate) async fn retained_content(&self) -> Result<RetainedContent> {
-        RetainedContent::load(
-            self.metadata_store.as_ref(),
-            &self.metadata_store.load_current_state().await?,
-        )
-        .await
+        self.retained_content_loader().load().await
     }
 }

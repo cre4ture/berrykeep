@@ -99,6 +99,44 @@ run_on_main_metadata_backends!(
     fully_local_recovery_does_not_require_the_store_write_lock_turso
 );
 
+async fn retained_catalog_loading_does_not_hold_the_store_lock_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let key = format!("retained-catalog-lock-{}", backend.suffix());
+    seed_subject_version(
+        &state,
+        &key,
+        "v1",
+        b"retained catalog bytes".to_vec(),
+        vec![],
+    )
+    .await;
+
+    let loader = {
+        let store = read_store(&state, "test.recovery.retained_catalog_loader").await;
+        store.retained_content_loader()
+    };
+    let writer = lock_store(&state, "test.recovery.retained_catalog_writer").await;
+    let retained = tokio::time::timeout(Duration::from_secs(1), loader.load())
+        .await
+        .expect("retained catalog loading must not wait for the global store lock")
+        .unwrap();
+    drop(writer);
+
+    assert!(
+        retained
+            .reference_for_subject(&format!("{key}@v1"))
+            .is_some(),
+        "loading outside the global store lock must retain version history"
+    );
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    retained_catalog_loading_does_not_hold_the_store_lock_impl,
+    retained_catalog_loading_does_not_hold_the_store_lock,
+    retained_catalog_loading_does_not_hold_the_store_lock_turso
+);
+
 async fn durable_recovery_replaces_same_size_corrupt_chunks_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let target = build_test_state(1, false, backend).await;
