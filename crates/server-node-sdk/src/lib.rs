@@ -445,6 +445,7 @@ struct ServerMaintenanceRuntime {
     local_availability_refresh_notify: Arc<Notify>,
     local_availability_generation: Arc<AtomicU64>,
     local_availability_cache: Arc<Mutex<Option<LocalAvailabilityCache>>>,
+    local_owned_manifest_presence_cache: Arc<Mutex<Option<LocalOwnedManifestPresenceCache>>>,
 }
 
 /// Serializes repair activity for one immutable manifest without allowing a
@@ -553,6 +554,24 @@ struct LocalAvailabilityCache {
 }
 
 impl LocalAvailabilityCache {
+    fn is_valid_for(&self, generation: u64) -> bool {
+        self.generation == generation && self.computed_at.elapsed() < LOCAL_AVAILABILITY_CACHE_TTL
+    }
+}
+
+/// Positive owned-replica checks for retained history. The cache intentionally
+/// records no negative results: a repair can make a previously incomplete
+/// manifest healthy at any time. Positive entries share the local availability
+/// generation and TTL, so namespace changes are immediate while out-of-band
+/// storage loss is observed by the next bounded refresh.
+#[derive(Clone)]
+struct LocalOwnedManifestPresenceCache {
+    generation: u64,
+    computed_at: Instant,
+    manifest_hashes: HashSet<String>,
+}
+
+impl LocalOwnedManifestPresenceCache {
     fn is_valid_for(&self, generation: u64) -> bool {
         self.generation == generation && self.computed_at.elapsed() < LOCAL_AVAILABILITY_CACHE_TTL
     }
@@ -7795,6 +7814,7 @@ async fn run_inner(
             local_availability_refresh_notify: Arc::new(Notify::new()),
             local_availability_generation: Arc::new(AtomicU64::new(0)),
             local_availability_cache: Arc::new(Mutex::new(None)),
+            local_owned_manifest_presence_cache: Arc::new(Mutex::new(None)),
         },
         metadata_commit_mode: config.metadata_commit_mode,
         autonomous_replication_on_put_enabled: config.autonomous_replication_on_put_enabled,

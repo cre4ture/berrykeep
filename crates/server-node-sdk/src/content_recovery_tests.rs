@@ -750,6 +750,88 @@ run_on_main_metadata_backends!(
     recovery_audit_skips_complete_local_content_with_empty_availability_turso
 );
 
+async fn recovery_audit_caches_complete_retained_history_presence_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let key = choose_locally_placed_key(&state, "cached-retained-history").await;
+    seed_subject_version(&state, &key, "v1", b"older retained bytes".to_vec(), vec![]).await;
+    seed_subject_version(
+        &state,
+        &key,
+        "v2",
+        b"current retained bytes".to_vec(),
+        vec!["v1".to_string()],
+    )
+    .await;
+    let old = bundle(&state, &key, "v1").await;
+
+    crate::content_recovery::audit_assigned(&state)
+        .await
+        .unwrap();
+    let generation = state
+        .maintenance
+        .local_availability_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        state
+            .maintenance
+            .local_owned_manifest_presence_cache
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|cache| {
+                cache.is_valid_for(generation)
+                    && cache.manifest_hashes.contains(&old.manifest_hash)
+                    && cache.manifest_hashes.len() >= 2
+            }),
+        "the first audit must retain positive checks for both current and historical manifests"
+    );
+
+    // A second audit must use the positive cache instead of statting every
+    // historical chunk again. Model out-of-band loss after that first pass.
+    remove_chunks(&state, &old, &[0]).await;
+    crate::content_recovery::audit_assigned(&state)
+        .await
+        .unwrap();
+    assert!(
+        read_store(&state, "test.recovery.cached_history_before_ttl")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a valid positive presence cache must avoid another history-wide content scan"
+    );
+
+    state
+        .maintenance
+        .local_owned_manifest_presence_cache
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .computed_at = std::time::Instant::now() - crate::LOCAL_AVAILABILITY_CACHE_TTL;
+    crate::content_recovery::audit_assigned(&state)
+        .await
+        .unwrap();
+    assert!(
+        read_store(&state, "test.recovery.cached_history_after_ttl")
+            .await
+            .content_repair_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.reference.manifest_hash == old.manifest_hash),
+        "the bounded TTL must eventually detect out-of-band loss and queue repair"
+    );
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_audit_caches_complete_retained_history_presence_impl,
+    recovery_audit_caches_complete_retained_history_presence,
+    recovery_audit_caches_complete_retained_history_presence_turso
+);
+
 async fn recovery_audit_claims_complete_cached_assigned_content_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let target = build_test_state(1, false, backend).await;

@@ -20122,6 +20122,7 @@ async fn build_test_state(
             local_availability_refresh_notify: Arc::new(tokio::sync::Notify::new()),
             local_availability_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_availability_cache: Arc::new(Mutex::new(None)),
+            local_owned_manifest_presence_cache: Arc::new(Mutex::new(None)),
         },
         metadata_commit_mode: MetadataCommitMode::Local,
         autonomous_replication_on_put_enabled: false,

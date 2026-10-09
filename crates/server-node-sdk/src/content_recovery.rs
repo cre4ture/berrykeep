@@ -813,12 +813,7 @@ pub(crate) async fn audit_assigned_from_retained(
         // after an out-of-band change). Do not turn a healthy owned replica
         // into pending repair work solely because that distributed view has
         // not caught up yet; a cache-only copy still needs ownership promotion.
-        if read_store(state, "content_recovery.audit_local_replica")
-            .await
-            .check_owned_replica_presence(hash)
-            .await
-            .is_ok()
-        {
+        if cached_owned_replica_presence(state, hash).await {
             continue;
         }
         if let Some(reference) = references
@@ -840,6 +835,58 @@ pub(crate) async fn audit_assigned_from_retained(
     }
     state.maintenance.content_repair_notify.notify_one();
     Ok(())
+}
+
+/// Avoid rescanning every chunk of healthy retained history on each auditor
+/// tick. A repair claim serializes concurrent checks for the same manifest;
+/// only complete owned replicas enter this cache, so repairs are never hidden
+/// behind a stale negative result.
+async fn cached_owned_replica_presence(state: &ServerState, hash: &str) -> bool {
+    let generation = state
+        .maintenance
+        .local_availability_generation
+        .load(Ordering::SeqCst);
+    if state
+        .maintenance
+        .local_owned_manifest_presence_cache
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|cache| cache.is_valid_for(generation) && cache.manifest_hashes.contains(hash))
+    {
+        return true;
+    }
+
+    if read_store(state, "content_recovery.audit_local_replica")
+        .await
+        .check_owned_replica_presence(hash)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut cache = state
+        .maintenance
+        .local_owned_manifest_presence_cache
+        .lock()
+        .await;
+    if !cache
+        .as_ref()
+        .is_some_and(|cache| cache.is_valid_for(generation))
+    {
+        *cache = Some(LocalOwnedManifestPresenceCache {
+            generation,
+            computed_at: Instant::now(),
+            manifest_hashes: HashSet::new(),
+        });
+    }
+    cache
+        .as_mut()
+        .expect("owned manifest presence cache was initialized")
+        .manifest_hashes
+        .insert(hash.to_string());
+    true
 }
 
 pub(crate) async fn get_manifest(
