@@ -165,7 +165,7 @@ pub(crate) struct ContentRepairTask {
     /// content recovery and the namespace import instead of treating the pin
     /// as stale merely because the version is not locally referenced yet.
     #[serde(default)]
-    pub pending_replication_import: Option<PendingReplicationImport>,
+    pub pending_replication_import: Option<Box<PendingReplicationImport>>,
 }
 
 impl ContentRepairTask {

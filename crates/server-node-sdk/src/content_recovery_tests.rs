@@ -125,8 +125,9 @@ async fn pending_replication_import_completes_without_local_retained_reference_i
     };
     let mut task = crate::storage::content_recovery::ContentRepairTask::new(reference, true);
     task.chunks = exported.manifest.chunks.clone();
-    task.pending_replication_import =
-        Some(crate::storage::content_recovery::PendingReplicationImport::from_bundle(&exported));
+    task.pending_replication_import = Some(Box::new(
+        crate::storage::content_recovery::PendingReplicationImport::from_bundle(&exported),
+    ));
     read_store(&target, "test.recovery.pending_import.persist")
         .await
         .install_recovery_manifest_and_persist_content_repair_task(&task, &exported.manifest_bytes)

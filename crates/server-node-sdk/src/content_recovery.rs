@@ -655,8 +655,12 @@ async fn finish_verified_recovery(state: &ServerState, task: &ContentRepairTask)
         let pending = pending.clone();
         let mut imports = tokio::task::JoinSet::new();
         imports.spawn(async move {
-            replication::complete_pending_replication_import(&import_state, &import_task, &pending)
-                .await
+            replication::complete_pending_replication_import(
+                &import_state,
+                &import_task,
+                pending.as_ref(),
+            )
+            .await
         });
         imports
             .join_next()
@@ -1157,7 +1161,10 @@ async fn repair_targets_inner(
         started_transfers += 1;
         report.attempted_transfers += 1;
         let recovered_before_attempt = task.recovered_chunks;
-        match recover_task(state, &mut task).await {
+        // Keep the deep backend/recovery state machine off the Tokio worker
+        // stack. Turso's futures are already large, and adding durable task
+        // metadata must not make otherwise unrelated repair paths overflow.
+        match Box::pin(recover_task(state, &mut task)).await {
             Ok(recovered) => {
                 // Completing the task removes the quarantine that kept this
                 // manifest out of the local availability view. A refresh may

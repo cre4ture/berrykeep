@@ -2099,8 +2099,9 @@ async fn pull_bundle_from_source(
         ) {
             let mut pin =
                 retained_repair_pin_for_replication_pull(existing, reference, chunks.clone());
-            pin.pending_replication_import =
-                Some(storage::content_recovery::PendingReplicationImport::from_bundle(&bundle));
+            pin.pending_replication_import = Some(Box::new(
+                storage::content_recovery::PendingReplicationImport::from_bundle(&bundle),
+            ));
             read_store(state, "replication_pull.pin")
                 .await
                 .install_recovery_manifest_and_persist_content_repair_task(
