@@ -638,16 +638,17 @@ async fn recover_task_initial_transfer(
         // Metadata-only nodes repair damaged cached bytes without hydrating
         // absent cache entries or acquiring replica ownership. Durable
         // completion performs the single full-byte validation pass.
-        let cache_entry_exists = inspector
-            .chunk_path_exists(&chunk.hash)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to inspect cached chunk {} before durable recovery",
-                    chunk.hash
-                )
-            })?;
-        if task.repair_chunks || cache_entry_exists {
+        let cache_entry_exists = task.repair_chunks
+            || inspector
+                .chunk_path_exists(&chunk.hash)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to inspect cached chunk {} before durable recovery",
+                        chunk.hash
+                    )
+                })?;
+        if cache_entry_exists {
             prepared_chunks.push(chunk);
         }
     }
@@ -811,7 +812,7 @@ async fn repair_subjects_inner(
         );
         tasks.insert(reference.manifest_hash.clone(), task);
     }
-    let availability_may_have_changed = !tasks.is_empty();
+    let mut availability_changed = false;
     let transfer_limit = limit.unwrap_or(usize::MAX);
     let mut started_transfers = 0;
     for mut task in tasks.into_values() {
@@ -841,6 +842,7 @@ async fn repair_subjects_inner(
             .await?
             .into_iter()
             .next();
+        let task_is_new = existing.is_none();
         task = existing.unwrap_or_else(|| {
             ContentRepairTask::new(requested_reference.clone(), requested_repair_chunks)
         });
@@ -851,6 +853,10 @@ async fn repair_subjects_inner(
             .await
             .prepare_and_persist_content_repair_task(&mut task)
             .await?;
+        if task_is_new {
+            request_local_availability_refresh(state);
+            availability_changed = true;
+        }
         if started_transfers >= transfer_limit {
             report.skipped_items += 1;
             log_outcome(
@@ -928,6 +934,10 @@ async fn repair_subjects_inner(
         let recovered_before_attempt = task.recovered_chunks;
         match recover_task(state, &mut task).await {
             Ok(recovered) => {
+                if !availability_changed {
+                    request_local_availability_refresh(state);
+                    availability_changed = true;
+                }
                 report.successful_transfers += 1;
                 log_outcome(
                     state,
@@ -969,10 +979,9 @@ async fn repair_subjects_inner(
             }
         }
     }
-    if availability_may_have_changed {
-        invalidate_local_availability_cache(state);
+    if availability_changed {
+        refresh_local_availability_view_once(state).await;
     }
-    refresh_local_availability_view_once(state).await;
     Ok(())
 }
 

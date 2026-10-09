@@ -801,6 +801,25 @@ async fn cache_only_recovery_fails_closed_on_chunk_presence_error_impl(backend: 
         "an unreadable cache path must not be scheduled for a cache-only download"
     );
 
+    let mut owned_task =
+        crate::storage::content_recovery::ContentRepairTask::new(task.reference.clone(), true);
+    let error = crate::content_recovery::recover_task_with_budget(
+        &target,
+        &mut owned_task,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !format!("{error:#}").contains("failed to inspect cached chunk"),
+        "an owner repair must leave presence checks to its transfer path: {error:#}"
+    );
+    assert_eq!(
+        owned_task.chunks.len(),
+        manifest.manifest.chunks.len(),
+        "an owner repair must schedule every manifest chunk without a preliminary stat"
+    );
+
     cleanup_test_state(&source).await;
     cleanup_test_state(&target).await;
 }
@@ -809,6 +828,77 @@ run_on_main_metadata_backends!(
     cache_only_recovery_fails_closed_on_chunk_presence_error_impl,
     cache_only_recovery_fails_closed_on_chunk_presence_error,
     cache_only_recovery_fails_closed_on_chunk_presence_error_turso
+);
+
+async fn repair_deferral_keeps_valid_local_availability_cache_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let key = choose_locally_placed_key(&state, "repair-deferral-cache").await;
+    seed_subject_version(
+        &state,
+        &key,
+        "v1",
+        b"repair deferral cache bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    let reference = read_store(&state, "test.recovery.deferral_cache_reference")
+        .await
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject(&format!("{key}@v1"))
+        .unwrap()
+        .clone();
+    let mut task = crate::storage::content_recovery::ContentRepairTask::new(reference, true);
+    read_store(&state, "test.recovery.deferral_cache_task")
+        .await
+        .prepare_and_persist_content_repair_task(&mut task)
+        .await
+        .unwrap();
+    crate::invalidate_local_availability_cache(&state);
+    crate::refresh_local_availability_view_once(&state).await;
+    let generation = state
+        .maintenance
+        .local_availability_generation
+        .load(Ordering::SeqCst);
+    let cached_subjects = state
+        .maintenance
+        .local_availability_cache
+        .lock()
+        .await
+        .as_ref()
+        .map(|cache| Arc::clone(&cache.subjects))
+        .expect("the initial refresh must populate the availability cache");
+
+    let report =
+        crate::content_recovery::repair_subjects(&state, vec![format!("{key}@v1")], Some(0)).await;
+
+    assert_eq!(report.attempted_transfers, 0, "{report:?}");
+    assert_eq!(report.skipped_items, 1, "{report:?}");
+    assert_eq!(
+        state
+            .maintenance
+            .local_availability_generation
+            .load(Ordering::SeqCst),
+        generation,
+        "an unchanged durable task must not invalidate local availability"
+    );
+    let cache = state.maintenance.local_availability_cache.lock().await;
+    assert!(
+        cache.as_ref().is_some_and(|cache| {
+            cache.is_valid_for(generation) && Arc::ptr_eq(&cache.subjects, &cached_subjects)
+        }),
+        "a no-op deferral must retain the existing availability cache"
+    );
+    drop(cache);
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    repair_deferral_keeps_valid_local_availability_cache_impl,
+    repair_deferral_keeps_valid_local_availability_cache,
+    repair_deferral_keeps_valid_local_availability_cache_turso
 );
 
 async fn recovery_read_budget_bounds_slow_unadvertised_peers_impl(backend: MainTestBackend) {
