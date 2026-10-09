@@ -8,12 +8,15 @@ use storage::retained_content::{MANIFEST_SUBJECT_PREFIX, RetainedContent, Retain
 const CHUNK_FETCH_CONCURRENCY: usize = 4;
 const PEER_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const READ_THROUGH_RECOVERY_BUDGET: Duration = Duration::from_secs(30);
-/// Bounds one durable repair pass. Its persisted task and any verified chunks
-/// survive cancellation, so a later pass resumes with a fresh peer snapshot.
+/// Bounds network transfer work in one durable repair pass. Its persisted task
+/// and any verified chunks survive cancellation, so a later pass resumes with
+/// a fresh peer snapshot. Full local verification is deliberately outside this
+/// budget: a large, locally complete object must always be able to finish.
 const DURABLE_CONTENT_REPAIR_BUDGET: Duration = Duration::from_secs(2 * 60);
 /// A worker pass processes one durable manifest at a time. Each manifest has
-/// its own recovery deadline, so this also bounds one persisted run and keeps
-/// notifications from being delayed behind a history-sized batch.
+/// its own transfer deadline, so this keeps notifications from being delayed
+/// behind a history-sized batch while still allowing local verification to
+/// finish.
 const BACKGROUND_REPAIR_PASS_MAX_TRANSFERS: usize = 1;
 /// Bounds expensive owned-replica checks during one periodic retained-history
 /// audit. The cursor below rotates this budget across the whole history.
@@ -312,7 +315,10 @@ pub(crate) async fn recover_chunks_for_read(
         .context("read-through recovery deadline exceeded")
 }
 
-async fn recover_manifest(state: &ServerState, reference: &RetainedReference) -> Result<Vec<u8>> {
+pub(crate) async fn recover_manifest(
+    state: &ServerState,
+    reference: &RetainedReference,
+) -> Result<Vec<u8>> {
     {
         let store = read_store(state, "content_recovery.check_manifest").await;
         if let Ok(Some(bytes)) = store.read_recovery_manifest(&reference.manifest_hash).await {
@@ -331,8 +337,13 @@ async fn recover_manifest(state: &ServerState, reference: &RetainedReference) ->
         {
             return Ok(bytes);
         }
-        // Mixed-version clusters may not have the manifest-by-hash endpoint yet.
-        if let Some(key) = &reference.key {
+    }
+    // Mixed-version clusters may not have the manifest-by-hash endpoint yet.
+    // Try the compatibility route only after every peer had a chance to serve
+    // the immutable hash directly. A 404 from an early peer must not spend a
+    // second timeout before a later new-style source is considered.
+    if let Some(key) = &reference.key {
+        for source in &sources {
             let path =
                 replication::build_replication_export_path(key, reference.version_id.as_deref());
             if let Ok(bytes) = request_bytes(state, source, &path).await
@@ -375,22 +386,87 @@ pub(crate) async fn recover_task_with_budget(
     budget: Duration,
 ) -> Result<usize> {
     let recovered_progress = Arc::new(AtomicUsize::new(0));
-    let outcome = bounded_durable_recovery(
-        budget,
-        recover_task_unbounded(state, task, recovered_progress.clone()),
-    )
-    .await;
+    let outcome =
+        recover_task_with_transfer_budget(state, task, budget, recovered_progress.clone()).await;
     task.recovered_chunks = task
         .recovered_chunks
         .saturating_add(recovered_progress.load(Ordering::Relaxed));
     outcome
 }
 
-async fn recover_task_unbounded(
+async fn bounded_durable_transfer<T>(
+    remaining_budget: &mut Duration,
+    transfer: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = Instant::now();
+    let outcome = bounded_durable_recovery(*remaining_budget, transfer).await;
+    *remaining_budget = remaining_budget.saturating_sub(started.elapsed());
+    outcome
+}
+
+async fn recover_task_with_transfer_budget(
+    state: &ServerState,
+    task: &mut ContentRepairTask,
+    mut remaining_budget: Duration,
+    recovered_progress: Arc<AtomicUsize>,
+) -> Result<usize> {
+    let (subject, recovered) = bounded_durable_transfer(
+        &mut remaining_budget,
+        recover_task_initial_transfer(state, task, recovered_progress.clone()),
+    )
+    .await?;
+
+    // Verification is local work with no resumable cursor. Keeping it outside
+    // the transfer budget guarantees that a large object whose bytes are all
+    // present can eventually complete instead of timing out at the same point
+    // on every pass.
+    let invalid_chunks = {
+        let store = read_store(state, "content_recovery.verify_selection").await;
+        store.invalid_recovered_chunks(task).await?
+    };
+    if invalid_chunks.is_empty() {
+        let store = read_store(state, "content_recovery.finish_verified").await;
+        store.finish_verified_content_repair(task).await?;
+        return Ok(recovered);
+    }
+    let replacement = bounded_durable_transfer(&mut remaining_budget, async {
+        Ok(recover_chunks_with_progress(
+            state,
+            &subject,
+            &invalid_chunks,
+            None,
+            !task.repair_chunks,
+            ExistingChunkCheck::Replace,
+            Some(recovered_progress),
+        )
+        .await)
+    })
+    .await?;
+    if !replacement.remaining.is_empty() {
+        let detail = format!(
+            "{} corrupt chunks replaced; {} still missing; {}",
+            replacement.recovered,
+            replacement.remaining.len(),
+            replacement.errors.join("; ")
+        );
+        if replacement.has_local_error {
+            bail!(detail);
+        }
+        return Err(NoContentSource(detail).into());
+    }
+    // `invalid_recovered_chunks` validated every retained byte, and replacement
+    // responses were hash-checked before installation. Finalize under the GC
+    // gate without re-reading the entire object a second time.
+    let store = read_store(state, "content_recovery.finish_verified").await;
+    store.finish_verified_content_repair(task).await?;
+    Ok(recovered.saturating_add(replacement.recovered))
+}
+
+async fn recover_task_initial_transfer(
     state: &ServerState,
     task: &mut ContentRepairTask,
     recovered_progress: Arc<AtomicUsize>,
-) -> Result<usize> {
+) -> Result<(String, usize)> {
     let bytes = recover_manifest(state, &task.reference).await?;
     let manifest = validate_manifest(&task.reference.manifest_hash, &bytes)?;
     {
@@ -446,45 +522,7 @@ async fn recover_task_unbounded(
         }
         return Err(NoContentSource(detail).into());
     }
-    let invalid_chunks = {
-        let store = read_store(state, "content_recovery.verify_selection").await;
-        store.invalid_recovered_chunks(task).await?
-    };
-    if invalid_chunks.is_empty() {
-        // `invalid_recovered_chunks` just performed the full-byte verification.
-        // Finalize under the GC gate without reading the entire object again.
-        let store = read_store(state, "content_recovery.finish_verified").await;
-        store.finish_verified_content_repair(task).await?;
-        return Ok(result.recovered);
-    }
-    let replacement = recover_chunks_with_progress(
-        state,
-        &subject,
-        &invalid_chunks,
-        None,
-        !task.repair_chunks,
-        ExistingChunkCheck::Replace,
-        Some(recovered_progress),
-    )
-    .await;
-    if !replacement.remaining.is_empty() {
-        let detail = format!(
-            "{} corrupt chunks replaced; {} still missing; {}",
-            replacement.recovered,
-            replacement.remaining.len(),
-            replacement.errors.join("; ")
-        );
-        if replacement.has_local_error {
-            bail!(detail);
-        }
-        return Err(NoContentSource(detail).into());
-    }
-    // Completion re-hashes every recovered byte. It must retain the content
-    // GC gate inside `finish_content_repair`, but does not mutate the store
-    // object itself, so do not monopolize the global store lock for the scan.
-    let store = read_store(state, "content_recovery.finish").await;
-    store.finish_content_repair(task).await?;
-    Ok(result.recovered.saturating_add(replacement.recovered))
+    Ok((subject, result.recovered))
 }
 
 fn empty_report() -> replication::ReplicationRepairReport {

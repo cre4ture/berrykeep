@@ -102,7 +102,11 @@ run_on_main_metadata_backends!(
 async fn durable_recovery_replaces_same_size_corrupt_chunks_impl(backend: MainTestBackend) {
     let source = build_test_state(1, false, backend).await;
     let target = build_test_state(1, false, backend).await;
-    let key = choose_locally_placed_key(&target, "same-size-corrupt-recovery").await;
+    let key = choose_locally_placed_key(
+        &target,
+        &format!("same-size-corrupt-recovery-{}", backend.suffix()),
+    )
+    .await;
     let payload = b"verified retained repair bytes".to_vec();
     for state in [&source, &target] {
         seed_subject_version(state, &key, "v1", payload.clone(), vec![]).await;
@@ -116,6 +120,10 @@ async fn durable_recovery_replaces_same_size_corrupt_chunks_impl(backend: MainTe
     )
     .await
     .unwrap();
+    let verification = crate::storage::content_recovery::block_recovery_verification_for_test(
+        &manifest.manifest_hash,
+    );
+    verification.release();
     let (url, handle) = spawn_internal_peer_api_server(source.clone()).await;
     register_online_source_node(&target, &source, &url).await;
 
@@ -129,6 +137,11 @@ async fn durable_recovery_replaces_same_size_corrupt_chunks_impl(backend: MainTe
     .await;
 
     assert_eq!(report.successful_transfers, 1, "{report:?}");
+    assert_eq!(
+        verification.calls(),
+        1,
+        "a corrupt-chunk repair must not re-read the full object during finalization"
+    );
     for event in ["targeted_repair_started", "targeted_repair_finished"] {
         assert!(
             report.detailed_log.iter().any(|entry| {
@@ -151,6 +164,9 @@ async fn durable_recovery_replaces_same_size_corrupt_chunks_impl(backend: MainTe
             .unwrap()
             .as_ref(),
         payload
+    );
+    crate::storage::content_recovery::clear_recovery_verification_blocker_for_test(
+        &manifest.manifest_hash,
     );
     handle.abort();
     let _ = handle.await;
@@ -768,6 +784,154 @@ run_on_main_metadata_backends!(
     recovery_read_budget_bounds_slow_unadvertised_peers_impl,
     recovery_read_budget_bounds_slow_unadvertised_peers,
     recovery_read_budget_bounds_slow_unadvertised_peers_turso
+);
+
+#[tokio::test]
+async fn recovery_manifest_checks_all_hash_sources_before_legacy_exports() {
+    let source = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let dummy = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let target = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let key = "hash-source-before-legacy.bin";
+    let version = "ver-hash-source-before-legacy";
+    seed_subject_version(
+        &source,
+        key,
+        version,
+        b"manifest source ordering".to_vec(),
+        vec![],
+    )
+    .await;
+    let export = bundle(&source, key, version).await;
+    let reference = crate::storage::retained_content::RetainedReference {
+        key: Some(key.to_string()),
+        object_id: None,
+        version_id: Some(version.to_string()),
+        manifest_hash: export.manifest_hash.clone(),
+        snapshot_only: false,
+    };
+    let manifest_path = format!("/cluster/v2/replication/manifest/{}", export.manifest_hash);
+
+    let bad_requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let requests = bad_requests.clone();
+    let bad_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bad_url = format!("http://{}", bad_listener.local_addr().unwrap());
+    let bad_app = axum::Router::new().fallback(axum::routing::any(
+        move |request: axum::extract::Request| {
+            let requests = requests.clone();
+            async move {
+                requests.lock().await.push(request.uri().path().to_string());
+                StatusCode::NOT_FOUND
+            }
+        },
+    ));
+    let bad_handle = tokio::spawn(async move {
+        axum::serve(bad_listener, bad_app).await.unwrap();
+    });
+
+    let good_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let good_url = format!("http://{}", good_listener.local_addr().unwrap());
+    let expected_manifest = export.manifest_bytes.clone();
+    let good_app = axum::Router::new().route(
+        &manifest_path,
+        axum::routing::get(move || {
+            let bytes = expected_manifest.clone();
+            async move { axum::body::Body::from(bytes) }
+        }),
+    );
+    let good_handle = tokio::spawn(async move {
+        axum::serve(good_listener, good_app).await.unwrap();
+    });
+
+    let (first, second) = if source.node_id < dummy.node_id {
+        (&source, &dummy)
+    } else {
+        (&dummy, &source)
+    };
+    register_online_source_node(&target, first, &bad_url).await;
+    register_online_source_node(&target, second, &good_url).await;
+
+    let recovered = crate::content_recovery::recover_manifest(&target, &reference)
+        .await
+        .unwrap();
+    assert_eq!(recovered, export.manifest_bytes);
+    assert_eq!(
+        bad_requests.lock().await.as_slice(),
+        [manifest_path.as_str()],
+        "an early 404 must not trigger its legacy export before later hash sources are tried"
+    );
+
+    bad_handle.abort();
+    good_handle.abort();
+    let _ = bad_handle.await;
+    let _ = good_handle.await;
+    for state in [&source, &dummy, &target] {
+        cleanup_test_state(state).await;
+    }
+}
+
+async fn recovery_verification_can_outlive_transfer_budget_impl(backend: MainTestBackend) {
+    let state = build_test_state(1, false, backend).await;
+    let key = format!("verification-outlives-budget-{}.bin", backend.suffix());
+    let version = "ver-verification-outlives-budget";
+    seed_subject_version(
+        &state,
+        &key,
+        version,
+        b"already local verification bytes".to_vec(),
+        vec![],
+    )
+    .await;
+    let manifest = bundle(&state, &key, version).await;
+    let reference = read_store(&state, "test.recovery.verification_budget_reference")
+        .await
+        .retained_content()
+        .await
+        .unwrap()
+        .reference_for_subject(&format!("{key}@{version}"))
+        .unwrap()
+        .clone();
+    let verification = crate::storage::content_recovery::block_recovery_verification_for_test(
+        &manifest.manifest_hash,
+    );
+    let mut task = crate::storage::content_recovery::ContentRepairTask::new(reference, true);
+    let recovery = crate::content_recovery::recover_task_with_budget(
+        &state,
+        &mut task,
+        Duration::from_millis(500),
+    );
+    tokio::pin!(recovery);
+
+    tokio::select! {
+        () = verification.wait_until_started() => {}
+        outcome = &mut recovery => panic!("recovery ended before local verification: {outcome:?}"),
+        () = tokio::time::sleep(Duration::from_secs(5)) => {
+            panic!("recovery did not reach local verification")
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(600), &mut recovery)
+            .await
+            .is_err(),
+        "the transfer deadline cancelled a locally complete object's verification"
+    );
+    verification.release();
+    let recovered = tokio::time::timeout(Duration::from_secs(5), &mut recovery)
+        .await
+        .expect("verification should finish after release")
+        .expect("locally complete recovery should succeed");
+    assert_eq!(recovered, 0);
+    assert_eq!(verification.calls(), 1);
+    crate::storage::content_recovery::clear_recovery_verification_blocker_for_test(
+        &manifest.manifest_hash,
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    recovery_verification_can_outlive_transfer_budget_impl,
+    recovery_verification_can_outlive_transfer_budget,
+    recovery_verification_can_outlive_transfer_budget_turso
 );
 
 #[tokio::test]

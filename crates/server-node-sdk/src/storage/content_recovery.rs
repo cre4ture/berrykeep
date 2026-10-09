@@ -2,6 +2,91 @@
 use super::retained_content::RetainedReference;
 use super::*;
 
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use tokio::sync::Notify;
+
+#[cfg(test)]
+pub(crate) struct RecoveryVerificationBlocker {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    released: std::sync::atomic::AtomicBool,
+    calls: AtomicUsize,
+}
+
+#[cfg(test)]
+impl RecoveryVerificationBlocker {
+    pub(crate) async fn wait_until_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+fn recovery_verification_blockers()
+-> &'static StdMutex<HashMap<String, Arc<RecoveryVerificationBlocker>>> {
+    static BLOCKERS: std::sync::OnceLock<
+        StdMutex<HashMap<String, Arc<RecoveryVerificationBlocker>>>,
+    > = std::sync::OnceLock::new();
+    BLOCKERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn block_recovery_verification_for_test(
+    manifest_hash: &str,
+) -> Arc<RecoveryVerificationBlocker> {
+    let blocker = Arc::new(RecoveryVerificationBlocker {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        released: std::sync::atomic::AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+    });
+    recovery_verification_blockers()
+        .lock()
+        .expect("recovery verification blocker lock should not be poisoned")
+        .insert(manifest_hash.to_string(), blocker.clone());
+    blocker
+}
+
+#[cfg(test)]
+pub(crate) fn clear_recovery_verification_blocker_for_test(manifest_hash: &str) {
+    recovery_verification_blockers()
+        .lock()
+        .expect("recovery verification blocker lock should not be poisoned")
+        .remove(manifest_hash);
+}
+
+#[cfg(test)]
+async fn wait_for_recovery_verification_test_blocker(manifest_hash: &str) {
+    let blocker = recovery_verification_blockers()
+        .lock()
+        .expect("recovery verification blocker lock should not be poisoned")
+        .get(manifest_hash)
+        .cloned();
+    if let Some(blocker) = blocker {
+        blocker.calls.fetch_add(1, Ordering::AcqRel);
+        blocker.started.notify_one();
+        loop {
+            let notified = blocker.release.notified();
+            if blocker.released.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ContentRepairTask {
     pub reference: RetainedReference,
@@ -278,6 +363,8 @@ impl PersistentStore {
         &self,
         task: &ContentRepairTask,
     ) -> Result<Vec<ReplicationChunkInfo>> {
+        #[cfg(test)]
+        wait_for_recovery_verification_test_blocker(&task.reference.manifest_hash).await;
         let payload = self
             .read_recovery_manifest(&task.reference.manifest_hash)
             .await?
@@ -308,6 +395,7 @@ impl PersistentStore {
         Ok(invalid)
     }
 
+    #[cfg(test)]
     pub(crate) async fn verify_recovered_content(&self, task: &ContentRepairTask) -> Result<()> {
         if let Some(chunk) = self.invalid_recovered_chunks(task).await?.first() {
             bail!("repaired chunk is missing or corrupt: {}", chunk.hash);
@@ -332,6 +420,7 @@ impl PersistentStore {
         manifest_is_fully_local(&self.storage_pool, hash).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn finish_content_repair(&self, task: &ContentRepairTask) -> Result<()> {
         let _guard = self.content_gc_gate.read().await;
         self.verify_recovered_content(task).await?;
