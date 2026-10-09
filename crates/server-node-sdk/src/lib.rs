@@ -20670,18 +20670,21 @@ async fn recover_missing_chunks_for_media_preview(
     }
 }
 
-async fn hydrate_missing_chunks_for_range(
+fn object_read_recovery_budget(is_range_request: bool, missing_chunk_count: usize) -> Duration {
+    if is_range_request {
+        content_recovery::READ_THROUGH_RECOVERY_BUDGET
+    } else {
+        content_recovery::full_object_recovery_budget(missing_chunk_count)
+    }
+}
+
+async fn hydrate_missing_chunks_for_object_read(
     state: &ServerState,
     subject: &str,
     missing_chunks: &[ReplicationChunkInfo],
+    budget: Duration,
 ) -> Result<()> {
-    hydrate_missing_chunks_with_budget(
-        state,
-        subject,
-        missing_chunks,
-        content_recovery::READ_THROUGH_RECOVERY_BUDGET,
-    )
-    .await
+    hydrate_missing_chunks_with_budget(state, subject, missing_chunks, budget).await
 }
 
 async fn hydrate_missing_chunks_with_budget(
@@ -20817,7 +20820,16 @@ async fn get_object_response(
             query.version.as_deref(),
         )
     {
-        match hydrate_missing_chunks_for_range(state, &subject, &missing_chunks).await {
+        let recovery_budget =
+            object_read_recovery_budget(selected_range.is_some(), missing_chunks.len());
+        match hydrate_missing_chunks_for_object_read(
+            state,
+            &subject,
+            &missing_chunks,
+            recovery_budget,
+        )
+        .await
+        {
             Ok(()) => {
                 request_local_availability_refresh(state);
                 refreshed_local_availability = true;

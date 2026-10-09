@@ -840,6 +840,20 @@ fn full_object_recovery_budget_scales_with_parallel_chunk_batches() {
     );
 }
 
+#[test]
+fn object_read_recovery_budget_scales_only_full_object_reads() {
+    assert_eq!(
+        crate::object_read_recovery_budget(true, 40),
+        crate::content_recovery::READ_THROUGH_RECOVERY_BUDGET,
+        "a byte range must retain its bounded foreground latency"
+    );
+    assert_eq!(
+        crate::object_read_recovery_budget(false, 40),
+        crate::content_recovery::READ_THROUGH_RECOVERY_BUDGET.saturating_mul(10),
+        "a whole-object read must have enough budget for every parallel chunk batch"
+    );
+}
+
 async fn media_preview_budget_exhaustion_is_retryable_impl(backend: MainTestBackend) {
     let target = build_test_state(1, false, backend).await;
     let source = build_test_state(1, false, backend).await;
@@ -2704,10 +2718,11 @@ async fn recovery_rejects_bad_peer_bytes_and_deduplicates_fetches_impl(backend: 
     assert_eq!(result.recovered, 1);
     assert_eq!(bad_requests.load(Ordering::SeqCst), 1);
     assert_eq!(good_requests.load(Ordering::SeqCst), 1);
-    crate::hydrate_missing_chunks_for_range(
+    crate::hydrate_missing_chunks_for_object_read(
         &target,
         "uncatalogued/history",
         std::slice::from_ref(&chunk),
+        crate::content_recovery::READ_THROUGH_RECOVERY_BUDGET,
     )
     .await
     .unwrap();
