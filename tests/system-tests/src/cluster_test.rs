@@ -2181,27 +2181,82 @@ mod tests {
                 wait_for_store_index_path_visible(&client, base_url, key, 240).await?;
             }
 
-            let mut missing_before_reads = Vec::new();
-            for (index, (internal_base_url, internal_client)) in internal_nodes.iter().enumerate() {
-                let subjects = local_available_subjects(internal_client, internal_base_url).await?;
-                if !subjects.contains(key) {
-                    missing_before_reads.push(index);
+            // A temporarily missing assigned replica can be repaired concurrently.
+            // Select genuinely unassigned nodes, excluding the original writer,
+            // rather than treating every not-yet-advertised copy as cache-only.
+            let mut cache_only_nodes = Vec::new();
+            for (index, (base_url, node_id, _, _)) in nodes.iter().enumerate().skip(1) {
+                let placement = client
+                    .get(format!("{base_url}/cluster/placement/{key}"))
+                    .header("x-ironmesh-admin-token", TEST_ADMIN_TOKEN)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<serde_json::Value>()
+                    .await?;
+                let selected_nodes = placement["selected_nodes"]
+                    .as_array()
+                    .context("placement selected_nodes absent")?;
+                assert_eq!(selected_nodes.len(), 3);
+                if !selected_nodes.iter().any(|selected| selected.as_str() == Some(*node_id)) {
+                    let (internal_base_url, internal_client) = &internal_nodes[index];
+                    assert!(
+                        !local_available_subjects(internal_client, internal_base_url)
+                            .await?
+                            .contains(key),
+                        "unassigned node {node_id} must not advertise a replica before read-through"
+                    );
+                    cache_only_nodes.push(index);
                 }
             }
 
             assert!(
-                !missing_before_reads.is_empty(),
-                "expected at least one non-replica node before read-through, but all nodes already reported local availability"
+                !cache_only_nodes.is_empty(),
+                "expected at least one unassigned non-writer in the five-node cluster"
             );
 
             for (base_url, _, _, _) in &nodes {
                 wait_for_store_object_bytes(&client, base_url, key, &payload, 160).await?;
             }
 
-            for index in &missing_before_reads {
-                let (internal_base_url, internal_client) = &internal_nodes[*index];
-                wait_for_local_available_subject(internal_client, internal_base_url, key, true, 160)
-                    .await?;
+            for index in cache_only_nodes {
+                let (base_url, node_id, _, _) = nodes[index];
+                let (internal_base_url, internal_client) = &internal_nodes[index];
+                // Wait for a demonstrably fresh availability scan after the read.
+                // An immediate negative assertion could pass against a stale view.
+                let marker_key = format!("read-through-availability-barrier-{index}");
+                client
+                    .put(format!("{base_url}/store/{marker_key}"))
+                    .body("availability refresh barrier")
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                // PUT announces its own replica immediately; rename only queues
+                // an availability scan, so the new name is the refresh barrier.
+                let refreshed_marker_key = format!("{marker_key}-renamed");
+                client
+                    .post(format!("{base_url}/store/rename"))
+                    .json(&serde_json::json!({
+                        "from_path": marker_key,
+                        "to_path": refreshed_marker_key,
+                        "overwrite": false,
+                    }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                wait_for_local_available_subject(
+                    internal_client,
+                    internal_base_url,
+                    &refreshed_marker_key,
+                    true,
+                    160,
+                )
+                .await?;
+                let subjects = local_available_subjects(internal_client, internal_base_url).await?;
+                assert!(
+                    !subjects.iter().any(|subject| subject == key || subject.starts_with(&format!("{key}@"))),
+                    "read-through cache on unassigned node {node_id} must not become a durable replica"
+                );
             }
 
             Ok::<(), anyhow::Error>(())

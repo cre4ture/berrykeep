@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,13 +14,15 @@ use tokio_rusqlite::Connection as TokioConnection;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::content_recovery::ContentRepairTask;
 use crate::cluster::NodeDescriptor;
 #[cfg(test)]
 use crate::operations::{OperationPriority, OperationProgress};
 use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 
 use super::{
-    ActiveSnapshotBatch, AdminAuditEvent, CachedChunkRecord, CachedMediaMetadata,
+    ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS,
+    CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT, CachedChunkRecord, CachedMediaMetadata,
     ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
     DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
     GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
@@ -41,11 +43,12 @@ use super::{
     S3ControlPlaneState, S3ObjectVersionRecord, SnapshotInfo, SnapshotManifest, StorageContentKind,
     StorageLocationRecord, StorageLocationState, StorageStatsSample, StorageStatsState,
     TOMBSTONE_MANIFEST_HASH, VersionIndexHeadProjection, compress_snapshot_json,
-    current_media_cache_metadata, decode_gallery_labels, decode_version_index,
-    decompress_snapshot_json, effective_gallery_captured_at_unix, effective_gallery_gps,
-    encode_gallery_labels, gallery_index_media_status, gallery_index_media_type_from_metadata,
-    gallery_label_filter_matches_json, gallery_label_predicates, gallery_map_bounded_resolution,
-    gallery_media_type_for_path, gallery_web_mercator_position, metadata_db_logical_summary_query,
+    current_media_cache_metadata, decode_content_repair_task, decode_gallery_labels,
+    decode_version_index, decompress_snapshot_json, effective_gallery_captured_at_unix,
+    effective_gallery_gps, encode_gallery_labels, gallery_index_media_status,
+    gallery_index_media_type_from_metadata, gallery_label_filter_matches_json,
+    gallery_label_predicates, gallery_map_bounded_resolution, gallery_media_type_for_path,
+    gallery_web_mercator_position, metadata_db_logical_summary_query,
     metadata_db_logical_table_specs, normalize_snapshot_manifest_object_ids,
     recoverable_history_listing_query, sqlite_like_prefix_pattern,
     version_created_at_unix_from_payload, version_index_head_projection,
@@ -253,6 +256,26 @@ impl SqliteMetadataStore {
                 )
             })?;
         Ok(db)
+    }
+
+    async fn discard_invalid_content_repair_tasks(
+        &self,
+        invalid_tasks: Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
+        if invalid_tasks.is_empty() {
+            return Ok(());
+        }
+        self.write_tx(move |db| {
+            let mut delete = db.prepare(
+                "DELETE FROM content_repair_tasks
+                 WHERE manifest_hash = ?1 AND CAST(task_json AS BLOB) = ?2",
+            )?;
+            for (manifest_hash, task_json) in invalid_tasks {
+                delete.execute(params![manifest_hash, task_json])?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn in_metadata_tx<T, F>(&self, f: F) -> Result<T>
@@ -2526,6 +2549,212 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn content_repair_pending(&self, manifest_hash: &str) -> Result<bool> {
+        let hash = manifest_hash.to_string();
+        self.read(move |db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_repair_tasks WHERE manifest_hash=?1)",
+                params![hash],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
+    async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
+        let (tasks, invalid_tasks) = self
+            .read(|db| {
+                let mut statement = db.prepare(
+                    "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks
+                     ORDER BY manifest_hash",
+                )?;
+                let mut rows = statement.query([])?;
+                let mut tasks = Vec::new();
+                let mut invalid_tasks = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let manifest_hash = row.get::<_, String>(0)?;
+                    let task_json = row.get::<_, Vec<u8>>(1)?;
+                    if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
+                        tasks.push(task);
+                    } else {
+                        invalid_tasks.push((manifest_hash, task_json));
+                    }
+                }
+                Ok((tasks, invalid_tasks))
+            })
+            .await?;
+        self.discard_invalid_content_repair_tasks(invalid_tasks)
+            .await?;
+        Ok(tasks)
+    }
+
+    async fn load_content_repair_tasks_for_manifests(
+        &self,
+        manifest_hashes: &[String],
+    ) -> Result<Vec<ContentRepairTask>> {
+        const CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE: usize = 500;
+
+        if manifest_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let hashes = manifest_hashes.to_vec();
+        let (tasks, invalid_tasks) = self
+            .read(move |db| {
+                let mut tasks = Vec::<ContentRepairTask>::new();
+                let mut invalid_tasks = Vec::new();
+                for batch in hashes.chunks(CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE) {
+                    let placeholders = std::iter::repeat_n("?", batch.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let statement = format!(
+                        "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks \
+                     WHERE manifest_hash IN ({placeholders}) ORDER BY manifest_hash"
+                    );
+                    let mut statement = db.prepare(&statement)?;
+                    let mut rows = statement.query(params_from_iter(batch.iter()))?;
+                    while let Some(row) = rows.next()? {
+                        let manifest_hash = row.get::<_, String>(0)?;
+                        let task_json = row.get::<_, Vec<u8>>(1)?;
+                        if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
+                            tasks.push(task);
+                        } else {
+                            invalid_tasks.push((manifest_hash, task_json));
+                        }
+                    }
+                }
+                tasks.sort_by(|left, right| {
+                    left.reference
+                        .manifest_hash
+                        .cmp(&right.reference.manifest_hash)
+                });
+                Ok((tasks, invalid_tasks))
+            })
+            .await?;
+        self.discard_invalid_content_repair_tasks(invalid_tasks)
+            .await?;
+        Ok(tasks)
+    }
+
+    async fn content_repair_task_hashes(&self) -> Result<Vec<String>> {
+        self.read(|db| {
+            let mut statement = db
+                .prepare("SELECT manifest_hash FROM content_repair_tasks ORDER BY manifest_hash")?;
+            let mut rows = statement.query([])?;
+            let mut hashes = Vec::new();
+            while let Some(row) = rows.next()? {
+                hashes.push(row.get(0)?);
+            }
+            Ok(hashes)
+        })
+        .await
+    }
+
+    async fn due_content_repair_task_hashes(
+        &self,
+        now_unix: u64,
+        source_fingerprint: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let source_change_retry_before_unix = i64::try_from(
+            now_unix.saturating_sub(CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS),
+        )
+        .expect("source retry timestamp cannot exceed the current timestamp");
+        let now_unix = i64::try_from(now_unix).context("repair task due timestamp overflow")?;
+        let source_fingerprint = source_fingerprint.to_string();
+        let limit = limit.max(1);
+        self.read(move |db| {
+            let mut statement = db.prepare(
+                "SELECT manifest_hash FROM content_repair_tasks
+                 WHERE next_attempt_unix <= ?1
+                 ORDER BY next_attempt_unix ASC, manifest_hash ASC
+                 LIMIT ?2",
+            )?;
+            let mut rows = statement.query(params![
+                now_unix,
+                i64::try_from(limit).context("repair task query limit overflow")?
+            ])?;
+            let mut hashes = Vec::new();
+            let mut seen = HashSet::new();
+            while let Some(row) = rows.next()? {
+                let hash = row.get::<_, String>(0)?;
+                seen.insert(hash.clone());
+                hashes.push(hash);
+            }
+            drop(rows);
+            drop(statement);
+
+            // A source topology change deliberately caps ordinary backoff at
+            // the minimum interval. Flapping peers can therefore trigger one
+            // attempt per interval; the last-attempt range keeps that rate
+            // limit indexed.
+            if hashes.len() < limit {
+                let remaining = i64::try_from(limit.saturating_sub(hashes.len()))
+                    .context("repair task query limit overflow")?;
+                let mut statement = db.prepare(
+                    "SELECT manifest_hash FROM content_repair_tasks
+                     WHERE source_fingerprint <> ?1 AND last_attempt_unix <= ?2
+                     ORDER BY last_attempt_unix ASC, manifest_hash ASC LIMIT ?3",
+                )?;
+                let mut rows = statement.query(params![
+                    source_fingerprint,
+                    source_change_retry_before_unix,
+                    remaining
+                ])?;
+                while let Some(row) = rows.next()? {
+                    let hash = row.get::<_, String>(0)?;
+                    if seen.insert(hash.clone()) {
+                        hashes.push(hash);
+                    }
+                }
+            }
+            Ok(hashes)
+        })
+        .await
+    }
+
+    async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {
+        let hash = task.reference.manifest_hash.clone();
+        let next_attempt_unix =
+            i64::try_from(task.next_attempt_unix).context("repair task timestamp overflow")?;
+        let last_attempt_unix =
+            i64::try_from(task.last_attempt_unix).context("repair task timestamp overflow")?;
+        let source_fingerprint = task.source_fingerprint.clone();
+        let payload = serde_json::to_vec(task)?;
+        self.write_tx(move |db| {
+            db.execute(
+                "INSERT INTO content_repair_tasks (
+                     manifest_hash, next_attempt_unix, last_attempt_unix, source_fingerprint, task_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(manifest_hash) DO UPDATE SET
+                     next_attempt_unix=excluded.next_attempt_unix,
+                     last_attempt_unix=excluded.last_attempt_unix,
+                     source_fingerprint=excluded.source_fingerprint,
+                     task_json=excluded.task_json",
+                params![
+                    hash,
+                    next_attempt_unix,
+                    last_attempt_unix,
+                    source_fingerprint,
+                    payload
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()> {
+        let hash = manifest_hash.to_string();
+        self.write_tx(move |db| {
+            db.execute(
+                "DELETE FROM content_repair_tasks WHERE manifest_hash=?1",
+                params![hash],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn load_repair_attempts(
         &self,
     ) -> Result<std::collections::HashMap<String, RepairAttemptRecord>> {
@@ -3242,20 +3471,59 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn persist_cluster_replicas(
+    async fn load_cluster_availability(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<NodeId>>> {
+        self.read(|db| {
+            let mut stmt = db.prepare(
+                "SELECT subject, node_id
+                 FROM cluster_available
+                 ORDER BY subject, node_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+            let mut available: std::collections::HashMap<String, Vec<NodeId>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let (subject, node_id) = row?;
+                let node_id = node_id.parse::<NodeId>().with_context(|| {
+                    format!("invalid node id in cluster availability: {node_id}")
+                })?;
+                available.entry(subject).or_default().push(node_id);
+            }
+            Ok(available)
+        })
+        .await
+    }
+
+    async fn persist_cluster_replica_views(
         &self,
         replicas: &std::collections::HashMap<String, Vec<NodeId>>,
+        available: &std::collections::HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
         let replicas = replicas.clone();
+        let available = available.clone();
         self.write_tx(move |db| {
             db.execute("DELETE FROM cluster_replicas", [])?;
-            let mut stmt = db.prepare(
+            db.execute("DELETE FROM cluster_available", [])?;
+            let mut replica_stmt = db.prepare(
                 "INSERT INTO cluster_replicas (subject, node_id)
                  VALUES (?1, ?2)",
             )?;
             for (subject, nodes) in replicas {
                 for node_id in nodes {
-                    stmt.execute(params![subject, node_id.to_string()])?;
+                    replica_stmt.execute(params![subject, node_id.to_string()])?;
+                }
+            }
+            let mut available_stmt = db.prepare(
+                "INSERT INTO cluster_available (subject, node_id)
+                 VALUES (?1, ?2)",
+            )?;
+            for (subject, nodes) in available {
+                for node_id in nodes {
+                    available_stmt.execute(params![subject, node_id.to_string()])?;
                 }
             }
             Ok(())
@@ -4620,6 +4888,7 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    #[cfg(test)]
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
         self.read(|db| {
             let mut stmt = db.prepare(
@@ -5326,6 +5595,14 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             last_failure_unix INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS content_repair_tasks (
+            manifest_hash TEXT PRIMARY KEY,
+            next_attempt_unix INTEGER NOT NULL DEFAULT 0,
+            last_attempt_unix INTEGER NOT NULL DEFAULT 0,
+            source_fingerprint TEXT NOT NULL DEFAULT '__legacy__',
+            task_json BLOB NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS repair_run_history (
             run_id TEXT PRIMARY KEY,
             finished_at_unix INTEGER NOT NULL,
@@ -5368,6 +5645,11 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS cluster_replicas (
+            subject TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            PRIMARY KEY(subject, node_id)
+        );
+        CREATE TABLE IF NOT EXISTS cluster_available (
             subject TEXT NOT NULL,
             node_id TEXT NOT NULL,
             PRIMARY KEY(subject, node_id)
@@ -5524,6 +5806,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             ON data_change_events(actor_id);
         CREATE INDEX IF NOT EXISTS idx_cluster_replicas_subject
             ON cluster_replicas(subject);
+        CREATE INDEX IF NOT EXISTS idx_cluster_available_subject
+            ON cluster_available(subject);
         CREATE INDEX IF NOT EXISTS idx_s3_object_versions_key
             ON s3_object_versions(bucket_name, berrykeep_key, created_at_unix DESC, version_id DESC);
         ",
@@ -5642,7 +5926,35 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             return Err(err).context("failed to migrate sqlite s3_access_keys.allow_manage");
         }
     }
-
+    add_sqlite_column_if_missing(
+        db,
+        "content_repair_tasks",
+        "next_attempt_unix",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_sqlite_column_if_missing(
+        db,
+        "content_repair_tasks",
+        "last_attempt_unix",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_sqlite_column_if_missing(
+        db,
+        "content_repair_tasks",
+        "source_fingerprint",
+        "TEXT NOT NULL DEFAULT '__legacy__'",
+    )?;
+    backfill_content_repair_task_schedule(db)?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_due_v2
+         ON content_repair_tasks(next_attempt_unix, manifest_hash)",
+        [],
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_content_repair_tasks_last_attempt
+         ON content_repair_tasks(last_attempt_unix, manifest_hash)",
+        [],
+    )?;
     let stored_version = db
         .query_row(
             "SELECT value FROM metadata_meta WHERE key = ?1",
@@ -5691,6 +6003,50 @@ fn add_sqlite_column_if_missing(
         && !err.to_string().contains("duplicate column name")
     {
         return Err(err).with_context(|| format!("failed to add {table}.{column}"));
+    }
+    Ok(())
+}
+
+fn backfill_content_repair_task_schedule(db: &Connection) -> Result<()> {
+    let (tasks, invalid_hashes) = {
+        let mut statement = db.prepare(
+            "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks
+             WHERE source_fingerprint = ?1",
+        )?;
+        let mut rows = statement.query([CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT])?;
+        let mut tasks = Vec::new();
+        let mut invalid_hashes = Vec::new();
+        while let Some(row) = rows.next()? {
+            let manifest_hash = row.get::<_, String>(0)?;
+            let task_json = row.get::<_, Vec<u8>>(1)?;
+            if let Some(task) = decode_content_repair_task(&manifest_hash, &task_json) {
+                tasks.push((manifest_hash, task));
+            } else {
+                invalid_hashes.push(manifest_hash);
+            }
+        }
+        (tasks, invalid_hashes)
+    };
+    for manifest_hash in invalid_hashes {
+        db.execute(
+            "DELETE FROM content_repair_tasks WHERE manifest_hash = ?1",
+            [manifest_hash],
+        )?;
+    }
+    for (manifest_hash, task) in tasks {
+        db.execute(
+            "UPDATE content_repair_tasks
+             SET next_attempt_unix = ?1, last_attempt_unix = ?2, source_fingerprint = ?3
+             WHERE manifest_hash = ?4",
+            params![
+                i64::try_from(task.next_attempt_unix)
+                    .context("repair task backfill timestamp overflow")?,
+                i64::try_from(task.last_attempt_unix)
+                    .context("repair task backfill timestamp overflow")?,
+                task.source_fingerprint,
+                manifest_hash,
+            ],
+        )?;
     }
     Ok(())
 }
@@ -6110,6 +6466,90 @@ mod tests {
             )
             .expect("schema version should be restored");
         assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
+    }
+
+    #[test]
+    fn init_metadata_db_discards_unreadable_legacy_content_repair_tasks() {
+        let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+        init_metadata_db(&db).expect("metadata schema should initialize");
+        db.execute(
+            "INSERT INTO content_repair_tasks (
+                 manifest_hash, next_attempt_unix, source_fingerprint, task_json
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "broken-repair-task",
+                0,
+                CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT,
+                b"{not valid json".to_vec(),
+            ],
+        )
+        .expect("broken legacy task should insert");
+
+        init_metadata_db(&db).expect("a broken legacy task must not block startup");
+
+        let remaining: usize = db
+            .query_row("SELECT COUNT(*) FROM content_repair_tasks", [], |row| {
+                row.get(0)
+            })
+            .expect("repair task count should load");
+        assert_eq!(
+            remaining, 0,
+            "the regenerable corrupt task must be discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_content_repair_tasks_do_not_block_queue_reads() {
+        let metadata_db_path = sqlite_test_db_path("unreadable-content-repair-task");
+        let store = SqliteMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("sqlite metadata store should open");
+
+        for manifest_hash in ["broken-selected-task", "broken-all-task"] {
+            let db = store
+                .metadata_conn()
+                .expect("metadata connection should open");
+            db.execute(
+                "INSERT INTO content_repair_tasks (
+                     manifest_hash, next_attempt_unix, source_fingerprint, task_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![manifest_hash, 0, "current", b"{not valid json".to_vec()],
+            )
+            .expect("broken current task should insert");
+        }
+
+        assert!(
+            store
+                .load_content_repair_tasks_for_manifests(&["broken-selected-task".to_string()])
+                .await
+                .expect("a broken selected task must be skipped")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .content_repair_task_hashes()
+                .await
+                .expect("remaining queue hashes should load"),
+            vec!["broken-all-task".to_string()],
+            "the selected-task reader must discard only the row it decoded"
+        );
+        assert!(
+            store
+                .load_content_repair_tasks()
+                .await
+                .expect("a broken queue task must be skipped")
+                .is_empty()
+        );
+        assert!(
+            store
+                .content_repair_task_hashes()
+                .await
+                .expect("corrupt queue rows should be removed")
+                .is_empty()
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
     }
 
     #[test]
