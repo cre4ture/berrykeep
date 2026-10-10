@@ -36,7 +36,10 @@ const DISCOVERY_MAX_CONCURRENCY: usize = 8;
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 const DISCOVERY_SUCCESS_GRACE: Duration = Duration::from_millis(250);
-const ENROLLMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const HTTP_ENROLLMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+// HTTPS probes include a TLS handshake. Keep their total budget above the
+// connection timeout so a reachable, slower endpoint is not discarded first.
+const HTTPS_ENROLLMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const RENDEZVOUS_CONTACT_LIST_SCHEMA_VERSION: u32 = 1;
 
 /// A cluster-provided Rendezvous contact list cached alongside a client's
@@ -2235,12 +2238,12 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
                     node_id,
                     cluster_id: target.cluster_id,
                 }),
-            ENROLLMENT_PROBE_TIMEOUT,
+            HTTPS_ENROLLMENT_PROBE_TIMEOUT,
         )
         .context("failed building bootstrap trusted client")?
     } else {
         reqwest::blocking::Client::builder()
-            .timeout(ENROLLMENT_PROBE_TIMEOUT)
+            .timeout(HTTP_ENROLLMENT_PROBE_TIMEOUT)
             .build()
             .context("failed building bootstrap probe client")?
     };

@@ -322,6 +322,8 @@ struct ClientIdentityEnrollmentReport {
     identity_file: String,
     cluster_id: String,
     device_id: String,
+    #[serde(skip_serializing)]
+    connection_bootstrap_json: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     server_base_url: Option<String>,
 }
@@ -1321,7 +1323,9 @@ async fn upsert_client_identity(
         request.into_identity(existing, state.paths.instance_store_path())?;
     let enrollment = if enroll {
         let report = enroll_client_identity(identity.clone(), bootstrap_content.as_deref()).await?;
-        if let Some(bootstrap_content) = bootstrap_content.as_deref() {
+        if let Some(bootstrap_content) =
+            persisted_bootstrap_content(&report, bootstrap_content.as_deref())
+        {
             write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
         }
         refresh_client_identity_metadata(&mut identity);
@@ -1352,6 +1356,16 @@ async fn upsert_client_identity(
         config: load_config_response(&state).map_err(ApiError::internal)?,
         enrollment,
     }))
+}
+
+fn persisted_bootstrap_content<'a>(
+    enrollment: &'a ClientIdentityEnrollmentReport,
+    submitted_bootstrap_content: Option<&'a str>,
+) -> Option<&'a str> {
+    enrollment
+        .connection_bootstrap_json
+        .as_deref()
+        .or(submitted_bootstrap_content)
 }
 
 async fn upsert_client_cli_instance(
@@ -2348,6 +2362,7 @@ fn enroll_client_identity_blocking(
         identity_file: identity.client_identity_file.clone(),
         cluster_id: material.cluster_id.to_string(),
         device_id: material.device_id.to_string(),
+        connection_bootstrap_json: enrolled.connection_bootstrap_json,
         server_base_url: enrolled.server_base_url,
     })
 }
@@ -4400,13 +4415,19 @@ window.controlService = async function(serviceKind, encodedId, action) {
 async function submitIdentityForm(event) {
   event.preventDefault();
   const submitButton = document.getElementById('save-identity-button');
+  const enroll = document.getElementById('identity-enroll').checked;
   submitButton.disabled = true;
-  submitButton.textContent = 'Enrolling Client Identity...';
-  showIdentityFormStatus('Contacting the BerryKeep server and enrolling this device...', 'pending');
+  submitButton.textContent = enroll ? 'Enrolling Client Identity...' : 'Saving Client Identity...';
+  showIdentityFormStatus(
+    enroll
+      ? 'Contacting the BerryKeep server and enrolling this device...'
+      : 'Saving the client identity...',
+    'pending',
+  );
   const payload = {
     id: document.getElementById('identity-id').value || null,
     bootstrap_content: document.getElementById('identity-bootstrap-content').value,
-    enroll: document.getElementById('identity-enroll').checked,
+    enroll,
   };
   let response;
   try {
@@ -4645,6 +4666,22 @@ mod tests {
         .expect("bootstrap JSON should parse");
 
         assert_eq!(label.as_deref(), Some("Desktop client"));
+    }
+
+    #[test]
+    fn claim_enrollment_persists_the_redeemed_connection_bootstrap() {
+        let enrollment = ClientIdentityEnrollmentReport {
+            identity_file: "/managed/client-identity.json".to_string(),
+            cluster_id: "cluster".to_string(),
+            device_id: "device".to_string(),
+            connection_bootstrap_json: Some("{\"bootstrap_bundle\":true}".to_string()),
+            server_base_url: None,
+        };
+
+        assert_eq!(
+            persisted_bootstrap_content(&enrollment, Some("{\"k\":\"claim\"}")),
+            Some("{\"bootstrap_bundle\":true}")
+        );
     }
 
     const KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX: u64 = 1_776_690_574;
