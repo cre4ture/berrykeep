@@ -22,8 +22,9 @@ use uuid::Uuid;
 
 use crate::berrykeep_client::{BerryKeepClient, CLIENT_API_V1_PREFIX, normalize_server_base_url};
 use crate::connection::{
-    build_blocking_reqwest_client_from_pem_for_url,
+    ENROLLMENT_REQUEST_TIMEOUT,
     build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity_and_timeout,
+    build_blocking_reqwest_client_from_pem_for_url_with_timeout,
     build_http_client_from_planned_targets, build_http_client_with_identity_from_planned_targets,
 };
 use crate::device_auth::{
@@ -2113,9 +2114,10 @@ pub fn enroll_bootstrap_claim_blocking(
     let mut retryable_errors = Vec::new();
     let mut redeemed = None;
     for redeem_url in claim_redeem_urls(claim)? {
-        let response = match build_blocking_reqwest_client_from_pem_for_url(
+        let response = match build_blocking_reqwest_client_from_pem_for_url_with_timeout(
             Some(&rendezvous_ca_pem),
             &redeem_url,
+            ENROLLMENT_REQUEST_TIMEOUT,
         )?
         .post(redeem_url.clone())
         .json(&redeem_request)

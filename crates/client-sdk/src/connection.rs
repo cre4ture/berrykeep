@@ -27,6 +27,7 @@ use crate::{BerryKeepClient, PlannedConnectionBootstrapTarget};
 
 const RELAY_REQUEST_BASE_URL: &str = "https://relay.invalid/";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const ENROLLMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_PROBE_RESPONSE_BYTES: usize = 64;
 const STARTUP_PROBE_WARMUP_COUNT: usize = 1;
 const STARTUP_PROBE_SAMPLE_COUNT: usize = 3;

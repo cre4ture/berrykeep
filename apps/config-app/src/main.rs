@@ -2310,10 +2310,9 @@ async fn enroll_client_identity(
     identity: ClientIdentityConfig,
     bootstrap_content: Option<&str>,
 ) -> Result<ClientIdentityEnrollmentReport, ApiError> {
-    let bootstrap_content = bootstrap_content
-        .map(str::to_owned)
-        .map(Ok)
-        .unwrap_or_else(|| {
+    let bootstrap_content = bootstrap_content.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let bootstrap_content = bootstrap_content.map(Ok).unwrap_or_else(|| {
             std::fs::read_to_string(&identity.bootstrap_file).map_err(|error| {
                 ApiError::internal(anyhow::anyhow!(
                     "failed reading managed bootstrap file {}: {error}",
@@ -2321,7 +2320,6 @@ async fn enroll_client_identity(
                 ))
             })
         })?;
-    tokio::task::spawn_blocking(move || {
         enroll_client_identity_blocking(&identity, &bootstrap_content)
     })
     .await
@@ -3162,7 +3160,7 @@ body {
   --nav-link-border: rgba(18, 184, 134, 0.16);
   --status-background: #f4f7f8;
   --status-foreground: #173039;
-  --form-feedback-pending: #0d6b5c;
+  --form-feedback-pending: #865d00;
   --form-feedback-success: #0d6b5c;
   --form-feedback-error: #b42318;
 }
@@ -3193,7 +3191,7 @@ body {
   --nav-link-border: rgba(116, 228, 200, 0.14);
   --status-background: #0d171b;
   --status-foreground: #dff8f1;
-  --form-feedback-pending: #74e4c8;
+  --form-feedback-pending: #ffd58a;
   --form-feedback-success: #74e4c8;
   --form-feedback-error: #ffb4ab;
 }

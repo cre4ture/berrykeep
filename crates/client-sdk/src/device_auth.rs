@@ -12,11 +12,9 @@ use crate::BerryKeepClient;
 use crate::berrykeep_client::CLIENT_API_V1_PREFIX;
 
 use crate::connection::{
-    build_blocking_reqwest_client_from_pem_for_url_with_timeout,
+    ENROLLMENT_REQUEST_TIMEOUT, build_blocking_reqwest_client_from_pem_for_url_with_timeout,
     build_reqwest_client_from_pem_for_url,
 };
-
-const DEVICE_ENROLLMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceEnrollmentRequest {
@@ -113,13 +111,14 @@ pub fn enroll_device_blocking(
         build_blocking_reqwest_client_from_pem_for_url_with_timeout(
             Some(&server_ca_pem),
             &enroll_url,
-            DEVICE_ENROLLMENT_REQUEST_TIMEOUT,
+            ENROLLMENT_REQUEST_TIMEOUT,
         )?
     } else {
-        reqwest::blocking::Client::builder()
-            .timeout(DEVICE_ENROLLMENT_REQUEST_TIMEOUT)
-            .build()
-            .context("failed building blocking HTTP client")?
+        build_blocking_reqwest_client_from_pem_for_url_with_timeout(
+            None,
+            &enroll_url,
+            ENROLLMENT_REQUEST_TIMEOUT,
+        )?
     };
     let response = client
         .post(enroll_url)
@@ -142,7 +141,7 @@ pub fn enroll_device_blocking_from_pem(
         base_url,
         server_ca_pem,
         request,
-        DEVICE_ENROLLMENT_REQUEST_TIMEOUT,
+        ENROLLMENT_REQUEST_TIMEOUT,
     )
 }
 
