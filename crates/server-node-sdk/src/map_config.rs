@@ -417,6 +417,20 @@ pub(crate) async fn admin_put_config(
 pub(crate) async fn load_current_configuration(
     state: &ServerState,
 ) -> Result<LoadedMapConfiguration> {
+    // A cold node may have to probe every online peer for the configuration.
+    // Serialize that recovery attempt so concurrent clients share its result
+    // (including the short-lived miss/unavailable backoff) instead of each
+    // issuing their own cluster-wide probe.
+    let _load_permit = Arc::clone(&state.storage.map_configuration_load_permit)
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow!("gallery map configuration load semaphore closed"))?;
+    load_current_configuration_serialized(state).await
+}
+
+async fn load_current_configuration_serialized(
+    state: &ServerState,
+) -> Result<LoadedMapConfiguration> {
     let local_descriptor = {
         let store = read_store(state, "maps.config.describe_local").await;
         store

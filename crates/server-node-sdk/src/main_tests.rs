@@ -20279,6 +20279,7 @@ async fn build_test_state(
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
             map_configuration_read_through_backoff: Arc::new(Mutex::new(None)),
+            map_configuration_load_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<
                 String,
                 Arc<super::web_maps::LogicalMbtilesSource>,
