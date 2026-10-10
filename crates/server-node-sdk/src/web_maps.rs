@@ -883,72 +883,109 @@ async fn get_or_create_mbtiles_source(
             .or_insert_with(|| Arc::new(Semaphore::new(1)))
             .clone()
     };
-    let _initialization_permit = initialization_lock
+    let initialization_permit = Arc::clone(&initialization_lock)
         .acquire_owned()
         .await
         .map_err(|_| anyhow!("MBTiles source initialization lock closed"))?;
 
-    if let Some(source) = state
-        .storage
-        .mbtiles_sources
-        .read()
+    let initialization_result = async {
+        if let Some(source) = state
+            .storage
+            .mbtiles_sources
+            .read()
+            .await
+            .get(manifest_key)
+            .cloned()
+        {
+            if state.storage.map_perf_logging_enabled {
+                info!(
+                    manifest_key = %manifest_key,
+                    cache = "single-flight-hit",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "map perf: reused concurrently initialized MBTiles source"
+                );
+            }
+            return Ok(source);
+        }
+
+        let loaded_manifest = load_split_logical_file_manifest(state, manifest_key).await?;
+        let handle = tokio::runtime::Handle::current();
+        let manifest_key_owned = manifest_key.to_string();
+        let perf_logging_enabled = state.storage.map_perf_logging_enabled;
+        let source = tokio::task::spawn_blocking({
+            let state = state.clone_for_mbtiles_read_through();
+            move || {
+                mbtiles::LogicalMbtilesSource::new(
+                    manifest_key_owned,
+                    state,
+                    handle,
+                    loaded_manifest,
+                    perf_logging_enabled,
+                )
+            }
+        })
         .await
+        .context("MBTiles source construction task join failed")??;
+        let source = Arc::new(source);
+
+        let mut sources = state.storage.mbtiles_sources.write().await;
+        if let Some(existing) = sources.get(manifest_key) {
+            if state.storage.map_perf_logging_enabled {
+                info!(
+                    manifest_key = %manifest_key,
+                    cache = "race-hit",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "map perf: reusing concurrently initialized MBTiles source"
+                );
+            }
+            return Ok(existing.clone());
+        }
+        sources.insert(manifest_key.to_string(), source.clone());
+        if state.storage.map_perf_logging_enabled {
+            info!(
+                manifest_key = %manifest_key,
+                cache = "miss",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "map perf: initialized MBTiles source"
+            );
+        }
+        Ok(source)
+    }
+    .await;
+
+    drop(initialization_permit);
+    remove_idle_mbtiles_source_initialization_lock(state, manifest_key, &initialization_lock).await;
+    initialization_result
+}
+
+async fn remove_idle_mbtiles_source_initialization_lock(
+    state: &ServerState,
+    manifest_key: &str,
+    initialization_lock: &Arc<Semaphore>,
+) {
+    let mut locks = state
+        .storage
+        .mbtiles_source_initialization_locks
+        .lock()
+        .await;
+    remove_idle_mbtiles_source_initialization_lock_from_map(
+        &mut locks,
+        manifest_key,
+        initialization_lock,
+    );
+}
+
+fn remove_idle_mbtiles_source_initialization_lock_from_map(
+    locks: &mut HashMap<String, Arc<Semaphore>>,
+    manifest_key: &str,
+    initialization_lock: &Arc<Semaphore>,
+) {
+    let is_current = locks
         .get(manifest_key)
-        .cloned()
-    {
-        if state.storage.map_perf_logging_enabled {
-            info!(
-                manifest_key = %manifest_key,
-                cache = "single-flight-hit",
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "map perf: reused concurrently initialized MBTiles source"
-            );
-        }
-        return Ok(source);
+        .is_some_and(|current| Arc::ptr_eq(current, initialization_lock));
+    if is_current && Arc::strong_count(initialization_lock) == 2 {
+        locks.remove(manifest_key);
     }
-
-    let loaded_manifest = load_split_logical_file_manifest(state, manifest_key).await?;
-    let handle = tokio::runtime::Handle::current();
-    let manifest_key_owned = manifest_key.to_string();
-    let perf_logging_enabled = state.storage.map_perf_logging_enabled;
-    let source = tokio::task::spawn_blocking({
-        let state = state.clone_for_mbtiles_read_through();
-        move || {
-            mbtiles::LogicalMbtilesSource::new(
-                manifest_key_owned,
-                state,
-                handle,
-                loaded_manifest,
-                perf_logging_enabled,
-            )
-        }
-    })
-    .await
-    .context("MBTiles source construction task join failed")??;
-    let source = Arc::new(source);
-
-    let mut sources = state.storage.mbtiles_sources.write().await;
-    if let Some(existing) = sources.get(manifest_key) {
-        if state.storage.map_perf_logging_enabled {
-            info!(
-                manifest_key = %manifest_key,
-                cache = "race-hit",
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "map perf: reusing concurrently initialized MBTiles source"
-            );
-        }
-        return Ok(existing.clone());
-    }
-    sources.insert(manifest_key.to_string(), source.clone());
-    if state.storage.map_perf_logging_enabled {
-        info!(
-            manifest_key = %manifest_key,
-            cache = "miss",
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "map perf: initialized MBTiles source"
-        );
-    }
-    Ok(source)
 }
 
 fn is_safe_fontstack_segment(value: &str) -> bool {
@@ -994,11 +1031,14 @@ fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
 mod tests {
     use super::{
         ErrorResponseBody, RequestCancellation, error_response, is_safe_fontstack_segment,
-        is_safe_glyph_range_segment,
+        is_safe_glyph_range_segment, remove_idle_mbtiles_source_initialization_lock_from_map,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use tokio::sync::Semaphore;
 
     #[test]
     fn request_cancellation_sets_lookup_flag_when_request_ends() {
@@ -1009,6 +1049,30 @@ mod tests {
         assert!(!flag.load(Ordering::Relaxed));
         drop(guard);
         assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn mbtiles_initialization_locks_are_removed_only_after_waiters_leave() {
+        let manifest_key = "sys/maps/example.mbtiles.manifest.json";
+        let initialization_lock = Arc::new(Semaphore::new(1));
+        let mut locks =
+            HashMap::from([(manifest_key.to_string(), Arc::clone(&initialization_lock))]);
+
+        let waiter = Arc::clone(&initialization_lock);
+        remove_idle_mbtiles_source_initialization_lock_from_map(
+            &mut locks,
+            manifest_key,
+            &initialization_lock,
+        );
+        assert!(locks.contains_key(manifest_key));
+
+        drop(waiter);
+        remove_idle_mbtiles_source_initialization_lock_from_map(
+            &mut locks,
+            manifest_key,
+            &initialization_lock,
+        );
+        assert!(!locks.contains_key(manifest_key));
     }
 
     #[tokio::test]
