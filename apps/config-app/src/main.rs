@@ -284,12 +284,9 @@ impl UpsertClientIdentityRequest {
             .as_deref()
             .map(client_identity_label_from_bootstrap_content)
             .transpose()?
+            .flatten()
             .or_else(|| existing.map(|identity| identity.label.to_string()))
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    "bootstrap content must include device_label so the identity name can be derived",
-                )
-            })?;
+            .unwrap_or_else(|| default_client_identity_label(&id));
         let identity = ClientIdentityConfig {
             id,
             label,
@@ -2376,7 +2373,7 @@ fn refresh_client_identity_metadata(identity: &mut ClientIdentityConfig) {
             .and_then(|pem| rendezvous_client_identity_not_after_unix(pem.as_bytes()).ok());
 }
 
-fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<String, ApiError> {
+fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<Option<String>, ApiError> {
     let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
         ApiError::bad_request(format!("bootstrap content must be valid JSON: {error}"))
     })?;
@@ -2389,13 +2386,15 @@ fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<String, Api
         &["bootstrap_bundle", "label"][..],
     ] {
         if let Some(label) = json_string_path(&value, path) {
-            return Ok(label);
+            return Ok(Some(label));
         }
     }
 
-    Err(ApiError::bad_request(
-        "bootstrap content must include device_label so the identity name can be derived",
-    ))
+    Ok(None)
+}
+
+fn default_client_identity_label(id: &str) -> String {
+    format!("Managed client identity {id}")
 }
 
 fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
@@ -2821,7 +2820,7 @@ const APP_HTML: &str = r###"<!doctype html>
               <input type="hidden" id="identity-id" />
               <label class="wide-field">
                 <span class="field-label">Bootstrap File</span>
-                <span class="field-help">Paste the bootstrap JSON from the server. The identity name is derived from its device_label.</span>
+                <span class="field-help">Paste the bootstrap JSON from the server. Its device_label is used when present; otherwise a managed identity name is generated.</span>
                 <textarea id="identity-bootstrap-content" spellcheck="false"></textarea>
               </label>
               <label class="checkbox checkbox-field">
@@ -4619,6 +4618,33 @@ mod tests {
             rendezvous_client_identity_expires_at_unix: None,
             last_enrolled_at_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn claim_without_device_label_uses_a_generated_managed_identity_name() {
+        let request = UpsertClientIdentityRequest {
+            id: Some("claim-identity".to_string()),
+            bootstrap_content: r#"{"v":1,"c":"cluster","n":"node","r":[],"t":"trust","k":"claim"}"#
+                .to_string(),
+            enroll: true,
+        };
+
+        let (identity, _, enroll) = request
+            .into_identity(None, Path::new("/managed/instances.json"))
+            .expect("claim input should create a managed identity");
+
+        assert!(enroll);
+        assert_eq!(identity.label, "Managed client identity claim-identity");
+    }
+
+    #[test]
+    fn bootstrap_device_label_remains_the_managed_identity_name() {
+        let label = client_identity_label_from_bootstrap_content(
+            r#"{"bootstrap_bundle":{"device_label":"Desktop client"}}"#,
+        )
+        .expect("bootstrap JSON should parse");
+
+        assert_eq!(label.as_deref(), Some("Desktop client"));
     }
 
     const KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX: u64 = 1_776_690_574;
