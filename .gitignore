@@ -29,3 +29,7 @@ apps/apple-file-provider/**/xcuserdata/
 .codex-remote-attachments/
 .tmp/
 bazel-*
+ironmesh-client-bootstrap-*.json
+ironmesh-client-bootstrap-*.json
+ironmesh-client-cli-bootstrap*.json
+web/.ironmesh-build.lock
