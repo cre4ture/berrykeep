@@ -418,19 +418,26 @@ pub(crate) async fn admin_put_config(
 pub(crate) async fn load_current_configuration(
     state: &ServerState,
 ) -> Result<LoadedMapConfiguration> {
+    load_current_configuration_inner(state, false).await
+}
+
+async fn load_current_configuration_after_peer_read_through_lock(
+    state: &ServerState,
+) -> Result<LoadedMapConfiguration> {
     // A cold node may have to probe every online peer for the configuration.
-    // Serialize that recovery attempt so concurrent clients share its result
-    // (including the short-lived miss/unavailable backoff) instead of each
-    // issuing their own cluster-wide probe.
+    // Serialize only that recovery attempt so concurrent clients share its
+    // result (including the short-lived miss/unavailable backoff) instead of
+    // each issuing their own cluster-wide probe.
     let _load_permit = Arc::clone(&state.storage.map_configuration_load_permit)
         .acquire_owned()
         .await
         .map_err(|_| anyhow!("gallery map configuration load semaphore closed"))?;
-    load_current_configuration_serialized(state).await
+    Box::pin(load_current_configuration_inner(state, true)).await
 }
 
-async fn load_current_configuration_serialized(
+async fn load_current_configuration_inner(
     state: &ServerState,
+    peer_read_through_allowed: bool,
 ) -> Result<LoadedMapConfiguration> {
     let local_descriptor = {
         let store = read_store(state, "maps.config.describe_local").await;
@@ -444,11 +451,9 @@ async fn load_current_configuration_serialized(
             .await
     };
     let cached_backoff = cached_map_configuration_read_through_backoff(state).await;
-    let local_payload_only_backoff = match (&local_descriptor, &cached_backoff) {
-        (Ok(_), Some(MapConfigurationReadThroughBackoff::Unavailable(message))) => {
-            Some(message.clone())
-        }
-        _ => None,
+    let unavailable_backoff_message = match &cached_backoff {
+        Some(MapConfigurationReadThroughBackoff::Unavailable(message)) => Some(message.clone()),
+        Some(MapConfigurationReadThroughBackoff::Missing) | None => None,
     };
     let descriptor = match local_descriptor {
         Ok(descriptor) => Some(descriptor),
@@ -461,6 +466,9 @@ async fn load_current_configuration_serialized(
             }
         }
         Err(StoreReadError::NotFound | StoreReadError::Corrupt(_)) => {
+            if !peer_read_through_allowed {
+                return load_current_configuration_after_peer_read_through_lock(state).await;
+            }
             match describe_object_with_metadata_read_through(
                 state,
                 MAP_CONFIGURATION_STORAGE_KEY,
@@ -510,21 +518,28 @@ async fn load_current_configuration_serialized(
         });
     };
 
-    let payload = if let Some(message) = local_payload_only_backoff {
-        let bytes = read_current_object_range_locally(
-            state,
-            &descriptor.manifest_hash,
-            0,
-            descriptor.total_size_bytes,
-        )
-        .await
-        .map_err(|_| anyhow!("gallery map configuration remains unavailable: {message}"))?;
-        ReadThroughObjectRange {
+    let local_payload = read_current_object_range_locally(
+        state,
+        &descriptor.manifest_hash,
+        0,
+        descriptor.total_size_bytes,
+    )
+    .await;
+    let payload = match local_payload {
+        Ok(bytes) => ReadThroughObjectRange {
             bytes,
             recovered_chunk_count: 0,
+        },
+        Err(StoreReadError::Corrupt(_)) if unavailable_backoff_message.is_some() => {
+            bail!(
+                "gallery map configuration remains unavailable: {}",
+                unavailable_backoff_message.expect("guarded above")
+            )
         }
-    } else {
-        match read_current_object_range_through_peer(
+        Err(StoreReadError::Corrupt(_)) if !peer_read_through_allowed => {
+            return load_current_configuration_after_peer_read_through_lock(state).await;
+        }
+        Err(StoreReadError::Corrupt(_)) => match read_current_object_range_through_peer(
             state,
             CurrentObjectRangeRead {
                 key: MAP_CONFIGURATION_STORAGE_KEY,
@@ -548,6 +563,16 @@ async fn load_current_configuration_serialized(
                 .await;
                 return Err(error);
             }
+        },
+        Err(error) => {
+            let error = anyhow!("{error}")
+                .context("failed reading gallery map configuration through peer cache");
+            cache_map_configuration_read_through_backoff(
+                state,
+                MapConfigurationReadThroughBackoff::Unavailable(error.to_string()),
+            )
+            .await;
+            return Err(error);
         }
     };
     if payload.recovered_chunk_count > 0 {

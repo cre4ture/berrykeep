@@ -18793,6 +18793,21 @@ async fn map_configuration_read_through_fetches_missing_chunks_impl(backend: Mai
     assert!(reloaded.stored);
     assert_eq!(reloaded.configuration, configuration);
 
+    let peer_read_through_permit = Arc::clone(&target.storage.map_configuration_load_permit)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let locally_loaded = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::map_config::load_current_configuration(&target),
+    )
+    .await
+    .expect("fully local map configuration should not wait for peer read-through")
+    .unwrap();
+    drop(peer_read_through_permit);
+    assert!(locally_loaded.stored);
+    assert_eq!(locally_loaded.configuration, configuration);
+
     let missing_chunks = {
         let store = read_store(&target, "tests.map_config.target.verify_cache").await;
         store
