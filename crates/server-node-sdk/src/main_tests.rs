@@ -20285,6 +20285,9 @@ async fn build_test_state(
             >::new())),
             mbtiles_source_initialization_locks: Arc::new(Mutex::new(HashMap::new())),
             mbtiles_source_initialization_failures: Arc::new(Mutex::new(HashMap::new())),
+            mbtiles_blocking_permits: Arc::new(tokio::sync::Semaphore::new(
+                super::MBTILES_BLOCKING_MAX_CONCURRENCY,
+            )),
             last_gc_pass: Arc::new(std::sync::Mutex::new(None)),
         },
         access: super::ServerAccessRuntime {

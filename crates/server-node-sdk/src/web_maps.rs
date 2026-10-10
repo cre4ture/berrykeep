@@ -328,10 +328,20 @@ pub(crate) async fn xyz_tile(
         Ok(source) => source,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
+    let tile_lookup_permit = match Arc::clone(&state.storage.mbtiles_blocking_permits)
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
 
     let tile_lookup = tokio::task::spawn_blocking({
         let cancelled = request_cancellation.flag();
-        move || source.lookup_tile_with_cancellation(z, x, y, cancelled)
+        move || {
+            let _tile_lookup_permit = tile_lookup_permit;
+            source.lookup_tile_with_cancellation(z, x, y, cancelled)
+        }
     })
     .await;
     let tile = match tile_lookup {
@@ -380,10 +390,20 @@ pub(crate) async fn vector_tile(
         Ok(source) => source,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
+    let tile_lookup_permit = match Arc::clone(&state.storage.mbtiles_blocking_permits)
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
 
     let tile_lookup = tokio::task::spawn_blocking({
         let cancelled = request_cancellation.flag();
-        move || source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
+        move || {
+            let _tile_lookup_permit = tile_lookup_permit;
+            source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
+        }
     })
     .await;
     let tile = match tile_lookup {
@@ -883,12 +903,14 @@ async fn get_or_create_mbtiles_source(
             .mbtiles_source_initialization_locks
             .lock()
             .await;
-        locks
-            .entry(manifest_key.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(1)))
-            .clone()
+        mbtiles_source_initialization_lock(&mut locks, manifest_key)
     };
-    let initialization_permit = Arc::clone(&initialization_lock)
+    let _initialization_lock_cleanup = MbtilesSourceInitializationLockCleanup {
+        locks: Arc::clone(&state.storage.mbtiles_source_initialization_locks),
+        manifest_key: manifest_key.to_string(),
+        initialization_lock: Some(initialization_lock),
+    };
+    let _initialization_permit = Arc::clone(_initialization_lock_cleanup.initialization_lock())
         .acquire_owned()
         .await
         .map_err(|_| anyhow!("MBTiles source initialization lock closed"))?;
@@ -901,10 +923,7 @@ async fn get_or_create_mbtiles_source(
         .get(manifest_key)
         .cloned()
     {
-        drop(initialization_permit);
         clear_mbtiles_source_initialization_failure(state, manifest_key).await;
-        remove_idle_mbtiles_source_initialization_lock(state, manifest_key, &initialization_lock)
-            .await;
         if state.storage.map_perf_logging_enabled {
             info!(
                 manifest_key = %manifest_key,
@@ -916,9 +935,6 @@ async fn get_or_create_mbtiles_source(
         return Ok(source);
     }
     if let Some(message) = cached_mbtiles_source_initialization_failure(state, manifest_key).await {
-        drop(initialization_permit);
-        remove_idle_mbtiles_source_initialization_lock(state, manifest_key, &initialization_lock)
-            .await;
         bail!("MBTiles source initialization remains unavailable: {message}");
     }
 
@@ -927,9 +943,14 @@ async fn get_or_create_mbtiles_source(
         let handle = tokio::runtime::Handle::current();
         let manifest_key_owned = manifest_key.to_string();
         let perf_logging_enabled = state.storage.map_perf_logging_enabled;
+        let source_construction_permit = Arc::clone(&state.storage.mbtiles_blocking_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("MBTiles blocking-work semaphore closed"))?;
         let source = tokio::task::spawn_blocking({
             let state = state.clone_for_mbtiles_read_through();
             move || {
+                let _source_construction_permit = source_construction_permit;
                 mbtiles::LogicalMbtilesSource::new(
                     manifest_key_owned,
                     state,
@@ -968,13 +989,76 @@ async fn get_or_create_mbtiles_source(
     }
     .await;
 
-    drop(initialization_permit);
     match &initialization_result {
         Ok(_) => clear_mbtiles_source_initialization_failure(state, manifest_key).await,
         Err(error) => cache_mbtiles_source_initialization_failure(state, manifest_key, error).await,
     }
-    remove_idle_mbtiles_source_initialization_lock(state, manifest_key, &initialization_lock).await;
     initialization_result
+}
+
+fn mbtiles_source_initialization_lock(
+    locks: &mut HashMap<String, std::sync::Weak<Semaphore>>,
+    manifest_key: &str,
+) -> Arc<Semaphore> {
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(manifest_key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(Semaphore::new(1));
+    locks.insert(manifest_key.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+struct MbtilesSourceInitializationLockCleanup {
+    locks: Arc<Mutex<HashMap<String, std::sync::Weak<Semaphore>>>>,
+    manifest_key: String,
+    initialization_lock: Option<Arc<Semaphore>>,
+}
+
+impl MbtilesSourceInitializationLockCleanup {
+    fn initialization_lock(&self) -> &Arc<Semaphore> {
+        self.initialization_lock
+            .as_ref()
+            .expect("initialization lock must exist before cleanup")
+    }
+}
+
+impl Drop for MbtilesSourceInitializationLockCleanup {
+    fn drop(&mut self) {
+        let locks = Arc::clone(&self.locks);
+        let manifest_key = self.manifest_key.clone();
+        let Some(initialization_lock) = self.initialization_lock.take() else {
+            return;
+        };
+        let initialization_lock_weak = Arc::downgrade(&initialization_lock);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        std::mem::drop(runtime.spawn(async move {
+            drop(initialization_lock);
+            let mut locks = locks.lock().await;
+            remove_dead_mbtiles_source_initialization_lock(
+                &mut locks,
+                &manifest_key,
+                &initialization_lock_weak,
+            );
+        }));
+    }
+}
+
+fn remove_dead_mbtiles_source_initialization_lock(
+    locks: &mut HashMap<String, std::sync::Weak<Semaphore>>,
+    manifest_key: &str,
+    initialization_lock: &std::sync::Weak<Semaphore>,
+) {
+    let is_dead_current_lock = locks
+        .get(manifest_key)
+        .is_some_and(|current| current.ptr_eq(initialization_lock))
+        && initialization_lock.strong_count() == 0;
+    if is_dead_current_lock {
+        locks.remove(manifest_key);
+    }
 }
 
 async fn cached_mbtiles_source_initialization_failure(
@@ -1028,36 +1112,6 @@ async fn clear_mbtiles_source_initialization_failure(state: &ServerState, manife
         .remove(manifest_key);
 }
 
-async fn remove_idle_mbtiles_source_initialization_lock(
-    state: &ServerState,
-    manifest_key: &str,
-    initialization_lock: &Arc<Semaphore>,
-) {
-    let mut locks = state
-        .storage
-        .mbtiles_source_initialization_locks
-        .lock()
-        .await;
-    remove_idle_mbtiles_source_initialization_lock_from_map(
-        &mut locks,
-        manifest_key,
-        initialization_lock,
-    );
-}
-
-fn remove_idle_mbtiles_source_initialization_lock_from_map(
-    locks: &mut HashMap<String, Arc<Semaphore>>,
-    manifest_key: &str,
-    initialization_lock: &Arc<Semaphore>,
-) {
-    let is_current = locks
-        .get(manifest_key)
-        .is_some_and(|current| Arc::ptr_eq(current, initialization_lock));
-    if is_current && Arc::strong_count(initialization_lock) == 2 {
-        locks.remove(manifest_key);
-    }
-}
-
 fn is_safe_fontstack_segment(value: &str) -> bool {
     // Note: `value.split('.').any(|segment| segment == "..")` would NOT catch
     // `value == ".."` (splitting ".." on '.' yields ["", "", ""], never "..").
@@ -1100,15 +1154,15 @@ fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorResponseBody, RequestCancellation, error_response, is_safe_fontstack_segment,
-        is_safe_glyph_range_segment, remove_idle_mbtiles_source_initialization_lock_from_map,
+        ErrorResponseBody, MbtilesSourceInitializationLockCleanup, RequestCancellation,
+        error_response, is_safe_fontstack_segment, is_safe_glyph_range_segment,
+        mbtiles_source_initialization_lock, remove_dead_mbtiles_source_initialization_lock,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use tokio::sync::Semaphore;
 
     #[test]
     fn request_cancellation_sets_lookup_flag_when_request_ends() {
@@ -1122,27 +1176,47 @@ mod tests {
     }
 
     #[test]
-    fn mbtiles_initialization_locks_are_removed_only_after_waiters_leave() {
+    fn mbtiles_initialization_locks_are_removed_after_callers_leave() {
         let manifest_key = "sys/maps/example.mbtiles.manifest.json";
-        let initialization_lock = Arc::new(Semaphore::new(1));
-        let mut locks =
-            HashMap::from([(manifest_key.to_string(), Arc::clone(&initialization_lock))]);
+        let mut locks = HashMap::new();
 
-        let waiter = Arc::clone(&initialization_lock);
-        remove_idle_mbtiles_source_initialization_lock_from_map(
-            &mut locks,
-            manifest_key,
-            &initialization_lock,
-        );
-        assert!(locks.contains_key(manifest_key));
+        let initialization_lock = mbtiles_source_initialization_lock(&mut locks, manifest_key);
+        let waiter = mbtiles_source_initialization_lock(&mut locks, manifest_key);
+        assert!(Arc::ptr_eq(&initialization_lock, &waiter));
 
+        let initialization_lock_weak = Arc::downgrade(&initialization_lock);
         drop(waiter);
-        remove_idle_mbtiles_source_initialization_lock_from_map(
+        drop(initialization_lock);
+        remove_dead_mbtiles_source_initialization_lock(
             &mut locks,
             manifest_key,
-            &initialization_lock,
+            &initialization_lock_weak,
         );
         assert!(!locks.contains_key(manifest_key));
+    }
+
+    #[tokio::test]
+    async fn mbtiles_initialization_lock_cleanup_runs_when_its_owner_is_dropped() {
+        let manifest_key = "sys/maps/canceled.mbtiles.manifest.json";
+        let locks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let initialization_lock = {
+            let mut locked = locks.lock().await;
+            mbtiles_source_initialization_lock(&mut locked, manifest_key)
+        };
+        let cleanup = MbtilesSourceInitializationLockCleanup {
+            locks: Arc::clone(&locks),
+            manifest_key: manifest_key.to_string(),
+            initialization_lock: Some(initialization_lock),
+        };
+
+        drop(cleanup);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if !locks.lock().await.contains_key(manifest_key) {
+                return;
+            }
+        }
+        assert!(!locks.lock().await.contains_key(manifest_key));
     }
 
     #[tokio::test]

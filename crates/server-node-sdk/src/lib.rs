@@ -128,6 +128,9 @@ const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
 const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
+/// Keep synchronous SQLite VFS work well below Tokio's shared blocking pool
+/// limit, because a cold read-through can itself need blocking file I/O.
+const MBTILES_BLOCKING_MAX_CONCURRENCY: usize = 32;
 /// Avoid rescanning every historical manifest on each five-second repair tick,
 /// while still detecting out-of-band disk loss without a namespace event.
 const LOCAL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -409,9 +412,10 @@ struct ServerStorageRuntime {
     map_configuration_read_through_backoff:
         Arc<Mutex<Option<CachedMapConfigurationReadThroughBackoff>>>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
-    mbtiles_source_initialization_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    mbtiles_source_initialization_locks: Arc<Mutex<HashMap<String, std::sync::Weak<Semaphore>>>>,
     mbtiles_source_initialization_failures:
         Arc<Mutex<HashMap<String, CachedMbtilesSourceInitializationFailure>>>,
+    mbtiles_blocking_permits: Arc<Semaphore>,
     last_gc_pass: Arc<StdMutex<Option<GcPassSummary>>>,
 }
 
@@ -7764,6 +7768,7 @@ async fn run_inner(
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
             mbtiles_source_initialization_locks: Arc::new(Mutex::new(HashMap::new())),
             mbtiles_source_initialization_failures: Arc::new(Mutex::new(HashMap::new())),
+            mbtiles_blocking_permits: Arc::new(Semaphore::new(MBTILES_BLOCKING_MAX_CONCURRENCY)),
             last_gc_pass: Arc::new(StdMutex::new(None)),
         },
         access: ServerAccessRuntime {
