@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow};
-use common::traced_rwlock::TracedRwLock;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, OpenOptions, Vfs};
 use std::borrow::Cow;
@@ -13,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tracing::info;
 
-use crate::storage::PersistentStore;
+use crate::ServerState;
 
 use super::{LoadedSplitLogicalFileManifest, read_logical_range_bytes_from_store};
 
@@ -149,7 +148,7 @@ pub(crate) struct LogicalMbtilesSource {
 impl LogicalMbtilesSource {
     pub(crate) fn new(
         manifest_key: String,
-        store: Arc<TracedRwLock<PersistentStore>>,
+        state: ServerState,
         runtime_handle: Handle,
         loaded_manifest: LoadedSplitLogicalFileManifest,
         perf_logging_enabled: bool,
@@ -157,7 +156,7 @@ impl LogicalMbtilesSource {
         let shared = Arc::new(LogicalFileSharedState {
             manifest_key: manifest_key.clone(),
             perf_logging_enabled,
-            store,
+            state,
             runtime_handle,
             loaded_manifest,
             chunk_size_bytes: SQLITE_RANGE_CACHE_CHUNK_BYTES,
@@ -458,7 +457,7 @@ pub(crate) struct TilePayload {
 struct LogicalFileSharedState {
     manifest_key: String,
     perf_logging_enabled: bool,
-    store: Arc<TracedRwLock<PersistentStore>>,
+    state: ServerState,
     runtime_handle: Handle,
     loaded_manifest: LoadedSplitLogicalFileManifest,
     chunk_size_bytes: u64,
@@ -553,7 +552,7 @@ impl LogicalFileSharedState {
             .min(self.file_size_bytes().saturating_sub(chunk_start));
         let started = Instant::now();
         let bytes = download_logical_range_blocking(
-            &self.store,
+            &self.state,
             &self.runtime_handle,
             &self.loaded_manifest,
             &self.manifest_key,
@@ -774,7 +773,7 @@ impl sqlite_vfs::wip::WalIndex for DisabledWalIndex {
 }
 
 fn download_logical_range_blocking(
-    store: &Arc<TracedRwLock<PersistentStore>>,
+    state: &ServerState,
     runtime_handle: &Handle,
     loaded_manifest: &LoadedSplitLogicalFileManifest,
     manifest_key: &str,
@@ -788,7 +787,7 @@ fn download_logical_range_blocking(
     let started = Instant::now();
     let body = runtime_handle
         .block_on(read_logical_range_bytes_from_store(
-            store,
+            state,
             loaded_manifest,
             start,
             length,

@@ -275,7 +275,7 @@ pub(crate) async fn logical_file(
         })
         .unwrap_or(total_size_bytes);
     let body = match read_logical_range_bytes_from_store(
-        &state.store,
+        &state,
         &loaded_manifest,
         range_start,
         range_length,
@@ -514,7 +514,7 @@ pub(crate) fn resolve_map_glyphs_root(explicit: Option<PathBuf>) -> Option<PathB
 }
 
 pub(crate) async fn read_logical_range_bytes_from_store(
-    store: &Arc<TracedRwLock<PersistentStore>>,
+    state: &ServerState,
     loaded_manifest: &LoadedSplitLogicalFileManifest,
     start: u64,
     length: u64,
@@ -523,7 +523,6 @@ pub(crate) async fn read_logical_range_bytes_from_store(
         .checked_add(length)
         .ok_or_else(|| anyhow!("logical MBTiles range overflow"))?;
     let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
-    let store = store.read("maps.logical_range.read").await;
 
     for (part, resolved_part) in loaded_manifest
         .manifest
@@ -555,14 +554,33 @@ pub(crate) async fn read_logical_range_bytes_from_store(
         let local_end_exclusive = local_start
             .checked_add(segment_length)
             .ok_or_else(|| anyhow!("logical MBTiles local range overflow"))?;
-        let bytes = store
-            .read_object_range_by_manifest_hash(
-                &resolved_part.manifest_hash,
-                local_start,
-                local_end_exclusive,
+        hydrate_current_object_range_for_read(
+            state,
+            &part.key,
+            &resolved_part.manifest_hash,
+            local_start,
+            local_end_exclusive,
+            true,
+        )
+        .await
+        .map_err(store_read_error_to_anyhow)
+        .with_context(|| {
+            format!(
+                "failed hydrating logical MBTiles part {} range {local_start}..{local_end_exclusive}",
+                part.key
             )
-            .await
-            .map_err(store_read_error_to_anyhow)?;
+        })?;
+        let bytes = {
+            let store = read_store(state, "maps.logical_range.read").await;
+            store
+                .read_object_range_by_manifest_hash(
+                    &resolved_part.manifest_hash,
+                    local_start,
+                    local_end_exclusive,
+                )
+                .await
+                .map_err(store_read_error_to_anyhow)?
+        };
         body.extend_from_slice(bytes.as_ref());
     }
 
@@ -732,15 +750,29 @@ async fn load_split_logical_file_manifest(
     manifest_key: &str,
 ) -> Result<LoadedSplitLogicalFileManifest> {
     let started = Instant::now();
-    let manifest_descriptor = {
-        let store = read_store(state, "maps.manifest.describe").await;
-        store
-            .describe_object(manifest_key, None, None, ObjectReadMode::Preferred)
-            .await
-            .map_err(store_read_error_to_anyhow)?
-    };
+    let manifest_descriptor = describe_object_with_metadata_read_through(
+        state,
+        manifest_key,
+        None,
+        None,
+        ObjectReadMode::Preferred,
+        MetadataReadThroughPeers::Advertised,
+    )
+    .await
+    .map_err(store_read_error_to_anyhow)?;
 
     let manifest_payload = {
+        hydrate_current_object_range_for_read(
+            state,
+            manifest_key,
+            &manifest_descriptor.manifest_hash,
+            0,
+            manifest_descriptor.total_size_bytes,
+            false,
+        )
+        .await
+        .map_err(store_read_error_to_anyhow)
+        .with_context(|| format!("failed hydrating split logical file manifest {manifest_key}"))?;
         let store = read_store(state, "maps.manifest.read").await;
         store
             .read_object_range_by_manifest_hash(
@@ -757,28 +789,29 @@ async fn load_split_logical_file_manifest(
     let manifest = validate_split_logical_file_manifest(manifest)?;
 
     let mut resolved_parts = Vec::with_capacity(manifest.parts.len());
-    {
-        let store = read_store(state, "maps.manifest.resolve_parts").await;
-        for part in &manifest.parts {
-            let descriptor = store
-                .describe_object(&part.key, None, None, ObjectReadMode::Preferred)
-                .await
-                .map_err(store_read_error_to_anyhow)
-                .with_context(|| {
-                    format!("failed to resolve split logical file part {}", part.key)
-                })?;
-            if descriptor.total_size_bytes as u64 != part.size_bytes {
-                bail!(
-                    "split logical file part size mismatch for {}: declared={} actual={}",
-                    part.key,
-                    part.size_bytes,
-                    descriptor.total_size_bytes
-                );
-            }
-            resolved_parts.push(LoadedSplitLogicalFilePart {
-                manifest_hash: descriptor.manifest_hash,
-            });
+    for part in &manifest.parts {
+        let descriptor = describe_object_with_metadata_read_through(
+            state,
+            &part.key,
+            None,
+            None,
+            ObjectReadMode::Preferred,
+            MetadataReadThroughPeers::Advertised,
+        )
+        .await
+        .map_err(store_read_error_to_anyhow)
+        .with_context(|| format!("failed to resolve split logical file part {}", part.key))?;
+        if descriptor.total_size_bytes as u64 != part.size_bytes {
+            bail!(
+                "split logical file part size mismatch for {}: declared={} actual={}",
+                part.key,
+                part.size_bytes,
+                descriptor.total_size_bytes
+            );
         }
+        resolved_parts.push(LoadedSplitLogicalFilePart {
+            manifest_hash: descriptor.manifest_hash,
+        });
     }
 
     if state.storage.map_perf_logging_enabled {
@@ -827,11 +860,11 @@ async fn get_or_create_mbtiles_source(
     let manifest_key_owned = manifest_key.to_string();
     let perf_logging_enabled = state.storage.map_perf_logging_enabled;
     let source = tokio::task::spawn_blocking({
-        let store = state.store.clone();
+        let state = state.clone_for_mbtiles_read_through();
         move || {
             mbtiles::LogicalMbtilesSource::new(
                 manifest_key_owned,
-                store,
+                state,
                 handle,
                 loaded_manifest,
                 perf_logging_enabled,

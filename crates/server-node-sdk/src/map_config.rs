@@ -416,33 +416,56 @@ pub(crate) async fn admin_put_config(
 pub(crate) async fn load_current_configuration(
     state: &ServerState,
 ) -> Result<LoadedMapConfiguration> {
-    let payload = {
-        let store = read_store(state, "maps.config.get").await;
-        match store
-            .get_object(
-                MAP_CONFIGURATION_STORAGE_KEY,
-                None,
-                None,
-                ObjectReadMode::ConfirmedOnly,
-            )
-            .await
-        {
-            Ok(payload) => Some(payload),
-            Err(StoreReadError::NotFound) => None,
-            Err(StoreReadError::Corrupt(message)) => {
-                bail!("gallery map configuration is corrupt: {message}")
-            }
-            Err(StoreReadError::Internal(err)) => return Err(err),
+    let descriptor = match describe_object_with_metadata_read_through(
+        state,
+        MAP_CONFIGURATION_STORAGE_KEY,
+        None,
+        None,
+        ObjectReadMode::ConfirmedOnly,
+        MetadataReadThroughPeers::AnyOnline,
+    )
+    .await
+    {
+        Ok(descriptor) => Some(descriptor),
+        Err(StoreReadError::NotFound) => None,
+        Err(StoreReadError::Corrupt(message)) => {
+            bail!("gallery map configuration is corrupt: {message}")
         }
+        Err(StoreReadError::Internal(err)) => return Err(err),
     };
 
-    let Some(payload) = payload else {
+    let Some(descriptor) = descriptor else {
         return Ok(LoadedMapConfiguration {
             configuration: default_configuration(),
             stored: false,
             needs_persistence: true,
         });
     };
+
+    hydrate_current_object_range_for_read(
+        state,
+        MAP_CONFIGURATION_STORAGE_KEY,
+        &descriptor.manifest_hash,
+        0,
+        descriptor.total_size_bytes,
+        false,
+    )
+    .await
+    .map_err(|error| anyhow!("{error}"))
+    .context("failed reading gallery map configuration through peer cache")?;
+
+    let payload = {
+        let store = read_store(state, "maps.config.read").await;
+        store
+            .read_object_range_by_manifest_hash(
+                &descriptor.manifest_hash,
+                0,
+                descriptor.total_size_bytes,
+            )
+            .await
+            .map_err(|error| anyhow!("{error}"))?
+    };
+
     let stored_configuration = serde_json::from_slice::<ClusterMapConfiguration>(&payload)
         .context("failed parsing gallery map configuration")?;
     validate_configuration(&stored_configuration)?;

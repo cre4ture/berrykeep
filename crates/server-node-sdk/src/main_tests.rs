@@ -18657,6 +18657,266 @@ run_on_main_metadata_backends!(
     metadata_import_makes_store_index_visible_without_marking_local_replica_turso
 );
 
+async fn start_read_through_chunk_peer(
+    source: &ServerState,
+    target: &ServerState,
+    subjects: &[String],
+) -> tokio::task::JoinHandle<()> {
+    {
+        let mut cluster = source.cluster.lock().await;
+        for subject in subjects {
+            cluster.note_replica(subject, source.node_id);
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route(
+            "/cluster/v2/replication/chunk/{hash}",
+            get(super::get_replication_chunk),
+        )
+        .route(
+            "/cluster/metadata/export",
+            get(super::export_metadata_bundle),
+        )
+        .with_state(source.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("chunk route should serve");
+    });
+
+    {
+        let mut cluster = target.cluster.lock().await;
+        cluster.register_node(super::cluster::NodeDescriptor {
+            node_id: source.node_id,
+            hostname: None,
+            reachability: test_node_reachability(
+                Some(peer_base_url.as_str()),
+                Some(peer_base_url.as_str()),
+                false,
+            ),
+            capabilities: super::cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: false,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 900_000,
+            storage_stats: None,
+            last_heartbeat_unix: super::unix_ts(),
+            status: super::cluster::NodeStatus::Online,
+        });
+        for subject in subjects {
+            cluster.note_replica(subject, source.node_id);
+        }
+    }
+
+    handle
+}
+
+async fn map_configuration_read_through_fetches_missing_chunks_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let mut configuration = super::map_config::default_configuration();
+    configuration.variants[0].label = "Read-through configuration".to_string();
+    let key = super::map_config::MAP_CONFIGURATION_STORAGE_KEY;
+    let configuration_payload = serde_json::to_vec(&configuration).unwrap();
+    let configuration_payload_len = configuration_payload.len();
+    let put = {
+        let mut store = lock_store(&source, "tests.map_config.source.put").await;
+        store
+            .put_object_versioned(
+                key,
+                bytes::Bytes::from(configuration_payload),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let subjects = vec![key.to_string(), format!("{key}@{}", put.version_id)];
+    let handle = start_read_through_chunk_peer(&source, &target, &subjects).await;
+
+    let bundle = {
+        let store = lock_store(&source, "tests.map_config.source.export").await;
+        store
+            .export_metadata_bundle(key, None, super::storage::ObjectReadMode::ConfirmedOnly)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    {
+        let mut store = lock_store(&target, "tests.map_config.target.import").await;
+        store.import_metadata_bundle(&bundle).await.unwrap();
+        fs::remove_file(store.manifest_path_for_test(&put.manifest_hash))
+            .await
+            .unwrap();
+    }
+    let initial_error = {
+        let store = read_store(&target, "tests.map_config.target.describe").await;
+        store
+            .describe_object(
+                key,
+                None,
+                None,
+                super::storage::ObjectReadMode::ConfirmedOnly,
+            )
+            .await
+            .unwrap_err()
+    };
+    assert!(matches!(
+        initial_error,
+        super::storage::StoreReadError::Corrupt(_)
+    ));
+
+    let loaded = super::map_config::load_current_configuration(&target)
+        .await
+        .unwrap();
+    assert!(loaded.stored);
+    assert_eq!(loaded.configuration, configuration);
+
+    let missing_chunks = {
+        let store = read_store(&target, "tests.map_config.target.verify_cache").await;
+        store
+            .missing_chunks_for_manifest_range(&put.manifest_hash, 0, configuration_payload_len)
+            .await
+            .unwrap()
+    };
+    assert!(missing_chunks.is_empty());
+    assert!(
+        target
+            .cluster
+            .lock()
+            .await
+            .subjects_for_node(target.node_id)
+            .is_empty()
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    map_configuration_read_through_fetches_missing_chunks_impl,
+    map_configuration_read_through_fetches_missing_chunks,
+    map_configuration_read_through_fetches_missing_chunks_turso
+);
+
+async fn logical_map_file_read_through_fetches_missing_chunks_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let manifest_key = "sys/maps/read-through.mbtiles.manifest.json";
+    let part_key = "sys/maps/read-through.mbtiles.part-00000";
+    let part_payload = b"map data served through peer read-through".to_vec();
+    let part_put = {
+        let mut store = lock_store(&source, "tests.map_file.source.put_part").await;
+        store
+            .put_object_versioned(
+                part_key,
+                bytes::Bytes::from(part_payload.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let manifest_payload = serde_json::json!({
+        "manifest_version": 1,
+        "type": "split_file_manifest",
+        "logical_format": "mbtiles",
+        "logical_key": "sys/maps/read-through.mbtiles",
+        "logical_size_bytes": part_payload.len(),
+        "parts_count": 1,
+        "parts": [{
+            "part_id": "00000",
+            "key": part_key,
+            "offset_bytes": 0,
+            "size_bytes": part_payload.len(),
+        }],
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest_payload).unwrap();
+    let manifest_put = {
+        let mut store = lock_store(&source, "tests.map_file.source.put_manifest").await;
+        store
+            .put_object_versioned(
+                manifest_key,
+                bytes::Bytes::from(manifest_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let subjects = vec![
+        manifest_key.to_string(),
+        format!("{manifest_key}@{}", manifest_put.version_id),
+        part_key.to_string(),
+        format!("{part_key}@{}", part_put.version_id),
+    ];
+    let handle = start_read_through_chunk_peer(&source, &target, &subjects).await;
+
+    let range_start = 4;
+    let range_end = 22;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::RANGE,
+        format!("bytes={range_start}-{range_end}").parse().unwrap(),
+    );
+    let response = axum::response::IntoResponse::into_response(
+        super::web_maps::logical_file(
+            axum::extract::State(target.clone()),
+            axum::http::Method::GET,
+            headers,
+            axum::extract::Query(
+                serde_json::from_value(serde_json::json!({ "manifest_key": manifest_key }))
+                    .unwrap(),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        &part_payload[range_start as usize..=range_end as usize]
+    );
+
+    for (put, payload_len) in [
+        (&manifest_put, manifest_bytes.len()),
+        (&part_put, part_payload.len()),
+    ] {
+        let missing_chunks = {
+            let store = read_store(&target, "tests.map_file.target.verify_cache").await;
+            store
+                .missing_chunks_for_manifest_range(&put.manifest_hash, 0, payload_len)
+                .await
+                .unwrap()
+        };
+        assert!(missing_chunks.is_empty());
+    }
+    assert!(
+        target
+            .cluster
+            .lock()
+            .await
+            .subjects_for_node(target.node_id)
+            .is_empty()
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    logical_map_file_read_through_fetches_missing_chunks_impl,
+    logical_map_file_read_through_fetches_missing_chunks,
+    logical_map_file_read_through_fetches_missing_chunks_turso
+);
+
 async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
     backend: MainTestBackend,
 ) {
