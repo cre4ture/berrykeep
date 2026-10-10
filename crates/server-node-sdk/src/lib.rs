@@ -388,7 +388,9 @@ struct ServerStorageRuntime {
     store_history_refresh_permits: Arc<Semaphore>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
+    map_configuration_metadata_miss_until: Arc<Mutex<Option<Instant>>>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
+    mbtiles_source_initialization_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     last_gc_pass: Arc<StdMutex<Option<GcPassSummary>>>,
 }
 
@@ -7737,7 +7739,9 @@ async fn run_inner(
             )),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
+            map_configuration_metadata_miss_until: Arc::new(Mutex::new(None)),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
+            mbtiles_source_initialization_locks: Arc::new(Mutex::new(HashMap::new())),
             last_gc_pass: Arc::new(StdMutex::new(None)),
         },
         access: ServerAccessRuntime {
@@ -20576,6 +20580,7 @@ pub(crate) async fn describe_object_with_metadata_read_through(
     version_id: Option<&str>,
     read_mode: ObjectReadMode,
     peer_scope: MetadataReadThroughPeers,
+    recovery_deadline: Option<Instant>,
 ) -> Result<ObjectReadDescriptor, StoreReadError> {
     let initial = {
         let store = read_store(state, "object_read.describe").await;
@@ -20589,8 +20594,19 @@ pub(crate) async fn describe_object_with_metadata_read_through(
         Err(error @ StoreReadError::Internal(_)) => return Err(error),
     };
 
+    let recovery_budget = match recovery_deadline {
+        Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining.min(content_recovery::READ_THROUGH_RECOVERY_BUDGET),
+            None => return Err(initial_error),
+        },
+        None => content_recovery::READ_THROUGH_RECOVERY_BUDGET,
+    };
+    if recovery_budget.is_zero() {
+        return Err(initial_error);
+    }
+
     match tokio::time::timeout(
-        content_recovery::READ_THROUGH_RECOVERY_BUDGET,
+        recovery_budget,
         describe_object_after_metadata_import(
             state,
             key,
@@ -20609,7 +20625,7 @@ pub(crate) async fn describe_object_with_metadata_read_through(
             tracing::info!(
                 key,
                 version_id = ?version_id,
-                budget_secs = content_recovery::READ_THROUGH_RECOVERY_BUDGET.as_secs_f64(),
+                budget_secs = recovery_budget.as_secs_f64(),
                 "on-demand metadata import exceeded its foreground recovery budget"
             );
             Err(initial_error)
@@ -20904,44 +20920,105 @@ fn object_read_recovery_budget(is_range_request: bool, missing_chunk_count: usiz
     }
 }
 
-/// Ensures the locally addressable chunks for an object range are present.
+/// Reads one range of a current object for a foreground request.
 ///
-/// Object metadata remains local-only: callers must resolve the descriptor
-/// before invoking this helper. Missing bytes, however, may be retrieved from
-/// any healthy peer that advertises (or can otherwise supply) the object
-/// subject. Successfully recovered chunks are kept as read-through cache
-/// entries, never advertised as durable local replicas.
-pub(crate) async fn hydrate_current_object_range_for_read(
+/// The normal path reads the local range exactly once. If that read detects a
+/// missing or corrupt chunk, recovery plans just that range and retries after
+/// the verified peer-cache hydration has completed.
+pub(crate) struct CurrentObjectRangeRead<'a> {
+    pub(crate) key: &'a str,
+    pub(crate) manifest_hash: &'a str,
+    pub(crate) range_start: usize,
+    pub(crate) range_end_exclusive: usize,
+    pub(crate) is_range_request: bool,
+    pub(crate) recovery_deadline: Option<Instant>,
+}
+
+pub(crate) struct ReadThroughObjectRange {
+    pub(crate) bytes: Bytes,
+    pub(crate) recovered_chunk_count: usize,
+}
+
+pub(crate) async fn read_current_object_range_through_peer(
     state: &ServerState,
-    key: &str,
-    manifest_hash: &str,
-    range_start: usize,
-    range_end_exclusive: usize,
-    is_range_request: bool,
-) -> Result<usize, StoreReadError> {
+    request: CurrentObjectRangeRead<'_>,
+) -> Result<ReadThroughObjectRange, StoreReadError> {
+    let local_read = {
+        let store = read_store(state, "object_read.read_local_range").await;
+        store
+            .read_object_range_by_manifest_hash(
+                request.manifest_hash,
+                request.range_start,
+                request.range_end_exclusive,
+            )
+            .await
+    };
+    let initial_error = match local_read {
+        Ok(bytes) => {
+            return Ok(ReadThroughObjectRange {
+                bytes,
+                recovered_chunk_count: 0,
+            });
+        }
+        Err(error @ StoreReadError::Corrupt(_)) => error,
+        Err(error) => return Err(error),
+    };
+
     let missing_chunks = {
         let store = read_store(state, "object_read.plan_missing_chunks").await;
         store
-            .missing_chunks_for_manifest_range(manifest_hash, range_start, range_end_exclusive)
+            .missing_chunks_for_manifest_range(
+                request.manifest_hash,
+                request.range_start,
+                request.range_end_exclusive,
+            )
             .await?
     };
 
     if missing_chunks.is_empty() {
-        return Ok(0);
+        return Err(initial_error);
     }
 
-    let subject = key;
     let missing_chunk_count = missing_chunks.len();
-    let recovery_budget = object_read_recovery_budget(is_range_request, missing_chunk_count);
-    hydrate_missing_chunks_for_object_read(state, subject, &missing_chunks, recovery_budget)
+    let mut recovery_budget =
+        object_read_recovery_budget(request.is_range_request, missing_chunk_count);
+    if let Some(deadline) = request.recovery_deadline {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(StoreReadError::Internal(anyhow!(
+                "read-through recovery deadline expired before hydrating key={}",
+                request.key
+            )));
+        };
+        recovery_budget = recovery_budget.min(remaining);
+    }
+    if recovery_budget.is_zero() {
+        return Err(StoreReadError::Internal(anyhow!(
+            "read-through recovery deadline expired before hydrating key={}",
+            request.key
+        )));
+    }
+    hydrate_missing_chunks_for_object_read(state, request.key, &missing_chunks, recovery_budget)
         .await
         .map_err(|error| {
             StoreReadError::Internal(error.context(format!(
-                "failed read-through chunk hydration for key={key} subject={subject} missing_chunk_count={missing_chunk_count}"
+                "failed read-through chunk hydration for key={} missing_chunk_count={missing_chunk_count}",
+                request.key,
             )))
         })?;
-    request_local_availability_refresh(state);
-    Ok(missing_chunk_count)
+    let bytes = {
+        let store = read_store(state, "object_read.read_hydrated_range").await;
+        store
+            .read_object_range_by_manifest_hash(
+                request.manifest_hash,
+                request.range_start,
+                request.range_end_exclusive,
+            )
+            .await?
+    };
+    Ok(ReadThroughObjectRange {
+        bytes,
+        recovered_chunk_count: missing_chunk_count,
+    })
 }
 
 async fn hydrate_missing_chunks_for_object_read(

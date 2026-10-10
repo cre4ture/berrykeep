@@ -279,6 +279,8 @@ pub(crate) async fn logical_file(
         &loaded_manifest,
         range_start,
         range_length,
+        selected_range.is_some(),
+        None,
     )
     .await
     {
@@ -518,11 +520,20 @@ pub(crate) async fn read_logical_range_bytes_from_store(
     loaded_manifest: &LoadedSplitLogicalFileManifest,
     start: u64,
     length: u64,
+    is_range_request: bool,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<Vec<u8>> {
     let end_exclusive = start
         .checked_add(length)
         .ok_or_else(|| anyhow!("logical MBTiles range overflow"))?;
     let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
+    let recovery_deadline = Instant::now()
+        + if is_range_request {
+            content_recovery::READ_THROUGH_RECOVERY_BUDGET
+        } else {
+            content_recovery::FULL_OBJECT_RECOVERY_BUDGET_MAX
+        };
+    let mut recovered_chunk_count = 0_usize;
 
     for (part, resolved_part) in loaded_manifest
         .manifest
@@ -530,6 +541,7 @@ pub(crate) async fn read_logical_range_bytes_from_store(
         .iter()
         .zip(loaded_manifest.resolved_parts.iter())
     {
+        ensure_logical_range_read_not_cancelled(cancellation)?;
         let part_start = part.offset_bytes;
         let part_end_exclusive = part
             .offset_bytes
@@ -554,13 +566,16 @@ pub(crate) async fn read_logical_range_bytes_from_store(
         let local_end_exclusive = local_start
             .checked_add(segment_length)
             .ok_or_else(|| anyhow!("logical MBTiles local range overflow"))?;
-        hydrate_current_object_range_for_read(
+        let range = read_current_object_range_through_peer(
             state,
-            &part.key,
-            &resolved_part.manifest_hash,
-            local_start,
-            local_end_exclusive,
-            true,
+            CurrentObjectRangeRead {
+                key: &part.key,
+                manifest_hash: &resolved_part.manifest_hash,
+                range_start: local_start,
+                range_end_exclusive: local_end_exclusive,
+                is_range_request,
+                recovery_deadline: Some(recovery_deadline),
+            },
         )
         .await
         .map_err(store_read_error_to_anyhow)
@@ -570,18 +585,8 @@ pub(crate) async fn read_logical_range_bytes_from_store(
                 part.key
             )
         })?;
-        let bytes = {
-            let store = read_store(state, "maps.logical_range.read").await;
-            store
-                .read_object_range_by_manifest_hash(
-                    &resolved_part.manifest_hash,
-                    local_start,
-                    local_end_exclusive,
-                )
-                .await
-                .map_err(store_read_error_to_anyhow)?
-        };
-        body.extend_from_slice(bytes.as_ref());
+        recovered_chunk_count = recovered_chunk_count.saturating_add(range.recovered_chunk_count);
+        body.extend_from_slice(range.bytes.as_ref());
     }
 
     if body.len() as u64 != length {
@@ -592,7 +597,18 @@ pub(crate) async fn read_logical_range_bytes_from_store(
         ));
     }
 
+    if recovered_chunk_count > 0 {
+        request_local_availability_refresh(state);
+    }
+
     Ok(body)
+}
+
+fn ensure_logical_range_read_not_cancelled(cancellation: Option<&AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+        bail!("logical MBTiles range read canceled");
+    }
+    Ok(())
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
@@ -750,6 +766,7 @@ async fn load_split_logical_file_manifest(
     manifest_key: &str,
 ) -> Result<LoadedSplitLogicalFileManifest> {
     let started = Instant::now();
+    let recovery_deadline = Instant::now() + content_recovery::READ_THROUGH_RECOVERY_BUDGET;
     let manifest_descriptor = describe_object_with_metadata_read_through(
         state,
         manifest_key,
@@ -757,35 +774,34 @@ async fn load_split_logical_file_manifest(
         None,
         ObjectReadMode::Preferred,
         MetadataReadThroughPeers::Advertised,
+        Some(recovery_deadline),
     )
     .await
     .map_err(store_read_error_to_anyhow)?;
 
-    let manifest_payload = {
-        hydrate_current_object_range_for_read(
-            state,
-            manifest_key,
-            &manifest_descriptor.manifest_hash,
-            0,
-            manifest_descriptor.total_size_bytes,
-            false,
-        )
-        .await
-        .map_err(store_read_error_to_anyhow)
-        .with_context(|| format!("failed hydrating split logical file manifest {manifest_key}"))?;
-        let store = read_store(state, "maps.manifest.read").await;
-        store
-            .read_object_range_by_manifest_hash(
-                &manifest_descriptor.manifest_hash,
-                0,
-                manifest_descriptor.total_size_bytes,
-            )
-            .await
-            .map_err(store_read_error_to_anyhow)?
-    };
+    let manifest_payload = read_current_object_range_through_peer(
+        state,
+        CurrentObjectRangeRead {
+            key: manifest_key,
+            manifest_hash: &manifest_descriptor.manifest_hash,
+            range_start: 0,
+            range_end_exclusive: manifest_descriptor.total_size_bytes,
+            is_range_request: false,
+            recovery_deadline: Some(recovery_deadline),
+        },
+    )
+    .await
+    .map_err(store_read_error_to_anyhow)
+    .with_context(|| format!("failed hydrating split logical file manifest {manifest_key}"))?;
+    if manifest_payload.recovered_chunk_count > 0 {
+        request_local_availability_refresh(state);
+    }
 
-    let manifest = serde_json::from_slice::<SplitLogicalFileManifest>(manifest_payload.as_ref())
-        .with_context(|| format!("failed to parse split logical file manifest {manifest_key}"))?;
+    let manifest =
+        serde_json::from_slice::<SplitLogicalFileManifest>(manifest_payload.bytes.as_ref())
+            .with_context(|| {
+                format!("failed to parse split logical file manifest {manifest_key}")
+            })?;
     let manifest = validate_split_logical_file_manifest(manifest)?;
 
     let mut resolved_parts = Vec::with_capacity(manifest.parts.len());
@@ -797,6 +813,7 @@ async fn load_split_logical_file_manifest(
             None,
             ObjectReadMode::Preferred,
             MetadataReadThroughPeers::Advertised,
+            Some(recovery_deadline),
         )
         .await
         .map_err(store_read_error_to_anyhow)
@@ -850,6 +867,41 @@ async fn get_or_create_mbtiles_source(
                 cache = "hit",
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "map perf: reusing cached MBTiles source"
+            );
+        }
+        return Ok(source);
+    }
+
+    let initialization_lock = {
+        let mut locks = state
+            .storage
+            .mbtiles_source_initialization_locks
+            .lock()
+            .await;
+        locks
+            .entry(manifest_key.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone()
+    };
+    let _initialization_permit = initialization_lock
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow!("MBTiles source initialization lock closed"))?;
+
+    if let Some(source) = state
+        .storage
+        .mbtiles_sources
+        .read()
+        .await
+        .get(manifest_key)
+        .cloned()
+    {
+        if state.storage.map_perf_logging_enabled {
+            info!(
+                manifest_key = %manifest_key,
+                cache = "single-flight-hit",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "map perf: reused concurrently initialized MBTiles source"
             );
         }
         return Ok(source);

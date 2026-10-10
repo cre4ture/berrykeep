@@ -20278,10 +20278,12 @@ async fn build_test_state(
             )),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
+            map_configuration_metadata_miss_until: Arc::new(Mutex::new(None)),
             mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<
                 String,
                 Arc<super::web_maps::LogicalMbtilesSource>,
             >::new())),
+            mbtiles_source_initialization_locks: Arc::new(Mutex::new(HashMap::new())),
             last_gc_pass: Arc::new(std::sync::Mutex::new(None)),
         },
         access: super::ServerAccessRuntime {

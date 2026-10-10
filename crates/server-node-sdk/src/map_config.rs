@@ -5,6 +5,7 @@ use super::*;
 pub(crate) const MAP_CONFIGURATION_STORAGE_KEY: &str = "sys/maps/gallery-map-config.json";
 const MAP_CONFIGURATION_VERSION: u32 = 1;
 const MAX_MAP_VARIANTS: usize = 32;
+const MAP_CONFIGURATION_METADATA_MISS_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -416,20 +417,50 @@ pub(crate) async fn admin_put_config(
 pub(crate) async fn load_current_configuration(
     state: &ServerState,
 ) -> Result<LoadedMapConfiguration> {
-    let descriptor = match describe_object_with_metadata_read_through(
-        state,
-        MAP_CONFIGURATION_STORAGE_KEY,
-        None,
-        None,
-        ObjectReadMode::ConfirmedOnly,
-        MetadataReadThroughPeers::AnyOnline,
-    )
-    .await
-    {
-        Ok(descriptor) => Some(descriptor),
-        Err(StoreReadError::NotFound) => None,
-        Err(StoreReadError::Corrupt(message)) => {
-            bail!("gallery map configuration is corrupt: {message}")
+    let local_descriptor = {
+        let store = read_store(state, "maps.config.describe_local").await;
+        store
+            .describe_object(
+                MAP_CONFIGURATION_STORAGE_KEY,
+                None,
+                None,
+                ObjectReadMode::ConfirmedOnly,
+            )
+            .await
+    };
+    let descriptor = match local_descriptor {
+        Ok(descriptor) => {
+            clear_map_configuration_metadata_miss(state).await;
+            Some(descriptor)
+        }
+        Err(StoreReadError::NotFound) if map_configuration_metadata_miss_is_cached(state).await => {
+            None
+        }
+        Err(StoreReadError::NotFound | StoreReadError::Corrupt(_)) => {
+            match describe_object_with_metadata_read_through(
+                state,
+                MAP_CONFIGURATION_STORAGE_KEY,
+                None,
+                None,
+                ObjectReadMode::ConfirmedOnly,
+                MetadataReadThroughPeers::AnyOnline,
+                None,
+            )
+            .await
+            {
+                Ok(descriptor) => {
+                    clear_map_configuration_metadata_miss(state).await;
+                    Some(descriptor)
+                }
+                Err(StoreReadError::NotFound) => {
+                    cache_map_configuration_metadata_miss(state).await;
+                    None
+                }
+                Err(StoreReadError::Corrupt(message)) => {
+                    bail!("gallery map configuration is corrupt: {message}")
+                }
+                Err(StoreReadError::Internal(err)) => return Err(err),
+            }
         }
         Err(StoreReadError::Internal(err)) => return Err(err),
     };
@@ -442,31 +473,25 @@ pub(crate) async fn load_current_configuration(
         });
     };
 
-    hydrate_current_object_range_for_read(
+    let payload = read_current_object_range_through_peer(
         state,
-        MAP_CONFIGURATION_STORAGE_KEY,
-        &descriptor.manifest_hash,
-        0,
-        descriptor.total_size_bytes,
-        false,
+        CurrentObjectRangeRead {
+            key: MAP_CONFIGURATION_STORAGE_KEY,
+            manifest_hash: &descriptor.manifest_hash,
+            range_start: 0,
+            range_end_exclusive: descriptor.total_size_bytes,
+            is_range_request: false,
+            recovery_deadline: None,
+        },
     )
     .await
     .map_err(|error| anyhow!("{error}"))
     .context("failed reading gallery map configuration through peer cache")?;
+    if payload.recovered_chunk_count > 0 {
+        request_local_availability_refresh(state);
+    }
 
-    let payload = {
-        let store = read_store(state, "maps.config.read").await;
-        store
-            .read_object_range_by_manifest_hash(
-                &descriptor.manifest_hash,
-                0,
-                descriptor.total_size_bytes,
-            )
-            .await
-            .map_err(|error| anyhow!("{error}"))?
-    };
-
-    let stored_configuration = serde_json::from_slice::<ClusterMapConfiguration>(&payload)
+    let stored_configuration = serde_json::from_slice::<ClusterMapConfiguration>(&payload.bytes)
         .context("failed parsing gallery map configuration")?;
     validate_configuration(&stored_configuration)?;
     let (configuration, needs_persistence) = add_default_map_variants(stored_configuration);
@@ -476,6 +501,39 @@ pub(crate) async fn load_current_configuration(
         stored: true,
         needs_persistence,
     })
+}
+
+async fn map_configuration_metadata_miss_is_cached(state: &ServerState) -> bool {
+    let mut miss_until = state
+        .storage
+        .map_configuration_metadata_miss_until
+        .lock()
+        .await;
+    let now = Instant::now();
+    match *miss_until {
+        Some(until) if until > now => true,
+        Some(_) => {
+            *miss_until = None;
+            false
+        }
+        None => false,
+    }
+}
+
+async fn cache_map_configuration_metadata_miss(state: &ServerState) {
+    *state
+        .storage
+        .map_configuration_metadata_miss_until
+        .lock()
+        .await = Some(Instant::now() + MAP_CONFIGURATION_METADATA_MISS_TTL);
+}
+
+async fn clear_map_configuration_metadata_miss(state: &ServerState) {
+    *state
+        .storage
+        .map_configuration_metadata_miss_until
+        .lock()
+        .await = None;
 }
 
 /// The client endpoint can safely fall back while a just-added node catches up.

@@ -103,12 +103,11 @@ fn record_active_tile_lookup_perf_stats(update: impl FnOnce(&mut MbtilesTileLook
 }
 
 fn active_tile_lookup_is_cancelled() -> bool {
-    ACTIVE_TILE_LOOKUP_CANCELLATION.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|cancelled| cancelled.load(Ordering::Relaxed))
-            .unwrap_or(false)
-    })
+    active_tile_lookup_cancellation().is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+}
+
+fn active_tile_lookup_cancellation() -> Option<Arc<AtomicBool>> {
+    ACTIVE_TILE_LOOKUP_CANCELLATION.with(|slot| slot.borrow().as_ref().cloned())
 }
 
 fn ensure_active_tile_lookup_not_cancelled() -> Result<(), Error> {
@@ -781,22 +780,40 @@ fn download_logical_range_blocking(
     length: u64,
     perf_logging_enabled: bool,
 ) -> Result<Vec<u8>> {
-    if active_tile_lookup_is_cancelled() {
+    let cancellation = active_tile_lookup_cancellation();
+    if cancellation
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+    {
         return Err(canceled_anyhow("logical MBTiles range download canceled"));
     }
     let started = Instant::now();
-    let body = runtime_handle
-        .block_on(read_logical_range_bytes_from_store(
+    let body = runtime_handle.block_on(async {
+        let read_cancellation = cancellation.clone();
+        let read = read_logical_range_bytes_from_store(
             state,
             loaded_manifest,
             start,
             length,
-        ))
-        .with_context(|| {
-            format!(
-                "failed downloading logical MBTiles range manifest_key={manifest_key} start={start} length={length}"
-            )
-        })?;
+            true,
+            read_cancellation.as_deref(),
+        );
+        if let Some(cancelled) = cancellation {
+            tokio::select! {
+                result = read => result,
+                () = wait_for_tile_lookup_cancellation(cancelled) => {
+                    Err(canceled_anyhow("logical MBTiles range download canceled"))
+                }
+            }
+        } else {
+            read.await
+        }
+    })
+    .with_context(|| {
+        format!(
+            "failed downloading logical MBTiles range manifest_key={manifest_key} start={start} length={length}"
+        )
+    })?;
 
     if body.len() as u64 != length {
         return Err(anyhow!(
@@ -817,6 +834,12 @@ fn download_logical_range_blocking(
     }
 
     Ok(body)
+}
+
+async fn wait_for_tile_lookup_cancellation(cancelled: Arc<AtomicBool>) {
+    while !cancelled.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 fn xyz_row_to_tms(zoom: u32, y_xyz: u32) -> Result<u32> {
