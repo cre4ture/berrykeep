@@ -19,6 +19,18 @@ const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 const MAP_MANIFEST_PREFIX: &str = "sys/maps/";
 const MBTILES_SOURCE_INITIALIZATION_FAILURE_TTL: Duration = Duration::from_secs(10);
 const MBTILES_SOURCE_INITIALIZATION_FAILURE_CACHE_MAX_ENTRIES: usize = 128;
+const MBTILES_BLOCKING_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug)]
+struct MbtilesBlockingWorkBusy;
+
+impl std::fmt::Display for MbtilesBlockingWorkBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MBTiles blocking work is saturated")
+    }
+}
+
+impl std::error::Error for MbtilesBlockingWorkBusy {}
 
 /// Cancels a blocking tile lookup when its request handler is dropped.
 #[derive(Clone, Default)]
@@ -124,6 +136,9 @@ pub(crate) async fn mbtiles_metadata(
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
+        Err(error) if is_mbtiles_blocking_work_busy(&error) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     };
     let metadata = source.metadata();
@@ -326,24 +341,20 @@ pub(crate) async fn xyz_tile(
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
+        Err(error) if is_mbtiles_blocking_work_busy(&error) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    let tile_lookup_permit = match Arc::clone(&state.storage.mbtiles_blocking_permits)
-        .acquire_owned()
-        .await
-    {
+    let tile_lookup_permit = match acquire_mbtiles_blocking_permit(&state).await {
         Ok(permit) => permit,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let tile_lookup = tokio::task::spawn_blocking({
         let cancelled = request_cancellation.flag();
-        let blocking_permits = Arc::clone(&state.storage.mbtiles_blocking_permits);
         move || {
-            let _tile_lookup_permit = mbtiles::ActiveMbtilesBlockingPermitGuard::install(
-                blocking_permits,
-                tile_lookup_permit,
-            );
+            let _tile_lookup_permit = tile_lookup_permit;
             source.lookup_tile_with_cancellation(z, x, y, cancelled)
         }
     })
@@ -392,24 +403,20 @@ pub(crate) async fn vector_tile(
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
+        Err(error) if is_mbtiles_blocking_work_busy(&error) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    let tile_lookup_permit = match Arc::clone(&state.storage.mbtiles_blocking_permits)
-        .acquire_owned()
-        .await
-    {
+    let tile_lookup_permit = match acquire_mbtiles_blocking_permit(&state).await {
         Ok(permit) => permit,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let tile_lookup = tokio::task::spawn_blocking({
         let cancelled = request_cancellation.flag();
-        let blocking_permits = Arc::clone(&state.storage.mbtiles_blocking_permits);
         move || {
-            let _tile_lookup_permit = mbtiles::ActiveMbtilesBlockingPermitGuard::install(
-                blocking_permits,
-                tile_lookup_permit,
-            );
+            let _tile_lookup_permit = tile_lookup_permit;
             source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
         }
     })
@@ -951,19 +958,11 @@ async fn get_or_create_mbtiles_source(
         let handle = tokio::runtime::Handle::current();
         let manifest_key_owned = manifest_key.to_string();
         let perf_logging_enabled = state.storage.map_perf_logging_enabled;
-        let source_construction_permit = Arc::clone(&state.storage.mbtiles_blocking_permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow!("MBTiles blocking-work semaphore closed"))?;
+        let source_construction_permit = acquire_mbtiles_blocking_permit(state).await?;
         let source = tokio::task::spawn_blocking({
             let state = state.clone_for_mbtiles_read_through();
-            let blocking_permits = Arc::clone(&state.storage.mbtiles_blocking_permits);
             move || {
-                let _source_construction_permit =
-                    mbtiles::ActiveMbtilesBlockingPermitGuard::install(
-                        blocking_permits,
-                        source_construction_permit,
-                    );
+                let _source_construction_permit = source_construction_permit;
                 mbtiles::LogicalMbtilesSource::new(
                     manifest_key_owned,
                     state,
@@ -1004,9 +1003,34 @@ async fn get_or_create_mbtiles_source(
 
     match &initialization_result {
         Ok(_) => clear_mbtiles_source_initialization_failure(state, manifest_key).await,
+        Err(error) if is_mbtiles_blocking_work_busy(error) => {}
         Err(error) => cache_mbtiles_source_initialization_failure(state, manifest_key, error).await,
     }
     initialization_result
+}
+
+async fn acquire_mbtiles_blocking_permit(
+    state: &ServerState,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    acquire_mbtiles_blocking_permit_from(
+        Arc::clone(&state.storage.mbtiles_blocking_permits),
+        MBTILES_BLOCKING_ACQUIRE_TIMEOUT,
+    )
+    .await
+}
+
+async fn acquire_mbtiles_blocking_permit_from(
+    permits: Arc<Semaphore>,
+    acquire_timeout: Duration,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    tokio::time::timeout(acquire_timeout, permits.acquire_owned())
+        .await
+        .map_err(|_| anyhow::Error::new(MbtilesBlockingWorkBusy))?
+        .map_err(|_| anyhow!("MBTiles blocking-work semaphore closed"))
+}
+
+fn is_mbtiles_blocking_work_busy(error: &anyhow::Error) -> bool {
+    error.is::<MbtilesBlockingWorkBusy>()
 }
 
 fn mbtiles_source_initialization_lock(
@@ -1170,15 +1194,18 @@ fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorResponseBody, MbtilesSourceInitializationLockCleanup, RequestCancellation,
-        error_response, is_safe_fontstack_segment, is_safe_glyph_range_segment,
-        mbtiles_source_initialization_lock, remove_dead_mbtiles_source_initialization_lock,
+        ErrorResponseBody, MbtilesBlockingWorkBusy, MbtilesSourceInitializationLockCleanup,
+        RequestCancellation, acquire_mbtiles_blocking_permit_from, error_response,
+        is_safe_fontstack_segment, is_safe_glyph_range_segment, mbtiles_source_initialization_lock,
+        remove_dead_mbtiles_source_initialization_lock,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
 
     #[test]
     fn request_cancellation_sets_lookup_flag_when_request_ends() {
@@ -1253,6 +1280,19 @@ mod tests {
                 error: "bad manifest".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn mbtiles_blocking_work_returns_busy_after_a_bounded_wait() {
+        let permits = Arc::new(Semaphore::new(1));
+        let held_permit = Arc::clone(&permits).acquire_owned().await.unwrap();
+
+        let error = acquire_mbtiles_blocking_permit_from(permits, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+
+        assert!(error.is::<MbtilesBlockingWorkBusy>());
+        drop(held_permit);
     }
 
     #[test]

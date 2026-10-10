@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::info;
 
 use crate::ServerState;
@@ -26,8 +25,6 @@ std::thread_local! {
     static ACTIVE_TILE_LOOKUP_PERF_STATS: RefCell<Option<Rc<RefCell<MbtilesTileLookupPerfStats>>>> =
         const { RefCell::new(None) };
     static ACTIVE_TILE_LOOKUP_CANCELLATION: RefCell<Option<Arc<AtomicBool>>> =
-        const { RefCell::new(None) };
-    static ACTIVE_MBTILES_BLOCKING_PERMIT: RefCell<Option<ActiveMbtilesBlockingPermit>> =
         const { RefCell::new(None) };
 }
 
@@ -94,70 +91,6 @@ impl Drop for ActiveTileLookupCancellationGuard {
             *slot.borrow_mut() = self.previous.take();
         });
     }
-}
-
-struct ActiveMbtilesBlockingPermit {
-    semaphore: Arc<Semaphore>,
-    permit: Option<OwnedSemaphorePermit>,
-}
-
-/// Holds the SQLite/VFS concurrency slot for one blocking MBTiles operation.
-///
-/// The VFS temporarily releases it while a cache miss is resolved through the
-/// asynchronous peer-read path, then reacquires it before returning to SQLite.
-pub(crate) struct ActiveMbtilesBlockingPermitGuard {
-    previous: Option<ActiveMbtilesBlockingPermit>,
-}
-
-impl ActiveMbtilesBlockingPermitGuard {
-    pub(crate) fn install(
-        semaphore: Arc<Semaphore>,
-        permit: OwnedSemaphorePermit,
-    ) -> ActiveMbtilesBlockingPermitGuard {
-        let previous = ACTIVE_MBTILES_BLOCKING_PERMIT.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let previous = slot.take();
-            *slot = Some(ActiveMbtilesBlockingPermit {
-                semaphore,
-                permit: Some(permit),
-            });
-            previous
-        });
-        ActiveMbtilesBlockingPermitGuard { previous }
-    }
-}
-
-impl Drop for ActiveMbtilesBlockingPermitGuard {
-    fn drop(&mut self) {
-        ACTIVE_MBTILES_BLOCKING_PERMIT.with(|slot| {
-            *slot.borrow_mut() = self.previous.take();
-        });
-    }
-}
-
-fn suspend_active_mbtiles_blocking_permit_for_read_through() -> Option<Arc<Semaphore>> {
-    ACTIVE_MBTILES_BLOCKING_PERMIT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let active = slot.as_mut()?;
-        let permit = active.permit.take()?;
-        let semaphore = Arc::clone(&active.semaphore);
-        drop(permit);
-        Some(semaphore)
-    })
-}
-
-fn restore_active_mbtiles_blocking_permit(permit: OwnedSemaphorePermit) -> Result<()> {
-    ACTIVE_MBTILES_BLOCKING_PERMIT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let active = slot
-            .as_mut()
-            .ok_or_else(|| anyhow!("missing active MBTiles blocking permit context"))?;
-        if active.permit.is_some() {
-            return Err(anyhow!("MBTiles blocking permit was restored twice"));
-        }
-        active.permit = Some(permit);
-        Ok(())
-    })
 }
 
 fn record_active_tile_lookup_perf_stats(update: impl FnOnce(&mut MbtilesTileLookupPerfStats)) {
@@ -855,9 +788,6 @@ fn download_logical_range_blocking(
         return Err(canceled_anyhow("logical MBTiles range download canceled"));
     }
     let started = Instant::now();
-    // SQLite calls this VFS hook from Tokio's blocking pool. Do not reserve a
-    // scarce SQLite slot while the actual work is waiting on peer I/O.
-    let released_blocking_permit = suspend_active_mbtiles_blocking_permit_for_read_through();
     let body = runtime_handle.block_on(async {
         let read_cancellation = cancellation.clone();
         let read = read_logical_range_bytes_from_store(
@@ -878,14 +808,8 @@ fn download_logical_range_blocking(
         } else {
             read.await
         }
-    });
-    if let Some(semaphore) = released_blocking_permit {
-        let permit = runtime_handle
-            .block_on(async { semaphore.acquire_owned().await })
-            .map_err(|_| anyhow!("MBTiles blocking-work semaphore closed"))?;
-        restore_active_mbtiles_blocking_permit(permit)?;
-    }
-    let body = body.with_context(|| {
+    })
+    .with_context(|| {
         format!(
             "failed downloading logical MBTiles range manifest_key={manifest_key} start={start} length={length}"
         )
@@ -1050,28 +974,6 @@ mod tests {
         }
 
         assert!(!active_tile_lookup_is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn mbtiles_blocking_permit_is_released_while_read_through_waits() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
-        let guard = ActiveMbtilesBlockingPermitGuard::install(Arc::clone(&semaphore), permit);
-
-        assert_eq!(semaphore.available_permits(), 0);
-        let released = suspend_active_mbtiles_blocking_permit_for_read_through();
-        assert!(released.is_some());
-        assert_eq!(semaphore.available_permits(), 1);
-
-        let competing_lookup_permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
-        drop(competing_lookup_permit);
-
-        let restored_permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
-        restore_active_mbtiles_blocking_permit(restored_permit).unwrap();
-        assert_eq!(semaphore.available_permits(), 0);
-
-        drop(guard);
-        assert_eq!(semaphore.available_permits(), 1);
     }
 
     #[test]

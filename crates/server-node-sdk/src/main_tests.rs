@@ -18970,6 +18970,37 @@ async fn logical_map_file_read_through_fetches_missing_chunks_impl(backend: Main
             .await
             .unwrap();
     }
+    let recovered_range = super::read_current_object_range_through_peer(
+        &target,
+        super::CurrentObjectRangeRead {
+            key: part_key,
+            manifest_hash: &part_put.manifest_hash,
+            range_start: range_start as usize,
+            range_end_exclusive: range_end as usize + 1,
+            is_range_request: true,
+            recovery_deadline: None,
+        },
+    )
+    .await
+    .expect("a restored manifest must make the already-cached range readable");
+    assert_eq!(
+        recovered_range.bytes.as_ref(),
+        &part_payload[range_start as usize..=range_end as usize]
+    );
+    assert_eq!(recovered_range.recovered_chunk_count, 0);
+
+    let manifest_is_restored = {
+        let store = read_store(&target, "tests.map_file.target.verify_restored_manifest").await;
+        store
+            .missing_chunks_for_manifest_range(
+                &part_put.manifest_hash,
+                range_start as usize,
+                range_end as usize + 1,
+            )
+            .await
+    };
+    assert!(manifest_is_restored.unwrap().is_empty());
+
     let recovered_response = axum::response::IntoResponse::into_response(
         super::web_maps::logical_file(
             axum::extract::State(target.clone()),

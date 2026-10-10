@@ -21003,6 +21003,7 @@ pub(crate) async fn read_current_object_range_through_peer(
         Err(error) => return Err(error),
     };
 
+    let mut recovered_manifest_metadata = false;
     let missing_chunks = match missing_chunks_for_current_object_range(state, &request).await {
         Ok(missing_chunks) => missing_chunks,
         // A metadata-only cache can lose the manifest that maps the current
@@ -21011,12 +21012,26 @@ pub(crate) async fn read_current_object_range_through_peer(
         // retain a resolved manifest hash between requests.
         Err(StoreReadError::Corrupt(_)) => {
             recover_current_object_manifest_metadata(state, &request).await?;
+            recovered_manifest_metadata = true;
             missing_chunks_for_current_object_range(state, &request).await?
         }
         Err(error) => return Err(error),
     };
 
     if missing_chunks.is_empty() {
+        if recovered_manifest_metadata {
+            return read_current_object_range_locally(
+                state,
+                request.manifest_hash,
+                request.range_start,
+                request.range_end_exclusive,
+            )
+            .await
+            .map(|bytes| ReadThroughObjectRange {
+                bytes,
+                recovered_chunk_count: 0,
+            });
+        }
         return Err(initial_error);
     }
 
