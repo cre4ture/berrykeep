@@ -128,6 +128,9 @@ const STORE_HISTORY_RESPONSE_MAX_ENTRY_COUNT: usize = 1_000;
 const STORE_HISTORY_CACHE_TTL: Duration = Duration::from_secs(15);
 const STORE_HISTORY_CACHE_MAX_SCOPES: usize = 4;
 const STORE_HISTORY_REFRESH_MAX_CONCURRENCY: usize = 2;
+/// Keep synchronous SQLite VFS work well below Tokio's shared blocking pool
+/// limit, because a cold read-through can itself need blocking file I/O.
+const MBTILES_BLOCKING_MAX_CONCURRENCY: usize = 32;
 /// Avoid rescanning every historical manifest on each five-second repair tick,
 /// while still detecting out-of-band disk loss without a namespace event.
 const LOCAL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -330,6 +333,25 @@ struct CachedClusterTaskQueueSnapshot {
 }
 
 #[derive(Clone)]
+enum MapConfigurationReadThroughBackoff {
+    Missing,
+    MetadataUnavailable(String),
+    ContentUnavailable(String),
+}
+
+#[derive(Clone)]
+struct CachedMapConfigurationReadThroughBackoff {
+    expires_at: Instant,
+    outcome: MapConfigurationReadThroughBackoff,
+}
+
+#[derive(Clone)]
+struct CachedMbtilesSourceInitializationFailure {
+    expires_at: Instant,
+    message: String,
+}
+
+#[derive(Clone)]
 struct ServerState {
     managed_paths: ManagedPaths,
     cluster_id: ClusterId,
@@ -355,6 +377,18 @@ struct ServerState {
     reliability_telemetry_runtime: Arc<Mutex<reliability_telemetry::ReliabilityTelemetryRuntime>>,
 }
 
+impl ServerState {
+    /// Clones the state used by a cached MBTiles VFS without retaining the
+    /// MBTiles-source cache itself. Keeping the original cache here would
+    /// create an `mbtiles_sources -> source -> ServerState ->
+    /// mbtiles_sources` reference cycle.
+    fn clone_for_mbtiles_read_through(&self) -> Self {
+        let mut state = self.clone();
+        state.storage.mbtiles_sources = Arc::new(RwLock::new(HashMap::new()));
+        state
+    }
+}
+
 #[derive(Clone)]
 struct ServerStorageRuntime {
     upload_chunk_ingestor: ChunkIngestor,
@@ -376,7 +410,14 @@ struct ServerStorageRuntime {
     store_history_refresh_permits: Arc<Semaphore>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
+    map_configuration_read_through_backoff:
+        Arc<Mutex<Option<CachedMapConfigurationReadThroughBackoff>>>,
+    map_configuration_load_permit: Arc<Semaphore>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
+    mbtiles_source_initialization_locks: Arc<Mutex<HashMap<String, std::sync::Weak<Semaphore>>>>,
+    mbtiles_source_initialization_failures:
+        Arc<Mutex<HashMap<String, CachedMbtilesSourceInitializationFailure>>>,
+    mbtiles_blocking_permits: Arc<Semaphore>,
     last_gc_pass: Arc<StdMutex<Option<GcPassSummary>>>,
 }
 
@@ -7725,7 +7766,12 @@ async fn run_inner(
             )),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
+            map_configuration_read_through_backoff: Arc::new(Mutex::new(None)),
+            map_configuration_load_permit: Arc::new(Semaphore::new(1)),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
+            mbtiles_source_initialization_locks: Arc::new(Mutex::new(HashMap::new())),
+            mbtiles_source_initialization_failures: Arc::new(Mutex::new(HashMap::new())),
+            mbtiles_blocking_permits: Arc::new(Semaphore::new(MBTILES_BLOCKING_MAX_CONCURRENCY)),
             last_gc_pass: Arc::new(StdMutex::new(None)),
         },
         access: ServerAccessRuntime {
@@ -12152,7 +12198,8 @@ pub(crate) async fn sync_cluster_metadata_once(state: &ServerState) {
                 continue;
             };
 
-            let export_path = build_metadata_export_path(&key, version_id.as_deref());
+            let export_path =
+                build_metadata_export_path(&key, version_id.as_deref(), ObjectReadMode::Preferred);
             let response = match execute_peer_request(
                 state,
                 &peer,
@@ -20404,6 +20451,218 @@ fn read_through_replication_subject(
     Some(key.to_string())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum MetadataReadThroughPeers {
+    /// Use only nodes that already advertise the subject. This avoids turning
+    /// a caller-controlled missing map key into a cluster-wide fan-out.
+    Advertised,
+    /// Probe every healthy peer when the key is a fixed, trusted singleton
+    /// such as the gallery map configuration.
+    AnyOnline,
+}
+
+async fn metadata_read_through_source_nodes(
+    state: &ServerState,
+    subject: &str,
+    peer_scope: MetadataReadThroughPeers,
+) -> Vec<NodeDescriptor> {
+    let mut cluster = state.cluster.lock().await;
+    cluster.update_health_and_detect_offline_transition();
+
+    let mut seen = HashSet::from([state.node_id]);
+    let mut nodes = Vec::new();
+    for node in cluster
+        .available_nodes_for_subject(subject)
+        .into_iter()
+        .chain(cluster.replica_nodes_for_subject(subject))
+    {
+        if node.status == cluster::NodeStatus::Online && seen.insert(node.node_id) {
+            nodes.push(node);
+        }
+    }
+    if matches!(peer_scope, MetadataReadThroughPeers::AnyOnline) {
+        for node in cluster.list_nodes() {
+            if node.status == cluster::NodeStatus::Online && seen.insert(node.node_id) {
+                nodes.push(node);
+            }
+        }
+    }
+    nodes
+}
+
+async fn describe_object_after_metadata_import(
+    state: &ServerState,
+    key: &str,
+    snapshot_id: Option<&str>,
+    version_id: Option<&str>,
+    read_mode: ObjectReadMode,
+    peer_scope: MetadataReadThroughPeers,
+) -> Result<Option<ObjectReadDescriptor>, StoreReadError> {
+    let Some(subject) = read_through_replication_subject(key, snapshot_id, version_id) else {
+        return Ok(None);
+    };
+    let export_path = build_metadata_export_path(key, version_id, read_mode);
+    for peer in metadata_read_through_source_nodes(state, &subject, peer_scope).await {
+        let response = match execute_peer_request(
+            state,
+            &peer,
+            reqwest::Method::GET,
+            &export_path,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(response) if response.is_success() => response,
+            Ok(response) => {
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    key,
+                    version_id = ?version_id,
+                    status = response.status,
+                    "on-demand metadata export request rejected"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    key,
+                    version_id = ?version_id,
+                    error = %error,
+                    "on-demand metadata export request failed"
+                );
+                continue;
+            }
+        };
+        let bundle = match response.json::<MetadataExportBundle>() {
+            Ok(bundle) if bundle.key == key => bundle,
+            Ok(bundle) => {
+                tracing::warn!(
+                    peer_node_id = %peer.node_id,
+                    requested_key = %key,
+                    received_key = %bundle.key,
+                    "on-demand metadata export returned a mismatched key"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    key,
+                    version_id = ?version_id,
+                    error = %error,
+                    "failed decoding on-demand metadata export"
+                );
+                continue;
+            }
+        };
+        let changed = {
+            let mut store = lock_store(state, "object_read.import_metadata_on_demand").await;
+            store.import_metadata_bundle(&bundle).await
+        };
+        match changed {
+            Ok(changed) => {
+                if changed {
+                    notify_metadata_bundle_import_handlers(state, &bundle);
+                    publish_namespace_change(state);
+                }
+                tracing::debug!(
+                    peer_node_id = %peer.node_id,
+                    key,
+                    version_id = ?version_id,
+                    changed,
+                    "imported on-demand object metadata"
+                );
+                let descriptor = {
+                    let store =
+                        read_store(state, "object_read.describe_after_metadata_import").await;
+                    store
+                        .describe_object(key, snapshot_id, version_id, read_mode)
+                        .await
+                };
+                match descriptor {
+                    Ok(descriptor) => return Ok(Some(descriptor)),
+                    Err(StoreReadError::NotFound | StoreReadError::Corrupt(_)) => continue,
+                    Err(error @ StoreReadError::Internal(_)) => return Err(error),
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    peer_node_id = %peer.node_id,
+                    key,
+                    version_id = ?version_id,
+                    error = %error,
+                    "failed importing on-demand object metadata"
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Resolves an object descriptor, importing only its missing or incomplete
+/// metadata from peer nodes within the supplied foreground recovery budget.
+pub(crate) async fn describe_object_with_metadata_read_through(
+    state: &ServerState,
+    key: &str,
+    snapshot_id: Option<&str>,
+    version_id: Option<&str>,
+    read_mode: ObjectReadMode,
+    peer_scope: MetadataReadThroughPeers,
+    recovery_deadline: Option<Instant>,
+) -> Result<ObjectReadDescriptor, StoreReadError> {
+    let initial = {
+        let store = read_store(state, "object_read.describe").await;
+        store
+            .describe_object(key, snapshot_id, version_id, read_mode)
+            .await
+    };
+    let initial_error = match initial {
+        Ok(descriptor) => return Ok(descriptor),
+        Err(error @ (StoreReadError::NotFound | StoreReadError::Corrupt(_))) => error,
+        Err(error @ StoreReadError::Internal(_)) => return Err(error),
+    };
+
+    let recovery_budget = match recovery_deadline {
+        Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining.min(content_recovery::READ_THROUGH_RECOVERY_BUDGET),
+            None => return Err(initial_error),
+        },
+        None => content_recovery::READ_THROUGH_RECOVERY_BUDGET,
+    };
+    if recovery_budget.is_zero() {
+        return Err(initial_error);
+    }
+
+    match tokio::time::timeout(
+        recovery_budget,
+        describe_object_after_metadata_import(
+            state,
+            key,
+            snapshot_id,
+            version_id,
+            read_mode,
+            peer_scope,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(descriptor))) => Ok(descriptor),
+        Ok(Ok(None)) => Err(initial_error),
+        Ok(Err(error)) => Err(error),
+        Err(_) => {
+            tracing::info!(
+                key,
+                version_id = ?version_id,
+                budget_secs = recovery_budget.as_secs_f64(),
+                "on-demand metadata import exceeded its foreground recovery budget"
+            );
+            Err(initial_error)
+        }
+    }
+}
+
 async fn media_artifact_source_nodes(
     state: &ServerState,
     subject_hint: Option<&str>,
@@ -20689,6 +20948,170 @@ fn object_read_recovery_budget(is_range_request: bool, missing_chunk_count: usiz
     } else {
         content_recovery::full_object_recovery_budget(missing_chunk_count)
     }
+}
+
+/// Reads one range of a current object for a foreground request.
+///
+/// The normal path reads the local range exactly once. If that read detects a
+/// missing or corrupt chunk, recovery plans just that range and retries after
+/// the verified peer-cache hydration has completed.
+pub(crate) struct CurrentObjectRangeRead<'a> {
+    pub(crate) key: &'a str,
+    pub(crate) manifest_hash: &'a str,
+    pub(crate) range_start: usize,
+    pub(crate) range_end_exclusive: usize,
+    pub(crate) is_range_request: bool,
+    pub(crate) recovery_deadline: Option<Instant>,
+}
+
+pub(crate) struct ReadThroughObjectRange {
+    pub(crate) bytes: Bytes,
+    pub(crate) recovered_chunk_count: usize,
+}
+
+pub(crate) async fn read_current_object_range_locally(
+    state: &ServerState,
+    manifest_hash: &str,
+    range_start: usize,
+    range_end_exclusive: usize,
+) -> Result<Bytes, StoreReadError> {
+    let store = read_store(state, "object_read.read_local_range").await;
+    store
+        .read_object_range_by_manifest_hash(manifest_hash, range_start, range_end_exclusive)
+        .await
+}
+
+pub(crate) async fn read_current_object_range_through_peer(
+    state: &ServerState,
+    request: CurrentObjectRangeRead<'_>,
+) -> Result<ReadThroughObjectRange, StoreReadError> {
+    let local_read = read_current_object_range_locally(
+        state,
+        request.manifest_hash,
+        request.range_start,
+        request.range_end_exclusive,
+    )
+    .await;
+    let initial_error = match local_read {
+        Ok(bytes) => {
+            return Ok(ReadThroughObjectRange {
+                bytes,
+                recovered_chunk_count: 0,
+            });
+        }
+        Err(error @ StoreReadError::Corrupt(_)) => error,
+        Err(error) => return Err(error),
+    };
+
+    let mut recovered_manifest_metadata = false;
+    let missing_chunks = match missing_chunks_for_current_object_range(state, &request).await {
+        Ok(missing_chunks) => missing_chunks,
+        // A metadata-only cache can lose the manifest that maps the current
+        // object to its chunks. Re-import it before planning hydration: this
+        // is especially important for long-lived MBTiles VFS sources, which
+        // retain a resolved manifest hash between requests.
+        Err(StoreReadError::Corrupt(_)) => {
+            recover_current_object_manifest_metadata(state, &request).await?;
+            recovered_manifest_metadata = true;
+            missing_chunks_for_current_object_range(state, &request).await?
+        }
+        Err(error) => return Err(error),
+    };
+
+    if missing_chunks.is_empty() {
+        if recovered_manifest_metadata {
+            return read_current_object_range_locally(
+                state,
+                request.manifest_hash,
+                request.range_start,
+                request.range_end_exclusive,
+            )
+            .await
+            .map(|bytes| ReadThroughObjectRange {
+                bytes,
+                recovered_chunk_count: 0,
+            });
+        }
+        return Err(initial_error);
+    }
+
+    let missing_chunk_count = missing_chunks.len();
+    let mut recovery_budget =
+        object_read_recovery_budget(request.is_range_request, missing_chunk_count);
+    if let Some(deadline) = request.recovery_deadline {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(StoreReadError::Internal(anyhow!(
+                "read-through recovery deadline expired before hydrating key={}",
+                request.key
+            )));
+        };
+        recovery_budget = recovery_budget.min(remaining);
+    }
+    if recovery_budget.is_zero() {
+        return Err(StoreReadError::Internal(anyhow!(
+            "read-through recovery deadline expired before hydrating key={}",
+            request.key
+        )));
+    }
+    hydrate_missing_chunks_for_object_read(state, request.key, &missing_chunks, recovery_budget)
+        .await
+        .map_err(|error| {
+            StoreReadError::Internal(error.context(format!(
+                "failed read-through chunk hydration for key={} missing_chunk_count={missing_chunk_count}",
+                request.key,
+            )))
+        })?;
+    let bytes = {
+        let store = read_store(state, "object_read.read_hydrated_range").await;
+        store
+            .read_object_range_by_manifest_hash(
+                request.manifest_hash,
+                request.range_start,
+                request.range_end_exclusive,
+            )
+            .await?
+    };
+    Ok(ReadThroughObjectRange {
+        bytes,
+        recovered_chunk_count: missing_chunk_count,
+    })
+}
+
+async fn missing_chunks_for_current_object_range(
+    state: &ServerState,
+    request: &CurrentObjectRangeRead<'_>,
+) -> Result<Vec<ReplicationChunkInfo>, StoreReadError> {
+    let store = read_store(state, "object_read.plan_missing_chunks").await;
+    store
+        .missing_chunks_for_manifest_range(
+            request.manifest_hash,
+            request.range_start,
+            request.range_end_exclusive,
+        )
+        .await
+}
+
+async fn recover_current_object_manifest_metadata(
+    state: &ServerState,
+    request: &CurrentObjectRangeRead<'_>,
+) -> Result<(), StoreReadError> {
+    let descriptor = describe_object_with_metadata_read_through(
+        state,
+        request.key,
+        None,
+        None,
+        ObjectReadMode::Preferred,
+        MetadataReadThroughPeers::Advertised,
+        request.recovery_deadline,
+    )
+    .await?;
+    if descriptor.manifest_hash != request.manifest_hash {
+        return Err(StoreReadError::Corrupt(format!(
+            "object metadata changed while recovering missing manifest for key={}: expected_manifest_hash={} actual_manifest_hash={}",
+            request.key, request.manifest_hash, descriptor.manifest_hash
+        )));
+    }
+    Ok(())
 }
 
 async fn hydrate_missing_chunks_for_object_read(
@@ -31233,6 +31656,7 @@ struct ReplicationExportQuery {
 struct MetadataExportQuery {
     key: String,
     version_id: Option<String>,
+    read_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -31267,9 +31691,24 @@ async fn export_replication_bundle(
     }
 }
 
-fn build_metadata_export_path(key: &str, version_id: Option<&str>) -> String {
+fn object_read_mode_query_value(read_mode: ObjectReadMode) -> &'static str {
+    match read_mode {
+        ObjectReadMode::Preferred => "preferred",
+        ObjectReadMode::ConfirmedOnly => "confirmed_only",
+        ObjectReadMode::ProvisionalAllowed => "provisional_allowed",
+    }
+}
+
+fn build_metadata_export_path(
+    key: &str,
+    version_id: Option<&str>,
+    read_mode: ObjectReadMode,
+) -> String {
     let encoded_key = utf8_percent_encode(key, QUERY_COMPONENT_ENCODE_SET).to_string();
-    let mut path = format!("/cluster/metadata/export?key={encoded_key}");
+    let mut path = format!(
+        "/cluster/metadata/export?key={encoded_key}&read_mode={}",
+        object_read_mode_query_value(read_mode)
+    );
     if let Some(version_id) = version_id {
         let encoded_version =
             utf8_percent_encode(version_id, QUERY_COMPONENT_ENCODE_SET).to_string();
@@ -31283,13 +31722,13 @@ async fn export_metadata_bundle(
     State(state): State<ServerState>,
     Query(query): Query<MetadataExportQuery>,
 ) -> impl IntoResponse {
+    let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
+        Some(read_mode) => read_mode,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
     let store = read_store(&state, "metadata.export_bundle").await;
     match store
-        .export_metadata_bundle(
-            &query.key,
-            query.version_id.as_deref(),
-            ObjectReadMode::Preferred,
-        )
+        .export_metadata_bundle(&query.key, query.version_id.as_deref(), read_mode)
         .await
     {
         Ok(Some(bundle)) => (StatusCode::OK, Json(bundle)).into_response(),
