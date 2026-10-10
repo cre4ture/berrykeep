@@ -294,8 +294,8 @@ mod tests {
 
     #[tokio::test]
     async fn config_app_does_not_persist_identity_when_enrollment_cannot_reach_server() -> Result<()> {
-        let server_bind = "127.0.0.1:19490";
-        let config_bind = "127.0.0.1:19491";
+        let server_bind = "127.0.0.1:19550";
+        let config_bind = "127.0.0.1:19551";
         let server_base = format!("http://{server_bind}");
         let config_base = format!("http://{config_bind}");
         let data_dir = fresh_data_dir("config-app-unreachable-enroll-server");
