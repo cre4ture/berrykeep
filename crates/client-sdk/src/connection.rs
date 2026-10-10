@@ -162,19 +162,48 @@ pub fn build_blocking_reqwest_client_from_pem_for_url(
     server_ca_pem: Option<&str>,
     url: &Url,
 ) -> Result<BlockingClient> {
-    build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity(
+    build_blocking_reqwest_client_from_pem_for_url_with_options(server_ca_pem, url, None, None)
+}
+
+pub(crate) fn build_blocking_reqwest_client_from_pem_for_url_with_timeout(
+    server_ca_pem: Option<&str>,
+    url: &Url,
+    timeout: Duration,
+) -> Result<BlockingClient> {
+    build_blocking_reqwest_client_from_pem_for_url_with_options(
         server_ca_pem,
         url,
         None,
+        Some(timeout),
     )
 }
 
-pub(crate) fn build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity(
+pub(crate) fn build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity_and_timeout(
     server_ca_pem: Option<&str>,
     url: &Url,
     expected_server_identity: Option<ExpectedNodeServerIdentity>,
+    timeout: Duration,
+) -> Result<BlockingClient> {
+    build_blocking_reqwest_client_from_pem_for_url_with_options(
+        server_ca_pem,
+        url,
+        expected_server_identity,
+        Some(timeout),
+    )
+}
+
+fn build_blocking_reqwest_client_from_pem_for_url_with_options(
+    server_ca_pem: Option<&str>,
+    url: &Url,
+    expected_server_identity: Option<ExpectedNodeServerIdentity>,
+    timeout: Option<Duration>,
 ) -> Result<BlockingClient> {
     let builder = configure_blocking_reqwest_client_builder(BlockingClient::builder());
+    let builder = if let Some(timeout) = timeout {
+        builder.timeout(timeout)
+    } else {
+        builder
+    };
     let builder = if url.scheme() == "https"
         && let Some(expected_server_identity) = expected_server_identity
     {

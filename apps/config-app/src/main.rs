@@ -1322,15 +1322,18 @@ async fn upsert_client_identity(
         .and_then(|id| store.client_identity(id));
     let (mut identity, bootstrap_content, enroll) =
         request.into_identity(existing, state.paths.instance_store_path())?;
-    if let Some(bootstrap_content) = bootstrap_content.as_deref() {
-        write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
-    }
     let enrollment = if enroll {
-        let report = enroll_client_identity(identity.clone()).await?;
+        let report = enroll_client_identity(identity.clone(), bootstrap_content.as_deref()).await?;
+        if let Some(bootstrap_content) = bootstrap_content.as_deref() {
+            write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
+        }
         refresh_client_identity_metadata(&mut identity);
         identity.last_enrolled_at_unix_ms = Some(unix_ts_ms());
         Some(report)
     } else {
+        if let Some(bootstrap_content) = bootstrap_content.as_deref() {
+            write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
+        }
         refresh_client_identity_metadata(&mut identity);
         None
     };
@@ -2305,26 +2308,35 @@ fn reconcile_managed_identity_target_blocking(
 
 async fn enroll_client_identity(
     identity: ClientIdentityConfig,
+    bootstrap_content: Option<&str>,
 ) -> Result<ClientIdentityEnrollmentReport, ApiError> {
-    tokio::task::spawn_blocking(move || enroll_client_identity_blocking(&identity))
-        .await
-        .map_err(|error| ApiError::internal(anyhow::anyhow!("enrollment task panicked: {error}")))?
+    let bootstrap_content = bootstrap_content
+        .map(str::to_owned)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            std::fs::read_to_string(&identity.bootstrap_file).map_err(|error| {
+                ApiError::internal(anyhow::anyhow!(
+                    "failed reading managed bootstrap file {}: {error}",
+                    identity.bootstrap_file
+                ))
+            })
+        })?;
+    tokio::task::spawn_blocking(move || {
+        enroll_client_identity_blocking(&identity, &bootstrap_content)
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow::anyhow!("enrollment task panicked: {error}")))?
 }
 
 fn enroll_client_identity_blocking(
     identity: &ClientIdentityConfig,
+    bootstrap_content: &str,
 ) -> Result<ClientIdentityEnrollmentReport, ApiError> {
-    let bootstrap_content = std::fs::read_to_string(&identity.bootstrap_file).map_err(|error| {
-        ApiError::internal(anyhow::anyhow!(
-            "failed reading managed bootstrap file {}: {error}",
-            identity.bootstrap_file
-        ))
-    })?;
     let enrolled =
-        enroll_connection_input_blocking(&bootstrap_content, None, Some(identity.label.as_str()))
+        enroll_connection_input_blocking(bootstrap_content, None, Some(identity.label.as_str()))
             .map_err(|error| {
-            ApiError::bad_request(format!("client identity enrollment failed: {error}"))
-        })?;
+                ApiError::bad_request(format!("client identity enrollment failed: {error}"))
+            })?;
     let material = enrolled.client_identity_material().map_err(|error| {
         ApiError::internal(error.context("failed building client identity material"))
     })?;
@@ -2821,7 +2833,8 @@ const APP_HTML: &str = r###"<!doctype html>
                   <span class="field-help">Enrolls this device identity and writes the managed client identity file.</span>
                 </span>
               </label>
-              <button type="submit">Save Client Identity</button>
+              <p id="identity-form-status" class="form-feedback" role="status" aria-live="polite">Ready to enroll a client identity.</p>
+              <button id="save-identity-button" type="submit">Save Client Identity</button>
             </form>
           </section>
 
@@ -3149,6 +3162,9 @@ body {
   --nav-link-border: rgba(18, 184, 134, 0.16);
   --status-background: #f4f7f8;
   --status-foreground: #173039;
+  --form-feedback-pending: #0d6b5c;
+  --form-feedback-success: #0d6b5c;
+  --form-feedback-error: #b42318;
 }
 
 :root[data-mantine-color-scheme="dark"] {
@@ -3177,6 +3193,9 @@ body {
   --nav-link-border: rgba(116, 228, 200, 0.14);
   --status-background: #0d171b;
   --status-foreground: #dff8f1;
+  --form-feedback-pending: #74e4c8;
+  --form-feedback-success: #74e4c8;
+  --form-feedback-error: #ffb4ab;
 }
 
 * {
@@ -3586,6 +3605,26 @@ dd {
   line-height: 1.45;
 }
 
+.form-feedback {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.form-feedback[data-state="pending"] {
+  color: var(--form-feedback-pending);
+}
+
+.form-feedback[data-state="success"] {
+  color: var(--form-feedback-success);
+}
+
+.form-feedback[data-state="error"] {
+  color: var(--form-feedback-error);
+}
+
 .instance-form input,
 .instance-form select,
 .instance-form textarea {
@@ -3842,6 +3881,12 @@ function renderInstanceDetailValue(kind, label, value, running) {
 function showStatus(value) {
   document.getElementById('status-output').textContent =
     typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+
+function showIdentityFormStatus(message, state) {
+  const target = document.getElementById('identity-form-status');
+  target.textContent = message;
+  target.dataset.state = state;
 }
 
 function renderLaunchReport(report) {
@@ -4357,19 +4402,47 @@ window.controlService = async function(serviceKind, encodedId, action) {
 
 async function submitIdentityForm(event) {
   event.preventDefault();
+  const submitButton = document.getElementById('save-identity-button');
+  submitButton.disabled = true;
+  submitButton.textContent = 'Enrolling Client Identity...';
+  showIdentityFormStatus('Contacting the BerryKeep server and enrolling this device...', 'pending');
   const payload = {
     id: document.getElementById('identity-id').value || null,
     bootstrap_content: document.getElementById('identity-bootstrap-content').value,
     enroll: document.getElementById('identity-enroll').checked,
   };
-  const response = await fetchJson('/api/client-identities', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  renderConfig(response.config);
-  clearIdentityForm();
-  showStatus(response.enrollment ? response.enrollment : 'Saved client identity.');
+  let response;
+  try {
+    response = await fetchJson('/api/client-identities', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showIdentityFormStatus(`Client identity was not saved: ${message}`, 'error');
+    showStatus({ error: message });
+    submitButton.disabled = false;
+    submitButton.textContent = 'Save Client Identity';
+    return;
+  }
+
+  try {
+    renderConfig(response.config);
+    clearIdentityForm();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showIdentityFormStatus(`Client identity was saved, but the form could not refresh: ${message}`, 'error');
+    showStatus({ error: message, saved: true });
+    return;
+  } finally {
+    submitButton.disabled = false;
+    submitButton.textContent = 'Save Client Identity';
+  }
+
+  const status = response.enrollment ? 'Client identity enrolled and saved.' : 'Client identity saved.';
+  showIdentityFormStatus(status, 'success');
+  showStatus(response.enrollment ? response.enrollment : status);
 }
 
 async function submitClientForm(event) {
@@ -4485,9 +4558,7 @@ window.addEventListener('DOMContentLoaded', async () => {
       updateColorSchemeControls();
     }
   });
-  document.getElementById('identity-form').addEventListener('submit', (event) => {
-    submitIdentityForm(event).catch((error) => showStatus({ error: error.message }));
-  });
+  document.getElementById('identity-form').addEventListener('submit', submitIdentityForm);
   document.getElementById('client-form').addEventListener('submit', (event) => {
     submitClientForm(event).catch((error) => showStatus({ error: error.message }));
   });

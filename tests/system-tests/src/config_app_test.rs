@@ -293,6 +293,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_app_does_not_persist_identity_when_enrollment_cannot_reach_server() -> Result<()> {
+        let server_bind = "127.0.0.1:19490";
+        let config_bind = "127.0.0.1:19491";
+        let server_base = format!("http://{server_bind}");
+        let config_base = format!("http://{config_bind}");
+        let data_dir = fresh_data_dir("config-app-unreachable-enroll-server");
+        let config_root = fresh_data_dir("config-app-unreachable-enroll-config");
+        let package_root = fresh_data_dir("config-app-unreachable-enroll-package");
+        let node_id = Uuid::new_v4().to_string();
+        let http = reqwest::Client::new();
+
+        let mut server = start_authenticated_server(server_bind, &data_dir, &node_id, 1).await?;
+        let bootstrap = issue_bootstrap_bundle(
+            &http,
+            &server_base,
+            TEST_ADMIN_TOKEN,
+            Some("offline-config-app-device"),
+            Some(3600),
+        )
+        .await?;
+        let bootstrap_content = bootstrap.to_json_pretty()?;
+        stop_server(&mut server).await;
+
+        let mut config_app = start_config_app(config_bind, &config_root, &package_root).await?;
+        let result = async {
+            let response = http
+                .post(format!("{config_base}/api/client-identities"))
+                .json(&serde_json::json!({
+                    "bootstrap_content": bootstrap_content,
+                    "enroll": true,
+                }))
+                .send()
+                .await
+                .context("failed posting unreachable bootstrap to config-app")?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            let config: serde_json::Value = http
+                .get(format!("{config_base}/api/config"))
+                .send()
+                .await
+                .context("failed reading config after unsuccessful enrollment")?
+                .error_for_status()
+                .context("config-app did not return configuration after unsuccessful enrollment")?
+                .json()
+                .await
+                .context("failed decoding config after unsuccessful enrollment")?;
+            let identities = config
+                .get("store")
+                .and_then(|value| value.get("client_identities"))
+                .and_then(|value| value.as_array())
+                .context("config-app response missing client identities")?;
+            assert!(
+                identities.is_empty(),
+                "failed enrollment must not add a managed client identity"
+            );
+
+            let config_path = config
+                .get("config_path")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from)
+                .context("config-app response missing config_path")?;
+            let identity_dir = config_path
+                .parent()
+                .context("config-app config path has no parent")?
+                .join("client-identities");
+            assert!(
+                !identity_dir.exists()
+                    || fs::read_dir(&identity_dir)
+                        .context("failed reading managed identity directory")?
+                        .next()
+                        .is_none(),
+                "failed enrollment must not leave client identity files in {}",
+                identity_dir.display()
+            );
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        stop_server(&mut config_app).await;
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&config_root);
+        let _ = fs::remove_dir_all(&package_root);
+        result
+    }
+
+    #[tokio::test]
     async fn config_app_launch_report_points_to_service_log_file() -> Result<()> {
         let config_bind = "127.0.0.1:19452";
         let config_base = format!("http://{config_bind}");

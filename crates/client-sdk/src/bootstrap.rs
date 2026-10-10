@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::berrykeep_client::{BerryKeepClient, CLIENT_API_V1_PREFIX, normalize_server_base_url};
 use crate::connection::{
     build_blocking_reqwest_client_from_pem_for_url,
-    build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity,
+    build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity_and_timeout,
     build_http_client_from_planned_targets, build_http_client_with_identity_from_planned_targets,
 };
 use crate::device_auth::{
@@ -35,6 +35,7 @@ const DISCOVERY_MAX_CONCURRENCY: usize = 8;
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 const DISCOVERY_SUCCESS_GRACE: Duration = Duration::from_millis(250);
+const ENROLLMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const RENDEZVOUS_CONTACT_LIST_SCHEMA_VERSION: u32 = 1;
 
 /// A cluster-provided Rendezvous contact list cached alongside a client's
@@ -2220,7 +2221,7 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
         .with_context(|| format!("failed to build health URL from {endpoint}"))?;
 
     let probe_client = if endpoint.scheme() == "https" {
-        build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity(
+        build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity_and_timeout(
             target
                 .server_ca_pem
                 .as_deref()
@@ -2232,11 +2233,12 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
                     node_id,
                     cluster_id: target.cluster_id,
                 }),
+            ENROLLMENT_PROBE_TIMEOUT,
         )
         .context("failed building bootstrap trusted client")?
     } else {
         reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(3))
+            .timeout(ENROLLMENT_PROBE_TIMEOUT)
             .build()
             .context("failed building bootstrap probe client")?
     };
