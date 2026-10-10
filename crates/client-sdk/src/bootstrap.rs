@@ -22,8 +22,9 @@ use uuid::Uuid;
 
 use crate::berrykeep_client::{BerryKeepClient, CLIENT_API_V1_PREFIX, normalize_server_base_url};
 use crate::connection::{
-    build_blocking_reqwest_client_from_pem_for_url,
-    build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity,
+    ENROLLMENT_REQUEST_TIMEOUT,
+    build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity_and_timeout,
+    build_blocking_reqwest_client_from_pem_for_url_with_timeout,
     build_http_client_from_planned_targets, build_http_client_with_identity_from_planned_targets,
 };
 use crate::device_auth::{
@@ -35,6 +36,10 @@ const DISCOVERY_MAX_CONCURRENCY: usize = 8;
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 const DISCOVERY_SUCCESS_GRACE: Duration = Duration::from_millis(250);
+const HTTP_ENROLLMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+// HTTPS probes include a TLS handshake. Keep their total budget above the
+// connection timeout so a reachable, slower endpoint is not discarded first.
+const HTTPS_ENROLLMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const RENDEZVOUS_CONTACT_LIST_SCHEMA_VERSION: u32 = 1;
 
 /// A cluster-provided Rendezvous contact list cached alongside a client's
@@ -2112,9 +2117,10 @@ pub fn enroll_bootstrap_claim_blocking(
     let mut retryable_errors = Vec::new();
     let mut redeemed = None;
     for redeem_url in claim_redeem_urls(claim)? {
-        let response = match build_blocking_reqwest_client_from_pem_for_url(
+        let response = match build_blocking_reqwest_client_from_pem_for_url_with_timeout(
             Some(&rendezvous_ca_pem),
             &redeem_url,
+            ENROLLMENT_REQUEST_TIMEOUT,
         )?
         .post(redeem_url.clone())
         .json(&redeem_request)
@@ -2220,7 +2226,7 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
         .with_context(|| format!("failed to build health URL from {endpoint}"))?;
 
     let probe_client = if endpoint.scheme() == "https" {
-        build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity(
+        build_blocking_reqwest_client_from_pem_for_url_with_expected_server_identity_and_timeout(
             target
                 .server_ca_pem
                 .as_deref()
@@ -2232,11 +2238,12 @@ fn probe_direct_http_target_blocking(target: &PlannedConnectionBootstrapTarget) 
                     node_id,
                     cluster_id: target.cluster_id,
                 }),
+            HTTPS_ENROLLMENT_PROBE_TIMEOUT,
         )
         .context("failed building bootstrap trusted client")?
     } else {
         reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(3))
+            .timeout(HTTP_ENROLLMENT_PROBE_TIMEOUT)
             .build()
             .context("failed building bootstrap probe client")?
     };

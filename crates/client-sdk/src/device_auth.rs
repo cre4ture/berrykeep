@@ -5,13 +5,14 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 use transport_sdk::IssuedClientIdentity;
 
 use crate::BerryKeepClient;
 use crate::berrykeep_client::CLIENT_API_V1_PREFIX;
 
 use crate::connection::{
-    build_blocking_http_client, build_blocking_reqwest_client_from_pem_for_url,
+    ENROLLMENT_REQUEST_TIMEOUT, build_blocking_reqwest_client_from_pem_for_url_with_timeout,
     build_reqwest_client_from_pem_for_url,
 };
 
@@ -107,9 +108,17 @@ pub fn enroll_device_blocking(
                 ca_cert_path.display()
             )
         })?;
-        build_blocking_reqwest_client_from_pem_for_url(Some(&server_ca_pem), &enroll_url)?
+        build_blocking_reqwest_client_from_pem_for_url_with_timeout(
+            Some(&server_ca_pem),
+            &enroll_url,
+            ENROLLMENT_REQUEST_TIMEOUT,
+        )?
     } else {
-        build_blocking_http_client(server_ca_cert)?
+        build_blocking_reqwest_client_from_pem_for_url_with_timeout(
+            None,
+            &enroll_url,
+            ENROLLMENT_REQUEST_TIMEOUT,
+        )?
     };
     let response = client
         .post(enroll_url)
@@ -128,10 +137,28 @@ pub fn enroll_device_blocking_from_pem(
     server_ca_pem: Option<&str>,
     request: &DeviceEnrollmentRequest,
 ) -> Result<DeviceEnrollmentResponse> {
+    enroll_device_blocking_from_pem_with_timeout(
+        base_url,
+        server_ca_pem,
+        request,
+        ENROLLMENT_REQUEST_TIMEOUT,
+    )
+}
+
+fn enroll_device_blocking_from_pem_with_timeout(
+    base_url: &Url,
+    server_ca_pem: Option<&str>,
+    request: &DeviceEnrollmentRequest,
+    timeout: Duration,
+) -> Result<DeviceEnrollmentResponse> {
     let enroll_url = base_url
         .join(&format!("{CLIENT_API_V1_PREFIX}/auth/device/enroll"))
         .with_context(|| format!("failed to build enroll URL from {base_url}"))?;
-    let client = build_blocking_reqwest_client_from_pem_for_url(server_ca_pem, &enroll_url)?;
+    let client = build_blocking_reqwest_client_from_pem_for_url_with_timeout(
+        server_ca_pem,
+        &enroll_url,
+        timeout,
+    )?;
     let response = client
         .post(enroll_url)
         .json(request)
@@ -213,6 +240,9 @@ mod tests {
     use super::*;
     use crate::BerryKeepClient;
     use axum::{Json, Router, routing::post};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::thread;
     use uuid::Uuid;
 
     fn sample_response() -> DeviceEnrollmentResponse {
@@ -369,6 +399,41 @@ mod tests {
                 .to_string()
                 .contains("device enrollment returned an incomplete credential")
         );
+    }
+
+    #[test]
+    fn blocking_enrollment_times_out_when_server_does_not_respond() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("server should receive enrollment");
+            let mut request = [0_u8; 1_024];
+            let _ = stream.read(&mut request);
+            thread::sleep(Duration::from_millis(150));
+        });
+        let request = DeviceEnrollmentRequest {
+            cluster_id: Uuid::now_v7(),
+            pairing_token: "pairing-token".to_string(),
+            device_id: Some(Uuid::now_v7().to_string()),
+            label: Some("desktop".to_string()),
+            public_key_pem: "public-key".to_string(),
+        };
+
+        let error = enroll_device_blocking_from_pem_with_timeout(
+            &Url::parse(&format!("http://{address}")).expect("URL should parse"),
+            None,
+            &request,
+            Duration::from_millis(25),
+        )
+        .expect_err("unresponsive enrollment server should time out");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to call /auth/device/enroll"),
+            "unexpected enrollment error: {error}"
+        );
+        server.join().expect("server thread should not panic");
     }
 
     async fn spawn_renewal_mock(

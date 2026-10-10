@@ -284,12 +284,9 @@ impl UpsertClientIdentityRequest {
             .as_deref()
             .map(client_identity_label_from_bootstrap_content)
             .transpose()?
+            .flatten()
             .or_else(|| existing.map(|identity| identity.label.to_string()))
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    "bootstrap content must include device_label so the identity name can be derived",
-                )
-            })?;
+            .unwrap_or_else(|| default_client_identity_label(&id));
         let identity = ClientIdentityConfig {
             id,
             label,
@@ -325,6 +322,8 @@ struct ClientIdentityEnrollmentReport {
     identity_file: String,
     cluster_id: String,
     device_id: String,
+    #[serde(skip_serializing)]
+    connection_bootstrap_json: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     server_base_url: Option<String>,
 }
@@ -1322,15 +1321,20 @@ async fn upsert_client_identity(
         .and_then(|id| store.client_identity(id));
     let (mut identity, bootstrap_content, enroll) =
         request.into_identity(existing, state.paths.instance_store_path())?;
-    if let Some(bootstrap_content) = bootstrap_content.as_deref() {
-        write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
-    }
     let enrollment = if enroll {
-        let report = enroll_client_identity(identity.clone()).await?;
+        let report = enroll_client_identity(identity.clone(), bootstrap_content.as_deref()).await?;
+        if let Some(bootstrap_content) =
+            persisted_bootstrap_content(&report, bootstrap_content.as_deref())
+        {
+            write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
+        }
         refresh_client_identity_metadata(&mut identity);
         identity.last_enrolled_at_unix_ms = Some(unix_ts_ms());
         Some(report)
     } else {
+        if let Some(bootstrap_content) = bootstrap_content.as_deref() {
+            write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
+        }
         refresh_client_identity_metadata(&mut identity);
         None
     };
@@ -1352,6 +1356,16 @@ async fn upsert_client_identity(
         config: load_config_response(&state).map_err(ApiError::internal)?,
         enrollment,
     }))
+}
+
+fn persisted_bootstrap_content<'a>(
+    enrollment: &'a ClientIdentityEnrollmentReport,
+    submitted_bootstrap_content: Option<&'a str>,
+) -> Option<&'a str> {
+    enrollment
+        .connection_bootstrap_json
+        .as_deref()
+        .or(submitted_bootstrap_content)
 }
 
 async fn upsert_client_cli_instance(
@@ -2305,26 +2319,33 @@ fn reconcile_managed_identity_target_blocking(
 
 async fn enroll_client_identity(
     identity: ClientIdentityConfig,
+    bootstrap_content: Option<&str>,
 ) -> Result<ClientIdentityEnrollmentReport, ApiError> {
-    tokio::task::spawn_blocking(move || enroll_client_identity_blocking(&identity))
-        .await
-        .map_err(|error| ApiError::internal(anyhow::anyhow!("enrollment task panicked: {error}")))?
+    let bootstrap_content = bootstrap_content.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let bootstrap_content = bootstrap_content.map(Ok).unwrap_or_else(|| {
+            std::fs::read_to_string(&identity.bootstrap_file).map_err(|error| {
+                ApiError::internal(anyhow::anyhow!(
+                    "failed reading managed bootstrap file {}: {error}",
+                    identity.bootstrap_file
+                ))
+            })
+        })?;
+        enroll_client_identity_blocking(&identity, &bootstrap_content)
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow::anyhow!("enrollment task panicked: {error}")))?
 }
 
 fn enroll_client_identity_blocking(
     identity: &ClientIdentityConfig,
+    bootstrap_content: &str,
 ) -> Result<ClientIdentityEnrollmentReport, ApiError> {
-    let bootstrap_content = std::fs::read_to_string(&identity.bootstrap_file).map_err(|error| {
-        ApiError::internal(anyhow::anyhow!(
-            "failed reading managed bootstrap file {}: {error}",
-            identity.bootstrap_file
-        ))
-    })?;
     let enrolled =
-        enroll_connection_input_blocking(&bootstrap_content, None, Some(identity.label.as_str()))
+        enroll_connection_input_blocking(bootstrap_content, None, Some(identity.label.as_str()))
             .map_err(|error| {
-            ApiError::bad_request(format!("client identity enrollment failed: {error}"))
-        })?;
+                ApiError::bad_request(format!("client identity enrollment failed: {error}"))
+            })?;
     let material = enrolled.client_identity_material().map_err(|error| {
         ApiError::internal(error.context("failed building client identity material"))
     })?;
@@ -2341,6 +2362,7 @@ fn enroll_client_identity_blocking(
         identity_file: identity.client_identity_file.clone(),
         cluster_id: material.cluster_id.to_string(),
         device_id: material.device_id.to_string(),
+        connection_bootstrap_json: enrolled.connection_bootstrap_json,
         server_base_url: enrolled.server_base_url,
     })
 }
@@ -2366,7 +2388,7 @@ fn refresh_client_identity_metadata(identity: &mut ClientIdentityConfig) {
             .and_then(|pem| rendezvous_client_identity_not_after_unix(pem.as_bytes()).ok());
 }
 
-fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<String, ApiError> {
+fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<Option<String>, ApiError> {
     let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
         ApiError::bad_request(format!("bootstrap content must be valid JSON: {error}"))
     })?;
@@ -2379,13 +2401,15 @@ fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<String, Api
         &["bootstrap_bundle", "label"][..],
     ] {
         if let Some(label) = json_string_path(&value, path) {
-            return Ok(label);
+            return Ok(Some(label));
         }
     }
 
-    Err(ApiError::bad_request(
-        "bootstrap content must include device_label so the identity name can be derived",
-    ))
+    Ok(None)
+}
+
+fn default_client_identity_label(id: &str) -> String {
+    format!("Managed client identity {id}")
 }
 
 fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
@@ -2811,7 +2835,7 @@ const APP_HTML: &str = r###"<!doctype html>
               <input type="hidden" id="identity-id" />
               <label class="wide-field">
                 <span class="field-label">Bootstrap File</span>
-                <span class="field-help">Paste the bootstrap JSON from the server. The identity name is derived from its device_label.</span>
+                <span class="field-help">Paste the bootstrap JSON from the server. Its device_label is used when present; otherwise a managed identity name is generated.</span>
                 <textarea id="identity-bootstrap-content" spellcheck="false"></textarea>
               </label>
               <label class="checkbox checkbox-field">
@@ -2821,7 +2845,8 @@ const APP_HTML: &str = r###"<!doctype html>
                   <span class="field-help">Enrolls this device identity and writes the managed client identity file.</span>
                 </span>
               </label>
-              <button type="submit">Save Client Identity</button>
+              <p id="identity-form-status" class="form-feedback" role="status" aria-live="polite">Ready to enroll a client identity.</p>
+              <button id="save-identity-button" type="submit">Save Client Identity</button>
             </form>
           </section>
 
@@ -3149,6 +3174,9 @@ body {
   --nav-link-border: rgba(18, 184, 134, 0.16);
   --status-background: #f4f7f8;
   --status-foreground: #173039;
+  --form-feedback-pending: #865d00;
+  --form-feedback-success: #0d6b5c;
+  --form-feedback-error: #b42318;
 }
 
 :root[data-mantine-color-scheme="dark"] {
@@ -3177,6 +3205,9 @@ body {
   --nav-link-border: rgba(116, 228, 200, 0.14);
   --status-background: #0d171b;
   --status-foreground: #dff8f1;
+  --form-feedback-pending: #ffd58a;
+  --form-feedback-success: #74e4c8;
+  --form-feedback-error: #ffb4ab;
 }
 
 * {
@@ -3586,6 +3617,26 @@ dd {
   line-height: 1.45;
 }
 
+.form-feedback {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.form-feedback[data-state="pending"] {
+  color: var(--form-feedback-pending);
+}
+
+.form-feedback[data-state="success"] {
+  color: var(--form-feedback-success);
+}
+
+.form-feedback[data-state="error"] {
+  color: var(--form-feedback-error);
+}
+
 .instance-form input,
 .instance-form select,
 .instance-form textarea {
@@ -3842,6 +3893,12 @@ function renderInstanceDetailValue(kind, label, value, running) {
 function showStatus(value) {
   document.getElementById('status-output').textContent =
     typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+
+function showIdentityFormStatus(message, state) {
+  const target = document.getElementById('identity-form-status');
+  target.textContent = message;
+  target.dataset.state = state;
 }
 
 function renderLaunchReport(report) {
@@ -4357,19 +4414,53 @@ window.controlService = async function(serviceKind, encodedId, action) {
 
 async function submitIdentityForm(event) {
   event.preventDefault();
+  const submitButton = document.getElementById('save-identity-button');
+  const enroll = document.getElementById('identity-enroll').checked;
+  submitButton.disabled = true;
+  submitButton.textContent = enroll ? 'Enrolling Client Identity...' : 'Saving Client Identity...';
+  showIdentityFormStatus(
+    enroll
+      ? 'Contacting the BerryKeep server and enrolling this device...'
+      : 'Saving the client identity...',
+    'pending',
+  );
   const payload = {
     id: document.getElementById('identity-id').value || null,
     bootstrap_content: document.getElementById('identity-bootstrap-content').value,
-    enroll: document.getElementById('identity-enroll').checked,
+    enroll,
   };
-  const response = await fetchJson('/api/client-identities', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  renderConfig(response.config);
-  clearIdentityForm();
-  showStatus(response.enrollment ? response.enrollment : 'Saved client identity.');
+  let response;
+  try {
+    response = await fetchJson('/api/client-identities', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showIdentityFormStatus(`Client identity was not saved: ${message}`, 'error');
+    showStatus({ error: message });
+    submitButton.disabled = false;
+    submitButton.textContent = 'Save Client Identity';
+    return;
+  }
+
+  try {
+    renderConfig(response.config);
+    clearIdentityForm();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showIdentityFormStatus(`Client identity was saved, but the form could not refresh: ${message}`, 'error');
+    showStatus({ error: message, saved: true });
+    return;
+  } finally {
+    submitButton.disabled = false;
+    submitButton.textContent = 'Save Client Identity';
+  }
+
+  const status = response.enrollment ? 'Client identity enrolled and saved.' : 'Client identity saved.';
+  showIdentityFormStatus(status, 'success');
+  showStatus(response.enrollment ? response.enrollment : status);
 }
 
 async function submitClientForm(event) {
@@ -4485,9 +4576,7 @@ window.addEventListener('DOMContentLoaded', async () => {
       updateColorSchemeControls();
     }
   });
-  document.getElementById('identity-form').addEventListener('submit', (event) => {
-    submitIdentityForm(event).catch((error) => showStatus({ error: error.message }));
-  });
+  document.getElementById('identity-form').addEventListener('submit', submitIdentityForm);
   document.getElementById('client-form').addEventListener('submit', (event) => {
     submitClientForm(event).catch((error) => showStatus({ error: error.message }));
   });
@@ -4550,6 +4639,49 @@ mod tests {
             rendezvous_client_identity_expires_at_unix: None,
             last_enrolled_at_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn claim_without_device_label_uses_a_generated_managed_identity_name() {
+        let request = UpsertClientIdentityRequest {
+            id: Some("claim-identity".to_string()),
+            bootstrap_content: r#"{"v":1,"c":"cluster","n":"node","r":[],"t":"trust","k":"claim"}"#
+                .to_string(),
+            enroll: true,
+        };
+
+        let (identity, _, enroll) = request
+            .into_identity(None, Path::new("/managed/instances.json"))
+            .expect("claim input should create a managed identity");
+
+        assert!(enroll);
+        assert_eq!(identity.label, "Managed client identity claim-identity");
+    }
+
+    #[test]
+    fn bootstrap_device_label_remains_the_managed_identity_name() {
+        let label = client_identity_label_from_bootstrap_content(
+            r#"{"bootstrap_bundle":{"device_label":"Desktop client"}}"#,
+        )
+        .expect("bootstrap JSON should parse");
+
+        assert_eq!(label.as_deref(), Some("Desktop client"));
+    }
+
+    #[test]
+    fn claim_enrollment_persists_the_redeemed_connection_bootstrap() {
+        let enrollment = ClientIdentityEnrollmentReport {
+            identity_file: "/managed/client-identity.json".to_string(),
+            cluster_id: "cluster".to_string(),
+            device_id: "device".to_string(),
+            connection_bootstrap_json: Some("{\"bootstrap_bundle\":true}".to_string()),
+            server_base_url: None,
+        };
+
+        assert_eq!(
+            persisted_bootstrap_content(&enrollment, Some("{\"k\":\"claim\"}")),
+            Some("{\"bootstrap_bundle\":true}")
+        );
     }
 
     const KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX: u64 = 1_776_690_574;
