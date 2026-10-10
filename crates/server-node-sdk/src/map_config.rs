@@ -386,6 +386,7 @@ pub(crate) async fn admin_put_config(
         &outcome.version_id,
     )
     .await;
+    clear_map_configuration_read_through_backoff(&state).await;
 
     append_admin_audit(
         &state,
@@ -443,13 +444,14 @@ async fn load_current_configuration_serialized(
             .await
     };
     let cached_backoff = cached_map_configuration_read_through_backoff(state).await;
+    let local_payload_only_backoff = match (&local_descriptor, &cached_backoff) {
+        (Ok(_), Some(MapConfigurationReadThroughBackoff::Unavailable(message))) => {
+            Some(message.clone())
+        }
+        _ => None,
+    };
     let descriptor = match local_descriptor {
-        Ok(descriptor) => match cached_backoff {
-            Some(MapConfigurationReadThroughBackoff::Unavailable(message)) => {
-                bail!("gallery map configuration remains unavailable: {message}")
-            }
-            Some(MapConfigurationReadThroughBackoff::Missing) | None => Some(descriptor),
-        },
+        Ok(descriptor) => Some(descriptor),
         Err(StoreReadError::NotFound | StoreReadError::Corrupt(_)) if cached_backoff.is_some() => {
             match cached_backoff.expect("guarded above") {
                 MapConfigurationReadThroughBackoff::Missing => None,
@@ -508,29 +510,44 @@ async fn load_current_configuration_serialized(
         });
     };
 
-    let payload = match read_current_object_range_through_peer(
-        state,
-        CurrentObjectRangeRead {
-            key: MAP_CONFIGURATION_STORAGE_KEY,
-            manifest_hash: &descriptor.manifest_hash,
-            range_start: 0,
-            range_end_exclusive: descriptor.total_size_bytes,
-            is_range_request: false,
-            recovery_deadline: None,
-        },
-    )
-    .await
-    {
-        Ok(payload) => payload,
-        Err(error) => {
-            let error = anyhow!("{error}")
-                .context("failed reading gallery map configuration through peer cache");
-            cache_map_configuration_read_through_backoff(
-                state,
-                MapConfigurationReadThroughBackoff::Unavailable(error.to_string()),
-            )
-            .await;
-            return Err(error);
+    let payload = if let Some(message) = local_payload_only_backoff {
+        let bytes = read_current_object_range_locally(
+            state,
+            &descriptor.manifest_hash,
+            0,
+            descriptor.total_size_bytes,
+        )
+        .await
+        .map_err(|_| anyhow!("gallery map configuration remains unavailable: {message}"))?;
+        ReadThroughObjectRange {
+            bytes,
+            recovered_chunk_count: 0,
+        }
+    } else {
+        match read_current_object_range_through_peer(
+            state,
+            CurrentObjectRangeRead {
+                key: MAP_CONFIGURATION_STORAGE_KEY,
+                manifest_hash: &descriptor.manifest_hash,
+                range_start: 0,
+                range_end_exclusive: descriptor.total_size_bytes,
+                is_range_request: false,
+                recovery_deadline: None,
+            },
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                let error = anyhow!("{error}")
+                    .context("failed reading gallery map configuration through peer cache");
+                cache_map_configuration_read_through_backoff(
+                    state,
+                    MapConfigurationReadThroughBackoff::Unavailable(error.to_string()),
+                )
+                .await;
+                return Err(error);
+            }
         }
     };
     if payload.recovered_chunk_count > 0 {

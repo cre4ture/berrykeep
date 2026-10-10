@@ -18777,6 +18777,22 @@ async fn map_configuration_read_through_fetches_missing_chunks_impl(backend: Mai
     assert!(loaded.stored);
     assert_eq!(loaded.configuration, configuration);
 
+    *target
+        .storage
+        .map_configuration_read_through_backoff
+        .lock()
+        .await = Some(super::CachedMapConfigurationReadThroughBackoff {
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        outcome: super::MapConfigurationReadThroughBackoff::Unavailable(
+            "stale read-through failure".to_string(),
+        ),
+    });
+    let reloaded = super::map_config::load_current_configuration(&target)
+        .await
+        .unwrap();
+    assert!(reloaded.stored);
+    assert_eq!(reloaded.configuration, configuration);
+
     let missing_chunks = {
         let store = read_store(&target, "tests.map_config.target.verify_cache").await;
         store

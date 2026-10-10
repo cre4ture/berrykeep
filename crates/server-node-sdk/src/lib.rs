@@ -20968,20 +20968,29 @@ pub(crate) struct ReadThroughObjectRange {
     pub(crate) recovered_chunk_count: usize,
 }
 
+pub(crate) async fn read_current_object_range_locally(
+    state: &ServerState,
+    manifest_hash: &str,
+    range_start: usize,
+    range_end_exclusive: usize,
+) -> Result<Bytes, StoreReadError> {
+    let store = read_store(state, "object_read.read_local_range").await;
+    store
+        .read_object_range_by_manifest_hash(manifest_hash, range_start, range_end_exclusive)
+        .await
+}
+
 pub(crate) async fn read_current_object_range_through_peer(
     state: &ServerState,
     request: CurrentObjectRangeRead<'_>,
 ) -> Result<ReadThroughObjectRange, StoreReadError> {
-    let local_read = {
-        let store = read_store(state, "object_read.read_local_range").await;
-        store
-            .read_object_range_by_manifest_hash(
-                request.manifest_hash,
-                request.range_start,
-                request.range_end_exclusive,
-            )
-            .await
-    };
+    let local_read = read_current_object_range_locally(
+        state,
+        request.manifest_hash,
+        request.range_start,
+        request.range_end_exclusive,
+    )
+    .await;
     let initial_error = match local_read {
         Ok(bytes) => {
             return Ok(ReadThroughObjectRange {
