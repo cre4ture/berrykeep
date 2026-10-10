@@ -330,6 +330,24 @@ struct CachedClusterTaskQueueSnapshot {
 }
 
 #[derive(Clone)]
+enum MapConfigurationReadThroughBackoff {
+    Missing,
+    Unavailable(String),
+}
+
+#[derive(Clone)]
+struct CachedMapConfigurationReadThroughBackoff {
+    expires_at: Instant,
+    outcome: MapConfigurationReadThroughBackoff,
+}
+
+#[derive(Clone)]
+struct CachedMbtilesSourceInitializationFailure {
+    expires_at: Instant,
+    message: String,
+}
+
+#[derive(Clone)]
 struct ServerState {
     managed_paths: ManagedPaths,
     cluster_id: ClusterId,
@@ -388,9 +406,12 @@ struct ServerStorageRuntime {
     store_history_refresh_permits: Arc<Semaphore>,
     map_perf_logging_enabled: bool,
     map_glyphs_root: Option<PathBuf>,
-    map_configuration_metadata_miss_until: Arc<Mutex<Option<Instant>>>,
+    map_configuration_read_through_backoff:
+        Arc<Mutex<Option<CachedMapConfigurationReadThroughBackoff>>>,
     mbtiles_sources: Arc<RwLock<HashMap<String, Arc<web_maps::LogicalMbtilesSource>>>>,
     mbtiles_source_initialization_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    mbtiles_source_initialization_failures:
+        Arc<Mutex<HashMap<String, CachedMbtilesSourceInitializationFailure>>>,
     last_gc_pass: Arc<StdMutex<Option<GcPassSummary>>>,
 }
 
@@ -7739,9 +7760,10 @@ async fn run_inner(
             )),
             map_perf_logging_enabled,
             map_glyphs_root: web_maps::resolve_map_glyphs_root(None),
-            map_configuration_metadata_miss_until: Arc::new(Mutex::new(None)),
+            map_configuration_read_through_backoff: Arc::new(Mutex::new(None)),
             mbtiles_sources: Arc::new(RwLock::new(HashMap::new())),
             mbtiles_source_initialization_locks: Arc::new(Mutex::new(HashMap::new())),
+            mbtiles_source_initialization_failures: Arc::new(Mutex::new(HashMap::new())),
             last_gc_pass: Arc::new(StdMutex::new(None)),
         },
         access: ServerAccessRuntime {

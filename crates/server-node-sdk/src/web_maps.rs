@@ -17,6 +17,8 @@ pub(crate) use mbtiles::LogicalMbtilesSource;
 
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 const MAP_MANIFEST_PREFIX: &str = "sys/maps/";
+const MBTILES_SOURCE_INITIALIZATION_FAILURE_TTL: Duration = Duration::from_secs(10);
+const MBTILES_SOURCE_INITIALIZATION_FAILURE_CACHE_MAX_ENTRIES: usize = 128;
 
 /// Cancels a blocking tile lookup when its request handler is dropped.
 #[derive(Clone, Default)]
@@ -871,6 +873,9 @@ async fn get_or_create_mbtiles_source(
         }
         return Ok(source);
     }
+    if let Some(message) = cached_mbtiles_source_initialization_failure(state, manifest_key).await {
+        bail!("MBTiles source initialization remains unavailable: {message}");
+    }
 
     let initialization_lock = {
         let mut locks = state
@@ -888,26 +893,36 @@ async fn get_or_create_mbtiles_source(
         .await
         .map_err(|_| anyhow!("MBTiles source initialization lock closed"))?;
 
-    let initialization_result = async {
-        if let Some(source) = state
-            .storage
-            .mbtiles_sources
-            .read()
-            .await
-            .get(manifest_key)
-            .cloned()
-        {
-            if state.storage.map_perf_logging_enabled {
-                info!(
-                    manifest_key = %manifest_key,
-                    cache = "single-flight-hit",
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "map perf: reused concurrently initialized MBTiles source"
-                );
-            }
-            return Ok(source);
+    if let Some(source) = state
+        .storage
+        .mbtiles_sources
+        .read()
+        .await
+        .get(manifest_key)
+        .cloned()
+    {
+        drop(initialization_permit);
+        clear_mbtiles_source_initialization_failure(state, manifest_key).await;
+        remove_idle_mbtiles_source_initialization_lock(state, manifest_key, &initialization_lock)
+            .await;
+        if state.storage.map_perf_logging_enabled {
+            info!(
+                manifest_key = %manifest_key,
+                cache = "single-flight-hit",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "map perf: reused concurrently initialized MBTiles source"
+            );
         }
+        return Ok(source);
+    }
+    if let Some(message) = cached_mbtiles_source_initialization_failure(state, manifest_key).await {
+        drop(initialization_permit);
+        remove_idle_mbtiles_source_initialization_lock(state, manifest_key, &initialization_lock)
+            .await;
+        bail!("MBTiles source initialization remains unavailable: {message}");
+    }
 
+    let initialization_result = async {
         let loaded_manifest = load_split_logical_file_manifest(state, manifest_key).await?;
         let handle = tokio::runtime::Handle::current();
         let manifest_key_owned = manifest_key.to_string();
@@ -954,8 +969,63 @@ async fn get_or_create_mbtiles_source(
     .await;
 
     drop(initialization_permit);
+    match &initialization_result {
+        Ok(_) => clear_mbtiles_source_initialization_failure(state, manifest_key).await,
+        Err(error) => cache_mbtiles_source_initialization_failure(state, manifest_key, error).await,
+    }
     remove_idle_mbtiles_source_initialization_lock(state, manifest_key, &initialization_lock).await;
     initialization_result
+}
+
+async fn cached_mbtiles_source_initialization_failure(
+    state: &ServerState,
+    manifest_key: &str,
+) -> Option<String> {
+    let mut failures = state
+        .storage
+        .mbtiles_source_initialization_failures
+        .lock()
+        .await;
+    let now = Instant::now();
+    failures.retain(|_, failure| failure.expires_at > now);
+    failures
+        .get(manifest_key)
+        .map(|failure| failure.message.clone())
+}
+
+async fn cache_mbtiles_source_initialization_failure(
+    state: &ServerState,
+    manifest_key: &str,
+    error: &anyhow::Error,
+) {
+    let mut failures = state
+        .storage
+        .mbtiles_source_initialization_failures
+        .lock()
+        .await;
+    let now = Instant::now();
+    failures.retain(|_, failure| failure.expires_at > now);
+    if failures.len() >= MBTILES_SOURCE_INITIALIZATION_FAILURE_CACHE_MAX_ENTRIES
+        && !failures.contains_key(manifest_key)
+    {
+        return;
+    }
+    failures.insert(
+        manifest_key.to_string(),
+        CachedMbtilesSourceInitializationFailure {
+            expires_at: now + MBTILES_SOURCE_INITIALIZATION_FAILURE_TTL,
+            message: error.to_string(),
+        },
+    );
+}
+
+async fn clear_mbtiles_source_initialization_failure(state: &ServerState, manifest_key: &str) {
+    state
+        .storage
+        .mbtiles_source_initialization_failures
+        .lock()
+        .await
+        .remove(manifest_key);
 }
 
 async fn remove_idle_mbtiles_source_initialization_lock(

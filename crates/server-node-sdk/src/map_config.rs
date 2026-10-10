@@ -428,13 +428,21 @@ pub(crate) async fn load_current_configuration(
             )
             .await
     };
+    let cached_backoff = cached_map_configuration_read_through_backoff(state).await;
     let descriptor = match local_descriptor {
-        Ok(descriptor) => {
-            clear_map_configuration_metadata_miss(state).await;
-            Some(descriptor)
-        }
-        Err(StoreReadError::NotFound) if map_configuration_metadata_miss_is_cached(state).await => {
-            None
+        Ok(descriptor) => match cached_backoff {
+            Some(MapConfigurationReadThroughBackoff::Unavailable(message)) => {
+                bail!("gallery map configuration remains unavailable: {message}")
+            }
+            Some(MapConfigurationReadThroughBackoff::Missing) | None => Some(descriptor),
+        },
+        Err(StoreReadError::NotFound | StoreReadError::Corrupt(_)) if cached_backoff.is_some() => {
+            match cached_backoff.expect("guarded above") {
+                MapConfigurationReadThroughBackoff::Missing => None,
+                MapConfigurationReadThroughBackoff::Unavailable(message) => {
+                    bail!("gallery map configuration remains unavailable: {message}")
+                }
+            }
         }
         Err(StoreReadError::NotFound | StoreReadError::Corrupt(_)) => {
             match describe_object_with_metadata_read_through(
@@ -448,18 +456,31 @@ pub(crate) async fn load_current_configuration(
             )
             .await
             {
-                Ok(descriptor) => {
-                    clear_map_configuration_metadata_miss(state).await;
-                    Some(descriptor)
-                }
+                Ok(descriptor) => Some(descriptor),
                 Err(StoreReadError::NotFound) => {
-                    cache_map_configuration_metadata_miss(state).await;
+                    cache_map_configuration_read_through_backoff(
+                        state,
+                        MapConfigurationReadThroughBackoff::Missing,
+                    )
+                    .await;
                     None
                 }
                 Err(StoreReadError::Corrupt(message)) => {
+                    cache_map_configuration_read_through_backoff(
+                        state,
+                        MapConfigurationReadThroughBackoff::Unavailable(message.clone()),
+                    )
+                    .await;
                     bail!("gallery map configuration is corrupt: {message}")
                 }
-                Err(StoreReadError::Internal(err)) => return Err(err),
+                Err(StoreReadError::Internal(err)) => {
+                    cache_map_configuration_read_through_backoff(
+                        state,
+                        MapConfigurationReadThroughBackoff::Unavailable(err.to_string()),
+                    )
+                    .await;
+                    return Err(err);
+                }
             }
         }
         Err(StoreReadError::Internal(err)) => return Err(err),
@@ -473,7 +494,7 @@ pub(crate) async fn load_current_configuration(
         });
     };
 
-    let payload = read_current_object_range_through_peer(
+    let payload = match read_current_object_range_through_peer(
         state,
         CurrentObjectRangeRead {
             key: MAP_CONFIGURATION_STORAGE_KEY,
@@ -485,8 +506,19 @@ pub(crate) async fn load_current_configuration(
         },
     )
     .await
-    .map_err(|error| anyhow!("{error}"))
-    .context("failed reading gallery map configuration through peer cache")?;
+    {
+        Ok(payload) => payload,
+        Err(error) => {
+            let error = anyhow!("{error}")
+                .context("failed reading gallery map configuration through peer cache");
+            cache_map_configuration_read_through_backoff(
+                state,
+                MapConfigurationReadThroughBackoff::Unavailable(error.to_string()),
+            )
+            .await;
+            return Err(error);
+        }
+    };
     if payload.recovered_chunk_count > 0 {
         request_local_availability_refresh(state);
     }
@@ -496,6 +528,7 @@ pub(crate) async fn load_current_configuration(
     validate_configuration(&stored_configuration)?;
     let (configuration, needs_persistence) = add_default_map_variants(stored_configuration);
     validate_configuration(&configuration)?;
+    clear_map_configuration_read_through_backoff(state).await;
     Ok(LoadedMapConfiguration {
         configuration,
         stored: true,
@@ -503,35 +536,43 @@ pub(crate) async fn load_current_configuration(
     })
 }
 
-async fn map_configuration_metadata_miss_is_cached(state: &ServerState) -> bool {
-    let mut miss_until = state
+async fn cached_map_configuration_read_through_backoff(
+    state: &ServerState,
+) -> Option<MapConfigurationReadThroughBackoff> {
+    let mut cached = state
         .storage
-        .map_configuration_metadata_miss_until
+        .map_configuration_read_through_backoff
         .lock()
         .await;
     let now = Instant::now();
-    match *miss_until {
-        Some(until) if until > now => true,
+    match cached.as_ref() {
+        Some(entry) if entry.expires_at > now => Some(entry.outcome.clone()),
         Some(_) => {
-            *miss_until = None;
-            false
+            *cached = None;
+            None
         }
-        None => false,
+        None => None,
     }
 }
 
-async fn cache_map_configuration_metadata_miss(state: &ServerState) {
+async fn cache_map_configuration_read_through_backoff(
+    state: &ServerState,
+    outcome: MapConfigurationReadThroughBackoff,
+) {
     *state
         .storage
-        .map_configuration_metadata_miss_until
+        .map_configuration_read_through_backoff
         .lock()
-        .await = Some(Instant::now() + MAP_CONFIGURATION_METADATA_MISS_TTL);
+        .await = Some(CachedMapConfigurationReadThroughBackoff {
+        expires_at: Instant::now() + MAP_CONFIGURATION_METADATA_MISS_TTL,
+        outcome,
+    });
 }
 
-async fn clear_map_configuration_metadata_miss(state: &ServerState) {
+async fn clear_map_configuration_read_through_backoff(state: &ServerState) {
     *state
         .storage
-        .map_configuration_metadata_miss_until
+        .map_configuration_read_through_backoff
         .lock()
         .await = None;
 }
