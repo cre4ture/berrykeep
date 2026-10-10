@@ -632,6 +632,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "windows-sys 0.61.2",
  "winres",
 ]
