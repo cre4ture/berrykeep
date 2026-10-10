@@ -338,8 +338,12 @@ pub(crate) async fn xyz_tile(
 
     let tile_lookup = tokio::task::spawn_blocking({
         let cancelled = request_cancellation.flag();
+        let blocking_permits = Arc::clone(&state.storage.mbtiles_blocking_permits);
         move || {
-            let _tile_lookup_permit = tile_lookup_permit;
+            let _tile_lookup_permit = mbtiles::ActiveMbtilesBlockingPermitGuard::install(
+                blocking_permits,
+                tile_lookup_permit,
+            );
             source.lookup_tile_with_cancellation(z, x, y, cancelled)
         }
     })
@@ -400,8 +404,12 @@ pub(crate) async fn vector_tile(
 
     let tile_lookup = tokio::task::spawn_blocking({
         let cancelled = request_cancellation.flag();
+        let blocking_permits = Arc::clone(&state.storage.mbtiles_blocking_permits);
         move || {
-            let _tile_lookup_permit = tile_lookup_permit;
+            let _tile_lookup_permit = mbtiles::ActiveMbtilesBlockingPermitGuard::install(
+                blocking_permits,
+                tile_lookup_permit,
+            );
             source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
         }
     })
@@ -949,8 +957,13 @@ async fn get_or_create_mbtiles_source(
             .map_err(|_| anyhow!("MBTiles blocking-work semaphore closed"))?;
         let source = tokio::task::spawn_blocking({
             let state = state.clone_for_mbtiles_read_through();
+            let blocking_permits = Arc::clone(&state.storage.mbtiles_blocking_permits);
             move || {
-                let _source_construction_permit = source_construction_permit;
+                let _source_construction_permit =
+                    mbtiles::ActiveMbtilesBlockingPermitGuard::install(
+                        blocking_permits,
+                        source_construction_permit,
+                    );
                 mbtiles::LogicalMbtilesSource::new(
                     manifest_key_owned,
                     state,
