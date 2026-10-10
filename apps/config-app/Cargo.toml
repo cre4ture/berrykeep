@@ -27,6 +27,7 @@ desktop-client-config = { path = "../../crates/desktop-client-config" }
 [dev-dependencies]
 assert_cmd.workspace = true
 reqwest.workspace = true
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres.workspace = true

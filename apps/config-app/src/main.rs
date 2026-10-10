@@ -623,56 +623,7 @@ async fn main() -> Result<()> {
             .context("failed saving launch report before config app startup")?;
     }
 
-    let app = Router::new()
-        .route("/", get(index_html))
-        .route("/favicon.svg", get(app_favicon))
-        .route("/app.css", get(app_css))
-        .route("/app.js", get(app_js))
-        .route("/api/config", get(get_config))
-        .route("/api/client-identities", post(upsert_client_identity))
-        .route(
-            "/api/client-cli-instances",
-            post(upsert_client_cli_instance),
-        )
-        .route(
-            "/api/os-integration-instances",
-            post(upsert_os_integration_instance),
-        )
-        .route(
-            "/api/folder-agent-instances",
-            post(upsert_folder_agent_instance),
-        )
-        .route(
-            "/api/os-integration-instances/{id}",
-            delete(delete_os_integration_instance),
-        )
-        .route(
-            "/api/folder-agent-instances/{id}",
-            delete(delete_folder_agent_instance),
-        )
-        .route(
-            "/api/client-identities/{id}",
-            delete(delete_client_identity),
-        )
-        .route(
-            "/api/client-cli-instances/{id}",
-            delete(delete_client_cli_instance),
-        )
-        .route(
-            "/api/services/{kind}/{id}/start",
-            post(start_service_instance),
-        )
-        .route(
-            "/api/services/{kind}/{id}/stop",
-            post(stop_service_instance),
-        )
-        .route(
-            "/api/services/{kind}/{id}/restart",
-            post(restart_service_instance),
-        )
-        .route("/api/launch-enabled", post(launch_enabled_now))
-        .route("/api/shutdown", post(shutdown_app))
-        .with_state(state.clone());
+    let app = build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
@@ -732,6 +683,59 @@ async fn main() -> Result<()> {
         .context("config UI server exited with error")?;
 
     Ok(())
+}
+
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(index_html))
+        .route(APP_FAVICON_PATH, get(app_favicon))
+        .route("/app.css", get(app_css))
+        .route("/app.js", get(app_js))
+        .route("/api/config", get(get_config))
+        .route("/api/client-identities", post(upsert_client_identity))
+        .route(
+            "/api/client-cli-instances",
+            post(upsert_client_cli_instance),
+        )
+        .route(
+            "/api/os-integration-instances",
+            post(upsert_os_integration_instance),
+        )
+        .route(
+            "/api/folder-agent-instances",
+            post(upsert_folder_agent_instance),
+        )
+        .route(
+            "/api/os-integration-instances/{id}",
+            delete(delete_os_integration_instance),
+        )
+        .route(
+            "/api/folder-agent-instances/{id}",
+            delete(delete_folder_agent_instance),
+        )
+        .route(
+            "/api/client-identities/{id}",
+            delete(delete_client_identity),
+        )
+        .route(
+            "/api/client-cli-instances/{id}",
+            delete(delete_client_cli_instance),
+        )
+        .route(
+            "/api/services/{kind}/{id}/start",
+            post(start_service_instance),
+        )
+        .route(
+            "/api/services/{kind}/{id}/stop",
+            post(stop_service_instance),
+        )
+        .route(
+            "/api/services/{kind}/{id}/restart",
+            post(restart_service_instance),
+        )
+        .route("/api/launch-enabled", post(launch_enabled_now))
+        .route("/api/shutdown", post(shutdown_app))
+        .with_state(state)
 }
 
 fn run_command(cli: &Cli, command: &Command) -> Result<()> {
@@ -2666,6 +2670,7 @@ fn open_browser(url: &str) -> Result<()> {
 
 const APP_HTML: &str = include_str!("assets/app.html");
 
+const APP_FAVICON_PATH: &str = "/favicon.svg";
 const APP_FAVICON: &str = include_str!("../../../docs/assets/berrykeep-favicon.svg");
 
 const APP_CSS: &str = r###"
@@ -4181,15 +4186,63 @@ window.addEventListener('DOMContentLoaded', async () => {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn app_favicon_route_serves_the_product_favicon() {
+        let response = build_router(test_app_state())
+            .oneshot(
+                Request::builder()
+                    .uri(APP_FAVICON_PATH)
+                    .body(Body::empty())
+                    .expect("favicon request should build"),
+            )
+            .await
+            .expect("favicon route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/svg+xml; charset=utf-8")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("favicon response body should read");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("favicon response should be UTF-8")
+                .contains("connected grape cluster with a green leaf")
+        );
+    }
 
     #[test]
     fn embedded_ui_exposes_the_product_favicon_and_build_version_in_the_header() {
-        assert!(APP_HTML.contains("/favicon.svg"));
+        assert!(APP_HTML.contains(APP_FAVICON_PATH));
         assert!(APP_HTML.contains("id=\"desktop-config-header-version\""));
         assert!(APP_JS.contains("desktop-config-header-version"));
         assert!(APP_JS.contains("function formatHeaderVersion"));
         assert!(APP_JS.contains("document.title = `${desktopConfigTitle}"));
         assert!(APP_FAVICON.contains("connected grape cluster with a green leaf"));
+    }
+
+    fn test_app_state() -> AppState {
+        AppState {
+            paths: ManagedPaths::new(
+                PathBuf::from("/test/instances.json"),
+                PathBuf::from("/test/launch-report.json"),
+                PathBuf::from("/test/package"),
+            ),
+            runtime: ConfigAppRuntime {
+                shutdown_tx: Arc::new(Mutex::new(None)),
+            },
+        }
     }
 
     fn sample_identity(id: &str, client_identity_file: &str) -> ClientIdentityConfig {
