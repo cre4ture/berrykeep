@@ -335,7 +335,8 @@ struct CachedClusterTaskQueueSnapshot {
 #[derive(Clone)]
 enum MapConfigurationReadThroughBackoff {
     Missing,
-    Unavailable(String),
+    MetadataUnavailable(String),
+    ContentUnavailable(String),
 }
 
 #[derive(Clone)]

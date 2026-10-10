@@ -18783,7 +18783,7 @@ async fn map_configuration_read_through_fetches_missing_chunks_impl(backend: Mai
         .lock()
         .await = Some(super::CachedMapConfigurationReadThroughBackoff {
         expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
-        outcome: super::MapConfigurationReadThroughBackoff::Unavailable(
+        outcome: super::MapConfigurationReadThroughBackoff::ContentUnavailable(
             "stale read-through failure".to_string(),
         ),
     });
@@ -18816,6 +18816,53 @@ async fn map_configuration_read_through_fetches_missing_chunks_impl(backend: Mai
             .unwrap()
     };
     assert!(missing_chunks.is_empty());
+
+    *target
+        .storage
+        .map_configuration_read_through_backoff
+        .lock()
+        .await = Some(super::CachedMapConfigurationReadThroughBackoff {
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        outcome: super::MapConfigurationReadThroughBackoff::Missing,
+    });
+    {
+        let store = lock_store(&target, "tests.map_config.target.remove_manifest_with_miss").await;
+        fs::remove_file(store.manifest_path_for_test(&put.manifest_hash))
+            .await
+            .unwrap();
+    }
+    let recovered_after_cached_miss = super::map_config::load_current_configuration(&target)
+        .await
+        .unwrap();
+    assert!(recovered_after_cached_miss.stored);
+    assert_eq!(recovered_after_cached_miss.configuration, configuration);
+
+    {
+        let store = lock_store(&target, "tests.map_config.target.remove_cached_manifest").await;
+        fs::remove_file(store.manifest_path_for_test(&put.manifest_hash))
+            .await
+            .unwrap();
+    }
+    *target
+        .storage
+        .map_configuration_read_through_backoff
+        .lock()
+        .await = Some(super::CachedMapConfigurationReadThroughBackoff {
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        outcome: super::MapConfigurationReadThroughBackoff::ContentUnavailable(
+            "map content is temporarily unavailable".to_string(),
+        ),
+    });
+    let public_response = super::map_config::public_config(axum::extract::State(target.clone()))
+        .await
+        .into_response();
+    assert_eq!(public_response.status(), axum::http::StatusCode::OK);
+    let public_body = axum::body::to_bytes(public_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let public_payload: serde_json::Value = serde_json::from_slice(&public_body).unwrap();
+    assert_eq!(public_payload["stored"], false);
+
     assert!(
         target
             .cluster
