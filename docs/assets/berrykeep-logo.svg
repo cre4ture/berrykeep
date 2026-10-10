@@ -1,68 +1,51 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 260" role="img" aria-labelledby="title desc">
-  <title id="title">berrykeep logo</title>
-  <desc id="desc">The berrykeep logo with a connected mesh icon and wordmark.</desc>
+  <title id="title">BerryKeep logo</title>
+  <desc id="desc">The BerryKeep logo with a connected grape cluster, wordmark, and connected status line.</desc>
   <defs>
-    <linearGradient id="panel" x1="24" y1="20" x2="220" y2="232" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#112523"/>
-      <stop offset="0.52" stop-color="#163f3a"/>
-      <stop offset="1" stop-color="#0d6b5c"/>
+    <linearGradient id="panel" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#c026d3"/>
     </linearGradient>
-    <linearGradient id="mesh" x1="72" y1="68" x2="184" y2="188" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#d9fff4"/>
-      <stop offset="0.45" stop-color="#74e4c8"/>
-      <stop offset="1" stop-color="#14b8a6"/>
+    <linearGradient id="leaf" x1="100" y1="6.24" x2="152.8" y2="37.92" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#86efac"/>
+      <stop offset="1" stop-color="#22c55e"/>
     </linearGradient>
-    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(84 72) rotate(45) scale(154 132)" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#74e4c8" stop-opacity="0.42"/>
-      <stop offset="1" stop-color="#74e4c8" stop-opacity="0"/>
-    </radialGradient>
-    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#0b1615" flood-opacity="0.18"/>
-    </filter>
+    <linearGradient id="status-line" x1="6" y1="0" x2="520" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a855f7"/>
+      <stop offset="1" stop-color="#d946ef"/>
+    </linearGradient>
   </defs>
 
-  <g transform="translate(10 6)">
-    <rect x="28" y="28" width="200" height="200" rx="54" fill="url(#panel)" filter="url(#soft-shadow)"/>
-    <rect x="28" y="28" width="200" height="200" rx="54" fill="url(#glow)"/>
-    <g fill="none" stroke="url(#mesh)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M128 68 L176 96 L176 160 L128 188 L80 160 L80 96 Z"/>
-      <path d="M128 68 L128 188"/>
-      <path d="M80 96 L176 160"/>
-      <path d="M176 96 L80 160"/>
-      <path d="M80 96 L176 96"/>
-      <path d="M80 160 L176 160"/>
+  <g transform="translate(38 30)">
+    <rect width="200" height="200" rx="44" fill="url(#panel)"/>
+    <path d="M100 22.08 Q126.4 6.24 152.8 16.8 Q140.92 37.92 113.2 37.92 Z" fill="url(#leaf)"/>
+    <line x1="100" y1="35.28" x2="100" y2="53.76" stroke="#22c55e" stroke-width="6.6" stroke-linecap="round"/>
+    <g stroke="#ffffff" stroke-width="6.6" opacity="0.85" stroke-linecap="round">
+      <line x1="100" y1="69.6" x2="57.76" y2="109.2"/>
+      <line x1="100" y1="69.6" x2="142.24" y2="109.2"/>
+      <line x1="57.76" y1="109.2" x2="142.24" y2="109.2"/>
+      <line x1="57.76" y1="109.2" x2="100" y2="162"/>
+      <line x1="142.24" y1="109.2" x2="100" y2="162"/>
     </g>
-    <g fill="#effff9">
-      <circle cx="128" cy="68" r="10"/>
-      <circle cx="176" cy="96" r="10"/>
-      <circle cx="176" cy="160" r="10"/>
-      <circle cx="128" cy="188" r="10"/>
-      <circle cx="80" cy="160" r="10"/>
-      <circle cx="80" cy="96" r="10"/>
-      <circle cx="128" cy="128" r="12" fill="#14b8a6"/>
-    </g>
-    <g fill="#0d3d37">
-      <circle cx="128" cy="68" r="4"/>
-      <circle cx="176" cy="96" r="4"/>
-      <circle cx="176" cy="160" r="4"/>
-      <circle cx="128" cy="188" r="4"/>
-      <circle cx="80" cy="160" r="4"/>
-      <circle cx="80" cy="96" r="4"/>
-      <circle cx="128" cy="128" r="4" fill="#e9fff8"/>
-    </g>
+    <circle cx="100" cy="69.6" r="18.48" fill="#ffffff"/>
+    <circle cx="57.76" cy="109.2" r="18.48" fill="#ffffff"/>
+    <circle cx="142.24" cy="109.2" r="18.48" fill="#ffffff"/>
+    <circle cx="100" cy="162" r="18.48" fill="#ffffff"/>
+    <circle cx="93.4" cy="63" r="5.016" fill="#e9d5ff" opacity="0.75"/>
+    <circle cx="51.16" cy="102.6" r="5.016" fill="#e9d5ff" opacity="0.75"/>
   </g>
 
   <g transform="translate(286 0)">
-    <text x="0" y="122" fill="#112523" font-family="Space Grotesk, Segoe UI, Arial, sans-serif" font-size="94" font-weight="700" letter-spacing="-3">
-      berrykeep
+    <text x="0" y="122" fill="#4c1d95" font-family="Space Grotesk, Segoe UI, Arial, sans-serif" font-size="94" font-weight="700" letter-spacing="-3">
+      BerryKeep
     </text>
-    <text x="4" y="166" fill="#0d6b5c" font-family="Space Grotesk, Segoe UI, Arial, sans-serif" font-size="24" font-weight="600" letter-spacing="3.4">
+    <text x="4" y="166" fill="#a21caf" font-family="Space Grotesk, Segoe UI, Arial, sans-serif" font-size="24" font-weight="600" letter-spacing="3.4">
       DISTRIBUTED EDGE STORAGE
     </text>
-    <path d="M6 190 H520" stroke="#74e4c8" stroke-width="6" stroke-linecap="round"/>
-    <circle cx="6" cy="190" r="6" fill="#14b8a6"/>
-    <circle cx="180" cy="190" r="6" fill="#74e4c8"/>
-    <circle cx="348" cy="190" r="6" fill="#74e4c8"/>
-    <circle cx="520" cy="190" r="6" fill="#14b8a6"/>
+    <path d="M6 190 H520" stroke="url(#status-line)" stroke-width="6" stroke-linecap="round"/>
+    <circle cx="6" cy="190" r="6" fill="#22c55e"/>
+    <circle cx="180" cy="190" r="6" fill="#a855f7"/>
+    <circle cx="348" cy="190" r="6" fill="#d946ef"/>
+    <circle cx="520" cy="190" r="6" fill="#22c55e"/>
   </g>
 </svg>
