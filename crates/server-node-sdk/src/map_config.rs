@@ -590,27 +590,9 @@ async fn load_current_configuration_inner(
         .await
         {
             Ok(payload) => payload,
-            Err(error) => {
-                let message =
-                    format!("failed reading gallery map configuration through peer cache: {error}");
-                cache_map_configuration_read_through_backoff(
-                    state,
-                    MapConfigurationReadThroughBackoff::ContentUnavailable(message.clone()),
-                )
-                .await;
-                return Err(map_configuration_content_unavailable(message));
-            }
+            Err(error) => return Err(map_configuration_payload_read_failure(state, error).await),
         },
-        Err(error) => {
-            let message =
-                format!("failed reading gallery map configuration through peer cache: {error}");
-            cache_map_configuration_read_through_backoff(
-                state,
-                MapConfigurationReadThroughBackoff::ContentUnavailable(message.clone()),
-            )
-            .await;
-            return Err(map_configuration_content_unavailable(message));
-        }
+        Err(error) => return Err(map_configuration_payload_read_failure(state, error).await),
     };
     if payload.recovered_chunk_count > 0 {
         request_local_availability_refresh(state);
@@ -631,6 +613,31 @@ async fn load_current_configuration_inner(
 
 fn map_configuration_content_unavailable(message: String) -> anyhow::Error {
     anyhow::Error::new(MapConfigurationContentUnavailable).context(message)
+}
+
+async fn map_configuration_payload_read_failure(
+    state: &ServerState,
+    error: StoreReadError,
+) -> anyhow::Error {
+    let message = match map_configuration_content_unavailable_message(error) {
+        Ok(message) => message,
+        Err(error) => return error,
+    };
+    cache_map_configuration_read_through_backoff(
+        state,
+        MapConfigurationReadThroughBackoff::ContentUnavailable(message.clone()),
+    )
+    .await;
+    map_configuration_content_unavailable(message)
+}
+
+fn map_configuration_content_unavailable_message(error: StoreReadError) -> Result<String> {
+    match error {
+        StoreReadError::Internal(error) => Err(error),
+        error => Ok(format!(
+            "failed reading gallery map configuration through peer cache: {error}"
+        )),
+    }
 }
 
 async fn cached_map_configuration_read_through_backoff(
@@ -878,6 +885,17 @@ fn is_valid_manifest_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_map_configuration_read_errors_do_not_become_content_fallbacks() {
+        let error = map_configuration_content_unavailable_message(StoreReadError::Internal(
+            anyhow!("simulated local storage I/O failure"),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "simulated local storage I/O failure");
+        assert!(!error.is::<MapConfigurationContentUnavailable>());
+    }
 
     #[test]
     fn default_configuration_is_valid_and_uses_the_small_globe() {
