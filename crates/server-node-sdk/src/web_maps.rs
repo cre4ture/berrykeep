@@ -1103,7 +1103,10 @@ async fn cache_mbtiles_source_initialization_failure(
     );
 }
 
-async fn clear_mbtiles_source_initialization_failure(state: &ServerState, manifest_key: &str) {
+pub(crate) async fn clear_mbtiles_source_initialization_failure(
+    state: &ServerState,
+    manifest_key: &str,
+) {
     state
         .storage
         .mbtiles_source_initialization_failures

@@ -18946,7 +18946,7 @@ async fn logical_map_file_read_through_fetches_missing_chunks_impl(backend: Main
         super::web_maps::logical_file(
             axum::extract::State(target.clone()),
             axum::http::Method::GET,
-            headers,
+            headers.clone(),
             axum::extract::Query(
                 serde_json::from_value(serde_json::json!({ "manifest_key": manifest_key }))
                     .unwrap(),
@@ -18958,6 +18958,36 @@ async fn logical_map_file_read_through_fetches_missing_chunks_impl(backend: Main
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(
         body.as_ref(),
+        &part_payload[range_start as usize..=range_end as usize]
+    );
+
+    // The same range helper is used by long-lived MBTiles VFS sources. When a
+    // resolved part manifest has been reclaimed locally, it must restore
+    // metadata from a peer before it can plan chunk hydration.
+    {
+        let store = lock_store(&target, "tests.map_file.target.remove_part_manifest").await;
+        fs::remove_file(store.manifest_path_for_test(&part_put.manifest_hash))
+            .await
+            .unwrap();
+    }
+    let recovered_response = axum::response::IntoResponse::into_response(
+        super::web_maps::logical_file(
+            axum::extract::State(target.clone()),
+            axum::http::Method::GET,
+            headers,
+            axum::extract::Query(
+                serde_json::from_value(serde_json::json!({ "manifest_key": manifest_key }))
+                    .unwrap(),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(recovered_response.status(), StatusCode::PARTIAL_CONTENT);
+    let recovered_body = to_bytes(recovered_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered_body.as_ref(),
         &part_payload[range_start as usize..=range_end as usize]
     );
 
@@ -18993,6 +19023,45 @@ run_on_main_metadata_backends!(
     logical_map_file_read_through_fetches_missing_chunks_impl,
     logical_map_file_read_through_fetches_missing_chunks,
     logical_map_file_read_through_fetches_missing_chunks_turso
+);
+
+async fn map_dataset_import_invalidation_clears_mbtiles_failure_backoff_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let manifest_key = "sys/maps/freshly-imported.mbtiles.manifest.json";
+    state
+        .storage
+        .mbtiles_source_initialization_failures
+        .lock()
+        .await
+        .insert(
+            manifest_key.to_string(),
+            super::CachedMbtilesSourceInitializationFailure {
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+                message: "manifest was still being imported".to_string(),
+            },
+        );
+
+    super::map_dataset_import::invalidate_cached_mbtiles_source(&state, manifest_key).await;
+
+    assert!(
+        !state
+            .storage
+            .mbtiles_source_initialization_failures
+            .lock()
+            .await
+            .contains_key(manifest_key),
+        "an import invalidation must clear its matching initialization backoff"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    map_dataset_import_invalidation_clears_mbtiles_failure_backoff_impl,
+    map_dataset_import_invalidation_clears_mbtiles_failure_backoff,
+    map_dataset_import_invalidation_clears_mbtiles_failure_backoff_turso
 );
 
 async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(

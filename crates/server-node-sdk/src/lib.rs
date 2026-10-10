@@ -21003,15 +21003,17 @@ pub(crate) async fn read_current_object_range_through_peer(
         Err(error) => return Err(error),
     };
 
-    let missing_chunks = {
-        let store = read_store(state, "object_read.plan_missing_chunks").await;
-        store
-            .missing_chunks_for_manifest_range(
-                request.manifest_hash,
-                request.range_start,
-                request.range_end_exclusive,
-            )
-            .await?
+    let missing_chunks = match missing_chunks_for_current_object_range(state, &request).await {
+        Ok(missing_chunks) => missing_chunks,
+        // A metadata-only cache can lose the manifest that maps the current
+        // object to its chunks. Re-import it before planning hydration: this
+        // is especially important for long-lived MBTiles VFS sources, which
+        // retain a resolved manifest hash between requests.
+        Err(StoreReadError::Corrupt(_)) => {
+            recover_current_object_manifest_metadata(state, &request).await?;
+            missing_chunks_for_current_object_range(state, &request).await?
+        }
+        Err(error) => return Err(error),
     };
 
     if missing_chunks.is_empty() {
@@ -21058,6 +21060,43 @@ pub(crate) async fn read_current_object_range_through_peer(
         bytes,
         recovered_chunk_count: missing_chunk_count,
     })
+}
+
+async fn missing_chunks_for_current_object_range(
+    state: &ServerState,
+    request: &CurrentObjectRangeRead<'_>,
+) -> Result<Vec<ReplicationChunkInfo>, StoreReadError> {
+    let store = read_store(state, "object_read.plan_missing_chunks").await;
+    store
+        .missing_chunks_for_manifest_range(
+            request.manifest_hash,
+            request.range_start,
+            request.range_end_exclusive,
+        )
+        .await
+}
+
+async fn recover_current_object_manifest_metadata(
+    state: &ServerState,
+    request: &CurrentObjectRangeRead<'_>,
+) -> Result<(), StoreReadError> {
+    let descriptor = describe_object_with_metadata_read_through(
+        state,
+        request.key,
+        None,
+        None,
+        ObjectReadMode::Preferred,
+        MetadataReadThroughPeers::Advertised,
+        request.recovery_deadline,
+    )
+    .await?;
+    if descriptor.manifest_hash != request.manifest_hash {
+        return Err(StoreReadError::Corrupt(format!(
+            "object metadata changed while recovering missing manifest for key={}: expected_manifest_hash={} actual_manifest_hash={}",
+            request.key, request.manifest_hash, descriptor.manifest_hash
+        )));
+    }
+    Ok(())
 }
 
 async fn hydrate_missing_chunks_for_object_read(
