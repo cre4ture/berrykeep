@@ -12100,13 +12100,9 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 
 async fn run_replication_audit_once(state: &ServerState) {
     request_ttl_bounded_local_availability_refresh(state);
-    // Serialize synchronization, retained-content audit, planning, and execution
-    // so the single plan snapshot remains fresh while this tick uses it.
-    let mut repair_permit = if state.repair_config.enabled {
-        Some(acquire_repair_execution(state, RepairRunTrigger::BackgroundAudit).await)
-    } else {
-        None
-    };
+    // Peer synchronization and retained-content enumeration deliberately run
+    // outside the local executor. They may be slow, but they do not mutate the
+    // local repair data plane and must not block manual or peer repair work.
     if state.repair_config.enabled {
         sync_availability_views_once(state).await;
         match content_recovery::retained_content_snapshot(state).await {
@@ -12123,6 +12119,14 @@ async fn run_replication_audit_once(state: &ServerState) {
         }
     }
 
+    // Acquire immediately before planning. This keeps the snapshot fresh with
+    // respect to every earlier local repair while avoiding peer I/O under the
+    // node-local execution permit.
+    let mut repair_permit = if state.repair_config.enabled {
+        Some(acquire_repair_execution(state, RepairRunTrigger::BackgroundAudit).await)
+    } else {
+        None
+    };
     let keys = planning_replication_subjects(state).await;
 
     let (node_transitioned_offline, plan_snapshot) = {

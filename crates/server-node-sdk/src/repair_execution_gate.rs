@@ -74,10 +74,12 @@ impl RepairExecutionGate {
             // between the state check and the first poll could be lost because
             // `notify_waiters` does not retain a permit for future waiters.
             changed.as_mut().enable();
-            {
+            let next_aging_deadline = {
                 let mut state = self.lock_state();
+                let now = Instant::now();
                 if !state.active
-                    && state.selected_waiter_id(self.automatic_priority_aging) == Some(waiter.id)
+                    && state.selected_waiter_id(self.automatic_priority_aging, now)
+                        == Some(waiter.id)
                 {
                     state.active = true;
                     waiter.unregister_locked(&mut state);
@@ -85,8 +87,20 @@ impl RepairExecutionGate {
                         gate: Arc::clone(self),
                     };
                 }
+                (!state.active)
+                    .then(|| {
+                        state.next_automatic_aging_deadline(self.automatic_priority_aging, now)
+                    })
+                    .flatten()
+            };
+            if let Some(deadline) = next_aging_deadline {
+                tokio::select! {
+                    _ = changed.as_mut() => {}
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                }
+            } else {
+                changed.await;
             }
-            changed.await;
         }
     }
 
@@ -122,12 +136,12 @@ impl RepairExecutionGate {
 }
 
 impl RepairExecutionGateState {
-    fn selected_waiter_id(&self, automatic_priority_aging: Duration) -> Option<u64> {
+    fn selected_waiter_id(&self, automatic_priority_aging: Duration, now: Instant) -> Option<u64> {
         self.waiters
             .iter()
             .find(|waiter| {
                 waiter.priority == RepairExecutionPriority::Automatic
-                    && waiter.enqueued_at.elapsed() >= automatic_priority_aging
+                    && now.saturating_duration_since(waiter.enqueued_at) >= automatic_priority_aging
             })
             .or_else(|| {
                 self.waiters
@@ -136,6 +150,19 @@ impl RepairExecutionGateState {
             })
             .or_else(|| self.waiters.front())
             .map(|waiter| waiter.id)
+    }
+
+    fn next_automatic_aging_deadline(
+        &self,
+        automatic_priority_aging: Duration,
+        now: Instant,
+    ) -> Option<Instant> {
+        self.waiters
+            .iter()
+            .filter(|waiter| waiter.priority == RepairExecutionPriority::Automatic)
+            .map(|waiter| waiter.enqueued_at + automatic_priority_aging)
+            .filter(|deadline| *deadline > now)
+            .min()
     }
 }
 
@@ -206,10 +233,13 @@ impl Drop for RepairExecutionPermit {
 
 #[cfg(test)]
 mod tests {
-    use super::{RepairExecutionGate, RepairExecutionPriority};
+    use super::{
+        RepairExecutionGate, RepairExecutionGateState, RepairExecutionPriority,
+        RepairExecutionWaiter,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::Notify;
 
     #[tokio::test]
@@ -253,6 +283,42 @@ mod tests {
         );
         drop(queued.await.expect("queued task should not panic"));
         assert!(gate.try_acquire().is_some());
+    }
+
+    #[test]
+    fn automatic_aging_exposes_a_wakeup_deadline_before_priority_changes() {
+        let enqueued_at = Instant::now();
+        let state = RepairExecutionGateState {
+            waiters: [
+                RepairExecutionWaiter {
+                    id: 1,
+                    priority: RepairExecutionPriority::Automatic,
+                    enqueued_at,
+                },
+                RepairExecutionWaiter {
+                    id: 2,
+                    priority: RepairExecutionPriority::Manual,
+                    enqueued_at,
+                },
+            ]
+            .into(),
+            ..RepairExecutionGateState::default()
+        };
+        let aging = Duration::from_secs(30);
+
+        assert_eq!(state.selected_waiter_id(aging, enqueued_at), Some(2));
+        assert_eq!(
+            state.next_automatic_aging_deadline(aging, enqueued_at),
+            Some(enqueued_at + aging)
+        );
+        assert_eq!(
+            state.selected_waiter_id(aging, enqueued_at + aging),
+            Some(1)
+        );
+        assert_eq!(
+            state.next_automatic_aging_deadline(aging, enqueued_at + aging),
+            None
+        );
     }
 
     #[tokio::test]
