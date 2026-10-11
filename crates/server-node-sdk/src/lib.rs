@@ -211,10 +211,7 @@ const DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS: u64 = 300;
 const PEER_REPAIR_REQUEST_TIMEOUT_GRACE_SECS: u64 = 30;
 const REPAIR_LOCAL_AVAILABILITY_SYNC_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS: u64 = 30 * 60;
-#[cfg(not(test))]
-const MAX_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS: u64 = 60;
-#[cfg(test)]
-const MAX_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS: u64 = 1;
+const DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS: u64 = 60;
 const OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES: usize = 64 * 1024;
 const STORAGE_STATS_RECONCILE_INTERVAL_SECS: u64 = 60 * 60;
 const STORAGE_STATS_HISTORY_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
@@ -3353,6 +3350,7 @@ pub struct ServerNodeConfig {
     pub replication_repair_max_retries: u32,
     pub replication_repair_backoff_secs: u64,
     pub replication_repair_execution_timeout_secs: u64,
+    pub replication_repair_subject_inspection_timeout_secs: u64,
     pub repair_busy_throttle_enabled: bool,
     pub repair_busy_inflight_threshold: usize,
     pub repair_busy_wait_millis: u64,
@@ -3441,6 +3439,7 @@ struct RepairConfig {
     max_retries: u32,
     backoff_secs: u64,
     execution_timeout_secs: u64,
+    subject_inspection_timeout_secs: u64,
     busy_throttle_enabled: bool,
     busy_inflight_threshold: usize,
     busy_wait_millis: u64,
@@ -3725,10 +3724,18 @@ impl RepairActiveRunProgress {
         report.skipped_max_retries = self
             .skipped_max_retries
             .saturating_sub(baseline.skipped_max_retries);
-        report.last_error = self
-            .last_error
-            .clone()
-            .or_else(|| report.last_error.clone());
+        report.last_error = if report.timed_out {
+            match (&report.last_error, &self.last_error) {
+                (Some(timeout), Some(last_repair_error)) => Some(format!(
+                    "{timeout}; last repair error before timeout: {last_repair_error}"
+                )),
+                (timeout, _) => timeout.clone(),
+            }
+        } else {
+            self.last_error
+                .clone()
+                .or_else(|| report.last_error.clone())
+        };
         report.had_chunk_progress = self.had_chunk_progress && !baseline.had_chunk_progress;
         report.waiting_for_source = self.waiting_for_source && !baseline.waiting_for_source;
         report.unresolved = self.unresolved && !baseline.unresolved;
@@ -6491,6 +6498,13 @@ impl ServerNodeConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS),
+            replication_repair_subject_inspection_timeout_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS),
             repair_busy_throttle_enabled: common::legacy_compatibility::var(
                 "BERRYKEEP_REPAIR_BUSY_THROTTLE_ENABLED",
             )
@@ -6847,6 +6861,13 @@ impl ServerNodeConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS),
+            replication_repair_subject_inspection_timeout_secs: common::legacy_compatibility::var(
+                "BERRYKEEP_REPLICATION_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS),
             repair_busy_throttle_enabled: common::legacy_compatibility::var(
                 "BERRYKEEP_REPAIR_BUSY_THROTTLE_ENABLED",
             )
@@ -6920,6 +6941,8 @@ impl ServerNodeConfig {
             max_retries: self.replication_repair_max_retries,
             backoff_secs: self.replication_repair_backoff_secs,
             execution_timeout_secs: self.replication_repair_execution_timeout_secs,
+            subject_inspection_timeout_secs: self
+                .replication_repair_subject_inspection_timeout_secs,
             busy_throttle_enabled: self.repair_busy_throttle_enabled,
             busy_inflight_threshold: self.repair_busy_inflight_threshold,
             busy_wait_millis: self.repair_busy_wait_millis,
@@ -13541,6 +13564,7 @@ async fn start_local_data_scrub(
     }
 }
 
+#[cfg(test)]
 async fn execute_tracked_local_replication_repair(
     state: &ServerState,
     batch_size_override: Option<usize>,

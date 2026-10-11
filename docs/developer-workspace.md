@@ -325,7 +325,7 @@ The env vars referenced in the tuning subsections below are current operational 
 ### Periodic replication audit and repair
 
 - Cluster-mode nodes run a background replication auditor and execute repair passes for under-replicated data by default.
-- A node runs at most one local repair data-plane operation at a time. Manual work is prioritized, automatic work ages into priority, and peer-coordinated requests receive `503 Service Unavailable` while the local executor is occupied instead of accumulating a remote retry queue.
+- A node runs at most one local repair data-plane operation at a time. Manual work is prioritized, automatic work ages into priority, and manual or peer local-scope HTTP requests receive `503 Service Unavailable` while the executor is occupied instead of accumulating abandoned retry work.
 - Local bundle inspection is bounded to 60 seconds (or the configured execution deadline when shorter), so one stalled subject does not block later subjects in the same plan. Completed transfer and retry-state changes are flushed once at normal completion or by cancellation cleanup after a timed-out run.
 - Configuration:
 	- `BERRYKEEP_REPLICATION_REPAIR_ENABLED` (default: `true`)
@@ -334,6 +334,7 @@ The env vars referenced in the tuning subsections below are current operational 
 	- `BERRYKEEP_REPLICATION_REPAIR_MAX_RETRIES` (default: `3`)
 	- `BERRYKEEP_REPLICATION_REPAIR_BACKOFF_SECS` (default: `30`)
 	- `BERRYKEEP_REPLICATION_REPAIR_EXECUTION_TIMEOUT_SECS` (default: `1800`; bounds one node-local repair execution so a stalled storage or transport phase releases the executor and is retained as `timed_out`; peer coordinators wait at least this deadline plus 30 seconds)
+	- `BERRYKEEP_REPLICATION_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS` (default: `60`; bounds inspection of one local subject so later plan items can still make progress)
 	- `BERRYKEEP_REPAIR_BUSY_THROTTLE_ENABLED` (default: `true`)
 	- `BERRYKEEP_REPAIR_BUSY_INFLIGHT_THRESHOLD` (default: `32`)
 	- `BERRYKEEP_REPAIR_BUSY_WAIT_MILLIS` (default: `100`)

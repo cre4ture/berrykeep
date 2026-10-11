@@ -1122,6 +1122,8 @@ fn test_cluster_config_without_internal_tls(
         replication_repair_max_retries: 3,
         replication_repair_backoff_secs: 30,
         replication_repair_execution_timeout_secs: super::DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS,
+        replication_repair_subject_inspection_timeout_secs:
+            super::DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS,
         repair_busy_throttle_enabled: false,
         repair_busy_inflight_threshold: 32,
         repair_busy_wait_millis: 100,
@@ -20590,6 +20592,7 @@ async fn build_test_state(
             max_retries: 3,
             backoff_secs: 0,
             execution_timeout_secs: super::DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS,
+            subject_inspection_timeout_secs: super::DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS,
             startup_repair_enabled: true,
             startup_repair_delay_secs: 0,
             busy_throttle_enabled: false,
@@ -22958,6 +22961,7 @@ async fn stalled_subject_inspection_does_not_block_later_subjects() {
     seed_test_replication_gap(&state, STALLED_KEY).await;
     seed_test_replication_gap(&state, LATER_KEY).await;
     state.repair_config.execution_timeout_secs = 5;
+    state.repair_config.subject_inspection_timeout_secs = 1;
     let blocker = super::replication::block_replication_export_for_test(STALLED_KEY);
 
     let report = tokio::time::timeout(

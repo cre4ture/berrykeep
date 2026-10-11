@@ -116,6 +116,9 @@ impl ReplicationRepairReport {
     }
 
     pub(crate) fn run_status(&self) -> RepairRunStatus {
+        if self.timed_out {
+            return RepairRunStatus::TimedOut;
+        }
         let deferred_transfer = self.skipped_backoff > 0 || self.skipped_max_retries > 0;
 
         if self.failed_transfers > 0 {
@@ -150,9 +153,6 @@ impl ReplicationRepairReport {
         }
         if deferred_transfer {
             return RepairRunStatus::PartiallyRepaired;
-        }
-        if self.timed_out {
-            return RepairRunStatus::TimedOut;
         }
         RepairRunStatus::Completed
     }
@@ -296,41 +296,25 @@ async fn execute_replication_repair_with_trigger(
 
     match scope {
         ReplicationRepairScope::Local => {
-            let preacquired_permit = if trigger == RepairRunTrigger::PeerClusterRequest {
-                match state.maintenance.repair_execution_gate.try_acquire() {
-                    Some(permit) => Some(permit),
-                    None => {
-                        warn!(
-                            "rejecting peer repair request because the node-local executor is busy"
-                        );
-                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                    }
+            let preacquired_permit = match state.maintenance.repair_execution_gate.try_acquire() {
+                Some(permit) => permit,
+                None => {
+                    warn!(
+                        ?trigger,
+                        "rejecting requested local repair because the node-local executor is busy"
+                    );
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
-            } else {
-                None
             };
             let repair_task = tokio::spawn(async move {
-                match preacquired_permit {
-                    Some(permit) => {
-                        execute_tracked_local_replication_repair_with_permit(
-                            &state,
-                            batch_override,
-                            trigger,
-                            None,
-                            permit,
-                        )
-                        .await
-                    }
-                    None => {
-                        execute_tracked_local_replication_repair(
-                            &state,
-                            batch_override,
-                            trigger,
-                            None,
-                        )
-                        .await
-                    }
-                }
+                execute_tracked_local_replication_repair_with_permit(
+                    &state,
+                    batch_override,
+                    trigger,
+                    None,
+                    preacquired_permit,
+                )
+                .await
             });
             match repair_task.await {
                 Ok(report) => (StatusCode::OK, Json(report)).into_response(),
@@ -597,9 +581,10 @@ async fn export_locally_owned_replication_bundle(
     version_id: Option<&str>,
 ) -> Result<Option<ReplicationExportBundle>> {
     let execution_timeout_secs = state.repair_config.execution_timeout_secs.max(1);
-    let timeout_secs = execution_timeout_secs
-        .saturating_sub(1)
-        .clamp(1, MAX_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS);
+    let timeout_secs = execution_timeout_secs.saturating_sub(1).clamp(
+        1,
+        state.repair_config.subject_inspection_timeout_secs.max(1),
+    );
     tokio::time::timeout(
         Duration::from_secs(timeout_secs),
         export_locally_owned_replication_bundle_inner(state, key, version_id),
@@ -2802,11 +2787,12 @@ mod tests {
     }
 
     #[test]
-    fn timeout_flag_does_not_hide_transfer_failures() {
+    fn timeout_status_retains_transfer_failures() {
         let mut report = ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
         report.failed_transfers = 1;
 
-        assert_eq!(report.run_status(), RepairRunStatus::Unresolved);
+        assert_eq!(report.run_status(), RepairRunStatus::TimedOut);
+        assert_eq!(report.failed_transfers, 1);
         assert!(report.timed_out);
     }
 
