@@ -291,10 +291,9 @@ pub fn insecure_https_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         // Zero-touch tests replace the setup listener with the runtime listener on the same
-        // origin, and longer scenarios may also outlive a server-side keep-alive connection.
-        // A pooled connection can therefore fail a later mutating request with an unexpected
-        // TLS EOF. Opening a connection per request preserves at-most-once request semantics
-        // without retrying operations whose response may have been lost.
+        // origin. A pooled setup connection can therefore fail a later mutating request with an
+        // unexpected TLS EOF. Opening a connection per request preserves at-most-once request
+        // semantics without retrying operations whose response may have been lost.
         .pool_max_idle_per_host(0)
         .build()
         .context("failed building insecure https client")
