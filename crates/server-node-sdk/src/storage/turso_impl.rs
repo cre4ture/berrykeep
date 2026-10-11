@@ -4219,8 +4219,21 @@ mod tests {
             .await
             .expect("turso metadata store should open");
         let primary_connection_guard = store.connection_lock.lock().await;
+        store
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .await
+            .expect("primary write transaction should begin");
+        store
+            .connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)",
+                ("scan-read-concurrency-test", "uncommitted"),
+            )
+            .await
+            .expect("primary write transaction should remain active");
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let scan_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let current_state = store.load_current_state().await?;
             assert!(current_state.objects.is_empty());
             assert!(current_state.object_ids.is_empty());
@@ -4295,9 +4308,16 @@ mod tests {
             );
             Ok::<(), anyhow::Error>(())
         })
-        .await
-        .expect("unbounded reads must not wait for the primary connection")
-        .expect("unbounded reads should complete");
+        .await;
+
+        store
+            .connection
+            .execute_batch("ROLLBACK")
+            .await
+            .expect("primary write transaction should roll back");
+        scan_result
+            .expect("unbounded reads must not wait for the primary write transaction")
+            .expect("unbounded reads should complete");
 
         drop(primary_connection_guard);
         drop(store);
