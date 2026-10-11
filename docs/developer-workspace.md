@@ -326,7 +326,7 @@ The env vars referenced in the tuning subsections below are current operational 
 
 - Cluster-mode nodes run a background replication auditor and execute repair passes for under-replicated data by default.
 - A node runs at most one local repair data-plane operation at a time. Manual work is prioritized, automatic work ages into priority, and peer-coordinated requests receive `503 Service Unavailable` while the local executor is occupied instead of accumulating a remote retry queue.
-- Local bundle inspection is bounded to 60 seconds (or the configured execution deadline when shorter), so one stalled subject does not block later subjects in the same plan. Completed transfer and retry-state changes are checkpointed durably as the run progresses.
+- Local bundle inspection is bounded to 60 seconds (or the configured execution deadline when shorter), so one stalled subject does not block later subjects in the same plan. Completed transfer and retry-state changes are flushed once at normal completion or by cancellation cleanup after a timed-out run.
 - Configuration:
 	- `BERRYKEEP_REPLICATION_REPAIR_ENABLED` (default: `true`)
 	- `BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS` (default: `3600`)

@@ -32360,22 +32360,8 @@ async fn persist_repair_state(state: &ServerState) -> Result<()> {
     store.persist_repair_attempts(&attempts).await
 }
 
-async fn persist_repair_state_cancellation_safe(state: &ServerState) -> Result<()> {
-    let state = state.clone();
-    tokio::spawn(async move { persist_repair_state(&state).await })
-        .await
-        .context("repair-attempt checkpoint task failed")?
-}
-
 async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
     persist_cluster_replicas_state_inner(state, true).await
-}
-
-async fn persist_cluster_replicas_state_cancellation_safe(state: &ServerState) -> Result<()> {
-    let state = state.clone();
-    tokio::spawn(async move { persist_cluster_replicas_state(&state).await })
-        .await
-        .context("cluster-replica checkpoint task failed")?
 }
 
 /// Persists the local availability set computed in this refresh. It is already

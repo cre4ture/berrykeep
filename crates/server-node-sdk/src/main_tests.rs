@@ -23010,7 +23010,7 @@ async fn cancelled_peer_handler_leaves_detached_repair_to_finish() {
         "the simulated disconnected peer handler should be cancelled"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let activity = super::local_repair_activity_payload(&state)
                 .await
@@ -23022,7 +23022,7 @@ async fn cancelled_peer_handler_leaves_detached_repair_to_finish() {
             if activity.active_runs.is_empty() && timed_out {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await

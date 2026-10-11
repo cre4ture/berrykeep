@@ -648,50 +648,75 @@ async fn export_locally_owned_replication_bundle_inner(
     }
 }
 
-async fn checkpoint_repair_progress(
-    state: &ServerState,
-    repair_run_id: &str,
-    replicas_state_dirty: &mut bool,
-    repair_state_dirty: &mut bool,
-) {
-    let checkpoint_replicas = *replicas_state_dirty;
-    let checkpoint_attempts = *repair_state_dirty;
-    let (replica_result, attempt_result) = tokio::join!(
-        async {
-            if checkpoint_replicas {
-                persist_cluster_replicas_state_cancellation_safe(state).await
-            } else {
-                Ok(())
-            }
-        },
-        async {
-            if checkpoint_attempts {
-                persist_repair_state_cancellation_safe(state).await
-            } else {
-                Ok(())
-            }
-        }
-    );
+struct RepairProgressPersistenceGuard {
+    state: ServerState,
+    repair_run_id: String,
+    replicas_state_dirty: bool,
+    repair_state_dirty: bool,
+}
 
-    if checkpoint_replicas {
-        match replica_result {
-            Ok(()) => *replicas_state_dirty = false,
-            Err(error) => warn!(
-                repair_run_id,
-                %error,
-                "failed to checkpoint cluster replica state during repair run"
-            ),
+impl RepairProgressPersistenceGuard {
+    fn new(state: &ServerState, repair_run_id: &str) -> Self {
+        Self {
+            state: state.clone(),
+            repair_run_id: repair_run_id.to_string(),
+            replicas_state_dirty: false,
+            repair_state_dirty: false,
         }
     }
-    if checkpoint_attempts {
-        match attempt_result {
-            Ok(()) => *repair_state_dirty = false,
-            Err(error) => warn!(
-                repair_run_id,
-                %error,
-                "failed to checkpoint repair attempt state during repair run"
-            ),
+}
+
+impl Drop for RepairProgressPersistenceGuard {
+    fn drop(&mut self) {
+        if !self.replicas_state_dirty && !self.repair_state_dirty {
+            return;
         }
+
+        let state = self.state.clone();
+        let repair_run_id = self.repair_run_id.clone();
+        let persist_replicas = self.replicas_state_dirty;
+        let persist_attempts = self.repair_state_dirty;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                repair_run_id,
+                persist_replicas,
+                persist_attempts,
+                "could not schedule cancelled repair progress persistence without a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            let (replica_result, attempt_result) = tokio::join!(
+                async {
+                    if persist_replicas {
+                        persist_cluster_replicas_state(&state).await
+                    } else {
+                        Ok(())
+                    }
+                },
+                async {
+                    if persist_attempts {
+                        persist_repair_state(&state).await
+                    } else {
+                        Ok(())
+                    }
+                }
+            );
+            if let Err(error) = replica_result {
+                warn!(
+                    repair_run_id,
+                    %error,
+                    "failed to persist cluster replica state after repair cancellation"
+                );
+            }
+            if let Err(error) = attempt_result {
+                warn!(
+                    repair_run_id,
+                    %error,
+                    "failed to persist repair attempt state after repair cancellation"
+                );
+            }
+        });
     }
 }
 
@@ -719,14 +744,12 @@ pub(crate) async fn execute_replication_repair_plan(
     let mut skipped_details = Vec::new();
     let mut detailed_log = Vec::new();
     let mut last_error = None;
-    let mut replicas_state_dirty = false;
-    let mut repair_state_dirty = false;
-
     let max_attempts = state.repair_config.max_retries;
     let backoff_secs = state.repair_config.backoff_secs;
     let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
     let now = unix_ts();
     let repair_run_id = run_id.unwrap_or("untracked");
+    let mut persistence = RepairProgressPersistenceGuard::new(state, repair_run_id);
     let locally_available = cached_local_cluster_available_subjects(state)
         .await
         .into_iter()
@@ -1156,20 +1179,12 @@ pub(crate) async fn execute_replication_repair_plan(
                     cluster.note_replica(&key, state.node_id);
                     cluster.note_replica(format!("{key}@{imported_version_id}"), state.node_id);
                     drop(cluster);
-                    replicas_state_dirty = true;
+                    persistence.replicas_state_dirty = true;
 
                     let mut repair_state = state.maintenance.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
                     drop(repair_state);
-                    repair_state_dirty = true;
-
-                    checkpoint_repair_progress(
-                        state,
-                        repair_run_id,
-                        &mut replicas_state_dirty,
-                        &mut repair_state_dirty,
-                    )
-                    .await;
+                    persistence.repair_state_dirty = true;
 
                     bundle =
                         export_locally_owned_replication_bundle(state, &key, version_id.as_deref())
@@ -1239,14 +1254,7 @@ pub(crate) async fn execute_replication_repair_plan(
                     entry.attempts = entry.attempts.saturating_add(1);
                     entry.last_failure_unix = now;
                     drop(repair_state);
-                    repair_state_dirty = true;
-                    checkpoint_repair_progress(
-                        state,
-                        repair_run_id,
-                        &mut replicas_state_dirty,
-                        &mut repair_state_dirty,
-                    )
-                    .await;
+                    persistence.repair_state_dirty = true;
                 }
             }
         }
@@ -1497,19 +1505,12 @@ pub(crate) async fn execute_replication_repair_plan(
                     }
                     cluster.note_replica(format!("{key}@{remote_version_id}"), target);
                     drop(cluster);
-                    replicas_state_dirty = true;
+                    persistence.replicas_state_dirty = true;
 
                     let mut repair_state = state.maintenance.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
                     drop(repair_state);
-                    repair_state_dirty = true;
-                    checkpoint_repair_progress(
-                        state,
-                        repair_run_id,
-                        &mut replicas_state_dirty,
-                        &mut repair_state_dirty,
-                    )
-                    .await;
+                    persistence.repair_state_dirty = true;
                 }
                 Err(err) => {
                     let error_text = format!("{err:#}");
@@ -1552,22 +1553,16 @@ pub(crate) async fn execute_replication_repair_plan(
                     entry.attempts = entry.attempts.saturating_add(1);
                     entry.last_failure_unix = now;
                     drop(repair_state);
-                    repair_state_dirty = true;
-                    checkpoint_repair_progress(
-                        state,
-                        repair_run_id,
-                        &mut replicas_state_dirty,
-                        &mut repair_state_dirty,
-                    )
-                    .await;
+                    persistence.repair_state_dirty = true;
                 }
             }
         }
     }
 
-    if replicas_state_dirty {
+    if persistence.replicas_state_dirty {
         match persist_cluster_replicas_state(state).await {
             Ok(()) => {
+                persistence.replicas_state_dirty = false;
                 push_repair_log_entry(
                     &mut detailed_log,
                     state.node_id,
@@ -1605,9 +1600,10 @@ pub(crate) async fn execute_replication_repair_plan(
         }
     }
 
-    if repair_state_dirty {
+    if persistence.repair_state_dirty {
         match persist_repair_state(state).await {
             Ok(()) => {
+                persistence.repair_state_dirty = false;
                 push_repair_log_entry(
                     &mut detailed_log,
                     state.node_id,
