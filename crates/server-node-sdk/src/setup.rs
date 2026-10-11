@@ -228,6 +228,9 @@ impl ManagedSetupPaths {
 #[derive(Clone)]
 struct SetupRuntimeState {
     managed_state: Arc<Mutex<ManagedSetupState>>,
+    // Keep state-changing setup requests exclusive without blocking health and status reads while
+    // a transition performs file I/O or password hashing.
+    lifecycle_transition_lock: Arc<Mutex<()>>,
     completion_tx: mpsc::Sender<SetupCompletion>,
 }
 
@@ -242,6 +245,7 @@ impl SetupServerState {
             bind_addr: config.bind_addr,
             runtime: SetupRuntimeState {
                 managed_state: Arc::new(Mutex::new(ManagedSetupState::default())),
+                lifecycle_transition_lock: Arc::new(Mutex::new(())),
                 completion_tx,
             },
         }
@@ -251,6 +255,15 @@ impl SetupServerState {
 #[derive(Debug)]
 struct SetupCompletion {
     config: ServerNodeConfig,
+}
+
+/// Returns the next supervisor action after the setup listener has fully stopped.
+///
+/// Keeping runtime startup in the outer supervisor prevents the large setup and runtime futures
+/// from being nested in one stack-resident future during an in-process transition.
+pub(crate) enum SetupModeOutcome {
+    Shutdown,
+    Runtime(Box<ServerNodeConfig>),
 }
 
 fn spawn_setup_runtime_transition(permit: OwnedPermit<SetupCompletion>, config: ServerNodeConfig) {
@@ -710,10 +723,8 @@ pub(crate) fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<
 
 pub(crate) async fn run_setup_mode(
     config: SetupBootstrapConfig,
-    log_buffer: Arc<LogBuffer>,
-    runtime_log_control: RuntimeLogControl,
     shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
+) -> Result<SetupModeOutcome> {
     let initial_state =
         ensure_managed_setup_state(&config.state_path).context("failed preparing setup state")?;
     let tls_config = ensure_bootstrap_tls_config(&config).await?;
@@ -723,6 +734,7 @@ pub(crate) async fn run_setup_mode(
         bind_addr: config.bind_addr,
         runtime: SetupRuntimeState {
             managed_state: Arc::new(Mutex::new(initial_state)),
+            lifecycle_transition_lock: Arc::new(Mutex::new(())),
             completion_tx,
         },
     };
@@ -760,30 +772,28 @@ pub(crate) async fn run_setup_mode(
                 .await
                 .context("bootstrap setup server task join failure")?;
             outcome.context("bootstrap setup server exited during shutdown")?;
-            return Ok(());
+            return Ok(SetupModeOutcome::Shutdown);
         }
     };
     if completion.is_none() {
         let outcome = server_task
             .await
             .context("bootstrap setup server task join failure")?;
-        return outcome.context("bootstrap setup server exited");
+        outcome.context("bootstrap setup server exited")?;
+        return Ok(SetupModeOutcome::Shutdown);
     }
 
-    handle.graceful_shutdown(Some(Duration::from_secs(0)));
+    // Give hyper and rustls time to close pooled setup connections cleanly before the runtime
+    // listener takes over the same address. An immediate shutdown can leave clients reusing a
+    // half-closed TLS connection during the handoff.
+    handle.graceful_shutdown(Some(Duration::from_secs(5)));
     let outcome = server_task
         .await
         .context("bootstrap setup server task join failure")?;
     outcome.context("bootstrap setup server exited during transition")?;
 
     let completion = completion.expect("checked is_some above");
-    run_inner(
-        completion.config,
-        Some(log_buffer),
-        runtime_log_control,
-        shutdown_rx,
-    )
-    .await
+    Ok(SetupModeOutcome::Runtime(Box::new(completion.config)))
 }
 
 async fn setup_health(State(state): State<SetupServerState>) -> impl IntoResponse {
@@ -845,6 +855,8 @@ async fn start_new_cluster(
                 .into_response();
         }
     };
+
+    let _transition_guard = state.runtime.lifecycle_transition_lock.lock().await;
 
     {
         let managed = state.runtime.managed_state.lock().await;
@@ -1014,6 +1026,17 @@ async fn start_new_cluster(
             .into_response();
     }
 
+    let admin_password_hash = match hash_admin_password_async(&request.admin_password).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
     let mut managed = state.runtime.managed_state.lock().await;
     managed.state = SetupLifecycleState::Online;
     managed.updated_at_unix = unix_ts();
@@ -1023,7 +1046,7 @@ async fn start_new_cluster(
     managed.runtime_data_dir = Some(state.paths.data_dir().display().to_string());
     managed.recovery_reason = None;
     managed.metadata_backend = Some(metadata_backend);
-    managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
+    managed.admin_password_hash = Some(admin_password_hash.clone());
     managed.managed_rendezvous_bind_addr = Some(managed_rendezvous_bind_addr.to_string());
     managed.managed_rendezvous_public_url = Some(managed_rendezvous_public_url.clone());
     managed.pending_join_request = None;
@@ -1052,7 +1075,7 @@ async fn start_new_cluster(
     };
     apply_managed_signer_paths(state.paths.data_dir(), &mut config);
     apply_managed_rendezvous_config(state.paths.data_dir(), &managed_snapshot, &mut config);
-    config.admin_password_hash = Some(hash_admin_password(&request.admin_password));
+    config.admin_password_hash = Some(admin_password_hash);
     let completion_permit = match state.runtime.completion_tx.clone().reserve_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -1094,6 +1117,7 @@ async fn generate_join_request(
         }
     };
 
+    let _transition_guard = state.runtime.lifecycle_transition_lock.lock().await;
     let mut managed = state.runtime.managed_state.lock().await;
     if managed.state == SetupLifecycleState::Online {
         return (
@@ -1178,7 +1202,15 @@ async fn import_node_enrollment_package(
         }
     };
 
-    let mut managed = state.runtime.managed_state.lock().await;
+    let _transition_guard = state.runtime.lifecycle_transition_lock.lock().await;
+    let managed = state.runtime.managed_state.lock().await;
+    if managed.state == SetupLifecycleState::Online {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "node is already initialized" })),
+        )
+            .into_response();
+    }
     let metadata_backend = match resolve_setup_metadata_backend(request.metadata_backend, &managed)
     {
         Ok(backend) => backend,
@@ -1233,6 +1265,18 @@ async fn import_node_enrollment_package(
         )
             .into_response();
     }
+    drop(managed);
+
+    let admin_password_hash = match hash_admin_password_async(&request.admin_password).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
 
     let runtime_enrollment_path = runtime_node_enrollment_path(state.paths.data_dir());
     if let Err(err) = package.write_to_path(&runtime_enrollment_path) {
@@ -1252,6 +1296,7 @@ async fn import_node_enrollment_package(
             .into_response();
     }
 
+    let mut managed = state.runtime.managed_state.lock().await;
     managed.state = SetupLifecycleState::Online;
     managed.updated_at_unix = unix_ts();
     managed.cluster_id = Some(package.bootstrap.cluster_id);
@@ -1260,7 +1305,7 @@ async fn import_node_enrollment_package(
     managed.runtime_data_dir = Some(state.paths.data_dir().display().to_string());
     managed.recovery_reason = None;
     managed.metadata_backend = Some(metadata_backend);
-    managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
+    managed.admin_password_hash = Some(admin_password_hash.clone());
     managed.managed_rendezvous_bind_addr = None;
     managed.managed_rendezvous_public_url = None;
     managed.pending_join_request = None;
@@ -1289,7 +1334,7 @@ async fn import_node_enrollment_package(
     };
     apply_managed_signer_paths(state.paths.data_dir(), &mut config);
     apply_managed_rendezvous_config(state.paths.data_dir(), &managed_snapshot, &mut config);
-    config.admin_password_hash = Some(hash_admin_password(&request.admin_password));
+    config.admin_password_hash = Some(admin_password_hash);
     let completion_permit = match state.runtime.completion_tx.clone().reserve_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -2440,6 +2485,13 @@ pub(crate) fn hash_admin_password(password: &str) -> String {
     format!("pbkdf2sha256:{ROUNDS}:{salt_hex}:{hash_hex}")
 }
 
+async fn hash_admin_password_async(password: &str) -> Result<String> {
+    let password = password.to_owned();
+    tokio::task::spawn_blocking(move || hash_admin_password(&password))
+        .await
+        .context("admin password hashing task failed")
+}
+
 pub(crate) fn validate_admin_password(password: &str) -> std::result::Result<(), &'static str> {
     if password.trim().len() < 12 {
         return Err("admin password must be at least 12 characters long");
@@ -3149,6 +3201,7 @@ mod tests {
             .admin_password_hash
             .as_deref()
             .expect("runtime config should receive an admin password hash");
+        assert_eq!(managed_hash, runtime_hash);
         assert!(crate::password_hash_matches(
             runtime_hash,
             &node_admin_password
@@ -3203,7 +3256,7 @@ mod tests {
         let response = start_new_cluster(
             State(state.clone()),
             Json(SetupStartClusterRequest {
-                admin_password,
+                admin_password: admin_password.clone(),
                 public_origin: "https://node-a.local:18443".to_string(),
                 metadata_backend: None,
                 telemetry_enabled: true,
@@ -3221,10 +3274,23 @@ mod tests {
             SetupMetadataBackend::from(completion.config.metadata_backend),
             default_setup_metadata_backend()
         );
+        let managed = state.runtime.managed_state.lock().await;
         assert_eq!(
-            state.runtime.managed_state.lock().await.metadata_backend,
+            managed.metadata_backend,
             Some(default_setup_metadata_backend())
         );
+        let managed_hash = managed
+            .admin_password_hash
+            .as_deref()
+            .expect("managed state should persist an admin password hash");
+        let runtime_hash = completion
+            .config
+            .admin_password_hash
+            .as_deref()
+            .expect("runtime config should receive an admin password hash");
+        assert_eq!(managed_hash, runtime_hash);
+        assert!(crate::password_hash_matches(runtime_hash, &admin_password));
+        drop(managed);
 
         // The setup-time choice must land in exactly the same persisted override the admin
         // toggle uses, so a fresh load of the runtime sees it as an explicit override, not just

@@ -6945,14 +6945,22 @@ pub async fn run_from_env_with_shutdown(shutdown_rx: watch::Receiver<bool>) -> R
         .init();
 
     ensure_rustls_crypto_provider_installed();
-    match setup::load_startup_mode_from_env()? {
-        setup::StartupMode::Runtime(config) => {
-            run_inner(config, Some(log_buffer), runtime_log_control, shutdown_rx).await
-        }
+    let runtime_config = match setup::load_startup_mode_from_env()? {
+        setup::StartupMode::Runtime(config) => config,
         setup::StartupMode::Setup(config) => {
-            setup::run_setup_mode(config, log_buffer, runtime_log_control, shutdown_rx).await
+            match setup::run_setup_mode(config, shutdown_rx.clone()).await? {
+                setup::SetupModeOutcome::Shutdown => return Ok(()),
+                setup::SetupModeOutcome::Runtime(config) => *config,
+            }
         }
-    }
+    };
+    run_inner(
+        runtime_config,
+        Some(log_buffer),
+        runtime_log_control,
+        shutdown_rx,
+    )
+    .await
 }
 
 pub async fn run_embedded_managed(config: EmbeddedManagedServerNodeConfig) -> Result<()> {
@@ -6963,27 +6971,24 @@ pub async fn run_embedded_managed(config: EmbeddedManagedServerNodeConfig) -> Re
         setup::managed_startup_bootstrap_config(config.data_dir, config.bind_addr)?;
     let log_buffer = Arc::new(LogBuffer::new(500));
     let runtime_log_control = RuntimeLogControl::disabled(config.log_directive.as_str());
+    let shutdown_rx = shutdown_receiver_from_signal();
 
-    match setup::load_managed_startup_mode(startup_config)? {
-        setup::StartupMode::Runtime(runtime_config) => {
-            run_inner(
-                runtime_config,
-                Some(log_buffer),
-                runtime_log_control,
-                shutdown_receiver_from_signal(),
-            )
-            .await
-        }
+    let runtime_config = match setup::load_managed_startup_mode(startup_config)? {
+        setup::StartupMode::Runtime(runtime_config) => runtime_config,
         setup::StartupMode::Setup(setup_config) => {
-            setup::run_setup_mode(
-                setup_config,
-                log_buffer,
-                runtime_log_control,
-                shutdown_receiver_from_signal(),
-            )
-            .await
+            match setup::run_setup_mode(setup_config, shutdown_rx.clone()).await? {
+                setup::SetupModeOutcome::Shutdown => return Ok(()),
+                setup::SetupModeOutcome::Runtime(config) => *config,
+            }
         }
-    }
+    };
+    run_inner(
+        runtime_config,
+        Some(log_buffer),
+        runtime_log_control,
+        shutdown_rx,
+    )
+    .await
 }
 
 pub async fn run(config: ServerNodeConfig) -> Result<()> {
