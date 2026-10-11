@@ -13000,12 +13000,38 @@ fn empty_repair_plan_summary() -> RepairPlanSummary {
     }
 }
 
+fn cluster_repair_report_from_local(
+    node_id: NodeId,
+    totals: replication::ReplicationRepairReport,
+) -> replication::ClusterReplicationRepairReport {
+    let node_report = replication::ClusterReplicationRepairNodeReport {
+        node_id,
+        attempted_transfers: totals.attempted_transfers,
+        successful_transfers: totals.successful_transfers,
+        failed_transfers: totals.failed_transfers,
+        skipped_items: totals.skipped_items,
+        skipped_backoff: totals.skipped_backoff,
+        skipped_max_retries: totals.skipped_max_retries,
+        skipped_details: totals.skipped_details.clone(),
+        last_error: totals.last_error.clone(),
+        request_error: None,
+    };
+    replication::ClusterReplicationRepairReport {
+        totals,
+        scope: replication::ReplicationRepairScope::Cluster,
+        nodes_contacted: 1,
+        failed_nodes: 0,
+        node_reports: vec![node_report],
+    }
+}
+
 async fn execute_serialized_local_replication_repair_phase(
     state: &ServerState,
     batch_size_override: Option<usize>,
     run_id: Option<&str>,
     trigger: RepairRunTrigger,
     tracker: Option<&RepairRunTracker>,
+    execution_deadline: tokio::time::Instant,
 ) -> replication::ReplicationRepairReport {
     let live_log_cursor = tracker.map(repair_live_log_cursor).unwrap_or_default();
     let progress_baseline = tracker.map(repair_progress_snapshot).unwrap_or_default();
@@ -13027,7 +13053,25 @@ async fn execute_serialized_local_replication_repair_phase(
             })),
         );
     }
-    let permit = acquire_repair_execution(state, trigger).await;
+    let Some(permit) = run_with_repair_execution_deadline(
+        state,
+        execution_deadline,
+        acquire_repair_execution(state, trigger),
+    )
+    .await
+    else {
+        return tracker.map_or_else(
+            || {
+                replication::ReplicationRepairReport::timed_out(
+                    state.node_id,
+                    state.repair_config.execution_timeout_secs,
+                )
+            },
+            |tracker| {
+                timed_out_repair_report_since(state, tracker, live_log_cursor, &progress_baseline)
+            },
+        );
+    };
     if tracker.is_some() {
         replication::push_repair_log_entry(
             &mut Vec::new(),
@@ -13042,8 +13086,9 @@ async fn execute_serialized_local_replication_repair_phase(
             None,
         );
     }
-    let report = run_with_repair_execution_timeout(
+    let report = run_with_repair_execution_deadline(
         state,
+        execution_deadline,
         replication::execute_replication_repair_inner_with_context(
             state,
             batch_size_override,
@@ -13873,23 +13918,41 @@ async fn execute_tracked_cluster_replication_repair(
     trigger: RepairRunTrigger,
     plan_summary_override: Option<RepairPlanSummary>,
 ) -> replication::ClusterReplicationRepairReport {
-    sync_availability_views_once(state).await;
-    let plan_summary = match plan_summary_override {
-        Some(plan_summary) => plan_summary,
-        None => run_with_repair_execution_timeout(state, current_replication_plan(state))
-            .await
-            .map(|plan| RepairPlanSummary::from_plan(&plan))
-            .unwrap_or_else(empty_repair_plan_summary),
-    };
+    let local_execution_deadline = repair_execution_deadline(state);
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Cluster, trigger)
             .await;
+    let preparation = run_with_repair_execution_deadline(state, local_execution_deadline, async {
+        sync_availability_views_once(state).await;
+        match plan_summary_override {
+            Some(plan_summary) => plan_summary,
+            None => RepairPlanSummary::from_plan(&current_replication_plan(state).await),
+        }
+    })
+    .await;
+    let Some(plan_summary) = preparation else {
+        let report = cluster_repair_report_from_local(
+            state.node_id,
+            timed_out_repair_report(state, &tracker),
+        );
+        finish_repair_run_tracking(
+            state,
+            tracker,
+            empty_repair_plan_summary(),
+            RepairRunStatus::TimedOut,
+            Some(RepairRunSummary::from_cluster_report(&report)),
+            serialize_repair_run_report(&report),
+        )
+        .await;
+        return report;
+    };
     let report = with_active_repair_log_tracking(&tracker, async {
         replication::execute_cluster_replication_repair_inner_with_context(
             state,
             batch_size_override,
             Some(&tracker.run_id),
             Some(&tracker),
+            local_execution_deadline,
         )
         .await
     })

@@ -22918,7 +22918,7 @@ async fn repair_activity_reports_executor_queue_depth() {
 }
 
 #[tokio::test]
-async fn busy_peer_repair_is_shed_without_queueing() {
+async fn busy_peer_cluster_scope_is_forced_local_and_shed_without_queueing() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let active = state
         .maintenance
@@ -22931,7 +22931,7 @@ async fn busy_peer_repair_is_shed_without_queueing() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/cluster/replication/repair?scope=local")
+                .uri("/cluster/replication/repair?scope=cluster")
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -22947,6 +22947,43 @@ async fn busy_peer_repair_is_shed_without_queueing() {
             .manual,
         0,
         "rejected peer work must not remain queued"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn cluster_repair_gate_wait_uses_local_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_cluster_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("cluster repair should not wait indefinitely for the local executor");
+    assert_eq!(report.totals.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.totals.timed_out);
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "timed-out cluster repair must leave no queued waiter"
     );
 
     drop(active);
@@ -23295,7 +23332,8 @@ async fn timed_out_cluster_local_phase_retains_progress_log() {
 }
 
 async fn cluster_replication_repair_report_includes_skipped_details_impl(backend: MainTestBackend) {
-    let state = build_test_state(2, true, backend).await;
+    let mut state = build_test_state(2, true, backend).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
 
     let keys = super::planning_replication_subjects(&state).await;
     let plan = {
@@ -23332,17 +23370,18 @@ async fn cluster_replication_repair_report_includes_skipped_details_impl(backend
         }
     }
 
-    let response = super::build_internal_peer_api()
-        .with_state(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/cluster/replication/repair?scope=cluster")
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("cluster repair route should respond");
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+    let response = super::replication::execute_replication_repair_public(
+        State(state.clone()),
+        headers,
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Cluster),
+        }),
+    )
+    .await
+    .into_response();
 
     assert_eq!(response.status(), StatusCode::OK);
 

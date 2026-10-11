@@ -413,7 +413,7 @@ pub(crate) async fn execute_replication_repair_peer(
         state,
         query,
         RepairRunTrigger::PeerClusterRequest,
-        false,
+        true,
     )
     .await
 }
@@ -1716,8 +1716,15 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
     batch_size_override: Option<usize>,
 ) -> ClusterReplicationRepairReport {
     sync_availability_views_once(state).await;
-    execute_cluster_replication_repair_inner_with_context(state, batch_size_override, None, None)
-        .await
+    let local_execution_deadline = repair_execution_deadline(state);
+    execute_cluster_replication_repair_inner_with_context(
+        state,
+        batch_size_override,
+        None,
+        None,
+        local_execution_deadline,
+    )
+    .await
 }
 
 pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
@@ -1725,6 +1732,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
     batch_size_override: Option<usize>,
     run_id: Option<&str>,
     tracker: Option<&RepairRunTracker>,
+    local_execution_deadline: tokio::time::Instant,
 ) -> ClusterReplicationRepairReport {
     let mut node_reports = Vec::new();
     let mut totals = ReplicationRepairReport {
@@ -1774,6 +1782,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         run_id,
         local_trigger,
         tracker,
+        local_execution_deadline,
     )
     .await;
     info!(
@@ -1812,6 +1821,9 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
             .collect::<Vec<_>>()
     };
 
+    let peer_phase_timeout_secs = peer_repair_request_timeout_secs(state);
+    let peer_phase_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(peer_phase_timeout_secs);
     for peer in peers {
         let path =
             build_replication_repair_path(batch_size_override, ReplicationRepairScope::Local);
@@ -1835,9 +1847,8 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                 "path": path,
             })),
         );
-        let peer_timeout_secs = peer_repair_request_timeout_secs(state);
-        let peer_result = tokio::time::timeout(
-            Duration::from_secs(peer_timeout_secs),
+        let peer_result = tokio::time::timeout_at(
+            peer_phase_deadline,
             execute_peer_request(
                 state,
                 &peer,
@@ -1848,7 +1859,9 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
             ),
         )
         .await
-        .map_err(|_| anyhow!("peer repair request timed out after {peer_timeout_secs} seconds"))
+        .map_err(|_| {
+            anyhow!("cluster peer repair phase timed out after {peer_phase_timeout_secs} seconds")
+        })
         .and_then(|result| result);
         match peer_result {
             Ok(response) if response.is_success() => {
