@@ -1663,6 +1663,8 @@ function formatStartupRepairStatus(status: string): string {
       return "skipped";
     case "completed":
       return "completed";
+    case "timed_out":
+      return "timed out";
     default:
       return status;
   }
@@ -1695,6 +1697,8 @@ function formatRepairStatus(status: string): string {
       return "waiting for source";
     case "unresolved":
       return "unresolved repair";
+    case "timed_out":
+      return "timed out";
     case "completed":
       return "completed";
     case "skipped_no_gaps":
@@ -1750,6 +1754,8 @@ function startupStatusColor(status: string | undefined): string {
   switch (status) {
     case "running":
       return "orange";
+    case "timed_out":
+      return "red";
     case "completed":
       return berrykeepPrimaryColor;
     case "skipped_no_gaps":
@@ -1768,6 +1774,7 @@ function repairStatusColor(status: string): string {
     case "waiting_for_source":
       return "yellow";
     case "unresolved":
+    case "timed_out":
       return "red";
     case "completed":
       return berrykeepPrimaryColor;

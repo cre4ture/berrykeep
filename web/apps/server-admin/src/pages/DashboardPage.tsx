@@ -1322,6 +1322,8 @@ function formatStartupRepairStatus(status: string): string {
       return "skipped";
     case "completed":
       return "completed";
+    case "timed_out":
+      return "timed out";
     default:
       return status;
   }
@@ -1343,6 +1345,8 @@ function startupStatusColor(status: string | undefined): string {
   switch (status) {
     case "running":
       return "orange";
+    case "timed_out":
+      return "red";
     case "completed":
       return berrykeepPrimaryColor;
     case "skipped_no_gaps":

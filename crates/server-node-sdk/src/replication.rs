@@ -5,6 +5,74 @@ const REPAIR_PROGRESS_CHUNK_LOG_INTERVAL: usize = 128;
 const MAX_REPAIR_REPORT_LOG_ENTRIES: usize = 2_048;
 const MAX_REPAIR_REPORT_SKIPPED_DETAILS: usize = 2_048;
 
+#[cfg(test)]
+pub(crate) struct ReplicationExportBlocker {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl ReplicationExportBlocker {
+    pub(crate) async fn wait_until_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn replication_export_blockers() -> &'static StdMutex<HashMap<String, Arc<ReplicationExportBlocker>>>
+{
+    static BLOCKERS: std::sync::OnceLock<StdMutex<HashMap<String, Arc<ReplicationExportBlocker>>>> =
+        std::sync::OnceLock::new();
+    BLOCKERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn block_replication_export_for_test(key: &str) -> Arc<ReplicationExportBlocker> {
+    let blocker = Arc::new(ReplicationExportBlocker {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        released: std::sync::atomic::AtomicBool::new(false),
+    });
+    replication_export_blockers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_string(), Arc::clone(&blocker));
+    blocker
+}
+
+#[cfg(test)]
+pub(crate) fn clear_replication_export_blocker_for_test(key: &str) {
+    replication_export_blockers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+}
+
+#[cfg(test)]
+async fn wait_for_replication_export_test_blocker(key: &str) {
+    let blocker = replication_export_blockers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .cloned();
+    if let Some(blocker) = blocker {
+        blocker.started.notify_one();
+        loop {
+            let released = blocker.release.notified();
+            if blocker.released.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReplicationRepairReport {
     pub(crate) attempted_transfers: usize,
@@ -24,6 +92,8 @@ pub(crate) struct ReplicationRepairReport {
     pub(crate) waiting_for_source: bool,
     #[serde(default)]
     pub(crate) unresolved: bool,
+    #[serde(default)]
+    pub(crate) timed_out: bool,
 }
 
 impl ReplicationRepairReport {
@@ -40,6 +110,9 @@ impl ReplicationRepairReport {
     }
 
     pub(crate) fn run_status(&self) -> RepairRunStatus {
+        if self.timed_out {
+            return RepairRunStatus::TimedOut;
+        }
         let deferred_transfer = self.skipped_backoff > 0 || self.skipped_max_retries > 0;
 
         if self.failed_transfers > 0 {
@@ -76,6 +149,41 @@ impl ReplicationRepairReport {
             return RepairRunStatus::PartiallyRepaired;
         }
         RepairRunStatus::Completed
+    }
+
+    pub(crate) fn timed_out(report_node_id: NodeId, timeout_secs: u64) -> Self {
+        let error = format!("repair execution timed out after {timeout_secs} seconds");
+        let mut report = Self {
+            attempted_transfers: 0,
+            successful_transfers: 0,
+            failed_transfers: 0,
+            skipped_items: 0,
+            skipped_backoff: 0,
+            skipped_max_retries: 0,
+            skipped_details: Vec::new(),
+            detailed_log: Vec::new(),
+            last_error: Some(error.clone()),
+            had_chunk_progress: false,
+            waiting_for_source: false,
+            unresolved: false,
+            timed_out: true,
+        };
+        push_repair_log_entry(
+            &mut report.detailed_log,
+            report_node_id,
+            "repair_run_timed_out",
+            "repair execution exceeded its configured deadline",
+            None,
+            None,
+            None,
+            None,
+            Some(report_node_id),
+            Some(serde_json::json!({
+                "timeout_secs": timeout_secs,
+                "error": error,
+            })),
+        );
+        report
     }
 }
 
@@ -436,6 +544,8 @@ async fn export_locally_owned_replication_bundle(
     key: &str,
     version_id: Option<&str>,
 ) -> Result<Option<ReplicationExportBundle>> {
+    #[cfg(test)]
+    wait_for_replication_export_test_blocker(key).await;
     let store = read_store(state, "replication_repair.export_bundle").await;
     let Some(bundle) = store
         .export_replication_bundle(key, version_id, ObjectReadMode::Preferred)
@@ -1436,6 +1546,7 @@ pub(crate) async fn execute_replication_repair_plan(
         had_chunk_progress: false,
         waiting_for_source: false,
         unresolved: false,
+        timed_out: false,
     }
 }
 
@@ -1466,6 +1577,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         had_chunk_progress: false,
         waiting_for_source: false,
         unresolved: false,
+        timed_out: false,
     };
     let mut failed_nodes = 0usize;
     let repair_run_id = run_id.unwrap_or("untracked");
@@ -1490,8 +1602,13 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         })),
     );
 
-    let local_report =
-        execute_replication_repair_inner_with_context(state, batch_size_override, run_id).await;
+    let local_report = execute_serialized_local_replication_repair_phase(
+        state,
+        batch_size_override,
+        run_id,
+        RepairRunTrigger::ManualRequest,
+    )
+    .await;
     info!(
         repair_run_id,
         attempted_transfers = local_report.attempted_transfers,
@@ -1551,16 +1668,26 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                 "path": path,
             })),
         );
-        match execute_peer_request(
-            state,
-            &peer,
-            reqwest::Method::POST,
-            &path,
-            Vec::new(),
-            Vec::new(),
+        let peer_result = tokio::time::timeout(
+            Duration::from_secs(DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS),
+            execute_peer_request(
+                state,
+                &peer,
+                reqwest::Method::POST,
+                &path,
+                Vec::new(),
+                Vec::new(),
+            ),
         )
         .await
-        {
+        .map_err(|_| {
+            anyhow!(
+                "peer repair request timed out after {} seconds",
+                DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS
+            )
+        })
+        .and_then(|result| result);
+        match peer_result {
             Ok(response) if response.is_success() => {
                 match response.json::<ReplicationRepairReport>() {
                     Ok(report) => {
@@ -1779,6 +1906,7 @@ fn accumulate_repair_report(
     totals.had_chunk_progress |= report.had_chunk_progress;
     totals.waiting_for_source |= report.waiting_for_source;
     totals.unresolved |= report.unresolved;
+    totals.timed_out |= report.timed_out;
     let skipped_detail_capacity =
         MAX_REPAIR_REPORT_SKIPPED_DETAILS.saturating_sub(totals.skipped_details.len());
     totals.skipped_details.extend(
@@ -2480,6 +2608,7 @@ mod tests {
             had_chunk_progress: false,
             waiting_for_source: false,
             unresolved: false,
+            timed_out: false,
         }
     }
 
@@ -2513,6 +2642,22 @@ mod tests {
             detailed_log.last().map(|entry| entry.detail.as_str()),
             Some(expected_last.as_str())
         );
+    }
+
+    #[test]
+    fn timed_out_report_has_terminal_timeout_status_and_diagnostics() {
+        let report = ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
+
+        assert_eq!(report.run_status(), RepairRunStatus::TimedOut);
+        assert!(report.timed_out);
+        assert!(
+            report
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("17 seconds"))
+        );
+        assert_eq!(report.detailed_log.len(), 1);
+        assert_eq!(report.detailed_log[0].event, "repair_run_timed_out");
     }
 
     #[test]
@@ -2831,6 +2976,7 @@ mod tests {
             had_chunk_progress: true,
             waiting_for_source: true,
             unresolved: true,
+            timed_out: false,
         };
 
         let mut totals = empty_report();

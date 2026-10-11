@@ -846,6 +846,7 @@ fn empty_report() -> replication::ReplicationRepairReport {
         had_chunk_progress: false,
         waiting_for_source: false,
         unresolved: false,
+        timed_out: false,
     }
 }
 

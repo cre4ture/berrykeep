@@ -331,6 +331,7 @@ The env vars referenced in the tuning subsections below are current operational 
 	- `BERRYKEEP_REPLICATION_REPAIR_BATCH_SIZE` (default: `256`)
 	- `BERRYKEEP_REPLICATION_REPAIR_MAX_RETRIES` (default: `3`)
 	- `BERRYKEEP_REPLICATION_REPAIR_BACKOFF_SECS` (default: `30`)
+	- `BERRYKEEP_REPLICATION_REPAIR_EXECUTION_TIMEOUT_SECS` (default: `1800`; bounds one node-local repair execution so a stalled storage or transport phase releases the executor and is retained as `timed_out`)
 	- `BERRYKEEP_REPAIR_BUSY_THROTTLE_ENABLED` (default: `true`)
 	- `BERRYKEEP_REPAIR_BUSY_INFLIGHT_THRESHOLD` (default: `32`)
 	- `BERRYKEEP_REPAIR_BUSY_WAIT_MILLIS` (default: `100`)

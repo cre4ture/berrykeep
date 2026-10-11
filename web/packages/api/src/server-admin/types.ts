@@ -300,7 +300,13 @@ export type RepairRunTrigger =
   | "autonomous_post_write"
   | "peer_cluster_request";
 
-export type RepairRunStatus = "completed" | "skipped_no_gaps" | "partially_repaired" | "waiting_for_source" | "unresolved";
+export type RepairRunStatus =
+  | "completed"
+  | "skipped_no_gaps"
+  | "partially_repaired"
+  | "waiting_for_source"
+  | "unresolved"
+  | "timed_out";
 
 export type RepairActivityState = "idle" | "scheduled" | "running";
 
@@ -309,7 +315,8 @@ export type StartupRepairStatus =
   | "scheduled"
   | "running"
   | "skipped_no_gaps"
-  | "completed";
+  | "completed"
+  | "timed_out";
 
 export type RepairPlanSummary = {
   generated_at_unix: number;
