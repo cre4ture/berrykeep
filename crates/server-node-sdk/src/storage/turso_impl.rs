@@ -3158,7 +3158,14 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         progress: Option<MetadataDbLogicalProgressCallback>,
     ) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
-        let _connection_guard = self.connection_lock.lock().await;
+        // This report scans every metadata table. Keep it off the latency-sensitive primary
+        // connection, just as the SQLite backend opens a dedicated analysis connection.
+        let connection = self.database.connect().with_context(|| {
+            format!(
+                "failed to open logical distribution Turso connection for {}",
+                self.metadata_path.display()
+            )
+        })?;
         let specs = metadata_db_logical_table_specs();
         let mut tables = Vec::with_capacity(specs.len());
         for (index, spec) in specs.iter().enumerate() {
@@ -3169,8 +3176,7 @@ impl MetadataStore for TursoMetadataStore {
                     current_table: Some(spec.table.to_string()),
                 });
             }
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(&metadata_db_logical_summary_query(*spec), ())
                 .await
                 .with_context(|| {
@@ -4184,6 +4190,28 @@ mod tests {
                 .is_empty()
         );
 
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn logical_distribution_uses_a_dedicated_read_connection() {
+        let metadata_db_path = turso_test_db_path("turso-logical-distribution-read-connection");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let primary_connection_guard = store.connection_lock.lock().await;
+
+        let tables = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.load_metadata_db_logical_breakdown(None),
+        )
+        .await
+        .expect("logical distribution must not wait for the primary connection")
+        .expect("logical distribution should load");
+        assert!(!tables.is_empty());
+
+        drop(primary_connection_guard);
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
