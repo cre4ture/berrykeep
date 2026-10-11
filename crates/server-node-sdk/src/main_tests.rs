@@ -20553,7 +20553,8 @@ async fn build_test_state(
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_execution_gate: Arc::new(super::RepairExecutionGate::default()),
-            manual_repair_request_admission: Arc::new(super::Semaphore::new(1)),
+            manual_local_repair_request_admission: Arc::new(super::Semaphore::new(1)),
+            manual_cluster_repair_request_admission: Arc::new(super::Semaphore::new(1)),
             peer_repair_request_admission: Arc::new(super::Semaphore::new(1)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
             content_repair_claims: Arc::new(crate::ContentRepairClaims::default()),
@@ -23096,7 +23097,7 @@ async fn admitted_manual_repair_takes_priority_over_peer_synchronization() {
     tokio::time::timeout(Duration::from_secs(2), async {
         while state
             .maintenance
-            .manual_repair_request_admission
+            .manual_local_repair_request_admission
             .available_permits()
             != 0
         {
@@ -23281,6 +23282,40 @@ async fn manual_cluster_repair_admits_only_one_waiting_request() {
 }
 
 #[tokio::test]
+async fn manual_local_repair_has_separate_admission_from_cluster_scope() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let cluster_admission = Arc::clone(&state.maintenance.manual_cluster_repair_request_admission)
+        .try_acquire_owned()
+        .expect("cluster admission should initially be available");
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::replication::execute_replication_repair_public(
+        State(state.clone()),
+        headers,
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Local),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state
+            .maintenance
+            .manual_cluster_repair_request_admission
+            .available_permits(),
+        0,
+        "the local request must not consume or release cluster admission"
+    );
+
+    drop(cluster_admission);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn manual_availability_sync_does_not_hold_repair_executor() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
@@ -23310,7 +23345,7 @@ async fn manual_availability_sync_does_not_hold_repair_executor() {
     tokio::time::timeout(Duration::from_secs(2), async {
         while state
             .maintenance
-            .manual_repair_request_admission
+            .manual_local_repair_request_admission
             .available_permits()
             != 0
         {
@@ -23381,6 +23416,7 @@ async fn stalled_subject_inspection_does_not_block_later_subjects() {
     seed_test_replication_gap(&state, LATER_KEY).await;
     state.repair_config.execution_timeout_secs = 5;
     state.repair_config.subject_inspection_timeout_secs = 1;
+    state.repair_config.max_retries = 0;
     let blocker = super::replication::block_replication_export_for_test(STALLED_KEY);
 
     let report = tokio::time::timeout(
@@ -23403,6 +23439,43 @@ async fn stalled_subject_inspection_does_not_block_later_subjects() {
     }));
     assert!(report.detailed_log.iter().any(|entry| {
         entry.event == "subject_evaluated" && entry.key.as_deref() == Some(LATER_KEY)
+    }));
+    assert!(
+        report.attempted_transfers > 0,
+        "the later subject should still perform actual transfer work"
+    );
+
+    let retry_blocker = super::replication::block_replication_export_for_test(STALLED_KEY);
+    let retry_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("failed inspection retry state should shed the stalled subject");
+    retry_blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(STALLED_KEY);
+    assert!(
+        retry_report.skipped_max_retries >= 1,
+        "persisted inspection failures should shed every matching stalled subject"
+    );
+    assert!(retry_report.detailed_log.iter().any(|entry| {
+        entry.event == "subject_skipped"
+            && entry.key.as_deref() == Some(STALLED_KEY)
+            && entry
+                .context
+                .as_ref()
+                .and_then(|context| context.get("phase"))
+                .and_then(serde_json::Value::as_str)
+                == Some("local_replica_inspection")
+    }));
+    assert!(!retry_report.detailed_log.iter().any(|entry| {
+        entry.event == "local_replica_inspection_failed"
+            && entry.key.as_deref() == Some(STALLED_KEY)
     }));
 
     cleanup_test_state(&state).await;

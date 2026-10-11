@@ -303,9 +303,15 @@ async fn execute_replication_repair_with_trigger(
     };
     let request_admission = match trigger {
         RepairRunTrigger::ManualRequest => {
-            let Ok(admission) =
-                Arc::clone(&state.maintenance.manual_repair_request_admission).try_acquire_owned()
-            else {
+            let admission = match scope {
+                ReplicationRepairScope::Local => {
+                    Arc::clone(&state.maintenance.manual_local_repair_request_admission)
+                }
+                ReplicationRepairScope::Cluster => {
+                    Arc::clone(&state.maintenance.manual_cluster_repair_request_admission)
+                }
+            };
+            let Ok(admission) = admission.try_acquire_owned() else {
                 warn!(
                     ?scope,
                     "rejecting duplicate manual repair while another request is admitted"
@@ -356,7 +362,7 @@ async fn execute_replication_repair_with_trigger(
                     };
                     if state
                         .maintenance
-                        .manual_repair_request_admission
+                        .manual_local_repair_request_admission
                         .available_permits()
                         == 0
                     {
@@ -791,6 +797,7 @@ pub(crate) async fn execute_replication_repair_plan(
     let plan_cleanup_deferred_items = plan.cleanup_deferred_items;
     let plan_cleanup_deferred_extra_nodes = plan.cleanup_deferred_extra_nodes;
     let mut attempted_transfers = 0usize;
+    let mut failed_subject_inspections = 0usize;
     let mut successful_transfers = 0usize;
     let mut failed_transfers = 0usize;
     let mut skipped_items = 0usize;
@@ -861,7 +868,8 @@ pub(crate) async fn execute_replication_repair_plan(
     );
 
     for item in plan_items {
-        if attempted_transfers >= max_transfers {
+        let consumed_work_items = attempted_transfers.saturating_add(failed_subject_inspections);
+        if consumed_work_items >= max_transfers {
             push_repair_log_entry(
                 &mut detailed_log,
                 state.node_id,
@@ -874,6 +882,8 @@ pub(crate) async fn execute_replication_repair_plan(
                 None,
                 Some(serde_json::json!({
                     "attempted_transfers": attempted_transfers,
+                    "failed_subject_inspections": failed_subject_inspections,
+                    "consumed_work_items": consumed_work_items,
                     "max_transfers": max_transfers,
                 })),
             );
@@ -962,6 +972,91 @@ pub(crate) async fn execute_replication_repair_plan(
             })),
         );
 
+        let inspection_attempt_key = format!("inspection|{}|{}", item.key, state.node_id);
+        {
+            let repair_state = state.maintenance.repair_state.lock().await;
+            if let Some(previous) = repair_state.attempts.get(&inspection_attempt_key) {
+                if previous.attempts > max_attempts {
+                    skipped_max_retries += 1;
+                    push_repair_skipped_detail(
+                        &mut skipped_details,
+                        state.node_id,
+                        item.key.clone(),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        None,
+                        Some(state.node_id),
+                        ReplicationRepairSkipReason::MaxRetriesExhausted,
+                        format!(
+                            "local replica inspection skipped after {} failed attempts (max_retries={max_attempts})",
+                            previous.attempts
+                        ),
+                    );
+                    push_repair_log_entry(
+                        &mut detailed_log,
+                        state.node_id,
+                        "subject_skipped",
+                        "local replica inspection retry limit exhausted",
+                        Some(item.key.clone()),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        None,
+                        Some(state.node_id),
+                        Some(serde_json::json!({
+                            "reason": "max_retries_exhausted",
+                            "phase": "local_replica_inspection",
+                            "failed_attempts": previous.attempts,
+                            "max_retries": max_attempts,
+                            "last_failure_unix": previous.last_failure_unix,
+                        })),
+                    );
+                    continue;
+                }
+
+                let elapsed = now.saturating_sub(previous.last_failure_unix);
+                let required_backoff =
+                    jittered_backoff_secs(backoff_secs, &inspection_attempt_key, previous.attempts);
+                if elapsed < required_backoff {
+                    skipped_backoff += 1;
+                    push_repair_skipped_detail(
+                        &mut skipped_details,
+                        state.node_id,
+                        item.key.clone(),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        None,
+                        Some(state.node_id),
+                        ReplicationRepairSkipReason::BackoffActive,
+                        format!(
+                            "local replica inspection retry backoff active for another {}s after {} failed attempts",
+                            required_backoff.saturating_sub(elapsed),
+                            previous.attempts
+                        ),
+                    );
+                    push_repair_log_entry(
+                        &mut detailed_log,
+                        state.node_id,
+                        "subject_skipped",
+                        "local replica inspection retry backoff is active",
+                        Some(item.key.clone()),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        None,
+                        Some(state.node_id),
+                        Some(serde_json::json!({
+                            "reason": "backoff_active",
+                            "phase": "local_replica_inspection",
+                            "failed_attempts": previous.attempts,
+                            "last_failure_unix": previous.last_failure_unix,
+                            "elapsed_since_failure_secs": elapsed,
+                            "required_backoff_secs": required_backoff,
+                        })),
+                    );
+                    continue;
+                }
+            }
+        }
+
         let mut bundle = match export_locally_owned_replication_bundle(
             state,
             &key,
@@ -969,9 +1064,21 @@ pub(crate) async fn execute_replication_repair_plan(
         )
         .await
         {
-            Ok(bundle) => bundle,
+            Ok(bundle) => {
+                let removed = state
+                    .maintenance
+                    .repair_state
+                    .lock()
+                    .await
+                    .attempts
+                    .remove(&inspection_attempt_key)
+                    .is_some();
+                persistence.repair_state_dirty |= removed;
+                bundle
+            }
             Err(err) => {
                 let error_text = format!("{err:#}");
+                failed_subject_inspections += 1;
                 failed_transfers += 1;
                 last_error = Some(error_text.clone());
                 warn!(
@@ -998,6 +1105,18 @@ pub(crate) async fn execute_replication_repair_plan(
                         "error": error_text,
                     })),
                 );
+                let mut repair_state = state.maintenance.repair_state.lock().await;
+                let entry = repair_state
+                    .attempts
+                    .entry(inspection_attempt_key)
+                    .or_insert(RepairAttemptEntry {
+                        attempts: 0,
+                        last_failure_unix: now,
+                    });
+                entry.attempts = entry.attempts.saturating_add(1);
+                entry.last_failure_unix = now;
+                drop(repair_state);
+                persistence.repair_state_dirty = true;
                 continue;
             }
         };
