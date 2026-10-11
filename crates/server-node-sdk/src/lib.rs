@@ -208,8 +208,13 @@ const DIRECT_PEER_REQUEST_TIMEOUT_SECS: u64 = 30;
 const CLUSTER_TASK_QUEUE_CACHE_TTL_SECS: u64 = 30;
 const CLUSTER_TASK_QUEUE_PEER_TIMEOUT_SECS: u64 = 3;
 const DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS: u64 = 300;
+const PEER_REPAIR_REQUEST_TIMEOUT_GRACE_SECS: u64 = 30;
 const REPAIR_LOCAL_AVAILABILITY_SYNC_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS: u64 = 30 * 60;
+#[cfg(not(test))]
+const MAX_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS: u64 = 60;
+#[cfg(test)]
+const MAX_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS: u64 = 1;
 const OBJECT_RESPONSE_STREAM_CHUNK_SIZE_BYTES: usize = 64 * 1024;
 const STORAGE_STATS_RECONCILE_INTERVAL_SECS: u64 = 60 * 60;
 const STORAGE_STATS_HISTORY_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
@@ -3608,6 +3613,7 @@ struct RepairHistoryResponse {
 #[derive(Debug, Default)]
 struct RepairActiveRunLiveState {
     entries: VecDeque<replication::ReplicationRepairLogEntry>,
+    total_entries: u64,
     truncated: bool,
     last_log_at_unix: Option<u64>,
 }
@@ -3732,6 +3738,7 @@ impl RepairActiveRunProgress {
 impl RepairActiveRunLiveState {
     fn push(&mut self, entry: replication::ReplicationRepairLogEntry) {
         self.last_log_at_unix = Some(entry.captured_at_unix);
+        self.total_entries = self.total_entries.saturating_add(1);
         self.entries.push_back(entry);
         while self.entries.len() > ACTIVE_REPAIR_LIVE_LOG_LIMIT {
             self.entries.pop_front();
@@ -10134,6 +10141,15 @@ impl PeerHttpResponse {
     }
 }
 
+fn peer_repair_request_timeout_secs(state: &ServerState) -> u64 {
+    DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS.max(
+        state
+            .repair_config
+            .execution_timeout_secs
+            .saturating_add(PEER_REPAIR_REQUEST_TIMEOUT_GRACE_SECS),
+    )
+}
+
 async fn execute_peer_request(
     state: &ServerState,
     node: &NodeDescriptor,
@@ -10154,6 +10170,12 @@ async fn execute_peer_request(
                 .map(|candidate| candidate.endpoint.trim_end_matches('/').to_string())
                 .context("peer transport plan did not include a selected candidate")?;
             let internal_http = build_direct_peer_http_client(state, node)?;
+            let request_timeout_secs = if path_and_query.starts_with("/cluster/replication/repair")
+            {
+                peer_repair_request_timeout_secs(state)
+            } else {
+                DIRECT_PEER_REQUEST_TIMEOUT_SECS
+            };
             let response = execute_direct_peer_request(
                 &internal_http,
                 &base_url,
@@ -10161,6 +10183,7 @@ async fn execute_peer_request(
                 path_and_query,
                 headers,
                 body,
+                request_timeout_secs,
             )
             .await?;
             if let Some(started) = started {
@@ -10222,15 +10245,11 @@ async fn execute_direct_peer_request(
     path_and_query: &str,
     headers: Vec<RelayHttpHeader>,
     body: Vec<u8>,
+    request_timeout_secs: u64,
 ) -> Result<PeerHttpResponse> {
     let url = join_peer_url(base_url, path_and_query)?;
     let request_url = url.to_string();
     let request_method = method.as_str().to_string();
-    let request_timeout_secs = if path_and_query.starts_with("/cluster/replication/repair") {
-        DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS
-    } else {
-        DIRECT_PEER_REQUEST_TIMEOUT_SECS
-    };
     let request_timeout = Duration::from_secs(request_timeout_secs);
     let mut request = http.request(method, url);
     for header in headers {
@@ -12851,7 +12870,7 @@ async fn execute_serialized_local_replication_repair_phase(
     trigger: RepairRunTrigger,
     tracker: Option<&RepairRunTracker>,
 ) -> replication::ReplicationRepairReport {
-    let live_log_offset = tracker.map(repair_live_log_len).unwrap_or_default();
+    let live_log_cursor = tracker.map(repair_live_log_cursor).unwrap_or_default();
     let progress_baseline = tracker.map(repair_progress_snapshot).unwrap_or_default();
     if tracker.is_some() {
         let queue = state.maintenance.repair_execution_gate.queue_snapshot();
@@ -12904,7 +12923,7 @@ async fn execute_serialized_local_replication_repair_phase(
                 )
             },
             |tracker| {
-                timed_out_repair_report_since(state, tracker, live_log_offset, &progress_baseline)
+                timed_out_repair_report_since(state, tracker, live_log_cursor, &progress_baseline)
             },
         )
     });
@@ -12963,10 +12982,10 @@ fn timed_out_repair_report(
     timed_out_repair_report_since(state, tracker, 0, &RepairActiveRunProgress::default())
 }
 
-fn repair_live_log_len(tracker: &RepairRunTracker) -> usize {
+fn repair_live_log_cursor(tracker: &RepairRunTracker) -> u64 {
     match tracker.live_log.lock() {
-        Ok(guard) => guard.entries.len(),
-        Err(poisoned) => poisoned.into_inner().entries.len(),
+        Ok(guard) => guard.total_entries,
+        Err(poisoned) => poisoned.into_inner().total_entries,
     }
 }
 
@@ -12980,24 +12999,38 @@ fn repair_progress_snapshot(tracker: &RepairRunTracker) -> RepairActiveRunProgre
 fn timed_out_repair_report_since(
     state: &ServerState,
     tracker: &RepairRunTracker,
-    live_log_offset: usize,
+    live_log_cursor: u64,
     progress_baseline: &RepairActiveRunProgress,
 ) -> replication::ReplicationRepairReport {
+    // Snapshot before constructing the timeout entry: that constructor also
+    // publishes into the task-local live log while a cluster run is active.
+    let live_entries = {
+        let live_state = match tracker.live_log.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let retained_start = live_state
+            .total_entries
+            .saturating_sub(live_state.entries.len() as u64);
+        let skip = live_log_cursor
+            .saturating_sub(retained_start)
+            .min(live_state.entries.len() as u64) as usize;
+        live_state
+            .entries
+            .iter()
+            .skip(skip)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let progress = repair_progress_snapshot(tracker);
     let mut report = replication::ReplicationRepairReport::timed_out(
         state.node_id,
         state.repair_config.execution_timeout_secs,
     );
     let timeout_entry = report.detailed_log.pop();
-    let live_state = match tracker.live_log.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    report
-        .detailed_log
-        .extend(live_state.entries.iter().skip(live_log_offset).cloned());
-    drop(live_state);
+    report.detailed_log.extend(live_entries);
     report.detailed_log.extend(timeout_entry);
-    repair_progress_snapshot(tracker).apply_delta_to_report(progress_baseline, &mut report);
+    progress.apply_delta_to_report(progress_baseline, &mut report);
     report
 }
 
@@ -13511,6 +13544,23 @@ async fn execute_tracked_local_replication_repair(
     plan_summary_override: Option<RepairPlanSummary>,
 ) -> replication::ReplicationRepairReport {
     let permit = acquire_repair_execution(state, trigger).await;
+    execute_tracked_local_replication_repair_with_permit(
+        state,
+        batch_size_override,
+        trigger,
+        plan_summary_override,
+        permit,
+    )
+    .await
+}
+
+async fn execute_tracked_local_replication_repair_with_permit(
+    state: &ServerState,
+    batch_size_override: Option<usize>,
+    trigger: RepairRunTrigger,
+    plan_summary_override: Option<RepairPlanSummary>,
+    permit: RepairExecutionPermit,
+) -> replication::ReplicationRepairReport {
     let timeout_plan_summary = plan_summary_override
         .clone()
         .unwrap_or_else(empty_repair_plan_summary);
@@ -32306,8 +32356,22 @@ async fn persist_repair_state(state: &ServerState) -> Result<()> {
     store.persist_repair_attempts(&attempts).await
 }
 
+async fn persist_repair_state_cancellation_safe(state: &ServerState) -> Result<()> {
+    let state = state.clone();
+    tokio::spawn(async move { persist_repair_state(&state).await })
+        .await
+        .context("repair-attempt checkpoint task failed")?
+}
+
 async fn persist_cluster_replicas_state(state: &ServerState) -> Result<()> {
     persist_cluster_replicas_state_inner(state, true).await
+}
+
+async fn persist_cluster_replicas_state_cancellation_safe(state: &ServerState) -> Result<()> {
+    let state = state.clone();
+    tokio::spawn(async move { persist_cluster_replicas_state(&state).await })
+        .await
+        .context("cluster-replica checkpoint task failed")?
 }
 
 /// Persists the local availability set computed in this refresh. It is already

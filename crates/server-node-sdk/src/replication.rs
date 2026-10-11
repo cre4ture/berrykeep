@@ -296,9 +296,41 @@ async fn execute_replication_repair_with_trigger(
 
     match scope {
         ReplicationRepairScope::Local => {
+            let preacquired_permit = if trigger == RepairRunTrigger::PeerClusterRequest {
+                match state.maintenance.repair_execution_gate.try_acquire() {
+                    Some(permit) => Some(permit),
+                    None => {
+                        warn!(
+                            "rejecting peer repair request because the node-local executor is busy"
+                        );
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                }
+            } else {
+                None
+            };
             let repair_task = tokio::spawn(async move {
-                execute_tracked_local_replication_repair(&state, batch_override, trigger, None)
-                    .await
+                match preacquired_permit {
+                    Some(permit) => {
+                        execute_tracked_local_replication_repair_with_permit(
+                            &state,
+                            batch_override,
+                            trigger,
+                            None,
+                            permit,
+                        )
+                        .await
+                    }
+                    None => {
+                        execute_tracked_local_replication_repair(
+                            &state,
+                            batch_override,
+                            trigger,
+                            None,
+                        )
+                        .await
+                    }
+                }
             });
             match repair_task.await {
                 Ok(report) => (StatusCode::OK, Json(report)).into_response(),
@@ -564,6 +596,27 @@ async fn export_locally_owned_replication_bundle(
     key: &str,
     version_id: Option<&str>,
 ) -> Result<Option<ReplicationExportBundle>> {
+    let execution_timeout_secs = state.repair_config.execution_timeout_secs.max(1);
+    let timeout_secs = execution_timeout_secs
+        .saturating_sub(1)
+        .clamp(1, MAX_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS);
+    tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        export_locally_owned_replication_bundle_inner(state, key, version_id),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out after {timeout_secs}s inspecting local replication bundle for key={key} version_id={version_id:?}"
+        )
+    })?
+}
+
+async fn export_locally_owned_replication_bundle_inner(
+    state: &ServerState,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<Option<ReplicationExportBundle>> {
     #[cfg(test)]
     wait_for_replication_export_test_blocker(key).await;
     let store = read_store(state, "replication_repair.export_bundle").await;
@@ -592,6 +645,53 @@ async fn export_locally_owned_replication_bundle(
         Ok(Some(bundle))
     } else {
         Ok(None)
+    }
+}
+
+async fn checkpoint_repair_progress(
+    state: &ServerState,
+    repair_run_id: &str,
+    replicas_state_dirty: &mut bool,
+    repair_state_dirty: &mut bool,
+) {
+    let checkpoint_replicas = *replicas_state_dirty;
+    let checkpoint_attempts = *repair_state_dirty;
+    let (replica_result, attempt_result) = tokio::join!(
+        async {
+            if checkpoint_replicas {
+                persist_cluster_replicas_state_cancellation_safe(state).await
+            } else {
+                Ok(())
+            }
+        },
+        async {
+            if checkpoint_attempts {
+                persist_repair_state_cancellation_safe(state).await
+            } else {
+                Ok(())
+            }
+        }
+    );
+
+    if checkpoint_replicas {
+        match replica_result {
+            Ok(()) => *replicas_state_dirty = false,
+            Err(error) => warn!(
+                repair_run_id,
+                %error,
+                "failed to checkpoint cluster replica state during repair run"
+            ),
+        }
+    }
+    if checkpoint_attempts {
+        match attempt_result {
+            Ok(()) => *repair_state_dirty = false,
+            Err(error) => warn!(
+                repair_run_id,
+                %error,
+                "failed to checkpoint repair attempt state during repair run"
+            ),
+        }
     }
 }
 
@@ -1063,18 +1163,19 @@ pub(crate) async fn execute_replication_repair_plan(
                     drop(repair_state);
                     repair_state_dirty = true;
 
-                    bundle = {
-                        let store = read_store(state, "replication_repair.reload_bundle").await;
-                        store
-                            .export_replication_bundle(
-                                &key,
-                                version_id.as_deref(),
-                                ObjectReadMode::Preferred,
-                            )
+                    checkpoint_repair_progress(
+                        state,
+                        repair_run_id,
+                        &mut replicas_state_dirty,
+                        &mut repair_state_dirty,
+                    )
+                    .await;
+
+                    bundle =
+                        export_locally_owned_replication_bundle(state, &key, version_id.as_deref())
                             .await
                             .ok()
-                            .flatten()
-                    };
+                            .flatten();
                 }
                 Ok(PullBundleOutcome::Deferred { manifest_hash }) => {
                     // Claim contention means another operation is already
@@ -1139,6 +1240,13 @@ pub(crate) async fn execute_replication_repair_plan(
                     entry.last_failure_unix = now;
                     drop(repair_state);
                     repair_state_dirty = true;
+                    checkpoint_repair_progress(
+                        state,
+                        repair_run_id,
+                        &mut replicas_state_dirty,
+                        &mut repair_state_dirty,
+                    )
+                    .await;
                 }
             }
         }
@@ -1395,6 +1503,13 @@ pub(crate) async fn execute_replication_repair_plan(
                     repair_state.attempts.remove(&transfer_key);
                     drop(repair_state);
                     repair_state_dirty = true;
+                    checkpoint_repair_progress(
+                        state,
+                        repair_run_id,
+                        &mut replicas_state_dirty,
+                        &mut repair_state_dirty,
+                    )
+                    .await;
                 }
                 Err(err) => {
                     let error_text = format!("{err:#}");
@@ -1438,6 +1553,13 @@ pub(crate) async fn execute_replication_repair_plan(
                     entry.last_failure_unix = now;
                     drop(repair_state);
                     repair_state_dirty = true;
+                    checkpoint_repair_progress(
+                        state,
+                        repair_run_id,
+                        &mut replicas_state_dirty,
+                        &mut repair_state_dirty,
+                    )
+                    .await;
                 }
             }
         }
@@ -1694,8 +1816,9 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                 "path": path,
             })),
         );
+        let peer_timeout_secs = peer_repair_request_timeout_secs(state);
         let peer_result = tokio::time::timeout(
-            Duration::from_secs(DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(peer_timeout_secs),
             execute_peer_request(
                 state,
                 &peer,
@@ -1706,12 +1829,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
             ),
         )
         .await
-        .map_err(|_| {
-            anyhow!(
-                "peer repair request timed out after {} seconds",
-                DIRECT_PEER_REPAIR_REQUEST_TIMEOUT_SECS
-            )
-        })
+        .map_err(|_| anyhow!("peer repair request timed out after {peer_timeout_secs} seconds"))
         .and_then(|result| result);
         match peer_result {
             Ok(response) if response.is_success() => {

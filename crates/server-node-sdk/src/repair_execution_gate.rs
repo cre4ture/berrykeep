@@ -50,6 +50,17 @@ impl Default for RepairExecutionGate {
 }
 
 impl RepairExecutionGate {
+    pub(super) fn try_acquire(self: &Arc<Self>) -> Option<RepairExecutionPermit> {
+        let mut state = self.lock_state();
+        if state.active || !state.waiters.is_empty() {
+            return None;
+        }
+        state.active = true;
+        Some(RepairExecutionPermit {
+            gate: Arc::clone(self),
+        })
+    }
+
     pub(super) async fn acquire(
         self: &Arc<Self>,
         priority: RepairExecutionPriority,
@@ -219,6 +230,29 @@ mod tests {
             .expect("second execution should acquire the released gate")
             .expect("second execution task should not panic");
         drop(second_permit);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_sheds_work_while_active_or_queued() {
+        let gate = Arc::new(RepairExecutionGate::default());
+        let active = gate
+            .try_acquire()
+            .expect("idle executor should admit immediate work");
+        assert!(gate.try_acquire().is_none());
+
+        let queued = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.acquire(RepairExecutionPriority::Automatic).await }
+        });
+        tokio::task::yield_now().await;
+        drop(active);
+
+        assert!(
+            gate.try_acquire().is_none(),
+            "immediate work must not overtake an existing waiter"
+        );
+        drop(queued.await.expect("queued task should not panic"));
+        assert!(gate.try_acquire().is_some());
     }
 
     #[tokio::test]

@@ -22759,6 +22759,79 @@ async fn timed_out_report_retains_partial_transfer_counters() {
 }
 
 #[tokio::test]
+async fn timed_out_report_uses_monotonic_cursor_after_live_log_truncation() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Cluster,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+
+    super::with_active_repair_log_tracking(&tracker, async {
+        let mut log = Vec::new();
+        for index in 0..2 {
+            super::replication::push_repair_log_entry(
+                &mut log,
+                state.node_id,
+                "before_local_phase",
+                format!("entry {index}"),
+                None,
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                None,
+            );
+        }
+    })
+    .await;
+    let cursor = super::repair_live_log_cursor(&tracker);
+    let baseline = super::repair_progress_snapshot(&tracker);
+
+    super::with_active_repair_log_tracking(&tracker, async {
+        let mut log = Vec::new();
+        for index in 0..(super::ACTIVE_REPAIR_LIVE_LOG_LIMIT + 1) {
+            super::replication::push_repair_log_entry(
+                &mut log,
+                state.node_id,
+                "local_phase_progress",
+                format!("entry {index}"),
+                None,
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                None,
+            );
+        }
+    })
+    .await;
+
+    let report = super::timed_out_repair_report_since(&state, &tracker, cursor, &baseline);
+    assert_eq!(
+        report
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "local_phase_progress")
+            .count(),
+        super::ACTIVE_REPAIR_LIVE_LOG_LIMIT,
+        "every still-retained local phase entry should survive the timeout splice"
+    );
+    assert_eq!(
+        report
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "repair_run_timed_out")
+            .count(),
+        1
+    );
+
+    drop(tracker);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn dropped_repair_tracker_removes_its_active_run() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let tracker = super::begin_repair_run_tracking(
@@ -22837,6 +22910,78 @@ async fn repair_activity_reports_executor_queue_depth() {
 
     waiter.abort();
     drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn busy_peer_repair_is_shed_without_queueing() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let response = super::build_internal_peer_api()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/cluster/replication/repair?scope=local")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("peer repair route should respond");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "rejected peer work must not remain queued"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn stalled_subject_inspection_does_not_block_later_subjects() {
+    const STALLED_KEY: &str = "a-stalled-repair-subject";
+    const LATER_KEY: &str = "z-later-repair-subject";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, STALLED_KEY).await;
+    seed_test_replication_gap(&state, LATER_KEY).await;
+    state.repair_config.execution_timeout_secs = 5;
+    let blocker = super::replication::block_replication_export_for_test(STALLED_KEY);
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("repair should move past a subject whose inspection stalls");
+
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(STALLED_KEY);
+    assert!(report.detailed_log.iter().any(|entry| {
+        entry.event == "local_replica_inspection_failed"
+            && entry.key.as_deref() == Some(STALLED_KEY)
+    }));
+    assert!(report.detailed_log.iter().any(|entry| {
+        entry.event == "subject_evaluated" && entry.key.as_deref() == Some(LATER_KEY)
+    }));
+
     cleanup_test_state(&state).await;
 }
 
@@ -22964,6 +23109,16 @@ async fn timed_out_cluster_local_phase_retains_progress_log() {
             .detailed_log
             .iter()
             .any(|entry| entry.event == "repair_run_timed_out")
+    );
+    assert_eq!(
+        report
+            .totals
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "repair_run_timed_out")
+            .count(),
+        1,
+        "cluster local-phase timeout should be recorded exactly once"
     );
     assert_eq!(
         report
