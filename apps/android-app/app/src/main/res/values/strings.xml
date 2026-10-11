@@ -48,6 +48,15 @@
     <string name="new_profile">New profile</string>
     <string name="profile_label">Profile label</string>
     <string name="remote_prefix_optional">Remote prefix (optional)</string>
+    <string name="browse_remote_folders">Browse remote folders</string>
+    <string name="remote_prefix_picker_title">Choose remote folder</string>
+    <string name="remote_prefix_picker_current_folder">Current folder: %1$s</string>
+    <string name="remote_prefix_picker_hint">Choose an existing remote folder for this profile. You can still enter a new prefix manually.</string>
+    <string name="remote_prefix_picker_up">Up</string>
+    <string name="remote_prefix_picker_refresh">Refresh</string>
+    <string name="remote_prefix_picker_retry">Retry</string>
+    <string name="remote_prefix_picker_empty">This remote folder has no subfolders.</string>
+    <string name="remote_prefix_picker_use_folder">Use this folder</string>
     <string name="local_folder_path">Local folder path</string>
     <string name="pick_folder">Pick folder</string>
     <string name="network_rules">Network rules</string>

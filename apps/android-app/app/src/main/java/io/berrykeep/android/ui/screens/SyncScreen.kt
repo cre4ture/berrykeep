@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -45,8 +46,11 @@ import io.berrykeep.android.data.GLOBAL_SYNC_STATE_HEALTHY
 import io.berrykeep.android.data.GLOBAL_SYNC_STATE_WAITING
 import io.berrykeep.android.ui.FolderSyncActivityFilter
 import io.berrykeep.android.ui.FolderSyncHistoryState
+import io.berrykeep.android.ui.RemotePrefixPickerState
 import io.berrykeep.android.ui.SyncScreenActions
 import io.berrykeep.android.ui.SyncUiState
+import io.berrykeep.android.ui.remotePrefixPickerDisplayPath
+import io.berrykeep.android.ui.remotePrefixPickerParent
 import io.berrykeep.android.ui.components.EmptyStateCard
 import io.berrykeep.android.ui.components.HeroTone
 import io.berrykeep.android.ui.components.SectionCard
@@ -229,53 +233,178 @@ private fun NewSyncProfileSheet(
     onPickLocalFolder: () -> Unit,
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
+    var showRemotePrefixPicker by rememberSaveable { mutableStateOf(false) }
+
+    if (showRemotePrefixPicker) {
+        RemotePrefixPickerSheet(
+            state = state.remotePrefixPicker,
+            onDismiss = { showRemotePrefixPicker = false },
+            onBrowse = actions.browseRemotePrefixPicker,
+            onSelect = { prefix ->
+                actions.updateNewProfilePrefix(prefix)
+                showRemotePrefixPicker = false
+            },
+        )
+    } else {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .imePadding()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text(stringResource(R.string.new_profile), style = MaterialTheme.typography.titleLarge)
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = state.newProfileLabel,
+                onValueChange = actions.updateNewProfileLabel,
+                label = { Text(stringResource(R.string.profile_label)) },
+                singleLine = true,
+            )
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = state.newProfilePrefix,
+                onValueChange = actions.updateNewProfilePrefix,
+                label = { Text(stringResource(R.string.remote_prefix_optional)) },
+                singleLine = true,
+            )
+            OutlinedButton(
+                onClick = {
+                    actions.openRemotePrefixPicker()
+                    showRemotePrefixPicker = true
+                },
+            ) {
+                Text(stringResource(R.string.browse_remote_folders))
+            }
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = state.newProfileLocalFolder,
+                onValueChange = actions.updateNewProfileLocalFolder,
+                label = { Text(stringResource(R.string.local_folder_path)) },
+                singleLine = true,
+            )
+            OutlinedButton(onClick = onPickLocalFolder) {
+                Text(stringResource(R.string.pick_folder))
+            }
+            Text(stringResource(R.string.network_rules), style = MaterialTheme.typography.titleMedium)
+            NetworkPolicyEditor(
+                allowWifi = state.newProfileAllowWifi,
+                onAllowWifiChange = actions.updateNewProfileAllowWifi,
+                allowCellular = state.newProfileAllowCellular,
+                onAllowCellularChange = actions.updateNewProfileAllowCellular,
+                allowOtherConnections = state.newProfileAllowOtherConnections,
+                onAllowOtherConnectionsChange = actions.updateNewProfileAllowOtherConnections,
+                allowRoaming = state.newProfileAllowRoaming,
+                onAllowRoamingChange = actions.updateNewProfileAllowRoaming,
+                allowedWifiSsids = state.newProfileAllowedWifiSsids,
+                onAllowedWifiSsidsChange = actions.updateNewProfileAllowedWifiSsids,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
+            ) {
+                OutlinedButton(onClick = onDismiss) {
+                    Text(stringResource(R.string.cancel))
+                }
+                Button(
+                    onClick = {
+                        actions.addProfile()?.let { policy ->
+                            onEnsureWifiNameAccess(policy)
+                            onDismiss()
+                        }
+                    },
+                ) {
+                    Text(stringResource(R.string.save))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemotePrefixPickerSheet(
+    state: RemotePrefixPickerState,
+    onDismiss: () -> Unit,
+    onBrowse: (String) -> Unit,
+    onSelect: (String) -> Unit,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .verticalScroll(rememberScrollState())
-            .imePadding()
             .navigationBarsPadding()
             .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Text(stringResource(R.string.new_profile), style = MaterialTheme.typography.titleLarge)
-        OutlinedTextField(
-            modifier = Modifier.fillMaxWidth(),
-            value = state.newProfileLabel,
-            onValueChange = actions.updateNewProfileLabel,
-            label = { Text(stringResource(R.string.profile_label)) },
-            singleLine = true,
+        Text(
+            stringResource(R.string.remote_prefix_picker_title),
+            style = MaterialTheme.typography.titleLarge,
         )
-        OutlinedTextField(
-            modifier = Modifier.fillMaxWidth(),
-            value = state.newProfilePrefix,
-            onValueChange = actions.updateNewProfilePrefix,
-            label = { Text(stringResource(R.string.remote_prefix_optional)) },
-            singleLine = true,
+        Text(
+            stringResource(
+                R.string.remote_prefix_picker_current_folder,
+                remotePrefixPickerDisplayPath(state.currentPath),
+            ),
+            style = MaterialTheme.typography.bodyMedium,
         )
-        OutlinedTextField(
-            modifier = Modifier.fillMaxWidth(),
-            value = state.newProfileLocalFolder,
-            onValueChange = actions.updateNewProfileLocalFolder,
-            label = { Text(stringResource(R.string.local_folder_path)) },
-            singleLine = true,
+        Text(
+            stringResource(R.string.remote_prefix_picker_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        OutlinedButton(onClick = onPickLocalFolder) {
-            Text(stringResource(R.string.pick_folder))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (state.currentPath.isNotBlank()) {
+                OutlinedButton(onClick = { onBrowse(remotePrefixPickerParent(state.currentPath)) }) {
+                    Text(stringResource(R.string.remote_prefix_picker_up))
+                }
+            }
+            OutlinedButton(onClick = { onBrowse(state.currentPath) }) {
+                Text(stringResource(R.string.remote_prefix_picker_refresh))
+            }
         }
-        Text(stringResource(R.string.network_rules), style = MaterialTheme.typography.titleMedium)
-        NetworkPolicyEditor(
-            allowWifi = state.newProfileAllowWifi,
-            onAllowWifiChange = actions.updateNewProfileAllowWifi,
-            allowCellular = state.newProfileAllowCellular,
-            onAllowCellularChange = actions.updateNewProfileAllowCellular,
-            allowOtherConnections = state.newProfileAllowOtherConnections,
-            onAllowOtherConnectionsChange = actions.updateNewProfileAllowOtherConnections,
-            allowRoaming = state.newProfileAllowRoaming,
-            onAllowRoamingChange = actions.updateNewProfileAllowRoaming,
-            allowedWifiSsids = state.newProfileAllowedWifiSsids,
-            onAllowedWifiSsidsChange = actions.updateNewProfileAllowedWifiSsids,
-        )
+        when {
+            state.loading -> {
+                CircularProgressIndicator()
+            }
+
+            state.error != null -> {
+                Text(
+                    state.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                OutlinedButton(onClick = { onBrowse(state.currentPath) }) {
+                    Text(stringResource(R.string.remote_prefix_picker_retry))
+                }
+            }
+
+            state.folders.isEmpty() -> {
+                Text(
+                    stringResource(R.string.remote_prefix_picker_empty),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            else -> {
+                state.folders.forEach { folder ->
+                    OutlinedButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = { onBrowse(folder.path) },
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(folder.displayName)
+                            Text(
+                                remotePrefixPickerDisplayPath(folder.path),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+                }
+            }
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
@@ -283,15 +412,8 @@ private fun NewSyncProfileSheet(
             OutlinedButton(onClick = onDismiss) {
                 Text(stringResource(R.string.cancel))
             }
-            Button(
-                onClick = {
-                    actions.addProfile()?.let { policy ->
-                        onEnsureWifiNameAccess(policy)
-                        onDismiss()
-                    }
-                },
-            ) {
-                Text(stringResource(R.string.save))
+            Button(onClick = { onSelect(state.currentPath) }) {
+                Text(stringResource(R.string.remote_prefix_picker_use_folder))
             }
         }
     }

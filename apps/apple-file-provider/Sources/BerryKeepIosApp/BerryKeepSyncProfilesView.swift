@@ -333,6 +333,13 @@ private struct BerryKeepNewSyncProfileSheet: View {
                     TextField("Remote prefix (optional)", text: $remotePrefix)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                    NavigationLink {
+                        BerryKeepRemotePrefixPicker(initialPath: remotePrefix) { selectedPath in
+                            remotePrefix = selectedPath
+                        }
+                    } label: {
+                        Label("Browse remote folders", systemImage: "folder")
+                    }
                     Stepper("Discovery depth: \(depth)", value: $depth, in: 1...256)
                 }
                 Section("Network and power") {
@@ -376,6 +383,126 @@ private struct BerryKeepNewSyncProfileSheet: View {
                     )
                 }
             }
+        }
+    }
+}
+
+private struct BerryKeepRemotePrefixPicker: View {
+    @EnvironmentObject private var model: BerryKeepBrowserModel
+    @Environment(\.dismiss) private var dismiss
+
+    let onSelect: (String) -> Void
+
+    @State private var currentPath: String
+    @State private var folders: [AppleBridgeItem] = []
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    init(initialPath: String, onSelect: @escaping (String) -> Void) {
+        self.onSelect = onSelect
+        _currentPath = State(initialValue: normalizedPath(initialPath))
+    }
+
+    var body: some View {
+        List {
+            Section {
+                LabeledContent("Current folder", value: displayPath(currentPath))
+                Text("Choose an existing remote folder for this profile. You can still enter a new prefix manually.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    if !currentPath.isEmpty {
+                        Button("Up", systemImage: "chevron.up") {
+                            currentPath = parentPath
+                        }
+                    }
+                    Button("Refresh", systemImage: "arrow.clockwise") {
+                        Task { await loadFolders() }
+                    }
+                }
+            }
+
+            Section("Folders") {
+                if isLoading {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                        Text("Loading remote folders…")
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let errorMessage {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(errorMessage)
+                            .foregroundStyle(.red)
+                        Button("Retry") {
+                            Task { await loadFolders() }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                } else if folders.isEmpty {
+                    Text("This remote folder has no subfolders.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(folders, id: \.path) { folder in
+                        Button {
+                            currentPath = normalizedPath(folder.path)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Label(folder.displayName, systemImage: "folder")
+                                Text(displayPath(folder.path))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Choose remote folder")
+        .navigationBarTitleDisplayMode(.inline)
+        .task(id: currentPath) {
+            await loadFolders()
+        }
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Use this folder") {
+                    onSelect(currentPath)
+                    dismiss()
+                }
+            }
+        }
+    }
+
+    private var parentPath: String {
+        let normalized = normalizedPath(currentPath)
+        guard let slashIndex = normalized.lastIndex(of: "/") else {
+            return ""
+        }
+        return String(normalized[..<slashIndex])
+    }
+
+    private func loadFolders() async {
+        let requestedPath = currentPath
+        isLoading = true
+        errorMessage = nil
+
+        do {
+            let loadedFolders = try await model.remoteDirectories(path: requestedPath)
+            try Task.checkCancellation()
+            guard requestedPath == currentPath else {
+                return
+            }
+            folders = loadedFolders
+            isLoading = false
+        } catch is CancellationError {
+            return
+        } catch {
+            guard requestedPath == currentPath else {
+                return
+            }
+            folders = []
+            errorMessage = error.localizedDescription
+            isLoading = false
         }
     }
 }
