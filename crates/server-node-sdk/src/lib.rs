@@ -12691,7 +12691,7 @@ async fn record_server_request_timing(request: Request, next: Next) -> Response 
 /// manifest-hash repair worker and are excluded here.
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
     #[cfg(test)]
-    wait_for_replication_planning_test_blocker().await;
+    wait_for_replication_planning_test_blocker(state.node_id).await;
 
     let local_subjects = cached_local_cluster_available_subjects(state).await;
     let cluster_subjects = {
@@ -12728,43 +12728,48 @@ impl ReplicationPlanningBlocker {
 }
 
 #[cfg(test)]
-fn replication_planning_blocker() -> &'static StdMutex<Option<Arc<ReplicationPlanningBlocker>>> {
-    static BLOCKER: std::sync::OnceLock<StdMutex<Option<Arc<ReplicationPlanningBlocker>>>> =
+type ReplicationPlanningBlockers = HashMap<NodeId, Arc<ReplicationPlanningBlocker>>;
+
+#[cfg(test)]
+fn replication_planning_blockers() -> &'static StdMutex<ReplicationPlanningBlockers> {
+    static BLOCKERS: std::sync::OnceLock<StdMutex<ReplicationPlanningBlockers>> =
         std::sync::OnceLock::new();
-    BLOCKER.get_or_init(|| StdMutex::new(None))
+    BLOCKERS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 #[cfg(test)]
-fn block_replication_planning_for_test() -> Arc<ReplicationPlanningBlocker> {
+fn block_replication_planning_for_test(node_id: NodeId) -> Arc<ReplicationPlanningBlocker> {
     let blocker = Arc::new(ReplicationPlanningBlocker {
         started: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
         released: std::sync::atomic::AtomicBool::new(false),
     });
-    let previous = replication_planning_blocker()
+    let previous = replication_planning_blockers()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .replace(Arc::clone(&blocker));
+        .insert(node_id, Arc::clone(&blocker));
     assert!(
         previous.is_none(),
-        "replication planning is already blocked"
+        "replication planning is already blocked for node {node_id}"
     );
     blocker
 }
 
 #[cfg(test)]
-fn clear_replication_planning_blocker_for_test() {
-    *replication_planning_blocker()
+fn clear_replication_planning_blocker_for_test(node_id: NodeId) {
+    replication_planning_blockers()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&node_id);
 }
 
 #[cfg(test)]
-async fn wait_for_replication_planning_test_blocker() {
-    let blocker = replication_planning_blocker()
+async fn wait_for_replication_planning_test_blocker(node_id: NodeId) {
+    let blocker = replication_planning_blockers()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+        .get(&node_id)
+        .cloned();
     if let Some(blocker) = blocker {
         blocker.started.notify_one();
         loop {

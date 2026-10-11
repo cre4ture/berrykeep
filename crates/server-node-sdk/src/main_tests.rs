@@ -23375,8 +23375,10 @@ async fn manual_availability_sync_does_not_hold_repair_executor() {
 #[tokio::test]
 async fn timed_out_audit_planning_releases_executor() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let unrelated_state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    assert_ne!(state.node_id, unrelated_state.node_id);
     state.repair_config.execution_timeout_secs = 1;
-    let blocker = super::block_replication_planning_for_test();
+    let blocker = super::block_replication_planning_for_test(state.node_id);
 
     let audit = tokio::spawn({
         let state = state.clone();
@@ -23385,6 +23387,12 @@ async fn timed_out_audit_planning_releases_executor() {
     tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
         .await
         .expect("audit should reach replication planning while holding the executor");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        super::planning_replication_subjects(&unrelated_state),
+    )
+    .await
+    .expect("a node-scoped planning blocker must not stall unrelated test nodes");
     tokio::time::timeout(Duration::from_secs(5), audit)
         .await
         .expect("stalled audit planning should respect the shared execution deadline")
@@ -23402,7 +23410,8 @@ async fn timed_out_audit_planning_releases_executor() {
     drop(follow_up);
 
     blocker.release();
-    super::clear_replication_planning_blocker_for_test();
+    super::clear_replication_planning_blocker_for_test(state.node_id);
+    cleanup_test_state(&unrelated_state).await;
     cleanup_test_state(&state).await;
 }
 
