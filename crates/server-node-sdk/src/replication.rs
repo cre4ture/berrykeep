@@ -277,8 +277,8 @@ pub(crate) struct ClusterReplicationRepairReport {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReplicationRepairQuery {
-    batch_size: Option<usize>,
-    scope: Option<ReplicationRepairScope>,
+    pub(crate) batch_size: Option<usize>,
+    pub(crate) scope: Option<ReplicationRepairScope>,
 }
 
 async fn execute_replication_repair_with_trigger(
@@ -296,16 +296,30 @@ async fn execute_replication_repair_with_trigger(
 
     match scope {
         ReplicationRepairScope::Local => {
-            let report =
+            let repair_task = tokio::spawn(async move {
                 execute_tracked_local_replication_repair(&state, batch_override, trigger, None)
-                    .await;
-            (StatusCode::OK, Json(report)).into_response()
+                    .await
+            });
+            match repair_task.await {
+                Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+                Err(error) => {
+                    warn!(%error, "local replication repair task failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
         }
         ReplicationRepairScope::Cluster => {
-            let report =
+            let repair_task = tokio::spawn(async move {
                 execute_tracked_cluster_replication_repair(&state, batch_override, trigger, None)
-                    .await;
-            (StatusCode::OK, Json(report)).into_response()
+                    .await
+            });
+            match repair_task.await {
+                Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+                Err(error) => {
+                    warn!(%error, "cluster replication repair task failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
         }
     }
 }

@@ -12735,7 +12735,7 @@ async fn execute_serialized_local_replication_repair_phase(
     report
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct RepairRunTracker {
     run_id: String,
     scope: replication::ReplicationRepairScope,
@@ -12743,6 +12743,39 @@ struct RepairRunTracker {
     started_at_unix: u64,
     started_at_instant: Instant,
     live_log: Arc<StdMutex<RepairActiveRunLiveState>>,
+    repair_activity: Arc<Mutex<RepairActivityRuntime>>,
+    cleanup_armed: bool,
+}
+
+impl Drop for RepairRunTracker {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+
+        if let Ok(mut activity) = self.repair_activity.try_lock() {
+            activity
+                .active_runs
+                .retain(|active_run| active_run.run_id != self.run_id);
+            return;
+        }
+
+        let repair_activity = Arc::clone(&self.repair_activity);
+        let run_id = self.run_id.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let mut activity = repair_activity.lock().await;
+                    activity
+                        .active_runs
+                        .retain(|active_run| active_run.run_id != run_id);
+                });
+            }
+            Err(error) => {
+                warn!(%error, %run_id, "could not schedule cancelled repair activity cleanup");
+            }
+        }
+    }
 }
 
 fn timed_out_repair_report(
@@ -12851,6 +12884,8 @@ async fn begin_repair_run_tracking(
         started_at_unix,
         started_at_instant: Instant::now(),
         live_log,
+        repair_activity: Arc::clone(&state.maintenance.repair_activity),
+        cleanup_armed: true,
     }
 }
 
@@ -12892,7 +12927,7 @@ async fn persist_repair_run_record_with_retention(state: &ServerState, record: &
 
 async fn finish_repair_run_tracking(
     state: &ServerState,
-    tracker: RepairRunTracker,
+    mut tracker: RepairRunTracker,
     plan_summary: RepairPlanSummary,
     status: RepairRunStatus,
     summary: Option<RepairRunSummary>,
@@ -12904,11 +12939,12 @@ async fn finish_repair_run_tracking(
             .active_runs
             .retain(|active_run| active_run.run_id != tracker.run_id);
     }
+    tracker.cleanup_armed = false;
 
     let duration_ms =
         u64::try_from(tracker.started_at_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
     let record = RepairRunRecord {
-        run_id: tracker.run_id,
+        run_id: tracker.run_id.clone(),
         reporting_node_id: state.node_id,
         scope: tracker.scope,
         trigger: tracker.trigger,

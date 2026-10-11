@@ -22699,6 +22699,96 @@ async fn timed_out_replication_export_finishes_run_and_releases_executor() {
 }
 
 #[tokio::test]
+async fn dropped_repair_tracker_removes_its_active_run() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+    let run_id = tracker.run_id.clone();
+    let activity = Arc::clone(&state.maintenance.repair_activity);
+    let locked_activity = activity.lock().await;
+
+    drop(tracker);
+    assert!(
+        locked_activity
+            .active_runs
+            .iter()
+            .any(|active_run| active_run.run_id == run_id)
+    );
+    drop(locked_activity);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if activity
+                .lock()
+                .await
+                .active_runs
+                .iter()
+                .all(|active_run| active_run.run_id != run_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping a tracker should remove its active repair entry");
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn cancelled_peer_handler_leaves_detached_repair_to_finish() {
+    const GAP_KEY: &str = "cancelled-peer-handler-gap-key";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::replication::block_replication_export_for_test(GAP_KEY);
+    let handler = tokio::spawn(super::replication::execute_replication_repair_peer(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Local),
+        }),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
+        .await
+        .expect("peer repair should reach the blocked bundle export");
+
+    handler.abort();
+    assert!(
+        handler.await.is_err(),
+        "the simulated disconnected peer handler should be cancelled"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let activity = super::local_repair_activity_payload(&state)
+                .await
+                .expect("repair activity should remain readable");
+            let timed_out = repair_run_history(&state)
+                .await
+                .iter()
+                .any(|record| record.status == super::RepairRunStatus::TimedOut);
+            if activity.active_runs.is_empty() && timed_out {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached peer repair should reach a terminal timeout record");
+
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(GAP_KEY);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn queued_background_repair_refreshes_its_plan_after_acquiring_executor() {
     const GAP_KEY: &str = "queued-audit-gap-key";
 
