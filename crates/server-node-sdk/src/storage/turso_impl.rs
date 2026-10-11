@@ -150,6 +150,8 @@ impl TursoMetadataStore {
         Ok(store)
     }
 
+    /// Keep unbounded reads off the primary connection so decoding a large result set cannot
+    /// block unrelated metadata traffic behind `connection_lock`.
     fn open_scan_connection(&self, operation: &str) -> Result<turso::Connection> {
         self.database.connect().with_context(|| {
             format!(
@@ -2758,10 +2760,9 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_uncompressed_snapshot_ids(&self) -> Result<Vec<String>> {
-        let _connection_guard = self.connection_lock.lock().await;
+        let connection = self.open_scan_connection("uncompressed snapshots")?;
         const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
-        let mut rows = self
-            .connection
+        let mut rows = connection
             .query("SELECT snapshot_id, snapshot_json FROM snapshots", ())
             .await?;
         let mut ids = Vec::new();
@@ -2862,9 +2863,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_storage_locations(&self) -> Result<Vec<StorageLocationRecord>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("storage locations")?;
+        let mut rows = connection
             .query(
                 "SELECT content_kind, content_hash, path_id, size_bytes, state
                  FROM storage_locations",
@@ -2962,9 +2962,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_cached_chunk_records(&self) -> Result<Vec<CachedChunkRecord>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("cached chunk records")?;
+        let mut rows = connection
             .query(
                 "SELECT record_json
                  FROM cached_chunks
@@ -3012,9 +3011,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_locally_owned_manifests(&self) -> Result<Vec<String>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("locally owned manifests")?;
+        let mut rows = connection
             .query(
                 "SELECT manifest_hash
                  FROM locally_owned_manifests
@@ -4210,6 +4208,10 @@ mod tests {
             assert!(store.load_all_version_indexes().await?.is_empty());
             assert!(store.list_version_index_object_ids().await?.is_empty());
             assert!(store.list_media_cache_fingerprints().await?.is_empty());
+            assert!(store.list_uncompressed_snapshot_ids().await?.is_empty());
+            assert!(store.load_storage_locations().await?.is_empty());
+            assert!(store.list_cached_chunk_records().await?.is_empty());
+            assert!(store.list_locally_owned_manifests().await?.is_empty());
             assert!(
                 !store
                     .load_metadata_db_logical_breakdown(None)
