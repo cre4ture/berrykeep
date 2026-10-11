@@ -23425,6 +23425,7 @@ async fn stalled_subject_inspection_does_not_block_later_subjects() {
     seed_test_replication_gap(&state, LATER_KEY).await;
     state.repair_config.execution_timeout_secs = 5;
     state.repair_config.subject_inspection_timeout_secs = 1;
+    state.repair_config.backoff_secs = 60;
     state.repair_config.max_retries = 0;
     let blocker = super::replication::block_replication_export_for_test(STALLED_KEY);
 
@@ -23472,20 +23473,75 @@ async fn stalled_subject_inspection_does_not_block_later_subjects() {
         retry_report.skipped_max_retries >= 1,
         "persisted inspection failures should shed every matching stalled subject"
     );
-    assert!(retry_report.detailed_log.iter().any(|entry| {
-        entry.event == "subject_skipped"
-            && entry.key.as_deref() == Some(STALLED_KEY)
-            && entry
-                .context
-                .as_ref()
-                .and_then(|context| context.get("phase"))
-                .and_then(serde_json::Value::as_str)
-                == Some("local_replica_inspection")
-    }));
+    assert!(
+        retry_report.detailed_log.iter().any(|entry| {
+            entry.event == "subject_skipped"
+                && entry
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with(STALLED_KEY))
+                && entry
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get("phase"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("local_replica_inspection")
+        }),
+        "retry log: {:#?}",
+        retry_report.detailed_log
+    );
     assert!(!retry_report.detailed_log.iter().any(|entry| {
         entry.event == "local_replica_inspection_failed"
-            && entry.key.as_deref() == Some(STALLED_KEY)
+            && entry
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(STALLED_KEY))
     }));
+
+    {
+        let mut repair_state = state.maintenance.repair_state.lock().await;
+        let inspection_attempts = repair_state
+            .attempts
+            .iter_mut()
+            .filter(|(attempt_key, _)| {
+                attempt_key.starts_with(&format!("inspection|{STALLED_KEY}"))
+            })
+            .map(|(_, attempt)| attempt)
+            .collect::<Vec<_>>();
+        assert!(!inspection_attempts.is_empty());
+        for attempt in inspection_attempts {
+            attempt.last_failure_unix = 0;
+        }
+    }
+    let reset_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("an expired inspection retry window should become retryable");
+    assert!(reset_report.detailed_log.iter().any(|entry| {
+        entry.event == "local_replica_inspection_retry_reset"
+            && entry
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(STALLED_KEY))
+    }));
+    assert!(
+        !state
+            .maintenance
+            .repair_state
+            .lock()
+            .await
+            .attempts
+            .keys()
+            .any(|attempt_key| attempt_key.starts_with(&format!("inspection|{STALLED_KEY}"))),
+        "successful inspection should clear the expired retry state"
+    );
 
     cleanup_test_state(&state).await;
 }

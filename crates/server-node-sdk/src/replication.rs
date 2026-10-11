@@ -808,6 +808,9 @@ pub(crate) async fn execute_replication_repair_plan(
     let mut last_error = None;
     let max_attempts = state.repair_config.max_retries;
     let backoff_secs = state.repair_config.backoff_secs;
+    let inspection_retry_reset_secs = backoff_secs
+        .max(state.repair_config.subject_inspection_timeout_secs.max(1))
+        .saturating_mul(u64::from(max_attempts).saturating_add(1));
     let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
     let now = unix_ts();
     let repair_run_id = run_id.unwrap_or("untracked");
@@ -973,50 +976,60 @@ pub(crate) async fn execute_replication_repair_plan(
         );
 
         let inspection_attempt_key = format!("inspection|{}|{}", item.key, state.node_id);
+        let mut inspection_retry_reset = None;
         {
-            let repair_state = state.maintenance.repair_state.lock().await;
-            if let Some(previous) = repair_state.attempts.get(&inspection_attempt_key) {
+            let mut repair_state = state.maintenance.repair_state.lock().await;
+            if let Some(previous) = repair_state.attempts.get(&inspection_attempt_key).copied() {
+                let elapsed = now.saturating_sub(previous.last_failure_unix);
                 if previous.attempts > max_attempts {
-                    skipped_max_retries += 1;
-                    push_repair_skipped_detail(
-                        &mut skipped_details,
-                        state.node_id,
-                        item.key.clone(),
-                        Some(key.clone()),
-                        version_id.clone(),
-                        None,
-                        Some(state.node_id),
-                        ReplicationRepairSkipReason::MaxRetriesExhausted,
-                        format!(
-                            "local replica inspection skipped after {} failed attempts (max_retries={max_attempts})",
-                            previous.attempts
-                        ),
-                    );
-                    push_repair_log_entry(
-                        &mut detailed_log,
-                        state.node_id,
-                        "subject_skipped",
-                        "local replica inspection retry limit exhausted",
-                        Some(item.key.clone()),
-                        Some(key.clone()),
-                        version_id.clone(),
-                        None,
-                        Some(state.node_id),
-                        Some(serde_json::json!({
-                            "reason": "max_retries_exhausted",
-                            "phase": "local_replica_inspection",
-                            "failed_attempts": previous.attempts,
-                            "max_retries": max_attempts,
-                            "last_failure_unix": previous.last_failure_unix,
-                        })),
-                    );
-                    continue;
+                    if elapsed >= inspection_retry_reset_secs {
+                        repair_state.attempts.remove(&inspection_attempt_key);
+                        persistence.repair_state_dirty = true;
+                        inspection_retry_reset = Some(previous);
+                    } else {
+                        skipped_max_retries += 1;
+                        push_repair_skipped_detail(
+                            &mut skipped_details,
+                            state.node_id,
+                            item.key.clone(),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            None,
+                            Some(state.node_id),
+                            ReplicationRepairSkipReason::MaxRetriesExhausted,
+                            format!(
+                                "local replica inspection deferred after {} failed attempts for another {}s (max_retries={max_attempts})",
+                                previous.attempts,
+                                inspection_retry_reset_secs.saturating_sub(elapsed)
+                            ),
+                        );
+                        push_repair_log_entry(
+                            &mut detailed_log,
+                            state.node_id,
+                            "subject_skipped",
+                            "local replica inspection retry limit temporarily exhausted",
+                            Some(item.key.clone()),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            None,
+                            Some(state.node_id),
+                            Some(serde_json::json!({
+                                "reason": "max_retries_exhausted",
+                                "phase": "local_replica_inspection",
+                                "failed_attempts": previous.attempts,
+                                "max_retries": max_attempts,
+                                "last_failure_unix": previous.last_failure_unix,
+                                "retry_reset_after_secs": inspection_retry_reset_secs,
+                                "retry_reset_remaining_secs": inspection_retry_reset_secs.saturating_sub(elapsed),
+                            })),
+                        );
+                        continue;
+                    }
                 }
 
-                let elapsed = now.saturating_sub(previous.last_failure_unix);
                 let required_backoff =
                     jittered_backoff_secs(backoff_secs, &inspection_attempt_key, previous.attempts);
-                if elapsed < required_backoff {
+                if inspection_retry_reset.is_none() && elapsed < required_backoff {
                     skipped_backoff += 1;
                     push_repair_skipped_detail(
                         &mut skipped_details,
@@ -1055,6 +1068,24 @@ pub(crate) async fn execute_replication_repair_plan(
                     continue;
                 }
             }
+        }
+        if let Some(previous) = inspection_retry_reset {
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "local_replica_inspection_retry_reset",
+                "retrying local replica inspection after its exhausted retry window expired",
+                Some(item.key.clone()),
+                Some(key.clone()),
+                version_id.clone(),
+                None,
+                Some(state.node_id),
+                Some(serde_json::json!({
+                    "failed_attempts": previous.attempts,
+                    "last_failure_unix": previous.last_failure_unix,
+                    "retry_reset_after_secs": inspection_retry_reset_secs,
+                })),
+            );
         }
 
         let mut bundle = match export_locally_owned_replication_bundle(
