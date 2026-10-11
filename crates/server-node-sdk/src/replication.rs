@@ -1561,13 +1561,15 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ClusterReplicationRepairReport {
-    execute_cluster_replication_repair_inner_with_context(state, batch_size_override, None).await
+    execute_cluster_replication_repair_inner_with_context(state, batch_size_override, None, None)
+        .await
 }
 
 pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
     state: &ServerState,
     batch_size_override: Option<usize>,
     run_id: Option<&str>,
+    tracker: Option<&RepairRunTracker>,
 ) -> ClusterReplicationRepairReport {
     let mut node_reports = Vec::new();
     let mut totals = ReplicationRepairReport {
@@ -1613,6 +1615,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         batch_size_override,
         run_id,
         RepairRunTrigger::ManualRequest,
+        tracker,
     )
     .await;
     info!(

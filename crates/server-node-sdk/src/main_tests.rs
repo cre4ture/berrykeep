@@ -20616,7 +20616,7 @@ async fn build_test_state(
     state
 }
 
-async fn seed_test_replication_gap(state: &ServerState, key: &str) {
+async fn seed_test_replication_gap(state: &ServerState, key: &str) -> String {
     let put = {
         let mut locked = state.store.write("tests.store").await;
         locked
@@ -20638,6 +20638,7 @@ async fn seed_test_replication_gap(state: &ServerState, key: &str) {
     let mut cluster = state.cluster.lock().await;
     cluster.note_replica(key, state.node_id);
     cluster.note_replica(format!("{key}@{}", put.version_id), state.node_id);
+    put.version_id
 }
 
 #[tokio::test]
@@ -22693,6 +22694,100 @@ async fn timed_out_replication_export_finishes_run_and_releases_executor() {
     .await
     .expect("a timed-out repair must release the executor for a later run");
     assert_eq!(follow_up.run_status(), super::RepairRunStatus::Completed);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn queued_background_repair_refreshes_its_plan_after_acquiring_executor() {
+    const GAP_KEY: &str = "queued-audit-gap-key";
+
+    let state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    let version_id = seed_test_replication_gap(&state, GAP_KEY).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    let repair = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::execute_tracked_replication_plan(
+                &state,
+                super::RepairRunTrigger::BackgroundAudit,
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        for node_id in cluster
+            .list_nodes()
+            .into_iter()
+            .map(|node| node.node_id)
+            .collect::<Vec<_>>()
+        {
+            cluster.note_replica(GAP_KEY, node_id);
+            cluster.note_replica(format!("{GAP_KEY}@{version_id}"), node_id);
+        }
+    }
+    drop(active);
+
+    let report = tokio::time::timeout(Duration::from_secs(5), repair)
+        .await
+        .expect("queued background repair should finish after the executor is released")
+        .expect("background repair task should not panic");
+    assert_eq!(report.attempted_transfers, 0);
+    assert_eq!(report.run_status(), super::RepairRunStatus::Completed);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_cluster_local_phase_retains_progress_log() {
+    const GAP_KEY: &str = "cluster-timeout-gap-key";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::replication::block_replication_export_for_test(GAP_KEY);
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        super::execute_tracked_cluster_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("cluster repair should finish after its local phase times out");
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(GAP_KEY);
+
+    assert_eq!(report.totals.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.totals.detailed_log.iter().any(|entry| {
+        entry.event == "subject_evaluated" && entry.key.as_deref() == Some(GAP_KEY)
+    }));
+    assert!(
+        report
+            .totals
+            .detailed_log
+            .iter()
+            .any(|entry| entry.event == "repair_run_timed_out")
+    );
+    assert_eq!(
+        report
+            .totals
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "cluster_repair_started")
+            .count(),
+        1
+    );
 
     cleanup_test_state(&state).await;
 }

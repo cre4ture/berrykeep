@@ -11978,7 +11978,7 @@ async fn run_replication_audit_once(state: &ServerState) {
         let plan_snapshot = cluster.replication_plan_snapshot(&keys);
         (node_transitioned_offline, plan_snapshot)
     };
-    let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
+    let (plan, _) = plan_snapshot.into_plan_and_nodes();
 
     if node_transitioned_offline || !plan.items.is_empty() {
         info!(
@@ -11991,8 +11991,7 @@ async fn run_replication_audit_once(state: &ServerState) {
 
     if state.repair_config.enabled && !plan.items.is_empty() {
         let report =
-            execute_tracked_replication_plan(state, plan, nodes, RepairRunTrigger::BackgroundAudit)
-                .await;
+            execute_tracked_replication_plan(state, RepairRunTrigger::BackgroundAudit).await;
         info!(
             attempted = report.attempted_transfers,
             success = report.successful_transfers,
@@ -12708,8 +12707,10 @@ async fn execute_serialized_local_replication_repair_phase(
     batch_size_override: Option<usize>,
     run_id: Option<&str>,
     trigger: RepairRunTrigger,
+    tracker: Option<&RepairRunTracker>,
 ) -> replication::ReplicationRepairReport {
     let permit = acquire_repair_execution(state, trigger).await;
+    let live_log_offset = tracker.map(repair_live_log_len).unwrap_or_default();
     let report = run_with_repair_execution_timeout(
         state,
         replication::execute_replication_repair_inner_with_context(
@@ -12720,9 +12721,14 @@ async fn execute_serialized_local_replication_repair_phase(
     )
     .await
     .unwrap_or_else(|| {
-        replication::ReplicationRepairReport::timed_out(
-            state.node_id,
-            state.repair_config.execution_timeout_secs,
+        tracker.map_or_else(
+            || {
+                replication::ReplicationRepairReport::timed_out(
+                    state.node_id,
+                    state.repair_config.execution_timeout_secs,
+                )
+            },
+            |tracker| timed_out_repair_report_since(state, tracker, live_log_offset),
         )
     });
     drop(permit);
@@ -12743,6 +12749,21 @@ fn timed_out_repair_report(
     state: &ServerState,
     tracker: &RepairRunTracker,
 ) -> replication::ReplicationRepairReport {
+    timed_out_repair_report_since(state, tracker, 0)
+}
+
+fn repair_live_log_len(tracker: &RepairRunTracker) -> usize {
+    match tracker.live_log.lock() {
+        Ok(guard) => guard.entries.len(),
+        Err(poisoned) => poisoned.into_inner().entries.len(),
+    }
+}
+
+fn timed_out_repair_report_since(
+    state: &ServerState,
+    tracker: &RepairRunTracker,
+    live_log_offset: usize,
+) -> replication::ReplicationRepairReport {
     let mut report = replication::ReplicationRepairReport::timed_out(
         state.node_id,
         state.repair_config.execution_timeout_secs,
@@ -12754,7 +12775,7 @@ fn timed_out_repair_report(
     };
     report
         .detailed_log
-        .extend(live_state.entries.iter().cloned());
+        .extend(live_state.entries.iter().skip(live_log_offset).cloned());
     drop(live_state);
     report.detailed_log.extend(timeout_entry);
     report
@@ -13291,21 +13312,25 @@ async fn execute_tracked_local_replication_repair(
     report
 }
 
-/// Records a repair run for a plan already assembled by the background
-/// auditor, preserving the one retained-content snapshot used for that tick.
+/// Records a background repair after refreshing the plan under the execution
+/// permit so work completed by an earlier queued repair is not retried.
 async fn execute_tracked_replication_plan(
     state: &ServerState,
-    plan: ReplicationPlan,
-    nodes: Vec<NodeDescriptor>,
     trigger: RepairRunTrigger,
 ) -> replication::ReplicationRepairReport {
     let permit = acquire_repair_execution(state, trigger).await;
-    let plan_summary = RepairPlanSummary::from_plan(&plan);
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let report = run_with_repair_execution_timeout(
-        state,
-        with_active_repair_log_tracking(&tracker, async {
+    let execution = run_with_repair_execution_timeout(state, async {
+        let keys = planning_replication_subjects(state).await;
+        let plan_snapshot = {
+            let mut cluster = state.cluster.lock().await;
+            cluster.update_health_and_detect_offline_transition();
+            cluster.replication_plan_snapshot(&keys)
+        };
+        let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
+        let plan_summary = RepairPlanSummary::from_plan(&plan);
+        let report = with_active_repair_log_tracking(&tracker, async {
             replication::execute_replication_repair_plan(
                 state,
                 &plan,
@@ -13314,10 +13339,18 @@ async fn execute_tracked_replication_plan(
                 Some(&tracker.run_id),
             )
             .await
-        }),
-    )
+        })
+        .await;
+        (plan_summary, report)
+    })
     .await
-    .unwrap_or_else(|| timed_out_repair_report(state, &tracker));
+    .unwrap_or_else(|| {
+        (
+            empty_repair_plan_summary(),
+            timed_out_repair_report(state, &tracker),
+        )
+    });
+    let (plan_summary, report) = execution;
     drop(permit);
     finish_repair_run_tracking(
         state,
@@ -13436,6 +13469,7 @@ async fn execute_tracked_cluster_replication_repair(
             state,
             batch_size_override,
             Some(&tracker.run_id),
+            Some(&tracker),
         )
         .await
     })
