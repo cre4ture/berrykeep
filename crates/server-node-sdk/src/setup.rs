@@ -257,6 +257,15 @@ struct SetupCompletion {
     config: ServerNodeConfig,
 }
 
+/// Returns the next supervisor action after the setup listener has fully stopped.
+///
+/// Keeping runtime startup in the outer supervisor prevents the large setup and runtime futures
+/// from being nested in one stack-resident future during an in-process transition.
+pub(crate) enum SetupModeOutcome {
+    Shutdown,
+    Runtime(Box<ServerNodeConfig>),
+}
+
 fn spawn_setup_runtime_transition(permit: OwnedPermit<SetupCompletion>, config: ServerNodeConfig) {
     tokio::spawn(async move {
         // Let the setup handler finish writing its JSON response before the
@@ -714,10 +723,8 @@ pub(crate) fn load_managed_startup_mode(config: SetupBootstrapConfig) -> Result<
 
 pub(crate) async fn run_setup_mode(
     config: SetupBootstrapConfig,
-    log_buffer: Arc<LogBuffer>,
-    runtime_log_control: RuntimeLogControl,
     shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
+) -> Result<SetupModeOutcome> {
     let initial_state =
         ensure_managed_setup_state(&config.state_path).context("failed preparing setup state")?;
     let tls_config = ensure_bootstrap_tls_config(&config).await?;
@@ -765,14 +772,15 @@ pub(crate) async fn run_setup_mode(
                 .await
                 .context("bootstrap setup server task join failure")?;
             outcome.context("bootstrap setup server exited during shutdown")?;
-            return Ok(());
+            return Ok(SetupModeOutcome::Shutdown);
         }
     };
     if completion.is_none() {
         let outcome = server_task
             .await
             .context("bootstrap setup server task join failure")?;
-        return outcome.context("bootstrap setup server exited");
+        outcome.context("bootstrap setup server exited")?;
+        return Ok(SetupModeOutcome::Shutdown);
     }
 
     // Give hyper and rustls time to close pooled setup connections cleanly before the runtime
@@ -785,13 +793,7 @@ pub(crate) async fn run_setup_mode(
     outcome.context("bootstrap setup server exited during transition")?;
 
     let completion = completion.expect("checked is_some above");
-    run_inner(
-        completion.config,
-        Some(log_buffer),
-        runtime_log_control,
-        shutdown_rx,
-    )
-    .await
+    Ok(SetupModeOutcome::Runtime(Box::new(completion.config)))
 }
 
 async fn setup_health(State(state): State<SetupServerState>) -> impl IntoResponse {
