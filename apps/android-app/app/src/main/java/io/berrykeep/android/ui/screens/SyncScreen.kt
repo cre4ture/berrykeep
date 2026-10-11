@@ -67,6 +67,7 @@ fun SyncScreen(
     val profileStatuses = state.folderSyncStatus.profiles.associateBy { it.profileId }
     val globalSyncStatus = state.globalFolderSyncStatus
     var showCreateSheet by rememberSaveable { mutableStateOf(false) }
+    var showRemotePrefixPicker by rememberSaveable { mutableStateOf(false) }
     var detailProfileId by rememberSaveable { mutableStateOf<String?>(null) }
     var editingProfileId by rememberSaveable { mutableStateOf<String?>(null) }
     val detailProfile = state.profiles.firstOrNull { it.id == detailProfileId }
@@ -93,7 +94,12 @@ fun SyncScreen(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                Button(onClick = { showCreateSheet = true }) {
+                Button(
+                    onClick = {
+                        showRemotePrefixPicker = false
+                        showCreateSheet = true
+                    },
+                ) {
                     Text(stringResource(R.string.new_profile))
                 }
                 OutlinedButton(onClick = actions.runNow) {
@@ -130,7 +136,10 @@ fun SyncScreen(
                 title = stringResource(R.string.sync_empty_title),
                 body = stringResource(R.string.sync_empty_body),
                 actionLabel = stringResource(R.string.open_profile_creator),
-                onAction = { showCreateSheet = true },
+                onAction = {
+                    showRemotePrefixPicker = false
+                    showCreateSheet = true
+                },
             )
         } else {
             state.profiles.forEach { profile ->
@@ -187,11 +196,25 @@ fun SyncScreen(
     }
 
     if (showCreateSheet) {
-        ModalBottomSheet(onDismissRequest = { showCreateSheet = false }) {
+        ModalBottomSheet(
+            onDismissRequest = {
+                if (showRemotePrefixPicker) {
+                    showRemotePrefixPicker = false
+                } else {
+                    showCreateSheet = false
+                }
+            },
+        ) {
             NewSyncProfileSheet(
                 state = state,
                 actions = actions,
+                showRemotePrefixPicker = showRemotePrefixPicker,
                 onDismiss = { showCreateSheet = false },
+                onOpenRemotePrefixPicker = {
+                    actions.openRemotePrefixPicker()
+                    showRemotePrefixPicker = true
+                },
+                onDismissRemotePrefixPicker = { showRemotePrefixPicker = false },
                 onPickLocalFolder = onPickLocalFolder,
                 onEnsureWifiNameAccess = onEnsureWifiNameAccess,
             )
@@ -229,20 +252,21 @@ fun SyncScreen(
 private fun NewSyncProfileSheet(
     state: SyncUiState,
     actions: SyncScreenActions,
+    showRemotePrefixPicker: Boolean,
     onDismiss: () -> Unit,
+    onOpenRemotePrefixPicker: () -> Unit,
+    onDismissRemotePrefixPicker: () -> Unit,
     onPickLocalFolder: () -> Unit,
     onEnsureWifiNameAccess: (FolderSyncNetworkPolicy) -> Unit,
 ) {
-    var showRemotePrefixPicker by rememberSaveable { mutableStateOf(false) }
-
     if (showRemotePrefixPicker) {
         RemotePrefixPickerSheet(
             state = state.remotePrefixPicker,
-            onDismiss = { showRemotePrefixPicker = false },
+            onDismiss = onDismissRemotePrefixPicker,
             onBrowse = actions.browseRemotePrefixPicker,
             onSelect = { prefix ->
                 actions.updateNewProfilePrefix(prefix)
-                showRemotePrefixPicker = false
+                onDismissRemotePrefixPicker()
             },
         )
     } else {
@@ -270,12 +294,7 @@ private fun NewSyncProfileSheet(
                 label = { Text(stringResource(R.string.remote_prefix_optional)) },
                 singleLine = true,
             )
-            OutlinedButton(
-                onClick = {
-                    actions.openRemotePrefixPicker()
-                    showRemotePrefixPicker = true
-                },
-            ) {
+            OutlinedButton(onClick = onOpenRemotePrefixPicker) {
                 Text(stringResource(R.string.browse_remote_folders))
             }
             OutlinedTextField(

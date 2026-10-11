@@ -413,12 +413,16 @@ private struct BerryKeepRemotePrefixPicker: View {
 
                 HStack {
                     if !currentPath.isEmpty {
-                        Button("Up", systemImage: "chevron.up") {
+                        Button {
                             currentPath = parentPath
+                        } label: {
+                            Label("Up", systemImage: "chevron.up")
                         }
                     }
-                    Button("Refresh", systemImage: "arrow.clockwise") {
+                    Button {
                         Task { await loadFolders() }
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
                     }
                 }
             }
