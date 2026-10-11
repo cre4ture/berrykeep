@@ -1014,6 +1014,17 @@ async fn start_new_cluster(
             .into_response();
     }
 
+    let admin_password_hash = match hash_admin_password_async(&request.admin_password).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
     let mut managed = state.runtime.managed_state.lock().await;
     managed.state = SetupLifecycleState::Online;
     managed.updated_at_unix = unix_ts();
@@ -1023,7 +1034,7 @@ async fn start_new_cluster(
     managed.runtime_data_dir = Some(state.paths.data_dir().display().to_string());
     managed.recovery_reason = None;
     managed.metadata_backend = Some(metadata_backend);
-    managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
+    managed.admin_password_hash = Some(admin_password_hash.clone());
     managed.managed_rendezvous_bind_addr = Some(managed_rendezvous_bind_addr.to_string());
     managed.managed_rendezvous_public_url = Some(managed_rendezvous_public_url.clone());
     managed.pending_join_request = None;
@@ -1052,7 +1063,7 @@ async fn start_new_cluster(
     };
     apply_managed_signer_paths(state.paths.data_dir(), &mut config);
     apply_managed_rendezvous_config(state.paths.data_dir(), &managed_snapshot, &mut config);
-    config.admin_password_hash = Some(hash_admin_password(&request.admin_password));
+    config.admin_password_hash = Some(admin_password_hash);
     let completion_permit = match state.runtime.completion_tx.clone().reserve_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -1252,6 +1263,17 @@ async fn import_node_enrollment_package(
             .into_response();
     }
 
+    let admin_password_hash = match hash_admin_password_async(&request.admin_password).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
     managed.state = SetupLifecycleState::Online;
     managed.updated_at_unix = unix_ts();
     managed.cluster_id = Some(package.bootstrap.cluster_id);
@@ -1260,7 +1282,7 @@ async fn import_node_enrollment_package(
     managed.runtime_data_dir = Some(state.paths.data_dir().display().to_string());
     managed.recovery_reason = None;
     managed.metadata_backend = Some(metadata_backend);
-    managed.admin_password_hash = Some(hash_admin_password(&request.admin_password));
+    managed.admin_password_hash = Some(admin_password_hash.clone());
     managed.managed_rendezvous_bind_addr = None;
     managed.managed_rendezvous_public_url = None;
     managed.pending_join_request = None;
@@ -1289,7 +1311,7 @@ async fn import_node_enrollment_package(
     };
     apply_managed_signer_paths(state.paths.data_dir(), &mut config);
     apply_managed_rendezvous_config(state.paths.data_dir(), &managed_snapshot, &mut config);
-    config.admin_password_hash = Some(hash_admin_password(&request.admin_password));
+    config.admin_password_hash = Some(admin_password_hash);
     let completion_permit = match state.runtime.completion_tx.clone().reserve_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -2440,6 +2462,13 @@ pub(crate) fn hash_admin_password(password: &str) -> String {
     format!("pbkdf2sha256:{ROUNDS}:{salt_hex}:{hash_hex}")
 }
 
+async fn hash_admin_password_async(password: &str) -> Result<String> {
+    let password = password.to_owned();
+    tokio::task::spawn_blocking(move || hash_admin_password(&password))
+        .await
+        .context("admin password hashing task failed")
+}
+
 pub(crate) fn validate_admin_password(password: &str) -> std::result::Result<(), &'static str> {
     if password.trim().len() < 12 {
         return Err("admin password must be at least 12 characters long");
@@ -3149,6 +3178,7 @@ mod tests {
             .admin_password_hash
             .as_deref()
             .expect("runtime config should receive an admin password hash");
+        assert_eq!(managed_hash, runtime_hash);
         assert!(crate::password_hash_matches(
             runtime_hash,
             &node_admin_password
@@ -3203,7 +3233,7 @@ mod tests {
         let response = start_new_cluster(
             State(state.clone()),
             Json(SetupStartClusterRequest {
-                admin_password,
+                admin_password: admin_password.clone(),
                 public_origin: "https://node-a.local:18443".to_string(),
                 metadata_backend: None,
                 telemetry_enabled: true,
@@ -3221,10 +3251,23 @@ mod tests {
             SetupMetadataBackend::from(completion.config.metadata_backend),
             default_setup_metadata_backend()
         );
+        let managed = state.runtime.managed_state.lock().await;
         assert_eq!(
-            state.runtime.managed_state.lock().await.metadata_backend,
+            managed.metadata_backend,
             Some(default_setup_metadata_backend())
         );
+        let managed_hash = managed
+            .admin_password_hash
+            .as_deref()
+            .expect("managed state should persist an admin password hash");
+        let runtime_hash = completion
+            .config
+            .admin_password_hash
+            .as_deref()
+            .expect("runtime config should receive an admin password hash");
+        assert_eq!(managed_hash, runtime_hash);
+        assert!(crate::password_hash_matches(runtime_hash, &admin_password));
+        drop(managed);
 
         // The setup-time choice must land in exactly the same persisted override the admin
         // toggle uses, so a fresh load of the runtime sees it as an explicit override, not just
