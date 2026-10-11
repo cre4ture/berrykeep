@@ -20553,6 +20553,7 @@ async fn build_test_state(
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_execution_gate: Arc::new(super::RepairExecutionGate::default()),
+            manual_repair_request_admission: Arc::new(super::Semaphore::new(1)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
             content_repair_claims: Arc::new(crate::ContentRepairClaims::default()),
             content_repair_notify: Arc::new(tokio::sync::Notify::new()),
@@ -22949,6 +22950,71 @@ async fn busy_peer_repair_is_shed_without_queueing() {
     );
 
     drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn manual_local_repair_admits_only_one_waiting_request() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+    let query = super::replication::ReplicationRepairQuery {
+        batch_size: None,
+        scope: Some(super::replication::ReplicationRepairScope::Local),
+    };
+
+    let first = tokio::spawn({
+        let state = state.clone();
+        let headers = headers.clone();
+        async move {
+            super::replication::execute_replication_repair_public(
+                State(state),
+                headers,
+                axum::extract::Query(query),
+            )
+            .await
+            .into_response()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first manual request should be admitted and wait for the executor");
+
+    let duplicate = super::replication::execute_replication_repair_public(
+        State(state.clone()),
+        headers,
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Local),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(duplicate.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(active);
+    let first_response = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("admitted manual repair should finish after the executor is released")
+        .expect("manual repair handler task should not panic");
+    assert_eq!(first_response.status(), StatusCode::OK);
+
     cleanup_test_state(&state).await;
 }
 

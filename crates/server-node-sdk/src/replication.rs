@@ -296,26 +296,48 @@ async fn execute_replication_repair_with_trigger(
 
     match scope {
         ReplicationRepairScope::Local => {
-            let preacquired_permit = match state.maintenance.repair_execution_gate.try_acquire() {
-                Some(permit) => permit,
-                None => {
-                    warn!(
-                        ?trigger,
-                        "rejecting requested local repair because the node-local executor is busy"
-                    );
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            let repair_task = match trigger {
+                RepairRunTrigger::PeerClusterRequest => {
+                    let Some(permit) = state.maintenance.repair_execution_gate.try_acquire() else {
+                        warn!(
+                            "rejecting peer local repair because the node-local executor is busy"
+                        );
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    };
+                    tokio::spawn(async move {
+                        execute_tracked_local_replication_repair_with_permit(
+                            &state,
+                            batch_override,
+                            trigger,
+                            None,
+                            permit,
+                        )
+                        .await
+                    })
                 }
+                RepairRunTrigger::ManualRequest => {
+                    let Ok(admission) =
+                        Arc::clone(&state.maintenance.manual_repair_request_admission)
+                            .try_acquire_owned()
+                    else {
+                        warn!(
+                            "rejecting duplicate manual local repair while another request is admitted"
+                        );
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    };
+                    tokio::spawn(async move {
+                        let _admission = admission;
+                        execute_tracked_local_replication_repair(
+                            &state,
+                            batch_override,
+                            trigger,
+                            None,
+                        )
+                        .await
+                    })
+                }
+                _ => unreachable!("HTTP repair requests use manual or peer triggers"),
             };
-            let repair_task = tokio::spawn(async move {
-                execute_tracked_local_replication_repair_with_permit(
-                    &state,
-                    batch_override,
-                    trigger,
-                    None,
-                    preacquired_permit,
-                )
-                .await
-            });
             match repair_task.await {
                 Ok(report) => (StatusCode::OK, Json(report)).into_response(),
                 Err(error) => {
