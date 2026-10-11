@@ -12152,13 +12152,22 @@ async fn run_replication_audit_once(state: &ServerState) {
     } else {
         None
     };
-    let keys = planning_replication_subjects(state).await;
-
-    let (node_transitioned_offline, plan_snapshot) = {
+    let execution_deadline = state
+        .repair_config
+        .enabled
+        .then(|| repair_execution_deadline(state));
+    let planning = run_with_optional_repair_execution_deadline(state, execution_deadline, async {
+        let keys = planning_replication_subjects(state).await;
         let mut cluster = state.cluster.lock().await;
         let node_transitioned_offline = cluster.update_health_and_detect_offline_transition();
         let plan_snapshot = cluster.replication_plan_snapshot(&keys);
         (node_transitioned_offline, plan_snapshot)
+    })
+    .await;
+    let Some((node_transitioned_offline, plan_snapshot)) = planning else {
+        drop(repair_permit.take());
+        warn!("replication audit planning timed out; releasing the repair executor");
+        return;
     };
     let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
 
@@ -12180,6 +12189,7 @@ async fn run_replication_audit_once(state: &ServerState) {
             repair_permit
                 .take()
                 .expect("enabled repair audit acquired an executor permit"),
+            execution_deadline.expect("enabled repair audit has an execution deadline"),
         )
         .await;
         info!(
@@ -12676,6 +12686,9 @@ async fn record_server_request_timing(request: Request, next: Next) -> Response 
 /// heads by placement key. Historical non-head obligations use the separate
 /// manifest-hash repair worker and are excluded here.
 async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
+    #[cfg(test)]
+    wait_for_replication_planning_test_blocker().await;
+
     let local_subjects = cached_local_cluster_available_subjects(state).await;
     let cluster_subjects = {
         let cluster = state.cluster.lock().await;
@@ -12689,6 +12702,77 @@ async fn planning_replication_subjects(state: &ServerState) -> Vec<String> {
     subjects.extend(local_subjects);
     subjects.extend(cluster_subjects);
     subjects.into_iter().collect()
+}
+
+#[cfg(test)]
+struct ReplicationPlanningBlocker {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl ReplicationPlanningBlocker {
+    async fn wait_until_started(&self) {
+        self.started.notified().await;
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn replication_planning_blocker() -> &'static StdMutex<Option<Arc<ReplicationPlanningBlocker>>> {
+    static BLOCKER: std::sync::OnceLock<StdMutex<Option<Arc<ReplicationPlanningBlocker>>>> =
+        std::sync::OnceLock::new();
+    BLOCKER.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn block_replication_planning_for_test() -> Arc<ReplicationPlanningBlocker> {
+    let blocker = Arc::new(ReplicationPlanningBlocker {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        released: std::sync::atomic::AtomicBool::new(false),
+    });
+    let previous = replication_planning_blocker()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(Arc::clone(&blocker));
+    assert!(
+        previous.is_none(),
+        "replication planning is already blocked"
+    );
+    blocker
+}
+
+#[cfg(test)]
+fn clear_replication_planning_blocker_for_test() {
+    *replication_planning_blocker()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+#[cfg(test)]
+async fn wait_for_replication_planning_test_blocker() {
+    let blocker = replication_planning_blocker()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(blocker) = blocker {
+        blocker.started.notify_one();
+        loop {
+            let released = blocker.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if blocker.released.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
+        }
+    }
 }
 
 async fn recompute_local_cluster_available_subjects(
@@ -12868,8 +12952,32 @@ async fn run_with_repair_execution_timeout<T>(
     state: &ServerState,
     future: impl Future<Output = T>,
 ) -> Option<T> {
+    run_with_repair_execution_deadline(state, repair_execution_deadline(state), future).await
+}
+
+fn repair_execution_deadline(state: &ServerState) -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        + Duration::from_secs(state.repair_config.execution_timeout_secs.max(1))
+}
+
+async fn run_with_optional_repair_execution_deadline<T>(
+    state: &ServerState,
+    deadline: Option<tokio::time::Instant>,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    match deadline {
+        Some(deadline) => run_with_repair_execution_deadline(state, deadline, future).await,
+        None => Some(future.await),
+    }
+}
+
+async fn run_with_repair_execution_deadline<T>(
+    state: &ServerState,
+    deadline: tokio::time::Instant,
+    future: impl Future<Output = T>,
+) -> Option<T> {
     let timeout_secs = state.repair_config.execution_timeout_secs.max(1);
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), future).await {
+    match tokio::time::timeout_at(deadline, future).await {
         Ok(output) => Some(output),
         Err(_) => {
             warn!(
@@ -13639,12 +13747,14 @@ async fn execute_tracked_replication_plan(
     nodes: Vec<NodeDescriptor>,
     trigger: RepairRunTrigger,
     permit: RepairExecutionPermit,
+    execution_deadline: tokio::time::Instant,
 ) -> replication::ReplicationRepairReport {
     let plan_summary = RepairPlanSummary::from_plan(&plan);
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let report = run_with_repair_execution_timeout(
+    let report = run_with_repair_execution_deadline(
         state,
+        execution_deadline,
         with_active_repair_log_tracking(&tracker, async {
             replication::execute_replication_repair_plan(
                 state,

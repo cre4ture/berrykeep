@@ -293,6 +293,22 @@ async fn execute_replication_repair_with_trigger(
     } else {
         query.scope.unwrap_or_default()
     };
+    let manual_admission = match trigger {
+        RepairRunTrigger::ManualRequest => {
+            let Ok(admission) =
+                Arc::clone(&state.maintenance.manual_repair_request_admission).try_acquire_owned()
+            else {
+                warn!(
+                    ?scope,
+                    "rejecting duplicate manual repair while another request is admitted"
+                );
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            Some(admission)
+        }
+        RepairRunTrigger::PeerClusterRequest => None,
+        _ => unreachable!("HTTP repair requests use manual or peer triggers"),
+    };
 
     match scope {
         ReplicationRepairScope::Local => {
@@ -316,15 +332,8 @@ async fn execute_replication_repair_with_trigger(
                     })
                 }
                 RepairRunTrigger::ManualRequest => {
-                    let Ok(admission) =
-                        Arc::clone(&state.maintenance.manual_repair_request_admission)
-                            .try_acquire_owned()
-                    else {
-                        warn!(
-                            "rejecting duplicate manual local repair while another request is admitted"
-                        );
-                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                    };
+                    let admission =
+                        manual_admission.expect("manual HTTP repair acquired its admission permit");
                     tokio::spawn(async move {
                         let _admission = admission;
                         execute_tracked_local_replication_repair(
@@ -348,6 +357,7 @@ async fn execute_replication_repair_with_trigger(
         }
         ReplicationRepairScope::Cluster => {
             let repair_task = tokio::spawn(async move {
+                let _manual_admission = manual_admission;
                 execute_tracked_cluster_replication_repair(&state, batch_override, trigger, None)
                     .await
             });

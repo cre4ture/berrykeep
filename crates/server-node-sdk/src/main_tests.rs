@@ -22954,7 +22954,7 @@ async fn busy_peer_repair_is_shed_without_queueing() {
 }
 
 #[tokio::test]
-async fn manual_local_repair_admits_only_one_waiting_request() {
+async fn manual_cluster_repair_admits_only_one_waiting_request() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let active = state
@@ -22966,7 +22966,7 @@ async fn manual_local_repair_admits_only_one_waiting_request() {
     headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
     let query = super::replication::ReplicationRepairQuery {
         batch_size: None,
-        scope: Some(super::replication::ReplicationRepairScope::Local),
+        scope: Some(super::replication::ReplicationRepairScope::Cluster),
     };
 
     let first = tokio::spawn({
@@ -23001,7 +23001,7 @@ async fn manual_local_repair_admits_only_one_waiting_request() {
         headers,
         axum::extract::Query(super::replication::ReplicationRepairQuery {
             batch_size: None,
-            scope: Some(super::replication::ReplicationRepairScope::Local),
+            scope: Some(super::replication::ReplicationRepairScope::Cluster),
         }),
     )
     .await
@@ -23015,6 +23015,40 @@ async fn manual_local_repair_admits_only_one_waiting_request() {
         .expect("manual repair handler task should not panic");
     assert_eq!(first_response.status(), StatusCode::OK);
 
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_audit_planning_releases_executor() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::block_replication_planning_for_test();
+
+    let audit = tokio::spawn({
+        let state = state.clone();
+        async move { super::run_replication_audit_once(&state).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
+        .await
+        .expect("audit should reach replication planning while holding the executor");
+    tokio::time::timeout(Duration::from_secs(5), audit)
+        .await
+        .expect("stalled audit planning should respect the shared execution deadline")
+        .expect("audit task should not panic");
+
+    let follow_up = tokio::time::timeout(
+        Duration::from_secs(1),
+        state
+            .maintenance
+            .repair_execution_gate
+            .acquire(super::RepairExecutionPriority::Manual),
+    )
+    .await
+    .expect("timed-out audit planning must release the executor");
+    drop(follow_up);
+
+    blocker.release();
+    super::clear_replication_planning_blocker_for_test();
     cleanup_test_state(&state).await;
 }
 
