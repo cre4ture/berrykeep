@@ -50,6 +50,11 @@ impl Default for RepairExecutionGate {
 }
 
 impl RepairExecutionGate {
+    pub(super) fn is_occupied(&self) -> bool {
+        let state = self.lock_state();
+        state.active || !state.waiters.is_empty()
+    }
+
     pub(super) fn try_acquire(self: &Arc<Self>) -> Option<RepairExecutionPermit> {
         let mut state = self.lock_state();
         if state.active || !state.waiters.is_empty() {

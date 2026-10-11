@@ -293,22 +293,36 @@ async fn execute_replication_repair_with_trigger(
     } else {
         query.scope.unwrap_or_default()
     };
-    let manual_admission = match trigger {
-        RepairRunTrigger::ManualRequest => {
-            let Ok(admission) =
-                Arc::clone(&state.maintenance.manual_repair_request_admission).try_acquire_owned()
-            else {
-                warn!(
-                    ?scope,
-                    "rejecting duplicate manual repair while another request is admitted"
-                );
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            };
-            Some(admission)
-        }
-        RepairRunTrigger::PeerClusterRequest => None,
-        _ => unreachable!("HTTP repair requests use manual or peer triggers"),
+    let request_admission = {
+        let Ok(admission) =
+            Arc::clone(&state.maintenance.http_repair_request_admission).try_acquire_owned()
+        else {
+            match trigger {
+                RepairRunTrigger::ManualRequest => {
+                    warn!(
+                        ?scope,
+                        "rejecting duplicate manual repair while another request is admitted"
+                    );
+                }
+                RepairRunTrigger::PeerClusterRequest => {
+                    warn!("rejecting duplicate peer repair while another request is admitted");
+                }
+                _ => unreachable!("HTTP repair requests use manual or peer triggers"),
+            }
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        admission
     };
+    match trigger {
+        RepairRunTrigger::ManualRequest => {}
+        RepairRunTrigger::PeerClusterRequest => {
+            if state.maintenance.repair_execution_gate.is_occupied() {
+                warn!("rejecting peer local repair because the node-local executor is busy");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+        _ => unreachable!("HTTP repair requests use manual or peer triggers"),
+    }
     if trigger == RepairRunTrigger::PeerClusterRequest && scope == ReplicationRepairScope::Local {
         // A peer-local request still needs a current view, but remote
         // synchronization must finish before it attempts to occupy the local
@@ -327,6 +341,7 @@ async fn execute_replication_repair_with_trigger(
                         return StatusCode::SERVICE_UNAVAILABLE.into_response();
                     };
                     tokio::spawn(async move {
+                        let _admission = request_admission;
                         execute_tracked_local_replication_repair_with_permit(
                             &state,
                             batch_override,
@@ -338,20 +353,11 @@ async fn execute_replication_repair_with_trigger(
                         .await
                     })
                 }
-                RepairRunTrigger::ManualRequest => {
-                    let admission =
-                        manual_admission.expect("manual HTTP repair acquired its admission permit");
-                    tokio::spawn(async move {
-                        let _admission = admission;
-                        execute_tracked_local_replication_repair(
-                            &state,
-                            batch_override,
-                            trigger,
-                            None,
-                        )
+                RepairRunTrigger::ManualRequest => tokio::spawn(async move {
+                    let _admission = request_admission;
+                    execute_tracked_local_replication_repair(&state, batch_override, trigger, None)
                         .await
-                    })
-                }
+                }),
                 _ => unreachable!("HTTP repair requests use manual or peer triggers"),
             };
             match repair_task.await {
@@ -364,7 +370,7 @@ async fn execute_replication_repair_with_trigger(
         }
         ReplicationRepairScope::Cluster => {
             let repair_task = tokio::spawn(async move {
-                let _manual_admission = manual_admission;
+                let _admission = request_admission;
                 execute_tracked_cluster_replication_repair(&state, batch_override, trigger, None)
                     .await
             });

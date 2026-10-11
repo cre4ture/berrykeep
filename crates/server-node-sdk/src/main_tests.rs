@@ -20553,7 +20553,7 @@ async fn build_test_state(
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_execution_gate: Arc::new(super::RepairExecutionGate::default()),
-            manual_repair_request_admission: Arc::new(super::Semaphore::new(1)),
+            http_repair_request_admission: Arc::new(super::Semaphore::new(1)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
             content_repair_claims: Arc::new(crate::ContentRepairClaims::default()),
             content_repair_notify: Arc::new(tokio::sync::Notify::new()),
@@ -22925,18 +22925,27 @@ async fn busy_peer_cluster_scope_is_forced_local_and_shed_without_queueing() {
         .repair_execution_gate
         .acquire(super::RepairExecutionPriority::Automatic)
         .await;
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
 
-    let response = super::build_internal_peer_api()
-        .with_state(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/cluster/replication/repair?scope=cluster")
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("peer repair route should respond");
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=cluster")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("busy peer repair must be shed before availability synchronization")
+    .expect("peer repair route should respond");
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
@@ -22949,7 +22958,72 @@ async fn busy_peer_cluster_scope_is_forced_local_and_shed_without_queueing() {
         "rejected peer work must not remain queued"
     );
 
+    drop(refresh_guard);
     drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn peer_repair_requests_share_http_admission() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+    let first = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::build_internal_peer_api()
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/cluster/replication/repair?scope=local")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("peer repair route should respond")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .http_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first peer repair should hold the HTTP admission slot");
+
+    let duplicate = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=local")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("duplicate peer repair should be shed before availability synchronization")
+    .expect("peer repair route should respond");
+    assert_eq!(duplicate.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(refresh_guard);
+    let first_response = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("admitted peer repair should finish after availability sync resumes")
+        .expect("peer repair handler task should not panic");
+    assert_eq!(first_response.status(), StatusCode::OK);
+
     cleanup_test_state(&state).await;
 }
 
@@ -23122,7 +23196,7 @@ async fn manual_availability_sync_does_not_hold_repair_executor() {
     tokio::time::timeout(Duration::from_secs(2), async {
         while state
             .maintenance
-            .manual_repair_request_admission
+            .http_repair_request_admission
             .available_permits()
             != 0
         {
