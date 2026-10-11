@@ -3543,16 +3543,16 @@ mod tests {
         )]);
         let credentials = ClientCredentialState::default();
 
-        let (gallery, repair, credentials, cluster_nodes) = tokio::join!(
+        let (gallery, repair, credentials, current_count) = tokio::join!(
             store.upsert_current_object_with_gallery("gallery/shared-writer.jpg", &entry),
             store.persist_repair_attempts(&attempts),
             store.persist_client_credential_state(&credentials),
-            store.load_cluster_nodes(),
+            store.count_current_objects(),
         );
         gallery.expect("gallery write should commit");
         repair.expect("repair attempt write should commit");
         credentials.expect("client credential write should commit");
-        cluster_nodes.expect("concurrent primary-connection read should succeed");
+        current_count.expect("concurrent primary-connection read should succeed");
 
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);

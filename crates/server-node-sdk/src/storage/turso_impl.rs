@@ -394,19 +394,18 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         keys: &[String],
     ) -> Result<HashMap<String, Vec<String>>> {
-        let _connection_guard = self.connection_lock.lock().await;
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let connection = self.open_scan_connection("gallery object labels").await?;
         const LABEL_LOOKUP_CHUNK_SIZE: usize = 500;
         let mut labels_by_key = HashMap::new();
         for keys in keys.chunks(LABEL_LOOKUP_CHUNK_SIZE) {
-            if keys.is_empty() {
-                continue;
-            }
             let placeholders = (1..=keys.len())
                 .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT key, labels_json FROM gallery_objects WHERE key IN ({placeholders})"
@@ -427,19 +426,18 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         keys: &[String],
     ) -> Result<HashMap<String, MediaGpsCoordinates>> {
-        let _connection_guard = self.connection_lock.lock().await;
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let connection = self.open_scan_connection("gallery object GPS").await?;
         const GPS_LOOKUP_CHUNK_SIZE: usize = 500;
         let mut gps_by_key = HashMap::new();
         for keys in keys.chunks(GPS_LOOKUP_CHUNK_SIZE) {
-            if keys.is_empty() {
-                continue;
-            }
             let placeholders = (1..=keys.len())
                 .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT key, latitude, longitude FROM gallery_objects WHERE key IN ({placeholders})"
@@ -594,18 +592,19 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         manifest_hashes: &[String],
     ) -> Result<Vec<ContentRepairTask>> {
-        let _connection_guard = self.connection_lock.lock().await;
         const CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE: usize = 500;
 
         if manifest_hashes.is_empty() {
             return Ok(Vec::new());
         }
+        let connection = self
+            .open_scan_connection("selected content repair tasks")
+            .await?;
         let mut tasks = Vec::<ContentRepairTask>::new();
         let mut invalid_tasks = Vec::new();
         for batch in manifest_hashes.chunks(CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE) {
             let placeholders = (0..batch.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     &format!(
                         "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks \
@@ -636,7 +635,7 @@ impl MetadataStore for TursoMetadataStore {
                 .manifest_hash
                 .cmp(&right.reference.manifest_hash)
         });
-        drop(_connection_guard);
+        drop(connection);
         self.discard_invalid_content_repair_tasks(invalid_tasks)
             .await?;
         Ok(tasks)
@@ -2120,20 +2119,18 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         manifest_hashes: &[String],
     ) -> Result<HashMap<String, ManifestSummary>> {
-        let _connection_guard = self.connection_lock.lock().await;
         const TURSO_SUMMARY_QUERY_BATCH_SIZE: usize = 500;
 
+        if manifest_hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let connection = self.open_scan_connection("manifest summaries").await?;
         let mut summaries = HashMap::with_capacity(manifest_hashes.len());
         for chunk in manifest_hashes.chunks(TURSO_SUMMARY_QUERY_BATCH_SIZE) {
-            if chunk.is_empty() {
-                continue;
-            }
-
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT manifest_hash, total_size_bytes, content_fingerprint
@@ -3054,20 +3051,20 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         manifest_hashes: &[String],
     ) -> Result<std::collections::HashSet<String>> {
-        let _connection_guard = self.connection_lock.lock().await;
         const TURSO_LOCALLY_OWNED_QUERY_BATCH_SIZE: usize = 500;
 
+        if manifest_hashes.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let connection = self
+            .open_scan_connection("locally owned manifest filter")
+            .await?;
         let mut owned = std::collections::HashSet::with_capacity(manifest_hashes.len());
         for chunk in manifest_hashes.chunks(TURSO_LOCALLY_OWNED_QUERY_BATCH_SIZE) {
-            if chunk.is_empty() {
-                continue;
-            }
-
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT manifest_hash
@@ -4234,11 +4231,30 @@ mod tests {
             .expect("primary write transaction should remain active");
 
         let scan_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let missing_keys = vec!["missing".to_string()];
             let current_state = store.load_current_state().await?;
             assert!(current_state.objects.is_empty());
             assert!(current_state.object_ids.is_empty());
             assert!(store.list_current_object_keys().await?.is_empty());
+            assert!(
+                store
+                    .gallery_object_labels_by_key(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .gallery_object_gps_by_key(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
             assert!(store.load_content_repair_tasks().await?.is_empty());
+            assert!(
+                store
+                    .load_content_repair_tasks_for_manifests(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
             assert!(store.content_repair_task_hashes().await?.is_empty());
             assert!(store.load_repair_attempts().await?.is_empty());
             assert!(store.list_repair_run_history(None, None).await?.is_empty());
@@ -4286,6 +4302,12 @@ mod tests {
                     .await?
                     .is_empty()
             );
+            assert!(
+                store
+                    .load_manifest_summaries(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
             assert!(store.load_all_version_indexes().await?.is_empty());
             assert!(store.list_version_index_object_ids().await?.is_empty());
             assert!(store.load_all_snapshots().await?.is_empty());
@@ -4294,6 +4316,12 @@ mod tests {
             assert!(store.load_storage_locations().await?.is_empty());
             assert!(store.list_cached_chunk_records().await?.is_empty());
             assert!(store.list_locally_owned_manifests().await?.is_empty());
+            assert!(
+                store
+                    .filter_locally_owned_manifests(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
             assert!(
                 store
                     .list_storage_stats_history(None, None)
