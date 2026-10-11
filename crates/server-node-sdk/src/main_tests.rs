@@ -14380,7 +14380,7 @@ async fn replication_repair_records_max_retry_skip_details_impl(backend: MainTes
         let mut repair_state = state.maintenance.repair_state.lock().await;
         for (subject, target_node_id) in &expected_skips {
             repair_state.attempts.insert(
-                format!("{subject}|{target_node_id}"),
+                super::replication::transfer_attempt_key(subject, *target_node_id),
                 super::RepairAttemptEntry {
                     attempts: state.repair_config.max_retries.saturating_add(1),
                     last_failure_unix: super::unix_ts(),
@@ -23040,9 +23040,8 @@ async fn peer_repair_requests_share_http_admission() {
 }
 
 #[tokio::test]
-async fn peer_availability_sync_uses_the_local_execution_deadline() {
-    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    state.repair_config.execution_timeout_secs = 1;
+async fn peer_availability_sync_uses_coordinator_execution_budget() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let refresh_guard = state
         .maintenance
         .local_availability_refresh_lock
@@ -23056,7 +23055,7 @@ async fn peer_availability_sync_uses_the_local_execution_deadline() {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/cluster/replication/repair?scope=local")
+                    .uri("/cluster/replication/repair?scope=local&execution_budget_millis=100")
                     .body(Body::empty())
                     .expect("request should build"),
             ),
@@ -23139,6 +23138,7 @@ async fn admitted_manual_repair_takes_priority_over_peer_synchronization() {
                 axum::extract::Query(super::replication::ReplicationRepairQuery {
                     batch_size: None,
                     scope: Some(super::replication::ReplicationRepairScope::Local),
+                    execution_budget_millis: None,
                 }),
             )
             .await
@@ -23271,6 +23271,7 @@ async fn manual_cluster_repair_admits_only_one_waiting_request() {
     let query = super::replication::ReplicationRepairQuery {
         batch_size: None,
         scope: Some(super::replication::ReplicationRepairScope::Cluster),
+        execution_budget_millis: None,
     };
 
     let first = tokio::spawn({
@@ -23306,6 +23307,7 @@ async fn manual_cluster_repair_admits_only_one_waiting_request() {
         axum::extract::Query(super::replication::ReplicationRepairQuery {
             batch_size: None,
             scope: Some(super::replication::ReplicationRepairScope::Cluster),
+            execution_budget_millis: None,
         }),
     )
     .await
@@ -23348,6 +23350,7 @@ async fn manual_local_repair_has_separate_admission_from_cluster_scope() {
         axum::extract::Query(super::replication::ReplicationRepairQuery {
             batch_size: None,
             scope: Some(super::replication::ReplicationRepairScope::Local),
+            execution_budget_millis: None,
         }),
     )
     .await
@@ -23387,6 +23390,7 @@ async fn manual_availability_sync_does_not_hold_repair_executor() {
                 axum::extract::Query(super::replication::ReplicationRepairQuery {
                     batch_size: None,
                     scope: Some(super::replication::ReplicationRepairScope::Local),
+                    execution_budget_millis: None,
                 }),
             )
             .await
@@ -23610,6 +23614,7 @@ async fn cancelled_peer_handler_leaves_detached_repair_to_finish() {
         axum::extract::Query(super::replication::ReplicationRepairQuery {
             batch_size: None,
             scope: Some(super::replication::ReplicationRepairScope::Local),
+            execution_budget_millis: None,
         }),
     ));
     tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
@@ -23775,7 +23780,7 @@ async fn cluster_replication_repair_report_includes_skipped_details_impl(backend
         let mut repair_state = state.maintenance.repair_state.lock().await;
         for (subject, target_node_id) in &expected_skips {
             repair_state.attempts.insert(
-                format!("{subject}|{target_node_id}"),
+                super::replication::transfer_attempt_key(subject, *target_node_id),
                 super::RepairAttemptEntry {
                     attempts: state.repair_config.max_retries.saturating_add(1),
                     last_failure_unix: super::unix_ts(),
@@ -23792,6 +23797,7 @@ async fn cluster_replication_repair_report_includes_skipped_details_impl(backend
         axum::extract::Query(super::replication::ReplicationRepairQuery {
             batch_size: None,
             scope: Some(super::replication::ReplicationRepairScope::Cluster),
+            execution_budget_millis: None,
         }),
     )
     .await

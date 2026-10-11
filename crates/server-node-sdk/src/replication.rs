@@ -279,6 +279,7 @@ pub(crate) struct ClusterReplicationRepairReport {
 pub(crate) struct ReplicationRepairQuery {
     pub(crate) batch_size: Option<usize>,
     pub(crate) scope: Option<ReplicationRepairScope>,
+    pub(crate) execution_budget_millis: Option<u64>,
 }
 
 fn repair_request_unavailable(error: &'static str) -> axum::response::Response {
@@ -343,7 +344,15 @@ async fn execute_replication_repair_with_trigger(
     };
     let peer_execution_deadline = (trigger == RepairRunTrigger::PeerClusterRequest
         && scope == ReplicationRepairScope::Local)
-        .then(|| repair_execution_deadline(&state));
+        .then(|| {
+            let configured_budget =
+                Duration::from_secs(state.repair_config.execution_timeout_secs.max(1));
+            let requested_budget = query
+                .execution_budget_millis
+                .map(|millis| Duration::from_millis(millis.max(1)))
+                .unwrap_or(configured_budget);
+            tokio::time::Instant::now() + requested_budget.min(configured_budget)
+        });
     if let Some(execution_deadline) = peer_execution_deadline {
         // A peer-local request still needs a current view, but remote
         // synchronization must finish before it attempts to occupy the local
@@ -993,7 +1002,7 @@ pub(crate) async fn execute_replication_repair_plan(
             })),
         );
 
-        let inspection_attempt_key = format!("inspection|{}|{}", item.key, state.node_id);
+        let inspection_attempt_key = inspection_attempt_key(&item.key, state.node_id);
         let mut inspection_retry_reset = None;
         {
             let mut repair_state = state.maintenance.repair_state.lock().await;
@@ -1241,7 +1250,7 @@ pub(crate) async fn execute_replication_repair_plan(
 
             repair_source_node_id = Some(source_node.node_id);
 
-            let transfer_key = format!("{}|{}", item.key, state.node_id);
+            let transfer_key = transfer_attempt_key(&item.key, state.node_id);
 
             {
                 let repair_state = state.maintenance.repair_state.lock().await;
@@ -1564,7 +1573,7 @@ pub(crate) async fn execute_replication_repair_plan(
                 continue;
             }
 
-            let transfer_key = format!("{}|{}", item.key, target);
+            let transfer_key = transfer_attempt_key(&item.key, target);
 
             {
                 let repair_state = state.maintenance.repair_state.lock().await;
@@ -1920,6 +1929,14 @@ fn fair_peer_request_deadline(
     now + phase_deadline.saturating_duration_since(now) / peers_left
 }
 
+fn peer_execution_budget(request_budget: Duration) -> Duration {
+    let response_grace =
+        Duration::from_secs(PEER_REPAIR_REQUEST_TIMEOUT_GRACE_SECS).min(request_budget / 2);
+    request_budget
+        .saturating_sub(response_grace)
+        .max(Duration::from_millis(1))
+}
+
 #[allow(dead_code)]
 pub(crate) async fn execute_cluster_replication_repair_inner(
     state: &ServerState,
@@ -2039,8 +2056,16 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         let peers_left = peer_count.saturating_sub(peer_index);
         let now = tokio::time::Instant::now();
         let peer_deadline = fair_peer_request_deadline(peer_phase_deadline, now, peers_left);
-        let path =
-            build_replication_repair_path(batch_size_override, ReplicationRepairScope::Local);
+        let execution_budget_millis = u64::try_from(
+            peer_execution_budget(peer_deadline.saturating_duration_since(now)).as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+        .max(1);
+        let path = build_replication_repair_path(
+            batch_size_override,
+            ReplicationRepairScope::Local,
+            Some(execution_budget_millis),
+        );
         info!(
             repair_run_id,
             peer_node_id = %peer.node_id,
@@ -2397,6 +2422,7 @@ pub(crate) fn push_repair_skipped_detail(
 fn build_replication_repair_path(
     batch_size_override: Option<usize>,
     scope: ReplicationRepairScope,
+    execution_budget_millis: Option<u64>,
 ) -> String {
     let mut query = Vec::new();
     if let Some(batch_size) = batch_size_override {
@@ -2409,8 +2435,19 @@ fn build_replication_repair_path(
             ReplicationRepairScope::Cluster => "cluster",
         }
     ));
+    if let Some(execution_budget_millis) = execution_budget_millis {
+        query.push(format!("execution_budget_millis={execution_budget_millis}"));
+    }
 
     format!("/cluster/replication/repair?{}", query.join("&"))
+}
+
+fn inspection_attempt_key(subject: &str, node_id: NodeId) -> String {
+    format!("inspection|{subject}|{node_id}")
+}
+
+pub(crate) fn transfer_attempt_key(subject: &str, node_id: NodeId) -> String {
+    format!("transfer|{subject}|{node_id}")
 }
 
 fn should_log_repair_chunk_progress(chunk_index: usize, chunk_count: usize) -> bool {
@@ -2509,7 +2546,7 @@ pub(crate) async fn complete_pending_replication_import(
         warn!(error = %error, "failed persisting replicas after pending replication import");
     }
 
-    let transfer_key = format!("{}|{}", task.reference.repair_label(), state.node_id);
+    let transfer_key = transfer_attempt_key(&task.reference.repair_label(), state.node_id);
     state
         .maintenance
         .repair_state
@@ -3246,6 +3283,27 @@ mod tests {
         assert_eq!(totals.failed_transfers, 1);
         assert!(totals.unresolved);
         assert_eq!(totals.run_status(), RepairRunStatus::PartiallyRepaired);
+    }
+
+    #[test]
+    fn peer_execution_budget_reserves_response_time() {
+        assert_eq!(
+            peer_execution_budget(Duration::from_secs(610)),
+            Duration::from_secs(580)
+        );
+        assert_eq!(
+            peer_execution_budget(Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn repair_attempt_kinds_use_disjoint_namespaces() {
+        let node_id = NodeId::new_v4();
+        assert_ne!(
+            inspection_attempt_key("foo", node_id),
+            transfer_attempt_key("inspection|foo", node_id)
+        );
     }
 
     #[test]
