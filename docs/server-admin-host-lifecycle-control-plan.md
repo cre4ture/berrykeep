@@ -178,14 +178,53 @@ The `prepare` response is short-lived and binds the selected action, target
 identity, preflight snapshot, and one-time nonce. `confirm` consumes it once.
 This makes accidental form resubmission and stale browser tabs harmless.
 
+### Reuse the existing admin authorization and audit trail
+
+Host-control endpoints must compose the existing
+`authorize_admin_request`/`append_admin_audit` mechanism rather than create
+a second, parallel BerryKeep admin audit system.
+
+The existing mechanism establishes the baseline admin authorization through an
+admin-token header or an admin-session cookie, supports the generic
+`dry_run`/ `approve` convention, and records actor/action metadata. The
+host-control design should use it as follows:
+
+- `prepare` calls it as a dry run, then appends an
+  `auth/host-control/prepare` audit event with the target, preflight digest,
+  and a newly generated correlation ID;
+- `confirm` calls it as a non-dry-run approved action, validates the
+  host-control challenge and browser-specific security gates below, records
+  `auth/host-control/confirm`, and only then sends the IPC request;
+- the privileged agent's durable journal records machine-level execution and
+  refers to that correlation ID. It complements rather than replaces the
+  existing admin audit trail.
+
+The existing generic `approve` flag is necessary but not sufficient for a
+host reboot. The short-lived, one-time `prepare`/ `confirm` challenge binds
+that existing approval convention to a specific action and target.
+
 ### Authentication and authorization
 
-There are two independent gates:
+There are two independent gates. The first one requires explicit new security
+work before *any* mutable host-control endpoint ships:
 
-1. **Server Admin gate.** The HTTP handler requires a normal authenticated
-   runtime admin session, same-origin/CSRF protections, a recent explicit
-   password re-entry (or a future stronger factor), and a typed confirmation.
-   Setup mode must never expose host actions.
+1. **Server Admin gate.** Every endpoint first uses
+   `authorize_admin_request` and its existing audit trail. Today, a session
+   cookie is `HttpOnly; SameSite=Lax`, with no Origin/`Sec-Fetch-Site`
+   enforcement, CSRF token, or step-up/fresh-password concept. The host-control
+   mutation design must add all of the following:
+   - exact configured-origin validation plus a synchronizer CSRF token for
+     browser `POST` requests; this must reject a same-site request from a
+     different port as well as a cross-site request;
+   - a session-bound, short-lived password-confirmation record, rate-limited
+     through the existing password-verification controls;
+   - a mutation policy that requires that cookie-backed, recently confirmed
+     session and rejects a bare `admin_token` header for `prepare` and
+     `confirm`. A token may still authorize read-only capability discovery;
+   - typed target confirmation and one-time challenge consumption.
+
+   Setup mode must never expose host actions. These are additive extensions to
+   the current admin session model, not properties already supplied by it.
 2. **Local-agent gate.** The agent authenticates the calling *local process*,
    not an HTTP bearer token. It accepts only the installed Server Node service
    identity through OS peer credentials and rejects all other local clients.
@@ -285,7 +324,11 @@ installer-provisioned `LaunchDaemon`, for example
 The current macOS deployment is already a system `LaunchDaemon`, so this
 approach fits its headless, no-logged-in-user lifecycle. It must not use the
 deprecated `AuthorizationExecuteWithPrivileges` path or make the web UI a
-privileged GUI application.
+privileged GUI application. For the current standalone package, use the
+installer-provisioned, root-owned launchd path; if a future app-bundle
+installation targets macOS 13 or later, use `SMAppService` for the helper
+registration. Treat `SMJobBless` only as a legacy-compatibility option, not
+as the preferred new implementation.
 
 ### Windows (Service Control Manager)
 
@@ -299,8 +342,21 @@ Extend the MSI with a separate `BerryKeepHostControl` Windows service.
   client token before accepting a request.
 - Restart only the fixed `BerryKeepServerNode` service through the Service
   Control Manager APIs (`ControlService`, `QueryServiceStatusEx`, and
-  `StartServiceW`), waiting within a bounded deadline. Do not call
-  `Restart-Service` or `sc.exe` through a shell.
+  `StartServiceW`). Do not call `Restart-Service` or `sc.exe` through a
+  shell.
+- Reconcile SCM failure actions instead of assuming the broker exclusively
+  owns the start. The current MSI configures automatic restart after a failed
+  service exit. After a stop request, the broker must observe
+  `STOP_PENDING`/ `STOPPED`, read the configured recovery delay, and watch
+  through that recovery window. If SCM has returned the service to
+  `RUNNING`, record automatic recovery as the successful restart; only call
+  `StartServiceW` when it remains stopped. Treat
+  `ERROR_SERVICE_ALREADY_RUNNING` as a reconciliation signal, then make the
+  final result from `QueryServiceStatusEx`.
+- Do not temporarily rewrite the service's failure-action configuration to
+  make this work. That would require broader service-configuration authority
+  and create another race; bounded observation and final-state reconciliation
+  are the safer protocol.
 - Request a reboot with the native shutdown API after enabling the required
   shutdown privilege, a non-zero grace period, an explicit planned-maintenance
   reason, and no forced closing of user applications by default.
@@ -309,9 +365,10 @@ Extend the MSI with a separate `BerryKeepHostControl` Windows service.
 
 The existing Server Node already accepts `SERVICE_CONTROL_STOP` and forwards
 it to `run_from_env_with_shutdown`, so a controlled SCM restart can use the
-node's graceful shutdown path. The broker must treat a Windows reboot request
-as asynchronous: operating-system acceptance is not proof that the machine
-has rebooted.
+node's graceful shutdown path. That shutdown can still return an error, which
+is why the broker must reconcile the MSI's recovery policy before journaling a
+result. A Windows reboot request is likewise asynchronous: operating-system
+acceptance is not proof that the machine has rebooted.
 
 ### Android
 
@@ -395,9 +452,16 @@ Follow PACE with one independently shippable slice at a time.
      Android Device Owner support boundary.
    - Update the Cockpit strategy only after this decision is accepted.
 
-2. **Shared protocol and read-only UI**
+2. **Shared protocol, authorization extension, and read-only UI**
    - Add typed protocol models, a fake provider, SDK capability endpoint,
      generated web API types, and `HostControlsCard` read-only states.
+   - Extend `authorize_admin_request` and the existing admin audit flow for
+     host-control actions; add exact-Origin validation, synchronizer CSRF
+     tokens, a session-bound fresh-password confirmation, and the one-time
+     challenge store. Explicitly reject header-token-only mutation requests.
+   - Test those security primitives before adding any mutable route. Existing
+     `SameSite=Lax` cookies and the generic `approve` flag are not enough
+     for this operation.
    - Add no privileged agent and no mutation in this slice.
    - Establish contract tests and visual states for absent, disabled, and
      supported providers.
@@ -411,7 +475,9 @@ Follow PACE with one independently shippable slice at a time.
 4. **Windows service restart**
    - Add the broker service, service-SID/named-pipe ACL, SCM implementation,
      MSI upgrade handling, and Windows Event Log records.
-   - Verify graceful stop/start using the existing SCM signal handler.
+   - Verify graceful stop/start using the existing SCM signal handler and
+     reconcile the existing SCM automatic-recovery delay before assigning a
+     terminal broker outcome.
 
 5. **macOS service restart**
    - Add the signed launchd helper, Unix peer authentication, package upgrade
@@ -442,8 +508,11 @@ Every slice needs narrow tests before broader platform validation.
 
 - protocol serialization/versioning and rejection of every unknown action;
 - idempotency, expired/consumed confirmation challenges, and journal recovery;
-- HTTP authentication, CSRF/origin protection, fresh-password requirement,
-  setup-mode denial, and remote-policy denial;
+- HTTP authentication, exact-Origin and CSRF protection (including a
+  same-site/different-port request), fresh-password requirement, setup-mode
+  denial, bare-token mutation denial, and remote-policy denial;
+- reuse of `authorize_admin_request` and the existing admin audit trail for
+  both prepare and confirm, linked to the agent journal by correlation ID;
 - UI states for unavailable capability, preflight warning, accepted action,
   reconnecting, and recovered result;
 - assertions that request payloads cannot represent an arbitrary command or
@@ -468,7 +537,9 @@ Every slice needs narrow tests before broader platform validation.
 - **macOS:** signed package structure, launchd registration, `_berrykeep` peer
   rejection/acceptance, `kickstart` restart, and both architecture packages.
 - **Windows:** MSI install/upgrade, named-pipe ACL/SID tests, SCM stop/start,
-  Event Log record, and reboot API error mapping in a native Windows runner.
+  Event Log record, recovery-policy reconciliation after an intentional stop
+  that exits with an error, and reboot API error mapping in a native Windows
+  runner.
 - **Android:** instrumentation test for runtime restart and state retention;
   managed-device/device-owner reboot testing on a dedicated test fleet because
   a normal emulator/app installation is not sufficient evidence.
@@ -495,8 +566,12 @@ fallbacks throughout rollout.
 - systemd's manager D-Bus API and logind power-management API:
   <https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html>
   and <https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html>
-- Apple guidance for privileged helpers and `launchd`:
-  <https://developer.apple.com/documentation/security/authorizationexecutewithprivileges>
+- Apple Service Management and `launchd` daemon guidance:
+  <https://developer.apple.com/documentation/servicemanagement/smappservice>
+  and <https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html>.
+  `SMJobBless` is documented at
+  <https://developer.apple.com/documentation/servicemanagement/smjobbless%28_%3A_%3A_%3A_%3A%29>
+  only for legacy compatibility; it is deprecated in favor of `SMAppService`.
 - Windows Service Control Manager access rights and controlled shutdown API:
   <https://learn.microsoft.com/en-us/windows/win32/services/service-security-and-access-rights>
   and <https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-initiatesystemshutdownexw>
