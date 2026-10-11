@@ -1610,11 +1610,14 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         })),
     );
 
+    let local_trigger = tracker
+        .map(|tracker| tracker.trigger)
+        .unwrap_or(RepairRunTrigger::ManualRequest);
     let local_report = execute_serialized_local_replication_repair_phase(
         state,
         batch_size_override,
         run_id,
-        RepairRunTrigger::ManualRequest,
+        local_trigger,
         tracker,
     )
     .await;
