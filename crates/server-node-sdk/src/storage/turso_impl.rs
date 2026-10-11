@@ -1725,9 +1725,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("snapshot manifest by ID").await?;
+        let mut rows = connection
             .query(
                 "SELECT snapshot_json FROM snapshots WHERE snapshot_id = ?1",
                 (snapshot_id,),
@@ -2707,8 +2706,12 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
-        let _connection_guard = self.connection_lock.lock().await;
         let payload = compress_snapshot_json(&serde_json::to_vec_pretty(manifest)?)?;
+        let created_at_unix =
+            i64::try_from(manifest.created_at_unix).context("snapshot timestamp overflow")?;
+        let object_count =
+            i64::try_from(manifest.objects.len()).context("snapshot object count overflow")?;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO snapshots (snapshot_id, created_at_unix, object_count, snapshot_json)
@@ -2717,14 +2720,7 @@ impl MetadataStore for TursoMetadataStore {
                      created_at_unix = excluded.created_at_unix,
                      object_count = excluded.object_count,
                      snapshot_json = excluded.snapshot_json",
-                (
-                    manifest.id.as_str(),
-                    i64::try_from(manifest.created_at_unix)
-                        .context("snapshot timestamp overflow")?,
-                    i64::try_from(manifest.objects.len())
-                        .context("snapshot object count overflow")?,
-                    payload,
-                ),
+                (manifest.id.as_str(), created_at_unix, object_count, payload),
             )
             .await?;
         Ok(())
@@ -2755,22 +2751,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT snapshot_json FROM snapshots WHERE snapshot_id = ?1",
-                (snapshot_id,),
-            )
-            .await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
-        let payload = decompress_snapshot_json(&payload)?;
-        let mut manifest = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
-        normalize_snapshot_manifest_object_ids(&mut manifest);
-        Ok(Some(manifest))
+        self.load_snapshot_manifest(snapshot_id).await
     }
 
     async fn list_uncompressed_snapshot_ids(&self) -> Result<Vec<String>> {
@@ -4213,6 +4194,19 @@ mod tests {
         let store = TursoMetadataStore::open(&metadata_db_path)
             .await
             .expect("turso metadata store should open");
+        let snapshot = SnapshotManifest {
+            id: "scan-read-snapshot".to_string(),
+            created_at_unix: 1,
+            objects: HashMap::from([("snapshot/key".to_string(), "snapshot-manifest".to_string())]),
+            object_ids: HashMap::from([(
+                "snapshot/key".to_string(),
+                "snapshot-object".to_string(),
+            )]),
+        };
+        store
+            .persist_snapshot_manifest(&snapshot)
+            .await
+            .expect("snapshot fixture should persist");
         let primary_connection_guard = store.connection_lock.lock().await;
         store
             .connection
@@ -4283,7 +4277,7 @@ mod tests {
             let s3_state = store.load_s3_control_plane_state().await?;
             assert!(s3_state.buckets.is_empty());
             assert!(s3_state.access_keys.is_empty());
-            assert!(store.list_snapshot_infos().await?.is_empty());
+            assert_eq!(store.list_snapshot_infos().await?.len(), 1);
             assert!(
                 store
                     .list_data_change_events(&DataChangeEventQuery::default())
@@ -4316,7 +4310,19 @@ mod tests {
             );
             assert!(store.load_all_version_indexes().await?.is_empty());
             assert!(store.list_version_index_object_ids().await?.is_empty());
-            assert!(store.load_all_snapshots().await?.is_empty());
+            assert_eq!(store.load_all_snapshots().await?.len(), 1);
+            let snapshot_manifest = store
+                .load_snapshot_manifest("scan-read-snapshot")
+                .await?
+                .expect("snapshot manifest should load through a scan connection");
+            assert_eq!(snapshot_manifest.id, "scan-read-snapshot");
+            assert_eq!(snapshot_manifest.objects.len(), 1);
+            let snapshot_by_id = store
+                .load_snapshot_by_id("scan-read-snapshot")
+                .await?
+                .expect("snapshot by ID should load through a scan connection");
+            assert_eq!(snapshot_by_id.id, "scan-read-snapshot");
+            assert_eq!(snapshot_by_id.object_ids.len(), 1);
             let history_listing = store.list_recoverable_history_listing("", 1, 1).await?;
             assert!(history_listing.entries.is_empty());
             assert!(!history_listing.truncated);
