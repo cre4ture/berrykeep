@@ -46,7 +46,9 @@ use super::{
 pub(super) struct TursoMetadataStore {
     database: turso::Database,
     connection: turso::Connection,
-    writer_lock: tokio::sync::Mutex<()>,
+    /// Turso rejects concurrent statements on one connection. Hold this guard until every row
+    /// produced by the primary connection has been consumed, not just until `query` returns.
+    connection_lock: tokio::sync::Mutex<()>,
     gallery_read_permits: Arc<tokio::sync::Semaphore>,
     gallery_summary_read_permits: Arc<tokio::sync::Semaphore>,
     metadata_path: PathBuf,
@@ -134,7 +136,7 @@ impl TursoMetadataStore {
         let store = Self {
             database: db,
             connection: conn,
-            writer_lock: tokio::sync::Mutex::new(()),
+            connection_lock: tokio::sync::Mutex::new(()),
             gallery_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT,
             )),
@@ -155,7 +157,7 @@ impl TursoMetadataStore {
         if invalid_tasks.is_empty() {
             return Ok(());
         }
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         for (manifest_hash, task_json) in invalid_tasks {
             match task_json {
                 Some(task_json) => {
@@ -223,6 +225,7 @@ impl TursoMetadataStore {
 #[async_trait]
 impl MetadataStore for TursoMetadataStore {
     async fn object_id_backfill_needed(&self) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -234,7 +237,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_object_id_backfill_complete(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
@@ -246,6 +249,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -257,7 +261,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
@@ -269,6 +273,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn gallery_sidecar_gps_backfill_needed(&self) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -280,7 +285,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_gallery_sidecar_gps_backfill_complete(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
@@ -292,6 +297,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_current_state(&self) -> Result<CurrentState> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -320,6 +326,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -362,6 +369,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         keys: &[String],
     ) -> Result<HashMap<String, Vec<String>>> {
+        let _connection_guard = self.connection_lock.lock().await;
         const LABEL_LOOKUP_CHUNK_SIZE: usize = 500;
         let mut labels_by_key = HashMap::new();
         for keys in keys.chunks(LABEL_LOOKUP_CHUNK_SIZE) {
@@ -394,6 +402,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         keys: &[String],
     ) -> Result<HashMap<String, MediaGpsCoordinates>> {
+        let _connection_guard = self.connection_lock.lock().await;
         const GPS_LOOKUP_CHUNK_SIZE: usize = 500;
         let mut gps_by_key = HashMap::new();
         for keys in keys.chunks(GPS_LOOKUP_CHUNK_SIZE) {
@@ -472,6 +481,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn count_current_objects(&self) -> Result<usize> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query("SELECT COUNT(*) FROM current_objects", ())
@@ -483,6 +493,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_current_object_keys(&self) -> Result<Vec<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query("SELECT key FROM current_objects", ())
@@ -495,6 +506,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -510,6 +522,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn content_repair_pending(&self, manifest_hash: &str) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -521,6 +534,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -548,6 +562,7 @@ impl MetadataStore for TursoMetadataStore {
             }
         }
         drop(rows);
+        drop(_connection_guard);
         self.discard_invalid_content_repair_tasks(invalid_tasks)
             .await?;
         Ok(tasks)
@@ -557,6 +572,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         manifest_hashes: &[String],
     ) -> Result<Vec<ContentRepairTask>> {
+        let _connection_guard = self.connection_lock.lock().await;
         const CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE: usize = 500;
 
         if manifest_hashes.is_empty() {
@@ -598,12 +614,14 @@ impl MetadataStore for TursoMetadataStore {
                 .manifest_hash
                 .cmp(&right.reference.manifest_hash)
         });
+        drop(_connection_guard);
         self.discard_invalid_content_repair_tasks(invalid_tasks)
             .await?;
         Ok(tasks)
     }
 
     async fn content_repair_task_hashes(&self) -> Result<Vec<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -624,6 +642,7 @@ impl MetadataStore for TursoMetadataStore {
         source_fingerprint: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let source_change_retry_before_unix = i64::try_from(
             now_unix.saturating_sub(CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS),
         )
@@ -681,7 +700,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO content_repair_tasks (
@@ -707,7 +726,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM content_repair_tasks WHERE manifest_hash=?1",
@@ -718,6 +737,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -747,7 +767,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         attempts: &HashMap<String, RepairAttemptRecord>,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -782,6 +802,7 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         finished_since_unix: Option<u64>,
     ) -> Result<Vec<RepairRunRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = match (finished_since_unix, limit) {
             (Some(finished_since_unix), Some(limit)) => {
                 self.connection
@@ -835,7 +856,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_repair_run_record(&self, record: &RepairRunRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -852,7 +873,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_repair_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM repair_run_history\n                 WHERE finished_at_unix < ?1",
@@ -868,6 +889,7 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         finished_since_unix: Option<u64>,
     ) -> Result<Vec<ManualRepairActionRunRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = match (finished_since_unix, limit) {
             (Some(finished_since_unix), Some(limit)) => {
                 self.connection
@@ -926,7 +948,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         record: &ManualRepairActionRunRecord,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -946,7 +968,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         finished_before_unix: u64,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM manual_repair_action_run_history\n                 WHERE finished_at_unix < ?1",
@@ -962,6 +984,7 @@ impl MetadataStore for TursoMetadataStore {
         operation_id: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<OperationRun>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = match (operation_id, limit) {
             (Some(operation_id), Some(limit)) => {
                 self.connection
@@ -1015,6 +1038,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1032,7 +1056,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_operation_run(&self, run: &OperationRun) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(run)?;
         let status = serde_json::to_value(run.status)?
             .as_str()
@@ -1068,7 +1092,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_operation_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let finished_before_unix = i64::try_from(finished_before_unix)
             .context("operation run history prune timestamp overflow")?;
         let result = async {
@@ -1110,7 +1134,7 @@ impl MetadataStore for TursoMetadataStore {
         finished_at_unix: u64,
         termination_reason: &str,
     ) -> Result<usize> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let result = async {
             self.connection.execute_batch("BEGIN IMMEDIATE").await?;
             let mut rows = self
@@ -1167,6 +1191,7 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<Vec<OperationResultChunk>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = match limit {
             Some(limit) => {
                 self.connection
@@ -1209,7 +1234,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(chunk)?;
         self.connection
             .execute(
@@ -1237,6 +1262,7 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         finished_since_unix: Option<u64>,
     ) -> Result<Vec<DataScrubRunRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = match (finished_since_unix, limit) {
             (Some(finished_since_unix), Some(limit)) => {
                 self.connection
@@ -1292,7 +1318,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_data_scrub_run_record(&self, record: &DataScrubRunRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -1309,7 +1335,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_data_scrub_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM data_scrub_run_history\n                 WHERE finished_at_unix < ?1",
@@ -1321,6 +1347,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1349,7 +1376,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -1375,6 +1402,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1396,6 +1424,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1423,7 +1452,7 @@ impl MetadataStore for TursoMetadataStore {
         replicas: &HashMap<String, Vec<NodeId>>,
         available: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -1465,6 +1494,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_client_credential_state(&self) -> Result<ClientCredentialState> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1480,7 +1510,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(state)?;
         self.connection
             .execute(
@@ -1494,6 +1524,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut bucket_rows = self
             .connection
             .query(
@@ -1566,7 +1597,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -1677,6 +1708,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1697,6 +1729,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_batch_state(&self) -> Result<Option<ActiveSnapshotBatch>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1720,7 +1753,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         state: Option<&ActiveSnapshotBatch>,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         match state {
             Some(state) => {
                 let payload = serde_json::to_vec_pretty(state)?;
@@ -1747,6 +1780,7 @@ impl MetadataStore for TursoMetadataStore {
         content_fingerprint: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
         let payload = {
+            let _connection_guard = self.connection_lock.lock().await;
             let mut rows = self
                 .connection
                 .query(
@@ -1804,6 +1838,7 @@ impl MetadataStore for TursoMetadataStore {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let _connection_guard = self.connection_lock.lock().await;
             let mut rows = self
                 .connection
                 .query(
@@ -1827,6 +1862,8 @@ impl MetadataStore for TursoMetadataStore {
                     Err(err) => invalid_rows.push((content_fingerprint, payload, err.to_string())),
                 }
             }
+            drop(rows);
+            drop(_connection_guard);
 
             for (content_fingerprint, payload, error) in invalid_rows {
                 let deleted = self
@@ -1859,6 +1896,7 @@ impl MetadataStore for TursoMetadataStore {
 
     #[cfg(test)]
     async fn has_media_cache_record(&self, content_fingerprint: &str) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1881,6 +1919,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_snapshot_infos(&self) -> Result<Vec<SnapshotInfo>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1906,6 +1945,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         query: &DataChangeEventQuery,
     ) -> Result<Vec<DataChangeEvent>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let limit = match query.limit {
             Some(limit) => i64::try_from(limit).context("data change event limit overflow")?,
             None => i64::MAX,
@@ -1959,7 +1999,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec(event)?;
         self.connection
             .execute(
@@ -1980,7 +2020,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn append_data_change_event(&self, event: &DataChangeEvent) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec(event)?;
         self.connection
             .execute(
@@ -2032,6 +2072,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         object_id: &str,
     ) -> Result<Option<FileVersionIndex>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2053,6 +2094,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         manifest_hashes: &[String],
     ) -> Result<HashMap<String, ManifestSummary>> {
+        let _connection_guard = self.connection_lock.lock().await;
         const TURSO_SUMMARY_QUERY_BATCH_SIZE: usize = 500;
 
         let mut summaries = HashMap::with_capacity(manifest_hashes.len());
@@ -2098,6 +2140,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         version_id: &str,
     ) -> Result<Option<ObjectVersionMetadataRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2136,7 +2179,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         metadata: &ObjectVersionMetadataRecord,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO object_version_metadata (
@@ -2180,7 +2223,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_object_version_metadata(&self, version_id: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM object_version_metadata WHERE version_id = ?1",
@@ -2195,6 +2238,7 @@ impl MetadataStore for TursoMetadataStore {
         bucket_name: &str,
         version_id: &str,
     ) -> Result<Option<S3ObjectVersionRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2223,6 +2267,7 @@ impl MetadataStore for TursoMetadataStore {
         bucket_name: &str,
         berrykeep_key: &str,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2256,6 +2301,7 @@ impl MetadataStore for TursoMetadataStore {
         bucket_name: &str,
         berrykeep_key_prefix: Option<&str>,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut records = Vec::new();
         let mut rows = if let Some(prefix) = berrykeep_key_prefix {
             let like_pattern = super::sqlite_like_prefix_pattern(prefix);
@@ -2298,7 +2344,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO s3_object_versions (
@@ -2329,7 +2375,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_s3_object_version(&self, bucket_name: &str, version_id: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM s3_object_versions
@@ -2359,6 +2405,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2383,6 +2430,7 @@ impl MetadataStore for TursoMetadataStore {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileVersionIndex>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
         let mut rows = if let Some(after_object_id) = after_object_id {
             self.connection
@@ -2421,6 +2469,7 @@ impl MetadataStore for TursoMetadataStore {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
         let mut rows = if let Some(after_object_id) = after_object_id {
             self.connection
@@ -2461,6 +2510,7 @@ impl MetadataStore for TursoMetadataStore {
         depth: usize,
         max_entries: usize,
     ) -> Result<RecoverableHistoryListing> {
+        let _connection_guard = self.connection_lock.lock().await;
         let prefix = prefix.trim().trim_matches('/').to_string();
         let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
         let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
@@ -2532,6 +2582,7 @@ impl MetadataStore for TursoMetadataStore {
     async fn history_head_projection_backfill_state(
         &self,
     ) -> Result<HistoryHeadProjectionBackfillState> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2567,7 +2618,7 @@ impl MetadataStore for TursoMetadataStore {
         next_after_object_id: Option<&str>,
         complete: bool,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         for projection in projections {
             insert_version_index_head_projection_if_missing(&self.connection, projection).await?;
         }
@@ -2601,7 +2652,7 @@ impl MetadataStore for TursoMetadataStore {
 
     #[cfg(test)]
     async fn clear_history_head_projections_for_test(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute("DELETE FROM version_index_heads", ())
             .await?;
@@ -2618,6 +2669,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2633,7 +2685,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = compress_snapshot_json(&serde_json::to_vec_pretty(manifest)?)?;
         self.connection
             .execute(
@@ -2658,6 +2710,7 @@ impl MetadataStore for TursoMetadataStore {
 
     #[cfg(test)]
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2681,6 +2734,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2699,6 +2753,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_uncompressed_snapshot_ids(&self) -> Result<Vec<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
         let mut rows = self
             .connection
@@ -2722,7 +2777,7 @@ impl MetadataStore for TursoMetadataStore {
             return Ok(());
         }
 
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             for chunk in snapshot_ids.chunks(TURSO_SNAPSHOT_DELETE_BATCH_SIZE) {
@@ -2748,7 +2803,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn vacuum_metadata_store(&self) -> Result<bool> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         match self.connection.execute("VACUUM", ()).await {
             Ok(_) => Ok(true),
             Err(err) => {
@@ -2769,6 +2824,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2787,7 +2843,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(state)?;
         self.connection
             .execute(
@@ -2801,6 +2857,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_storage_locations(&self) -> Result<Vec<StorageLocationRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2825,7 +2882,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_storage_location(&self, location: &StorageLocationRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO storage_locations
@@ -2848,7 +2905,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_storage_location(&self, kind: StorageContentKind, hash: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM storage_locations WHERE content_kind = ?1 AND content_hash = ?2",
@@ -2859,6 +2916,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2877,7 +2935,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_cached_chunk_record(&self, record: &CachedChunkRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -2891,7 +2949,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_cached_chunk_record(&self, hash: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute("DELETE FROM cached_chunks WHERE hash = ?1", (hash,))
             .await?;
@@ -2899,6 +2957,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_cached_chunk_records(&self) -> Result<Vec<CachedChunkRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2921,7 +2980,7 @@ impl MetadataStore for TursoMetadataStore {
         manifest_hash: &str,
         owned_at_unix: u64,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO locally_owned_manifests (manifest_hash, owned_at_unix)
@@ -2937,7 +2996,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM locally_owned_manifests WHERE manifest_hash = ?1",
@@ -2948,6 +3007,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_locally_owned_manifests(&self) -> Result<Vec<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2972,6 +3032,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         manifest_hashes: &[String],
     ) -> Result<std::collections::HashSet<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         const TURSO_LOCALLY_OWNED_QUERY_BATCH_SIZE: usize = 500;
 
         let mut owned = std::collections::HashSet::with_capacity(manifest_hashes.len());
@@ -3008,6 +3069,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -3030,6 +3092,7 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         collected_since_unix: Option<u64>,
     ) -> Result<Vec<StorageStatsSample>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = match (collected_since_unix, limit) {
             (Some(collected_since_unix), Some(limit)) => {
                 self.connection
@@ -3095,6 +3158,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         progress: Option<MetadataDbLogicalProgressCallback>,
     ) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let specs = metadata_db_logical_table_specs();
         let mut tables = Vec::with_capacity(specs.len());
         for (index, spec) in specs.iter().enumerate() {
@@ -3151,7 +3215,7 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
         let payload = serde_json::to_vec_pretty(sample)?;
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -3184,7 +3248,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM storage_stats_history
@@ -3197,6 +3261,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn has_version_index(&self, object_id: &str) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -3208,7 +3273,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM version_indexes WHERE object_id = ?1",
@@ -3225,6 +3290,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_media_cache_fingerprints(&self) -> Result<Vec<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -3248,6 +3314,7 @@ impl MetadataStore for TursoMetadataStore {
         key: &str,
         source_version_id: &str,
     ) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -3261,7 +3328,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_reconciled(&self, marker: &ReconcileMarker) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO reconcile_markers (

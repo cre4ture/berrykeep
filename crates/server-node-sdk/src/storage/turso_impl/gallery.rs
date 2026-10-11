@@ -342,7 +342,7 @@ async fn backfill_gallery_spatial_positions(connection: &turso::Connection) -> R
 
 impl TursoMetadataStore {
     pub(super) async fn backfill_gallery_objects(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -404,7 +404,7 @@ impl TursoMetadataStore {
         key: &str,
         entry: &CurrentObjectEntry,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -426,7 +426,7 @@ impl TursoMetadataStore {
     }
 
     pub(super) async fn remove_current_object_with_gallery(&self, key: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -454,7 +454,7 @@ impl TursoMetadataStore {
         labels: &[String],
     ) -> Result<()> {
         let labels_json = encode_gallery_labels(labels)?;
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -479,7 +479,7 @@ impl TursoMetadataStore {
         key: &str,
         location: Option<XmpGeoLocation>,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -544,7 +544,7 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(metadata)?;
         let content_fingerprint = metadata.content_fingerprint.clone();
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -578,7 +578,7 @@ impl TursoMetadataStore {
         &self,
         content_fingerprint: &str,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -609,7 +609,7 @@ impl TursoMetadataStore {
         content_fingerprint: &str,
         payload: &[u8],
     ) -> Result<bool> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -644,7 +644,7 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let total_size_bytes =
             i64::try_from(summary.total_size_bytes).context("manifest summary size overflow")?;
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -684,7 +684,7 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
         let head_projection = version_index_head_projection(object_id, index);
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -3520,8 +3520,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gallery_writes_share_the_turso_writer_with_other_transactions() {
-        let metadata_db_path = turso_test_db_path("gallery-shared-writer-lock");
+    async fn gallery_writes_share_the_primary_turso_connection_lock() {
+        let metadata_db_path = turso_test_db_path("gallery-shared-connection-lock");
         let store = TursoMetadataStore::open(&metadata_db_path)
             .await
             .expect("turso metadata store should open");
@@ -3538,14 +3538,16 @@ mod tests {
         )]);
         let credentials = ClientCredentialState::default();
 
-        let (gallery, repair, credentials) = tokio::join!(
+        let (gallery, repair, credentials, cluster_nodes) = tokio::join!(
             store.upsert_current_object_with_gallery("gallery/shared-writer.jpg", &entry),
             store.persist_repair_attempts(&attempts),
             store.persist_client_credential_state(&credentials),
+            store.load_cluster_nodes(),
         );
         gallery.expect("gallery write should commit");
         repair.expect("repair attempt write should commit");
         credentials.expect("client credential write should commit");
+        cluster_nodes.expect("concurrent primary-connection read should succeed");
 
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
