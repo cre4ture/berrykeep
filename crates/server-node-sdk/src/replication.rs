@@ -341,11 +341,28 @@ async fn execute_replication_repair_with_trigger(
         }
         _ => unreachable!("HTTP repair requests use manual or peer triggers"),
     };
-    if trigger == RepairRunTrigger::PeerClusterRequest && scope == ReplicationRepairScope::Local {
+    let peer_execution_deadline = (trigger == RepairRunTrigger::PeerClusterRequest
+        && scope == ReplicationRepairScope::Local)
+        .then(|| repair_execution_deadline(&state));
+    if let Some(execution_deadline) = peer_execution_deadline {
         // A peer-local request still needs a current view, but remote
         // synchronization must finish before it attempts to occupy the local
-        // repair data plane.
-        sync_availability_views_once(&state).await;
+        // repair data plane. It shares one absolute deadline with the repair so
+        // sequential peer synchronization cannot extend the remote request
+        // beyond the configured local execution budget.
+        if run_with_repair_execution_deadline(
+            &state,
+            execution_deadline,
+            sync_availability_views_once(&state),
+        )
+        .await
+        .is_none()
+        {
+            warn!("rejecting peer local repair because availability synchronization timed out");
+            return repair_request_unavailable(
+                "peer replication repair preparation exceeded its execution deadline",
+            );
+        }
     }
 
     match scope {
@@ -380,7 +397,8 @@ async fn execute_replication_repair_with_trigger(
                             trigger,
                             None,
                             permit,
-                            repair_execution_deadline(&state),
+                            peer_execution_deadline
+                                .expect("peer local repair should have an execution deadline"),
                         )
                         .await
                     })
@@ -2095,7 +2113,10 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                                 "skipped_max_retries": report.skipped_max_retries,
                             })),
                         );
-                        accumulate_repair_report(&mut totals, &report);
+                        if report.timed_out {
+                            failed_nodes = failed_nodes.saturating_add(1);
+                        }
+                        accumulate_peer_repair_report(&mut totals, &report);
                         node_reports.push(ClusterReplicationRepairNodeReport {
                             node_id: peer.node_id,
                             attempted_transfers: report.attempted_transfers,
@@ -2302,6 +2323,15 @@ fn accumulate_repair_report(
     if report.last_error.is_some() {
         totals.last_error = report.last_error.clone();
     }
+}
+
+fn accumulate_peer_repair_report(
+    totals: &mut ReplicationRepairReport,
+    report: &ReplicationRepairReport,
+) {
+    let local_phase_timed_out = totals.timed_out;
+    accumulate_repair_report(totals, report);
+    totals.timed_out = local_phase_timed_out;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3196,6 +3226,26 @@ mod tests {
             assert_eq!(aggregate.unresolved, unresolved);
             assert_eq!(aggregate.run_status(), expected_status);
         }
+    }
+
+    #[test]
+    fn peer_timeout_does_not_override_cluster_aggregate_work_status() {
+        let mut totals = empty_report();
+        totals.successful_transfers = 1;
+        let mut peer_report = ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
+        peer_report.failed_transfers = 1;
+        peer_report.unresolved = true;
+
+        accumulate_peer_repair_report(&mut totals, &peer_report);
+
+        assert!(
+            !totals.timed_out,
+            "only the local phase owns aggregate timeout"
+        );
+        assert_eq!(totals.successful_transfers, 1);
+        assert_eq!(totals.failed_transfers, 1);
+        assert!(totals.unresolved);
+        assert_eq!(totals.run_status(), RepairRunStatus::PartiallyRepaired);
     }
 
     #[test]

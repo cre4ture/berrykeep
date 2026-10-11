@@ -23040,6 +23040,57 @@ async fn peer_repair_requests_share_http_admission() {
 }
 
 #[tokio::test]
+async fn peer_availability_sync_uses_the_local_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=local")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("peer preparation should respect the local execution deadline")
+    .expect("peer repair route should respond");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("peer timeout response body should be readable"),
+    )
+    .expect("peer timeout response should be JSON");
+    assert_eq!(
+        body["error"],
+        "peer replication repair preparation exceeded its execution deadline"
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits(),
+        1,
+        "timed-out preparation must release peer admission"
+    );
+    assert!(!state.maintenance.repair_execution_gate.is_occupied());
+
+    drop(refresh_guard);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn admitted_manual_repair_takes_priority_over_peer_synchronization() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
