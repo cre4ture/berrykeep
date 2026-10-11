@@ -4120,6 +4120,36 @@ struct RepairAttemptEntry {
     last_failure_unix: u64,
 }
 
+const REPAIR_ATTEMPT_KEY_VERSION: u8 = 2;
+
+fn migrate_persisted_repair_attempts(
+    persisted_attempts: HashMap<String, RepairAttemptRecord>,
+) -> (HashMap<String, RepairAttemptEntry>, bool) {
+    let mut migrated = false;
+    let mut attempts = HashMap::with_capacity(persisted_attempts.len());
+    for (key, record) in persisted_attempts {
+        let key = if record.key_version < REPAIR_ATTEMPT_KEY_VERSION {
+            migrated = true;
+            format!("transfer|{key}")
+        } else {
+            key
+        };
+        let entry = RepairAttemptEntry {
+            attempts: record.attempts,
+            last_failure_unix: record.last_failure_unix,
+        };
+        attempts
+            .entry(key)
+            .and_modify(|existing: &mut RepairAttemptEntry| {
+                existing.attempts = existing.attempts.max(entry.attempts);
+                existing.last_failure_unix =
+                    existing.last_failure_unix.max(entry.last_failure_unix);
+            })
+            .or_insert(entry);
+    }
+    (attempts, migrated)
+}
+
 #[derive(Debug, Clone, Default)]
 struct StorageStatsRuntime {
     collecting: bool,
@@ -8155,20 +8185,18 @@ async fn start_background_runtimes(
         load_repair_attempts_phase_started_at,
     );
 
+    let (loaded_attempts, migrated_repair_attempt_keys) =
+        migrate_persisted_repair_attempts(persisted_attempts);
     {
         let mut repair_state = state.maintenance.repair_state.lock().await;
-        repair_state.attempts = persisted_attempts
-            .into_iter()
-            .map(|(key, record)| {
-                (
-                    key,
-                    RepairAttemptEntry {
-                        attempts: record.attempts,
-                        last_failure_unix: record.last_failure_unix,
-                    },
-                )
-            })
-            .collect();
+        repair_state.attempts = loaded_attempts;
+    }
+    if migrated_repair_attempt_keys {
+        if let Err(error) = persist_repair_state(state).await {
+            warn!(%error, "failed persisting migrated repair attempt keys");
+        } else {
+            info!("migrated legacy repair attempt keys to the typed namespace");
+        }
     }
 
     if state.network.rendezvous_registration_enabled {
@@ -13048,11 +13076,15 @@ fn cluster_repair_report_from_local(
 async fn execute_serialized_local_replication_repair_phase(
     state: &ServerState,
     batch_size_override: Option<usize>,
+    plan_summary_override: Option<RepairPlanSummary>,
     run_id: Option<&str>,
     trigger: RepairRunTrigger,
     tracker: Option<&RepairRunTracker>,
     execution_deadline: tokio::time::Instant,
-) -> replication::ReplicationRepairReport {
+) -> (RepairPlanSummary, replication::ReplicationRepairReport) {
+    let timeout_plan_summary = plan_summary_override
+        .clone()
+        .unwrap_or_else(empty_repair_plan_summary);
     let live_log_cursor = tracker.map(repair_live_log_cursor).unwrap_or_default();
     let progress_baseline = tracker.map(repair_progress_snapshot).unwrap_or_default();
     if tracker.is_some() {
@@ -13081,7 +13113,7 @@ async fn execute_serialized_local_replication_repair_phase(
     )
     .await
     else {
-        return tracker.map_or_else(
+        let report = tracker.map_or_else(
             || replication::ReplicationRepairReport::timed_out(state.node_id, queue_timeout_secs),
             |tracker| {
                 timed_out_repair_report_since(
@@ -13093,6 +13125,7 @@ async fn execute_serialized_local_replication_repair_phase(
                 )
             },
         );
+        return (timeout_plan_summary, report);
     };
     if tracker.is_some() {
         replication::push_repair_log_entry(
@@ -13109,37 +13142,59 @@ async fn execute_serialized_local_replication_repair_phase(
         );
     }
     let execution_timeout_secs = repair_deadline_budget_secs(execution_deadline);
-    let report = run_with_repair_execution_deadline(
-        state,
-        execution_deadline,
-        replication::execute_replication_repair_inner_with_context(
+    let execution = async {
+        if let Some(plan_summary) = plan_summary_override {
+            let report = replication::execute_replication_repair_inner_with_context(
+                state,
+                batch_size_override,
+                run_id,
+            )
+            .await;
+            return (plan_summary, report);
+        }
+
+        let keys = planning_replication_subjects(state).await;
+        let plan_snapshot = {
+            let mut cluster = state.cluster.lock().await;
+            cluster.update_health_and_detect_offline_transition();
+            cluster.replication_plan_snapshot(&keys)
+        };
+        let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
+        let plan_summary = RepairPlanSummary::from_plan(&plan);
+        let report = replication::execute_replication_repair_plan(
             state,
+            &plan,
+            nodes,
             batch_size_override,
             run_id,
-        ),
-    )
-    .await
-    .unwrap_or_else(|| {
-        tracker.map_or_else(
-            || {
-                replication::ReplicationRepairReport::timed_out(
-                    state.node_id,
-                    execution_timeout_secs,
-                )
-            },
-            |tracker| {
-                timed_out_repair_report_since(
-                    state,
-                    tracker,
-                    live_log_cursor,
-                    &progress_baseline,
-                    execution_timeout_secs,
-                )
-            },
         )
-    });
+        .await;
+        (plan_summary, report)
+    };
+    let result = run_with_repair_execution_deadline(state, execution_deadline, execution)
+        .await
+        .unwrap_or_else(|| {
+            let report = tracker.map_or_else(
+                || {
+                    replication::ReplicationRepairReport::timed_out(
+                        state.node_id,
+                        execution_timeout_secs,
+                    )
+                },
+                |tracker| {
+                    timed_out_repair_report_since(
+                        state,
+                        tracker,
+                        live_log_cursor,
+                        &progress_baseline,
+                        execution_timeout_secs,
+                    )
+                },
+            );
+            (timeout_plan_summary, report)
+        });
     drop(permit);
-    report
+    result
 }
 
 #[derive(Debug)]
@@ -13891,7 +13946,7 @@ async fn execute_tracked_targeted_local_manifest_repair(
     manifest_hashes: Vec<String>,
     trigger: RepairRunTrigger,
 ) -> replication::ReplicationRepairReport {
-    let permit = acquire_repair_execution(state, trigger).await;
+    let execution_deadline = repair_execution_deadline(state);
     let plan_summary = RepairPlanSummary {
         generated_at_unix: unix_ts(),
         under_replicated: manifest_hashes.len(),
@@ -13902,9 +13957,30 @@ async fn execute_tracked_targeted_local_manifest_repair(
     };
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let execution_timeout_secs = state.repair_config.execution_timeout_secs.max(1);
-    let report = run_with_repair_execution_timeout(
+    let queue_timeout_secs = repair_deadline_budget_secs(execution_deadline);
+    let Some(permit) = run_with_repair_execution_deadline(
         state,
+        execution_deadline,
+        acquire_repair_execution(state, trigger),
+    )
+    .await
+    else {
+        let report = timed_out_repair_report(state, &tracker, queue_timeout_secs);
+        finish_repair_run_tracking(
+            state,
+            tracker,
+            plan_summary,
+            RepairRunStatus::TimedOut,
+            Some(RepairRunSummary::from_local_report(&report)),
+            serialize_repair_run_report(&report),
+        )
+        .await;
+        return report;
+    };
+    let execution_timeout_secs = repair_deadline_budget_secs(execution_deadline);
+    let report = run_with_repair_execution_deadline(
+        state,
+        execution_deadline,
         with_active_repair_log_tracking(&tracker, async {
             replication::execute_targeted_manifest_repair_inner_with_context(
                 state,
@@ -13935,13 +14011,32 @@ async fn execute_tracked_targeted_replication_repair(
     subjects: Vec<String>,
     trigger: RepairRunTrigger,
 ) -> replication::ReplicationRepairReport {
-    sync_availability_views_once(state).await;
-    let permit = acquire_repair_execution(state, trigger).await;
+    let execution_deadline = repair_execution_deadline(state);
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let execution_timeout_secs = state.repair_config.execution_timeout_secs.max(1);
-    let execution = run_with_repair_execution_timeout(
+    let preparation_timeout_secs = repair_deadline_budget_secs(execution_deadline);
+    let preparation = run_with_repair_execution_deadline(state, execution_deadline, async {
+        sync_availability_views_once(state).await;
+        acquire_repair_execution(state, trigger).await
+    })
+    .await;
+    let Some(permit) = preparation else {
+        let report = timed_out_repair_report(state, &tracker, preparation_timeout_secs);
+        finish_repair_run_tracking(
+            state,
+            tracker,
+            empty_repair_plan_summary(),
+            RepairRunStatus::TimedOut,
+            Some(RepairRunSummary::from_local_report(&report)),
+            serialize_repair_run_report(&report),
+        )
+        .await;
+        return report;
+    };
+    let execution_timeout_secs = repair_deadline_budget_secs(execution_deadline);
+    let execution = run_with_repair_execution_deadline(
         state,
+        execution_deadline,
         with_active_repair_log_tracking(&tracker, async {
             replication::execute_planned_targeted_replication_repair_inner_with_context(
                 state,
@@ -13984,15 +14079,13 @@ async fn execute_tracked_cluster_replication_repair(
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Cluster, trigger)
             .await;
     let preparation_timeout_secs = repair_deadline_budget_secs(local_execution_deadline);
-    let preparation = run_with_repair_execution_deadline(state, local_execution_deadline, async {
-        sync_availability_views_once(state).await;
-        match plan_summary_override {
-            Some(plan_summary) => plan_summary,
-            None => RepairPlanSummary::from_plan(&current_replication_plan(state).await),
-        }
-    })
+    let preparation = run_with_repair_execution_deadline(
+        state,
+        local_execution_deadline,
+        sync_availability_views_once(state),
+    )
     .await;
-    let Some(plan_summary) = preparation else {
+    if preparation.is_none() {
         let report = cluster_repair_report_from_local(
             state.node_id,
             timed_out_repair_report(state, &tracker, preparation_timeout_secs),
@@ -14007,11 +14100,12 @@ async fn execute_tracked_cluster_replication_repair(
         )
         .await;
         return report;
-    };
-    let report = with_active_repair_log_tracking(&tracker, async {
+    }
+    let (report, plan_summary) = with_active_repair_log_tracking(&tracker, async {
         replication::execute_cluster_replication_repair_inner_with_context(
             state,
             batch_size_override,
+            plan_summary_override,
             Some(&tracker.run_id),
             Some(&tracker),
             local_execution_deadline,
@@ -32615,6 +32709,7 @@ async fn persist_repair_state(state: &ServerState) -> Result<()> {
                     RepairAttemptRecord {
                         attempts: entry.attempts,
                         last_failure_unix: entry.last_failure_unix,
+                        key_version: REPAIR_ATTEMPT_KEY_VERSION,
                     },
                 )
             })

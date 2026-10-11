@@ -2446,6 +2446,7 @@ pub struct MetadataExportBundle {
 pub struct RepairAttemptRecord {
     pub attempts: u32,
     pub last_failure_unix: u64,
+    pub key_version: u8,
 }
 
 #[derive(Debug, Clone)]

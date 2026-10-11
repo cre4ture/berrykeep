@@ -23106,6 +23106,35 @@ fn repair_timeout_diagnostics_round_the_assigned_budget_up() {
     assert_eq!(super::repair_duration_budget_secs(Duration::ZERO), 1);
 }
 
+#[test]
+fn legacy_repair_attempt_keys_migrate_without_prefix_ambiguity() {
+    let node_id = NodeId::new_v4();
+    let ambiguous_key = format!("inspection|foo|{node_id}");
+    let legacy = HashMap::from([(
+        ambiguous_key.clone(),
+        super::storage::RepairAttemptRecord {
+            attempts: 3,
+            last_failure_unix: 17,
+            key_version: 1,
+        },
+    )]);
+    let (legacy, migrated) = super::migrate_persisted_repair_attempts(legacy);
+    assert!(migrated);
+    assert!(legacy.contains_key(&format!("transfer|{ambiguous_key}")));
+
+    let current = HashMap::from([(
+        ambiguous_key.clone(),
+        super::storage::RepairAttemptRecord {
+            attempts: 2,
+            last_failure_unix: 11,
+            key_version: super::REPAIR_ATTEMPT_KEY_VERSION,
+        },
+    )]);
+    let (current, migrated) = super::migrate_persisted_repair_attempts(current);
+    assert!(!migrated);
+    assert!(current.contains_key(&ambiguous_key));
+}
+
 #[tokio::test]
 async fn admitted_manual_repair_takes_priority_over_peer_synchronization() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
@@ -23268,6 +23297,59 @@ async fn manual_local_repair_gate_wait_uses_execution_deadline() {
             .manual,
         0,
         "timed-out local repair must leave no queued waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn targeted_repair_gate_waits_share_the_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+
+    let manifest_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_targeted_local_manifest_repair(
+            &state,
+            vec!["blocked-manifest".to_string()],
+            super::RepairRunTrigger::DataScrubAutoRepair,
+        ),
+    )
+    .await
+    .expect("targeted manifest repair should bound its executor wait");
+    assert_eq!(
+        manifest_report.run_status(),
+        super::RepairRunStatus::TimedOut
+    );
+
+    let subject_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_targeted_replication_repair(
+            &state,
+            vec!["blocked-subject".to_string()],
+            super::RepairRunTrigger::AutonomousPostWrite,
+        ),
+    )
+    .await
+    .expect("targeted subject repair should bound its executor wait");
+    assert_eq!(
+        subject_report.run_status(),
+        super::RepairRunStatus::TimedOut
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic,
+        0,
+        "timed-out targeted repairs must leave no queued waiter"
     );
 
     drop(active);
@@ -23706,6 +23788,70 @@ async fn queued_background_repair_refreshes_its_plan_after_acquiring_executor() 
         repair_run_history(&state).await.is_empty(),
         "a refreshed empty plan should not create a repair run"
     );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn queued_cluster_repair_builds_its_plan_after_acquiring_executor() {
+    const GAP_KEY: &str = "queued-cluster-gap-key";
+
+    let state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let repair = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::execute_tracked_cluster_replication_repair(
+                &state,
+                None,
+                super::RepairRunTrigger::ManualRequest,
+                None,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cluster repair should queue before planning");
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        for node_id in cluster
+            .list_nodes()
+            .into_iter()
+            .map(|node| node.node_id)
+            .filter(|node_id| *node_id != state.node_id)
+            .collect::<Vec<_>>()
+        {
+            cluster.remove_node(node_id);
+        }
+    }
+    drop(active);
+
+    let report = tokio::time::timeout(Duration::from_secs(5), repair)
+        .await
+        .expect("cluster repair should finish after the executor is released")
+        .expect("cluster repair task should not panic");
+    assert_eq!(report.totals.attempted_transfers, 0);
+    let history = repair_run_history(&state).await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].plan_summary.item_count, 0);
+    assert_eq!(history[0].plan_summary.under_replicated, 0);
 
     cleanup_test_state(&state).await;
 }

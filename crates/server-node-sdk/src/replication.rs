@@ -1949,18 +1949,21 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
         batch_size_override,
         None,
         None,
+        None,
         local_execution_deadline,
     )
     .await
+    .0
 }
 
 pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
     state: &ServerState,
     batch_size_override: Option<usize>,
+    plan_summary_override: Option<RepairPlanSummary>,
     run_id: Option<&str>,
     tracker: Option<&RepairRunTracker>,
     local_execution_deadline: tokio::time::Instant,
-) -> ClusterReplicationRepairReport {
+) -> (ClusterReplicationRepairReport, RepairPlanSummary) {
     let mut node_reports = Vec::new();
     let mut totals = ReplicationRepairReport {
         attempted_transfers: 0,
@@ -2003,9 +2006,10 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
     let local_trigger = tracker
         .map(|tracker| tracker.trigger)
         .unwrap_or(RepairRunTrigger::ManualRequest);
-    let local_report = execute_serialized_local_replication_repair_phase(
+    let (plan_summary, local_report) = execute_serialized_local_replication_repair_phase(
         state,
         batch_size_override,
+        plan_summary_override,
         run_id,
         local_trigger,
         tracker,
@@ -2294,13 +2298,16 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         })),
     );
 
-    ClusterReplicationRepairReport {
-        totals,
-        scope: ReplicationRepairScope::Cluster,
-        nodes_contacted: node_reports.len(),
-        failed_nodes,
-        node_reports,
-    }
+    (
+        ClusterReplicationRepairReport {
+            totals,
+            scope: ReplicationRepairScope::Cluster,
+            nodes_contacted: node_reports.len(),
+            failed_nodes,
+            node_reports,
+        },
+        plan_summary,
+    )
 }
 
 fn accumulate_repair_report(

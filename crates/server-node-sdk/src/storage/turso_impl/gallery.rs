@@ -3534,6 +3534,7 @@ mod tests {
             RepairAttemptRecord {
                 attempts: 1,
                 last_failure_unix: 2,
+                key_version: 2,
             },
         )]);
         let credentials = ClientCredentialState::default();
