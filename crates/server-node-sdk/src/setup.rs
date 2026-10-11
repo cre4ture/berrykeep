@@ -770,7 +770,10 @@ pub(crate) async fn run_setup_mode(
         return outcome.context("bootstrap setup server exited");
     }
 
-    handle.graceful_shutdown(Some(Duration::from_secs(0)));
+    // Give hyper and rustls time to close pooled setup connections cleanly before the runtime
+    // listener takes over the same address. An immediate shutdown can leave clients reusing a
+    // half-closed TLS connection during the handoff.
+    handle.graceful_shutdown(Some(Duration::from_secs(5)));
     let outcome = server_task
         .await
         .context("bootstrap setup server task join failure")?;
