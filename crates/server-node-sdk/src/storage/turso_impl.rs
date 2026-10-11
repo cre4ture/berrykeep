@@ -504,9 +504,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn count_current_objects(&self) -> Result<usize> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("current object count").await?;
+        let mut rows = connection
             .query("SELECT COUNT(*) FROM current_objects", ())
             .await?;
         let Some(row) = rows.next().await? else {
@@ -583,6 +582,7 @@ impl MetadataStore for TursoMetadataStore {
             }
         }
         drop(rows);
+        drop(connection);
         self.discard_invalid_content_repair_tasks(invalid_tasks)
             .await?;
         Ok(tasks)
@@ -2533,7 +2533,9 @@ impl MetadataStore for TursoMetadataStore {
         depth: usize,
         max_entries: usize,
     ) -> Result<RecoverableHistoryListing> {
-        let _connection_guard = self.connection_lock.lock().await;
+        let connection = self
+            .open_scan_connection("recoverable history listing")
+            .await?;
         let prefix = prefix.trim().trim_matches('/').to_string();
         let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
         let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
@@ -2545,8 +2547,7 @@ impl MetadataStore for TursoMetadataStore {
             .and_then(|value| i64::try_from(value).ok())
             .unwrap_or(i64::MAX);
         let query = recoverable_history_listing_query(!prefix.is_empty());
-        let mut rows = self
-            .connection
+        let mut rows = connection
             .query(
                 &query,
                 (
@@ -4235,6 +4236,7 @@ mod tests {
             let current_state = store.load_current_state().await?;
             assert!(current_state.objects.is_empty());
             assert!(current_state.object_ids.is_empty());
+            assert_eq!(store.count_current_objects().await?, 0);
             assert!(store.list_current_object_keys().await?.is_empty());
             assert!(
                 store
@@ -4311,6 +4313,9 @@ mod tests {
             assert!(store.load_all_version_indexes().await?.is_empty());
             assert!(store.list_version_index_object_ids().await?.is_empty());
             assert!(store.load_all_snapshots().await?.is_empty());
+            let history_listing = store.list_recoverable_history_listing("", 1, 1).await?;
+            assert!(history_listing.entries.is_empty());
+            assert!(!history_listing.truncated);
             assert!(store.list_media_cache_fingerprints().await?.is_empty());
             assert!(store.list_uncompressed_snapshot_ids().await?.is_empty());
             assert!(store.load_storage_locations().await?.is_empty());
