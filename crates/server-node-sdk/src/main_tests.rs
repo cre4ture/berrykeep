@@ -20610,30 +20610,34 @@ async fn build_test_state(
     };
 
     if seed_gap {
-        let put = {
-            let mut locked = store.write("tests.store").await;
-            locked
-                .put_object_versioned(
-                    "startup-gap-key",
-                    bytes::Bytes::from_static(b"payload"),
-                    PutOptions {
-                        parent_version_ids: Vec::new(),
-                        state: VersionConsistencyState::Confirmed,
-                        inherit_preferred_parent: true,
-                        create_snapshot: true,
-                        explicit_version_id: None,
-                    },
-                )
-                .await
-                .unwrap()
-        };
-
-        let mut cluster = state.cluster.lock().await;
-        cluster.note_replica("startup-gap-key", local_node_id);
-        cluster.note_replica(format!("startup-gap-key@{}", put.version_id), local_node_id);
+        seed_test_replication_gap(&state, "startup-gap-key").await;
     }
 
     state
+}
+
+async fn seed_test_replication_gap(state: &ServerState, key: &str) {
+    let put = {
+        let mut locked = state.store.write("tests.store").await;
+        locked
+            .put_object_versioned(
+                key,
+                bytes::Bytes::from_static(b"payload"),
+                PutOptions {
+                    parent_version_ids: Vec::new(),
+                    state: VersionConsistencyState::Confirmed,
+                    inherit_preferred_parent: true,
+                    create_snapshot: true,
+                    explicit_version_id: None,
+                },
+            )
+            .await
+            .unwrap()
+    };
+
+    let mut cluster = state.cluster.lock().await;
+    cluster.note_replica(key, state.node_id);
+    cluster.note_replica(format!("{key}@{}", put.version_id), state.node_id);
 }
 
 #[tokio::test]
@@ -22624,9 +22628,12 @@ run_on_main_metadata_backends!(
 
 #[tokio::test]
 async fn timed_out_replication_export_finishes_run_and_releases_executor() {
-    let mut state = build_test_state(2, true, MainTestBackend::Sqlite).await;
+    const GAP_KEY: &str = "repair-timeout-gap-key";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
     state.repair_config.execution_timeout_secs = 1;
-    let blocker = super::replication::block_replication_export_for_test("startup-gap-key");
+    let blocker = super::replication::block_replication_export_for_test(GAP_KEY);
 
     let repair = tokio::spawn({
         let state = state.clone();
@@ -22651,7 +22658,7 @@ async fn timed_out_replication_export_finishes_run_and_releases_executor() {
     assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
     assert!(report.timed_out);
     blocker.release();
-    super::replication::clear_replication_export_blocker_for_test("startup-gap-key");
+    super::replication::clear_replication_export_blocker_for_test(GAP_KEY);
 
     let activity = super::local_repair_activity_payload(&state)
         .await

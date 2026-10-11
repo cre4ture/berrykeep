@@ -30,6 +30,11 @@ impl RepairExecutionGate {
 
         loop {
             let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // Register before inspecting the state. Otherwise a permit release
+            // between the state check and the first poll could be lost because
+            // `notify_waiters` does not retain a permit for future waiters.
+            changed.as_mut().enable();
             {
                 let mut state = self.lock_state();
                 let manual_has_priority = priority == RepairExecutionPriority::Manual;

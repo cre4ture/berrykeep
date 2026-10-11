@@ -39,10 +39,14 @@ pub(crate) fn block_replication_export_for_test(key: &str) -> Arc<ReplicationExp
         release: Arc::new(Notify::new()),
         released: std::sync::atomic::AtomicBool::new(false),
     });
-    replication_export_blockers()
+    let previous = replication_export_blockers()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key.to_string(), Arc::clone(&blocker));
+    assert!(
+        previous.is_none(),
+        "replication export blocker already registered for {key}"
+    );
     blocker
 }
 
@@ -65,6 +69,8 @@ async fn wait_for_replication_export_test_blocker(key: &str) {
         blocker.started.notify_one();
         loop {
             let released = blocker.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             if blocker.released.load(Ordering::Acquire) {
                 break;
             }
