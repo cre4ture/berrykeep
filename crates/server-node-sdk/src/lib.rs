@@ -13680,6 +13680,7 @@ async fn execute_tracked_local_replication_repair(
     trigger: RepairRunTrigger,
     plan_summary_override: Option<RepairPlanSummary>,
 ) -> replication::ReplicationRepairReport {
+    sync_availability_views_once(state).await;
     let permit = acquire_repair_execution(state, trigger).await;
     execute_tracked_local_replication_repair_with_permit(
         state,
@@ -13829,6 +13830,7 @@ async fn execute_tracked_targeted_replication_repair(
     subjects: Vec<String>,
     trigger: RepairRunTrigger,
 ) -> replication::ReplicationRepairReport {
+    sync_availability_views_once(state).await;
     let permit = acquire_repair_execution(state, trigger).await;
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
@@ -13871,6 +13873,7 @@ async fn execute_tracked_cluster_replication_repair(
     trigger: RepairRunTrigger,
     plan_summary_override: Option<RepairPlanSummary>,
 ) -> replication::ClusterReplicationRepairReport {
+    sync_availability_views_once(state).await;
     let plan_summary = match plan_summary_override {
         Some(plan_summary) => plan_summary,
         None => run_with_repair_execution_timeout(state, current_replication_plan(state))
@@ -13909,6 +13912,7 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
 
+        sync_availability_views_once(&state).await;
         let permit = acquire_repair_execution(&state, RepairRunTrigger::StartupRepair).await;
         {
             let mut status = state.maintenance.startup_repair_status.lock().await;

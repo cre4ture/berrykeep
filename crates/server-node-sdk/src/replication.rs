@@ -309,6 +309,12 @@ async fn execute_replication_repair_with_trigger(
         RepairRunTrigger::PeerClusterRequest => None,
         _ => unreachable!("HTTP repair requests use manual or peer triggers"),
     };
+    if trigger == RepairRunTrigger::PeerClusterRequest && scope == ReplicationRepairScope::Local {
+        // A peer-local request still needs a current view, but remote
+        // synchronization must finish before it attempts to occupy the local
+        // repair data plane.
+        sync_availability_views_once(&state).await;
+    }
 
     match scope {
         ReplicationRepairScope::Local => {
@@ -416,6 +422,7 @@ pub(crate) async fn execute_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ReplicationRepairReport {
+    sync_availability_views_once(state).await;
     execute_replication_repair_inner_with_context(state, batch_size_override, None).await
 }
 
@@ -424,7 +431,6 @@ pub(crate) async fn execute_replication_repair_inner_with_context(
     batch_size_override: Option<usize>,
     run_id: Option<&str>,
 ) -> ReplicationRepairReport {
-    sync_availability_views_once(state).await;
     let keys = planning_replication_subjects(state).await;
 
     let plan_snapshot = {
@@ -443,6 +449,7 @@ pub(crate) async fn execute_planned_targeted_replication_repair_inner(
     subjects: Vec<String>,
     batch_size_override: Option<usize>,
 ) -> (ReplicationPlan, ReplicationRepairReport) {
+    sync_availability_views_once(state).await;
     execute_planned_targeted_replication_repair_inner_with_context(
         state,
         subjects,
@@ -464,8 +471,6 @@ pub(crate) async fn execute_planned_targeted_replication_repair_inner_with_conte
         .collect::<Vec<_>>();
     subjects.sort();
     subjects.dedup();
-
-    sync_availability_views_once(state).await;
 
     let plan_snapshot = {
         let mut cluster = state.cluster.lock().await;
@@ -1710,6 +1715,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ClusterReplicationRepairReport {
+    sync_availability_views_once(state).await;
     execute_cluster_replication_repair_inner_with_context(state, batch_size_override, None, None)
         .await
 }

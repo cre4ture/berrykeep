@@ -23019,6 +23019,63 @@ async fn manual_cluster_repair_admits_only_one_waiting_request() {
 }
 
 #[tokio::test]
+async fn manual_availability_sync_does_not_hold_repair_executor() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+
+    let request = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::replication::execute_replication_repair_public(
+                State(state),
+                headers,
+                axum::extract::Query(super::replication::ReplicationRepairQuery {
+                    batch_size: None,
+                    scope: Some(super::replication::ReplicationRepairScope::Local),
+                }),
+            )
+            .await
+            .into_response()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .manual_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual request should hold its admission slot while availability sync waits");
+
+    let executor_probe = state
+        .maintenance
+        .repair_execution_gate
+        .try_acquire()
+        .expect("availability synchronization must run outside the repair executor");
+    drop(executor_probe);
+    drop(refresh_guard);
+
+    let response = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("manual repair should finish after availability sync resumes")
+        .expect("manual repair handler task should not panic");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn timed_out_audit_planning_releases_executor() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.repair_config.execution_timeout_secs = 1;
