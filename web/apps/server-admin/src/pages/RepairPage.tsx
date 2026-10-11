@@ -463,6 +463,16 @@ export function RepairPage() {
                   <Badge variant="light" color={startupStatusColor(repairActivity?.startup_status)}>
                     startup {formatStartupRepairStatus(repairActivity?.startup_status ?? "disabled")}
                   </Badge>
+                  {(repairActivity?.queued_manual_repairs ?? 0) > 0 ? (
+                    <Badge variant="light" color="orange">
+                      {repairActivity?.queued_manual_repairs} manual queued
+                    </Badge>
+                  ) : null}
+                  {(repairActivity?.queued_automatic_repairs ?? 0) > 0 ? (
+                    <Badge variant="light" color="blue">
+                      {repairActivity?.queued_automatic_repairs} automatic queued
+                    </Badge>
+                  ) : null}
                   <Badge variant="light">retention {retentionLabel}</Badge>
                 </Group>
                 {activeRuns.length > 0 ? (

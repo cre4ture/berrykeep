@@ -3612,6 +3612,123 @@ struct RepairActiveRunLiveState {
     last_log_at_unix: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RepairActiveRunProgress {
+    attempted_transfers: usize,
+    successful_transfers: usize,
+    failed_transfers: usize,
+    skipped_items: usize,
+    skipped_backoff: usize,
+    skipped_max_retries: usize,
+    last_error: Option<String>,
+    had_chunk_progress: bool,
+    waiting_for_source: bool,
+    unresolved: bool,
+}
+
+impl RepairActiveRunProgress {
+    fn record_log_entry(&mut self, entry: &replication::ReplicationRepairLogEntry) {
+        let context = entry.context.as_ref();
+        self.had_chunk_progress |= context
+            .and_then(|context| context.get("chunks_recovered"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0);
+
+        match entry.event.as_str() {
+            "local_pull_started" | "target_push_started" => {
+                if let Some(attempted) = context
+                    .and_then(|context| context.get("attempted_transfers"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|attempted| usize::try_from(attempted).ok())
+                {
+                    self.attempted_transfers = self.attempted_transfers.max(attempted);
+                }
+            }
+            "local_pull_completed" | "target_push_completed" => {
+                self.successful_transfers += 1;
+            }
+            "local_replica_inspection_failed" | "local_pull_failed" | "target_push_failed" => {
+                self.failed_transfers += 1;
+                self.last_error = context
+                    .and_then(|context| context.get("error"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| Some(entry.detail.clone()));
+            }
+            "repair_verified" => {
+                self.attempted_transfers += 1;
+                self.successful_transfers += 1;
+            }
+            "repair_waiting" | "repair_unresolved" => {
+                let attempted = context
+                    .and_then(|context| context.get("pending"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if attempted {
+                    self.attempted_transfers += 1;
+                    self.failed_transfers += 1;
+                    self.last_error = Some(entry.detail.clone());
+                } else if context.is_some_and(|context| context.get("next_attempt_unix").is_some())
+                {
+                    self.skipped_items += 1;
+                    self.skipped_backoff += 1;
+                }
+                self.waiting_for_source |= entry.event == "repair_waiting";
+                self.unresolved |= entry.event == "repair_unresolved";
+            }
+            _ => {}
+        }
+    }
+
+    fn record_skipped_item(&mut self, reason: &replication::ReplicationRepairSkipReason) {
+        match reason {
+            replication::ReplicationRepairSkipReason::RepairInProgress => {
+                self.skipped_items += 1;
+                self.attempted_transfers = self.attempted_transfers.saturating_sub(1);
+            }
+            replication::ReplicationRepairSkipReason::BackoffActive => {
+                self.skipped_backoff += 1;
+            }
+            replication::ReplicationRepairSkipReason::MaxRetriesExhausted => {
+                self.skipped_max_retries += 1;
+            }
+            _ => {
+                self.skipped_items += 1;
+            }
+        }
+    }
+
+    fn apply_delta_to_report(
+        &self,
+        baseline: &Self,
+        report: &mut replication::ReplicationRepairReport,
+    ) {
+        report.attempted_transfers = self
+            .attempted_transfers
+            .saturating_sub(baseline.attempted_transfers);
+        report.successful_transfers = self
+            .successful_transfers
+            .saturating_sub(baseline.successful_transfers);
+        report.failed_transfers = self
+            .failed_transfers
+            .saturating_sub(baseline.failed_transfers);
+        report.skipped_items = self.skipped_items.saturating_sub(baseline.skipped_items);
+        report.skipped_backoff = self
+            .skipped_backoff
+            .saturating_sub(baseline.skipped_backoff);
+        report.skipped_max_retries = self
+            .skipped_max_retries
+            .saturating_sub(baseline.skipped_max_retries);
+        report.last_error = self
+            .last_error
+            .clone()
+            .or_else(|| report.last_error.clone());
+        report.had_chunk_progress = self.had_chunk_progress && !baseline.had_chunk_progress;
+        report.waiting_for_source = self.waiting_for_source && !baseline.waiting_for_source;
+        report.unresolved = self.unresolved && !baseline.unresolved;
+    }
+}
+
 impl RepairActiveRunLiveState {
     fn push(&mut self, entry: replication::ReplicationRepairLogEntry) {
         self.last_log_at_unix = Some(entry.captured_at_unix);
@@ -3626,15 +3743,27 @@ impl RepairActiveRunLiveState {
 #[derive(Debug, Clone)]
 struct RepairActiveRunLiveLogHandle {
     state: Arc<StdMutex<RepairActiveRunLiveState>>,
+    progress: Arc<StdMutex<RepairActiveRunProgress>>,
 }
 
 impl RepairActiveRunLiveLogHandle {
     fn push_entry(&self, entry: replication::ReplicationRepairLogEntry) {
+        match self.progress.lock() {
+            Ok(mut progress) => progress.record_log_entry(&entry),
+            Err(poisoned) => poisoned.into_inner().record_log_entry(&entry),
+        }
         let mut live_state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         live_state.push(entry);
+    }
+
+    fn push_skipped_item(&self, reason: &replication::ReplicationRepairSkipReason) {
+        match self.progress.lock() {
+            Ok(mut progress) => progress.record_skipped_item(reason),
+            Err(poisoned) => poisoned.into_inner().record_skipped_item(reason),
+        }
     }
 }
 
@@ -3688,6 +3817,8 @@ struct RepairActivityRuntime {
 struct RepairActivityStatusResponse {
     state: RepairActivityState,
     startup_status: StartupRepairStatus,
+    queued_manual_repairs: usize,
+    queued_automatic_repairs: usize,
     active_runs: Vec<RepairActiveRun>,
     latest_run: Option<RepairRunRecord>,
 }
@@ -11950,10 +12081,13 @@ fn spawn_replication_auditor(state: ServerState, interval_secs: u64) {
 
 async fn run_replication_audit_once(state: &ServerState) {
     request_ttl_bounded_local_availability_refresh(state);
-    // A plan snapshot is only meaningful after both the local and remote
-    // availability views have been reconciled. The plan executor intentionally
-    // consumes this snapshot directly to avoid recomputing retained history, so
-    // it cannot supply this synchronization on the auditor's behalf.
+    // Serialize synchronization, retained-content audit, planning, and execution
+    // so the single plan snapshot remains fresh while this tick uses it.
+    let mut repair_permit = if state.repair_config.enabled {
+        Some(acquire_repair_execution(state, RepairRunTrigger::BackgroundAudit).await)
+    } else {
+        None
+    };
     if state.repair_config.enabled {
         sync_availability_views_once(state).await;
         match content_recovery::retained_content_snapshot(state).await {
@@ -11978,7 +12112,7 @@ async fn run_replication_audit_once(state: &ServerState) {
         let plan_snapshot = cluster.replication_plan_snapshot(&keys);
         (node_transitioned_offline, plan_snapshot)
     };
-    let (plan, _) = plan_snapshot.into_plan_and_nodes();
+    let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
 
     if node_transitioned_offline || !plan.items.is_empty() {
         info!(
@@ -11990,8 +12124,16 @@ async fn run_replication_audit_once(state: &ServerState) {
     }
 
     if state.repair_config.enabled && !plan.items.is_empty() {
-        let report =
-            execute_tracked_replication_plan(state, RepairRunTrigger::BackgroundAudit).await;
+        let report = execute_tracked_replication_plan(
+            state,
+            plan,
+            nodes,
+            RepairRunTrigger::BackgroundAudit,
+            repair_permit
+                .take()
+                .expect("enabled repair audit acquired an executor permit"),
+        )
+        .await;
         info!(
             attempted = report.attempted_transfers,
             success = report.successful_transfers,
@@ -12709,8 +12851,41 @@ async fn execute_serialized_local_replication_repair_phase(
     trigger: RepairRunTrigger,
     tracker: Option<&RepairRunTracker>,
 ) -> replication::ReplicationRepairReport {
-    let permit = acquire_repair_execution(state, trigger).await;
     let live_log_offset = tracker.map(repair_live_log_len).unwrap_or_default();
+    let progress_baseline = tracker.map(repair_progress_snapshot).unwrap_or_default();
+    if tracker.is_some() {
+        let queue = state.maintenance.repair_execution_gate.queue_snapshot();
+        replication::push_repair_log_entry(
+            &mut Vec::new(),
+            state.node_id,
+            "waiting_for_executor",
+            "waiting for the node-local repair executor",
+            None,
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(serde_json::json!({
+                "queued_manual_repairs": queue.manual,
+                "queued_automatic_repairs": queue.automatic,
+            })),
+        );
+    }
+    let permit = acquire_repair_execution(state, trigger).await;
+    if tracker.is_some() {
+        replication::push_repair_log_entry(
+            &mut Vec::new(),
+            state.node_id,
+            "executor_acquired",
+            "acquired the node-local repair executor",
+            None,
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            None,
+        );
+    }
     let report = run_with_repair_execution_timeout(
         state,
         replication::execute_replication_repair_inner_with_context(
@@ -12728,7 +12903,9 @@ async fn execute_serialized_local_replication_repair_phase(
                     state.repair_config.execution_timeout_secs,
                 )
             },
-            |tracker| timed_out_repair_report_since(state, tracker, live_log_offset),
+            |tracker| {
+                timed_out_repair_report_since(state, tracker, live_log_offset, &progress_baseline)
+            },
         )
     });
     drop(permit);
@@ -12743,6 +12920,7 @@ struct RepairRunTracker {
     started_at_unix: u64,
     started_at_instant: Instant,
     live_log: Arc<StdMutex<RepairActiveRunLiveState>>,
+    progress: Arc<StdMutex<RepairActiveRunProgress>>,
     repair_activity: Arc<Mutex<RepairActivityRuntime>>,
     cleanup_armed: bool,
 }
@@ -12782,7 +12960,7 @@ fn timed_out_repair_report(
     state: &ServerState,
     tracker: &RepairRunTracker,
 ) -> replication::ReplicationRepairReport {
-    timed_out_repair_report_since(state, tracker, 0)
+    timed_out_repair_report_since(state, tracker, 0, &RepairActiveRunProgress::default())
 }
 
 fn repair_live_log_len(tracker: &RepairRunTracker) -> usize {
@@ -12792,10 +12970,18 @@ fn repair_live_log_len(tracker: &RepairRunTracker) -> usize {
     }
 }
 
+fn repair_progress_snapshot(tracker: &RepairRunTracker) -> RepairActiveRunProgress {
+    match tracker.progress.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 fn timed_out_repair_report_since(
     state: &ServerState,
     tracker: &RepairRunTracker,
     live_log_offset: usize,
+    progress_baseline: &RepairActiveRunProgress,
 ) -> replication::ReplicationRepairReport {
     let mut report = replication::ReplicationRepairReport::timed_out(
         state.node_id,
@@ -12811,12 +12997,19 @@ fn timed_out_repair_report_since(
         .extend(live_state.entries.iter().skip(live_log_offset).cloned());
     drop(live_state);
     report.detailed_log.extend(timeout_entry);
+    repair_progress_snapshot(tracker).apply_delta_to_report(progress_baseline, &mut report);
     report
 }
 
 fn append_active_repair_log_entry(entry: &replication::ReplicationRepairLogEntry) {
     let _ = ACTIVE_REPAIR_LOG_HANDLE.try_with(|handle| {
         handle.push_entry(entry.clone());
+    });
+}
+
+fn append_active_repair_skipped_item(reason: &replication::ReplicationRepairSkipReason) {
+    let _ = ACTIVE_REPAIR_LOG_HANDLE.try_with(|handle| {
+        handle.push_skipped_item(reason);
     });
 }
 
@@ -12837,6 +13030,7 @@ async fn with_active_repair_log_tracking<T>(
         .scope(
             RepairActiveRunLiveLogHandle {
                 state: tracker.live_log.clone(),
+                progress: tracker.progress.clone(),
             },
             future,
         )
@@ -12865,6 +13059,7 @@ async fn begin_repair_run_tracking(
     let run_id = Uuid::now_v7().to_string();
     let started_at_unix = unix_ts();
     let live_log = Arc::new(StdMutex::new(RepairActiveRunLiveState::default()));
+    let progress = Arc::new(StdMutex::new(RepairActiveRunProgress::default()));
 
     {
         let mut activity = state.maintenance.repair_activity.lock().await;
@@ -12884,6 +13079,7 @@ async fn begin_repair_run_tracking(
         started_at_unix,
         started_at_instant: Instant::now(),
         live_log,
+        progress,
         repair_activity: Arc::clone(&state.maintenance.repair_activity),
         cleanup_armed: true,
     }
@@ -12964,10 +13160,11 @@ async fn finish_repair_run_tracking(
 fn current_repair_activity_state(
     active_runs: &[RepairActiveRunRuntime],
     startup_status: StartupRepairStatus,
+    queued_repairs: usize,
 ) -> RepairActivityState {
     if !active_runs.is_empty() || startup_status == StartupRepairStatus::Running {
         RepairActivityState::Running
-    } else if startup_status == StartupRepairStatus::Scheduled {
+    } else if queued_repairs > 0 || startup_status == StartupRepairStatus::Scheduled {
         RepairActivityState::Scheduled
     } else {
         RepairActivityState::Idle
@@ -12979,10 +13176,17 @@ async fn local_repair_activity_payload(
 ) -> Result<RepairActivityStatusResponse> {
     let latest_run = latest_repair_run_record(state).await?;
     let startup_status = *state.maintenance.startup_repair_status.lock().await;
+    let queue = state.maintenance.repair_execution_gate.queue_snapshot();
     let activity = state.maintenance.repair_activity.lock().await;
     Ok(RepairActivityStatusResponse {
-        state: current_repair_activity_state(&activity.active_runs, startup_status),
+        state: current_repair_activity_state(
+            &activity.active_runs,
+            startup_status,
+            queue.manual + queue.automatic,
+        ),
         startup_status,
+        queued_manual_repairs: queue.manual,
+        queued_automatic_repairs: queue.automatic,
         active_runs: activity
             .active_runs
             .iter()
@@ -13352,21 +13556,17 @@ async fn execute_tracked_local_replication_repair(
 /// permit so work completed by an earlier queued repair is not retried.
 async fn execute_tracked_replication_plan(
     state: &ServerState,
+    plan: ReplicationPlan,
+    nodes: Vec<NodeDescriptor>,
     trigger: RepairRunTrigger,
+    permit: RepairExecutionPermit,
 ) -> replication::ReplicationRepairReport {
-    let permit = acquire_repair_execution(state, trigger).await;
+    let plan_summary = RepairPlanSummary::from_plan(&plan);
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let execution = run_with_repair_execution_timeout(state, async {
-        let keys = planning_replication_subjects(state).await;
-        let plan_snapshot = {
-            let mut cluster = state.cluster.lock().await;
-            cluster.update_health_and_detect_offline_transition();
-            cluster.replication_plan_snapshot(&keys)
-        };
-        let (plan, nodes) = plan_snapshot.into_plan_and_nodes();
-        let plan_summary = RepairPlanSummary::from_plan(&plan);
-        let report = with_active_repair_log_tracking(&tracker, async {
+    let report = run_with_repair_execution_timeout(
+        state,
+        with_active_repair_log_tracking(&tracker, async {
             replication::execute_replication_repair_plan(
                 state,
                 &plan,
@@ -13375,18 +13575,10 @@ async fn execute_tracked_replication_plan(
                 Some(&tracker.run_id),
             )
             .await
-        })
-        .await;
-        (plan_summary, report)
-    })
+        }),
+    )
     .await
-    .unwrap_or_else(|| {
-        (
-            empty_repair_plan_summary(),
-            timed_out_repair_report(state, &tracker),
-        )
-    });
-    let (plan_summary, report) = execution;
+    .unwrap_or_else(|| timed_out_repair_report(state, &tracker));
     drop(permit);
     finish_repair_run_tracking(
         state,

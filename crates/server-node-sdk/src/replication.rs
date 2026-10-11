@@ -116,9 +116,6 @@ impl ReplicationRepairReport {
     }
 
     pub(crate) fn run_status(&self) -> RepairRunStatus {
-        if self.timed_out {
-            return RepairRunStatus::TimedOut;
-        }
         let deferred_transfer = self.skipped_backoff > 0 || self.skipped_max_retries > 0;
 
         if self.failed_transfers > 0 {
@@ -153,6 +150,9 @@ impl ReplicationRepairReport {
         }
         if deferred_transfer {
             return RepairRunStatus::PartiallyRepaired;
+        }
+        if self.timed_out {
+            return RepairRunStatus::TimedOut;
         }
         RepairRunStatus::Completed
     }
@@ -2000,6 +2000,7 @@ pub(crate) fn push_repair_skipped_detail(
     reason: ReplicationRepairSkipReason,
     detail: impl Into<String>,
 ) {
+    append_active_repair_skipped_item(&reason);
     if skipped_details.len() >= MAX_REPAIR_REPORT_SKIPPED_DETAILS {
         return;
     }
@@ -2684,6 +2685,15 @@ mod tests {
         );
         assert_eq!(report.detailed_log.len(), 1);
         assert_eq!(report.detailed_log[0].event, "repair_run_timed_out");
+    }
+
+    #[test]
+    fn timeout_flag_does_not_hide_transfer_failures() {
+        let mut report = ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
+        report.failed_transfers = 1;
+
+        assert_eq!(report.run_status(), RepairRunStatus::Unresolved);
+        assert!(report.timed_out);
     }
 
     #[test]

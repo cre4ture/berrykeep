@@ -22699,6 +22699,66 @@ async fn timed_out_replication_export_finishes_run_and_releases_executor() {
 }
 
 #[tokio::test]
+async fn timed_out_report_retains_partial_transfer_counters() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+    super::with_active_repair_log_tracking(&tracker, async {
+        let mut log = Vec::new();
+        super::replication::push_repair_log_entry(
+            &mut log,
+            state.node_id,
+            "target_push_started",
+            "first transfer started",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(NodeId::new_v4()),
+            Some(serde_json::json!({"attempted_transfers": 1})),
+        );
+        super::replication::push_repair_log_entry(
+            &mut log,
+            state.node_id,
+            "target_push_completed",
+            "first transfer completed",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(NodeId::new_v4()),
+            None,
+        );
+        super::replication::push_repair_log_entry(
+            &mut log,
+            state.node_id,
+            "target_push_started",
+            "second transfer started",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(NodeId::new_v4()),
+            Some(serde_json::json!({"attempted_transfers": 2})),
+        );
+    })
+    .await;
+
+    let report = super::timed_out_repair_report(&state, &tracker);
+    assert_eq!(report.attempted_transfers, 2);
+    assert_eq!(report.successful_transfers, 1);
+    assert_eq!(report.failed_transfers, 0);
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+
+    drop(tracker);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn dropped_repair_tracker_removes_its_active_run() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let tracker = super::begin_repair_run_tracking(
@@ -22737,6 +22797,46 @@ async fn dropped_repair_tracker_removes_its_active_run() {
     .await
     .expect("dropping a tracker should remove its active repair entry");
 
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn repair_activity_reports_executor_queue_depth() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    *state.maintenance.startup_repair_status.lock().await = StartupRepairStatus::Disabled;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let waiter = tokio::spawn({
+        let gate = Arc::clone(&state.maintenance.repair_execution_gate);
+        async move { gate.acquire(super::RepairExecutionPriority::Manual).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual repair should become visible in the executor queue");
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("repair activity should be readable");
+    assert_eq!(activity.state, super::RepairActivityState::Scheduled);
+    assert_eq!(activity.queued_manual_repairs, 1);
+    assert_eq!(activity.queued_automatic_repairs, 0);
+    assert!(activity.active_runs.is_empty());
+
+    waiter.abort();
+    drop(active);
     cleanup_test_state(&state).await;
 }
 
@@ -22801,13 +22901,7 @@ async fn queued_background_repair_refreshes_its_plan_after_acquiring_executor() 
         .await;
     let repair = tokio::spawn({
         let state = state.clone();
-        async move {
-            super::execute_tracked_replication_plan(
-                &state,
-                super::RepairRunTrigger::BackgroundAudit,
-            )
-            .await
-        }
+        async move { super::run_replication_audit_once(&state).await }
     });
     tokio::task::yield_now().await;
 
@@ -22825,12 +22919,14 @@ async fn queued_background_repair_refreshes_its_plan_after_acquiring_executor() 
     }
     drop(active);
 
-    let report = tokio::time::timeout(Duration::from_secs(5), repair)
+    tokio::time::timeout(Duration::from_secs(5), repair)
         .await
         .expect("queued background repair should finish after the executor is released")
         .expect("background repair task should not panic");
-    assert_eq!(report.attempted_transfers, 0);
-    assert_eq!(report.run_status(), super::RepairRunStatus::Completed);
+    assert!(
+        repair_run_history(&state).await.is_empty(),
+        "a refreshed empty plan should not create a repair run"
+    );
 
     cleanup_test_state(&state).await;
 }

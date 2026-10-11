@@ -1,4 +1,6 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
@@ -11,13 +13,40 @@ pub(super) enum RepairExecutionPriority {
 #[derive(Debug, Default)]
 struct RepairExecutionGateState {
     active: bool,
-    manual_waiters: usize,
+    next_waiter_id: u64,
+    waiters: VecDeque<RepairExecutionWaiter>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct RepairExecutionWaiter {
+    id: u64,
+    priority: RepairExecutionPriority,
+    enqueued_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct RepairExecutionQueueSnapshot {
+    pub(super) manual: usize,
+    pub(super) automatic: usize,
+}
+
+const DEFAULT_AUTOMATIC_PRIORITY_AGING: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
 pub(super) struct RepairExecutionGate {
     state: StdMutex<RepairExecutionGateState>,
     changed: Notify,
+    automatic_priority_aging: Duration,
+}
+
+impl Default for RepairExecutionGate {
+    fn default() -> Self {
+        Self {
+            state: StdMutex::new(RepairExecutionGateState::default()),
+            changed: Notify::new(),
+            automatic_priority_aging: DEFAULT_AUTOMATIC_PRIORITY_AGING,
+        }
+    }
 }
 
 impl RepairExecutionGate {
@@ -25,8 +54,7 @@ impl RepairExecutionGate {
         self: &Arc<Self>,
         priority: RepairExecutionPriority,
     ) -> RepairExecutionPermit {
-        let mut manual_waiter = (priority == RepairExecutionPriority::Manual)
-            .then(|| ManualWaiter::register(Arc::clone(self)));
+        let mut waiter = RepairExecutionWaiterRegistration::register(Arc::clone(self), priority);
 
         loop {
             let changed = self.changed.notified();
@@ -37,18 +65,41 @@ impl RepairExecutionGate {
             changed.as_mut().enable();
             {
                 let mut state = self.lock_state();
-                let manual_has_priority = priority == RepairExecutionPriority::Manual;
-                if !state.active && (manual_has_priority || state.manual_waiters == 0) {
+                if !state.active
+                    && state.selected_waiter_id(self.automatic_priority_aging) == Some(waiter.id)
+                {
                     state.active = true;
-                    if let Some(waiter) = manual_waiter.as_mut() {
-                        waiter.unregister_locked(&mut state);
-                    }
+                    waiter.unregister_locked(&mut state);
                     return RepairExecutionPermit {
                         gate: Arc::clone(self),
                     };
                 }
             }
             changed.await;
+        }
+    }
+
+    pub(super) fn queue_snapshot(&self) -> RepairExecutionQueueSnapshot {
+        let state = self.lock_state();
+        RepairExecutionQueueSnapshot {
+            manual: state
+                .waiters
+                .iter()
+                .filter(|waiter| waiter.priority == RepairExecutionPriority::Manual)
+                .count(),
+            automatic: state
+                .waiters
+                .iter()
+                .filter(|waiter| waiter.priority == RepairExecutionPriority::Automatic)
+                .count(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_automatic_priority_aging(automatic_priority_aging: Duration) -> Self {
+        Self {
+            automatic_priority_aging,
+            ..Self::default()
         }
     }
 
@@ -59,39 +110,69 @@ impl RepairExecutionGate {
     }
 }
 
+impl RepairExecutionGateState {
+    fn selected_waiter_id(&self, automatic_priority_aging: Duration) -> Option<u64> {
+        self.waiters
+            .iter()
+            .find(|waiter| {
+                waiter.priority == RepairExecutionPriority::Automatic
+                    && waiter.enqueued_at.elapsed() >= automatic_priority_aging
+            })
+            .or_else(|| {
+                self.waiters
+                    .iter()
+                    .find(|waiter| waiter.priority == RepairExecutionPriority::Manual)
+            })
+            .or_else(|| self.waiters.front())
+            .map(|waiter| waiter.id)
+    }
+}
+
 #[derive(Debug)]
-struct ManualWaiter {
+struct RepairExecutionWaiterRegistration {
     gate: Arc<RepairExecutionGate>,
+    id: u64,
     registered: bool,
 }
 
-impl ManualWaiter {
-    fn register(gate: Arc<RepairExecutionGate>) -> Self {
-        gate.lock_state().manual_waiters += 1;
+impl RepairExecutionWaiterRegistration {
+    fn register(gate: Arc<RepairExecutionGate>, priority: RepairExecutionPriority) -> Self {
+        let id = {
+            let mut state = gate.lock_state();
+            let id = state.next_waiter_id;
+            state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
+            state.waiters.push_back(RepairExecutionWaiter {
+                id,
+                priority,
+                enqueued_at: Instant::now(),
+            });
+            id
+        };
         Self {
             gate,
+            id,
             registered: true,
         }
     }
 
     fn unregister_locked(&mut self, state: &mut RepairExecutionGateState) {
         if self.registered {
-            state.manual_waiters = state.manual_waiters.saturating_sub(1);
+            state.waiters.retain(|waiter| waiter.id != self.id);
             self.registered = false;
         }
     }
 }
 
-impl Drop for ManualWaiter {
+impl Drop for RepairExecutionWaiterRegistration {
     fn drop(&mut self) {
         if !self.registered {
             return;
         }
         {
             let mut state = self.gate.lock_state();
-            state.manual_waiters = state.manual_waiters.saturating_sub(1);
-            self.registered = false;
+            state.waiters.retain(|waiter| waiter.id != self.id);
         }
+        self.registered = false;
         self.gate.changed.notify_waiters();
     }
 }
@@ -197,6 +278,64 @@ mod tests {
             .expect("automatic waiter should no longer be priority-blocked")
             .expect("automatic task should not panic");
         drop(permit);
+    }
+
+    #[tokio::test]
+    async fn queue_snapshot_counts_waiters_by_priority() {
+        let gate = Arc::new(RepairExecutionGate::default());
+        let active = gate.acquire(RepairExecutionPriority::Manual).await;
+        let manual = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.acquire(RepairExecutionPriority::Manual).await }
+        });
+        let automatic = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.acquire(RepairExecutionPriority::Automatic).await }
+        });
+        tokio::task::yield_now().await;
+
+        let snapshot = gate.queue_snapshot();
+        assert_eq!(snapshot.manual, 1);
+        assert_eq!(snapshot.automatic, 1);
+
+        manual.abort();
+        automatic.abort();
+        drop(active);
+    }
+
+    #[tokio::test]
+    async fn aged_automatic_waiter_runs_before_newer_manual_work() {
+        let gate = Arc::new(RepairExecutionGate::with_automatic_priority_aging(
+            Duration::ZERO,
+        ));
+        let active = gate.acquire(RepairExecutionPriority::Manual).await;
+        let order = Arc::new(AtomicUsize::new(0));
+        let automatic = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            let order = Arc::clone(&order);
+            async move {
+                let permit = gate.acquire(RepairExecutionPriority::Automatic).await;
+                let position = order.fetch_add(1, Ordering::SeqCst);
+                drop(permit);
+                position
+            }
+        });
+        tokio::task::yield_now().await;
+        let manual = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            let order = Arc::clone(&order);
+            async move {
+                let permit = gate.acquire(RepairExecutionPriority::Manual).await;
+                let position = order.fetch_add(1, Ordering::SeqCst);
+                drop(permit);
+                position
+            }
+        });
+        tokio::task::yield_now().await;
+
+        drop(active);
+        assert_eq!(automatic.await.expect("automatic task should finish"), 0);
+        assert_eq!(manual.await.expect("manual task should finish"), 1);
     }
 
     #[tokio::test]

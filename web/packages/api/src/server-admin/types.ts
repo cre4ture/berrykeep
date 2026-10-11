@@ -385,6 +385,8 @@ export type RepairHistoryResponse = {
 export type RepairActivityStatusResponse = {
   state: RepairActivityState;
   startup_status: StartupRepairStatus;
+  queued_manual_repairs: number;
+  queued_automatic_repairs: number;
   active_runs: RepairActiveRun[];
   latest_run?: RepairRunRecord | null;
 };
