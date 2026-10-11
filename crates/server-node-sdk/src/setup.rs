@@ -1189,6 +1189,17 @@ async fn import_node_enrollment_package(
         }
     };
 
+    let admin_password_hash = match hash_admin_password_async(&request.admin_password).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
     let mut managed = state.runtime.managed_state.lock().await;
     let metadata_backend = match resolve_setup_metadata_backend(request.metadata_backend, &managed)
     {
@@ -1262,17 +1273,6 @@ async fn import_node_enrollment_package(
         )
             .into_response();
     }
-
-    let admin_password_hash = match hash_admin_password_async(&request.admin_password).await {
-        Ok(hash) => hash,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response();
-        }
-    };
 
     managed.state = SetupLifecycleState::Online;
     managed.updated_at_unix = unix_ts();
