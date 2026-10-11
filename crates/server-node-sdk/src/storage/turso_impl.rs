@@ -1160,6 +1160,7 @@ impl MetadataStore for TursoMetadataStore {
                 run.progress.message = Some("Interrupted after server restart.".to_string());
                 interrupted.push((run_id, serde_json::to_vec_pretty(&run)?));
             }
+            drop(rows);
             for (run_id, payload) in &interrupted {
                 self.connection
                     .execute(
@@ -1555,6 +1556,7 @@ impl MetadataStore for TursoMetadataStore {
                 deleted_at_unix: row_opt_u64(&row, 7, "s3_buckets.deleted_at_unix")?,
             });
         }
+        drop(bucket_rows);
 
         let mut access_key_rows = self
             .connection

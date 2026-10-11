@@ -381,6 +381,7 @@ impl TursoMetadataStore {
                     },
                 ));
             }
+            drop(rows);
             for (key, entry) in entries {
                 upsert_gallery_object(connection, &key, &entry).await?;
             }
@@ -1138,6 +1139,7 @@ async fn refresh_gallery_objects_for_content_fingerprint(
     while let Some(row) = rows.next().await? {
         manifests.push(row_string(&row, 0, "manifest_summaries.manifest_hash")?);
     }
+    drop(rows);
     for manifest_hash in manifests {
         refresh_gallery_objects_for_manifest(connection, &manifest_hash).await?;
     }
@@ -1411,6 +1413,7 @@ async fn query_gallery_index(
         video_count: count(5, "gallery summary video")?,
         geotagged_count: count(6, "gallery summary geotagged")?,
     };
+    drop(summary_rows);
     let sort_direction = match query.captured_sort {
         GalleryIndexCapturedSort::Asc => "ASC",
         GalleryIndexCapturedSort::Desc => "DESC",
@@ -2115,6 +2118,7 @@ async fn query_gallery_delta(
         None => None,
     }
     .unwrap_or(current_revision.saturating_add(1));
+    drop(oldest_rows);
     if since_revision.saturating_add(1) < oldest_revision {
         return Ok(Err(GalleryDeltaCursorError::Expired {
             history_id: current_history_id,
@@ -2155,6 +2159,7 @@ async fn query_gallery_delta(
             row_string(&row, 6, "gallery_changes.previous_labels_json")?,
         ));
     }
+    drop(rows);
     let has_more = raw_changes.len() > limit;
     raw_changes.truncate(limit);
     let next_revision = raw_changes
