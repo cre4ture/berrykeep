@@ -281,6 +281,14 @@ pub(crate) struct ReplicationRepairQuery {
     pub(crate) scope: Option<ReplicationRepairScope>,
 }
 
+fn repair_request_unavailable(error: &'static str) -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": error })),
+    )
+        .into_response()
+}
+
 async fn execute_replication_repair_with_trigger(
     State(state): State<ServerState>,
     Query(query): Query<ReplicationRepairQuery>,
@@ -293,36 +301,40 @@ async fn execute_replication_repair_with_trigger(
     } else {
         query.scope.unwrap_or_default()
     };
-    let request_admission = {
-        let Ok(admission) =
-            Arc::clone(&state.maintenance.http_repair_request_admission).try_acquire_owned()
-        else {
-            match trigger {
-                RepairRunTrigger::ManualRequest => {
-                    warn!(
-                        ?scope,
-                        "rejecting duplicate manual repair while another request is admitted"
-                    );
-                }
-                RepairRunTrigger::PeerClusterRequest => {
-                    warn!("rejecting duplicate peer repair while another request is admitted");
-                }
-                _ => unreachable!("HTTP repair requests use manual or peer triggers"),
-            }
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        admission
-    };
-    match trigger {
-        RepairRunTrigger::ManualRequest => {}
+    let request_admission = match trigger {
+        RepairRunTrigger::ManualRequest => {
+            let Ok(admission) =
+                Arc::clone(&state.maintenance.manual_repair_request_admission).try_acquire_owned()
+            else {
+                warn!(
+                    ?scope,
+                    "rejecting duplicate manual repair while another request is admitted"
+                );
+                return repair_request_unavailable(
+                    "another manual replication repair request is already admitted",
+                );
+            };
+            admission
+        }
         RepairRunTrigger::PeerClusterRequest => {
+            let Ok(admission) =
+                Arc::clone(&state.maintenance.peer_repair_request_admission).try_acquire_owned()
+            else {
+                warn!("rejecting duplicate peer repair while another request is admitted");
+                return repair_request_unavailable(
+                    "another peer replication repair request is already admitted",
+                );
+            };
             if state.maintenance.repair_execution_gate.is_occupied() {
                 warn!("rejecting peer local repair because the node-local executor is busy");
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                return repair_request_unavailable(
+                    "the node-local replication repair executor is busy",
+                );
             }
+            admission
         }
         _ => unreachable!("HTTP repair requests use manual or peer triggers"),
-    }
+    };
     if trigger == RepairRunTrigger::PeerClusterRequest && scope == ReplicationRepairScope::Local {
         // A peer-local request still needs a current view, but remote
         // synchronization must finish before it attempts to occupy the local
@@ -338,8 +350,22 @@ async fn execute_replication_repair_with_trigger(
                         warn!(
                             "rejecting peer local repair because the node-local executor is busy"
                         );
-                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        return repair_request_unavailable(
+                            "the node-local replication repair executor is busy",
+                        );
                     };
+                    if state
+                        .maintenance
+                        .manual_repair_request_admission
+                        .available_permits()
+                        == 0
+                    {
+                        drop(permit);
+                        warn!("rejecting peer local repair because a manual request is admitted");
+                        return repair_request_unavailable(
+                            "a manual replication repair request is already admitted",
+                        );
+                    }
                     tokio::spawn(async move {
                         let _admission = request_admission;
                         execute_tracked_local_replication_repair_with_permit(
@@ -1717,6 +1743,15 @@ pub(crate) async fn execute_replication_repair_plan(
     }
 }
 
+fn fair_peer_request_deadline(
+    phase_deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+    peers_left: usize,
+) -> tokio::time::Instant {
+    let peers_left = u32::try_from(peers_left).unwrap_or(u32::MAX).max(1);
+    now + phase_deadline.saturating_duration_since(now) / peers_left
+}
+
 #[allow(dead_code)]
 pub(crate) async fn execute_cluster_replication_repair_inner(
     state: &ServerState,
@@ -1831,7 +1866,11 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
     let peer_phase_timeout_secs = peer_repair_request_timeout_secs(state);
     let peer_phase_deadline =
         tokio::time::Instant::now() + Duration::from_secs(peer_phase_timeout_secs);
-    for peer in peers {
+    let peer_count = peers.len();
+    for (peer_index, peer) in peers.into_iter().enumerate() {
+        let peers_left = peer_count.saturating_sub(peer_index);
+        let now = tokio::time::Instant::now();
+        let peer_deadline = fair_peer_request_deadline(peer_phase_deadline, now, peers_left);
         let path =
             build_replication_repair_path(batch_size_override, ReplicationRepairScope::Local);
         info!(
@@ -1855,7 +1894,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
             })),
         );
         let peer_result = tokio::time::timeout_at(
-            peer_phase_deadline,
+            peer_deadline,
             execute_peer_request(
                 state,
                 &peer,
@@ -1867,7 +1906,9 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         )
         .await
         .map_err(|_| {
-            anyhow!("cluster peer repair phase timed out after {peer_phase_timeout_secs} seconds")
+            anyhow!(
+                "peer repair request exhausted its fair share of the {peer_phase_timeout_secs}-second cluster peer phase"
+            )
         })
         .and_then(|result| result);
         match peer_result {
@@ -2794,6 +2835,27 @@ mod tests {
             unresolved: false,
             timed_out: false,
         }
+    }
+
+    #[test]
+    fn peer_phase_budget_is_shared_across_every_remaining_peer() {
+        let phase_started = tokio::time::Instant::now();
+        let phase_deadline = phase_started + Duration::from_secs(1_830);
+
+        let first_deadline = fair_peer_request_deadline(phase_deadline, phase_started, 3);
+        assert_eq!(
+            first_deadline.duration_since(phase_started),
+            Duration::from_secs(610)
+        );
+
+        let second_started = phase_started + Duration::from_secs(300);
+        let second_deadline = fair_peer_request_deadline(phase_deadline, second_started, 2);
+        assert_eq!(
+            second_deadline.duration_since(second_started),
+            Duration::from_secs(765),
+            "an early peer completion should redistribute its unused share"
+        );
+        assert!(second_deadline < phase_deadline);
     }
 
     #[test]

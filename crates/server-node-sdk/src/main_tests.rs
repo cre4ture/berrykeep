@@ -20553,7 +20553,8 @@ async fn build_test_state(
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
             repair_execution_gate: Arc::new(super::RepairExecutionGate::default()),
-            http_repair_request_admission: Arc::new(super::Semaphore::new(1)),
+            manual_repair_request_admission: Arc::new(super::Semaphore::new(1)),
+            peer_repair_request_admission: Arc::new(super::Semaphore::new(1)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
             content_repair_claims: Arc::new(crate::ContentRepairClaims::default()),
             content_repair_notify: Arc::new(tokio::sync::Notify::new()),
@@ -22990,7 +22991,7 @@ async fn peer_repair_requests_share_http_admission() {
     tokio::time::timeout(Duration::from_secs(2), async {
         while state
             .maintenance
-            .http_repair_request_admission
+            .peer_repair_request_admission
             .available_permits()
             != 0
         {
@@ -23016,6 +23017,16 @@ async fn peer_repair_requests_share_http_admission() {
     .expect("duplicate peer repair should be shed before availability synchronization")
     .expect("peer repair route should respond");
     assert_eq!(duplicate.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let duplicate_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("duplicate peer response body should be readable"),
+    )
+    .expect("duplicate peer response should be JSON");
+    assert_eq!(
+        duplicate_body["error"],
+        "another peer replication repair request is already admitted"
+    );
 
     drop(refresh_guard);
     let first_response = tokio::time::timeout(Duration::from_secs(5), first)
@@ -23023,6 +23034,99 @@ async fn peer_repair_requests_share_http_admission() {
         .expect("admitted peer repair should finish after availability sync resumes")
         .expect("peer repair handler task should not panic");
     assert_eq!(first_response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn admitted_manual_repair_takes_priority_over_peer_synchronization() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+    let peer = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::build_internal_peer_api()
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/cluster/replication/repair?scope=local")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("peer repair route should respond")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer request should enter availability synchronization");
+
+    let manual = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+            super::replication::execute_replication_repair_public(
+                State(state),
+                headers,
+                axum::extract::Query(super::replication::ReplicationRepairQuery {
+                    batch_size: None,
+                    scope: Some(super::replication::ReplicationRepairScope::Local),
+                }),
+            )
+            .await
+            .into_response()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .manual_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual request should be admitted independently of the peer request");
+
+    drop(refresh_guard);
+    let peer_response = tokio::time::timeout(Duration::from_secs(5), peer)
+        .await
+        .expect("peer repair should yield to the admitted manual request")
+        .expect("peer repair handler task should not panic");
+    assert_eq!(peer_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let peer_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(peer_response.into_body(), usize::MAX)
+            .await
+            .expect("peer response body should be readable"),
+    )
+    .expect("peer response should be JSON");
+    assert_eq!(
+        peer_body["error"],
+        "a manual replication repair request is already admitted"
+    );
+    let manual_response = tokio::time::timeout(Duration::from_secs(5), manual)
+        .await
+        .expect("manual repair should finish after the peer yields")
+        .expect("manual repair handler task should not panic");
+    assert_eq!(manual_response.status(), StatusCode::OK);
 
     cleanup_test_state(&state).await;
 }
@@ -23155,6 +23259,16 @@ async fn manual_cluster_repair_admits_only_one_waiting_request() {
     .await
     .into_response();
     assert_eq!(duplicate.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let duplicate_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("duplicate manual response body should be readable"),
+    )
+    .expect("duplicate manual response should be JSON");
+    assert_eq!(
+        duplicate_body["error"],
+        "another manual replication repair request is already admitted"
+    );
 
     drop(active);
     let first_response = tokio::time::timeout(Duration::from_secs(5), first)
@@ -23196,7 +23310,7 @@ async fn manual_availability_sync_does_not_hold_repair_executor() {
     tokio::time::timeout(Duration::from_secs(2), async {
         while state
             .maintenance
-            .http_repair_request_admission
+            .manual_repair_request_admission
             .available_permits()
             != 0
         {
