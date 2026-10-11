@@ -150,6 +150,15 @@ impl TursoMetadataStore {
         Ok(store)
     }
 
+    fn open_scan_connection(&self, operation: &str) -> Result<turso::Connection> {
+        self.database.connect().with_context(|| {
+            format!(
+                "failed to open Turso read connection for {operation} from {}",
+                self.metadata_path.display()
+            )
+        })
+    }
+
     async fn discard_invalid_content_repair_tasks(
         &self,
         invalid_tasks: Vec<(String, Option<Vec<u8>>)>,
@@ -297,9 +306,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_current_state(&self) -> Result<CurrentState> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("current state")?;
+        let mut rows = connection
             .query(
                 "SELECT key, manifest_hash, object_id
                  FROM current_objects",
@@ -493,9 +501,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_current_object_keys(&self) -> Result<Vec<String>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("current object keys")?;
+        let mut rows = connection
             .query("SELECT key FROM current_objects", ())
             .await?;
         let mut keys = Vec::new();
@@ -534,9 +541,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("content repair tasks")?;
+        let mut rows = connection
             .query(
                 "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks
                  ORDER BY manifest_hash",
@@ -562,7 +568,6 @@ impl MetadataStore for TursoMetadataStore {
             }
         }
         drop(rows);
-        drop(_connection_guard);
         self.discard_invalid_content_repair_tasks(invalid_tasks)
             .await?;
         Ok(tasks)
@@ -2407,9 +2412,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("version indexes")?;
+        let mut rows = connection
             .query(
                 "SELECT object_id, index_json
                  FROM version_indexes
@@ -2671,9 +2675,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("version index object IDs")?;
+        let mut rows = connection
             .query(
                 "SELECT object_id FROM version_indexes ORDER BY object_id",
                 (),
@@ -3162,12 +3165,7 @@ impl MetadataStore for TursoMetadataStore {
     ) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
         // This report scans every metadata table. Keep it off the latency-sensitive primary
         // connection, just as the SQLite backend opens a dedicated analysis connection.
-        let connection = self.database.connect().with_context(|| {
-            format!(
-                "failed to open logical distribution Turso connection for {}",
-                self.metadata_path.display()
-            )
-        })?;
+        let connection = self.open_scan_connection("logical distribution")?;
         let specs = metadata_db_logical_table_specs();
         let mut tables = Vec::with_capacity(specs.len());
         for (index, spec) in specs.iter().enumerate() {
@@ -3298,9 +3296,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_media_cache_fingerprints(&self) -> Result<Vec<String>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("media cache fingerprints")?;
+        let mut rows = connection
             .query(
                 "SELECT content_fingerprint
                  FROM media_cache
@@ -4197,21 +4194,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logical_distribution_uses_a_dedicated_read_connection() {
-        let metadata_db_path = turso_test_db_path("turso-logical-distribution-read-connection");
+    async fn unbounded_reads_use_dedicated_connections() {
+        let metadata_db_path = turso_test_db_path("turso-unbounded-read-connections");
         let store = TursoMetadataStore::open(&metadata_db_path)
             .await
             .expect("turso metadata store should open");
         let primary_connection_guard = store.connection_lock.lock().await;
 
-        let tables = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            store.load_metadata_db_logical_breakdown(None),
-        )
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let current_state = store.load_current_state().await?;
+            assert!(current_state.objects.is_empty());
+            assert!(current_state.object_ids.is_empty());
+            assert!(store.list_current_object_keys().await?.is_empty());
+            assert!(store.load_content_repair_tasks().await?.is_empty());
+            assert!(store.load_all_version_indexes().await?.is_empty());
+            assert!(store.list_version_index_object_ids().await?.is_empty());
+            assert!(store.list_media_cache_fingerprints().await?.is_empty());
+            assert!(
+                !store
+                    .load_metadata_db_logical_breakdown(None)
+                    .await?
+                    .is_empty()
+            );
+            Ok::<(), anyhow::Error>(())
+        })
         .await
-        .expect("logical distribution must not wait for the primary connection")
-        .expect("logical distribution should load");
-        assert!(!tables.is_empty());
+        .expect("unbounded reads must not wait for the primary connection")
+        .expect("unbounded reads should complete");
 
         drop(primary_connection_guard);
         drop(store);
