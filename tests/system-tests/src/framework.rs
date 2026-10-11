@@ -290,11 +290,6 @@ pub fn mtls_client_for_node_id(node_id: &str) -> Result<reqwest::Client> {
 pub fn insecure_https_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
-        // Zero-touch tests replace the setup listener with the runtime listener on the same
-        // origin. A pooled setup connection can therefore fail a later mutating request with an
-        // unexpected TLS EOF. Opening a connection per request preserves at-most-once request
-        // semantics without retrying operations whose response may have been lost.
-        .pool_max_idle_per_host(0)
         .build()
         .context("failed building insecure https client")
 }
