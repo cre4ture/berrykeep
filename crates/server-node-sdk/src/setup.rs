@@ -228,6 +228,9 @@ impl ManagedSetupPaths {
 #[derive(Clone)]
 struct SetupRuntimeState {
     managed_state: Arc<Mutex<ManagedSetupState>>,
+    // Keep state-changing setup requests exclusive without blocking health and status reads while
+    // a transition performs file I/O or password hashing.
+    lifecycle_transition_lock: Arc<Mutex<()>>,
     completion_tx: mpsc::Sender<SetupCompletion>,
 }
 
@@ -242,6 +245,7 @@ impl SetupServerState {
             bind_addr: config.bind_addr,
             runtime: SetupRuntimeState {
                 managed_state: Arc::new(Mutex::new(ManagedSetupState::default())),
+                lifecycle_transition_lock: Arc::new(Mutex::new(())),
                 completion_tx,
             },
         }
@@ -723,6 +727,7 @@ pub(crate) async fn run_setup_mode(
         bind_addr: config.bind_addr,
         runtime: SetupRuntimeState {
             managed_state: Arc::new(Mutex::new(initial_state)),
+            lifecycle_transition_lock: Arc::new(Mutex::new(())),
             completion_tx,
         },
     };
@@ -848,6 +853,8 @@ async fn start_new_cluster(
                 .into_response();
         }
     };
+
+    let _transition_guard = state.runtime.lifecycle_transition_lock.lock().await;
 
     {
         let managed = state.runtime.managed_state.lock().await;
@@ -1108,6 +1115,7 @@ async fn generate_join_request(
         }
     };
 
+    let _transition_guard = state.runtime.lifecycle_transition_lock.lock().await;
     let mut managed = state.runtime.managed_state.lock().await;
     if managed.state == SetupLifecycleState::Online {
         return (
@@ -1192,18 +1200,15 @@ async fn import_node_enrollment_package(
         }
     };
 
-    let admin_password_hash = match hash_admin_password_async(&request.admin_password).await {
-        Ok(hash) => hash,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response();
-        }
-    };
-
-    let mut managed = state.runtime.managed_state.lock().await;
+    let _transition_guard = state.runtime.lifecycle_transition_lock.lock().await;
+    let managed = state.runtime.managed_state.lock().await;
+    if managed.state == SetupLifecycleState::Online {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "node is already initialized" })),
+        )
+            .into_response();
+    }
     let metadata_backend = match resolve_setup_metadata_backend(request.metadata_backend, &managed)
     {
         Ok(backend) => backend,
@@ -1258,6 +1263,18 @@ async fn import_node_enrollment_package(
         )
             .into_response();
     }
+    drop(managed);
+
+    let admin_password_hash = match hash_admin_password_async(&request.admin_password).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
 
     let runtime_enrollment_path = runtime_node_enrollment_path(state.paths.data_dir());
     if let Err(err) = package.write_to_path(&runtime_enrollment_path) {
@@ -1277,6 +1294,7 @@ async fn import_node_enrollment_package(
             .into_response();
     }
 
+    let mut managed = state.runtime.managed_state.lock().await;
     managed.state = SetupLifecycleState::Online;
     managed.updated_at_unix = unix_ts();
     managed.cluster_id = Some(package.bootstrap.cluster_id);
