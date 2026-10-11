@@ -137,17 +137,18 @@ impl RepairExecutionGate {
 
 impl RepairExecutionGateState {
     fn selected_waiter_id(&self, automatic_priority_aging: Duration, now: Instant) -> Option<u64> {
+        let oldest_manual = self
+            .waiters
+            .iter()
+            .find(|waiter| waiter.priority == RepairExecutionPriority::Manual);
         self.waiters
             .iter()
             .find(|waiter| {
                 waiter.priority == RepairExecutionPriority::Automatic
                     && now.saturating_duration_since(waiter.enqueued_at) >= automatic_priority_aging
+                    && oldest_manual.is_none_or(|manual| waiter.enqueued_at <= manual.enqueued_at)
             })
-            .or_else(|| {
-                self.waiters
-                    .iter()
-                    .find(|waiter| waiter.priority == RepairExecutionPriority::Manual)
-            })
+            .or(oldest_manual)
             .or_else(|| self.waiters.front())
             .map(|waiter| waiter.id)
     }
@@ -318,6 +319,35 @@ mod tests {
         assert_eq!(
             state.next_automatic_aging_deadline(aging, enqueued_at + aging),
             None
+        );
+    }
+
+    #[test]
+    fn aged_automatic_work_does_not_overtake_an_older_manual_waiter() {
+        let enqueued_at = Instant::now();
+        let state = RepairExecutionGateState {
+            waiters: [
+                RepairExecutionWaiter {
+                    id: 1,
+                    priority: RepairExecutionPriority::Manual,
+                    enqueued_at,
+                },
+                RepairExecutionWaiter {
+                    id: 2,
+                    priority: RepairExecutionPriority::Automatic,
+                    enqueued_at: enqueued_at + Duration::from_secs(5),
+                },
+            ]
+            .into(),
+            ..RepairExecutionGateState::default()
+        };
+
+        assert_eq!(
+            state.selected_waiter_id(
+                Duration::from_secs(30),
+                enqueued_at + Duration::from_secs(60),
+            ),
+            Some(1)
         );
     }
 

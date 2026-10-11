@@ -13725,14 +13725,35 @@ async fn execute_tracked_local_replication_repair(
     trigger: RepairRunTrigger,
     plan_summary_override: Option<RepairPlanSummary>,
 ) -> replication::ReplicationRepairReport {
-    sync_availability_views_once(state).await;
-    let permit = acquire_repair_execution(state, trigger).await;
+    let execution_deadline = repair_execution_deadline(state);
+    let preparation = run_with_repair_execution_deadline(state, execution_deadline, async {
+        sync_availability_views_once(state).await;
+        acquire_repair_execution(state, trigger).await
+    })
+    .await;
+    let Some(permit) = preparation else {
+        let tracker =
+            begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger)
+                .await;
+        let report = timed_out_repair_report(state, &tracker);
+        finish_repair_run_tracking(
+            state,
+            tracker,
+            plan_summary_override.unwrap_or_else(empty_repair_plan_summary),
+            RepairRunStatus::TimedOut,
+            Some(RepairRunSummary::from_local_report(&report)),
+            serialize_repair_run_report(&report),
+        )
+        .await;
+        return report;
+    };
     execute_tracked_local_replication_repair_with_permit(
         state,
         batch_size_override,
         trigger,
         plan_summary_override,
         permit,
+        execution_deadline,
     )
     .await
 }
@@ -13743,13 +13764,14 @@ async fn execute_tracked_local_replication_repair_with_permit(
     trigger: RepairRunTrigger,
     plan_summary_override: Option<RepairPlanSummary>,
     permit: RepairExecutionPermit,
+    execution_deadline: tokio::time::Instant,
 ) -> replication::ReplicationRepairReport {
     let timeout_plan_summary = plan_summary_override
         .clone()
         .unwrap_or_else(empty_repair_plan_summary);
     let tracker =
         begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
-    let execution = run_with_repair_execution_timeout(state, async {
+    let execution = run_with_repair_execution_deadline(state, execution_deadline, async {
         let plan_summary = match plan_summary_override {
             Some(plan_summary) => plan_summary,
             None => RepairPlanSummary::from_plan(&current_replication_plan(state).await),

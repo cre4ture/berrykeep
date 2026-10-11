@@ -333,6 +333,7 @@ async fn execute_replication_repair_with_trigger(
                             trigger,
                             None,
                             permit,
+                            repair_execution_deadline(&state),
                         )
                         .await
                     })

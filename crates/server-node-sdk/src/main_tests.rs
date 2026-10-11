@@ -22991,6 +22991,43 @@ async fn cluster_repair_gate_wait_uses_local_execution_deadline() {
 }
 
 #[tokio::test]
+async fn manual_local_repair_gate_wait_uses_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("manual local repair should not wait indefinitely for the executor");
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.timed_out);
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "timed-out local repair must leave no queued waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn manual_cluster_repair_admits_only_one_waiting_request() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
