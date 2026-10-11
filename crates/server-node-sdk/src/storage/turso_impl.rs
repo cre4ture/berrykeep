@@ -85,23 +85,29 @@ pub(super) struct GalleryReadConnectionFactory {
 
 impl GalleryReadConnectionFactory {
     pub(super) async fn open(&self) -> Result<TursoReadConnection> {
-        open_gallery_read_connection(&self.database, &self.metadata_path, self.permits.clone())
-            .await
+        open_bounded_read_connection(
+            &self.database,
+            &self.metadata_path,
+            self.permits.clone(),
+            "gallery",
+        )
+        .await
     }
 }
 
-async fn open_gallery_read_connection(
+async fn open_bounded_read_connection(
     database: &turso::Database,
     metadata_path: &Path,
     permits: Arc<tokio::sync::Semaphore>,
+    operation: &str,
 ) -> Result<TursoReadConnection> {
     let permit = permits
         .acquire_owned()
         .await
-        .context("gallery read semaphore should not be closed")?;
+        .with_context(|| format!("{operation} read semaphore should not be closed"))?;
     let connection = database.connect().with_context(|| {
         format!(
-            "failed to open a Turso gallery read connection to {}",
+            "failed to open a Turso read connection for {operation} from {}",
             metadata_path.display()
         )
     })?;
@@ -158,22 +164,13 @@ impl TursoMetadataStore {
     /// Keep unbounded reads off the primary connection so decoding a large result set cannot
     /// block unrelated metadata traffic behind `connection_lock`.
     async fn open_scan_connection(&self, operation: &str) -> Result<TursoReadConnection> {
-        let permit = self
-            .scan_read_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .context("Turso scan read semaphore should not be closed")?;
-        let connection = self.database.connect().with_context(|| {
-            format!(
-                "failed to open Turso read connection for {operation} from {}",
-                self.metadata_path.display()
-            )
-        })?;
-        Ok(TursoReadConnection {
-            connection,
-            _permit: permit,
-        })
+        open_bounded_read_connection(
+            &self.database,
+            &self.metadata_path,
+            self.scan_read_permits.clone(),
+            operation,
+        )
+        .await
     }
 
     async fn discard_invalid_content_repair_tasks(
@@ -215,10 +212,11 @@ impl TursoMetadataStore {
     }
 
     async fn gallery_read_connection(&self) -> Result<TursoReadConnection> {
-        open_gallery_read_connection(
+        open_bounded_read_connection(
             &self.database,
             &self.metadata_path,
             self.gallery_read_permits.clone(),
+            "gallery",
         )
         .await
     }
@@ -527,9 +525,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>> {
-        let _connection_guard = self.connection_lock.lock().await;
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("object keys by ID").await?;
+        let mut rows = connection
             .query(
                 "SELECT key FROM current_objects WHERE object_id = ?1",
                 (object_id,),
@@ -1847,8 +1844,13 @@ impl MetadataStore for TursoMetadataStore {
     ) -> Result<HashMap<String, CachedMediaMetadata>> {
         const TURSO_MEDIA_CACHE_QUERY_BATCH_SIZE: usize = 500;
 
+        if content_fingerprints.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut metadata_by_content_fingerprint =
             HashMap::with_capacity(content_fingerprints.len());
+        let connection = self.open_scan_connection("cached media metadata").await?;
+        let mut invalid_rows = Vec::new();
 
         for chunk in content_fingerprints.chunks(TURSO_MEDIA_CACHE_QUERY_BATCH_SIZE) {
             if chunk.is_empty() {
@@ -1858,9 +1860,7 @@ impl MetadataStore for TursoMetadataStore {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _connection_guard = self.connection_lock.lock().await;
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT content_fingerprint, metadata_json
@@ -1871,7 +1871,6 @@ impl MetadataStore for TursoMetadataStore {
                 )
                 .await?;
 
-            let mut invalid_rows = Vec::new();
             while let Some(row) = rows.next().await? {
                 let content_fingerprint = row_string(&row, 0, "media_cache.content_fingerprint")?;
                 let payload = row_blob(&row, 1, "media_cache.metadata_json")?;
@@ -1883,27 +1882,25 @@ impl MetadataStore for TursoMetadataStore {
                 }
             }
             drop(rows);
-            drop(_connection_guard);
+        }
+        drop(connection);
 
-            for (content_fingerprint, payload, error) in invalid_rows {
-                let deleted = self
-                    .delete_invalid_media_cache_record_if_payload_matches(
-                        &content_fingerprint,
-                        &payload,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to delete invalid media metadata row for {content_fingerprint}"
-                        )
-                    })?;
-                if deleted {
-                    warn!(
-                        content_fingerprint = %content_fingerprint,
-                        error,
-                        "deleted invalid cached media metadata row from Turso"
-                    );
-                }
+        for (content_fingerprint, payload, error) in invalid_rows {
+            let deleted = self
+                .delete_invalid_media_cache_record_if_payload_matches(
+                    &content_fingerprint,
+                    &payload,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to delete invalid media metadata row for {content_fingerprint}")
+                })?;
+            if deleted {
+                warn!(
+                    content_fingerprint = %content_fingerprint,
+                    error,
+                    "deleted invalid cached media metadata row from Turso"
+                );
             }
         }
 
@@ -4238,6 +4235,7 @@ mod tests {
             assert!(current_state.object_ids.is_empty());
             assert_eq!(store.count_current_objects().await?, 0);
             assert!(store.list_current_object_keys().await?.is_empty());
+            assert!(store.list_keys_for_object_id("missing").await?.is_empty());
             assert!(
                 store
                     .gallery_object_labels_by_key(&missing_keys)
@@ -4307,6 +4305,12 @@ mod tests {
             assert!(
                 store
                     .load_manifest_summaries(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .load_cached_media_metadata_many(&missing_keys)
                     .await?
                     .is_empty()
             );
