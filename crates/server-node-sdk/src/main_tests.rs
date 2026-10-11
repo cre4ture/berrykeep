@@ -22754,10 +22754,14 @@ async fn timed_out_report_retains_partial_transfer_counters() {
     })
     .await;
 
-    let report = super::timed_out_repair_report(&state, &tracker);
+    let report = super::timed_out_repair_report(&state, &tracker, 17);
     assert_eq!(report.attempted_transfers, 2);
     assert_eq!(report.successful_transfers, 1);
     assert_eq!(report.failed_transfers, 0);
+    assert_eq!(
+        report.last_error.as_deref(),
+        Some("repair execution timed out after 17 seconds")
+    );
     assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
 
     drop(tracker);
@@ -22814,7 +22818,7 @@ async fn timed_out_report_uses_monotonic_cursor_after_live_log_truncation() {
     })
     .await;
 
-    let report = super::timed_out_repair_report_since(&state, &tracker, cursor, &baseline);
+    let report = super::timed_out_repair_report_since(&state, &tracker, cursor, &baseline, 17);
     assert_eq!(
         report
             .detailed_log
@@ -23087,6 +23091,19 @@ async fn peer_availability_sync_uses_coordinator_execution_budget() {
 
     drop(refresh_guard);
     cleanup_test_state(&state).await;
+}
+
+#[test]
+fn repair_timeout_diagnostics_round_the_assigned_budget_up() {
+    assert_eq!(
+        super::repair_duration_budget_secs(Duration::from_millis(1_001)),
+        2
+    );
+    assert_eq!(
+        super::repair_duration_budget_secs(Duration::from_millis(1_000)),
+        1
+    );
+    assert_eq!(super::repair_duration_budget_secs(Duration::ZERO), 1);
 }
 
 #[tokio::test]

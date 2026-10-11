@@ -178,7 +178,7 @@ impl ReplicationRepairReport {
             &mut report.detailed_log,
             report_node_id,
             "repair_run_timed_out",
-            "repair execution exceeded its configured deadline",
+            "repair execution exceeded its assigned deadline",
             None,
             None,
             None,
