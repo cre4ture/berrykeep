@@ -89,18 +89,20 @@ jobs:
         run: |
           coverage_ignore_regex='crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)'
 
+          # The system tests launch Cargo artifact dependencies as child
+          # processes. Keep one coverage environment active while both the
+          # workspace tests and those external binaries run so their profiles
+          # and coverage objects are merged into the same report.
+          eval "$(cargo +nightly-2026-02-17 llvm-cov show-env --sh)"
           cargo +nightly-2026-02-17 llvm-cov clean --workspace
-          cargo +nightly-2026-02-17 llvm-cov --locked \
+          cargo +nightly-2026-02-17 test --locked \
             --workspace \
-            --all-features \
-            --no-report
+            --all-features
 
-          cargo +nightly-2026-02-17 llvm-cov --locked \
+          cargo +nightly-2026-02-17 test --locked \
             -Z bindeps \
             --manifest-path tests/system-tests/Cargo.toml \
-            --lib \
-            --dep-coverage client-sdk,sync-core,transport-sdk,rendezvous-server,server-node-sdk \
-            --no-report
+            --lib
 
           mkdir -p target/coverage
           cargo +nightly-2026-02-17 llvm-cov report \
@@ -112,6 +114,24 @@ jobs:
             --lcov \
             --output-path target/coverage/lcov.info \
             --ignore-filename-regex "${coverage_ignore_regex}"
+
+          reconcile_line="$(grep -n '^async fn reconcile_from_node(' crates/server-node-sdk/src/lib.rs | cut -d: -f1)"
+          awk -v expected_line="${reconcile_line}" '
+            /^SF:/ {
+              selected = ($0 ~ /\/crates\/server-node-sdk\/src\/lib\.rs$/)
+              next
+            }
+            selected && /^DA:/ {
+              split(substr($0, 4), values, ",")
+              if (values[1] == expected_line && values[2] + 0 > 0) {
+                covered = 1
+              }
+            }
+            END { exit covered ? 0 : 1 }
+          ' target/coverage/lcov.info || {
+            echo "::error::system-test coverage is missing for reconcile_from_node"
+            exit 1
+          }
 
           cargo +nightly-2026-02-17 llvm-cov report \
             -p client-sdk \
