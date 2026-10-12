@@ -677,7 +677,10 @@ async fn main() -> Result<()> {
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
+            tokio::select! {
+                _ = shutdown_rx => {}
+                _ = common::shutdown::wait_for_shutdown_signal() => {}
+            }
         })
         .await
         .context("config UI server exited with error")?;

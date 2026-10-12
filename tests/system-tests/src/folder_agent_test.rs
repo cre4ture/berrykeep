@@ -144,7 +144,7 @@ async fn start_folder_agent(
         bail!("berrykeep-folder-agent exited early with status {status}");
     }
 
-    Ok(ChildGuard::with_resources(child, resource_guards))
+    Ok(ChildGuard::with_resources(child, resource_guards).require_graceful_shutdown())
 }
 
 async fn spawn_folder_agent_no_wait(

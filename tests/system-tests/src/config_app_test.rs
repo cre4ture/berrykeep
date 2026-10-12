@@ -167,7 +167,7 @@ mod tests {
             });
         }
 
-        Ok(ChildGuard::with_resources(child, resource_guards))
+        Ok(ChildGuard::with_resources(child, resource_guards).require_graceful_shutdown())
     }
 
     async fn start_config_app(

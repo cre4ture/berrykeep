@@ -7290,7 +7290,7 @@ pub async fn run(config: ServerNodeConfig) -> Result<()> {
 fn shutdown_receiver_from_signal() -> watch::Receiver<bool> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        shutdown_signal().await;
+        common::shutdown::wait_for_shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     });
     shutdown_rx
@@ -7463,36 +7463,6 @@ fn spawn_embedded_managed_rendezvous_listener(
             }
         }
     })
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            warn!(error = %err, "failed waiting for ctrl-c signal");
-            std::future::pending::<()>().await;
-        }
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                let _ = signal.recv().await;
-            }
-            Err(err) => {
-                warn!(error = %err, "failed installing SIGTERM handler");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-    }
 }
 
 async fn run_inner(

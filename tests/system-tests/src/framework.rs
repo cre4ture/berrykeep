@@ -1376,7 +1376,7 @@ pub async fn start_cli_web(bind: &str) -> Result<ChildGuard> {
         .context("failed to spawn cli-client serve-web")?;
 
     wait_for_url_status(&format!("http://{bind}/api/ping"), StatusCode::OK, 40).await?;
-    Ok(ChildGuard::with_resources(child, resource_guards))
+    Ok(ChildGuard::with_resources(child, resource_guards).require_graceful_shutdown())
 }
 
 pub async fn start_rendezvous_service(bind: &str) -> Result<ChildGuard> {

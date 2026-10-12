@@ -6,6 +6,7 @@ pub mod content_fingerprint;
 pub mod legacy_compatibility;
 pub mod logging;
 pub mod range_chunk_cache;
+pub mod shutdown;
 pub mod task_queue;
 pub mod traced_mutex;
 pub mod traced_rwlock;

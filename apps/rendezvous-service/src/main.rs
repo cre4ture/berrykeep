@@ -4,7 +4,7 @@ mod failover;
 use crate::config::RendezvousServiceConfig;
 use anyhow::Result;
 use rendezvous_server::{RendezvousAppState, serve_with_shutdown};
-use tracing::{info, warn};
+use tracing::info;
 
 #[cfg(test)]
 use rendezvous_server::serve as serve_rendezvous;
@@ -59,39 +59,9 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
 
     serve_with_shutdown(
         RendezvousAppState::new_with_admission(config.server_config(), config.admission)?,
-        shutdown_signal(),
+        common::shutdown::wait_for_shutdown_signal(),
     )
     .await
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            warn!(%error, "failed waiting for ctrl-c signal");
-            std::future::pending::<()>().await;
-        }
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                let _ = signal.recv().await;
-            }
-            Err(error) => {
-                warn!(%error, "failed installing SIGTERM handler");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-    }
 }
 
 #[cfg(test)]
