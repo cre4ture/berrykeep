@@ -93,6 +93,7 @@ jobs:
           # processes. Keep one coverage environment active while both the
           # workspace tests and those external binaries run so their profiles
           # and coverage objects are merged into the same report.
+          export CARGO_TARGET_DIR="${CARGO_LLVM_COV_TARGET_DIR}"
           eval "$(cargo +nightly-2026-02-17 llvm-cov show-env --sh)"
           cargo +nightly-2026-02-17 llvm-cov clean --workspace
           cargo +nightly-2026-02-17 test --locked \
