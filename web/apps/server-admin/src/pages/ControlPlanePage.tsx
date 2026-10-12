@@ -42,18 +42,15 @@ export function ControlPlanePage() {
   const [directEndpointsConfig, setDirectEndpointsConfig] = useState<DirectEndpointsConfigView | null>(null);
   const [editablePublicDirectUrlsText, setEditablePublicDirectUrlsText] = useState("");
   const [editablePeerDirectUrlsText, setEditablePeerDirectUrlsText] = useState("");
-  const [directEndpointsDirty, setDirectEndpointsDirty] = useState(false);
   const directEndpointsDirtyRef = useRef(false);
   const [directEndpointsConfigLoading, setDirectEndpointsConfigLoading] = useState(true);
   const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
   const [editableRendezvousUrlsText, setEditableRendezvousUrlsText] = useState("");
-  const [rendezvousUrlsDirty, setRendezvousUrlsDirty] = useState(false);
   const rendezvousUrlsDirtyRef = useRef(false);
   const [rendezvousConfigLoading, setRendezvousConfigLoading] = useState(true);
   const [rendezvousContactConfiguration, setRendezvousContactConfiguration] =
     useState<RendezvousContactConfigurationResponse | null>(null);
   const [rendezvousContactUrlsText, setRendezvousContactUrlsText] = useState("");
-  const [rendezvousContactUrlsDirty, setRendezvousContactUrlsDirty] = useState(false);
   const rendezvousContactUrlsDirtyRef = useRef(false);
   const [rendezvousContactConfigurationLoading, setRendezvousContactConfigurationLoading] = useState(true);
   const [rendezvousPassphrase, setRendezvousPassphrase] = useState("");
@@ -87,21 +84,9 @@ export function ControlPlanePage() {
   >(null);
 
   useEffect(() => {
-    directEndpointsDirtyRef.current = directEndpointsDirty;
-  }, [directEndpointsDirty]);
-
-  useEffect(() => {
-    rendezvousUrlsDirtyRef.current = rendezvousUrlsDirty;
-  }, [rendezvousUrlsDirty]);
-
-  useEffect(() => {
-    rendezvousContactUrlsDirtyRef.current = rendezvousContactUrlsDirty;
-  }, [rendezvousContactUrlsDirty]);
-
-  useEffect(() => {
     let cancelled = false;
 
-    async function refreshConfigs(showLoading: boolean, preserveDraft: boolean) {
+    async function refreshConfigs(showLoading: boolean) {
       if (showLoading) {
         setDirectEndpointsConfigLoading(true);
         setRendezvousConfigLoading(true);
@@ -117,20 +102,17 @@ export function ControlPlanePage() {
           return;
         }
         setDirectEndpointsConfig(directEndpointsPayload);
-        if (!preserveDraft || !directEndpointsDirtyRef.current) {
+        if (!directEndpointsDirtyRef.current) {
           setEditablePublicDirectUrlsText(directEndpointsPayload.editable_public_urls.join("\n"));
           setEditablePeerDirectUrlsText(directEndpointsPayload.editable_peer_urls.join("\n"));
-          setDirectEndpointsDirty(false);
         }
         setRendezvousConfig(rendezvousPayload);
-        if (!preserveDraft || !rendezvousUrlsDirtyRef.current) {
+        if (!rendezvousUrlsDirtyRef.current) {
           setEditableRendezvousUrlsText(rendezvousPayload.editable_urls.join("\n"));
-          setRendezvousUrlsDirty(false);
         }
         setRendezvousContactConfiguration(rendezvousContactsPayload);
-        if (!preserveDraft || !rendezvousContactUrlsDirtyRef.current) {
+        if (!rendezvousContactUrlsDirtyRef.current) {
           setRendezvousContactUrlsText(rendezvousContactsPayload.configuration.rendezvous_urls.join("\n"));
-          setRendezvousContactUrlsDirty(false);
         }
       } catch (actionError) {
         if (cancelled) {
@@ -146,9 +128,9 @@ export function ControlPlanePage() {
       }
     }
 
-    void refreshConfigs(true, false);
+    void refreshConfigs(true);
     const refreshInterval = window.setInterval(() => {
-      void refreshConfigs(false, true);
+      void refreshConfigs(false);
     }, 5000);
 
     return () => {
@@ -173,7 +155,7 @@ export function ControlPlanePage() {
       setDirectEndpointsConfig(payload);
       setEditablePublicDirectUrlsText(payload.editable_public_urls.join("\n"));
       setEditablePeerDirectUrlsText(payload.editable_peer_urls.join("\n"));
-      setDirectEndpointsDirty(false);
+      directEndpointsDirtyRef.current = false;
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError));
     } finally {
@@ -192,7 +174,7 @@ export function ControlPlanePage() {
       const payload = await updateRendezvousConfig({ editable_urls }, adminTokenOverride);
       setRendezvousConfig(payload);
       setEditableRendezvousUrlsText(payload.editable_urls.join("\n"));
-      setRendezvousUrlsDirty(false);
+      rendezvousUrlsDirtyRef.current = false;
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError));
     } finally {
@@ -217,7 +199,7 @@ export function ControlPlanePage() {
       );
       setRendezvousContactConfiguration(payload);
       setRendezvousContactUrlsText(payload.configuration.rendezvous_urls.join("\n"));
-      setRendezvousContactUrlsDirty(false);
+      rendezvousContactUrlsDirtyRef.current = false;
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError));
     } finally {
@@ -368,8 +350,8 @@ export function ControlPlanePage() {
                   autosize
                   value={editablePublicDirectUrlsText}
                   onChange={(event) => {
+                    directEndpointsDirtyRef.current = true;
                     setEditablePublicDirectUrlsText(event.currentTarget.value);
-                    setDirectEndpointsDirty(true);
                   }}
                   placeholder={"https://edge.example:8443\nhttps://198.51.100.10:8443"}
                 />
@@ -380,8 +362,8 @@ export function ControlPlanePage() {
                   autosize
                   value={editablePeerDirectUrlsText}
                   onChange={(event) => {
+                    directEndpointsDirtyRef.current = true;
                     setEditablePeerDirectUrlsText(event.currentTarget.value);
-                    setDirectEndpointsDirty(true);
                   }}
                   placeholder={"https://edge.example:18443\nhttps://198.51.100.10:18443"}
                 />
@@ -450,8 +432,8 @@ export function ControlPlanePage() {
                   autosize
                   value={editableRendezvousUrlsText}
                   onChange={(event) => {
+                    rendezvousUrlsDirtyRef.current = true;
                     setEditableRendezvousUrlsText(event.currentTarget.value);
-                    setRendezvousUrlsDirty(true);
                   }}
                   placeholder={"https://rendezvous-a.example:9443\nhttps://rendezvous-b.example:9443"}
                 />
@@ -514,8 +496,8 @@ export function ControlPlanePage() {
                   autosize
                   value={rendezvousContactUrlsText}
                   onChange={(event) => {
+                    rendezvousContactUrlsDirtyRef.current = true;
                     setRendezvousContactUrlsText(event.currentTarget.value);
-                    setRendezvousContactUrlsDirty(true);
                   }}
                   placeholder={"https://relay.example:19080\nhttps://fallback.example:19080"}
                 />

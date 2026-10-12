@@ -531,6 +531,46 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   expect(requestedPaths).not.toContain("/auth/bootstrap-claims/issue");
 });
 
+test("server-admin preserves control-plane drafts while the initial configuration loads", async ({ page }) => {
+  let markDirectEndpointsConfigRequestStarted: () => void;
+  const directEndpointsConfigRequestStarted = new Promise<void>((resolve) => {
+    markDirectEndpointsConfigRequestStarted = resolve;
+  });
+  let releaseDirectEndpointsConfigResponse: () => void;
+  const directEndpointsConfigResponseAllowed = new Promise<void>((resolve) => {
+    releaseDirectEndpointsConfigResponse = resolve;
+  });
+  await installServerAdminMocks(page, {
+    directEndpointsConfigResponseAllowed,
+    markDirectEndpointsConfigRequestStarted: () => markDirectEndpointsConfigRequestStarted()
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Control Plane", { exact: true }).click();
+  await directEndpointsConfigRequestStarted;
+  const publicUrls = page.getByRole("textbox", { name: "Additional public API URLs" });
+  const peerUrls = page.getByRole("textbox", { name: "Additional peer API URLs" });
+  const rendezvousUrls = page.getByRole("textbox", { name: "Editable operator-managed URLs" });
+  const contactUrls = page.getByRole("textbox", { name: "Rendezvous contact URLs" });
+  await publicUrls.fill("https://draft.example:8443");
+  await peerUrls.fill("https://draft.example:18443");
+  await rendezvousUrls.fill("https://draft-rendezvous.example:9443");
+  await contactUrls.fill("https://draft-contact.example:19080");
+
+  releaseDirectEndpointsConfigResponse();
+  await expect(page.locator("pre").filter({ hasText: "node-alpha.local" }).first()).toBeVisible();
+  await expect(publicUrls).toHaveValue("https://draft.example:8443");
+  await expect(peerUrls).toHaveValue("https://draft.example:18443");
+  await expect(rendezvousUrls).toHaveValue("https://draft-rendezvous.example:9443");
+  await expect(contactUrls).toHaveValue("https://draft-contact.example:19080");
+});
+
 test("server-admin mobile drawer is available only when its navigation is available", async ({ page }) => {
   await installServerAdminMocks(page);
   await page.setViewportSize({ width: 390, height: 844 });
@@ -2014,6 +2054,8 @@ async function installServerAdminMocks(
     mapConfiguration?: GalleryMapConfiguration;
     mapConfigurationStatus?: number;
     legacyGalleryMapApiOnly?: boolean;
+    directEndpointsConfigResponseAllowed?: Promise<void>;
+    markDirectEndpointsConfigRequestStarted?: () => void;
   }
 ) {
   const imageBody = tinyPngBuffer();
@@ -3470,6 +3512,8 @@ async function installServerAdminMocks(
         await route.fulfill({ status: 401 });
         return;
       }
+      options?.markDirectEndpointsConfigRequestStarted?.();
+      await options?.directEndpointsConfigResponseAllowed;
       return json(route, directEndpointsConfig);
     }
 
