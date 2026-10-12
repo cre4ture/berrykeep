@@ -22811,6 +22811,24 @@ async fn timed_out_report_retains_partial_transfer_counters() {
     cleanup_test_state(&state).await;
 }
 
+#[test]
+fn timeout_progress_flags_remain_monotonic_across_a_baseline() {
+    let baseline = super::RepairActiveRunProgress {
+        had_chunk_progress: true,
+        waiting_for_source: true,
+        unresolved: true,
+        ..Default::default()
+    };
+    let progress = baseline.clone();
+    let mut report = super::replication::ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
+
+    progress.apply_delta_to_report(&baseline, &mut report);
+
+    assert!(report.had_chunk_progress);
+    assert!(report.waiting_for_source);
+    assert!(report.unresolved);
+}
+
 #[tokio::test]
 async fn timed_out_report_uses_monotonic_cursor_after_live_log_truncation() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;

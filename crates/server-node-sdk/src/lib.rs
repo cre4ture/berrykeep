@@ -3749,9 +3749,9 @@ impl RepairActiveRunProgress {
                 .clone()
                 .or_else(|| report.last_error.clone())
         };
-        report.had_chunk_progress = self.had_chunk_progress && !baseline.had_chunk_progress;
-        report.waiting_for_source = self.waiting_for_source && !baseline.waiting_for_source;
-        report.unresolved = self.unresolved && !baseline.unresolved;
+        report.had_chunk_progress = self.had_chunk_progress;
+        report.waiting_for_source = self.waiting_for_source;
+        report.unresolved = self.unresolved;
     }
 }
 
