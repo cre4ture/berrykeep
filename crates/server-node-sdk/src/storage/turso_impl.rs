@@ -1778,9 +1778,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
-        let connection = self
-            .open_lookup_connection("snapshot manifest by ID")
-            .await?;
+        let connection = self.open_scan_connection("snapshot manifest by ID").await?;
         let mut rows = connection
             .query(
                 "SELECT snapshot_json FROM snapshots WHERE snapshot_id = ?1",
@@ -4682,6 +4680,51 @@ mod tests {
 
         drop(lookup_connections);
         drop(scan_connections);
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn snapshot_manifest_reads_do_not_consume_lookup_capacity() {
+        let metadata_db_path = turso_test_db_path("turso-snapshot-scan-read-connection");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let snapshot = SnapshotManifest {
+            id: "scan-budget-snapshot".to_string(),
+            created_at_unix: 1,
+            objects: HashMap::from([("snapshot/key".to_string(), "manifest".to_string())]),
+            object_ids: HashMap::from([("snapshot/key".to_string(), "object".to_string())]),
+        };
+        store
+            .persist_snapshot_manifest(&snapshot)
+            .await
+            .expect("snapshot fixture should persist");
+
+        let mut lookup_connections = Vec::new();
+        for _ in 0..DEFAULT_TURSO_LOOKUP_READ_CONNECTION_COUNT {
+            lookup_connections.push(
+                store
+                    .open_lookup_connection("occupied lookup slot")
+                    .await
+                    .expect("lookup connection should open within its budget"),
+            );
+        }
+
+        let loaded = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.load_snapshot_manifest("scan-budget-snapshot"),
+        )
+        .await
+        .expect("lookup saturation must not block snapshot scan reads")
+        .expect("snapshot manifest should load")
+        .expect("snapshot manifest should exist");
+        assert_eq!(loaded.id, snapshot.id);
+        assert_eq!(loaded.created_at_unix, snapshot.created_at_unix);
+        assert_eq!(loaded.objects, snapshot.objects);
+        assert_eq!(loaded.object_ids, snapshot.object_ids);
+
+        drop(lookup_connections);
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
