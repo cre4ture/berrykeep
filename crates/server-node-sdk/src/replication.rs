@@ -909,7 +909,8 @@ pub(crate) async fn execute_replication_repair_plan(
     );
 
     for item in plan_items {
-        let consumed_work_items = attempted_transfers.saturating_add(failed_subject_inspections);
+        let consumed_work_items =
+            consumed_repair_work_items(attempted_transfers, failed_subject_inspections);
         if consumed_work_items >= max_transfers {
             push_repair_log_entry(
                 &mut detailed_log,
@@ -1542,7 +1543,9 @@ pub(crate) async fn execute_replication_repair_plan(
         };
 
         for &target in &item.missing_nodes {
-            if attempted_transfers >= max_transfers {
+            let consumed_work_items =
+                consumed_repair_work_items(attempted_transfers, failed_subject_inspections);
+            if consumed_work_items >= max_transfers {
                 push_repair_log_entry(
                     &mut detailed_log,
                     state.node_id,
@@ -1555,6 +1558,8 @@ pub(crate) async fn execute_replication_repair_plan(
                     Some(target),
                     Some(serde_json::json!({
                         "attempted_transfers": attempted_transfers,
+                        "failed_subject_inspections": failed_subject_inspections,
+                        "consumed_work_items": consumed_work_items,
                         "max_transfers": max_transfers,
                     })),
                 );
@@ -1950,6 +1955,13 @@ fn peer_execution_budget(request_budget: Duration) -> Duration {
     request_budget
         .saturating_sub(response_grace)
         .max(Duration::from_millis(1))
+}
+
+fn consumed_repair_work_items(
+    attempted_transfers: usize,
+    failed_subject_inspections: usize,
+) -> usize {
+    attempted_transfers.saturating_add(failed_subject_inspections)
 }
 
 #[allow(dead_code)]
@@ -3101,6 +3113,18 @@ mod tests {
             "an early peer completion should redistribute its unused share"
         );
         assert!(second_deadline < phase_deadline);
+    }
+
+    #[test]
+    fn failed_subject_inspections_consume_the_push_batch_budget() {
+        let max_transfers = 4;
+        let failed_subject_inspections = 3;
+        let attempted_transfers = 1;
+
+        assert_eq!(
+            consumed_repair_work_items(attempted_transfers, failed_subject_inspections),
+            max_transfers
+        );
     }
 
     #[test]
