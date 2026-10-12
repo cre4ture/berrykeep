@@ -21150,6 +21150,28 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
         repair.pending_subjects.insert("photos/a.jpg".to_string());
         repair.active = true;
     }
+    let active_repair = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let queued_repair = tokio::spawn({
+        let gate = Arc::clone(&state.maintenance.repair_execution_gate);
+        async move { gate.acquire(super::RepairExecutionPriority::Manual).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual repair should become visible in the executor queue");
 
     let snapshot = super::local_task_queue_snapshot(&state, false).await;
 
@@ -21170,7 +21192,7 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
         .iter()
         .find(|queue| queue.id == "replication_repair")
         .expect("repair queue should be present");
-    assert_eq!(repair.pending, 2);
+    assert_eq!(repair.pending, 3);
     assert_eq!(repair.active, 1);
 
     let first_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
@@ -21181,6 +21203,9 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
     let cached_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
     assert_eq!(cached_cluster_snapshot, first_cluster_snapshot);
 
+    queued_repair.abort();
+    let _ = queued_repair.await;
+    drop(active_repair);
     cleanup_test_state(&state).await;
 }
 
@@ -22751,6 +22776,17 @@ async fn timed_out_report_retains_partial_transfer_counters() {
             Some(NodeId::new_v4()),
             Some(serde_json::json!({"attempted_transfers": 2})),
         );
+        super::replication::push_repair_skipped_detail(
+            &mut Vec::new(),
+            state.node_id,
+            "deferred-subject".to_string(),
+            Some("deferred-key".to_string()),
+            None,
+            None,
+            Some(state.node_id),
+            super::replication::ReplicationRepairSkipReason::BackoffActive,
+            "retry backoff remains active",
+        );
     })
     .await;
 
@@ -22758,6 +22794,13 @@ async fn timed_out_report_retains_partial_transfer_counters() {
     assert_eq!(report.attempted_transfers, 2);
     assert_eq!(report.successful_transfers, 1);
     assert_eq!(report.failed_transfers, 0);
+    assert_eq!(report.skipped_backoff, 1);
+    assert_eq!(report.skipped_details.len(), 1);
+    assert_eq!(report.skipped_details[0].subject, "deferred-subject");
+    assert_eq!(
+        report.skipped_details[0].reason,
+        super::replication::ReplicationRepairSkipReason::BackoffActive
+    );
     assert_eq!(
         report.last_error.as_deref(),
         Some("repair execution timed out after 17 seconds")
@@ -23580,6 +23623,15 @@ async fn manual_availability_sync_does_not_hold_repair_executor() {
     })
     .await
     .expect("manual request should hold its admission slot while availability sync waits");
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("manual repair activity should remain readable during preparation");
+    assert_eq!(
+        activity.active_runs.len(),
+        1,
+        "admitted manual preparation must be visible as an active repair run"
+    );
 
     let executor_probe = state
         .maintenance

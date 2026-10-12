@@ -3,7 +3,7 @@ use storage::{ReplicationExportBundle, TOMBSTONE_MANIFEST_HASH};
 
 const REPAIR_PROGRESS_CHUNK_LOG_INTERVAL: usize = 128;
 const MAX_REPAIR_REPORT_LOG_ENTRIES: usize = 2_048;
-const MAX_REPAIR_REPORT_SKIPPED_DETAILS: usize = 2_048;
+pub(super) const MAX_REPAIR_REPORT_SKIPPED_DETAILS: usize = 2_048;
 
 #[cfg(test)]
 pub(crate) struct ReplicationExportBlocker {
@@ -2425,11 +2425,7 @@ pub(crate) fn push_repair_skipped_detail(
     reason: ReplicationRepairSkipReason,
     detail: impl Into<String>,
 ) {
-    append_active_repair_skipped_item(&reason);
-    if skipped_details.len() >= MAX_REPAIR_REPORT_SKIPPED_DETAILS {
-        return;
-    }
-    skipped_details.push(ReplicationRepairSkippedItem {
+    let skipped_item = ReplicationRepairSkippedItem {
         report_node_id,
         subject,
         key,
@@ -2438,7 +2434,12 @@ pub(crate) fn push_repair_skipped_detail(
         target_node_id,
         reason,
         detail: detail.into(),
-    });
+    };
+    append_active_repair_skipped_item(&skipped_item);
+    if skipped_details.len() >= MAX_REPAIR_REPORT_SKIPPED_DETAILS {
+        return;
+    }
+    skipped_details.push(skipped_item);
 }
 
 fn build_replication_repair_path(

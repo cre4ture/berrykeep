@@ -3628,6 +3628,7 @@ struct RepairActiveRunProgress {
     skipped_items: usize,
     skipped_backoff: usize,
     skipped_max_retries: usize,
+    skipped_details: Vec<replication::ReplicationRepairSkippedItem>,
     last_error: Option<String>,
     had_chunk_progress: bool,
     waiting_for_source: bool,
@@ -3688,8 +3689,8 @@ impl RepairActiveRunProgress {
         }
     }
 
-    fn record_skipped_item(&mut self, reason: &replication::ReplicationRepairSkipReason) {
-        match reason {
+    fn record_skipped_item(&mut self, item: &replication::ReplicationRepairSkippedItem) {
+        match &item.reason {
             replication::ReplicationRepairSkipReason::RepairInProgress => {
                 self.skipped_items += 1;
                 self.attempted_transfers = self.attempted_transfers.saturating_sub(1);
@@ -3703,6 +3704,9 @@ impl RepairActiveRunProgress {
             _ => {
                 self.skipped_items += 1;
             }
+        }
+        if self.skipped_details.len() < replication::MAX_REPAIR_REPORT_SKIPPED_DETAILS {
+            self.skipped_details.push(item.clone());
         }
     }
 
@@ -3727,6 +3731,12 @@ impl RepairActiveRunProgress {
         report.skipped_max_retries = self
             .skipped_max_retries
             .saturating_sub(baseline.skipped_max_retries);
+        report.skipped_details = self
+            .skipped_details
+            .iter()
+            .skip(baseline.skipped_details.len())
+            .cloned()
+            .collect();
         report.last_error = if report.timed_out {
             match (&report.last_error, &self.last_error) {
                 (Some(timeout), Some(last_repair_error)) => Some(format!(
@@ -3776,10 +3786,10 @@ impl RepairActiveRunLiveLogHandle {
         live_state.push(entry);
     }
 
-    fn push_skipped_item(&self, reason: &replication::ReplicationRepairSkipReason) {
+    fn push_skipped_item(&self, item: &replication::ReplicationRepairSkippedItem) {
         match self.progress.lock() {
-            Ok(mut progress) => progress.record_skipped_item(reason),
-            Err(poisoned) => poisoned.into_inner().record_skipped_item(reason),
+            Ok(mut progress) => progress.record_skipped_item(item),
+            Err(poisoned) => poisoned.into_inner().record_skipped_item(item),
         }
     }
 }
@@ -13322,9 +13332,9 @@ fn append_active_repair_log_entry(entry: &replication::ReplicationRepairLogEntry
     });
 }
 
-fn append_active_repair_skipped_item(reason: &replication::ReplicationRepairSkipReason) {
+fn append_active_repair_skipped_item(item: &replication::ReplicationRepairSkippedItem) {
     let _ = ACTIVE_REPAIR_LOG_HANDLE.try_with(|handle| {
-        handle.push_skipped_item(reason);
+        handle.push_skipped_item(item);
     });
 }
 
@@ -13827,15 +13837,14 @@ async fn execute_tracked_local_replication_repair(
 ) -> replication::ReplicationRepairReport {
     let execution_deadline = repair_execution_deadline(state);
     let preparation_timeout_secs = repair_deadline_budget_secs(execution_deadline);
+    let tracker =
+        begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
     let preparation = run_with_repair_execution_deadline(state, execution_deadline, async {
         sync_availability_views_once(state).await;
         acquire_repair_execution(state, trigger).await
     })
     .await;
     let Some(permit) = preparation else {
-        let tracker =
-            begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger)
-                .await;
         let report = timed_out_repair_report(state, &tracker, preparation_timeout_secs);
         finish_repair_run_tracking(
             state,
@@ -13848,11 +13857,11 @@ async fn execute_tracked_local_replication_repair(
         .await;
         return report;
     };
-    execute_tracked_local_replication_repair_with_permit(
+    execute_tracked_local_replication_repair_with_tracker_and_permit(
         state,
         batch_size_override,
-        trigger,
         plan_summary_override,
+        tracker,
         permit,
         execution_deadline,
     )
@@ -13867,11 +13876,30 @@ async fn execute_tracked_local_replication_repair_with_permit(
     permit: RepairExecutionPermit,
     execution_deadline: tokio::time::Instant,
 ) -> replication::ReplicationRepairReport {
+    let tracker =
+        begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
+    execute_tracked_local_replication_repair_with_tracker_and_permit(
+        state,
+        batch_size_override,
+        plan_summary_override,
+        tracker,
+        permit,
+        execution_deadline,
+    )
+    .await
+}
+
+async fn execute_tracked_local_replication_repair_with_tracker_and_permit(
+    state: &ServerState,
+    batch_size_override: Option<usize>,
+    plan_summary_override: Option<RepairPlanSummary>,
+    tracker: RepairRunTracker,
+    permit: RepairExecutionPermit,
+    execution_deadline: tokio::time::Instant,
+) -> replication::ReplicationRepairReport {
     let timeout_plan_summary = plan_summary_override
         .clone()
         .unwrap_or_else(empty_repair_plan_summary);
-    let tracker =
-        begin_repair_run_tracking(state, replication::ReplicationRepairScope::Local, trigger).await;
     let execution_timeout_secs = repair_deadline_budget_secs(execution_deadline);
     let execution = run_with_repair_execution_deadline(state, execution_deadline, async {
         let plan_summary = match plan_summary_override {
@@ -29901,8 +29929,15 @@ async fn local_task_queue_snapshot(
     drop(repair_activity);
     let startup_repair_status = *state.maintenance.startup_repair_status.lock().await;
     let autonomous_repair = state.maintenance.autonomous_post_write_repair.lock().await;
-    let repair_pending = autonomous_repair.pending_subjects.len()
-        + usize::from(startup_repair_status == StartupRepairStatus::Scheduled);
+    let executor_queue = state.maintenance.repair_execution_gate.queue_snapshot();
+    let repair_pending = autonomous_repair
+        .pending_subjects
+        .len()
+        .saturating_add(usize::from(
+            startup_repair_status == StartupRepairStatus::Scheduled,
+        ))
+        .saturating_add(executor_queue.manual)
+        .saturating_add(executor_queue.automatic);
     let repair_worker_active = repair_active
         .max(usize::from(autonomous_repair.active))
         .max(usize::from(
