@@ -116,19 +116,12 @@ jobs:
             --output-path target/coverage/lcov.info \
             --ignore-filename-regex "${coverage_ignore_regex}"
 
-          reconcile_start="$(grep -n '^async fn reconcile_from_node(' crates/server-node-sdk/src/lib.rs | cut -d: -f1)"
-          reconcile_end="$(awk -v start="${reconcile_start}" '
-            NR > start && /^(pub )?(async )?fn / {
-              print NR - 1
-              found = 1
-              exit
-            }
-            END {
-              if (!found) {
-                print NR
-              }
-            }
-          ' crates/server-node-sdk/src/lib.rs)"
+          reconcile_start="$(grep -nF '// COVERAGE_CANARY_START: reconcile_from_node' crates/server-node-sdk/src/lib.rs | cut -d: -f1)"
+          reconcile_end="$(grep -nF '// COVERAGE_CANARY_END: reconcile_from_node' crates/server-node-sdk/src/lib.rs | cut -d: -f1)"
+          if [[ ! "${reconcile_start}" =~ ^[0-9]+$ || ! "${reconcile_end}" =~ ^[0-9]+$ || "${reconcile_start}" -ge "${reconcile_end}" ]]; then
+            echo "::error::invalid reconcile_from_node coverage canary markers"
+            exit 1
+          fi
           awk -v expected_start="${reconcile_start}" -v expected_end="${reconcile_end}" '
             /^SF:/ {
               selected = ($0 ~ /\/crates\/server-node-sdk\/src\/lib\.rs$/)

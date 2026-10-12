@@ -34350,6 +34350,9 @@ async fn export_provisional_versions(State(state): State<ServerState>) -> impl I
     }
 }
 
+// Keep these paired markers around the handler; coverage CI uses them to
+// verify that external server-node profiles are merged into the report.
+// COVERAGE_CANARY_START: reconcile_from_node
 async fn reconcile_from_node(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -34623,3 +34626,4 @@ async fn reconcile_from_node(
     )
         .into_response()
 }
+// COVERAGE_CANARY_END: reconcile_from_node
