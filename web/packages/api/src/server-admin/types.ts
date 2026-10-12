@@ -253,6 +253,8 @@ export type ClusterSummary = {
 
 export type NodeDescriptor = {
   node_id: string;
+  hostname?: string | null;
+  software_version?: string | null;
   reachability: {
     public_api_url?: string | null;
     public_direct_urls?: string[];

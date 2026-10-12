@@ -212,9 +212,13 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("button", { name: "30d", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "All", exact: true })).toBeVisible();
   await expect(page.getByRole("columnheader", { name: "Chunk Store" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Hostname" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Version" })).toBeVisible();
   await expect(page.getByText("Latest snapshot ID:")).toBeVisible();
   await expect(page.getByText("Snapshot logical size:")).toBeVisible();
   await expect(page.getByRole("cell", { name: "node-alpha", exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("cell", { name: "edge-alpha", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "2.0.1", exact: true })).toBeVisible();
   await expect(page.locator("td").filter({ hasText: /logical/ }).first()).toBeVisible();
   await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
   await expect(
@@ -2769,6 +2773,8 @@ async function installServerAdminMocks(
       return json(route, [
         {
           node_id: "node-alpha",
+          hostname: "edge-alpha",
+          software_version: "2.0.1",
           reachability: {
             public_api_url: "https://node-alpha.local",
             peer_api_url: "https://node-alpha-peer.local",
@@ -2801,6 +2807,8 @@ async function installServerAdminMocks(
         },
         {
           node_id: "node-beta",
+          hostname: "edge-beta",
+          software_version: "2.0.0",
           reachability: {
             public_api_url: null,
             peer_api_url: null,

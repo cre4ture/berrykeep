@@ -80,6 +80,10 @@ pub struct NodeDescriptor {
     /// unique identity and is the only value used for cluster operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Last known version reported by this server node. It is optional for
+    /// compatibility with nodes that predate version metadata distribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_version: Option<String>,
     pub reachability: NodeReachability,
     pub capabilities: NodeCapabilities,
     pub labels: HashMap<String, String>,
@@ -301,6 +305,7 @@ impl ClusterService {
     ) -> bool {
         existing.node_id != candidate.node_id
             || existing.hostname != candidate.hostname
+            || existing.software_version != candidate.software_version
             || existing.reachability != candidate.reachability
             || existing.capabilities != candidate.capabilities
             || existing.labels != candidate.labels
@@ -374,6 +379,7 @@ impl ClusterService {
         capacity_bytes: Option<u64>,
         storage_stats: Option<NodeStorageStatsSummary>,
         labels: Option<HashMap<String, String>>,
+        software_version: Option<String>,
     ) -> bool {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.last_heartbeat_unix = unix_ts();
@@ -389,6 +395,9 @@ impl ClusterService {
             }
             if let Some(labels) = labels {
                 node.labels = labels;
+            }
+            if let Some(software_version) = software_version {
+                node.software_version = Some(software_version);
             }
             true
         } else {
@@ -1056,6 +1065,7 @@ mod tests {
         NodeDescriptor {
             node_id: id,
             hostname: None,
+            software_version: None,
             reachability: NodeReachability {
                 public_api_url: Some(format!("http://{id}")),
                 public_direct_urls: vec![format!("http://{id}")],
@@ -1179,6 +1189,7 @@ mod tests {
             Some(1_000),
             Some(sample_storage_stats(456)),
             None,
+            Some("2.0.1".to_string()),
         ));
 
         let node = svc
@@ -1193,6 +1204,7 @@ mod tests {
                 .map(|stats| stats.chunk_store_bytes),
             Some(456)
         );
+        assert_eq!(node.software_version.as_deref(), Some("2.0.1"));
     }
 
     #[test]
@@ -1535,6 +1547,7 @@ mod tests {
         svc.import_nodes(vec![NodeDescriptor {
             node_id: remote,
             hostname: None,
+            software_version: None,
             reachability: NodeReachability {
                 public_api_url: Some("https://remote.example".to_string()),
                 public_direct_urls: vec!["https://remote.example".to_string()],

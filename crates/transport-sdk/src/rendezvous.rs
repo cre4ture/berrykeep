@@ -339,6 +339,10 @@ pub struct PresenceRegistration {
     /// to display without rejecting the presence registration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Version of the server-node software that registered this presence.
+    /// This is display metadata only and is not part of the node identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_version: Option<String>,
     #[serde(default)]
     pub public_api_url: Option<String>,
     #[serde(default)]
@@ -1767,6 +1771,7 @@ mod tests {
             cluster_id: ClusterId::now_v7(),
             identity: PeerIdentity::Node(NodeId::now_v7()),
             hostname: None,
+            software_version: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: None,
@@ -1794,6 +1799,7 @@ mod tests {
             cluster_id: ClusterId::now_v7(),
             identity: PeerIdentity::Node(NodeId::now_v7()),
             hostname: Some("edge-a".to_string()),
+            software_version: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: None,
