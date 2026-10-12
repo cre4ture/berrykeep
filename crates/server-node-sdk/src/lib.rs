@@ -24027,6 +24027,22 @@ fn normalize_s3_control_plane_state(mut state: S3ControlPlaneState) -> S3Control
     state
 }
 
+fn active_s3_bucket_count(control_plane: &S3ControlPlaneState) -> usize {
+    control_plane
+        .buckets
+        .iter()
+        .filter(|bucket| bucket.deleted_at_unix.is_none())
+        .count()
+}
+
+fn active_s3_access_key_count(control_plane: &S3ControlPlaneState) -> usize {
+    control_plane
+        .access_keys
+        .iter()
+        .filter(|access_key| access_key.revoked_at_unix.is_none())
+        .count()
+}
+
 fn s3_bucket_effective_unix(record: &S3BucketRecord) -> u64 {
     record
         .deleted_at_unix
@@ -24122,12 +24138,8 @@ fn apply_s3_control_plane_import_state(
 
     S3ControlPlaneImportResponse {
         changed,
-        bucket_count: control_plane
-            .buckets
-            .iter()
-            .filter(|bucket| bucket.deleted_at_unix.is_none())
-            .count(),
-        access_key_count: control_plane.access_keys.len(),
+        bucket_count: active_s3_bucket_count(control_plane),
+        access_key_count: active_s3_access_key_count(control_plane),
     }
 }
 
@@ -24185,12 +24197,8 @@ async fn build_s3_control_plane_status_response(
         last_applied_at_unix: runtime.last_applied_at_unix,
         last_source_node_id: runtime.last_source_node_id,
         last_error: runtime.last_error,
-        bucket_count: control_plane
-            .buckets
-            .iter()
-            .filter(|bucket| bucket.deleted_at_unix.is_none())
-            .count(),
-        access_key_count: control_plane.access_keys.len(),
+        bucket_count: active_s3_bucket_count(&control_plane),
+        access_key_count: active_s3_access_key_count(&control_plane),
     }
 }
 

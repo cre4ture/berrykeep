@@ -4429,7 +4429,7 @@ async fn s3_control_plane_admin_lifecycle_impl(backend: MainTestBackend) {
     let status_after: super::S3ControlPlaneStatusResponse =
         serde_json::from_slice(&status_after_body).unwrap();
     assert_eq!(status_after.bucket_count, 0);
-    assert_eq!(status_after.access_key_count, 1);
+    assert_eq!(status_after.access_key_count, 0);
     assert!(status_after.local_generation >= 4);
 
     cleanup_test_state(&state).await;
@@ -4639,7 +4639,7 @@ async fn s3_control_plane_import_merges_tombstones_and_revocations_impl(backend:
         serde_json::from_slice(&tombstone_import_body).unwrap();
     assert!(tombstone_report.changed);
     assert_eq!(tombstone_report.bucket_count, 0);
-    assert_eq!(tombstone_report.access_key_count, 1);
+    assert_eq!(tombstone_report.access_key_count, 0);
 
     let stale_import = super::import_s3_control_plane(
         State(state.clone()),
@@ -4667,7 +4667,7 @@ async fn s3_control_plane_import_merges_tombstones_and_revocations_impl(backend:
         serde_json::from_slice(&stale_import_body).unwrap();
     assert!(!stale_report.changed);
     assert_eq!(stale_report.bucket_count, 0);
-    assert_eq!(stale_report.access_key_count, 1);
+    assert_eq!(stale_report.access_key_count, 0);
 
     let control_plane = state.s3.control_plane.lock().await.clone();
     assert_eq!(control_plane.buckets.len(), 1);
@@ -27019,7 +27019,7 @@ async fn admin_operations_router_exposes_s3_lifecycle_and_health_views_impl(
     )
     .await;
     assert_eq!(final_status["bucket_count"], 0);
-    assert_eq!(final_status["access_key_count"], 1);
+    assert_eq!(final_status["access_key_count"], 0);
     assert!(final_status["local_generation"].as_u64().unwrap() >= 4);
 
     let operational_read_paths = [
