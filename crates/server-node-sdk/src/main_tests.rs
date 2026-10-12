@@ -26279,6 +26279,285 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
     cleanup_test_state(&state).await;
 }
 
+async fn execute_admin_control_request(
+    app: &Router,
+    method: Method,
+    path: &str,
+    admin_token: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut request = Request::builder().method(method).uri(path);
+    if let Some(admin_token) = admin_token {
+        request = request.header(super::ADMIN_TOKEN_HEADER, admin_token);
+    }
+    let body = match body {
+        Some(body) => {
+            request = request.header(axum::http::header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(&body).unwrap())
+        }
+        None => Body::empty(),
+    };
+    let response = app
+        .clone()
+        .oneshot(request.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    (status, payload)
+}
+
+async fn admin_control_surface_routes_round_trip_runtime_configuration_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    let admin_token = fresh_test_secret("admin-control-surface");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
+
+    let (_reload_layer, reload_handle) = tracing_subscriber::reload::Layer::<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::Registry,
+    >::new(tracing_subscriber::EnvFilter::new("info"));
+    state.runtime_log_control = super::RuntimeLogControl::with_reload_handle("info", reload_handle);
+
+    let app = super::build_server_apps(&state).public_app;
+    let logging_path = "/api/v1/auth/logging/config";
+    let direct_endpoints_path = "/api/v1/auth/direct-endpoints-config";
+    let priority_path = "/api/v1/auth/node-connection-priority";
+    let rendezvous_path = "/api/v1/auth/rendezvous-config";
+
+    for path in [
+        logging_path,
+        direct_endpoints_path,
+        priority_path,
+        rendezvous_path,
+    ] {
+        let (status, _) = execute_admin_control_request(&app, Method::GET, path, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "path {path}");
+    }
+
+    let (status, logging) =
+        execute_admin_control_request(&app, Method::GET, logging_path, Some(&admin_token), None)
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(logging["filter_expression"], "info");
+    assert_eq!(logging["default_level"], "info");
+    assert_eq!(logging["directives"], serde_json::json!([]));
+    assert_eq!(logging["runtime_reconfigurable"], true);
+
+    let (status, invalid_logging) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        logging_path,
+        Some(&admin_token),
+        Some(serde_json::json!({ "default_level": "verbose" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_logging["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported log level")
+    );
+
+    let (status, logging) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        logging_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "default_level": "debug",
+            "directives": [{
+                "target": "server_node_sdk::replication",
+                "level": "trace"
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        logging["filter_expression"],
+        "debug,server_node_sdk::replication=trace"
+    );
+    assert_eq!(logging["default_level"], "debug");
+    assert_eq!(
+        logging["directives"],
+        serde_json::json!([{
+            "target": "server_node_sdk::replication",
+            "level": "trace"
+        }])
+    );
+    assert_eq!(logging["runtime_reconfigurable"], true);
+
+    let (status, invalid_direct_endpoints) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        direct_endpoints_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "public_urls": ["not a URL"],
+            "peer_urls": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_direct_endpoints["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid direct endpoint URL")
+    );
+
+    let (status, direct_endpoints) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        direct_endpoints_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "public_urls": [
+                " https://operator-public.example:8443/ ",
+                "https://operator-public.example:8443"
+            ],
+            "peer_urls": ["https://operator-peer.example:9443/"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        direct_endpoints["effective_public_urls"],
+        serde_json::json!([
+            "http://127.0.0.1:39080",
+            "https://operator-public.example:8443"
+        ])
+    );
+    assert_eq!(
+        direct_endpoints["editable_public_urls"],
+        serde_json::json!(["https://operator-public.example:8443"])
+    );
+    assert_eq!(
+        direct_endpoints["effective_peer_urls"],
+        serde_json::json!([
+            "https://127.0.0.1:49080",
+            "https://operator-peer.example:9443"
+        ])
+    );
+    assert_eq!(
+        direct_endpoints["editable_peer_urls"],
+        serde_json::json!(["https://operator-peer.example:9443"])
+    );
+    assert_eq!(direct_endpoints["persistence_source"], "runtime_only");
+    assert_eq!(direct_endpoints["persisted"], false);
+
+    let (status, invalid_priority) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        priority_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "priority": transport_sdk::MAX_NODE_CONNECTION_PRIORITY + 1
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_priority["error"]
+            .as_str()
+            .unwrap()
+            .contains("node connection priority must be between")
+    );
+
+    let (status, priority) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        priority_path,
+        Some(&admin_token),
+        Some(serde_json::json!({ "priority": -7 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(priority["priority"], -7);
+    assert_eq!(
+        priority["min_priority"],
+        transport_sdk::MIN_NODE_CONNECTION_PRIORITY
+    );
+    assert_eq!(
+        priority["max_priority"],
+        transport_sdk::MAX_NODE_CONNECTION_PRIORITY
+    );
+    assert_eq!(priority["persistence_source"], "runtime_only");
+    assert_eq!(priority["persisted"], false);
+
+    let (status, invalid_rendezvous) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        rendezvous_path,
+        Some(&admin_token),
+        Some(serde_json::json!({ "editable_urls": ["not a URL"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_rendezvous["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid rendezvous URL")
+    );
+
+    let (status, rendezvous) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        rendezvous_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "editable_urls": [
+                " https://rendezvous-a.example:9443 ",
+                "https://rendezvous-a.example:9443/",
+                ""
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        rendezvous["effective_urls"],
+        serde_json::json!(["https://rendezvous-a.example:9443/"])
+    );
+    assert_eq!(
+        rendezvous["editable_urls"],
+        serde_json::json!(["https://rendezvous-a.example:9443/"])
+    );
+    assert_eq!(rendezvous["managed_embedded_url"], serde_json::Value::Null);
+    assert_eq!(rendezvous["registration_enabled"], false);
+    assert_eq!(rendezvous["persistence_source"], "runtime_only");
+    assert_eq!(rendezvous["persisted"], false);
+
+    for (path, expected) in [
+        (logging_path, logging),
+        (direct_endpoints_path, direct_endpoints),
+        (priority_path, priority),
+        (rendezvous_path, rendezvous),
+    ] {
+        let (status, actual) =
+            execute_admin_control_request(&app, Method::GET, path, Some(&admin_token), None).await;
+        assert_eq!(status, StatusCode::OK, "path {path}");
+        assert_eq!(actual, expected, "path {path}");
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    admin_control_surface_routes_round_trip_runtime_configuration_impl,
+    admin_control_surface_routes_round_trip_runtime_configuration,
+    admin_control_surface_routes_round_trip_runtime_configuration_turso
+);
+
 #[tokio::test]
 async fn local_node_connection_priority_updates_presence_labels() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
