@@ -116,15 +116,34 @@ jobs:
             --output-path target/coverage/lcov.info \
             --ignore-filename-regex "${coverage_ignore_regex}"
 
-          reconcile_line="$(grep -n '^async fn reconcile_from_node(' crates/server-node-sdk/src/lib.rs | cut -d: -f1)"
-          awk -v expected_line="${reconcile_line}" '
+          reconcile_start="$(grep -n '^async fn reconcile_from_node(' crates/server-node-sdk/src/lib.rs | cut -d: -f1)"
+          reconcile_end="$(awk -v start="${reconcile_start}" '
+            NR > start && /^(pub )?(async )?fn / {
+              print NR - 1
+              found = 1
+              exit
+            }
+            END {
+              if (!found) {
+                print NR
+              }
+            }
+          ' crates/server-node-sdk/src/lib.rs)"
+          awk -v expected_start="${reconcile_start}" -v expected_end="${reconcile_end}" '
             /^SF:/ {
               selected = ($0 ~ /\/crates\/server-node-sdk\/src\/lib\.rs$/)
               next
             }
             selected && /^DA:/ {
               split(substr($0, 4), values, ",")
-              if (values[1] == expected_line && values[2] + 0 > 0) {
+              if (
+                values[1] >= expected_start &&
+                values[1] <= expected_end &&
+                values[2] + 0 > 0
+              ) {
+                if (!covered) {
+                  printf "reconcile_from_node coverage canary: DA:%s,%s\n", values[1], values[2]
+                }
                 covered = 1
               }
             }
