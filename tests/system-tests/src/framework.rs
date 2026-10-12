@@ -1682,18 +1682,20 @@ pub async fn wait_for_store_index_entry(
 }
 
 pub async fn stop_server(child: &mut ChildGuard) {
-    child
-        .stop()
-        .await
-        .expect("failed to stop child process cleanly");
+    let require_graceful_shutdown = child.require_graceful_shutdown;
+    let result = child.stop().await;
+    if require_graceful_shutdown {
+        result.expect("failed to stop child process cleanly");
+    }
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub async fn stop_server_without_cleanup(child: &mut ChildGuard) {
-    child
-        .stop_without_cleanup()
-        .await
-        .expect("failed to stop child process cleanly without cleanup");
+    let require_graceful_shutdown = child.require_graceful_shutdown;
+    let result = child.stop_without_cleanup().await;
+    if require_graceful_shutdown {
+        result.expect("failed to stop child process cleanly without cleanup");
+    }
 }
 
 pub fn binary_path(name: &str) -> Result<PathBuf> {
