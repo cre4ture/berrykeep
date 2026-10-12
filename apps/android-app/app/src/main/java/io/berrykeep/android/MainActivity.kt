@@ -118,6 +118,8 @@ class MainActivity : ComponentActivity() {
                     runNow = vm::runFolderSyncNow,
                     updateNewProfileLabel = vm::updateNewSyncLabel,
                     updateNewProfilePrefix = vm::updateNewSyncPrefix,
+                    openRemotePrefixPicker = vm::openRemotePrefixPicker,
+                    browseRemotePrefixPicker = vm::browseRemotePrefixPicker,
                     updateNewProfileLocalFolder = vm::updateNewSyncLocalFolder,
                     updateNewProfileAllowWifi = vm::updateNewSyncAllowWifi,
                     updateNewProfileAllowCellular = vm::updateNewSyncAllowCellular,

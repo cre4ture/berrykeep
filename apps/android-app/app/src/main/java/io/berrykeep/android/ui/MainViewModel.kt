@@ -97,6 +97,7 @@ class MainViewModel(
 
     private val repository = BerryKeepRepository()
     private var galleryRequestVersion = 0
+    private var remotePrefixPickerRequestVersion = 0
     private var pinnedGalleryItemIndex: Int? = null
     private var folderSyncStatusMonitorJob: Job? = null
     private var appConnectionStatusMonitorJob: Job? = null
@@ -637,6 +638,68 @@ class MainViewModel(
         uiState.value = uiState.value.copy(newSyncPrefix = value)
     }
 
+    fun openRemotePrefixPicker() {
+        loadRemotePrefixFolders(uiState.value.newSyncPrefix)
+    }
+
+    fun browseRemotePrefixPicker(path: String) {
+        loadRemotePrefixFolders(path)
+    }
+
+    private fun loadRemotePrefixFolders(path: String) {
+        val normalizedPath = normalizedRemotePrefixPath(path)
+        val requestVersion = nextRemotePrefixPickerRequestVersion()
+        val currentPicker = uiState.value.remotePrefixPicker
+        uiState.value = uiState.value.copy(
+            remotePrefixPicker = RemotePrefixPickerState(
+                currentPath = normalizedPath,
+                folders = if (currentPicker.currentPath == normalizedPath) currentPicker.folders else emptyList(),
+                loading = true,
+            ),
+        )
+
+        viewModelScope.launch {
+            runCatching {
+                val deviceAuth = refreshPersistedDeviceAuthState()
+                val connectionInput = deviceAuth.connectionBootstrapJson()
+                val clientIdentityJson = deviceAuth.toClientIdentityJson()
+                check(connectionInput.isNotBlank() && !clientIdentityJson.isNullOrBlank()) {
+                    "Enroll this device before browsing remote folders"
+                }
+                withContext(Dispatchers.IO) {
+                    repository.storeIndexDirectoryListing(
+                        connectionInput = connectionInput,
+                        prefix = normalizedPath.ifBlank { null },
+                        serverCaPem = deviceAuth.serverCaPem?.takeIf { it.isNotBlank() },
+                        clientIdentityJson = clientIdentityJson,
+                    )
+                }
+            }
+                .onSuccess { listing ->
+                    if (!isCurrentRemotePrefixPickerRequest(requestVersion)) {
+                        return@onSuccess
+                    }
+                    uiState.value = uiState.value.copy(
+                        remotePrefixPicker = RemotePrefixPickerState(
+                            currentPath = normalizedPath,
+                            folders = remotePrefixFolders(listing.entries),
+                        ),
+                    )
+                }
+                .onFailure { error ->
+                    if (!isCurrentRemotePrefixPickerRequest(requestVersion)) {
+                        return@onFailure
+                    }
+                    uiState.value = uiState.value.copy(
+                        remotePrefixPicker = RemotePrefixPickerState(
+                            currentPath = normalizedPath,
+                            error = error.message ?: "Failed to load remote folders",
+                        ),
+                    )
+                }
+        }
+    }
+
     fun updateNewSyncLocalFolder(value: String) {
         uiState.value = uiState.value.copy(
             newSyncLocalFolder = value,
@@ -1139,7 +1202,7 @@ class MainViewModel(
             return null
         }
 
-        val prefix = uiState.value.newSyncPrefix.trim().trim('/').replace('\\', '/')
+        val prefix = normalizedRemotePrefixPath(uiState.value.newSyncPrefix)
         val label = uiState.value.newSyncLabel.trim().ifBlank {
             localFolder.substringAfterLast('/').ifBlank { "Sync Profile" }
         }
@@ -1171,6 +1234,7 @@ class MainViewModel(
             syncProfiles = updated,
             newSyncLabel = "",
             newSyncPrefix = "",
+            remotePrefixPicker = RemotePrefixPickerState(),
             newSyncLocalFolder = "",
             newSyncLocalFolderTreeUri = null,
             newSyncAllowWifi = true,
@@ -2511,6 +2575,15 @@ class MainViewModel(
 
     private fun isCurrentGalleryRequest(requestVersion: Int): Boolean {
         return requestVersion == galleryRequestVersion
+    }
+
+    private fun nextRemotePrefixPickerRequestVersion(): Int {
+        remotePrefixPickerRequestVersion += 1
+        return remotePrefixPickerRequestVersion
+    }
+
+    private fun isCurrentRemotePrefixPickerRequest(requestVersion: Int): Boolean {
+        return requestVersion == remotePrefixPickerRequestVersion
     }
 
 }
