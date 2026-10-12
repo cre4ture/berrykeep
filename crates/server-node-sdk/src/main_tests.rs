@@ -14173,6 +14173,21 @@ fn autonomous_post_write_repair_runtime_coalesces_pending_subjects() {
     assert!(runtime.active);
     assert_eq!(runtime.take_pending_subjects(), None);
     assert!(!runtime.active);
+
+    assert!(runtime.enqueue(["docs/retry.txt".to_string()]));
+    let retry_subjects = runtime.take_pending_subjects().unwrap();
+    assert_eq!(
+        runtime.requeue_after_timeout(retry_subjects.clone(), 1),
+        (1, 0)
+    );
+    assert_eq!(
+        runtime.take_pending_subjects(),
+        Some(retry_subjects.clone())
+    );
+    assert_eq!(runtime.requeue_after_timeout(retry_subjects, 1), (0, 1));
+    assert_eq!(runtime.take_pending_subjects(), None);
+    assert!(!runtime.active);
+    assert!(runtime.timeout_retries.is_empty());
 }
 
 #[tokio::test]
@@ -23111,6 +23126,57 @@ async fn repair_activity_reports_executor_queue_depth() {
     assert_eq!(repair.active, 0, "a queued run is not executing yet");
 
     waiter.abort();
+    drop(tracker);
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn cluster_tracker_runs_peer_phase_after_local_executor_timeout() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    *state.maintenance.startup_repair_status.lock().await = StartupRepairStatus::Disabled;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Cluster,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+
+    let (_, report) = super::execute_serialized_local_replication_repair_phase(
+        &state,
+        None,
+        None,
+        Some(&tracker.run_id),
+        super::RepairRunTrigger::ManualRequest,
+        Some(&tracker),
+        tokio::time::Instant::now() + Duration::from_millis(10),
+    )
+    .await;
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("cluster peer phase activity should remain visible");
+    assert_eq!(activity.state, super::RepairActivityState::Running);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Running
+    );
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(repair.pending, 0);
+    assert_eq!(repair.active, 1);
+
     drop(tracker);
     drop(active);
     cleanup_test_state(&state).await;

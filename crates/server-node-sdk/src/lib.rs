@@ -4122,19 +4122,18 @@ struct RepairExecutorState {
 struct AutonomousPostWriteRepairRuntime {
     active: bool,
     pending_subjects: BTreeSet<String>,
+    timeout_retries: HashMap<String, u32>,
 }
 
 impl AutonomousPostWriteRepairRuntime {
-    fn requeue(&mut self, subjects: impl IntoIterator<Item = String>) {
-        self.pending_subjects.extend(
-            subjects
-                .into_iter()
-                .filter(|subject| !subject.trim().is_empty()),
-        );
-    }
-
     fn enqueue(&mut self, subjects: impl IntoIterator<Item = String>) -> bool {
-        self.requeue(subjects);
+        for subject in subjects
+            .into_iter()
+            .filter(|subject| !subject.trim().is_empty())
+        {
+            self.timeout_retries.remove(&subject);
+            self.pending_subjects.insert(subject);
+        }
         if self.pending_subjects.is_empty() || self.active {
             return false;
         }
@@ -4153,6 +4152,34 @@ impl AutonomousPostWriteRepairRuntime {
                 .into_iter()
                 .collect(),
         )
+    }
+
+    fn requeue_after_timeout(
+        &mut self,
+        subjects: impl IntoIterator<Item = String>,
+        max_retries: u32,
+    ) -> (usize, usize) {
+        let mut requeued = 0usize;
+        let mut exhausted = 0usize;
+        for subject in subjects {
+            let retries = self.timeout_retries.get(&subject).copied().unwrap_or(0);
+            if retries >= max_retries {
+                self.timeout_retries.remove(&subject);
+                exhausted += 1;
+                continue;
+            }
+            self.timeout_retries
+                .insert(subject.clone(), retries.saturating_add(1));
+            self.pending_subjects.insert(subject);
+            requeued += 1;
+        }
+        (requeued, exhausted)
+    }
+
+    fn clear_timeout_retries(&mut self, subjects: impl IntoIterator<Item = String>) {
+        for subject in subjects {
+            self.timeout_retries.remove(&subject);
+        }
     }
 }
 
@@ -13179,6 +13206,11 @@ async fn execute_serialized_local_replication_repair_phase(
                 )
             },
         );
+        if let Some(tracker) = tracker {
+            // The cluster coordinator continues into its peer phase even when
+            // this node could not enter the local executor before the deadline.
+            tracker.set_phase(RepairActiveRunPhase::Running);
+        }
         return (timeout_plan_summary, report);
     };
     if let Some(tracker) = tracker {
@@ -15807,16 +15839,26 @@ async fn run_autonomous_post_write_replication(state: ServerState) {
         )
         .await;
         if report.run_status() == RepairRunStatus::TimedOut {
+            let (requeued, exhausted) = state
+                .maintenance
+                .autonomous_post_write_repair
+                .lock()
+                .await
+                .requeue_after_timeout(subjects.iter().cloned(), state.repair_config.max_retries);
+            warn!(
+                subject_count = subjects.len(),
+                requeued,
+                exhausted,
+                max_retries = state.repair_config.max_retries,
+                "processed autonomous post-write replication execution timeout"
+            );
+        } else {
             state
                 .maintenance
                 .autonomous_post_write_repair
                 .lock()
                 .await
-                .requeue(subjects.iter().cloned());
-            warn!(
-                subject_count = subjects.len(),
-                "requeued autonomous post-write replication after execution timeout"
-            );
+                .clear_timeout_retries(subjects.iter().cloned());
         }
         if report.attempted_transfers > 0 || report.failed_transfers > 0 {
             info!(
