@@ -3701,7 +3701,6 @@ impl RepairActiveRunProgress {
         match &item.reason {
             replication::ReplicationRepairSkipReason::RepairInProgress => {
                 self.skipped_items += 1;
-                self.attempted_transfers = self.attempted_transfers.saturating_sub(1);
             }
             replication::ReplicationRepairSkipReason::BackoffActive => {
                 self.skipped_backoff += 1;
@@ -3716,6 +3715,10 @@ impl RepairActiveRunProgress {
         if self.skipped_details.len() < replication::MAX_REPAIR_REPORT_SKIPPED_DETAILS {
             self.skipped_details.push(item.clone());
         }
+    }
+
+    fn rollback_attempted_transfer(&mut self) {
+        self.attempted_transfers = self.attempted_transfers.saturating_sub(1);
     }
 
     fn apply_delta_to_report(
@@ -3798,6 +3801,13 @@ impl RepairActiveRunLiveLogHandle {
         match self.progress.lock() {
             Ok(mut progress) => progress.record_skipped_item(item),
             Err(poisoned) => poisoned.into_inner().record_skipped_item(item),
+        }
+    }
+
+    fn rollback_attempted_transfer(&self) {
+        match self.progress.lock() {
+            Ok(mut progress) => progress.rollback_attempted_transfer(),
+            Err(poisoned) => poisoned.into_inner().rollback_attempted_transfer(),
         }
     }
 }
@@ -13365,6 +13375,12 @@ fn append_active_repair_log_entry(entry: &replication::ReplicationRepairLogEntry
 fn append_active_repair_skipped_item(item: &replication::ReplicationRepairSkippedItem) {
     let _ = ACTIVE_REPAIR_LOG_HANDLE.try_with(|handle| {
         handle.push_skipped_item(item);
+    });
+}
+
+fn rollback_active_repair_attempt() {
+    let _ = ACTIVE_REPAIR_LOG_HANDLE.try_with(|handle| {
+        handle.rollback_attempted_transfer();
     });
 }
 

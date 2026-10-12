@@ -1441,6 +1441,7 @@ pub(crate) async fn execute_replication_repair_plan(
                     // recovering this immutable manifest. No transfer started,
                     // so leave capacity for the rest of this repair batch.
                     attempted_transfers = attempted_transfers.saturating_sub(1);
+                    rollback_active_repair_attempt();
                     skipped_items += 1;
                     push_repair_skipped_detail(
                         &mut skipped_details,
@@ -1936,17 +1937,12 @@ pub(crate) async fn execute_replication_repair_plan(
     }
 }
 
-fn fair_peer_request_deadline(
-    phase_deadline: tokio::time::Instant,
-    now: tokio::time::Instant,
-    peers_left: usize,
-) -> tokio::time::Instant {
-    let peers_left = u32::try_from(peers_left).unwrap_or(u32::MAX).max(1);
-    now + phase_deadline.saturating_duration_since(now) / peers_left
-}
-
 fn peer_phase_budget(per_peer_budget: Duration, peer_count: usize) -> Duration {
-    per_peer_budget.saturating_mul(u32::try_from(peer_count).unwrap_or(u32::MAX))
+    if peer_count == 0 {
+        Duration::ZERO
+    } else {
+        per_peer_budget
+    }
 }
 
 fn peer_execution_budget(request_budget: Duration) -> Duration {
@@ -2083,12 +2079,13 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
     let peer_request_timeout_secs = peer_repair_request_timeout_secs(state);
     let peer_phase_deadline = tokio::time::Instant::now()
         + peer_phase_budget(Duration::from_secs(peer_request_timeout_secs), peer_count);
-    for (peer_index, peer) in peers.into_iter().enumerate() {
-        let peers_left = peer_count.saturating_sub(peer_index);
-        let now = tokio::time::Instant::now();
-        let peer_deadline = fair_peer_request_deadline(peer_phase_deadline, now, peers_left);
+    // Every peer serializes repair execution locally. Fan requests out together
+    // so each node receives the full execution budget while the coordinator's
+    // aggregate peer phase remains bounded by that same absolute deadline.
+    let mut peer_requests = Vec::with_capacity(peer_count);
+    for peer in peers {
         let execution_budget_millis = u64::try_from(
-            peer_execution_budget(peer_deadline.saturating_duration_since(now)).as_millis(),
+            peer_execution_budget(Duration::from_secs(peer_request_timeout_secs)).as_millis(),
         )
         .unwrap_or(u64::MAX)
         .max(1);
@@ -2117,24 +2114,29 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                 "path": path,
             })),
         );
-        let peer_result = tokio::time::timeout_at(
-            peer_deadline,
-            execute_peer_request(
-                state,
-                &peer,
-                reqwest::Method::POST,
-                &path,
-                Vec::new(),
-                Vec::new(),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "peer repair request exhausted its fair share of the {peer_request_timeout_secs}-second per-peer budget"
+        peer_requests.push(async move {
+            let peer_result = tokio::time::timeout_at(
+                peer_phase_deadline,
+                execute_peer_request(
+                    state,
+                    &peer,
+                    reqwest::Method::POST,
+                    &path,
+                    Vec::new(),
+                    Vec::new(),
+                ),
             )
-        })
-        .and_then(|result| result);
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "peer repair request exhausted the {peer_request_timeout_secs}-second cluster peer phase budget"
+                )
+            })
+            .and_then(|result| result);
+            (peer, peer_result)
+        });
+    }
+    for (peer, peer_result) in futures_util::future::join_all(peer_requests).await {
         match peer_result {
             Ok(response) if response.is_success() => {
                 match response.json::<ReplicationRepairReport>() {
@@ -3095,24 +3097,12 @@ mod tests {
     }
 
     #[test]
-    fn peer_phase_budget_preserves_each_peers_request_budget() {
-        let phase_started = tokio::time::Instant::now();
-        let phase_deadline = phase_started + peer_phase_budget(Duration::from_secs(1_830), 3);
+    fn peer_phase_budget_is_bounded_independent_of_peer_count() {
+        let request_budget = Duration::from_secs(1_830);
 
-        let first_deadline = fair_peer_request_deadline(phase_deadline, phase_started, 3);
-        assert_eq!(
-            first_deadline.duration_since(phase_started),
-            Duration::from_secs(1_830)
-        );
-
-        let second_started = phase_started + Duration::from_secs(900);
-        let second_deadline = fair_peer_request_deadline(phase_deadline, second_started, 2);
-        assert_eq!(
-            second_deadline.duration_since(second_started),
-            Duration::from_secs(2_295),
-            "an early peer completion should redistribute its unused share"
-        );
-        assert!(second_deadline < phase_deadline);
+        assert_eq!(peer_phase_budget(request_budget, 1), request_budget);
+        assert_eq!(peer_phase_budget(request_budget, 40), request_budget);
+        assert_eq!(peer_phase_budget(request_budget, 0), Duration::ZERO);
     }
 
     #[test]

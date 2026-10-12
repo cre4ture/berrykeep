@@ -22834,6 +22834,31 @@ fn timeout_progress_flags_remain_monotonic_across_a_baseline() {
     assert!(report.unresolved);
 }
 
+#[test]
+fn repair_in_progress_skip_does_not_rollback_an_unrelated_transfer() {
+    let node_id = NodeId::new_v4();
+    let mut progress = super::RepairActiveRunProgress {
+        attempted_transfers: 2,
+        ..Default::default()
+    };
+    progress.record_skipped_item(&super::replication::ReplicationRepairSkippedItem {
+        report_node_id: node_id,
+        subject: "manifest:claimed".to_string(),
+        key: None,
+        version_id: None,
+        source_node_id: None,
+        target_node_id: Some(node_id),
+        reason: super::replication::ReplicationRepairSkipReason::RepairInProgress,
+        detail: "another operation owns the manifest".to_string(),
+    });
+
+    assert_eq!(progress.attempted_transfers, 2);
+    assert_eq!(progress.skipped_items, 1);
+
+    progress.rollback_attempted_transfer();
+    assert_eq!(progress.attempted_transfers, 1);
+}
+
 #[tokio::test]
 async fn timed_out_report_uses_monotonic_cursor_after_live_log_truncation() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
