@@ -42,19 +42,7 @@ jobs:
 
       - name: Install Linux FUSE runtime
         if: ${{ matrix.label == 'linux' }}
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes fuse3
-          fusermount3_path="$(dpkg-query --listfiles fuse3 | awk '/\/fusermount3$/ { print; exit }')"
-          test -n "$fusermount3_path"
-          export PATH="$(dirname "$fusermount3_path"):$PATH"
-          echo "PATH=$PATH" >> "$GITHUB_ENV"
-          test "$(readlink -f "$(command -v fusermount3)")" = "$(readlink -f "$fusermount3_path")"
-          test -c /dev/fuse
-          test -r /dev/fuse
-          test -w /dev/fuse
-          ls -l /dev/fuse "$fusermount3_path"
+        uses: ./.github/actions/setup-linux-fuse
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

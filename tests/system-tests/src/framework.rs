@@ -18,6 +18,13 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::sleep;
 use uuid::Uuid;
 
+#[cfg(unix)]
+use nix::{
+    errno::Errno,
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+
 pub const TEST_ADMIN_TOKEN: &str = "system-test-admin";
 
 type ResourceMutex = Arc<AsyncMutex<()>>;
@@ -298,6 +305,7 @@ pub struct ChildGuard {
     child: Option<Child>,
     _resource_guards: Vec<TestResourceGuard>,
     cleanup_commands: Vec<CleanupCommand>,
+    require_graceful_shutdown: bool,
 }
 
 #[derive(Debug)]
@@ -397,7 +405,13 @@ impl ChildGuard {
             child: Some(child),
             _resource_guards: resource_guards,
             cleanup_commands: Vec::new(),
+            require_graceful_shutdown: false,
         }
+    }
+
+    pub fn require_graceful_shutdown(mut self) -> Self {
+        self.require_graceful_shutdown = cfg!(unix);
+        self
     }
 
     pub fn id(&self) -> Option<u32> {
@@ -417,16 +431,19 @@ impl ChildGuard {
     }
 
     pub async fn stop(&mut self) -> Result<()> {
+        self.stop_with_mode(self.require_graceful_shutdown).await
+    }
+
+    pub async fn force_stop(&mut self) -> Result<()> {
+        self.stop_with_mode(false).await
+    }
+
+    async fn stop_with_mode(&mut self, require_graceful_shutdown: bool) -> Result<()> {
         let mut stop_error = None;
 
         if let Some(child) = self.child.as_mut() {
-            if let Err(error) = child.kill().await {
-                stop_error =
-                    Some(anyhow::Error::new(error).context("failed to kill child process"));
-            } else if let Err(error) = child.wait().await {
-                stop_error = Some(
-                    anyhow::Error::new(error).context("failed to wait for child process to exit"),
-                );
+            if let Err(error) = stop_child(child, require_graceful_shutdown).await {
+                stop_error = Some(error);
             }
             self.child = None;
         }
@@ -451,11 +468,7 @@ impl ChildGuard {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub async fn stop_without_cleanup(&mut self) -> Result<()> {
         if let Some(child) = self.child.as_mut() {
-            child.kill().await.context("failed to kill child process")?;
-            child
-                .wait()
-                .await
-                .context("failed to wait for child process to exit")?;
+            stop_child(child, self.require_graceful_shutdown).await?;
             self.child = None;
         }
 
@@ -463,6 +476,86 @@ impl ChildGuard {
         self._resource_guards.clear();
         Ok(())
     }
+}
+
+#[cfg(unix)]
+async fn stop_child(child: &mut Child, require_graceful_shutdown: bool) -> Result<()> {
+    const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+    if let Some(status) = child
+        .try_wait()
+        .context("failed to query child process state")?
+    {
+        return if require_graceful_shutdown {
+            validate_graceful_child_exit(status)
+        } else {
+            Ok(())
+        };
+    }
+
+    if !require_graceful_shutdown {
+        child.start_kill().context("failed to kill child process")?;
+        child
+            .wait()
+            .await
+            .context("failed to wait for killed child process")?;
+        return Ok(());
+    }
+
+    let Some(process_id) = child.id() else {
+        let status = child
+            .wait()
+            .await
+            .context("failed to wait for child process to exit")?;
+        return validate_graceful_child_exit(status);
+    };
+    let process_id = i32::try_from(process_id).context("child process id exceeds i32")?;
+
+    match kill(Pid::from_raw(process_id), Signal::SIGTERM) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context("failed to request graceful child process shutdown"));
+        }
+    }
+
+    match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, child.wait()).await {
+        Ok(result) => {
+            let status = result.context("failed to wait for child process to exit")?;
+            validate_graceful_child_exit(status)?;
+        }
+        Err(_) => {
+            child
+                .start_kill()
+                .context("failed to force-kill child process after graceful shutdown timed out")?;
+            child
+                .wait()
+                .await
+                .context("failed to wait for force-killed child process to exit")?;
+            bail!(
+                "child process did not exit within {GRACEFUL_SHUTDOWN_TIMEOUT:?} after SIGTERM and was force-killed"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_graceful_child_exit(status: std::process::ExitStatus) -> Result<()> {
+    if !status.success() {
+        bail!("child process did not shut down gracefully: {status}");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn stop_child(child: &mut Child, _require_graceful_shutdown: bool) -> Result<()> {
+    child.start_kill().context("failed to kill child process")?;
+    child
+        .wait()
+        .await
+        .context("failed to wait for child process to exit")?;
+    Ok(())
 }
 
 impl Drop for ChildGuard {
@@ -593,7 +686,7 @@ pub async fn start_zero_touch_server(bind: &str, data_dir: &Path) -> Result<Chil
         bail!("zero-touch server-node exited early on {bind} with status {status}");
     }
 
-    Ok(ChildGuard::with_resources(child, resource_guards))
+    Ok(ChildGuard::with_resources(child, resource_guards).require_graceful_shutdown())
 }
 
 pub async fn start_open_server_with_data_dir(bind: &str, data_dir: &Path) -> Result<ChildGuard> {
@@ -841,7 +934,7 @@ async fn start_server_with_env_options_inner(
     {
         bail!("server-node exited early on {bind} with status {status}");
     }
-    Ok(ChildGuard::with_resources(child, resource_guards))
+    Ok(ChildGuard::with_resources(child, resource_guards).require_graceful_shutdown())
 }
 
 pub async fn register_node(
@@ -1291,7 +1384,7 @@ pub async fn start_cli_web(bind: &str) -> Result<ChildGuard> {
         .context("failed to spawn cli-client serve-web")?;
 
     wait_for_url_status(&format!("http://{bind}/api/ping"), StatusCode::OK, 40).await?;
-    Ok(ChildGuard::with_resources(child, resource_guards))
+    Ok(ChildGuard::with_resources(child, resource_guards).require_graceful_shutdown())
 }
 
 pub async fn start_rendezvous_service(bind: &str) -> Result<ChildGuard> {
@@ -1365,7 +1458,7 @@ pub async fn start_rendezvous_service_with_env(
         bail!("rendezvous-service exited early on {bind} with status {status}");
     }
 
-    Ok(ChildGuard::with_resources(child, resource_guards))
+    Ok(ChildGuard::with_resources(child, resource_guards).require_graceful_shutdown())
 }
 
 pub async fn wait_for_server(bind: &str, retries: usize) -> Result<()> {
@@ -1597,12 +1690,20 @@ pub async fn wait_for_store_index_entry(
 }
 
 pub async fn stop_server(child: &mut ChildGuard) {
-    child.stop().await.ok();
+    let require_graceful_shutdown = child.require_graceful_shutdown;
+    let result = child.stop().await;
+    if require_graceful_shutdown {
+        result.expect("failed to stop child process cleanly");
+    }
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
 pub async fn stop_server_without_cleanup(child: &mut ChildGuard) {
-    child.stop_without_cleanup().await.ok();
+    let require_graceful_shutdown = child.require_graceful_shutdown;
+    let result = child.stop_without_cleanup().await;
+    if require_graceful_shutdown {
+        result.expect("failed to stop child process cleanly without cleanup");
+    }
 }
 
 pub fn binary_path(name: &str) -> Result<PathBuf> {
@@ -1715,4 +1816,93 @@ pub fn first_chunk_file(root: PathBuf) -> Result<PathBuf> {
     }
 
     bail!("no chunk files found")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn child_guard_stop_requests_graceful_shutdown() -> Result<()> {
+        let test_dir = fresh_data_dir("child-guard-graceful-stop");
+        let flush_marker = test_dir.join("flushed");
+        let ready_marker = test_dir.join("ready");
+        let script = r#"
+trap 'printf flushed > "$1"; exit 0' TERM
+printf ready > "$2"
+while :; do sleep 1; done
+"#;
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("child-guard-graceful-stop")
+            .arg(&flush_marker)
+            .arg(&ready_marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to spawn graceful-shutdown test child")?;
+
+        timeout(Duration::from_secs(5), async {
+            while !ready_marker.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("graceful-shutdown test child did not become ready")?;
+
+        let mut guard = ChildGuard::with_resources(child, Vec::new()).require_graceful_shutdown();
+        guard.stop().await?;
+
+        let flushed = fs::read_to_string(&flush_marker)
+            .context("child did not flush state during graceful shutdown")?;
+        let _ = fs::remove_dir_all(&test_dir);
+        assert_eq!(flushed, "flushed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn child_guard_force_stop_overrides_graceful_shutdown() -> Result<()> {
+        let test_dir = fresh_data_dir("child-guard-force-stop");
+        let graceful_marker = test_dir.join("graceful");
+        let ready_marker = test_dir.join("ready");
+        let script = r#"
+trap 'printf graceful > "$1"; exit 0' TERM
+printf ready > "$2"
+while :; do sleep 1; done
+"#;
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("child-guard-force-stop")
+            .arg(&graceful_marker)
+            .arg(&ready_marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to spawn force-stop test child")?;
+
+        timeout(Duration::from_secs(5), async {
+            while !ready_marker.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("force-stop test child did not become ready")?;
+
+        let mut guard = ChildGuard::with_resources(child, Vec::new()).require_graceful_shutdown();
+        timeout(Duration::from_secs(5), guard.force_stop())
+            .await
+            .context("force-stopped child did not stop promptly")??;
+
+        assert!(
+            !graceful_marker.exists(),
+            "force-stopped child unexpectedly received graceful shutdown"
+        );
+        let _ = fs::remove_dir_all(&test_dir);
+        Ok(())
+    }
 }

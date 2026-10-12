@@ -5,6 +5,7 @@ mod global_registration;
 mod iroh_relay;
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -509,6 +510,13 @@ pub fn build_router(state: RendezvousAppState) -> Router {
 }
 
 pub async fn serve(state: RendezvousAppState) -> Result<()> {
+    serve_with_shutdown(state, std::future::pending()).await
+}
+
+pub async fn serve_with_shutdown<F>(state: RendezvousAppState, shutdown: F) -> Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
     let bind_addr = state.config.bind_addr;
     let admission = state.admission;
     let app = build_router(state.clone());
@@ -531,9 +539,16 @@ pub async fn serve(state: RendezvousAppState) -> Result<()> {
         None
     };
 
-    let result =
-        iroh_relay::serve_listener(bind_addr, app, tls_config, relay_service.clone(), admission)
-            .await;
+    let result = tokio::select! {
+        result = iroh_relay::serve_listener(
+            bind_addr,
+            app,
+            tls_config,
+            relay_service.clone(),
+            admission,
+        ) => result,
+        _ = shutdown => Ok(()),
+    };
     if let Some(relay_service) = relay_service {
         relay_service.shutdown().await;
     }
@@ -1963,6 +1978,34 @@ mod tests {
     use transport_sdk::{
         RelayMode, RendezvousClientConfig, RendezvousControlClient, TransportCapability,
     };
+
+    #[tokio::test]
+    async fn serve_with_shutdown_stops_the_listener() {
+        let state = RendezvousAppState::new(RendezvousServerConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind addr should parse"),
+            public_url: "http://127.0.0.1:0".to_string(),
+            relay_public_urls: vec!["http://127.0.0.1:0".to_string()],
+            iroh_relay: None,
+            peer_rendezvous_urls: Vec::new(),
+            mtls: None,
+        })
+        .expect("rendezvous state should build");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_with_shutdown(state, async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        tokio::task::yield_now().await;
+        shutdown_tx
+            .send(())
+            .expect("shutdown receiver should exist");
+
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("rendezvous listener should stop promptly")
+            .expect("rendezvous listener task should join")
+            .expect("rendezvous listener should shut down cleanly");
+    }
 
     fn presence_registration(
         cluster_id: ClusterId,

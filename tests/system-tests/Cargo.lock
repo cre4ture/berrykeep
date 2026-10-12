@@ -6423,6 +6423,7 @@ dependencies = [
  "hmac 0.12.1",
  "image",
  "libc",
+ "nix 0.31.3",
  "os-integration",
  "p256",
  "patchbay",

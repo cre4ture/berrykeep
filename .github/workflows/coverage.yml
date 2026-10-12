@@ -25,9 +25,11 @@ jobs:
   coverage:
     name: Cov
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
+      CARGO_LLVM_COV_TARGET_DIR: ${{ github.workspace }}/target/llvm-cov-target
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,9 +51,24 @@ jobs:
         working-directory: web
         run: pnpm install --frozen-lockfile
 
-      - name: Install Rust toolchain with llvm-tools
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux FUSE runtime
+        uses: ./.github/actions/setup-linux-fuse
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
+          python-version: '3.12'
+
+      - name: Install AWS CLI
+        run: python -m pip install --upgrade pip awscli
+
+      - name: Verify AWS CLI
+        run: aws --version
+
+      - name: Install Rust toolchain with llvm-tools
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-02-17
           components: llvm-tools-preview
 
       - name: Setup sccache
@@ -64,21 +81,85 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
 
-      - name: Enforce line coverage threshold
+      - name: Run unit and system coverage
         run: |
-          cargo llvm-cov --locked \
+          coverage_ignore_regex='crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)'
+
+          # The system tests launch Cargo artifact dependencies as child
+          # processes. Keep one coverage environment active while both the
+          # workspace tests and those external binaries run so their profiles
+          # and coverage objects are merged into the same report.
+          export CARGO_TARGET_DIR="${CARGO_LLVM_COV_TARGET_DIR}"
+          eval "$(cargo +nightly-2026-02-17 llvm-cov show-env --sh)"
+          cargo +nightly-2026-02-17 llvm-cov clean --workspace
+          cargo +nightly-2026-02-17 test --locked \
+            --workspace \
+            --all-features
+
+          cargo +nightly-2026-02-17 test --locked \
+            -Z bindeps \
+            --manifest-path tests/system-tests/Cargo.toml \
+            --lib
+
+          mkdir -p target/coverage
+          cargo +nightly-2026-02-17 llvm-cov report \
             -p client-sdk \
             -p sync-core \
             -p transport-sdk \
             -p rendezvous-server \
             -p server-node-sdk \
-            --lib \
-            --all-features \
+            --lcov \
+            --output-path target/coverage/lcov.info \
+            --ignore-filename-regex "${coverage_ignore_regex}"
+
+          reconcile_start="$(grep -nF '// COVERAGE_CANARY_START: reconcile_from_node' crates/server-node-sdk/src/lib.rs | cut -d: -f1)"
+          reconcile_end="$(grep -nF '// COVERAGE_CANARY_END: reconcile_from_node' crates/server-node-sdk/src/lib.rs | cut -d: -f1)"
+          if [[ ! "${reconcile_start}" =~ ^[0-9]+$ || ! "${reconcile_end}" =~ ^[0-9]+$ || "${reconcile_start}" -ge "${reconcile_end}" ]]; then
+            echo "::error::invalid reconcile_from_node coverage canary markers"
+            exit 1
+          fi
+          awk -v expected_start="${reconcile_start}" -v expected_end="${reconcile_end}" '
+            /^SF:/ {
+              selected = ($0 ~ /\/crates\/server-node-sdk\/src\/lib\.rs$/)
+              next
+            }
+            selected && /^DA:/ {
+              split(substr($0, 4), values, ",")
+              if (values[1] >= expected_start && values[1] <= expected_end && values[2] + 0 > 0) {
+                if (!covered) {
+                  printf "reconcile_from_node coverage canary: DA:%s,%s\n", values[1], values[2]
+                }
+                covered = 1
+              }
+            }
+            END { exit covered ? 0 : 1 }
+          ' target/coverage/lcov.info || {
+            echo "::error::system-test coverage is missing for reconcile_from_node"
+            exit 1
+          }
+
+          cargo +nightly-2026-02-17 llvm-cov report \
+            -p client-sdk \
+            -p sync-core \
+            -p transport-sdk \
+            -p rendezvous-server \
+            -p server-node-sdk \
             --summary-only \
-            --ignore-filename-regex 'crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)' \
+            --ignore-filename-regex "${coverage_ignore_regex}" \
             --fail-under-lines 68
+
+      - name: Upload line coverage report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-line-coverage
+          path: target/coverage/lcov.info
+          if-no-files-found: warn
+          retention-days: 14
 
   required-coverage:
     name: Required coverage

@@ -144,7 +144,7 @@ async fn start_folder_agent(
         bail!("berrykeep-folder-agent exited early with status {status}");
     }
 
-    Ok(ChildGuard::with_resources(child, resource_guards))
+    Ok(ChildGuard::with_resources(child, resource_guards).require_graceful_shutdown())
 }
 
 async fn spawn_folder_agent_no_wait(
@@ -543,6 +543,10 @@ async fn delete_remote_key_by_query(sdk: &BerryKeepClient, key: &str) -> Result<
 
 async fn stop_folder_agent(agent: &mut ChildGuard) {
     agent.stop().await.ok();
+}
+
+async fn crash_folder_agent(agent: &mut ChildGuard) {
+    agent.force_stop().await.ok();
 }
 
 fn baseline_db_path(
@@ -1764,7 +1768,7 @@ async fn folder_agent_recovers_local_offline_changes_after_unfriendly_stop() -> 
         wait_for_remote_file_bytes(&sdk, "crash-case/existing.txt", b"before-crash", 220).await?;
 
         // Intentionally kill the process (unfriendly stop simulation).
-        stop_folder_agent(&mut first_run).await;
+        crash_folder_agent(&mut first_run).await;
 
         fs::write(
             local_root.join("crash-case/existing.txt"),
@@ -2369,7 +2373,7 @@ async fn folder_agent_ignores_partial_download_artifacts_after_crash() -> Result
         let artifact = artifact.context("did not observe download temp artifact before crash")?;
 
         // Kill the agent while it is mid-download (temp file exists, target still old).
-        stop_folder_agent(&mut first_run).await;
+        crash_folder_agent(&mut first_run).await;
 
         assert!(
             artifact.exists(),

@@ -3,8 +3,11 @@ mod failover;
 
 use crate::config::RendezvousServiceConfig;
 use anyhow::Result;
-use rendezvous_server::{RendezvousAppState, serve as serve_rendezvous};
+use rendezvous_server::{RendezvousAppState, serve_with_shutdown};
 use tracing::info;
+
+#[cfg(test)]
+use rendezvous_server::serve as serve_rendezvous;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,10 +57,10 @@ async fn run_with_config(config: RendezvousServiceConfig) -> Result<()> {
         );
     }
 
-    serve_rendezvous(RendezvousAppState::new_with_admission(
-        config.server_config(),
-        config.admission,
-    )?)
+    serve_with_shutdown(
+        RendezvousAppState::new_with_admission(config.server_config(), config.admission)?,
+        common::shutdown::wait_for_shutdown_signal(),
+    )
     .await
 }
 

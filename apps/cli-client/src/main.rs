@@ -448,7 +448,9 @@ async fn run() -> Result<()> {
                 .route("/{*path}", any(s3_gateway_proxy))
                 .with_state(S3GatewayState { client });
             let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-            axum::serve(listener, app).await?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(common::shutdown::wait_for_shutdown_signal())
+                .await?;
             Ok(())
         }
         Commands::ServeWeb { bind } => {
@@ -500,7 +502,9 @@ async fn run() -> Result<()> {
             info!(bind_addr = %bind_addr, "cli web interface listening");
             println!("web interface at http://{bind_addr}");
             let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-            axum::serve(listener, app).await?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(common::shutdown::wait_for_shutdown_signal())
+                .await?;
             Ok(())
         }
     }

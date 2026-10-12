@@ -38,6 +38,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 web-ui-backend = { path = "../../crates/web-ui-backend" }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
+
 [target.'cfg(windows)'.dependencies]
 adapter-windows-cfapi = { path = "../../crates/adapter-windows-cfapi" }
 windows-thumbnail-provider = { path = "../../crates/windows-thumbnail-provider" }
