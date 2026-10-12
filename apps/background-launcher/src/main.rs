@@ -3,13 +3,19 @@
 use anyhow::{Context, Result};
 use desktop_client_config::{
     CONFIG_APP_EXE, ManagedInstanceStore, default_instance_store_path, default_launch_report_path,
-    launch_enabled_instances, package_root_from_current_exe, save_launch_report,
+    launch_enabled_instances, migrate_legacy_virtualized_windows_state,
+    package_root_from_current_exe, save_launch_report,
 };
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 fn main() -> Result<()> {
+    if let Err(error) = migrate_legacy_virtualized_windows_state() {
+        eprintln!(
+            "background-launcher: legacy MSIX state migration failed; continuing without migration: {error:#}"
+        );
+    }
     let package_root = package_root_from_current_exe()?;
     let instance_store_path = default_instance_store_path();
     let launch_report_path = default_launch_report_path();

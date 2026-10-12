@@ -27,9 +27,9 @@ use desktop_client_config::{
     ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
     default_service_log_dir, generate_instance_id, launch_client_cli_instance,
     launch_enabled_instances, launch_folder_agent_instance, launch_os_integration_instance,
-    launch_report_with_updated_outcome, load_last_launch_report, package_root_from_current_exe,
-    save_launch_report, service_desktop_status_file_path, service_runtime_statuses,
-    stop_service_from_report,
+    launch_report_with_updated_outcome, load_last_launch_report,
+    migrate_legacy_virtualized_windows_state, package_root_from_current_exe, save_launch_report,
+    service_desktop_status_file_path, service_runtime_statuses, stop_service_from_report,
 };
 use desktop_status::{
     DesktopServiceStatus, DesktopStatusDocument, GNOME_EXTENSION_UUID, StatusFacet, StatusSnapshot,
@@ -593,6 +593,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Some(command) = cli.command.as_ref() {
         return run_command(&cli, command);
+    }
+
+    if let Err(error) = migrate_legacy_virtualized_windows_state() {
+        eprintln!(
+            "config-app: legacy MSIX state migration failed; continuing without migration: {error:#}"
+        );
     }
 
     let bind_addr: SocketAddr = cli.bind.parse().context("failed parsing --bind address")?;
