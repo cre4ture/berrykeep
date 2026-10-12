@@ -10,6 +10,10 @@ import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
 import { updateGalleryMapClusterGrid } from "./gallery-map-cluster-grid";
 import { galleryMapClusterCellSizeForViewport } from "./gallery-map-cluster-density";
 import {
+  isGalleryMapLocationOccluded,
+  type GalleryMapOcclusionAdapter
+} from "./gallery-map-occlusion";
+import {
   clusterScreenPoints,
   type ClusterableScreenPoint,
   type ScreenPointCluster
@@ -40,10 +44,6 @@ const TRANSPARENT_PNG_BYTES = base64ToUint8Array(
 type GalleryBasemapMarkerPoint = ClusterableScreenPoint<GalleryBasemapMapCluster> & {
   latitude: number;
   longitude: number;
-};
-
-type GalleryBasemapOcclusionTransform = {
-  isLocationOccluded?: (location: maplibregl.LngLat) => boolean;
 };
 
 type GalleryBasemapMapEntry = {
@@ -1307,10 +1307,10 @@ function isBasemapLocationOccluded(
   longitude: number,
   latitude: number
 ): boolean {
-  // Match MapLibre Marker's globe occlusion behavior by using the same internal transform hook.
-  const transform = (map as maplibregl.Map & { transform?: GalleryBasemapOcclusionTransform })
-    .transform;
-  return transform?.isLocationOccluded?.(new maplibregl.LngLat(longitude, latitude)) ?? false;
+  return isGalleryMapLocationOccluded(
+    map as unknown as GalleryMapOcclusionAdapter<maplibregl.LngLat>,
+    new maplibregl.LngLat(longitude, latitude)
+  );
 }
 
 function formatClusterCount(count: number): string {
