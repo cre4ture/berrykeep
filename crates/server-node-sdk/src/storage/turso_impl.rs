@@ -3089,7 +3089,7 @@ impl MetadataStore for TursoMetadataStore {
             return Ok(std::collections::HashSet::new());
         }
         let connection = self
-            .open_lookup_connection("locally owned manifest filter")
+            .open_scan_connection("locally owned manifest filter")
             .await?;
         let mut owned = std::collections::HashSet::with_capacity(manifest_hashes.len());
         for chunk in manifest_hashes.chunks(TURSO_LOCALLY_OWNED_QUERY_BATCH_SIZE) {
@@ -4731,6 +4731,14 @@ mod tests {
         .expect("lookup saturation must not block S3 version scans")
         .expect("S3 object versions should load");
         assert!(s3_versions.is_empty());
+        let owned_manifests = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.filter_locally_owned_manifests(&["missing".to_string()]),
+        )
+        .await
+        .expect("lookup saturation must not block locally owned manifest scans")
+        .expect("locally owned manifests should load");
+        assert!(owned_manifests.is_empty());
 
         drop(lookup_connections);
         drop(store);
