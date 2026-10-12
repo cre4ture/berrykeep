@@ -478,7 +478,20 @@ async fn stop_child(child: &mut Child, require_graceful_shutdown: bool) -> Resul
         .try_wait()
         .context("failed to query child process state")?
     {
-        return validate_child_exit(status, require_graceful_shutdown);
+        return if require_graceful_shutdown {
+            validate_graceful_child_exit(status)
+        } else {
+            Ok(())
+        };
+    }
+
+    if !require_graceful_shutdown {
+        child.start_kill().context("failed to kill child process")?;
+        child
+            .wait()
+            .await
+            .context("failed to wait for killed child process")?;
+        return Ok(());
     }
 
     let Some(process_id) = child.id() else {
@@ -486,7 +499,7 @@ async fn stop_child(child: &mut Child, require_graceful_shutdown: bool) -> Resul
             .wait()
             .await
             .context("failed to wait for child process to exit")?;
-        return validate_child_exit(status, require_graceful_shutdown);
+        return validate_graceful_child_exit(status);
     };
     let process_id = i32::try_from(process_id).context("child process id exceeds i32")?;
 
@@ -501,7 +514,7 @@ async fn stop_child(child: &mut Child, require_graceful_shutdown: bool) -> Resul
     match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, child.wait()).await {
         Ok(result) => {
             let status = result.context("failed to wait for child process to exit")?;
-            validate_child_exit(status, require_graceful_shutdown)?;
+            validate_graceful_child_exit(status)?;
         }
         Err(_) => {
             child
@@ -520,11 +533,8 @@ async fn stop_child(child: &mut Child, require_graceful_shutdown: bool) -> Resul
 }
 
 #[cfg(unix)]
-fn validate_child_exit(
-    status: std::process::ExitStatus,
-    require_graceful_shutdown: bool,
-) -> Result<()> {
-    if require_graceful_shutdown && !status.success() {
+fn validate_graceful_child_exit(status: std::process::ExitStatus) -> Result<()> {
+    if !status.success() {
         bail!("child process did not shut down gracefully: {status}");
     }
     Ok(())
@@ -1840,6 +1850,49 @@ while :; do sleep 1; done
             .context("child did not flush state during graceful shutdown")?;
         let _ = fs::remove_dir_all(&test_dir);
         assert_eq!(flushed, "flushed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn child_guard_stop_force_kills_unmarked_child() -> Result<()> {
+        let test_dir = fresh_data_dir("child-guard-force-stop");
+        let graceful_marker = test_dir.join("graceful");
+        let ready_marker = test_dir.join("ready");
+        let script = r#"
+trap 'printf graceful > "$1"; exit 0' TERM
+printf ready > "$2"
+while :; do sleep 1; done
+"#;
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("child-guard-force-stop")
+            .arg(&graceful_marker)
+            .arg(&ready_marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to spawn force-stop test child")?;
+
+        timeout(Duration::from_secs(5), async {
+            while !ready_marker.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("force-stop test child did not become ready")?;
+
+        let mut guard = ChildGuard::with_resources(child, Vec::new());
+        timeout(Duration::from_secs(5), guard.stop())
+            .await
+            .context("unmarked child did not stop promptly")??;
+
+        assert!(
+            !graceful_marker.exists(),
+            "unmarked child unexpectedly received graceful shutdown"
+        );
+        let _ = fs::remove_dir_all(&test_dir);
         Ok(())
     }
 }
