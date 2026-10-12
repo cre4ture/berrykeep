@@ -21,6 +21,7 @@ mod gallery;
 const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
 const DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT: usize = 1;
 const DEFAULT_TURSO_SCAN_READ_CONNECTION_COUNT: usize = 4;
+const DEFAULT_TURSO_LOOKUP_READ_CONNECTION_COUNT: usize = 4;
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS,
@@ -52,6 +53,7 @@ pub(super) struct TursoMetadataStore {
     /// produced by the primary connection has been consumed, not just until `query` returns.
     connection_lock: tokio::sync::Mutex<()>,
     scan_read_permits: Arc<tokio::sync::Semaphore>,
+    lookup_read_permits: Arc<tokio::sync::Semaphore>,
     gallery_read_permits: Arc<tokio::sync::Semaphore>,
     gallery_summary_read_permits: Arc<tokio::sync::Semaphore>,
     metadata_path: PathBuf,
@@ -166,6 +168,9 @@ impl TursoMetadataStore {
             scan_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_TURSO_SCAN_READ_CONNECTION_COUNT,
             )),
+            lookup_read_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_TURSO_LOOKUP_READ_CONNECTION_COUNT,
+            )),
             gallery_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT,
             )),
@@ -186,6 +191,18 @@ impl TursoMetadataStore {
             &self.database,
             &self.metadata_path,
             self.scan_read_permits.clone(),
+            operation,
+        )
+        .await
+    }
+
+    /// Keep request- and key-bounded reads responsive when background full-table scans saturate
+    /// their separate connection budget.
+    async fn open_lookup_connection(&self, operation: &str) -> Result<TursoReadConnection> {
+        open_bounded_read_connection(
+            &self.database,
+            &self.metadata_path,
+            self.lookup_read_permits.clone(),
             operation,
         )
         .await
@@ -413,7 +430,7 @@ impl MetadataStore for TursoMetadataStore {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
-        let connection = self.open_scan_connection("gallery object labels").await?;
+        let connection = self.open_lookup_connection("gallery object labels").await?;
         const LABEL_LOOKUP_CHUNK_SIZE: usize = 500;
         let mut labels_by_key = HashMap::new();
         for keys in keys.chunks(LABEL_LOOKUP_CHUNK_SIZE) {
@@ -445,7 +462,7 @@ impl MetadataStore for TursoMetadataStore {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
-        let connection = self.open_scan_connection("gallery object GPS").await?;
+        let connection = self.open_lookup_connection("gallery object GPS").await?;
         const GPS_LOOKUP_CHUNK_SIZE: usize = 500;
         let mut gps_by_key = HashMap::new();
         for keys in keys.chunks(GPS_LOOKUP_CHUNK_SIZE) {
@@ -543,7 +560,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>> {
-        let connection = self.open_scan_connection("object keys by ID").await?;
+        let connection = self.open_lookup_connection("object keys by ID").await?;
         let mut rows = connection
             .query(
                 "SELECT key FROM current_objects WHERE object_id = ?1",
@@ -613,7 +630,7 @@ impl MetadataStore for TursoMetadataStore {
             return Ok(Vec::new());
         }
         let connection = self
-            .open_scan_connection("selected content repair tasks")
+            .open_lookup_connection("selected content repair tasks")
             .await?;
         let mut tasks = Vec::<ContentRepairTask>::new();
         let mut invalid_tasks = Vec::new();
@@ -1230,7 +1247,9 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<Vec<OperationResultChunk>> {
-        let connection = self.open_scan_connection("operation result chunks").await?;
+        let connection = self
+            .open_lookup_connection("operation result chunks")
+            .await?;
         let mut rows = match limit {
             Some(limit) => {
                 connection
@@ -1759,7 +1778,9 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
-        let connection = self.open_scan_connection("snapshot manifest by ID").await?;
+        let connection = self
+            .open_lookup_connection("snapshot manifest by ID")
+            .await?;
         let mut rows = connection
             .query(
                 "SELECT snapshot_json FROM snapshots WHERE snapshot_id = ?1",
@@ -1882,7 +1903,7 @@ impl MetadataStore for TursoMetadataStore {
         }
         let mut metadata_by_content_fingerprint =
             HashMap::with_capacity(content_fingerprints.len());
-        let connection = self.open_scan_connection("cached media metadata").await?;
+        let connection = self.open_lookup_connection("cached media metadata").await?;
         let mut invalid_rows = Vec::new();
 
         for chunk in content_fingerprints.chunks(TURSO_MEDIA_CACHE_QUERY_BATCH_SIZE) {
@@ -1994,7 +2015,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         query: &DataChangeEventQuery,
     ) -> Result<Vec<DataChangeEvent>> {
-        let connection = self.open_scan_connection("data change events").await?;
+        let connection = self.open_lookup_connection("data change events").await?;
         let limit = match query.limit {
             Some(limit) => i64::try_from(limit).context("data change event limit overflow")?,
             None => i64::MAX,
@@ -2154,7 +2175,7 @@ impl MetadataStore for TursoMetadataStore {
         if manifest_hashes.is_empty() {
             return Ok(HashMap::new());
         }
-        let connection = self.open_scan_connection("manifest summaries").await?;
+        let connection = self.open_lookup_connection("manifest summaries").await?;
         let mut summaries = HashMap::with_capacity(manifest_hashes.len());
         for chunk in manifest_hashes.chunks(TURSO_SUMMARY_QUERY_BATCH_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -2321,7 +2342,7 @@ impl MetadataStore for TursoMetadataStore {
         berrykeep_key: &str,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
         let connection = self
-            .open_scan_connection("S3 object versions for key")
+            .open_lookup_connection("S3 object versions for key")
             .await?;
         let mut rows = connection
             .query(
@@ -2355,7 +2376,7 @@ impl MetadataStore for TursoMetadataStore {
         bucket_name: &str,
         berrykeep_key_prefix: Option<&str>,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
-        let connection = self.open_scan_connection("S3 object versions").await?;
+        let connection = self.open_lookup_connection("S3 object versions").await?;
         let mut records = Vec::new();
         let mut rows = if let Some(prefix) = berrykeep_key_prefix {
             let like_pattern = super::sqlite_like_prefix_pattern(prefix);
@@ -3070,7 +3091,7 @@ impl MetadataStore for TursoMetadataStore {
             return Ok(std::collections::HashSet::new());
         }
         let connection = self
-            .open_scan_connection("locally owned manifest filter")
+            .open_lookup_connection("locally owned manifest filter")
             .await?;
         let mut owned = std::collections::HashSet::with_capacity(manifest_hashes.len());
         for chunk in manifest_hashes.chunks(TURSO_LOCALLY_OWNED_QUERY_BATCH_SIZE) {
@@ -4609,6 +4630,58 @@ mod tests {
             "unfinished operations are never removed by retention"
         );
 
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn lookup_read_connections_are_isolated_and_bounded() {
+        let metadata_db_path = turso_test_db_path("turso-bounded-lookup-read-connections");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+
+        let mut scan_connections = Vec::new();
+        for _ in 0..DEFAULT_TURSO_SCAN_READ_CONNECTION_COUNT {
+            scan_connections.push(
+                store
+                    .open_scan_connection("occupied scan slot")
+                    .await
+                    .expect("scan connection should open within its budget"),
+            );
+        }
+
+        let mut lookup_connections = Vec::new();
+        for _ in 0..DEFAULT_TURSO_LOOKUP_READ_CONNECTION_COUNT {
+            lookup_connections.push(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    store.open_lookup_connection("lookup isolation test"),
+                )
+                .await
+                .expect("scan saturation must not block lookup reads")
+                .expect("lookup connection should open within its budget"),
+            );
+        }
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            store.open_lookup_connection("blocked lookup test"),
+        )
+        .await;
+        assert!(blocked.is_err(), "lookup connection budget must be bounded");
+
+        drop(lookup_connections.pop());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.open_lookup_connection("released lookup test"),
+        )
+        .await
+        .expect("a released lookup permit should unblock the next reader")
+        .expect("lookup connection should open after a permit is released");
+
+        drop(lookup_connections);
+        drop(scan_connections);
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }
