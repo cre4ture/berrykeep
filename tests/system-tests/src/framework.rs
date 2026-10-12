@@ -431,10 +431,18 @@ impl ChildGuard {
     }
 
     pub async fn stop(&mut self) -> Result<()> {
+        self.stop_with_mode(self.require_graceful_shutdown).await
+    }
+
+    pub async fn force_stop(&mut self) -> Result<()> {
+        self.stop_with_mode(false).await
+    }
+
+    async fn stop_with_mode(&mut self, require_graceful_shutdown: bool) -> Result<()> {
         let mut stop_error = None;
 
         if let Some(child) = self.child.as_mut() {
-            if let Err(error) = stop_child(child, self.require_graceful_shutdown).await {
+            if let Err(error) = stop_child(child, require_graceful_shutdown).await {
                 stop_error = Some(error);
             }
             self.child = None;
@@ -1856,7 +1864,7 @@ while :; do sleep 1; done
     }
 
     #[tokio::test]
-    async fn child_guard_stop_force_kills_unmarked_child() -> Result<()> {
+    async fn child_guard_force_stop_overrides_graceful_shutdown() -> Result<()> {
         let test_dir = fresh_data_dir("child-guard-force-stop");
         let graceful_marker = test_dir.join("graceful");
         let ready_marker = test_dir.join("ready");
@@ -1885,14 +1893,14 @@ while :; do sleep 1; done
         .await
         .context("force-stop test child did not become ready")?;
 
-        let mut guard = ChildGuard::with_resources(child, Vec::new());
-        timeout(Duration::from_secs(5), guard.stop())
+        let mut guard = ChildGuard::with_resources(child, Vec::new()).require_graceful_shutdown();
+        timeout(Duration::from_secs(5), guard.force_stop())
             .await
-            .context("unmarked child did not stop promptly")??;
+            .context("force-stopped child did not stop promptly")??;
 
         assert!(
             !graceful_marker.exists(),
-            "unmarked child unexpectedly received graceful shutdown"
+            "force-stopped child unexpectedly received graceful shutdown"
         );
         let _ = fs::remove_dir_all(&test_dir);
         Ok(())
