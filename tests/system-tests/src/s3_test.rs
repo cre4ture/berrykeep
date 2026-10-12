@@ -3426,7 +3426,7 @@ mod tests {
             assert_eq!(revoke_access_key_response.status(), StatusCode::NO_CONTENT);
 
             let status_a =
-                wait_for_s3_control_plane_status(&http, &base_a, 1, 1, Some(node_id_b)).await?;
+                wait_for_s3_control_plane_status(&http, &base_a, 1, 0, Some(node_id_b)).await?;
             assert_eq!(
                 status_a
                     .get("last_source_node_id")
