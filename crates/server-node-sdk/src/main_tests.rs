@@ -26312,6 +26312,109 @@ async fn execute_admin_control_request(
     (status, payload)
 }
 
+async fn expect_admin_control_response(
+    app: &Router,
+    method: Method,
+    path: &str,
+    admin_token: Option<&str>,
+    body: Option<serde_json::Value>,
+    expected_status: StatusCode,
+) -> serde_json::Value {
+    let (status, payload) =
+        execute_admin_control_request(app, method, path, admin_token, body).await;
+    assert_eq!(status, expected_status, "path {path}, payload {payload}");
+    payload
+}
+
+fn test_storage_stats_sample(collected_at_unix: u64) -> super::storage::StorageStatsSample {
+    super::storage::StorageStatsSample {
+        collected_at_unix,
+        latest_snapshot_id: Some(format!("snapshot-{collected_at_unix}")),
+        latest_snapshot_created_at_unix: Some(collected_at_unix.saturating_sub(10)),
+        latest_snapshot_object_count: collected_at_unix as usize / 1_000,
+        chunk_store_bytes: collected_at_unix + 10,
+        manifest_store_bytes: collected_at_unix + 20,
+        metadata_db_bytes: collected_at_unix + 30,
+        media_cache_bytes: collected_at_unix + 40,
+        latest_snapshot_logical_bytes: collected_at_unix + 50,
+        latest_snapshot_unique_chunk_bytes: collected_at_unix + 60,
+        storage_paths: Vec::new(),
+    }
+}
+
+fn test_process_stats_sample(collected_at_unix: u64) -> super::ProcessStatsSample {
+    super::ProcessStatsSample {
+        collected_at_unix,
+        main_cpu_percent: 12.5,
+        main_memory_bytes: 512 * 1024 * 1024,
+        main_disk_read_bytes_per_sec: 4_096,
+        main_disk_write_bytes_per_sec: 2_048,
+        children_cpu_percent: 6.25,
+        children_memory_bytes: 128 * 1024 * 1024,
+        children_disk_read_bytes_per_sec: 1_024,
+        children_disk_write_bytes_per_sec: 512,
+        children_count: 1,
+        temperature_component_count: 1,
+        temperature_reporting_component_count: 1,
+        hottest_temperature_celsius: Some(68.25),
+        average_temperature_celsius: Some(68.25),
+    }
+}
+
+async fn spawn_task_queue_response_server(
+    status: StatusCode,
+    body: String,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("task queue fixture listener should bind");
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().route(
+        "/cluster/task-queues/local",
+        get(move || {
+            let body = body.clone();
+            async move { (status, body) }
+        }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("task queue fixture should serve");
+    });
+    (base_url, handle)
+}
+
+async fn register_task_queue_test_node(
+    state: &ServerState,
+    peer_api_url: Option<&str>,
+    status: super::cluster::NodeStatus,
+) -> NodeId {
+    let node_id = NodeId::new_v4();
+    let descriptor = super::cluster::NodeDescriptor {
+        node_id,
+        hostname: None,
+        reachability: test_node_reachability(peer_api_url, peer_api_url, false),
+        capabilities: super::cluster::NodeCapabilities {
+            public_api: peer_api_url.is_some(),
+            peer_api: peer_api_url.is_some(),
+            relay_tunnel: false,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 1_000_000,
+        free_bytes: 900_000,
+        storage_stats: None,
+        last_heartbeat_unix: 0,
+        status: status.clone(),
+    };
+    let mut cluster = state.cluster.lock().await;
+    if status == super::cluster::NodeStatus::Online {
+        cluster.register_node(descriptor);
+    } else {
+        cluster.import_nodes(vec![descriptor]);
+    }
+    node_id
+}
+
 async fn admin_control_surface_routes_round_trip_runtime_configuration_impl(
     backend: MainTestBackend,
 ) {
@@ -26584,6 +26687,834 @@ run_on_main_metadata_backends!(
     admin_control_surface_routes_round_trip_runtime_configuration_impl,
     admin_control_surface_routes_round_trip_runtime_configuration,
     admin_control_surface_routes_round_trip_runtime_configuration_turso
+);
+
+async fn admin_operations_router_exposes_s3_lifecycle_and_health_views_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    let admin_token = fresh_test_secret("admin-operations");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
+
+    {
+        let store = lock_store(&state, "tests.admin_operations.seed_storage_stats").await;
+        for collected_at_unix in [1_000, 2_000, 3_000, 4_000, 5_000] {
+            store
+                .persist_storage_stats_sample(&test_storage_stats_sample(collected_at_unix))
+                .await
+                .expect("storage stats sample should persist");
+        }
+    }
+    {
+        let mut runtime = state
+            .process_stats_runtime
+            .lock()
+            .expect("process stats runtime lock should not be poisoned");
+        runtime.push(test_process_stats_sample(1_000), Vec::new(), Vec::new(), 8);
+        runtime.push(
+            test_process_stats_sample(2_000),
+            vec![super::ChildProcessStat {
+                pid: 4_242,
+                name: "worker".to_string(),
+                cpu_percent: 6.25,
+                memory_bytes: 128 * 1024 * 1024,
+                disk_read_bytes_per_sec: 1_024,
+                disk_write_bytes_per_sec: 512,
+            }],
+            vec![super::TemperatureComponentStat {
+                label: "CPU package".to_string(),
+                temperature_celsius: Some(68.25),
+                max_celsius: Some(85.0),
+                critical_celsius: Some(100.0),
+            }],
+            8,
+        );
+    }
+
+    let app = super::build_server_apps(&state).public_app;
+    let s3_status_path = "/api/v1/auth/s3/status";
+    let s3_buckets_path = "/api/v1/auth/s3/buckets";
+    let s3_access_keys_path = "/api/v1/auth/s3/access-keys";
+    let valid_bucket_request = serde_json::json!({
+        "bucket_name": "Photos.Example",
+        "root_prefix": " /tenant/photos/ ",
+        "versioning_status": "enabled",
+        "read_only": false
+    });
+    let valid_access_key_request = serde_json::json!({
+        "description": " photos writer ",
+        "bucket_scope": ["photos.example"],
+        "prefix_scope": ["tenant/photos/inbox/"],
+        "allow_list": true,
+        "allow_read": true,
+        "allow_write": true,
+        "allow_delete": false,
+        "allow_manage": false
+    });
+
+    for (method, path, body) in [
+        (Method::GET, s3_status_path, None),
+        (Method::GET, s3_buckets_path, None),
+        (Method::GET, s3_access_keys_path, None),
+        (
+            Method::POST,
+            s3_buckets_path,
+            Some(valid_bucket_request.clone()),
+        ),
+        (
+            Method::POST,
+            s3_access_keys_path,
+            Some(valid_access_key_request.clone()),
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/auth/s3/buckets/unknown.example",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/auth/s3/access-keys/IMUNKNOWN/revoke",
+            None,
+        ),
+    ] {
+        expect_admin_control_response(&app, method, path, None, body, StatusCode::UNAUTHORIZED)
+            .await;
+    }
+
+    for bucket_name in ["ab", "-abc", ".abc", "a..b", "bad/name"] {
+        let payload = expect_admin_control_response(
+            &app,
+            Method::POST,
+            s3_buckets_path,
+            Some(&admin_token),
+            Some(serde_json::json!({ "bucket_name": bucket_name })),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("bucket_name")),
+            "bucket {bucket_name}, payload {payload}"
+        );
+    }
+
+    let initial_status = expect_admin_control_response(
+        &app,
+        Method::GET,
+        s3_status_path,
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(initial_status["listener_enabled"], false);
+    assert_eq!(initial_status["bucket_count"], 0);
+    assert_eq!(initial_status["access_key_count"], 0);
+
+    let created_bucket = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_buckets_path,
+        Some(&admin_token),
+        Some(valid_bucket_request),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(created_bucket["bucket_name"], "photos.example");
+    assert_eq!(created_bucket["root_prefix"], "tenant/photos/");
+    assert_eq!(created_bucket["versioning_status"], "enabled");
+    assert_eq!(created_bucket["read_only"], false);
+
+    let updated_bucket = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_buckets_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "bucket_name": "photos.example",
+            "root_prefix": "tenant/photos",
+            "versioning_status": "disabled",
+            "read_only": true
+        })),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(updated_bucket["bucket_name"], "photos.example");
+    assert_eq!(updated_bucket["versioning_status"], "disabled");
+    assert_eq!(updated_bucket["read_only"], true);
+
+    let conflicting_bucket = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_buckets_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "bucket_name": "videos.example",
+            "root_prefix": "tenant/photos/archive"
+        })),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert!(
+        conflicting_bucket["error"]
+            .as_str()
+            .unwrap()
+            .contains("overlaps")
+    );
+
+    let missing_permissions = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_access_keys_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "allow_list": false,
+            "allow_read": false,
+            "allow_write": false,
+            "allow_delete": false,
+            "allow_manage": false
+        })),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        missing_permissions["error"]
+            .as_str()
+            .unwrap()
+            .contains("at least one S3 permission")
+    );
+
+    let unknown_scope = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_access_keys_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "bucket_scope": ["missing.example"],
+            "allow_read": true
+        })),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        unknown_scope["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown bucket")
+    );
+
+    let created_access_key = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_access_keys_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "description": " photos writer ",
+            "bucket_scope": ["photos.example", "", "photos.example"],
+            "prefix_scope": [
+                "tenant/photos/inbox/",
+                " tenant/photos/archive/ ",
+                "tenant/photos/inbox/"
+            ],
+            "allow_list": true,
+            "allow_read": true,
+            "allow_write": true,
+            "allow_delete": false,
+            "allow_manage": false
+        })),
+        StatusCode::CREATED,
+    )
+    .await;
+    let access_key_id = created_access_key["access_key_id"]
+        .as_str()
+        .expect("created access key id should be returned")
+        .to_string();
+    assert!(access_key_id.starts_with("IM"));
+    assert!(
+        !created_access_key["secret_access_key"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(created_access_key["view"]["description"], "photos writer");
+    assert_eq!(
+        created_access_key["view"]["bucket_scope"],
+        serde_json::json!(["photos.example"])
+    );
+    assert_eq!(
+        created_access_key["view"]["prefix_scope"],
+        serde_json::json!(["tenant/photos/archive/", "tenant/photos/inbox/"])
+    );
+
+    let buckets = expect_admin_control_response(
+        &app,
+        Method::GET,
+        s3_buckets_path,
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(buckets.as_array().unwrap().len(), 1);
+    assert_eq!(buckets[0]["bucket_name"], "photos.example");
+
+    let access_keys = expect_admin_control_response(
+        &app,
+        Method::GET,
+        s3_access_keys_path,
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(access_keys.as_array().unwrap().len(), 1);
+    assert_eq!(access_keys[0]["access_key_id"], access_key_id);
+    assert!(access_keys[0].get("secret_access_key").is_none());
+
+    expect_admin_control_response(
+        &app,
+        Method::DELETE,
+        "/api/v1/auth/s3/buckets/unknown.example",
+        Some(&admin_token),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    expect_admin_control_response(
+        &app,
+        Method::POST,
+        "/api/v1/auth/s3/access-keys/IMUNKNOWN/revoke",
+        Some(&admin_token),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    expect_admin_control_response(
+        &app,
+        Method::POST,
+        &format!("/api/v1/auth/s3/access-keys/{access_key_id}/revoke"),
+        Some(&admin_token),
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    expect_admin_control_response(
+        &app,
+        Method::DELETE,
+        "/api/v1/auth/s3/buckets/photos.example",
+        Some(&admin_token),
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let final_status = expect_admin_control_response(
+        &app,
+        Method::GET,
+        s3_status_path,
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(final_status["bucket_count"], 0);
+    assert_eq!(final_status["access_key_count"], 1);
+    assert!(final_status["local_generation"].as_u64().unwrap() >= 4);
+
+    let operational_read_paths = [
+        "/api/v1/storage/stats/current",
+        "/api/v1/storage/stats/history?since_unix=1000&max_points=3",
+        "/api/v1/process/stats/current",
+        "/api/v1/process/stats/history?limit=1",
+        "/api/v1/process/stats/memory",
+        "/api/v1/auth/storage/pool",
+        "/api/v1/auth/storage/host/volumes",
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        "/api/v1/auth/host/dependencies",
+        "/api/v1/auth/node-certificates/status",
+        "/api/v1/auth/repair/activity",
+        "/api/v1/auth/repair/history?since_unix=1",
+        "/api/v1/auth/repair/actions",
+        "/api/v1/auth/repair/actions/activity",
+        "/api/v1/auth/repair/actions/history?since_unix=1",
+        "/api/v1/auth/scrub/activity",
+        "/api/v1/auth/scrub/history?since_unix=1",
+        "/api/v1/auth/scrub/cluster?since_unix=1",
+        "/api/v1/auth/client-connections",
+        "/api/v1/auth/data-changes",
+    ];
+    for path in operational_read_paths {
+        expect_admin_control_response(
+            &app,
+            Method::GET,
+            path,
+            None,
+            None,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+    }
+
+    let storage_current = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/storage/stats/current",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(storage_current["sample"]["collected_at_unix"], 5_000);
+    assert_eq!(storage_current["sample"]["chunk_store_bytes"], 5_010);
+    assert_eq!(storage_current["collecting"], false);
+
+    let storage_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/storage/stats/history?since_unix=1000&max_points=3",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        storage_history
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|sample| sample["collected_at_unix"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![5_000, 3_000, 1_000]
+    );
+
+    let process_current = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/process/stats/current",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(process_current["sample"]["collected_at_unix"], 2_000);
+    assert_eq!(process_current["children"][0]["name"], "worker");
+    assert_eq!(process_current["logical_cpu_count"], 8);
+
+    let process_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/process/stats/history?limit=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(process_history.as_array().unwrap().len(), 1);
+    assert_eq!(process_history[0]["collected_at_unix"], 2_000);
+
+    let process_memory = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/process/stats/memory",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(process_memory["in_flight_upload_session_count"], 0);
+    assert_eq!(process_memory["current_objects_total_count"], 0);
+
+    let storage_pool = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/storage/pool",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(storage_pool["config_path"].as_str().is_some());
+    assert!(storage_pool["config"].is_object());
+    assert!(storage_pool["paths"].is_array());
+
+    let host_volumes = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/storage/host/volumes",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(host_volumes["platform"], std::env::consts::OS);
+    assert!(host_volumes["volumes"].is_array());
+
+    let metadata_distribution = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(metadata_distribution["state"], "idle");
+    assert!(metadata_distribution["backend"].is_string());
+
+    expect_admin_control_response(
+        &app,
+        Method::POST,
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        None,
+        None,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    let metadata_distribution_trigger = expect_admin_control_response(
+        &app,
+        Method::POST,
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        Some(&admin_token),
+        None,
+        StatusCode::ACCEPTED,
+    )
+    .await;
+    assert_eq!(metadata_distribution_trigger["started"], true);
+    assert_eq!(metadata_distribution_trigger["status"]["state"], "running");
+    wait_for_condition(
+        "metadata db logical distribution analysis",
+        Duration::from_secs(5),
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .storage
+                    .metadata_db_distribution_runtime
+                    .lock()
+                    .map(|runtime| !runtime.running && runtime.distribution.is_some())
+                    .unwrap_or(false)
+            }
+        },
+    )
+    .await;
+    let metadata_distribution = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(metadata_distribution["state"], "idle");
+    assert!(metadata_distribution["finished_at_unix"].as_u64().is_some());
+    assert!(metadata_distribution["distribution"].is_object());
+    assert_eq!(metadata_distribution["last_error"], serde_json::Value::Null);
+
+    let host_dependencies = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/host/dependencies",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(host_dependencies["host_os"], std::env::consts::OS);
+    assert!(!host_dependencies["checks"].as_array().unwrap().is_empty());
+
+    let certificate_status = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/node-certificates/status",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(certificate_status["public_tls"]["state"], "not_configured");
+    assert_eq!(
+        certificate_status["internal_tls"]["state"],
+        "not_configured"
+    );
+    assert_eq!(certificate_status["auto_renew"]["enabled"], false);
+
+    let cluster_status = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/cluster/status",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(cluster_status["total_nodes"], 1);
+
+    let cluster_nodes = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/cluster/nodes",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(cluster_nodes.as_array().unwrap().len(), 1);
+    assert_eq!(cluster_nodes[0]["node_id"], state.node_id.to_string());
+
+    let repair_activity = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/activity",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(repair_activity["state"], "scheduled");
+    assert!(
+        repair_activity["active_runs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let repair_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/history?since_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(repair_history["retention_secs"].as_u64().is_some());
+    assert!(repair_history["runs"].as_array().unwrap().is_empty());
+
+    let repair_actions = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/actions",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(repair_actions["actions"].as_array().unwrap().len(), 4);
+
+    let repair_action_activity = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/actions/activity",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(repair_action_activity["state"], "idle");
+    assert!(
+        repair_action_activity["active_runs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let repair_action_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/actions/history?since_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(repair_action_history["runs"].as_array().unwrap().is_empty());
+
+    let scrub_activity = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/scrub/activity",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(scrub_activity["state"], "idle");
+    assert_eq!(scrub_activity["enabled"], true);
+
+    let scrub_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/scrub/history?since_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(scrub_history["runs"].as_array().unwrap().is_empty());
+
+    let scrub_cluster = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/scrub/cluster?since_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(scrub_cluster["nodes"].as_array().unwrap().len(), 1);
+    assert!(
+        scrub_cluster["skipped_nodes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(scrub_cluster["runs"].as_array().unwrap().is_empty());
+
+    let client_connections = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/client-connections?limit=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(client_connections["summary"].is_object());
+    assert!(client_connections["entries"].as_array().unwrap().is_empty());
+    expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/client-connections?before_connected_at_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let data_changes = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/data-changes?limit=1&path_prefix=%20%20",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(data_changes["entries"].is_array());
+    expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/data-changes?before_created_at_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let (healthy_url, healthy_handle) = spawn_task_queue_response_server(
+        StatusCode::OK,
+        serde_json::json!({
+            "node_id": "healthy-peer",
+            "queues": [{
+                "id": "requests",
+                "label": "API requests",
+                "pending": 0,
+                "active": 1,
+                "state": "running"
+            }]
+        })
+        .to_string(),
+    )
+    .await;
+    let (invalid_url, invalid_handle) =
+        spawn_task_queue_response_server(StatusCode::OK, "not-json".to_string()).await;
+    let (error_url, error_handle) = spawn_task_queue_response_server(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable".to_string(),
+    )
+    .await;
+    for (url, expected_status) in [
+        (&healthy_url, StatusCode::OK),
+        (&invalid_url, StatusCode::OK),
+        (&error_url, StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let response = reqwest::get(format!("{url}/cluster/task-queues/local"))
+            .await
+            .expect("task queue fixture should accept HTTP requests");
+        assert_eq!(response.status(), expected_status, "fixture {url}");
+    }
+    let _healthy_id = register_task_queue_test_node(
+        &state,
+        Some(&healthy_url),
+        super::cluster::NodeStatus::Online,
+    )
+    .await;
+    let invalid_id = register_task_queue_test_node(
+        &state,
+        Some(&invalid_url),
+        super::cluster::NodeStatus::Online,
+    )
+    .await;
+    let error_id =
+        register_task_queue_test_node(&state, Some(&error_url), super::cluster::NodeStatus::Online)
+            .await;
+    let unreachable_id = register_task_queue_test_node(
+        &state,
+        Some("http://127.0.0.1:9"),
+        super::cluster::NodeStatus::Online,
+    )
+    .await;
+    let offline_id =
+        register_task_queue_test_node(&state, None, super::cluster::NodeStatus::Offline).await;
+
+    let task_queues = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/cluster/task-queues",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        task_queues["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["node_id"] == "healthy-peer")
+    );
+    let unavailable = task_queues["unavailable_nodes"].as_array().unwrap();
+    for (node_id, expected_error) in [
+        (invalid_id, "invalid task queue response"),
+        (error_id, "task queue request returned HTTP 503"),
+        (unreachable_id, "task queue request failed"),
+        (offline_id, "node is offline"),
+    ] {
+        let entry = unavailable
+            .iter()
+            .find(|entry| entry["node_id"] == node_id.to_string())
+            .unwrap_or_else(|| panic!("missing unavailable node {node_id}: {task_queues}"));
+        assert!(
+            entry["error"].as_str().unwrap().contains(expected_error),
+            "node {node_id}, expected {expected_error}, entry {entry}, payload {task_queues}"
+        );
+    }
+
+    healthy_handle.abort();
+    invalid_handle.abort();
+    error_handle.abort();
+    let _ = healthy_handle.await;
+    let _ = invalid_handle.await;
+    let _ = error_handle.await;
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    admin_operations_router_exposes_s3_lifecycle_and_health_views_impl,
+    admin_operations_router_exposes_s3_lifecycle_and_health_views,
+    admin_operations_router_exposes_s3_lifecycle_and_health_views_turso
 );
 
 #[tokio::test]
