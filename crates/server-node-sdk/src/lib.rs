@@ -4125,12 +4125,16 @@ struct AutonomousPostWriteRepairRuntime {
 }
 
 impl AutonomousPostWriteRepairRuntime {
-    fn enqueue(&mut self, subjects: impl IntoIterator<Item = String>) -> bool {
+    fn requeue(&mut self, subjects: impl IntoIterator<Item = String>) {
         self.pending_subjects.extend(
             subjects
                 .into_iter()
                 .filter(|subject| !subject.trim().is_empty()),
         );
+    }
+
+    fn enqueue(&mut self, subjects: impl IntoIterator<Item = String>) -> bool {
+        self.requeue(subjects);
         if self.pending_subjects.is_empty() || self.active {
             return false;
         }
@@ -14233,18 +14237,19 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
 
-        sync_availability_views_once(&state).await;
-        let permit = acquire_repair_execution(&state, RepairRunTrigger::StartupRepair).await;
-        {
-            let mut status = state.maintenance.startup_repair_status.lock().await;
-            *status = StartupRepairStatus::Running;
-        }
         let tracker = begin_repair_run_tracking(
             &state,
             replication::ReplicationRepairScope::Local,
             RepairRunTrigger::StartupRepair,
         )
         .await;
+        sync_availability_views_once(&state).await;
+        tracker.set_phase(RepairActiveRunPhase::Queued);
+        let permit = acquire_repair_execution(&state, RepairRunTrigger::StartupRepair).await;
+        {
+            let mut status = state.maintenance.startup_repair_status.lock().await;
+            *status = StartupRepairStatus::Running;
+        }
         tracker.set_phase(RepairActiveRunPhase::Running);
         let execution_timeout_secs = state.repair_config.execution_timeout_secs.max(1);
         let execution = run_with_repair_execution_timeout(&state, async {
@@ -15801,6 +15806,18 @@ async fn run_autonomous_post_write_replication(state: ServerState) {
             RepairRunTrigger::AutonomousPostWrite,
         )
         .await;
+        if report.run_status() == RepairRunStatus::TimedOut {
+            state
+                .maintenance
+                .autonomous_post_write_repair
+                .lock()
+                .await
+                .requeue(subjects.iter().cloned());
+            warn!(
+                subject_count = subjects.len(),
+                "requeued autonomous post-write replication after execution timeout"
+            );
+        }
         if report.attempted_transfers > 0 || report.failed_transfers > 0 {
             info!(
                 subject_count = subjects.len(),
@@ -29989,31 +30006,32 @@ async fn local_task_queue_snapshot(
     let storage_stats_active =
         usize::from(state.storage.storage_stats_runtime.lock().await.collecting);
     let repair_activity = state.maintenance.repair_activity.lock().await;
-    let (repair_active, tracked_pending, tracked_executor_waiters) = repair_activity
-        .active_runs
-        .iter()
-        .map(RepairActiveRunRuntime::phase)
-        .fold((0usize, 0usize, 0usize), |counts, phase| match phase {
-            RepairActiveRunPhase::Preparing => (counts.0, counts.1 + 1, counts.2),
-            RepairActiveRunPhase::Queued => (counts.0, counts.1 + 1, counts.2 + 1),
-            RepairActiveRunPhase::Running => (counts.0 + 1, counts.1, counts.2),
-        });
+    let mut repair_active = 0usize;
+    let mut tracked_preparing = 0usize;
+    let mut startup_tracked = false;
+    for run in &repair_activity.active_runs {
+        startup_tracked |= run.trigger == RepairRunTrigger::StartupRepair;
+        match run.phase() {
+            RepairActiveRunPhase::Preparing => tracked_preparing += 1,
+            RepairActiveRunPhase::Queued => {}
+            RepairActiveRunPhase::Running => repair_active += 1,
+        }
+    }
     drop(repair_activity);
     let startup_repair_status = *state.maintenance.startup_repair_status.lock().await;
     let autonomous_repair = state.maintenance.autonomous_post_write_repair.lock().await;
     let executor_queue = state.maintenance.repair_execution_gate.queue_snapshot();
-    let untracked_executor_waiters = executor_queue
+    let executor_waiters = executor_queue
         .manual
-        .saturating_add(executor_queue.automatic)
-        .saturating_sub(tracked_executor_waiters);
+        .saturating_add(executor_queue.automatic);
     let repair_pending = autonomous_repair
         .pending_subjects
         .len()
         .saturating_add(usize::from(
-            startup_repair_status == StartupRepairStatus::Scheduled,
+            startup_repair_status == StartupRepairStatus::Scheduled && !startup_tracked,
         ))
-        .saturating_add(tracked_pending)
-        .saturating_add(untracked_executor_waiters);
+        .saturating_add(tracked_preparing)
+        .saturating_add(executor_waiters);
     let repair_worker_active = repair_active
         .max(usize::from(autonomous_repair.active))
         .max(usize::from(

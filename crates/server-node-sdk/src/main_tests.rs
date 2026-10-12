@@ -14175,6 +14175,84 @@ fn autonomous_post_write_repair_runtime_coalesces_pending_subjects() {
     assert!(!runtime.active);
 }
 
+#[tokio::test]
+async fn autonomous_post_write_repair_requeues_after_executor_timeout() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    *state.maintenance.startup_repair_status.lock().await = StartupRepairStatus::Disabled;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    {
+        let mut runtime = state.maintenance.autonomous_post_write_repair.lock().await;
+        assert!(runtime.enqueue(["docs/retry.txt".to_string()]));
+    }
+
+    let worker = tokio::spawn(super::run_autonomous_post_write_replication(state.clone()));
+    let first_run_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state
+                .maintenance
+                .repair_execution_gate
+                .queue_snapshot()
+                .automatic
+                > 0
+                && let Some(run_id) = state
+                    .maintenance
+                    .repair_activity
+                    .lock()
+                    .await
+                    .active_runs
+                    .first()
+                    .map(|run| run.run_id.clone())
+            {
+                break run_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first autonomous attempt should wait on the executor");
+
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if state
+                .maintenance
+                .repair_execution_gate
+                .queue_snapshot()
+                .automatic
+                > 0
+                && state
+                    .maintenance
+                    .repair_activity
+                    .lock()
+                    .await
+                    .active_runs
+                    .first()
+                    .is_some_and(|run| run.run_id != first_run_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a timed-out autonomous attempt should requeue its subjects");
+
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the requeued autonomous repair should finish after the executor is released")
+        .expect("the autonomous repair worker should not panic");
+    let runtime = state.maintenance.autonomous_post_write_repair.lock().await;
+    assert!(!runtime.active);
+    assert!(runtime.pending_subjects.is_empty());
+    drop(runtime);
+    cleanup_test_state(&state).await;
+}
+
 #[test]
 fn replication_peer_routes_use_v2_paths() {
     let export_url = build_replication_export_path("hello", Some("ver-123"));
@@ -23035,6 +23113,76 @@ async fn repair_activity_reports_executor_queue_depth() {
     waiter.abort();
     drop(tracker);
     drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn startup_executor_wait_is_counted_once() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    super::spawn_startup_replication_repair(state.clone(), 0);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup repair should wait on the executor");
+
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(
+        repair.pending, 1,
+        "startup repair must only be counted once"
+    );
+    assert_eq!(repair.active, 0);
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("startup repair activity should be readable");
+    assert_eq!(activity.state, super::RepairActivityState::Scheduled);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Queued
+    );
+
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = *state.maintenance.startup_repair_status.lock().await;
+            let active_runs_empty = state
+                .maintenance
+                .repair_activity
+                .lock()
+                .await
+                .active_runs
+                .is_empty();
+            if status != StartupRepairStatus::Scheduled
+                && status != StartupRepairStatus::Running
+                && active_runs_empty
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup repair should finish after the executor is released");
     cleanup_test_state(&state).await;
 }
 

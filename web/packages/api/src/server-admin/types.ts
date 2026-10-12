@@ -309,6 +309,7 @@ export type RepairRunStatus =
   | "timed_out";
 
 export type RepairActivityState = "idle" | "scheduled" | "running";
+export type RepairActiveRunPhase = "preparing" | "queued" | "running";
 
 export type StartupRepairStatus =
   | "disabled"
@@ -372,6 +373,7 @@ export type RepairActiveRun = {
   scope: ReplicationRepairScope;
   trigger: RepairRunTrigger;
   started_at_unix: number;
+  phase: RepairActiveRunPhase;
   last_log_at_unix?: number | null;
   live_log: RepairLogEntry[];
   live_log_truncated?: boolean;

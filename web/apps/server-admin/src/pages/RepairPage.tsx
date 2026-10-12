@@ -487,6 +487,12 @@ export function RepairPage() {
                             <Badge color="blue" variant="light">
                               {activeRun.scope}
                             </Badge>
+                            <Badge
+                              color={activeRun.phase === "running" ? "green" : "orange"}
+                              variant="light"
+                            >
+                              {formatRepairRunPhase(activeRun.phase)}
+                            </Badge>
                           </Group>
                           <Text size="sm">
                             Started {formatUnixTs(activeRun.started_at_unix)}
@@ -1658,6 +1664,19 @@ function formatRepairActivityState(state: string): string {
     case "idle":
     default:
       return "idle";
+  }
+}
+
+function formatRepairRunPhase(phase: string): string {
+  switch (phase) {
+    case "preparing":
+      return "preparing";
+    case "queued":
+      return "queued";
+    case "running":
+      return "running";
+    default:
+      return phase;
   }
 }
 
