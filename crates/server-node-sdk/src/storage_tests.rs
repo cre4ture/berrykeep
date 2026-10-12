@@ -7939,8 +7939,9 @@ async fn persist_and_load_cluster_replica_views_roundtrip_impl(backend: StorageT
         .await
         .unwrap();
 
-    assert_eq!(store.load_cluster_replicas().await.unwrap(), replicas);
-    assert_eq!(store.load_cluster_availability().await.unwrap(), available);
+    let loaded = store.load_cluster_replica_views().await.unwrap();
+    assert_eq!(loaded.replicas, replicas);
+    assert_eq!(loaded.available, available);
 
     drop(store);
     let _ = fs::remove_dir_all(root).await;

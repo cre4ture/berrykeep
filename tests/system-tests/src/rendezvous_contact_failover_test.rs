@@ -207,11 +207,36 @@ async fn replicated_rendezvous_contacts_register_nodes_and_survive_old_relay_shu
     stop_server(&mut node_a).await;
     stop_server(&mut node_b).await;
     stop_server(&mut new_rendezvous).await;
+    if let Err(err) = &result {
+        eprintln!("rendezvous contact failover failed: {err:#}");
+        print_server_log_tail("node A", &data_a);
+        print_server_log_tail("node B", &data_b);
+    }
     let _ = fs::remove_dir_all(&data_a);
     let _ = fs::remove_dir_all(&data_b);
     let _ = fs::remove_dir_all(&client_dir);
 
     result
+}
+
+fn print_server_log_tail(label: &str, data_dir: &Path) {
+    for name in [
+        "server-node.setup.stdout.log",
+        "server-node.setup.stderr.log",
+    ] {
+        let path = data_dir.join(name);
+        let contents = fs::read_to_string(&path).unwrap_or_default();
+        let tail = contents
+            .lines()
+            .rev()
+            .take(120)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        eprintln!("--- {label} {} (tail) ---\n{tail}", path.display());
+    }
 }
 
 async fn issue_and_enroll_initial_client(
