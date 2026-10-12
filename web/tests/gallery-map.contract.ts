@@ -28,6 +28,10 @@ test("gallery map contract retains the MapLibre v5 transform fallback for globe 
   expect(isGalleryMapLocationOccluded(map, backSideLocation)).toBe(true);
 });
 
+test("gallery map contract reports an unavailable globe occlusion hook", () => {
+  expect(isGalleryMapLocationOccluded({}, { longitude: 180, latitude: 0 })).toBeNull();
+});
+
 export type GalleryMapContractSetup = {
   mapConfiguration?: GalleryMapConfiguration;
   mapConfigurationStatus?: number;

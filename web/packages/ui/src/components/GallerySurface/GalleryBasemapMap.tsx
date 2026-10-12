@@ -207,6 +207,7 @@ const mbtilesSourceCache = new Map<string, Promise<MbtilesSource>>();
 const mbtilesConfigRegistry = new Map<string, GalleryRasterBasemapConfig>();
 const cachedMarkerImages = new Map<string, CachedMarkerImage>();
 let mbtilesProtocolRegistered = false;
+const mapsWithUnresolvedGlobeOcclusion = new WeakSet<object>();
 
 export function GalleryBasemapMap({
   basemap,
@@ -1249,7 +1250,13 @@ function projectVisibleBasemapMarkerPoint(
   map: maplibregl.Map,
   cluster: GalleryBasemapMapCluster
 ): GalleryBasemapMarkerPoint | null {
-  if (isBasemapLocationOccluded(map, cluster.longitude, cluster.latitude)) {
+  const locationOccluded = isBasemapLocationOccluded(map, cluster.longitude, cluster.latitude);
+  if (locationOccluded === true) {
+    return null;
+  }
+
+  if (locationOccluded === null && currentMapProjectionType(map) !== "mercator") {
+    reportUnresolvedGlobeOcclusion(map);
     return null;
   }
 
@@ -1306,10 +1313,20 @@ function isBasemapLocationOccluded(
   map: maplibregl.Map,
   longitude: number,
   latitude: number
-): boolean {
+): boolean | null {
   return isGalleryMapLocationOccluded(
     map as unknown as GalleryMapOcclusionAdapter<maplibregl.LngLat>,
     new maplibregl.LngLat(longitude, latitude)
+  );
+}
+
+function reportUnresolvedGlobeOcclusion(map: object): void {
+  if (mapsWithUnresolvedGlobeOcclusion.has(map)) {
+    return;
+  }
+  mapsWithUnresolvedGlobeOcclusion.add(map);
+  console.warn(
+    "Gallery map markers are hidden because this MapLibre version does not expose globe occlusion."
   );
 }
 
