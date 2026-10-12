@@ -4,34 +4,6 @@ import {
   isGalleryMapLocationOccluded
 } from "../packages/ui/src/components/GallerySurface/gallery-map-occlusion";
 
-test("gallery map contract uses the MapLibre v6 camera transform for globe occlusion", () => {
-  const backSideLocation = { longitude: 180, latitude: 0 };
-  const map = {
-    _camera: {
-      transform: {
-        isLocationOccluded: (location: typeof backSideLocation) => location === backSideLocation
-      }
-    }
-  };
-
-  expect(isGalleryMapLocationOccluded(map, backSideLocation)).toBe(true);
-});
-
-test("gallery map contract retains the MapLibre v5 transform fallback for globe occlusion", () => {
-  const backSideLocation = { longitude: 180, latitude: 0 };
-  const map = {
-    transform: {
-      isLocationOccluded: (location: typeof backSideLocation) => location === backSideLocation
-    }
-  };
-
-  expect(isGalleryMapLocationOccluded(map, backSideLocation)).toBe(true);
-});
-
-test("gallery map contract reports an unavailable globe occlusion hook", () => {
-  expect(isGalleryMapLocationOccluded({}, { longitude: 180, latitude: 0 })).toBeNull();
-});
-
 export type GalleryMapContractSetup = {
   mapConfiguration?: GalleryMapConfiguration;
   mapConfigurationStatus?: number;
@@ -125,6 +97,34 @@ const configuredMapVariants: GalleryMapConfiguration = {
  * the assertions intentionally stay identical.
  */
 export function registerGalleryMapContractTests(target: GalleryMapContractTarget): void {
+  test(`${target.name} gallery map contract uses the MapLibre v6 camera transform for globe occlusion`, () => {
+    const backSideLocation = { longitude: 180, latitude: 0 };
+    const map = {
+      _camera: {
+        transform: {
+          isLocationOccluded: (location: typeof backSideLocation) => location === backSideLocation
+        }
+      }
+    };
+
+    expect(isGalleryMapLocationOccluded(map, backSideLocation)).toBe(true);
+  });
+
+  test(`${target.name} gallery map contract retains the MapLibre v5 transform fallback for globe occlusion`, () => {
+    const backSideLocation = { longitude: 180, latitude: 0 };
+    const map = {
+      transform: {
+        isLocationOccluded: (location: typeof backSideLocation) => location === backSideLocation
+      }
+    };
+
+    expect(isGalleryMapLocationOccluded(map, backSideLocation)).toBe(true);
+  });
+
+  test(`${target.name} gallery map contract reports an unavailable globe occlusion hook`, () => {
+    expect(isGalleryMapLocationOccluded({}, { longitude: 180, latitude: 0 })).toBeNull();
+  });
+
   test(`${target.name} gallery map contract lists visible configured styles`, async ({ page }) => {
     await target.setup(page, { mapConfiguration: configuredMapVariants });
     await target.openGallery(page);
