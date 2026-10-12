@@ -8,6 +8,7 @@ use common::NodeId;
 use common::xmp::XmpGeoLocation;
 use tracing::warn;
 use turso::params_from_iter;
+use turso::transaction::{DropBehavior, Transaction, TransactionBehavior};
 
 use super::content_recovery::ContentRepairTask;
 use crate::cluster::NodeDescriptor;
@@ -24,8 +25,8 @@ const DEFAULT_TURSO_SCAN_READ_CONNECTION_COUNT: usize = 4;
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS,
     CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT, CachedChunkRecord, CachedMediaMetadata,
-    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
+    ClientCredentialState, ClusterReplicaViews, CurrentObjectEntry, CurrentState, DataChangeEvent,
+    DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
     GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaCursorError, GalleryDeltaPage,
     GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, GalleryMapClusterEntriesQuery,
     GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache,
@@ -73,6 +74,23 @@ impl std::ops::Deref for TursoReadConnection {
 
     fn deref(&self) -> &turso::Connection {
         &self.connection
+    }
+}
+
+async fn finish_read_transaction<T>(
+    mut transaction: Transaction<'_>,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => {
+            transaction.set_drop_behavior(DropBehavior::Commit);
+            transaction.finish().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
     }
 }
 
@@ -1421,48 +1439,56 @@ impl MetadataStore for TursoMetadataStore {
         result
     }
 
-    async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
-        let connection = self.open_scan_connection("cluster replicas").await?;
-        let mut rows = connection
-            .query(
-                "SELECT subject, node_id
-                 FROM cluster_replicas
-                 ORDER BY subject, node_id",
-                (),
-            )
-            .await?;
-        let mut replicas = HashMap::<String, Vec<NodeId>>::new();
-        while let Some(row) = rows.next().await? {
-            let subject = row_string(&row, 0, "cluster_replicas.subject")?;
-            let node_id = row_string(&row, 1, "cluster_replicas.node_id")?
-                .parse::<NodeId>()
-                .with_context(|| format!("invalid node id in cluster replicas for {subject}"))?;
-            replicas.entry(subject).or_default().push(node_id);
-        }
-        Ok(replicas)
-    }
+    async fn load_cluster_replica_views(&self) -> Result<ClusterReplicaViews> {
+        let connection = self.open_scan_connection("cluster replica views").await?;
+        let transaction =
+            Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
+        let result = async {
+            let mut rows = transaction
+                .query(
+                    "SELECT subject, node_id
+                     FROM cluster_replicas
+                     ORDER BY subject, node_id",
+                    (),
+                )
+                .await?;
+            let mut replicas = HashMap::<String, Vec<NodeId>>::new();
+            while let Some(row) = rows.next().await? {
+                let subject = row_string(&row, 0, "cluster_replicas.subject")?;
+                let node_id = row_string(&row, 1, "cluster_replicas.node_id")?
+                    .parse::<NodeId>()
+                    .with_context(|| {
+                        format!("invalid node id in cluster replicas for {subject}")
+                    })?;
+                replicas.entry(subject).or_default().push(node_id);
+            }
+            drop(rows);
 
-    async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>> {
-        let connection = self.open_scan_connection("cluster availability").await?;
-        let mut rows = connection
-            .query(
-                "SELECT subject, node_id
-                 FROM cluster_available
-                 ORDER BY subject, node_id",
-                (),
-            )
-            .await?;
-        let mut available = HashMap::<String, Vec<NodeId>>::new();
-        while let Some(row) = rows.next().await? {
-            let subject = row_string(&row, 0, "cluster_available.subject")?;
-            let node_id = row_string(&row, 1, "cluster_available.node_id")?
-                .parse::<NodeId>()
-                .with_context(|| {
-                    format!("invalid node id in cluster availability for {subject}")
-                })?;
-            available.entry(subject).or_default().push(node_id);
+            let mut rows = transaction
+                .query(
+                    "SELECT subject, node_id
+                     FROM cluster_available
+                     ORDER BY subject, node_id",
+                    (),
+                )
+                .await?;
+            let mut available = HashMap::<String, Vec<NodeId>>::new();
+            while let Some(row) = rows.next().await? {
+                let subject = row_string(&row, 0, "cluster_available.subject")?;
+                let node_id = row_string(&row, 1, "cluster_available.node_id")?
+                    .parse::<NodeId>()
+                    .with_context(|| {
+                        format!("invalid node id in cluster availability for {subject}")
+                    })?;
+                available.entry(subject).or_default().push(node_id);
+            }
+            Ok(ClusterReplicaViews {
+                replicas,
+                available,
+            })
         }
-        Ok(available)
+        .await;
+        finish_read_transaction(transaction, result).await
     }
 
     async fn persist_cluster_replica_views(
@@ -1543,74 +1569,82 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState> {
         let connection = self.open_scan_connection("S3 control plane state").await?;
-        let mut bucket_rows = connection
-            .query(
-                "SELECT bucket_name, root_prefix, versioning_status, read_only,
-                        created_at_unix, updated_at_unix, created_by, deleted_at_unix
-                 FROM s3_buckets
-                 ORDER BY bucket_name",
-                (),
-            )
-            .await?;
-        let mut buckets = Vec::new();
-        while let Some(row) = bucket_rows.next().await? {
-            let versioning_status = row_string(&row, 2, "s3_buckets.versioning_status")?;
-            buckets.push(S3BucketRecord {
-                bucket_name: row_string(&row, 0, "s3_buckets.bucket_name")?,
-                root_prefix: row_string(&row, 1, "s3_buckets.root_prefix")?,
-                versioning_status: S3BucketVersioningStatus::parse(&versioning_status)
-                    .with_context(|| {
-                        format!(
-                            "invalid s3 bucket versioning status in Turso metadata database {}: {versioning_status}",
-                            self.metadata_path.display()
-                        )
-                    })?,
-                read_only: row_bool(&row, 3, "s3_buckets.read_only")?,
-                created_at_unix: row_u64(&row, 4, "s3_buckets.created_at_unix")?,
-                updated_at_unix: row_u64(&row, 5, "s3_buckets.updated_at_unix")?,
-                created_by: row_opt_string(&row, 6, "s3_buckets.created_by")?,
-                deleted_at_unix: row_opt_u64(&row, 7, "s3_buckets.deleted_at_unix")?,
-            });
-        }
-        drop(bucket_rows);
+        let transaction =
+            Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
+        let result = async {
+            let mut bucket_rows = transaction
+                .query(
+                    "SELECT bucket_name, root_prefix, versioning_status, read_only,
+                            created_at_unix, updated_at_unix, created_by, deleted_at_unix
+                     FROM s3_buckets
+                     ORDER BY bucket_name",
+                    (),
+                )
+                .await?;
+            let mut buckets = Vec::new();
+            while let Some(row) = bucket_rows.next().await? {
+                let versioning_status = row_string(&row, 2, "s3_buckets.versioning_status")?;
+                buckets.push(S3BucketRecord {
+                    bucket_name: row_string(&row, 0, "s3_buckets.bucket_name")?,
+                    root_prefix: row_string(&row, 1, "s3_buckets.root_prefix")?,
+                    versioning_status: S3BucketVersioningStatus::parse(&versioning_status)
+                        .with_context(|| {
+                            format!(
+                                "invalid s3 bucket versioning status in Turso metadata database {}: {versioning_status}",
+                                self.metadata_path.display()
+                            )
+                        })?,
+                    read_only: row_bool(&row, 3, "s3_buckets.read_only")?,
+                    created_at_unix: row_u64(&row, 4, "s3_buckets.created_at_unix")?,
+                    updated_at_unix: row_u64(&row, 5, "s3_buckets.updated_at_unix")?,
+                    created_by: row_opt_string(&row, 6, "s3_buckets.created_by")?,
+                    deleted_at_unix: row_opt_u64(&row, 7, "s3_buckets.deleted_at_unix")?,
+                });
+            }
+            drop(bucket_rows);
 
-        let mut access_key_rows = connection
-            .query(
-                "SELECT access_key_id, secret_material, description, bucket_scope_json,
-                        prefix_scope_json, allow_list, allow_read, allow_write,
-                        allow_delete, allow_manage, created_at_unix, updated_at_unix,
-                        last_used_at_unix, revoked_at_unix
-                 FROM s3_access_keys
-                 ORDER BY access_key_id",
-                (),
-            )
-            .await?;
-        let mut access_keys = Vec::new();
-        while let Some(row) = access_key_rows.next().await? {
-            let bucket_scope_json = row_blob(&row, 3, "s3_access_keys.bucket_scope_json")?;
-            let prefix_scope_json = row_blob(&row, 4, "s3_access_keys.prefix_scope_json")?;
-            access_keys.push(S3AccessKeyRecord {
-                access_key_id: row_string(&row, 0, "s3_access_keys.access_key_id")?,
-                secret_material: row_string(&row, 1, "s3_access_keys.secret_material")?,
-                description: row_opt_string(&row, 2, "s3_access_keys.description")?,
-                bucket_scope: self.decode_json(bucket_scope_json, "s3 access key bucket scope")?,
-                prefix_scope: self.decode_json(prefix_scope_json, "s3 access key prefix scope")?,
-                allow_list: row_bool(&row, 5, "s3_access_keys.allow_list")?,
-                allow_read: row_bool(&row, 6, "s3_access_keys.allow_read")?,
-                allow_write: row_bool(&row, 7, "s3_access_keys.allow_write")?,
-                allow_delete: row_bool(&row, 8, "s3_access_keys.allow_delete")?,
-                allow_manage: row_bool(&row, 9, "s3_access_keys.allow_manage")?,
-                created_at_unix: row_u64(&row, 10, "s3_access_keys.created_at_unix")?,
-                updated_at_unix: row_u64(&row, 11, "s3_access_keys.updated_at_unix")?,
-                last_used_at_unix: row_opt_u64(&row, 12, "s3_access_keys.last_used_at_unix")?,
-                revoked_at_unix: row_opt_u64(&row, 13, "s3_access_keys.revoked_at_unix")?,
-            });
-        }
+            let mut access_key_rows = transaction
+                .query(
+                    "SELECT access_key_id, secret_material, description, bucket_scope_json,
+                            prefix_scope_json, allow_list, allow_read, allow_write,
+                            allow_delete, allow_manage, created_at_unix, updated_at_unix,
+                            last_used_at_unix, revoked_at_unix
+                     FROM s3_access_keys
+                     ORDER BY access_key_id",
+                    (),
+                )
+                .await?;
+            let mut access_keys = Vec::new();
+            while let Some(row) = access_key_rows.next().await? {
+                let bucket_scope_json = row_blob(&row, 3, "s3_access_keys.bucket_scope_json")?;
+                let prefix_scope_json = row_blob(&row, 4, "s3_access_keys.prefix_scope_json")?;
+                access_keys.push(S3AccessKeyRecord {
+                    access_key_id: row_string(&row, 0, "s3_access_keys.access_key_id")?,
+                    secret_material: row_string(&row, 1, "s3_access_keys.secret_material")?,
+                    description: row_opt_string(&row, 2, "s3_access_keys.description")?,
+                    bucket_scope: self
+                        .decode_json(bucket_scope_json, "s3 access key bucket scope")?,
+                    prefix_scope: self
+                        .decode_json(prefix_scope_json, "s3 access key prefix scope")?,
+                    allow_list: row_bool(&row, 5, "s3_access_keys.allow_list")?,
+                    allow_read: row_bool(&row, 6, "s3_access_keys.allow_read")?,
+                    allow_write: row_bool(&row, 7, "s3_access_keys.allow_write")?,
+                    allow_delete: row_bool(&row, 8, "s3_access_keys.allow_delete")?,
+                    allow_manage: row_bool(&row, 9, "s3_access_keys.allow_manage")?,
+                    created_at_unix: row_u64(&row, 10, "s3_access_keys.created_at_unix")?,
+                    updated_at_unix: row_u64(&row, 11, "s3_access_keys.updated_at_unix")?,
+                    last_used_at_unix: row_opt_u64(&row, 12, "s3_access_keys.last_used_at_unix")?,
+                    revoked_at_unix: row_opt_u64(&row, 13, "s3_access_keys.revoked_at_unix")?,
+                });
+            }
 
-        Ok(S3ControlPlaneState {
-            buckets,
-            access_keys,
-        })
+            Ok(S3ControlPlaneState {
+                buckets,
+                access_keys,
+            })
+        }
+        .await;
+        finish_read_transaction(transaction, result).await
     }
 
     async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()> {
@@ -4272,8 +4306,9 @@ mod tests {
                     .is_empty()
             );
             assert!(store.load_cluster_nodes().await?.is_empty());
-            assert!(store.load_cluster_replicas().await?.is_empty());
-            assert!(store.load_cluster_availability().await?.is_empty());
+            let cluster_replica_views = store.load_cluster_replica_views().await?;
+            assert!(cluster_replica_views.replicas.is_empty());
+            assert!(cluster_replica_views.available.is_empty());
             let s3_state = store.load_s3_control_plane_state().await?;
             assert!(s3_state.buckets.is_empty());
             assert!(s3_state.access_keys.is_empty());

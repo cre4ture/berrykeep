@@ -2001,6 +2001,12 @@ pub struct DataChangeEventQuery {
     pub before: Option<DataChangeEventCursor>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ClusterReplicaViews {
+    pub(crate) replicas: HashMap<String, Vec<NodeId>>,
+    pub(crate) available: HashMap<String, Vec<NodeId>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientCredentialState {
     #[serde(default)]
@@ -3095,8 +3101,7 @@ trait MetadataStore: Send + Sync {
     async fn prune_data_scrub_run_history_before(&self, finished_before_unix: u64) -> Result<()>;
     async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>>;
     async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()>;
-    async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>>;
-    async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>>;
+    async fn load_cluster_replica_views(&self) -> Result<ClusterReplicaViews>;
     async fn persist_cluster_replica_views(
         &self,
         replicas: &HashMap<String, Vec<NodeId>>,
@@ -5479,11 +5484,24 @@ impl PersistentStore {
     }
 
     pub async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
-        self.metadata_store.load_cluster_replicas().await
+        Ok(self
+            .metadata_store
+            .load_cluster_replica_views()
+            .await?
+            .replicas)
     }
 
+    #[allow(dead_code)]
     pub async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>> {
-        self.metadata_store.load_cluster_availability().await
+        Ok(self
+            .metadata_store
+            .load_cluster_replica_views()
+            .await?
+            .available)
+    }
+
+    pub(crate) async fn load_cluster_replica_views(&self) -> Result<ClusterReplicaViews> {
+        self.metadata_store.load_cluster_replica_views().await
     }
 
     pub async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>> {

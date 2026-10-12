@@ -23,13 +23,13 @@ use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS,
     CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT, CachedChunkRecord, CachedMediaMetadata,
-    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
-    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
-    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange, GalleryDeltaCursorError,
-    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
-    GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery,
-    GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
+    ClientCredentialState, ClusterReplicaViews, CurrentObjectEntry, CurrentState, DataChangeEvent,
+    DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
+    GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY, GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION,
+    GALLERY_SIDECAR_GPS_BACKFILL_KEY, GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange,
+    GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope,
+    GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage,
+    GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
     GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue, GallerySummaryMiss,
     GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
     GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
@@ -3444,56 +3444,51 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn load_cluster_replicas(
-        &self,
-    ) -> Result<std::collections::HashMap<String, Vec<NodeId>>> {
+    async fn load_cluster_replica_views(&self) -> Result<ClusterReplicaViews> {
         self.read(|db| {
-            let mut stmt = db.prepare(
-                "SELECT subject, node_id
-                 FROM cluster_replicas
-                 ORDER BY subject, node_id",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-
-            let mut replicas: std::collections::HashMap<String, Vec<NodeId>> =
-                std::collections::HashMap::new();
-            for row in rows {
-                let (subject, node_id) = row?;
-                let node_id = node_id
-                    .parse::<NodeId>()
-                    .with_context(|| format!("invalid node id in cluster replicas: {node_id}"))?;
-                replicas.entry(subject).or_default().push(node_id);
-            }
-            Ok(replicas)
-        })
-        .await
-    }
-
-    async fn load_cluster_availability(
-        &self,
-    ) -> Result<std::collections::HashMap<String, Vec<NodeId>>> {
-        self.read(|db| {
-            let mut stmt = db.prepare(
-                "SELECT subject, node_id
-                 FROM cluster_available
-                 ORDER BY subject, node_id",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-
-            let mut available: std::collections::HashMap<String, Vec<NodeId>> =
-                std::collections::HashMap::new();
-            for row in rows {
-                let (subject, node_id) = row?;
-                let node_id = node_id.parse::<NodeId>().with_context(|| {
-                    format!("invalid node id in cluster availability: {node_id}")
+            let transaction = db.transaction()?;
+            let mut replicas = HashMap::<String, Vec<NodeId>>::new();
+            {
+                let mut stmt = transaction.prepare(
+                    "SELECT subject, node_id
+                     FROM cluster_replicas
+                     ORDER BY subject, node_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?;
-                available.entry(subject).or_default().push(node_id);
+                for row in rows {
+                    let (subject, node_id) = row?;
+                    let node_id = node_id.parse::<NodeId>().with_context(|| {
+                        format!("invalid node id in cluster replicas: {node_id}")
+                    })?;
+                    replicas.entry(subject).or_default().push(node_id);
+                }
             }
-            Ok(available)
+
+            let mut available = HashMap::<String, Vec<NodeId>>::new();
+            {
+                let mut stmt = transaction.prepare(
+                    "SELECT subject, node_id
+                     FROM cluster_available
+                     ORDER BY subject, node_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (subject, node_id) = row?;
+                    let node_id = node_id.parse::<NodeId>().with_context(|| {
+                        format!("invalid node id in cluster availability: {node_id}")
+                    })?;
+                    available.entry(subject).or_default().push(node_id);
+                }
+            }
+            transaction.commit()?;
+            Ok(ClusterReplicaViews {
+                replicas,
+                available,
+            })
         })
         .await
     }

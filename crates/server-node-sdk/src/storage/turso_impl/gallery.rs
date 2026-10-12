@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use common::xmp::XmpGeoLocation;
 use tracing::warn;
-use turso::transaction::{DropBehavior, Transaction, TransactionBehavior};
+use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Value, params_from_iter};
 use uuid::Uuid;
 
@@ -25,7 +25,10 @@ use super::super::{
 };
 #[cfg(test)]
 use super::turso_test_db_path;
-use super::{TursoMetadataStore, row_string, row_u64, upsert_version_index_head_projection};
+use super::{
+    TursoMetadataStore, finish_read_transaction, row_string, row_u64,
+    upsert_version_index_head_projection,
+};
 
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
 const GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS: i64 = 1_000;
@@ -727,7 +730,7 @@ impl TursoMetadataStore {
             query_gallery_index(&transaction, query, history_id, revision).await
         }
         .await;
-        finish_gallery_read_transaction(transaction, result).await
+        finish_read_transaction(transaction, result).await
     }
 
     pub(super) async fn query_turso_gallery_map_clusters(
@@ -768,7 +771,7 @@ impl TursoMetadataStore {
                 ))
             }
             .await;
-            finish_gallery_read_transaction(transaction, result).await?
+            finish_read_transaction(transaction, result).await?
         };
 
         let (total_entry_count, media_summary, summary_status) = self
@@ -893,7 +896,7 @@ impl TursoMetadataStore {
             query_gallery_map_cluster_entries(&transaction, query, history_id, revision).await
         }
         .await;
-        finish_gallery_read_transaction(transaction, result).await
+        finish_read_transaction(transaction, result).await
     }
 
     pub(super) async fn query_turso_gallery_delta(
@@ -908,7 +911,7 @@ impl TursoMetadataStore {
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
         let result =
             query_gallery_delta(&transaction, history_id, since_revision, limit, scope).await;
-        finish_gallery_read_transaction(transaction, result).await
+        finish_read_transaction(transaction, result).await
     }
 }
 
@@ -919,23 +922,6 @@ async fn finish_gallery_transaction<T>(
     match result {
         Ok(value) => {
             transaction.commit().await?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
-        }
-    }
-}
-
-async fn finish_gallery_read_transaction<T>(
-    mut transaction: Transaction<'_>,
-    result: Result<T>,
-) -> Result<T> {
-    match result {
-        Ok(value) => {
-            transaction.set_drop_behavior(DropBehavior::Commit);
-            transaction.finish().await?;
             Ok(value)
         }
         Err(error) => {
@@ -1961,7 +1947,7 @@ pub(super) async fn query_gallery_map_summary(
         })
     }
     .await;
-    finish_gallery_read_transaction(transaction, result).await
+    finish_read_transaction(transaction, result).await
 }
 
 async fn query_gallery_map_cluster_entries(
@@ -3503,7 +3489,7 @@ mod tests {
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
                 .await
                 .expect("gallery read transaction should begin");
-        let read_error = finish_gallery_read_transaction::<()>(
+        let read_error = finish_read_transaction::<()>(
             read_transaction,
             Err(anyhow::anyhow!("forced gallery read failure")),
         )

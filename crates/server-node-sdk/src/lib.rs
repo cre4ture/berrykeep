@@ -7376,13 +7376,13 @@ async fn run_inner(
 
     let load_cluster_replicas_phase_started_at =
         log_server_startup_phase_begin("load_cluster_replicas", startup_phase_anchor);
-    let persisted_cluster_replicas = {
-        let store_guard = store.read("server.init.load_cluster_replicas").await;
-        match store_guard.load_cluster_replicas().await {
-            Ok(replicas) => replicas,
+    let persisted_cluster_replica_views = {
+        let store_guard = store.read("server.init.load_cluster_replica_views").await;
+        match store_guard.load_cluster_replica_views().await {
+            Ok(views) => views,
             Err(err) => {
-                warn!(error = %err, "failed to load cluster replica state; starting empty");
-                HashMap::new()
+                warn!(error = %err, "failed to load cluster replica views; starting empty");
+                Default::default()
             }
         }
     };
@@ -7391,16 +7391,8 @@ async fn run_inner(
         startup_phase_anchor,
         load_cluster_replicas_phase_started_at,
     );
-    let persisted_cluster_availability = {
-        let store_guard = store.read("server.init.load_cluster_availability").await;
-        match store_guard.load_cluster_availability().await {
-            Ok(availability) => availability,
-            Err(err) => {
-                warn!(error = %err, "failed to load cluster availability state; starting empty");
-                HashMap::new()
-            }
-        }
-    };
+    let persisted_cluster_replicas = persisted_cluster_replica_views.replicas;
+    let persisted_cluster_availability = persisted_cluster_replica_views.available;
     let persisted_cluster_nodes = backfill_cluster_nodes_from_replica_rows(
         persisted_cluster_nodes,
         &persisted_cluster_replicas,
