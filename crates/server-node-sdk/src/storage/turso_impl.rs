@@ -2374,7 +2374,7 @@ impl MetadataStore for TursoMetadataStore {
         bucket_name: &str,
         berrykeep_key_prefix: Option<&str>,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
-        let connection = self.open_lookup_connection("S3 object versions").await?;
+        let connection = self.open_scan_connection("S3 object versions").await?;
         let mut records = Vec::new();
         let mut rows = if let Some(prefix) = berrykeep_key_prefix {
             let like_pattern = super::sqlite_like_prefix_pattern(prefix);
@@ -4685,8 +4685,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_manifest_reads_do_not_consume_lookup_capacity() {
-        let metadata_db_path = turso_test_db_path("turso-snapshot-scan-read-connection");
+    async fn scan_reads_do_not_consume_lookup_capacity() {
+        let metadata_db_path = turso_test_db_path("turso-scan-read-lookup-isolation");
         let store = TursoMetadataStore::open(&metadata_db_path)
             .await
             .expect("turso metadata store should open");
@@ -4723,6 +4723,14 @@ mod tests {
         assert_eq!(loaded.created_at_unix, snapshot.created_at_unix);
         assert_eq!(loaded.objects, snapshot.objects);
         assert_eq!(loaded.object_ids, snapshot.object_ids);
+        let s3_versions = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.list_s3_object_versions("missing", None),
+        )
+        .await
+        .expect("lookup saturation must not block S3 version scans")
+        .expect("S3 object versions should load");
+        assert!(s3_versions.is_empty());
 
         drop(lookup_connections);
         drop(store);
