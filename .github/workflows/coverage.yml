@@ -129,11 +129,7 @@ jobs:
             }
             selected && /^DA:/ {
               split(substr($0, 4), values, ",")
-              if (
-                values[1] >= expected_start &&
-                values[1] <= expected_end &&
-                values[2] + 0 > 0
-              ) {
+              if (values[1] >= expected_start && values[1] <= expected_end && values[2] + 0 > 0) {
                 if (!covered) {
                   printf "reconcile_from_node coverage canary: DA:%s,%s\n", values[1], values[2]
                 }
