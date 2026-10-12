@@ -91,12 +91,7 @@ jobs:
 
           cargo +nightly-2026-02-17 llvm-cov clean --workspace
           cargo +nightly-2026-02-17 llvm-cov --locked \
-            -p client-sdk \
-            -p sync-core \
-            -p transport-sdk \
-            -p rendezvous-server \
-            -p server-node-sdk \
-            --lib \
+            --workspace \
             --all-features \
             --no-report
 
