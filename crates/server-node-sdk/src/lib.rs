@@ -13065,13 +13065,6 @@ async fn acquire_repair_execution(
         .await
 }
 
-async fn run_with_repair_execution_timeout<T>(
-    state: &ServerState,
-    future: impl Future<Output = T>,
-) -> Option<T> {
-    run_with_repair_execution_deadline(state, repair_execution_deadline(state), future).await
-}
-
 fn repair_execution_deadline(state: &ServerState) -> tokio::time::Instant {
     tokio::time::Instant::now()
         + Duration::from_secs(state.repair_config.execution_timeout_secs.max(1))
@@ -14263,28 +14256,68 @@ async fn execute_tracked_cluster_replication_repair(
     report
 }
 
+async fn finish_timed_out_startup_replication_repair(
+    state: &ServerState,
+    tracker: RepairRunTracker,
+    delay_secs: u64,
+    timeout_secs: u64,
+) {
+    {
+        let mut status = state.maintenance.startup_repair_status.lock().await;
+        *status = StartupRepairStatus::TimedOut;
+    }
+    let report = timed_out_repair_report(state, &tracker, timeout_secs);
+    finish_repair_run_tracking(
+        state,
+        tracker,
+        empty_repair_plan_summary(),
+        RepairRunStatus::TimedOut,
+        Some(RepairRunSummary::from_local_report(&report)),
+        serialize_repair_run_report(&report),
+    )
+    .await;
+    warn!(
+        delay_secs,
+        timeout_secs, "startup replication repair timed out"
+    );
+}
+
 fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
     tokio::spawn(async move {
         if delay_secs > 0 {
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
 
+        let execution_deadline = repair_execution_deadline(&state);
+        let execution_timeout_secs = repair_deadline_budget_secs(execution_deadline);
         let tracker = begin_repair_run_tracking(
             &state,
             replication::ReplicationRepairScope::Local,
             RepairRunTrigger::StartupRepair,
         )
         .await;
-        sync_availability_views_once(&state).await;
-        tracker.set_phase(RepairActiveRunPhase::Queued);
-        let permit = acquire_repair_execution(&state, RepairRunTrigger::StartupRepair).await;
+        let preparation = run_with_repair_execution_deadline(&state, execution_deadline, async {
+            sync_availability_views_once(&state).await;
+            tracker.set_phase(RepairActiveRunPhase::Queued);
+            acquire_repair_execution(&state, RepairRunTrigger::StartupRepair).await
+        })
+        .await;
+        let Some(permit) = preparation else {
+            finish_timed_out_startup_replication_repair(
+                &state,
+                tracker,
+                delay_secs,
+                execution_timeout_secs,
+            )
+            .await;
+            return;
+        };
         {
             let mut status = state.maintenance.startup_repair_status.lock().await;
             *status = StartupRepairStatus::Running;
         }
         tracker.set_phase(RepairActiveRunPhase::Running);
-        let execution_timeout_secs = state.repair_config.execution_timeout_secs.max(1);
-        let execution = run_with_repair_execution_timeout(&state, async {
+        let execution = run_with_repair_execution_deadline(&state, execution_deadline, async {
             let plan = current_replication_plan(&state).await;
             if plan.items.is_empty() {
                 return (plan, None);
@@ -14303,26 +14336,14 @@ fn spawn_startup_replication_repair(state: ServerState, delay_secs: u64) {
         .await;
 
         let Some((plan, report)) = execution else {
-            {
-                let mut status = state.maintenance.startup_repair_status.lock().await;
-                *status = StartupRepairStatus::TimedOut;
-            }
-            let report = timed_out_repair_report(&state, &tracker, execution_timeout_secs);
             drop(permit);
-            finish_repair_run_tracking(
+            finish_timed_out_startup_replication_repair(
                 &state,
                 tracker,
-                empty_repair_plan_summary(),
-                RepairRunStatus::TimedOut,
-                Some(RepairRunSummary::from_local_report(&report)),
-                serialize_repair_run_report(&report),
+                delay_secs,
+                execution_timeout_secs,
             )
             .await;
-            warn!(
-                delay_secs,
-                timeout_secs = state.repair_config.execution_timeout_secs,
-                "startup replication repair timed out"
-            );
             return;
         };
         let plan_summary = RepairPlanSummary::from_plan(&plan);

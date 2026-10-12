@@ -23253,6 +23253,62 @@ async fn startup_executor_wait_is_counted_once() {
 }
 
 #[tokio::test]
+async fn startup_executor_wait_uses_absolute_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    super::spawn_startup_replication_repair(state.clone(), 0);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = *state.maintenance.startup_repair_status.lock().await;
+            let active_runs_empty = state
+                .maintenance
+                .repair_activity
+                .lock()
+                .await
+                .active_runs
+                .is_empty();
+            let timed_out_recorded = repair_run_history(&state).await.iter().any(|record| {
+                record.trigger == super::RepairRunTrigger::StartupRepair
+                    && record.status == super::RepairRunStatus::TimedOut
+            });
+            if status == StartupRepairStatus::TimedOut && active_runs_empty && timed_out_recorded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup repair should time out while waiting for the executor");
+
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic,
+        0,
+        "timed-out startup repair must leave no executor waiter"
+    );
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(repair.pending, 0);
+    assert_eq!(repair.active, 0);
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn busy_peer_cluster_scope_is_forced_local_and_waits_within_budget() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let active = state
