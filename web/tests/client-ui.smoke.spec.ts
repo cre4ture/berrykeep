@@ -71,6 +71,18 @@ test("client-ui uses the MapLibre v6 camera transform for globe occlusion", () =
   expect(isGalleryMapLocationOccluded(map, backSideLocation)).toBe(true);
 });
 
+test("client-ui preserves the MapLibre transform receiver for globe occlusion", () => {
+  const backSideLocation = { longitude: 180, latitude: 0 };
+  const transform = {
+    backSideLocation,
+    isLocationOccluded(location: typeof backSideLocation) {
+      return location === this.backSideLocation;
+    }
+  };
+
+  expect(isGalleryMapLocationOccluded({ _camera: { transform } }, backSideLocation)).toBe(true);
+});
+
 test("client-ui retains the MapLibre v5 transform fallback for globe occlusion", () => {
   const backSideLocation = { longitude: 180, latitude: 0 };
   const map = {

@@ -15,6 +15,5 @@ export function isGalleryMapLocationOccluded<TLocation>(
 ): boolean | null {
   // MapLibre moved its transform from Map to Map._camera in v6.
   const transform = map._camera?.transform ?? map.transform;
-  const isLocationOccluded = transform?.isLocationOccluded;
-  return isLocationOccluded ? isLocationOccluded(location) : null;
+  return transform?.isLocationOccluded?.(location) ?? null;
 }
