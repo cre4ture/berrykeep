@@ -25,9 +25,11 @@ jobs:
   coverage:
     name: Cov
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
+      CARGO_LLVM_COV_TARGET_DIR: ${{ github.workspace }}/target/llvm-cov-target
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,8 +51,21 @@ jobs:
         working-directory: web
         run: pnpm install --frozen-lockfile
 
+      - name: Install Linux FUSE runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fuse3
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install AWS CLI
+        run: python -m pip install --upgrade pip awscli
+
       - name: Install Rust toolchain with llvm-tools
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly-2026-02-17
         with:
           components: llvm-tools-preview
 
@@ -66,9 +81,12 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Enforce line coverage threshold
+      - name: Run unit and system coverage
         run: |
-          cargo llvm-cov --locked \
+          coverage_ignore_regex='crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)'
+
+          cargo +nightly-2026-02-17 llvm-cov clean --workspace
+          cargo +nightly-2026-02-17 llvm-cov --locked \
             -p client-sdk \
             -p sync-core \
             -p transport-sdk \
@@ -76,9 +94,44 @@ jobs:
             -p server-node-sdk \
             --lib \
             --all-features \
+            --no-report
+
+          cargo +nightly-2026-02-17 llvm-cov --locked \
+            -Z bindeps \
+            --manifest-path tests/system-tests/Cargo.toml \
+            --lib \
+            --dep-coverage client-sdk,sync-core,transport-sdk,rendezvous-server,server-node-sdk \
+            --no-report
+
+          mkdir -p target/coverage
+          cargo +nightly-2026-02-17 llvm-cov report \
+            -p client-sdk \
+            -p sync-core \
+            -p transport-sdk \
+            -p rendezvous-server \
+            -p server-node-sdk \
+            --lcov \
+            --output-path target/coverage/lcov.info \
+            --ignore-filename-regex "${coverage_ignore_regex}"
+
+          cargo +nightly-2026-02-17 llvm-cov report \
+            -p client-sdk \
+            -p sync-core \
+            -p transport-sdk \
+            -p rendezvous-server \
+            -p server-node-sdk \
             --summary-only \
-            --ignore-filename-regex 'crates/common/src/lib.rs|crates/client-sdk/src/content_addressed_client_cache.rs|crates/server-node-sdk/src/(embedded_rendezvous|setup|ui\.rs)|crates/server-node-sdk/src/web_maps(\.rs|/)' \
+            --ignore-filename-regex "${coverage_ignore_regex}" \
             --fail-under-lines 68
+
+      - name: Upload line coverage report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-line-coverage
+          path: target/coverage/lcov.info
+          if-no-files-found: warn
+          retention-days: 14
 
   required-coverage:
     name: Required coverage
