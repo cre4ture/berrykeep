@@ -1,3 +1,14 @@
+berrykeep (2.0.1-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Harden server storage repair and replication, including serialized Turso
+    access and peer-backed map data reads.
+  * Improve client enrollment feedback, Android remote-prefix selection,
+    shutdown behavior, and task-queue status.
+  * Refresh BerryKeep branding and desktop configuration assets.
+  * Roll the workspace release to 2.0.1.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Mon, 12 Oct 2026 10:53:54 +0200
+
 berrykeep (2.0.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Update Rustls and web dependency security fixes across shipped clients and

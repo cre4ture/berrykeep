@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-linux-fuse"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-windows-cfapi"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -153,7 +153,7 @@ checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
 name = "android-app"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "android-server-node-app"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "jni 0.21.1",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "berrykeep-background-launcher"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "common",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "berrykeep-config-app"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "berrykeep-folder-agent"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1034,7 +1034,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli-client"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "client-sdk"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-client-config"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "git-version",
@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-status"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "client-sdk",
@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "ios-app"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3657,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "mobile-client-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4250,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "os-integration"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "adapter-linux-fuse",
  "adapter-windows-cfapi",
@@ -5003,7 +5003,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-server"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5038,7 +5038,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-service"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -5610,7 +5610,7 @@ dependencies = [
 
 [[package]]
 name = "server-node"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -5625,7 +5625,7 @@ dependencies = [
 
 [[package]]
 name = "server-node-sdk"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aead",
  "aes-gcm-siv",
@@ -5963,7 +5963,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stats-collector-server"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -6066,7 +6066,7 @@ dependencies = [
 
 [[package]]
 name = "sync-agent-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -6086,7 +6086,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "serde",
 ]
@@ -6407,7 +6407,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-display-status"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "embedded-graphics",
@@ -6777,7 +6777,7 @@ dependencies = [
 
 [[package]]
 name = "transport-sdk"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -7342,7 +7342,7 @@ dependencies = [
 
 [[package]]
 name = "web-ui-backend"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -7766,7 +7766,7 @@ dependencies = [
 
 [[package]]
 name = "windows-thumbnail-provider"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "adapter-windows-cfapi",
  "anyhow",
