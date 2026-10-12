@@ -45,7 +45,7 @@ use common::traced_rwlock::{
 use common::xmp::{is_sidecar_key, sidecar_key_for_media};
 use common::{
     ClusterId, DeviceId, HealthStatus, NodeId, normalize_node_hostname,
-    parse_comma_separated_labels,
+    normalize_node_software_version, parse_comma_separated_labels,
 };
 use futures_util::io::{
     AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt,
@@ -787,6 +787,7 @@ fn placeholder_cluster_node_descriptor(node_id: NodeId) -> NodeDescriptor {
     NodeDescriptor {
         node_id,
         hostname: None,
+        software_version: None,
         reachability: NodeReachability::default(),
         capabilities: NodeCapabilities::default(),
         labels: HashMap::new(),
@@ -4652,6 +4653,7 @@ fn local_node_enrollment_issuer_descriptor(
     Some(cluster::NodeDescriptor {
         node_id: state.node_id,
         hostname: state.node_hostname.clone(),
+        software_version: Some(BUILD_VERSION.to_string()),
         reachability,
         capabilities: NodeCapabilities {
             public_api: true,
@@ -7665,6 +7667,7 @@ async fn run_inner(
     let _ = cluster.register_node(NodeDescriptor {
         node_id: config.node_id,
         hostname: node_hostname.clone(),
+        software_version: Some(BUILD_VERSION.to_string()),
         reachability: local_reachability.clone(),
         capabilities: NodeCapabilities {
             public_api: !local_reachability.public_api_urls().is_empty(),
@@ -9754,6 +9757,7 @@ fn build_rendezvous_presence_registration(
         cluster_id: state.cluster_id,
         identity: PeerIdentity::Node(state.node_id),
         hostname: state.node_hostname.clone(),
+        software_version: Some(BUILD_VERSION.to_string()),
         public_api_url,
         public_direct_urls,
         peer_api_url,
@@ -9857,6 +9861,11 @@ async fn apply_rendezvous_presence_entries(
                 descriptor.hostname = cluster
                     .node(descriptor.node_id)
                     .and_then(|node| node.hostname.clone());
+            }
+            if descriptor.software_version.is_none() {
+                descriptor.software_version = cluster
+                    .node(descriptor.node_id)
+                    .and_then(|node| node.software_version.clone());
             }
 
             if cluster.register_node(descriptor) {
@@ -9976,6 +9985,11 @@ fn node_descriptor_from_presence_entry(
             .hostname
             .as_deref()
             .and_then(normalize_node_hostname),
+        software_version: entry
+            .registration
+            .software_version
+            .as_deref()
+            .and_then(normalize_node_software_version),
         reachability: NodeReachability {
             public_api_url: public_api_url.clone(),
             public_direct_urls,
@@ -14414,6 +14428,7 @@ fn spawn_peer_heartbeat_emitter(state: ServerState, interval_secs: u64) {
                 capacity_bytes: Some(local_descriptor.capacity_bytes),
                 storage_stats: local_descriptor.storage_stats,
                 labels: Some(local_descriptor.labels),
+                software_version: local_descriptor.software_version,
             };
 
             for peer in peers {
@@ -23313,6 +23328,8 @@ struct RegisterNodeRequest {
     #[serde(default)]
     hostname: Option<String>,
     #[serde(default)]
+    software_version: Option<String>,
+    #[serde(default)]
     capabilities: Option<NodeCapabilities>,
     labels: HashMap<String, String>,
     capacity_bytes: Option<u64>,
@@ -23328,6 +23345,8 @@ struct NodeHeartbeatRequest {
     #[serde(default)]
     storage_stats: Option<NodeStorageStatsSummary>,
     labels: Option<HashMap<String, String>>,
+    #[serde(default)]
+    software_version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -23337,6 +23356,8 @@ struct OutboundNodeHeartbeatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     storage_stats: Option<NodeStorageStatsSummary>,
     labels: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    software_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28936,6 +28957,7 @@ async fn refresh_local_node_reachability(state: &ServerState) -> Result<()> {
         cluster.register_node(NodeDescriptor {
             node_id: state.node_id,
             hostname: state.node_hostname.clone(),
+            software_version: Some(BUILD_VERSION.to_string()),
             reachability: reachability.clone(),
             capabilities: NodeCapabilities {
                 public_api: !reachability.public_api_urls().is_empty(),
@@ -32118,6 +32140,10 @@ async fn apply_node_heartbeat(
     node_id: NodeId,
     request: NodeHeartbeatRequest,
 ) -> StatusCode {
+    let software_version = request
+        .software_version
+        .as_deref()
+        .and_then(normalize_node_software_version);
     let mut cluster = state.cluster.lock().await;
     if cluster.touch_heartbeat(
         node_id,
@@ -32125,6 +32151,7 @@ async fn apply_node_heartbeat(
         request.capacity_bytes,
         request.storage_stats,
         request.labels,
+        software_version,
     ) {
         StatusCode::NO_CONTENT
     } else {
@@ -32158,6 +32185,13 @@ async fn register_node(
     let requested_hostname = match request.hostname {
         Some(hostname) => match normalize_node_hostname(&hostname) {
             Some(hostname) => Some(hostname),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
+    };
+    let requested_software_version = match request.software_version {
+        Some(software_version) => match normalize_node_software_version(&software_version) {
+            Some(software_version) => Some(software_version),
             None => return StatusCode::BAD_REQUEST.into_response(),
         },
         None => None,
@@ -32233,9 +32267,15 @@ async fn register_node(
                 .node(node_id)
                 .and_then(|existing| existing.hostname.clone())
         });
+        let software_version = requested_software_version.or_else(|| {
+            cluster
+                .node(node_id)
+                .and_then(|existing| existing.software_version.clone())
+        });
         cluster.register_node(NodeDescriptor {
             node_id,
             hostname,
+            software_version,
             reachability,
             capabilities,
             labels: request.labels,
