@@ -3977,6 +3977,7 @@ async fn persist_and_load_repair_attempts_roundtrip_impl(backend: StorageTestBac
         RepairAttemptRecord {
             attempts: 2,
             last_failure_unix: 123,
+            key_version: 2,
         },
     );
 
@@ -3986,6 +3987,7 @@ async fn persist_and_load_repair_attempts_roundtrip_impl(backend: StorageTestBac
     let entry = loaded.get("subject@version|node").unwrap();
     assert_eq!(entry.attempts, 2);
     assert_eq!(entry.last_failure_unix, 123);
+    assert_eq!(entry.key_version, 2);
 
     let _ = fs::remove_dir_all(root).await;
 }

@@ -721,7 +721,7 @@ impl MetadataStore for TursoMetadataStore {
         let mut rows = self
             .connection
             .query(
-                "SELECT subject, attempts, last_failure_unix
+                "SELECT subject, attempts, last_failure_unix, key_version
                  FROM repair_attempts",
                 (),
             )
@@ -732,11 +732,14 @@ impl MetadataStore for TursoMetadataStore {
             let attempts_count = u32::try_from(row_u64(&row, 1, "repair_attempts.attempts")?)
                 .context("repair attempt count overflow")?;
             let last_failure_unix = row_u64(&row, 2, "repair_attempts.last_failure_unix")?;
+            let key_version = u8::try_from(row_u64(&row, 3, "repair_attempts.key_version")?)
+                .context("repair attempt key version overflow")?;
             attempts.insert(
                 subject,
                 RepairAttemptRecord {
                     attempts: attempts_count,
                     last_failure_unix,
+                    key_version,
                 },
             );
         }
@@ -756,13 +759,14 @@ impl MetadataStore for TursoMetadataStore {
             for (subject, record) in attempts {
                 self.connection
                     .execute(
-                        "INSERT INTO repair_attempts (subject, attempts, last_failure_unix)
-                         VALUES (?1, ?2, ?3)",
+                        "INSERT INTO repair_attempts (subject, attempts, last_failure_unix, key_version)
+                         VALUES (?1, ?2, ?3, ?4)",
                         (
                             subject.as_str(),
                             i64::from(record.attempts),
                             i64::try_from(record.last_failure_unix)
                                 .context("repair failure timestamp overflow")?,
+                            i64::from(record.key_version),
                         ),
                     )
                     .await?;
@@ -3527,7 +3531,8 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS repair_attempts (
                 subject TEXT PRIMARY KEY,
                 attempts INTEGER NOT NULL,
-                last_failure_unix INTEGER NOT NULL
+                last_failure_unix INTEGER NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 2
             );
 
             CREATE TABLE IF NOT EXISTS content_repair_tasks (
@@ -3780,6 +3785,13 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             (),
         )
         .await?;
+    add_column_if_missing(
+        connection,
+        "repair_attempts",
+        "key_version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    .await?;
     add_column_if_missing(
         connection,
         "content_repair_tasks",

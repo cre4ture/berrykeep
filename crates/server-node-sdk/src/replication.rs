@@ -3,7 +3,81 @@ use storage::{ReplicationExportBundle, TOMBSTONE_MANIFEST_HASH};
 
 const REPAIR_PROGRESS_CHUNK_LOG_INTERVAL: usize = 128;
 const MAX_REPAIR_REPORT_LOG_ENTRIES: usize = 2_048;
-const MAX_REPAIR_REPORT_SKIPPED_DETAILS: usize = 2_048;
+pub(super) const MAX_REPAIR_REPORT_SKIPPED_DETAILS: usize = 2_048;
+
+#[cfg(test)]
+pub(crate) struct ReplicationExportBlocker {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl ReplicationExportBlocker {
+    pub(crate) async fn wait_until_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+fn replication_export_blockers() -> &'static StdMutex<HashMap<String, Arc<ReplicationExportBlocker>>>
+{
+    static BLOCKERS: std::sync::OnceLock<StdMutex<HashMap<String, Arc<ReplicationExportBlocker>>>> =
+        std::sync::OnceLock::new();
+    BLOCKERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn block_replication_export_for_test(key: &str) -> Arc<ReplicationExportBlocker> {
+    let blocker = Arc::new(ReplicationExportBlocker {
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        released: std::sync::atomic::AtomicBool::new(false),
+    });
+    let previous = replication_export_blockers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_string(), Arc::clone(&blocker));
+    assert!(
+        previous.is_none(),
+        "replication export blocker already registered for {key}"
+    );
+    blocker
+}
+
+#[cfg(test)]
+pub(crate) fn clear_replication_export_blocker_for_test(key: &str) {
+    replication_export_blockers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+}
+
+#[cfg(test)]
+async fn wait_for_replication_export_test_blocker(key: &str) {
+    let blocker = replication_export_blockers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .cloned();
+    if let Some(blocker) = blocker {
+        blocker.started.notify_one();
+        loop {
+            let released = blocker.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if blocker.released.load(Ordering::Acquire) {
+                break;
+            }
+            released.await;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReplicationRepairReport {
@@ -24,6 +98,8 @@ pub(crate) struct ReplicationRepairReport {
     pub(crate) waiting_for_source: bool,
     #[serde(default)]
     pub(crate) unresolved: bool,
+    #[serde(default)]
+    pub(crate) timed_out: bool,
 }
 
 impl ReplicationRepairReport {
@@ -40,6 +116,9 @@ impl ReplicationRepairReport {
     }
 
     pub(crate) fn run_status(&self) -> RepairRunStatus {
+        if self.timed_out {
+            return RepairRunStatus::TimedOut;
+        }
         let deferred_transfer = self.skipped_backoff > 0 || self.skipped_max_retries > 0;
 
         if self.failed_transfers > 0 {
@@ -77,6 +156,41 @@ impl ReplicationRepairReport {
         }
         RepairRunStatus::Completed
     }
+
+    pub(crate) fn timed_out(report_node_id: NodeId, timeout_secs: u64) -> Self {
+        let error = format!("repair execution timed out after {timeout_secs} seconds");
+        let mut report = Self {
+            attempted_transfers: 0,
+            successful_transfers: 0,
+            failed_transfers: 0,
+            skipped_items: 0,
+            skipped_backoff: 0,
+            skipped_max_retries: 0,
+            skipped_details: Vec::new(),
+            detailed_log: Vec::new(),
+            last_error: Some(error.clone()),
+            had_chunk_progress: false,
+            waiting_for_source: false,
+            unresolved: false,
+            timed_out: true,
+        };
+        push_repair_log_entry(
+            &mut report.detailed_log,
+            report_node_id,
+            "repair_run_timed_out",
+            "repair execution exceeded its assigned deadline",
+            None,
+            None,
+            None,
+            None,
+            Some(report_node_id),
+            Some(serde_json::json!({
+                "timeout_secs": timeout_secs,
+                "error": error,
+            })),
+        );
+        report
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +222,7 @@ pub(crate) enum ReplicationRepairSkipReason {
     SourceNodeUnavailable,
     BundleUnavailable,
     RepairInProgress,
+    BatchLimitReached,
     BackoffActive,
     MaxRetriesExhausted,
 }
@@ -163,8 +278,17 @@ pub(crate) struct ClusterReplicationRepairReport {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReplicationRepairQuery {
-    batch_size: Option<usize>,
-    scope: Option<ReplicationRepairScope>,
+    pub(crate) batch_size: Option<usize>,
+    pub(crate) scope: Option<ReplicationRepairScope>,
+    pub(crate) execution_budget_millis: Option<u64>,
+}
+
+fn repair_request_unavailable(error: &'static str) -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": error })),
+    )
+        .into_response()
 }
 
 async fn execute_replication_repair_with_trigger(
@@ -179,19 +303,154 @@ async fn execute_replication_repair_with_trigger(
     } else {
         query.scope.unwrap_or_default()
     };
+    let request_admission = match trigger {
+        RepairRunTrigger::ManualRequest => {
+            let admission = match scope {
+                ReplicationRepairScope::Local => {
+                    Arc::clone(&state.maintenance.manual_local_repair_request_admission)
+                }
+                ReplicationRepairScope::Cluster => {
+                    Arc::clone(&state.maintenance.manual_cluster_repair_request_admission)
+                }
+            };
+            let Ok(admission) = admission.try_acquire_owned() else {
+                warn!(
+                    ?scope,
+                    "rejecting duplicate manual repair while another request is admitted"
+                );
+                return repair_request_unavailable(
+                    "another manual replication repair request is already admitted",
+                );
+            };
+            admission
+        }
+        RepairRunTrigger::PeerClusterRequest => {
+            let Ok(admission) =
+                Arc::clone(&state.maintenance.peer_repair_request_admission).try_acquire_owned()
+            else {
+                warn!("rejecting duplicate peer repair while another request is admitted");
+                return repair_request_unavailable(
+                    "another peer replication repair request is already admitted",
+                );
+            };
+            if state
+                .maintenance
+                .manual_local_repair_request_admission
+                .available_permits()
+                == 0
+            {
+                warn!("rejecting peer local repair because a manual request is admitted");
+                return repair_request_unavailable(
+                    "a manual replication repair request is already admitted",
+                );
+            }
+            admission
+        }
+        _ => unreachable!("HTTP repair requests use manual or peer triggers"),
+    };
+    let peer_execution_deadline = (trigger == RepairRunTrigger::PeerClusterRequest
+        && scope == ReplicationRepairScope::Local)
+        .then(|| {
+            let configured_budget =
+                Duration::from_secs(state.repair_config.execution_timeout_secs.max(1));
+            let requested_budget = query
+                .execution_budget_millis
+                .map(|millis| Duration::from_millis(millis.max(1)))
+                .unwrap_or(configured_budget);
+            tokio::time::Instant::now() + requested_budget.min(configured_budget)
+        });
+    if let Some(execution_deadline) = peer_execution_deadline {
+        // A peer-local request still needs a current view, but remote
+        // synchronization must finish before it attempts to occupy the local
+        // repair data plane. It shares one absolute deadline with the repair so
+        // sequential peer synchronization cannot extend the remote request
+        // beyond the configured local execution budget.
+        if run_with_repair_execution_deadline(
+            &state,
+            execution_deadline,
+            sync_availability_views_once(&state),
+        )
+        .await
+        .is_none()
+        {
+            warn!("rejecting peer local repair because availability synchronization timed out");
+            return repair_request_unavailable(
+                "peer replication repair preparation exceeded its execution deadline",
+            );
+        }
+    }
 
     match scope {
         ReplicationRepairScope::Local => {
-            let report =
-                execute_tracked_local_replication_repair(&state, batch_override, trigger, None)
-                    .await;
-            (StatusCode::OK, Json(report)).into_response()
+            let repair_task = match trigger {
+                RepairRunTrigger::PeerClusterRequest => {
+                    let execution_deadline = peer_execution_deadline
+                        .expect("peer local repair should have an execution deadline");
+                    let Some(permit) = run_with_repair_execution_deadline(
+                        &state,
+                        execution_deadline,
+                        acquire_repair_execution(&state, trigger),
+                    )
+                    .await
+                    else {
+                        warn!("rejecting peer local repair because executor wait timed out");
+                        return repair_request_unavailable(
+                            "peer replication repair executor wait exceeded its execution deadline",
+                        );
+                    };
+                    if state
+                        .maintenance
+                        .manual_local_repair_request_admission
+                        .available_permits()
+                        == 0
+                    {
+                        drop(permit);
+                        warn!("rejecting peer local repair because a manual request is admitted");
+                        return repair_request_unavailable(
+                            "a manual replication repair request is already admitted",
+                        );
+                    }
+                    tokio::spawn(async move {
+                        let _admission = request_admission;
+                        execute_tracked_local_replication_repair_with_permit(
+                            &state,
+                            batch_override,
+                            trigger,
+                            None,
+                            permit,
+                            execution_deadline,
+                        )
+                        .await
+                    })
+                }
+                RepairRunTrigger::ManualRequest => tokio::spawn(async move {
+                    let _admission = request_admission;
+                    execute_tracked_local_replication_repair(&state, batch_override, trigger, None)
+                        .await
+                }),
+                _ => unreachable!("HTTP repair requests use manual or peer triggers"),
+            };
+            match repair_task.await {
+                Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+                Err(error) => {
+                    warn!(%error, "local replication repair task failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
         }
         ReplicationRepairScope::Cluster => {
-            let report =
+            let repair_task = tokio::spawn(async move {
+                let _admission = request_admission;
                 execute_tracked_cluster_replication_repair(&state, batch_override, trigger, None)
-                    .await;
-            (StatusCode::OK, Json(report)).into_response()
+                    .await
+            });
+            match repair_task.await {
+                Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+                Err(error) => {
+                    warn!(%error, "cluster replication repair task failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
         }
     }
 }
@@ -231,7 +490,7 @@ pub(crate) async fn execute_replication_repair_peer(
         state,
         query,
         RepairRunTrigger::PeerClusterRequest,
-        false,
+        true,
     )
     .await
 }
@@ -240,6 +499,7 @@ pub(crate) async fn execute_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ReplicationRepairReport {
+    sync_availability_views_once(state).await;
     execute_replication_repair_inner_with_context(state, batch_size_override, None).await
 }
 
@@ -248,7 +508,6 @@ pub(crate) async fn execute_replication_repair_inner_with_context(
     batch_size_override: Option<usize>,
     run_id: Option<&str>,
 ) -> ReplicationRepairReport {
-    sync_availability_views_once(state).await;
     let keys = planning_replication_subjects(state).await;
 
     let plan_snapshot = {
@@ -267,6 +526,7 @@ pub(crate) async fn execute_planned_targeted_replication_repair_inner(
     subjects: Vec<String>,
     batch_size_override: Option<usize>,
 ) -> (ReplicationPlan, ReplicationRepairReport) {
+    sync_availability_views_once(state).await;
     execute_planned_targeted_replication_repair_inner_with_context(
         state,
         subjects,
@@ -288,8 +548,6 @@ pub(crate) async fn execute_planned_targeted_replication_repair_inner_with_conte
         .collect::<Vec<_>>();
     subjects.sort();
     subjects.dedup();
-
-    sync_availability_views_once(state).await;
 
     let plan_snapshot = {
         let mut cluster = state.cluster.lock().await;
@@ -436,6 +694,30 @@ async fn export_locally_owned_replication_bundle(
     key: &str,
     version_id: Option<&str>,
 ) -> Result<Option<ReplicationExportBundle>> {
+    let execution_timeout_secs = state.repair_config.execution_timeout_secs.max(1);
+    let timeout_secs = execution_timeout_secs.saturating_sub(1).clamp(
+        1,
+        state.repair_config.subject_inspection_timeout_secs.max(1),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        export_locally_owned_replication_bundle_inner(state, key, version_id),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out after {timeout_secs}s inspecting local replication bundle for key={key} version_id={version_id:?}"
+        )
+    })?
+}
+
+async fn export_locally_owned_replication_bundle_inner(
+    state: &ServerState,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<Option<ReplicationExportBundle>> {
+    #[cfg(test)]
+    wait_for_replication_export_test_blocker(key).await;
     let store = read_store(state, "replication_repair.export_bundle").await;
     let Some(bundle) = store
         .export_replication_bundle(key, version_id, ObjectReadMode::Preferred)
@@ -465,6 +747,78 @@ async fn export_locally_owned_replication_bundle(
     }
 }
 
+struct RepairProgressPersistenceGuard {
+    state: ServerState,
+    repair_run_id: String,
+    replicas_state_dirty: bool,
+    repair_state_dirty: bool,
+}
+
+impl RepairProgressPersistenceGuard {
+    fn new(state: &ServerState, repair_run_id: &str) -> Self {
+        Self {
+            state: state.clone(),
+            repair_run_id: repair_run_id.to_string(),
+            replicas_state_dirty: false,
+            repair_state_dirty: false,
+        }
+    }
+}
+
+impl Drop for RepairProgressPersistenceGuard {
+    fn drop(&mut self) {
+        if !self.replicas_state_dirty && !self.repair_state_dirty {
+            return;
+        }
+
+        let state = self.state.clone();
+        let repair_run_id = self.repair_run_id.clone();
+        let persist_replicas = self.replicas_state_dirty;
+        let persist_attempts = self.repair_state_dirty;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                repair_run_id,
+                persist_replicas,
+                persist_attempts,
+                "could not schedule cancelled repair progress persistence without a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            let (replica_result, attempt_result) = tokio::join!(
+                async {
+                    if persist_replicas {
+                        persist_cluster_replicas_state(&state).await
+                    } else {
+                        Ok(())
+                    }
+                },
+                async {
+                    if persist_attempts {
+                        persist_repair_state(&state).await
+                    } else {
+                        Ok(())
+                    }
+                }
+            );
+            if let Err(error) = replica_result {
+                warn!(
+                    repair_run_id,
+                    %error,
+                    "failed to persist cluster replica state after repair cancellation"
+                );
+            }
+            if let Err(error) = attempt_result {
+                warn!(
+                    repair_run_id,
+                    %error,
+                    "failed to persist repair attempt state after repair cancellation"
+                );
+            }
+        });
+    }
+}
+
 pub(crate) async fn execute_replication_repair_plan(
     state: &ServerState,
     plan: &ReplicationPlan,
@@ -481,6 +835,7 @@ pub(crate) async fn execute_replication_repair_plan(
     let plan_cleanup_deferred_items = plan.cleanup_deferred_items;
     let plan_cleanup_deferred_extra_nodes = plan.cleanup_deferred_extra_nodes;
     let mut attempted_transfers = 0usize;
+    let mut failed_subject_inspections = 0usize;
     let mut successful_transfers = 0usize;
     let mut failed_transfers = 0usize;
     let mut skipped_items = 0usize;
@@ -489,14 +844,15 @@ pub(crate) async fn execute_replication_repair_plan(
     let mut skipped_details = Vec::new();
     let mut detailed_log = Vec::new();
     let mut last_error = None;
-    let mut replicas_state_dirty = false;
-    let mut repair_state_dirty = false;
-
     let max_attempts = state.repair_config.max_retries;
     let backoff_secs = state.repair_config.backoff_secs;
+    let inspection_retry_reset_secs = backoff_secs
+        .max(state.repair_config.subject_inspection_timeout_secs.max(1))
+        .saturating_mul(u64::from(max_attempts).saturating_add(1));
     let max_transfers = batch_size_override.unwrap_or(state.repair_config.batch_size);
     let now = unix_ts();
     let repair_run_id = run_id.unwrap_or("untracked");
+    let mut persistence = RepairProgressPersistenceGuard::new(state, repair_run_id);
     let locally_available = cached_local_cluster_available_subjects(state)
         .await
         .into_iter()
@@ -553,7 +909,9 @@ pub(crate) async fn execute_replication_repair_plan(
     );
 
     for item in plan_items {
-        if attempted_transfers >= max_transfers {
+        let consumed_work_items =
+            consumed_repair_work_items(attempted_transfers, failed_subject_inspections);
+        if consumed_work_items >= max_transfers {
             push_repair_log_entry(
                 &mut detailed_log,
                 state.node_id,
@@ -566,6 +924,8 @@ pub(crate) async fn execute_replication_repair_plan(
                 None,
                 Some(serde_json::json!({
                     "attempted_transfers": attempted_transfers,
+                    "failed_subject_inspections": failed_subject_inspections,
+                    "consumed_work_items": consumed_work_items,
                     "max_transfers": max_transfers,
                 })),
             );
@@ -654,6 +1014,119 @@ pub(crate) async fn execute_replication_repair_plan(
             })),
         );
 
+        let inspection_attempt_key = inspection_attempt_key(&item.key, state.node_id);
+        let mut inspection_retry_reset = None;
+        {
+            let mut repair_state = state.maintenance.repair_state.lock().await;
+            if let Some(previous) = repair_state.attempts.get(&inspection_attempt_key).copied() {
+                let elapsed = now.saturating_sub(previous.last_failure_unix);
+                if previous.attempts > max_attempts {
+                    if elapsed >= inspection_retry_reset_secs {
+                        repair_state.attempts.remove(&inspection_attempt_key);
+                        persistence.repair_state_dirty = true;
+                        inspection_retry_reset = Some(previous);
+                    } else {
+                        skipped_max_retries += 1;
+                        push_repair_skipped_detail(
+                            &mut skipped_details,
+                            state.node_id,
+                            item.key.clone(),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            None,
+                            Some(state.node_id),
+                            ReplicationRepairSkipReason::MaxRetriesExhausted,
+                            format!(
+                                "local replica inspection deferred after {} failed attempts for another {}s (max_retries={max_attempts})",
+                                previous.attempts,
+                                inspection_retry_reset_secs.saturating_sub(elapsed)
+                            ),
+                        );
+                        push_repair_log_entry(
+                            &mut detailed_log,
+                            state.node_id,
+                            "subject_skipped",
+                            "local replica inspection retry limit temporarily exhausted",
+                            Some(item.key.clone()),
+                            Some(key.clone()),
+                            version_id.clone(),
+                            None,
+                            Some(state.node_id),
+                            Some(serde_json::json!({
+                                "reason": "max_retries_exhausted",
+                                "phase": "local_replica_inspection",
+                                "failed_attempts": previous.attempts,
+                                "max_retries": max_attempts,
+                                "last_failure_unix": previous.last_failure_unix,
+                                "retry_reset_after_secs": inspection_retry_reset_secs,
+                                "retry_reset_remaining_secs": inspection_retry_reset_secs.saturating_sub(elapsed),
+                            })),
+                        );
+                        continue;
+                    }
+                }
+
+                let required_backoff =
+                    jittered_backoff_secs(backoff_secs, &inspection_attempt_key, previous.attempts);
+                if inspection_retry_reset.is_none() && elapsed < required_backoff {
+                    skipped_backoff += 1;
+                    push_repair_skipped_detail(
+                        &mut skipped_details,
+                        state.node_id,
+                        item.key.clone(),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        None,
+                        Some(state.node_id),
+                        ReplicationRepairSkipReason::BackoffActive,
+                        format!(
+                            "local replica inspection retry backoff active for another {}s after {} failed attempts",
+                            required_backoff.saturating_sub(elapsed),
+                            previous.attempts
+                        ),
+                    );
+                    push_repair_log_entry(
+                        &mut detailed_log,
+                        state.node_id,
+                        "subject_skipped",
+                        "local replica inspection retry backoff is active",
+                        Some(item.key.clone()),
+                        Some(key.clone()),
+                        version_id.clone(),
+                        None,
+                        Some(state.node_id),
+                        Some(serde_json::json!({
+                            "reason": "backoff_active",
+                            "phase": "local_replica_inspection",
+                            "failed_attempts": previous.attempts,
+                            "last_failure_unix": previous.last_failure_unix,
+                            "elapsed_since_failure_secs": elapsed,
+                            "required_backoff_secs": required_backoff,
+                        })),
+                    );
+                    continue;
+                }
+            }
+        }
+        if let Some(previous) = inspection_retry_reset {
+            push_repair_log_entry(
+                &mut detailed_log,
+                state.node_id,
+                "local_replica_inspection_retry_reset",
+                "retrying local replica inspection after its exhausted retry window expired",
+                Some(item.key.clone()),
+                Some(key.clone()),
+                version_id.clone(),
+                None,
+                Some(state.node_id),
+                Some(serde_json::json!({
+                    "failed_attempts": previous.attempts,
+                    "last_failure_unix": previous.last_failure_unix,
+                    "retry_reset_after_secs": inspection_retry_reset_secs,
+                })),
+            );
+        }
+
         let mut bundle = match export_locally_owned_replication_bundle(
             state,
             &key,
@@ -661,9 +1134,21 @@ pub(crate) async fn execute_replication_repair_plan(
         )
         .await
         {
-            Ok(bundle) => bundle,
+            Ok(bundle) => {
+                let removed = state
+                    .maintenance
+                    .repair_state
+                    .lock()
+                    .await
+                    .attempts
+                    .remove(&inspection_attempt_key)
+                    .is_some();
+                persistence.repair_state_dirty |= removed;
+                bundle
+            }
             Err(err) => {
                 let error_text = format!("{err:#}");
+                failed_subject_inspections += 1;
                 failed_transfers += 1;
                 last_error = Some(error_text.clone());
                 warn!(
@@ -690,6 +1175,18 @@ pub(crate) async fn execute_replication_repair_plan(
                         "error": error_text,
                     })),
                 );
+                let mut repair_state = state.maintenance.repair_state.lock().await;
+                let entry = repair_state
+                    .attempts
+                    .entry(inspection_attempt_key)
+                    .or_insert(RepairAttemptEntry {
+                        attempts: 0,
+                        last_failure_unix: now,
+                    });
+                entry.attempts = entry.attempts.saturating_add(1);
+                entry.last_failure_unix = now;
+                drop(repair_state);
+                persistence.repair_state_dirty = true;
                 continue;
             }
         };
@@ -765,7 +1262,7 @@ pub(crate) async fn execute_replication_repair_plan(
 
             repair_source_node_id = Some(source_node.node_id);
 
-            let transfer_key = format!("{}|{}", item.key, state.node_id);
+            let transfer_key = transfer_attempt_key(&item.key, state.node_id);
 
             {
                 let repair_state = state.maintenance.repair_state.lock().await;
@@ -926,31 +1423,25 @@ pub(crate) async fn execute_replication_repair_plan(
                     cluster.note_replica(&key, state.node_id);
                     cluster.note_replica(format!("{key}@{imported_version_id}"), state.node_id);
                     drop(cluster);
-                    replicas_state_dirty = true;
+                    persistence.replicas_state_dirty = true;
 
                     let mut repair_state = state.maintenance.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
                     drop(repair_state);
-                    repair_state_dirty = true;
+                    persistence.repair_state_dirty = true;
 
-                    bundle = {
-                        let store = read_store(state, "replication_repair.reload_bundle").await;
-                        store
-                            .export_replication_bundle(
-                                &key,
-                                version_id.as_deref(),
-                                ObjectReadMode::Preferred,
-                            )
+                    bundle =
+                        export_locally_owned_replication_bundle(state, &key, version_id.as_deref())
                             .await
                             .ok()
-                            .flatten()
-                    };
+                            .flatten();
                 }
                 Ok(PullBundleOutcome::Deferred { manifest_hash }) => {
                     // Claim contention means another operation is already
                     // recovering this immutable manifest. No transfer started,
                     // so leave capacity for the rest of this repair batch.
                     attempted_transfers = attempted_transfers.saturating_sub(1);
+                    rollback_active_repair_attempt();
                     skipped_items += 1;
                     push_repair_skipped_detail(
                         &mut skipped_details,
@@ -1008,7 +1499,7 @@ pub(crate) async fn execute_replication_repair_plan(
                     entry.attempts = entry.attempts.saturating_add(1);
                     entry.last_failure_unix = now;
                     drop(repair_state);
-                    repair_state_dirty = true;
+                    persistence.repair_state_dirty = true;
                 }
             }
         }
@@ -1053,7 +1544,9 @@ pub(crate) async fn execute_replication_repair_plan(
         };
 
         for &target in &item.missing_nodes {
-            if attempted_transfers >= max_transfers {
+            let consumed_work_items =
+                consumed_repair_work_items(attempted_transfers, failed_subject_inspections);
+            if consumed_work_items >= max_transfers {
                 push_repair_log_entry(
                     &mut detailed_log,
                     state.node_id,
@@ -1066,6 +1559,8 @@ pub(crate) async fn execute_replication_repair_plan(
                     Some(target),
                     Some(serde_json::json!({
                         "attempted_transfers": attempted_transfers,
+                        "failed_subject_inspections": failed_subject_inspections,
+                        "consumed_work_items": consumed_work_items,
                         "max_transfers": max_transfers,
                     })),
                 );
@@ -1095,7 +1590,7 @@ pub(crate) async fn execute_replication_repair_plan(
                 continue;
             }
 
-            let transfer_key = format!("{}|{}", item.key, target);
+            let transfer_key = transfer_attempt_key(&item.key, target);
 
             {
                 let repair_state = state.maintenance.repair_state.lock().await;
@@ -1259,12 +1754,12 @@ pub(crate) async fn execute_replication_repair_plan(
                     }
                     cluster.note_replica(format!("{key}@{remote_version_id}"), target);
                     drop(cluster);
-                    replicas_state_dirty = true;
+                    persistence.replicas_state_dirty = true;
 
                     let mut repair_state = state.maintenance.repair_state.lock().await;
                     repair_state.attempts.remove(&transfer_key);
                     drop(repair_state);
-                    repair_state_dirty = true;
+                    persistence.repair_state_dirty = true;
                 }
                 Err(err) => {
                     let error_text = format!("{err:#}");
@@ -1307,15 +1802,16 @@ pub(crate) async fn execute_replication_repair_plan(
                     entry.attempts = entry.attempts.saturating_add(1);
                     entry.last_failure_unix = now;
                     drop(repair_state);
-                    repair_state_dirty = true;
+                    persistence.repair_state_dirty = true;
                 }
             }
         }
     }
 
-    if replicas_state_dirty {
+    if persistence.replicas_state_dirty {
         match persist_cluster_replicas_state(state).await {
             Ok(()) => {
+                persistence.replicas_state_dirty = false;
                 push_repair_log_entry(
                     &mut detailed_log,
                     state.node_id,
@@ -1353,9 +1849,10 @@ pub(crate) async fn execute_replication_repair_plan(
         }
     }
 
-    if repair_state_dirty {
+    if persistence.repair_state_dirty {
         match persist_repair_state(state).await {
             Ok(()) => {
+                persistence.repair_state_dirty = false;
                 push_repair_log_entry(
                     &mut detailed_log,
                     state.node_id,
@@ -1436,7 +1933,31 @@ pub(crate) async fn execute_replication_repair_plan(
         had_chunk_progress: false,
         waiting_for_source: false,
         unresolved: false,
+        timed_out: false,
     }
+}
+
+fn peer_phase_budget(per_peer_budget: Duration, peer_count: usize) -> Duration {
+    if peer_count == 0 {
+        Duration::ZERO
+    } else {
+        per_peer_budget
+    }
+}
+
+fn peer_execution_budget(request_budget: Duration) -> Duration {
+    let response_grace =
+        Duration::from_secs(PEER_REPAIR_REQUEST_TIMEOUT_GRACE_SECS).min(request_budget / 2);
+    request_budget
+        .saturating_sub(response_grace)
+        .max(Duration::from_millis(1))
+}
+
+fn consumed_repair_work_items(
+    attempted_transfers: usize,
+    failed_subject_inspections: usize,
+) -> usize {
+    attempted_transfers.saturating_add(failed_subject_inspections)
 }
 
 #[allow(dead_code)]
@@ -1444,14 +1965,28 @@ pub(crate) async fn execute_cluster_replication_repair_inner(
     state: &ServerState,
     batch_size_override: Option<usize>,
 ) -> ClusterReplicationRepairReport {
-    execute_cluster_replication_repair_inner_with_context(state, batch_size_override, None).await
+    sync_availability_views_once(state).await;
+    let local_execution_deadline = repair_execution_deadline(state);
+    execute_cluster_replication_repair_inner_with_context(
+        state,
+        batch_size_override,
+        None,
+        None,
+        None,
+        local_execution_deadline,
+    )
+    .await
+    .0
 }
 
 pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
     state: &ServerState,
     batch_size_override: Option<usize>,
+    plan_summary_override: Option<RepairPlanSummary>,
     run_id: Option<&str>,
-) -> ClusterReplicationRepairReport {
+    tracker: Option<&RepairRunTracker>,
+    local_execution_deadline: tokio::time::Instant,
+) -> (ClusterReplicationRepairReport, RepairPlanSummary) {
     let mut node_reports = Vec::new();
     let mut totals = ReplicationRepairReport {
         attempted_transfers: 0,
@@ -1466,6 +2001,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         had_chunk_progress: false,
         waiting_for_source: false,
         unresolved: false,
+        timed_out: false,
     };
     let mut failed_nodes = 0usize;
     let repair_run_id = run_id.unwrap_or("untracked");
@@ -1490,8 +2026,19 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         })),
     );
 
-    let local_report =
-        execute_replication_repair_inner_with_context(state, batch_size_override, run_id).await;
+    let local_trigger = tracker
+        .map(|tracker| tracker.trigger)
+        .unwrap_or(RepairRunTrigger::ManualRequest);
+    let (plan_summary, local_report) = execute_serialized_local_replication_repair_phase(
+        state,
+        batch_size_override,
+        plan_summary_override,
+        run_id,
+        local_trigger,
+        tracker,
+        local_execution_deadline,
+    )
+    .await;
     info!(
         repair_run_id,
         attempted_transfers = local_report.attempted_transfers,
@@ -1528,9 +2075,25 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
             .collect::<Vec<_>>()
     };
 
+    let peer_count = peers.len();
+    let peer_request_timeout_secs = peer_repair_request_timeout_secs(state);
+    let peer_phase_deadline = tokio::time::Instant::now()
+        + peer_phase_budget(Duration::from_secs(peer_request_timeout_secs), peer_count);
+    // Every peer serializes repair execution locally. Fan requests out together
+    // so each node receives the full execution budget while the coordinator's
+    // aggregate peer phase remains bounded by that same absolute deadline.
+    let mut peer_requests = Vec::with_capacity(peer_count);
     for peer in peers {
-        let path =
-            build_replication_repair_path(batch_size_override, ReplicationRepairScope::Local);
+        let execution_budget_millis = u64::try_from(
+            peer_execution_budget(Duration::from_secs(peer_request_timeout_secs)).as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+        .max(1);
+        let path = build_replication_repair_path(
+            batch_size_override,
+            ReplicationRepairScope::Local,
+            Some(execution_budget_millis),
+        );
         info!(
             repair_run_id,
             peer_node_id = %peer.node_id,
@@ -1551,16 +2114,30 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                 "path": path,
             })),
         );
-        match execute_peer_request(
-            state,
-            &peer,
-            reqwest::Method::POST,
-            &path,
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
-        {
+        peer_requests.push(async move {
+            let peer_result = tokio::time::timeout_at(
+                peer_phase_deadline,
+                execute_peer_request(
+                    state,
+                    &peer,
+                    reqwest::Method::POST,
+                    &path,
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "peer repair request exhausted the {peer_request_timeout_secs}-second cluster peer phase budget"
+                )
+            })
+            .and_then(|result| result);
+            (peer, peer_result)
+        });
+    }
+    for (peer, peer_result) in futures_util::future::join_all(peer_requests).await {
+        match peer_result {
             Ok(response) if response.is_success() => {
                 match response.json::<ReplicationRepairReport>() {
                     Ok(report) => {
@@ -1594,7 +2171,10 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                                 "skipped_max_retries": report.skipped_max_retries,
                             })),
                         );
-                        accumulate_repair_report(&mut totals, &report);
+                        if report.timed_out {
+                            record_failed_cluster_peer(&mut totals, &mut failed_nodes);
+                        }
+                        accumulate_peer_repair_report(&mut totals, &report);
                         node_reports.push(ClusterReplicationRepairNodeReport {
                             node_id: peer.node_id,
                             attempted_transfers: report.attempted_transfers,
@@ -1609,7 +2189,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                         });
                     }
                     Err(err) => {
-                        failed_nodes += 1;
+                        record_failed_cluster_peer(&mut totals, &mut failed_nodes);
                         let error = format!("failed decoding peer repair report: {err}");
                         warn!(
                             repair_run_id,
@@ -1648,7 +2228,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                 }
             }
             Ok(response) => {
-                failed_nodes += 1;
+                record_failed_cluster_peer(&mut totals, &mut failed_nodes);
                 let error = format!("peer repair request returned HTTP {}", response.status);
                 warn!(
                     repair_run_id,
@@ -1686,7 +2266,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                 });
             }
             Err(err) => {
-                failed_nodes += 1;
+                record_failed_cluster_peer(&mut totals, &mut failed_nodes);
                 let error = format!("peer repair request failed: {err:#}");
                 warn!(
                     repair_run_id,
@@ -1747,13 +2327,21 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         })),
     );
 
-    ClusterReplicationRepairReport {
-        totals,
-        scope: ReplicationRepairScope::Cluster,
-        nodes_contacted: node_reports.len(),
-        failed_nodes,
-        node_reports,
-    }
+    (
+        ClusterReplicationRepairReport {
+            totals,
+            scope: ReplicationRepairScope::Cluster,
+            nodes_contacted: node_reports.len(),
+            failed_nodes,
+            node_reports,
+        },
+        plan_summary,
+    )
+}
+
+fn record_failed_cluster_peer(totals: &mut ReplicationRepairReport, failed_nodes: &mut usize) {
+    *failed_nodes = failed_nodes.saturating_add(1);
+    totals.unresolved = true;
 }
 
 fn accumulate_repair_report(
@@ -1779,6 +2367,7 @@ fn accumulate_repair_report(
     totals.had_chunk_progress |= report.had_chunk_progress;
     totals.waiting_for_source |= report.waiting_for_source;
     totals.unresolved |= report.unresolved;
+    totals.timed_out |= report.timed_out;
     let skipped_detail_capacity =
         MAX_REPAIR_REPORT_SKIPPED_DETAILS.saturating_sub(totals.skipped_details.len());
     totals.skipped_details.extend(
@@ -1800,6 +2389,15 @@ fn accumulate_repair_report(
     if report.last_error.is_some() {
         totals.last_error = report.last_error.clone();
     }
+}
+
+fn accumulate_peer_repair_report(
+    totals: &mut ReplicationRepairReport,
+    report: &ReplicationRepairReport,
+) {
+    let local_phase_timed_out = totals.timed_out;
+    accumulate_repair_report(totals, report);
+    totals.timed_out = local_phase_timed_out;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1846,10 +2444,7 @@ pub(crate) fn push_repair_skipped_detail(
     reason: ReplicationRepairSkipReason,
     detail: impl Into<String>,
 ) {
-    if skipped_details.len() >= MAX_REPAIR_REPORT_SKIPPED_DETAILS {
-        return;
-    }
-    skipped_details.push(ReplicationRepairSkippedItem {
+    let skipped_item = ReplicationRepairSkippedItem {
         report_node_id,
         subject,
         key,
@@ -1858,12 +2453,18 @@ pub(crate) fn push_repair_skipped_detail(
         target_node_id,
         reason,
         detail: detail.into(),
-    });
+    };
+    append_active_repair_skipped_item(&skipped_item);
+    if skipped_details.len() >= MAX_REPAIR_REPORT_SKIPPED_DETAILS {
+        return;
+    }
+    skipped_details.push(skipped_item);
 }
 
 fn build_replication_repair_path(
     batch_size_override: Option<usize>,
     scope: ReplicationRepairScope,
+    execution_budget_millis: Option<u64>,
 ) -> String {
     let mut query = Vec::new();
     if let Some(batch_size) = batch_size_override {
@@ -1876,8 +2477,19 @@ fn build_replication_repair_path(
             ReplicationRepairScope::Cluster => "cluster",
         }
     ));
+    if let Some(execution_budget_millis) = execution_budget_millis {
+        query.push(format!("execution_budget_millis={execution_budget_millis}"));
+    }
 
     format!("/cluster/replication/repair?{}", query.join("&"))
+}
+
+fn inspection_attempt_key(subject: &str, node_id: NodeId) -> String {
+    format!("inspection|{subject}|{node_id}")
+}
+
+pub(crate) fn transfer_attempt_key(subject: &str, node_id: NodeId) -> String {
+    format!("transfer|{subject}|{node_id}")
 }
 
 fn should_log_repair_chunk_progress(chunk_index: usize, chunk_count: usize) -> bool {
@@ -1976,7 +2588,7 @@ pub(crate) async fn complete_pending_replication_import(
         warn!(error = %error, "failed persisting replicas after pending replication import");
     }
 
-    let transfer_key = format!("{}|{}", task.reference.repair_label(), state.node_id);
+    let transfer_key = transfer_attempt_key(&task.reference.repair_label(), state.node_id);
     state
         .maintenance
         .repair_state
@@ -2480,7 +3092,29 @@ mod tests {
             had_chunk_progress: false,
             waiting_for_source: false,
             unresolved: false,
+            timed_out: false,
         }
+    }
+
+    #[test]
+    fn peer_phase_budget_is_bounded_independent_of_peer_count() {
+        let request_budget = Duration::from_secs(1_830);
+
+        assert_eq!(peer_phase_budget(request_budget, 1), request_budget);
+        assert_eq!(peer_phase_budget(request_budget, 40), request_budget);
+        assert_eq!(peer_phase_budget(request_budget, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn failed_subject_inspections_consume_the_push_batch_budget() {
+        let max_transfers = 4;
+        let failed_subject_inspections = 3;
+        let attempted_transfers = 1;
+
+        assert_eq!(
+            consumed_repair_work_items(attempted_transfers, failed_subject_inspections),
+            max_transfers
+        );
     }
 
     #[test]
@@ -2513,6 +3147,32 @@ mod tests {
             detailed_log.last().map(|entry| entry.detail.as_str()),
             Some(expected_last.as_str())
         );
+    }
+
+    #[test]
+    fn timed_out_report_has_terminal_timeout_status_and_diagnostics() {
+        let report = ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
+
+        assert_eq!(report.run_status(), RepairRunStatus::TimedOut);
+        assert!(report.timed_out);
+        assert!(
+            report
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("17 seconds"))
+        );
+        assert_eq!(report.detailed_log.len(), 1);
+        assert_eq!(report.detailed_log[0].event, "repair_run_timed_out");
+    }
+
+    #[test]
+    fn timeout_status_retains_transfer_failures() {
+        let mut report = ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
+        report.failed_transfers = 1;
+
+        assert_eq!(report.run_status(), RepairRunStatus::TimedOut);
+        assert_eq!(report.failed_transfers, 1);
+        assert!(report.timed_out);
     }
 
     #[test]
@@ -2645,6 +3305,62 @@ mod tests {
             assert_eq!(aggregate.unresolved, unresolved);
             assert_eq!(aggregate.run_status(), expected_status);
         }
+    }
+
+    #[test]
+    fn peer_timeout_does_not_override_cluster_aggregate_work_status() {
+        let mut totals = empty_report();
+        totals.successful_transfers = 1;
+        let mut peer_report = ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
+        peer_report.failed_transfers = 1;
+        peer_report.unresolved = true;
+
+        accumulate_peer_repair_report(&mut totals, &peer_report);
+
+        assert!(
+            !totals.timed_out,
+            "only the local phase owns aggregate timeout"
+        );
+        assert_eq!(totals.successful_transfers, 1);
+        assert_eq!(totals.failed_transfers, 1);
+        assert!(totals.unresolved);
+        assert_eq!(totals.run_status(), RepairRunStatus::PartiallyRepaired);
+    }
+
+    #[test]
+    fn failed_cluster_peer_marks_the_aggregate_unresolved() {
+        let mut totals = empty_report();
+        let mut failed_nodes = 0;
+
+        record_failed_cluster_peer(&mut totals, &mut failed_nodes);
+
+        assert_eq!(failed_nodes, 1);
+        assert!(totals.unresolved);
+        assert_eq!(totals.run_status(), RepairRunStatus::Unresolved);
+
+        totals.successful_transfers = 1;
+        assert_eq!(totals.run_status(), RepairRunStatus::PartiallyRepaired);
+    }
+
+    #[test]
+    fn peer_execution_budget_reserves_response_time() {
+        assert_eq!(
+            peer_execution_budget(Duration::from_secs(610)),
+            Duration::from_secs(580)
+        );
+        assert_eq!(
+            peer_execution_budget(Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn repair_attempt_kinds_use_disjoint_namespaces() {
+        let node_id = NodeId::new_v4();
+        assert_ne!(
+            inspection_attempt_key("foo", node_id),
+            transfer_attempt_key("inspection|foo", node_id)
+        );
     }
 
     #[test]
@@ -2831,6 +3547,7 @@ mod tests {
             had_chunk_progress: true,
             waiting_for_source: true,
             unresolved: true,
+            timed_out: false,
         };
 
         let mut totals = empty_report();

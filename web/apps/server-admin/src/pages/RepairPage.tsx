@@ -463,6 +463,16 @@ export function RepairPage() {
                   <Badge variant="light" color={startupStatusColor(repairActivity?.startup_status)}>
                     startup {formatStartupRepairStatus(repairActivity?.startup_status ?? "disabled")}
                   </Badge>
+                  {(repairActivity?.queued_manual_repairs ?? 0) > 0 ? (
+                    <Badge variant="light" color="orange">
+                      {repairActivity?.queued_manual_repairs} manual queued
+                    </Badge>
+                  ) : null}
+                  {(repairActivity?.queued_automatic_repairs ?? 0) > 0 ? (
+                    <Badge variant="light" color="blue">
+                      {repairActivity?.queued_automatic_repairs} automatic queued
+                    </Badge>
+                  ) : null}
                   <Badge variant="light">retention {retentionLabel}</Badge>
                 </Group>
                 {activeRuns.length > 0 ? (
@@ -476,6 +486,12 @@ export function RepairPage() {
                             </Badge>
                             <Badge color="blue" variant="light">
                               {activeRun.scope}
+                            </Badge>
+                            <Badge
+                              color={activeRun.phase === "running" ? "green" : "orange"}
+                              variant="light"
+                            >
+                              {formatRepairRunPhase(activeRun.phase)}
                             </Badge>
                           </Group>
                           <Text size="sm">
@@ -1651,6 +1667,19 @@ function formatRepairActivityState(state: string): string {
   }
 }
 
+function formatRepairRunPhase(phase: string): string {
+  switch (phase) {
+    case "preparing":
+      return "preparing";
+    case "queued":
+      return "queued";
+    case "running":
+      return "running";
+    default:
+      return phase;
+  }
+}
+
 function formatStartupRepairStatus(status: string): string {
   switch (status) {
     case "disabled":
@@ -1663,6 +1692,8 @@ function formatStartupRepairStatus(status: string): string {
       return "skipped";
     case "completed":
       return "completed";
+    case "timed_out":
+      return "timed out";
     default:
       return status;
   }
@@ -1695,6 +1726,8 @@ function formatRepairStatus(status: string): string {
       return "waiting for source";
     case "unresolved":
       return "unresolved repair";
+    case "timed_out":
+      return "timed out";
     case "completed":
       return "completed";
     case "skipped_no_gaps":
@@ -1750,6 +1783,8 @@ function startupStatusColor(status: string | undefined): string {
   switch (status) {
     case "running":
       return "orange";
+    case "timed_out":
+      return "red";
     case "completed":
       return berrykeepPrimaryColor;
     case "skipped_no_gaps":
@@ -1768,6 +1803,7 @@ function repairStatusColor(status: string): string {
     case "waiting_for_source":
       return "yellow";
     case "unresolved":
+    case "timed_out":
       return "red";
     case "completed":
       return berrykeepPrimaryColor;

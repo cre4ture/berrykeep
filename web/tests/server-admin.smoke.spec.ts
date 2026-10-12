@@ -2802,6 +2802,7 @@ async function installServerAdminMocks(
             scope: "local",
             trigger: "background_audit",
             started_at_unix: 1_900_000_001,
+            phase: "running",
             last_log_at_unix: 1_900_000_009,
             live_log_truncated: false,
             live_log: [

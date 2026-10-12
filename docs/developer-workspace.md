@@ -325,12 +325,16 @@ The env vars referenced in the tuning subsections below are current operational 
 ### Periodic replication audit and repair
 
 - Cluster-mode nodes run a background replication auditor and execute repair passes for under-replicated data by default.
+- A node runs at most one local repair data-plane operation at a time. Manual work is prioritized and automatic work ages into priority. Local- and cluster-scope manual HTTP requests each have a one-request admission slot (same-scope duplicates receive `503 Service Unavailable`), so a cluster coordinator in its peer phase does not lock out a local operator repair. Peer local-scope requests wait at manual priority behind active work, bounded by the coordinator-assigned fair execution budget shared with availability synchronization and local execution. A peer request declines before execution if a local operator request is already admitted; execution is non-preemptive once any repair owns the executor, so later requests wait within their own deadline.
+- Local bundle inspection is bounded to 60 seconds (or the configured execution deadline when shorter), so one stalled subject does not block later subjects in the same plan. Repeated inspection failures enter persistent backoff and max-retry deferral, then become retryable again after a cooldown derived from the inspection timeout, backoff, and retry limit. Completed transfer and retry-state changes are flushed once at normal completion or by cancellation cleanup after a timed-out run.
 - Configuration:
 	- `BERRYKEEP_REPLICATION_REPAIR_ENABLED` (default: `true`)
 	- `BERRYKEEP_REPLICATION_AUDIT_INTERVAL_SECS` (default: `3600`)
 	- `BERRYKEEP_REPLICATION_REPAIR_BATCH_SIZE` (default: `256`)
 	- `BERRYKEEP_REPLICATION_REPAIR_MAX_RETRIES` (default: `3`)
 	- `BERRYKEEP_REPLICATION_REPAIR_BACKOFF_SECS` (default: `30`)
+	- `BERRYKEEP_REPLICATION_REPAIR_EXECUTION_TIMEOUT_SECS` (default: `1800`; bounds one node-local repair execution so a stalled storage or transport phase releases the executor and is retained as `timed_out`; peer coordinators wait at least this deadline plus 30 seconds)
+	- `BERRYKEEP_REPLICATION_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS` (default: `60`; bounds inspection of one local subject so later plan items can still make progress)
 	- `BERRYKEEP_REPAIR_BUSY_THROTTLE_ENABLED` (default: `true`)
 	- `BERRYKEEP_REPAIR_BUSY_INFLIGHT_THRESHOLD` (default: `32`)
 	- `BERRYKEEP_REPAIR_BUSY_WAIT_MILLIS` (default: `100`)

@@ -2760,7 +2760,7 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<std::collections::HashMap<String, RepairAttemptRecord>> {
         self.read(|db| {
             let mut stmt = db.prepare(
-                "SELECT subject, attempts, last_failure_unix
+                "SELECT subject, attempts, last_failure_unix, key_version
                  FROM repair_attempts",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -2769,6 +2769,7 @@ impl MetadataStore for SqliteMetadataStore {
                     RepairAttemptRecord {
                         attempts: row.get::<_, u32>(1)?,
                         last_failure_unix: row.get::<_, u64>(2)?,
+                        key_version: row.get::<_, u8>(3)?,
                     },
                 ))
             })?;
@@ -2791,14 +2792,15 @@ impl MetadataStore for SqliteMetadataStore {
         self.write_tx(move |db| {
             db.execute("DELETE FROM repair_attempts", [])?;
             let mut stmt = db.prepare(
-                "INSERT INTO repair_attempts (subject, attempts, last_failure_unix)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO repair_attempts (subject, attempts, last_failure_unix, key_version)
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (subject, record) in attempts {
                 stmt.execute(params![
                     subject,
                     record.attempts,
-                    u64_to_i64(record.last_failure_unix)?
+                    u64_to_i64(record.last_failure_unix)?,
+                    record.key_version,
                 ])?;
             }
             Ok(())
@@ -5592,7 +5594,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS repair_attempts (
             subject TEXT PRIMARY KEY,
             attempts INTEGER NOT NULL,
-            last_failure_unix INTEGER NOT NULL
+            last_failure_unix INTEGER NOT NULL,
+            key_version INTEGER NOT NULL DEFAULT 2
         );
 
         CREATE TABLE IF NOT EXISTS content_repair_tasks (
@@ -5926,6 +5929,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             return Err(err).context("failed to migrate sqlite s3_access_keys.allow_manage");
         }
     }
+    add_sqlite_column_if_missing(
+        db,
+        "repair_attempts",
+        "key_version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
     add_sqlite_column_if_missing(
         db,
         "content_repair_tasks",
@@ -6466,6 +6475,32 @@ mod tests {
             )
             .expect("schema version should be restored");
         assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
+    }
+
+    #[test]
+    fn init_metadata_db_marks_legacy_repair_attempt_keys_for_migration() {
+        let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+        db.execute_batch(
+            "CREATE TABLE repair_attempts (
+                 subject TEXT PRIMARY KEY,
+                 attempts INTEGER NOT NULL,
+                 last_failure_unix INTEGER NOT NULL
+             );
+             INSERT INTO repair_attempts (subject, attempts, last_failure_unix)
+             VALUES ('legacy|node', 3, 17);",
+        )
+        .expect("legacy repair attempt table should initialize");
+
+        init_metadata_db(&db).expect("metadata schema should migrate");
+
+        let key_version: u8 = db
+            .query_row(
+                "SELECT key_version FROM repair_attempts WHERE subject = 'legacy|node'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy repair attempt should remain readable");
+        assert_eq!(key_version, 1);
     }
 
     #[test]

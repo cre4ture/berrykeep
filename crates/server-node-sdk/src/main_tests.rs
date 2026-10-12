@@ -1121,6 +1121,9 @@ fn test_cluster_config_without_internal_tls(
         replication_repair_batch_size: 256,
         replication_repair_max_retries: 3,
         replication_repair_backoff_secs: 30,
+        replication_repair_execution_timeout_secs: super::DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS,
+        replication_repair_subject_inspection_timeout_secs:
+            super::DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS,
         repair_busy_throttle_enabled: false,
         repair_busy_inflight_threshold: 32,
         repair_busy_wait_millis: 100,
@@ -14170,6 +14173,99 @@ fn autonomous_post_write_repair_runtime_coalesces_pending_subjects() {
     assert!(runtime.active);
     assert_eq!(runtime.take_pending_subjects(), None);
     assert!(!runtime.active);
+
+    assert!(runtime.enqueue(["docs/retry.txt".to_string()]));
+    let retry_subjects = runtime.take_pending_subjects().unwrap();
+    assert_eq!(
+        runtime.requeue_after_timeout(retry_subjects.clone(), 1),
+        (1, 0)
+    );
+    assert_eq!(
+        runtime.take_pending_subjects(),
+        Some(retry_subjects.clone())
+    );
+    assert_eq!(runtime.requeue_after_timeout(retry_subjects, 1), (0, 1));
+    assert_eq!(runtime.take_pending_subjects(), None);
+    assert!(!runtime.active);
+    assert!(runtime.timeout_retries.is_empty());
+}
+
+#[tokio::test]
+async fn autonomous_post_write_repair_requeues_after_executor_timeout() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    *state.maintenance.startup_repair_status.lock().await = StartupRepairStatus::Disabled;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    {
+        let mut runtime = state.maintenance.autonomous_post_write_repair.lock().await;
+        assert!(runtime.enqueue(["docs/retry.txt".to_string()]));
+    }
+
+    let worker = tokio::spawn(super::run_autonomous_post_write_replication(state.clone()));
+    let first_run_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state
+                .maintenance
+                .repair_execution_gate
+                .queue_snapshot()
+                .automatic
+                > 0
+                && let Some(run_id) = state
+                    .maintenance
+                    .repair_activity
+                    .lock()
+                    .await
+                    .active_runs
+                    .first()
+                    .map(|run| run.run_id.clone())
+            {
+                break run_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first autonomous attempt should wait on the executor");
+
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if state
+                .maintenance
+                .repair_execution_gate
+                .queue_snapshot()
+                .automatic
+                > 0
+                && state
+                    .maintenance
+                    .repair_activity
+                    .lock()
+                    .await
+                    .active_runs
+                    .first()
+                    .is_some_and(|run| run.run_id != first_run_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a timed-out autonomous attempt should requeue its subjects");
+
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the requeued autonomous repair should finish after the executor is released")
+        .expect("the autonomous repair worker should not panic");
+    let runtime = state.maintenance.autonomous_post_write_repair.lock().await;
+    assert!(!runtime.active);
+    assert!(runtime.pending_subjects.is_empty());
+    drop(runtime);
+    cleanup_test_state(&state).await;
 }
 
 #[test]
@@ -14377,7 +14473,7 @@ async fn replication_repair_records_max_retry_skip_details_impl(backend: MainTes
         let mut repair_state = state.maintenance.repair_state.lock().await;
         for (subject, target_node_id) in &expected_skips {
             repair_state.attempts.insert(
-                format!("{subject}|{target_node_id}"),
+                super::replication::transfer_attempt_key(subject, *target_node_id),
                 super::RepairAttemptEntry {
                     attempts: state.repair_config.max_retries.saturating_add(1),
                     last_failure_unix: super::unix_ts(),
@@ -20549,6 +20645,10 @@ async fn build_test_state(
         maintenance: super::ServerMaintenanceRuntime {
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
+            repair_execution_gate: Arc::new(super::RepairExecutionGate::default()),
+            manual_local_repair_request_admission: Arc::new(super::Semaphore::new(1)),
+            manual_cluster_repair_request_admission: Arc::new(super::Semaphore::new(1)),
+            peer_repair_request_admission: Arc::new(super::Semaphore::new(1)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
             content_repair_claims: Arc::new(crate::ContentRepairClaims::default()),
             content_repair_notify: Arc::new(tokio::sync::Notify::new()),
@@ -20587,6 +20687,8 @@ async fn build_test_state(
             batch_size: 32,
             max_retries: 3,
             backoff_secs: 0,
+            execution_timeout_secs: super::DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS,
+            subject_inspection_timeout_secs: super::DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS,
             startup_repair_enabled: true,
             startup_repair_delay_secs: 0,
             busy_throttle_enabled: false,
@@ -20607,30 +20709,35 @@ async fn build_test_state(
     };
 
     if seed_gap {
-        let put = {
-            let mut locked = store.write("tests.store").await;
-            locked
-                .put_object_versioned(
-                    "startup-gap-key",
-                    bytes::Bytes::from_static(b"payload"),
-                    PutOptions {
-                        parent_version_ids: Vec::new(),
-                        state: VersionConsistencyState::Confirmed,
-                        inherit_preferred_parent: true,
-                        create_snapshot: true,
-                        explicit_version_id: None,
-                    },
-                )
-                .await
-                .unwrap()
-        };
-
-        let mut cluster = state.cluster.lock().await;
-        cluster.note_replica("startup-gap-key", local_node_id);
-        cluster.note_replica(format!("startup-gap-key@{}", put.version_id), local_node_id);
+        seed_test_replication_gap(&state, "startup-gap-key").await;
     }
 
     state
+}
+
+async fn seed_test_replication_gap(state: &ServerState, key: &str) -> String {
+    let put = {
+        let mut locked = state.store.write("tests.store").await;
+        locked
+            .put_object_versioned(
+                key,
+                bytes::Bytes::from_static(b"payload"),
+                PutOptions {
+                    parent_version_ids: Vec::new(),
+                    state: VersionConsistencyState::Confirmed,
+                    inherit_preferred_parent: true,
+                    create_snapshot: true,
+                    explicit_version_id: None,
+                },
+            )
+            .await
+            .unwrap()
+    };
+
+    let mut cluster = state.cluster.lock().await;
+    cluster.note_replica(key, state.node_id);
+    cluster.note_replica(format!("{key}@{}", put.version_id), state.node_id);
+    put.version_id
 }
 
 #[tokio::test]
@@ -20983,6 +21090,7 @@ async fn repair_activity_payload_includes_live_log_for_active_run_impl(backend: 
         super::RepairRunTrigger::ManualRequest,
     )
     .await;
+    tracker.set_phase(super::RepairActiveRunPhase::Running);
 
     let activity = tokio::time::timeout(
         Duration::from_millis(250),
@@ -21011,6 +21119,10 @@ async fn repair_activity_payload_includes_live_log_for_active_run_impl(backend: 
     assert_eq!(activity.state, super::RepairActivityState::Running);
     assert_eq!(activity.active_runs.len(), 1);
     assert_eq!(activity.active_runs[0].run_id, tracker.run_id);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Running
+    );
     assert_eq!(
         activity.active_runs[0].last_log_at_unix,
         Some(1_900_000_000)
@@ -21136,6 +21248,28 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
         repair.pending_subjects.insert("photos/a.jpg".to_string());
         repair.active = true;
     }
+    let active_repair = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let queued_repair = tokio::spawn({
+        let gate = Arc::clone(&state.maintenance.repair_execution_gate);
+        async move { gate.acquire(super::RepairExecutionPriority::Manual).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual repair should become visible in the executor queue");
 
     let snapshot = super::local_task_queue_snapshot(&state, false).await;
 
@@ -21156,7 +21290,7 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
         .iter()
         .find(|queue| queue.id == "replication_repair")
         .expect("repair queue should be present");
-    assert_eq!(repair.pending, 2);
+    assert_eq!(repair.pending, 3);
     assert_eq!(repair.active, 1);
 
     let first_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
@@ -21167,6 +21301,9 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
     let cached_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
     assert_eq!(cached_cluster_snapshot, first_cluster_snapshot);
 
+    queued_repair.abort();
+    let _ = queued_repair.await;
+    drop(active_repair);
     cleanup_test_state(&state).await;
 }
 
@@ -22619,8 +22756,1683 @@ run_on_main_metadata_backends!(
     tracked_local_replication_repair_persists_history_turso
 );
 
+#[tokio::test]
+async fn timed_out_replication_export_finishes_run_and_releases_executor() {
+    const GAP_KEY: &str = "repair-timeout-gap-key";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::replication::block_replication_export_for_test(GAP_KEY);
+
+    let repair = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::execute_tracked_local_replication_repair(
+                &state,
+                None,
+                super::RepairRunTrigger::ManualRequest,
+                None,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
+        .await
+        .expect("repair should reach the blocked bundle export");
+
+    let report = tokio::time::timeout(Duration::from_secs(5), repair)
+        .await
+        .expect("blocked repair should respect its execution deadline")
+        .expect("repair task should not panic");
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.timed_out);
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(GAP_KEY);
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("repair activity should remain readable after timeout");
+    assert!(activity.active_runs.is_empty());
+    let timeout_record = repair_run_history(&state)
+        .await
+        .into_iter()
+        .find(|record| record.status == super::RepairRunStatus::TimedOut)
+        .expect("timed-out repair should be retained as a terminal run");
+    let events = timeout_record
+        .report
+        .as_ref()
+        .and_then(|report| report.get("detailed_log"))
+        .and_then(serde_json::Value::as_array)
+        .expect("timed-out repair should retain its progress log");
+    assert!(events.iter().any(|entry| {
+        entry.get("event").and_then(serde_json::Value::as_str) == Some("subject_evaluated")
+    }));
+    assert!(events.iter().any(|entry| {
+        entry.get("event").and_then(serde_json::Value::as_str) == Some("repair_run_timed_out")
+    }));
+
+    let follow_up = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::execute_tracked_targeted_local_manifest_repair(
+            &state,
+            Vec::new(),
+            super::RepairRunTrigger::ManualRequest,
+        ),
+    )
+    .await
+    .expect("a timed-out repair must release the executor for a later run");
+    assert_eq!(follow_up.run_status(), super::RepairRunStatus::Completed);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_report_retains_partial_transfer_counters() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+    super::with_active_repair_log_tracking(&tracker, async {
+        let mut log = Vec::new();
+        super::replication::push_repair_log_entry(
+            &mut log,
+            state.node_id,
+            "target_push_started",
+            "first transfer started",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(NodeId::new_v4()),
+            Some(serde_json::json!({"attempted_transfers": 1})),
+        );
+        super::replication::push_repair_log_entry(
+            &mut log,
+            state.node_id,
+            "target_push_completed",
+            "first transfer completed",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(NodeId::new_v4()),
+            None,
+        );
+        super::replication::push_repair_log_entry(
+            &mut log,
+            state.node_id,
+            "target_push_started",
+            "second transfer started",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(NodeId::new_v4()),
+            Some(serde_json::json!({"attempted_transfers": 2})),
+        );
+        super::replication::push_repair_skipped_detail(
+            &mut Vec::new(),
+            state.node_id,
+            "deferred-subject".to_string(),
+            Some("deferred-key".to_string()),
+            None,
+            None,
+            Some(state.node_id),
+            super::replication::ReplicationRepairSkipReason::BackoffActive,
+            "retry backoff remains active",
+        );
+    })
+    .await;
+
+    let report = super::timed_out_repair_report(&state, &tracker, 17);
+    assert_eq!(report.attempted_transfers, 2);
+    assert_eq!(report.successful_transfers, 1);
+    assert_eq!(report.failed_transfers, 0);
+    assert_eq!(report.skipped_backoff, 1);
+    assert_eq!(report.skipped_details.len(), 1);
+    assert_eq!(report.skipped_details[0].subject, "deferred-subject");
+    assert_eq!(
+        report.skipped_details[0].reason,
+        super::replication::ReplicationRepairSkipReason::BackoffActive
+    );
+    assert_eq!(
+        report.last_error.as_deref(),
+        Some("repair execution timed out after 17 seconds")
+    );
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+
+    drop(tracker);
+    cleanup_test_state(&state).await;
+}
+
+#[test]
+fn timeout_progress_flags_remain_monotonic_across_a_baseline() {
+    let baseline = super::RepairActiveRunProgress {
+        had_chunk_progress: true,
+        waiting_for_source: true,
+        unresolved: true,
+        ..Default::default()
+    };
+    let progress = baseline.clone();
+    let mut report = super::replication::ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
+
+    progress.apply_delta_to_report(&baseline, &mut report);
+
+    assert!(report.had_chunk_progress);
+    assert!(report.waiting_for_source);
+    assert!(report.unresolved);
+}
+
+#[test]
+fn repair_in_progress_skip_does_not_rollback_an_unrelated_transfer() {
+    let node_id = NodeId::new_v4();
+    let mut progress = super::RepairActiveRunProgress {
+        attempted_transfers: 2,
+        ..Default::default()
+    };
+    progress.record_skipped_item(&super::replication::ReplicationRepairSkippedItem {
+        report_node_id: node_id,
+        subject: "manifest:claimed".to_string(),
+        key: None,
+        version_id: None,
+        source_node_id: None,
+        target_node_id: Some(node_id),
+        reason: super::replication::ReplicationRepairSkipReason::RepairInProgress,
+        detail: "another operation owns the manifest".to_string(),
+    });
+
+    assert_eq!(progress.attempted_transfers, 2);
+    assert_eq!(progress.skipped_items, 1);
+
+    progress.rollback_attempted_transfer();
+    assert_eq!(progress.attempted_transfers, 1);
+}
+
+#[tokio::test]
+async fn timed_out_report_uses_monotonic_cursor_after_live_log_truncation() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Cluster,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+
+    super::with_active_repair_log_tracking(&tracker, async {
+        let mut log = Vec::new();
+        for index in 0..2 {
+            super::replication::push_repair_log_entry(
+                &mut log,
+                state.node_id,
+                "before_local_phase",
+                format!("entry {index}"),
+                None,
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                None,
+            );
+        }
+    })
+    .await;
+    let cursor = super::repair_live_log_cursor(&tracker);
+    let baseline = super::repair_progress_snapshot(&tracker);
+
+    super::with_active_repair_log_tracking(&tracker, async {
+        let mut log = Vec::new();
+        for index in 0..(super::ACTIVE_REPAIR_LIVE_LOG_LIMIT + 1) {
+            super::replication::push_repair_log_entry(
+                &mut log,
+                state.node_id,
+                "local_phase_progress",
+                format!("entry {index}"),
+                None,
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                None,
+            );
+        }
+    })
+    .await;
+
+    let report = super::timed_out_repair_report_since(&state, &tracker, cursor, &baseline, 17);
+    assert_eq!(
+        report
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "local_phase_progress")
+            .count(),
+        super::ACTIVE_REPAIR_LIVE_LOG_LIMIT,
+        "every still-retained local phase entry should survive the timeout splice"
+    );
+    assert_eq!(
+        report
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "repair_run_timed_out")
+            .count(),
+        1
+    );
+
+    drop(tracker);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn dropped_repair_tracker_removes_its_active_run() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+    let run_id = tracker.run_id.clone();
+    let activity = Arc::clone(&state.maintenance.repair_activity);
+    let locked_activity = activity.lock().await;
+
+    drop(tracker);
+    assert!(
+        locked_activity
+            .active_runs
+            .iter()
+            .any(|active_run| active_run.run_id == run_id)
+    );
+    drop(locked_activity);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if activity
+                .lock()
+                .await
+                .active_runs
+                .iter()
+                .all(|active_run| active_run.run_id != run_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping a tracker should remove its active repair entry");
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn repair_activity_reports_executor_queue_depth() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    *state.maintenance.startup_repair_status.lock().await = StartupRepairStatus::Disabled;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+    tracker.set_phase(super::RepairActiveRunPhase::Queued);
+    let waiter = tokio::spawn({
+        let gate = Arc::clone(&state.maintenance.repair_execution_gate);
+        async move { gate.acquire(super::RepairExecutionPriority::Manual).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual repair should become visible in the executor queue");
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("repair activity should be readable");
+    assert_eq!(activity.state, super::RepairActivityState::Scheduled);
+    assert_eq!(activity.queued_manual_repairs, 1);
+    assert_eq!(activity.queued_automatic_repairs, 0);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Queued
+    );
+
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(
+        repair.pending, 1,
+        "a tracked waiter must only be counted once"
+    );
+    assert_eq!(repair.active, 0, "a queued run is not executing yet");
+
+    waiter.abort();
+    drop(tracker);
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn cluster_tracker_runs_peer_phase_after_local_executor_timeout() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    *state.maintenance.startup_repair_status.lock().await = StartupRepairStatus::Disabled;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Cluster,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+
+    let (_, report) = super::execute_serialized_local_replication_repair_phase(
+        &state,
+        None,
+        None,
+        Some(&tracker.run_id),
+        super::RepairRunTrigger::ManualRequest,
+        Some(&tracker),
+        tokio::time::Instant::now() + Duration::from_millis(10),
+    )
+    .await;
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("cluster peer phase activity should remain visible");
+    assert_eq!(activity.state, super::RepairActivityState::Running);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Running
+    );
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(repair.pending, 0);
+    assert_eq!(repair.active, 1);
+
+    drop(tracker);
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn startup_executor_wait_is_counted_once() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    super::spawn_startup_replication_repair(state.clone(), 0);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup repair should wait on the executor");
+
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(
+        repair.pending, 1,
+        "startup repair must only be counted once"
+    );
+    assert_eq!(repair.active, 0);
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("startup repair activity should be readable");
+    assert_eq!(activity.state, super::RepairActivityState::Scheduled);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Queued
+    );
+
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = *state.maintenance.startup_repair_status.lock().await;
+            let active_runs_empty = state
+                .maintenance
+                .repair_activity
+                .lock()
+                .await
+                .active_runs
+                .is_empty();
+            if status != StartupRepairStatus::Scheduled
+                && status != StartupRepairStatus::Running
+                && active_runs_empty
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup repair should finish after the executor is released");
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn startup_executor_wait_uses_absolute_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    super::spawn_startup_replication_repair(state.clone(), 0);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = *state.maintenance.startup_repair_status.lock().await;
+            let active_runs_empty = state
+                .maintenance
+                .repair_activity
+                .lock()
+                .await
+                .active_runs
+                .is_empty();
+            let timed_out_recorded = repair_run_history(&state).await.iter().any(|record| {
+                record.trigger == super::RepairRunTrigger::StartupRepair
+                    && record.status == super::RepairRunStatus::TimedOut
+            });
+            if status == StartupRepairStatus::TimedOut && active_runs_empty && timed_out_recorded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup repair should time out while waiting for the executor");
+
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic,
+        0,
+        "timed-out startup repair must leave no executor waiter"
+    );
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(repair.pending, 0);
+    assert_eq!(repair.active, 0);
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn busy_peer_cluster_scope_is_forced_local_and_waits_within_budget() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let request = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::build_internal_peer_api()
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(
+                            "/cluster/replication/repair?scope=cluster&execution_budget_millis=3000",
+                        )
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("peer repair route should respond")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer repair should queue behind active automatic work");
+
+    drop(active);
+    let response = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("queued peer repair should finish after the executor is released")
+        .expect("peer repair handler task should not panic");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "completed peer work must leave no queued waiter"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn peer_executor_wait_is_bounded_by_coordinator_budget() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=local&execution_budget_millis=100")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("peer executor wait should respect the coordinator budget")
+    .expect("peer repair route should respond");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("peer timeout response body should be readable"),
+    )
+    .expect("peer timeout response should be JSON");
+    assert_eq!(
+        body["error"],
+        "peer replication repair executor wait exceeded its execution deadline"
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "timed-out peer work must unregister its executor waiter"
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits(),
+        1,
+        "timed-out peer work must release HTTP admission"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn peer_repair_requests_share_http_admission() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+    let first = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::build_internal_peer_api()
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/cluster/replication/repair?scope=local")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("peer repair route should respond")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first peer repair should hold the HTTP admission slot");
+
+    let duplicate = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=local")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("duplicate peer repair should be shed before availability synchronization")
+    .expect("peer repair route should respond");
+    assert_eq!(duplicate.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let duplicate_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("duplicate peer response body should be readable"),
+    )
+    .expect("duplicate peer response should be JSON");
+    assert_eq!(
+        duplicate_body["error"],
+        "another peer replication repair request is already admitted"
+    );
+
+    drop(refresh_guard);
+    let first_response = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("admitted peer repair should finish after availability sync resumes")
+        .expect("peer repair handler task should not panic");
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn peer_availability_sync_uses_coordinator_execution_budget() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=local&execution_budget_millis=100")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("peer preparation should respect the local execution deadline")
+    .expect("peer repair route should respond");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("peer timeout response body should be readable"),
+    )
+    .expect("peer timeout response should be JSON");
+    assert_eq!(
+        body["error"],
+        "peer replication repair preparation exceeded its execution deadline"
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits(),
+        1,
+        "timed-out preparation must release peer admission"
+    );
+    assert!(!state.maintenance.repair_execution_gate.is_occupied());
+
+    drop(refresh_guard);
+    cleanup_test_state(&state).await;
+}
+
+#[test]
+fn repair_timeout_diagnostics_round_the_assigned_budget_up() {
+    assert_eq!(
+        super::repair_duration_budget_secs(Duration::from_millis(1_001)),
+        2
+    );
+    assert_eq!(
+        super::repair_duration_budget_secs(Duration::from_millis(1_000)),
+        1
+    );
+    assert_eq!(super::repair_duration_budget_secs(Duration::ZERO), 1);
+}
+
+#[test]
+fn legacy_repair_attempt_keys_migrate_without_prefix_ambiguity() {
+    let node_id = NodeId::new_v4();
+    let ambiguous_key = format!("inspection|foo|{node_id}");
+    let legacy = HashMap::from([(
+        ambiguous_key.clone(),
+        super::storage::RepairAttemptRecord {
+            attempts: 3,
+            last_failure_unix: 17,
+            key_version: 1,
+        },
+    )]);
+    let (legacy, migrated) = super::migrate_persisted_repair_attempts(legacy);
+    assert!(migrated);
+    assert!(legacy.contains_key(&format!("transfer|{ambiguous_key}")));
+
+    let current = HashMap::from([(
+        ambiguous_key.clone(),
+        super::storage::RepairAttemptRecord {
+            attempts: 2,
+            last_failure_unix: 11,
+            key_version: super::REPAIR_ATTEMPT_KEY_VERSION,
+        },
+    )]);
+    let (current, migrated) = super::migrate_persisted_repair_attempts(current);
+    assert!(!migrated);
+    assert!(current.contains_key(&ambiguous_key));
+}
+
+#[tokio::test]
+async fn admitted_manual_repair_takes_priority_over_peer_synchronization() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+    let peer = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::build_internal_peer_api()
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/cluster/replication/repair?scope=local")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("peer repair route should respond")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer request should enter availability synchronization");
+
+    let manual = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+            super::replication::execute_replication_repair_public(
+                State(state),
+                headers,
+                axum::extract::Query(super::replication::ReplicationRepairQuery {
+                    batch_size: None,
+                    scope: Some(super::replication::ReplicationRepairScope::Local),
+                    execution_budget_millis: None,
+                }),
+            )
+            .await
+            .into_response()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .manual_local_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual request should be admitted independently of the peer request");
+
+    drop(refresh_guard);
+    let peer_response = tokio::time::timeout(Duration::from_secs(5), peer)
+        .await
+        .expect("peer repair should yield to the admitted manual request")
+        .expect("peer repair handler task should not panic");
+    assert_eq!(peer_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let peer_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(peer_response.into_body(), usize::MAX)
+            .await
+            .expect("peer response body should be readable"),
+    )
+    .expect("peer response should be JSON");
+    assert_eq!(
+        peer_body["error"],
+        "a manual replication repair request is already admitted"
+    );
+    let manual_response = tokio::time::timeout(Duration::from_secs(5), manual)
+        .await
+        .expect("manual repair should finish after the peer yields")
+        .expect("manual repair handler task should not panic");
+    assert_eq!(manual_response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn cluster_repair_gate_wait_uses_local_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_cluster_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("cluster repair should not wait indefinitely for the local executor");
+    assert_eq!(report.totals.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.totals.timed_out);
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "timed-out cluster repair must leave no queued waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn manual_local_repair_gate_wait_uses_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("manual local repair should not wait indefinitely for the executor");
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.timed_out);
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "timed-out local repair must leave no queued waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn targeted_repair_gate_waits_share_the_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+
+    let manifest_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_targeted_local_manifest_repair(
+            &state,
+            vec!["blocked-manifest".to_string()],
+            super::RepairRunTrigger::DataScrubAutoRepair,
+        ),
+    )
+    .await
+    .expect("targeted manifest repair should bound its executor wait");
+    assert_eq!(
+        manifest_report.run_status(),
+        super::RepairRunStatus::TimedOut
+    );
+
+    let subject_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_targeted_replication_repair(
+            &state,
+            vec!["blocked-subject".to_string()],
+            super::RepairRunTrigger::AutonomousPostWrite,
+        ),
+    )
+    .await
+    .expect("targeted subject repair should bound its executor wait");
+    assert_eq!(
+        subject_report.run_status(),
+        super::RepairRunStatus::TimedOut
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic,
+        0,
+        "timed-out targeted repairs must leave no queued waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn manual_cluster_repair_admits_only_one_waiting_request() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+    let query = super::replication::ReplicationRepairQuery {
+        batch_size: None,
+        scope: Some(super::replication::ReplicationRepairScope::Cluster),
+        execution_budget_millis: None,
+    };
+
+    let first = tokio::spawn({
+        let state = state.clone();
+        let headers = headers.clone();
+        async move {
+            super::replication::execute_replication_repair_public(
+                State(state),
+                headers,
+                axum::extract::Query(query),
+            )
+            .await
+            .into_response()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first manual request should be admitted and wait for the executor");
+
+    let duplicate = super::replication::execute_replication_repair_public(
+        State(state.clone()),
+        headers,
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Cluster),
+            execution_budget_millis: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(duplicate.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let duplicate_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("duplicate manual response body should be readable"),
+    )
+    .expect("duplicate manual response should be JSON");
+    assert_eq!(
+        duplicate_body["error"],
+        "another manual replication repair request is already admitted"
+    );
+
+    drop(active);
+    let first_response = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("admitted manual repair should finish after the executor is released")
+        .expect("manual repair handler task should not panic");
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn manual_local_repair_has_separate_admission_from_cluster_scope() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let cluster_admission = Arc::clone(&state.maintenance.manual_cluster_repair_request_admission)
+        .try_acquire_owned()
+        .expect("cluster admission should initially be available");
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::replication::execute_replication_repair_public(
+        State(state.clone()),
+        headers,
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Local),
+            execution_budget_millis: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state
+            .maintenance
+            .manual_cluster_repair_request_admission
+            .available_permits(),
+        0,
+        "the local request must not consume or release cluster admission"
+    );
+
+    drop(cluster_admission);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn manual_availability_sync_does_not_hold_repair_executor() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+
+    let request = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::replication::execute_replication_repair_public(
+                State(state),
+                headers,
+                axum::extract::Query(super::replication::ReplicationRepairQuery {
+                    batch_size: None,
+                    scope: Some(super::replication::ReplicationRepairScope::Local),
+                    execution_budget_millis: None,
+                }),
+            )
+            .await
+            .into_response()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .manual_local_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual request should hold its admission slot while availability sync waits");
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("manual repair activity should remain readable during preparation");
+    assert_eq!(
+        activity.active_runs.len(),
+        1,
+        "admitted manual preparation must be visible as an active repair run"
+    );
+    assert_eq!(activity.state, super::RepairActivityState::Scheduled);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Preparing
+    );
+
+    let executor_probe = state
+        .maintenance
+        .repair_execution_gate
+        .try_acquire()
+        .expect("availability synchronization must run outside the repair executor");
+    drop(executor_probe);
+    drop(refresh_guard);
+
+    let response = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("manual repair should finish after availability sync resumes")
+        .expect("manual repair handler task should not panic");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_audit_planning_releases_executor() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let unrelated_state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    assert_ne!(state.node_id, unrelated_state.node_id);
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::block_replication_planning_for_test(state.node_id);
+
+    let audit = tokio::spawn({
+        let state = state.clone();
+        async move { super::run_replication_audit_once(&state).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
+        .await
+        .expect("audit should reach replication planning while holding the executor");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        super::planning_replication_subjects(&unrelated_state),
+    )
+    .await
+    .expect("a node-scoped planning blocker must not stall unrelated test nodes");
+    tokio::time::timeout(Duration::from_secs(5), audit)
+        .await
+        .expect("stalled audit planning should respect the shared execution deadline")
+        .expect("audit task should not panic");
+
+    let follow_up = tokio::time::timeout(
+        Duration::from_secs(1),
+        state
+            .maintenance
+            .repair_execution_gate
+            .acquire(super::RepairExecutionPriority::Manual),
+    )
+    .await
+    .expect("timed-out audit planning must release the executor");
+    drop(follow_up);
+
+    blocker.release();
+    super::clear_replication_planning_blocker_for_test(state.node_id);
+    cleanup_test_state(&unrelated_state).await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_audit_executor_wait_leaves_no_waiter() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+
+    let audit = tokio::spawn({
+        let state = state.clone();
+        async move { super::run_replication_audit_once(&state).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background audit should wait for the active executor");
+
+    tokio::time::timeout(Duration::from_secs(3), audit)
+        .await
+        .expect("background audit executor wait should respect its execution deadline")
+        .expect("audit task should not panic");
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic,
+        0,
+        "timed-out background work must unregister its executor waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn stalled_subject_inspection_does_not_block_later_subjects() {
+    const STALLED_KEY: &str = "a-stalled-repair-subject";
+    const LATER_KEY: &str = "z-later-repair-subject";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, STALLED_KEY).await;
+    seed_test_replication_gap(&state, LATER_KEY).await;
+    state.repair_config.execution_timeout_secs = 5;
+    state.repair_config.subject_inspection_timeout_secs = 1;
+    state.repair_config.backoff_secs = 60;
+    state.repair_config.max_retries = 0;
+    let blocker = super::replication::block_replication_export_for_test(STALLED_KEY);
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("repair should move past a subject whose inspection stalls");
+
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(STALLED_KEY);
+    assert!(report.detailed_log.iter().any(|entry| {
+        entry.event == "local_replica_inspection_failed"
+            && entry.key.as_deref() == Some(STALLED_KEY)
+    }));
+    assert!(report.detailed_log.iter().any(|entry| {
+        entry.event == "subject_evaluated" && entry.key.as_deref() == Some(LATER_KEY)
+    }));
+    assert!(
+        report.attempted_transfers > 0,
+        "the later subject should still perform actual transfer work"
+    );
+
+    let retry_blocker = super::replication::block_replication_export_for_test(STALLED_KEY);
+    let retry_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("failed inspection retry state should shed the stalled subject");
+    retry_blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(STALLED_KEY);
+    assert!(
+        retry_report.skipped_max_retries >= 1,
+        "persisted inspection failures should shed every matching stalled subject"
+    );
+    assert!(
+        retry_report.detailed_log.iter().any(|entry| {
+            entry.event == "subject_skipped"
+                && entry
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with(STALLED_KEY))
+                && entry
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get("phase"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("local_replica_inspection")
+        }),
+        "retry log: {:#?}",
+        retry_report.detailed_log
+    );
+    assert!(!retry_report.detailed_log.iter().any(|entry| {
+        entry.event == "local_replica_inspection_failed"
+            && entry
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(STALLED_KEY))
+    }));
+
+    {
+        let mut repair_state = state.maintenance.repair_state.lock().await;
+        let inspection_attempts = repair_state
+            .attempts
+            .iter_mut()
+            .filter(|(attempt_key, _)| {
+                attempt_key.starts_with(&format!("inspection|{STALLED_KEY}"))
+            })
+            .map(|(_, attempt)| attempt)
+            .collect::<Vec<_>>();
+        assert!(!inspection_attempts.is_empty());
+        for attempt in inspection_attempts {
+            attempt.last_failure_unix = 0;
+        }
+    }
+    let reset_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("an expired inspection retry window should become retryable");
+    assert!(reset_report.detailed_log.iter().any(|entry| {
+        entry.event == "local_replica_inspection_retry_reset"
+            && entry
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(STALLED_KEY))
+    }));
+    assert!(
+        !state
+            .maintenance
+            .repair_state
+            .lock()
+            .await
+            .attempts
+            .keys()
+            .any(|attempt_key| attempt_key.starts_with(&format!("inspection|{STALLED_KEY}"))),
+        "successful inspection should clear the expired retry state"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn cancelled_peer_handler_leaves_detached_repair_to_finish() {
+    const GAP_KEY: &str = "cancelled-peer-handler-gap-key";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::replication::block_replication_export_for_test(GAP_KEY);
+    let handler = tokio::spawn(super::replication::execute_replication_repair_peer(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Local),
+            execution_budget_millis: None,
+        }),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
+        .await
+        .expect("peer repair should reach the blocked bundle export");
+
+    handler.abort();
+    assert!(
+        handler.await.is_err(),
+        "the simulated disconnected peer handler should be cancelled"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let activity = super::local_repair_activity_payload(&state)
+                .await
+                .expect("repair activity should remain readable");
+            let timed_out = repair_run_history(&state)
+                .await
+                .iter()
+                .any(|record| record.status == super::RepairRunStatus::TimedOut);
+            if activity.active_runs.is_empty() && timed_out {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached peer repair should reach a terminal timeout record");
+
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(GAP_KEY);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn queued_background_repair_refreshes_its_plan_after_acquiring_executor() {
+    const GAP_KEY: &str = "queued-audit-gap-key";
+
+    let state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    let version_id = seed_test_replication_gap(&state, GAP_KEY).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    let repair = tokio::spawn({
+        let state = state.clone();
+        async move { super::run_replication_audit_once(&state).await }
+    });
+    tokio::task::yield_now().await;
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        for node_id in cluster
+            .list_nodes()
+            .into_iter()
+            .map(|node| node.node_id)
+            .collect::<Vec<_>>()
+        {
+            cluster.note_replica(GAP_KEY, node_id);
+            cluster.note_replica(format!("{GAP_KEY}@{version_id}"), node_id);
+        }
+    }
+    drop(active);
+
+    tokio::time::timeout(Duration::from_secs(5), repair)
+        .await
+        .expect("queued background repair should finish after the executor is released")
+        .expect("background repair task should not panic");
+    assert!(
+        repair_run_history(&state).await.is_empty(),
+        "a refreshed empty plan should not create a repair run"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn queued_cluster_repair_builds_its_plan_after_acquiring_executor() {
+    const GAP_KEY: &str = "queued-cluster-gap-key";
+
+    let state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let repair = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::execute_tracked_cluster_replication_repair(
+                &state,
+                None,
+                super::RepairRunTrigger::ManualRequest,
+                None,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cluster repair should queue before planning");
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        for node_id in cluster
+            .list_nodes()
+            .into_iter()
+            .map(|node| node.node_id)
+            .filter(|node_id| *node_id != state.node_id)
+            .collect::<Vec<_>>()
+        {
+            cluster.remove_node(node_id);
+        }
+    }
+    drop(active);
+
+    let report = tokio::time::timeout(Duration::from_secs(5), repair)
+        .await
+        .expect("cluster repair should finish after the executor is released")
+        .expect("cluster repair task should not panic");
+    assert_eq!(report.totals.attempted_transfers, 0);
+    let history = repair_run_history(&state).await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].plan_summary.item_count, 0);
+    assert_eq!(history[0].plan_summary.under_replicated, 0);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_cluster_local_phase_retains_progress_log() {
+    const GAP_KEY: &str = "cluster-timeout-gap-key";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::replication::block_replication_export_for_test(GAP_KEY);
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        super::execute_tracked_cluster_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("cluster repair should finish after its local phase times out");
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(GAP_KEY);
+
+    assert_eq!(report.totals.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.totals.detailed_log.iter().any(|entry| {
+        entry.event == "subject_evaluated" && entry.key.as_deref() == Some(GAP_KEY)
+    }));
+    assert!(
+        report
+            .totals
+            .detailed_log
+            .iter()
+            .any(|entry| entry.event == "repair_run_timed_out")
+    );
+    assert_eq!(
+        report
+            .totals
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "repair_run_timed_out")
+            .count(),
+        1,
+        "cluster local-phase timeout should be recorded exactly once"
+    );
+    assert_eq!(
+        report
+            .totals
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "cluster_repair_started")
+            .count(),
+        1
+    );
+
+    cleanup_test_state(&state).await;
+}
+
 async fn cluster_replication_repair_report_includes_skipped_details_impl(backend: MainTestBackend) {
-    let state = build_test_state(2, true, backend).await;
+    let mut state = build_test_state(2, true, backend).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
 
     let keys = super::planning_replication_subjects(&state).await;
     let plan = {
@@ -22648,7 +24460,7 @@ async fn cluster_replication_repair_report_includes_skipped_details_impl(backend
         let mut repair_state = state.maintenance.repair_state.lock().await;
         for (subject, target_node_id) in &expected_skips {
             repair_state.attempts.insert(
-                format!("{subject}|{target_node_id}"),
+                super::replication::transfer_attempt_key(subject, *target_node_id),
                 super::RepairAttemptEntry {
                     attempts: state.repair_config.max_retries.saturating_add(1),
                     last_failure_unix: super::unix_ts(),
@@ -22657,17 +24469,19 @@ async fn cluster_replication_repair_report_includes_skipped_details_impl(backend
         }
     }
 
-    let response = super::build_internal_peer_api()
-        .with_state(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/cluster/replication/repair?scope=cluster")
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("cluster repair route should respond");
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+    let response = super::replication::execute_replication_repair_public(
+        State(state.clone()),
+        headers,
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Cluster),
+            execution_budget_millis: None,
+        }),
+    )
+    .await
+    .into_response();
 
     assert_eq!(response.status(), StatusCode::OK);
 

@@ -2645,6 +2645,9 @@ mod tests {
             replication_repair_batch_size: 256,
             replication_repair_max_retries: 3,
             replication_repair_backoff_secs: 30,
+            replication_repair_execution_timeout_secs: crate::DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS,
+            replication_repair_subject_inspection_timeout_secs:
+                crate::DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS,
             repair_busy_throttle_enabled: false,
             repair_busy_inflight_threshold: 32,
             repair_busy_wait_millis: 100,

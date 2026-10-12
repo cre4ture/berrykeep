@@ -300,16 +300,24 @@ export type RepairRunTrigger =
   | "autonomous_post_write"
   | "peer_cluster_request";
 
-export type RepairRunStatus = "completed" | "skipped_no_gaps" | "partially_repaired" | "waiting_for_source" | "unresolved";
+export type RepairRunStatus =
+  | "completed"
+  | "skipped_no_gaps"
+  | "partially_repaired"
+  | "waiting_for_source"
+  | "unresolved"
+  | "timed_out";
 
 export type RepairActivityState = "idle" | "scheduled" | "running";
+export type RepairActiveRunPhase = "preparing" | "queued" | "running";
 
 export type StartupRepairStatus =
   | "disabled"
   | "scheduled"
   | "running"
   | "skipped_no_gaps"
-  | "completed";
+  | "completed"
+  | "timed_out";
 
 export type RepairPlanSummary = {
   generated_at_unix: number;
@@ -365,6 +373,7 @@ export type RepairActiveRun = {
   scope: ReplicationRepairScope;
   trigger: RepairRunTrigger;
   started_at_unix: number;
+  phase: RepairActiveRunPhase;
   last_log_at_unix?: number | null;
   live_log: RepairLogEntry[];
   live_log_truncated?: boolean;
@@ -378,6 +387,8 @@ export type RepairHistoryResponse = {
 export type RepairActivityStatusResponse = {
   state: RepairActivityState;
   startup_status: StartupRepairStatus;
+  queued_manual_repairs: number;
+  queued_automatic_repairs: number;
   active_runs: RepairActiveRun[];
   latest_run?: RepairRunRecord | null;
 };
