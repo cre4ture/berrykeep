@@ -5483,21 +5483,13 @@ impl PersistentStore {
         self.data_scrubber().await?.run().await
     }
 
+    #[cfg(test)]
     pub async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
         Ok(self
             .metadata_store
             .load_cluster_replica_views()
             .await?
             .replicas)
-    }
-
-    #[allow(dead_code)]
-    pub async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>> {
-        Ok(self
-            .metadata_store
-            .load_cluster_replica_views()
-            .await?
-            .available)
     }
 
     pub(crate) async fn load_cluster_replica_views(&self) -> Result<ClusterReplicaViews> {
