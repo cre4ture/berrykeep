@@ -873,6 +873,26 @@ fn log_outcome(
     );
 }
 
+fn record_task_skip_detail(
+    state: &ServerState,
+    report: &mut replication::ReplicationRepairReport,
+    task: &ContentRepairTask,
+    reason: replication::ReplicationRepairSkipReason,
+    detail: &str,
+) {
+    replication::push_repair_skipped_detail(
+        &mut report.skipped_details,
+        state.node_id,
+        task.reference.repair_label(),
+        task.reference.key.clone(),
+        task.reference.version_id.clone(),
+        None,
+        Some(state.node_id),
+        reason,
+        detail,
+    );
+}
+
 pub(crate) async fn repair_subjects(
     state: &ServerState,
     subjects: Vec<String>,
@@ -946,17 +966,29 @@ async fn repair_targets_inner(
         {
             let Some(_claim) = state.maintenance.content_repair_claims.try_claim(hash) else {
                 report.skipped_items += 1;
+                let detail = "repair task ownership changed while checking its retained reference";
                 replication::push_repair_log_entry(
                     &mut report.detailed_log,
                     state.node_id,
                     "repair_deferred",
-                    "repair task ownership changed while checking its retained reference",
+                    detail,
                     Some(subject.clone()),
                     None,
                     None,
                     None,
                     Some(state.node_id),
                     Some(json!({"pending": true, "reason": "manifest_repair_in_progress"})),
+                );
+                replication::push_repair_skipped_detail(
+                    &mut report.skipped_details,
+                    state.node_id,
+                    subject.clone(),
+                    None,
+                    None,
+                    None,
+                    Some(state.node_id),
+                    replication::ReplicationRepairSkipReason::RepairInProgress,
+                    detail,
                 );
                 continue;
             };
@@ -1045,13 +1077,21 @@ async fn repair_targets_inner(
             .try_claim(&task.reference.manifest_hash)
         else {
             report.skipped_items += 1;
+            let detail = "repair remains queued while another operation owns its manifest";
             log_outcome(
                 state,
                 report,
                 &task,
                 "repair_deferred",
-                "repair remains queued while another operation owns its manifest".to_string(),
+                detail.to_string(),
                 json!({"pending": true, "reason": "manifest_repair_in_progress"}),
+            );
+            record_task_skip_detail(
+                state,
+                report,
+                &task,
+                replication::ReplicationRepairSkipReason::RepairInProgress,
+                detail,
             );
             continue;
         };
@@ -1089,13 +1129,21 @@ async fn repair_targets_inner(
         }
         if started_transfers >= transfer_limit {
             report.skipped_items += 1;
+            let detail = "repair queued for a later execution batch";
             log_outcome(
                 state,
                 report,
                 &task,
                 "repair_deferred",
-                "repair queued for a later execution batch".to_string(),
+                detail.to_string(),
                 json!({"pending": true}),
+            );
+            record_task_skip_detail(
+                state,
+                report,
+                &task,
+                replication::ReplicationRepairSkipReason::BatchLimitReached,
+                detail,
             );
             continue;
         }
@@ -1115,13 +1163,21 @@ async fn repair_targets_inner(
             .try_claim(&task.reference.manifest_hash)
         else {
             report.skipped_items += 1;
+            let detail = "repair remains queued while another operation owns its manifest";
             log_outcome(
                 state,
                 report,
                 &task,
                 "repair_deferred",
-                "repair remains queued while another operation owns its manifest".to_string(),
+                detail.to_string(),
                 json!({"pending": true, "reason": "manifest_repair_in_progress"}),
+            );
+            record_task_skip_detail(
+                state,
+                report,
+                &task,
+                replication::ReplicationRepairSkipReason::RepairInProgress,
+                detail,
             );
             continue;
         };

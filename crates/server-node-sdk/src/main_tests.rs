@@ -20997,6 +20997,7 @@ async fn repair_activity_payload_includes_live_log_for_active_run_impl(backend: 
         super::RepairRunTrigger::ManualRequest,
     )
     .await;
+    tracker.set_phase(super::RepairActiveRunPhase::Running);
 
     let activity = tokio::time::timeout(
         Duration::from_millis(250),
@@ -21025,6 +21026,10 @@ async fn repair_activity_payload_includes_live_log_for_active_run_impl(backend: 
     assert_eq!(activity.state, super::RepairActivityState::Running);
     assert_eq!(activity.active_runs.len(), 1);
     assert_eq!(activity.active_runs[0].run_id, tracker.run_id);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Running
+    );
     assert_eq!(
         activity.active_runs[0].last_log_at_unix,
         Some(1_900_000_000)
@@ -22953,6 +22958,13 @@ async fn repair_activity_reports_executor_queue_depth() {
         .repair_execution_gate
         .acquire(super::RepairExecutionPriority::Automatic)
         .await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+    tracker.set_phase(super::RepairActiveRunPhase::Queued);
     let waiter = tokio::spawn({
         let gate = Arc::clone(&state.maintenance.repair_execution_gate);
         async move { gate.acquire(super::RepairExecutionPriority::Manual).await }
@@ -22977,9 +22989,26 @@ async fn repair_activity_reports_executor_queue_depth() {
     assert_eq!(activity.state, super::RepairActivityState::Scheduled);
     assert_eq!(activity.queued_manual_repairs, 1);
     assert_eq!(activity.queued_automatic_repairs, 0);
-    assert!(activity.active_runs.is_empty());
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Queued
+    );
+
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(
+        repair.pending, 1,
+        "a tracked waiter must only be counted once"
+    );
+    assert_eq!(repair.active, 0, "a queued run is not executing yet");
 
     waiter.abort();
+    drop(tracker);
     drop(active);
     cleanup_test_state(&state).await;
 }
@@ -23649,6 +23678,11 @@ async fn manual_availability_sync_does_not_hold_repair_executor() {
         activity.active_runs.len(),
         1,
         "admitted manual preparation must be visible as an active repair run"
+    );
+    assert_eq!(activity.state, super::RepairActivityState::Scheduled);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Preparing
     );
 
     let executor_probe = state

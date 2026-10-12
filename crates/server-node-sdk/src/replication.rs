@@ -222,6 +222,7 @@ pub(crate) enum ReplicationRepairSkipReason {
     SourceNodeUnavailable,
     BundleUnavailable,
     RepairInProgress,
+    BatchLimitReached,
     BackoffActive,
     MaxRetriesExhausted,
 }
@@ -1939,6 +1940,10 @@ fn fair_peer_request_deadline(
     now + phase_deadline.saturating_duration_since(now) / peers_left
 }
 
+fn peer_phase_budget(per_peer_budget: Duration, peer_count: usize) -> Duration {
+    per_peer_budget.saturating_mul(u32::try_from(peer_count).unwrap_or(u32::MAX))
+}
+
 fn peer_execution_budget(request_budget: Duration) -> Duration {
     let response_grace =
         Duration::from_secs(PEER_REPAIR_REQUEST_TIMEOUT_GRACE_SECS).min(request_budget / 2);
@@ -2062,10 +2067,10 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
             .collect::<Vec<_>>()
     };
 
-    let peer_phase_timeout_secs = peer_repair_request_timeout_secs(state);
-    let peer_phase_deadline =
-        tokio::time::Instant::now() + Duration::from_secs(peer_phase_timeout_secs);
     let peer_count = peers.len();
+    let peer_request_timeout_secs = peer_repair_request_timeout_secs(state);
+    let peer_phase_deadline = tokio::time::Instant::now()
+        + peer_phase_budget(Duration::from_secs(peer_request_timeout_secs), peer_count);
     for (peer_index, peer) in peers.into_iter().enumerate() {
         let peers_left = peer_count.saturating_sub(peer_index);
         let now = tokio::time::Instant::now();
@@ -2114,7 +2119,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         .await
         .map_err(|_| {
             anyhow!(
-                "peer repair request exhausted its fair share of the {peer_phase_timeout_secs}-second cluster peer phase"
+                "peer repair request exhausted its fair share of the {peer_request_timeout_secs}-second per-peer budget"
             )
         })
         .and_then(|result| result);
@@ -3078,21 +3083,21 @@ mod tests {
     }
 
     #[test]
-    fn peer_phase_budget_is_shared_across_every_remaining_peer() {
+    fn peer_phase_budget_preserves_each_peers_request_budget() {
         let phase_started = tokio::time::Instant::now();
-        let phase_deadline = phase_started + Duration::from_secs(1_830);
+        let phase_deadline = phase_started + peer_phase_budget(Duration::from_secs(1_830), 3);
 
         let first_deadline = fair_peer_request_deadline(phase_deadline, phase_started, 3);
         assert_eq!(
             first_deadline.duration_since(phase_started),
-            Duration::from_secs(610)
+            Duration::from_secs(1_830)
         );
 
-        let second_started = phase_started + Duration::from_secs(300);
+        let second_started = phase_started + Duration::from_secs(900);
         let second_deadline = fair_peer_request_deadline(phase_deadline, second_started, 2);
         assert_eq!(
             second_deadline.duration_since(second_started),
-            Duration::from_secs(765),
+            Duration::from_secs(2_295),
             "an early peer completion should redistribute its unused share"
         );
         assert!(second_deadline < phase_deadline);

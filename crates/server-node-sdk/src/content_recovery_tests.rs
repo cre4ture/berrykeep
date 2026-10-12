@@ -2104,19 +2104,40 @@ async fn recovery_enqueue_only_pass_bypasses_busy_throttle_impl(backend: MainTes
         .maintenance
         .inflight_requests
         .store(2, std::sync::atomic::Ordering::Relaxed);
+    let tracker = crate::begin_repair_run_tracking(
+        &state,
+        crate::replication::ReplicationRepairScope::Local,
+        crate::RepairRunTrigger::DataScrubAutoRepair,
+    )
+    .await;
 
     let report = tokio::time::timeout(
         Duration::from_millis(100),
-        crate::content_recovery::repair_manifest_hashes(
-            &state,
-            vec![manifest.manifest_hash.clone()],
-            Some(0),
+        crate::with_active_repair_log_tracking(
+            &tracker,
+            crate::content_recovery::repair_manifest_hashes(
+                &state,
+                vec![manifest.manifest_hash.clone()],
+                Some(0),
+            ),
         ),
     )
     .await
     .expect("enqueue-only repair work must not wait for foreground load");
 
     assert_eq!(report.skipped_items, 1, "{report:?}");
+    assert_eq!(report.skipped_details.len(), 1, "{report:?}");
+    assert_eq!(
+        report.skipped_details[0].reason,
+        crate::replication::ReplicationRepairSkipReason::BatchLimitReached
+    );
+    let timed_out = crate::timed_out_repair_report(&state, &tracker, 17);
+    assert_eq!(timed_out.skipped_items, 1, "{timed_out:?}");
+    assert_eq!(timed_out.skipped_details.len(), 1, "{timed_out:?}");
+    assert_eq!(
+        timed_out.skipped_details[0].reason,
+        crate::replication::ReplicationRepairSkipReason::BatchLimitReached
+    );
     assert!(
         read_store(&state, "test.recovery.busy_enqueue_only")
             .await
@@ -2127,6 +2148,7 @@ async fn recovery_enqueue_only_pass_bypasses_busy_throttle_impl(backend: MainTes
             .any(|task| task.reference.manifest_hash == manifest.manifest_hash),
         "the enqueue-only pass must durably publish its repair finding"
     );
+    drop(tracker);
     cleanup_test_state(&state).await;
 }
 
