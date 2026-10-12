@@ -62,6 +62,9 @@ jobs:
       - name: Install AWS CLI
         run: python -m pip install --upgrade pip awscli
 
+      - name: Verify AWS CLI
+        run: aws --version
+
       - name: Install Rust toolchain with llvm-tools
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -78,7 +81,9 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
 
       - name: Run unit and system coverage
         run: |
