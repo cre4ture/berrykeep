@@ -332,10 +332,15 @@ async fn execute_replication_repair_with_trigger(
                     "another peer replication repair request is already admitted",
                 );
             };
-            if state.maintenance.repair_execution_gate.is_occupied() {
-                warn!("rejecting peer local repair because the node-local executor is busy");
+            if state
+                .maintenance
+                .manual_local_repair_request_admission
+                .available_permits()
+                == 0
+            {
+                warn!("rejecting peer local repair because a manual request is admitted");
                 return repair_request_unavailable(
-                    "the node-local replication repair executor is busy",
+                    "a manual replication repair request is already admitted",
                 );
             }
             admission
@@ -378,12 +383,18 @@ async fn execute_replication_repair_with_trigger(
         ReplicationRepairScope::Local => {
             let repair_task = match trigger {
                 RepairRunTrigger::PeerClusterRequest => {
-                    let Some(permit) = state.maintenance.repair_execution_gate.try_acquire() else {
-                        warn!(
-                            "rejecting peer local repair because the node-local executor is busy"
-                        );
+                    let execution_deadline = peer_execution_deadline
+                        .expect("peer local repair should have an execution deadline");
+                    let Some(permit) = run_with_repair_execution_deadline(
+                        &state,
+                        execution_deadline,
+                        acquire_repair_execution(&state, trigger),
+                    )
+                    .await
+                    else {
+                        warn!("rejecting peer local repair because executor wait timed out");
                         return repair_request_unavailable(
-                            "the node-local replication repair executor is busy",
+                            "peer replication repair executor wait exceeded its execution deadline",
                         );
                     };
                     if state
@@ -406,8 +417,7 @@ async fn execute_replication_repair_with_trigger(
                             trigger,
                             None,
                             permit,
-                            peer_execution_deadline
-                                .expect("peer local repair should have an execution deadline"),
+                            execution_deadline,
                         )
                         .await
                     })
@@ -2143,7 +2153,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                             })),
                         );
                         if report.timed_out {
-                            failed_nodes = failed_nodes.saturating_add(1);
+                            record_failed_cluster_peer(&mut totals, &mut failed_nodes);
                         }
                         accumulate_peer_repair_report(&mut totals, &report);
                         node_reports.push(ClusterReplicationRepairNodeReport {
@@ -2160,7 +2170,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                         });
                     }
                     Err(err) => {
-                        failed_nodes += 1;
+                        record_failed_cluster_peer(&mut totals, &mut failed_nodes);
                         let error = format!("failed decoding peer repair report: {err}");
                         warn!(
                             repair_run_id,
@@ -2199,7 +2209,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                 }
             }
             Ok(response) => {
-                failed_nodes += 1;
+                record_failed_cluster_peer(&mut totals, &mut failed_nodes);
                 let error = format!("peer repair request returned HTTP {}", response.status);
                 warn!(
                     repair_run_id,
@@ -2237,7 +2247,7 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
                 });
             }
             Err(err) => {
-                failed_nodes += 1;
+                record_failed_cluster_peer(&mut totals, &mut failed_nodes);
                 let error = format!("peer repair request failed: {err:#}");
                 warn!(
                     repair_run_id,
@@ -2308,6 +2318,11 @@ pub(crate) async fn execute_cluster_replication_repair_inner_with_context(
         },
         plan_summary,
     )
+}
+
+fn record_failed_cluster_peer(totals: &mut ReplicationRepairReport, failed_nodes: &mut usize) {
+    *failed_nodes = failed_nodes.saturating_add(1);
+    totals.unresolved = true;
 }
 
 fn accumulate_repair_report(
@@ -3289,6 +3304,21 @@ mod tests {
         assert_eq!(totals.successful_transfers, 1);
         assert_eq!(totals.failed_transfers, 1);
         assert!(totals.unresolved);
+        assert_eq!(totals.run_status(), RepairRunStatus::PartiallyRepaired);
+    }
+
+    #[test]
+    fn failed_cluster_peer_marks_the_aggregate_unresolved() {
+        let mut totals = empty_report();
+        let mut failed_nodes = 0;
+
+        record_failed_cluster_peer(&mut totals, &mut failed_nodes);
+
+        assert_eq!(failed_nodes, 1);
+        assert!(totals.unresolved);
+        assert_eq!(totals.run_status(), RepairRunStatus::Unresolved);
+
+        totals.successful_transfers = 1;
         assert_eq!(totals.run_status(), RepairRunStatus::PartiallyRepaired);
     }
 

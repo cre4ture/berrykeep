@@ -22924,36 +22924,52 @@ async fn repair_activity_reports_executor_queue_depth() {
 }
 
 #[tokio::test]
-async fn busy_peer_cluster_scope_is_forced_local_and_shed_without_queueing() {
+async fn busy_peer_cluster_scope_is_forced_local_and_waits_within_budget() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let active = state
         .maintenance
         .repair_execution_gate
         .acquire(super::RepairExecutionPriority::Automatic)
         .await;
-    let refresh_guard = state
-        .maintenance
-        .local_availability_refresh_lock
-        .lock()
-        .await;
-
-    let response = tokio::time::timeout(
-        Duration::from_secs(2),
-        super::build_internal_peer_api()
-            .with_state(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/cluster/replication/repair?scope=cluster")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            ),
-    )
+    let request = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::build_internal_peer_api()
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(
+                            "/cluster/replication/repair?scope=cluster&execution_budget_millis=3000",
+                        )
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("peer repair route should respond")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("busy peer repair must be shed before availability synchronization")
-    .expect("peer repair route should respond");
+    .expect("peer repair should queue behind active automatic work");
 
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(active);
+    let response = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("queued peer repair should finish after the executor is released")
+        .expect("peer repair handler task should not panic");
+
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         state
             .maintenance
@@ -22961,10 +22977,66 @@ async fn busy_peer_cluster_scope_is_forced_local_and_shed_without_queueing() {
             .queue_snapshot()
             .manual,
         0,
-        "rejected peer work must not remain queued"
+        "completed peer work must leave no queued waiter"
     );
 
-    drop(refresh_guard);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn peer_executor_wait_is_bounded_by_coordinator_budget() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=local&execution_budget_millis=100")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("peer executor wait should respect the coordinator budget")
+    .expect("peer repair route should respond");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("peer timeout response body should be readable"),
+    )
+    .expect("peer timeout response should be JSON");
+    assert_eq!(
+        body["error"],
+        "peer replication repair executor wait exceeded its execution deadline"
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "timed-out peer work must unregister its executor waiter"
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits(),
+        1,
+        "timed-out peer work must release HTTP admission"
+    );
+
     drop(active);
     cleanup_test_state(&state).await;
 }
@@ -23566,6 +23638,52 @@ async fn timed_out_audit_planning_releases_executor() {
     blocker.release();
     super::clear_replication_planning_blocker_for_test(state.node_id);
     cleanup_test_state(&unrelated_state).await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_audit_executor_wait_leaves_no_waiter() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+
+    let audit = tokio::spawn({
+        let state = state.clone();
+        async move { super::run_replication_audit_once(&state).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background audit should wait for the active executor");
+
+    tokio::time::timeout(Duration::from_secs(3), audit)
+        .await
+        .expect("background audit executor wait should respect its execution deadline")
+        .expect("audit task should not panic");
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic,
+        0,
+        "timed-out background work must unregister its executor waiter"
+    );
+
+    drop(active);
     cleanup_test_state(&state).await;
 }
 

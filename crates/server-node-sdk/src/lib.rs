@@ -12176,18 +12176,29 @@ async fn run_replication_audit_once(state: &ServerState) {
         }
     }
 
-    // Acquire immediately before planning. This keeps the snapshot fresh with
-    // respect to every earlier local repair while avoiding peer I/O under the
-    // node-local execution permit.
-    let mut repair_permit = if state.repair_config.enabled {
-        Some(acquire_repair_execution(state, RepairRunTrigger::BackgroundAudit).await)
-    } else {
-        None
-    };
     let execution_deadline = state
         .repair_config
         .enabled
         .then(|| repair_execution_deadline(state));
+    // Acquire immediately before planning. Queueing, planning, and execution
+    // share one absolute deadline so a busy executor cannot retain an
+    // automatic waiter indefinitely. The late acquisition keeps the snapshot
+    // fresh while avoiding peer I/O under the node-local execution permit.
+    let mut repair_permit = if let Some(deadline) = execution_deadline {
+        let Some(permit) = run_with_repair_execution_deadline(
+            state,
+            deadline,
+            acquire_repair_execution(state, RepairRunTrigger::BackgroundAudit),
+        )
+        .await
+        else {
+            warn!("replication audit executor wait timed out");
+            return;
+        };
+        Some(permit)
+    } else {
+        None
+    };
     let planning = run_with_optional_repair_execution_deadline(state, execution_deadline, async {
         let keys = planning_replication_subjects(state).await;
         let mut cluster = state.cluster.lock().await;
