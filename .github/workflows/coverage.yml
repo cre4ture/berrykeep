@@ -65,8 +65,9 @@ jobs:
         run: python -m pip install --upgrade pip awscli
 
       - name: Install Rust toolchain with llvm-tools
-        uses: dtolnay/rust-toolchain@nightly-2026-02-17
+        uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-02-17
           components: llvm-tools-preview
 
       - name: Setup sccache
