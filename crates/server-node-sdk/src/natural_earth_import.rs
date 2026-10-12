@@ -1670,18 +1670,43 @@ async fn publish_generated_mbtiles(
     artifact: &NaturalEarthImportArtifactView,
     artifact_path: &Path,
 ) -> Result<u64> {
+    publish_generated_mbtiles_with_limits(
+        state,
+        job,
+        artifact,
+        artifact_path,
+        NATURAL_EARTH_IMPORT_MAX_ARTIFACT_BYTES,
+        NATURAL_EARTH_IMPORT_PART_BYTES,
+    )
+    .await
+}
+
+async fn publish_generated_mbtiles_with_limits(
+    state: &ServerState,
+    job: &NaturalEarthImportJobView,
+    artifact: &NaturalEarthImportArtifactView,
+    artifact_path: &Path,
+    max_artifact_bytes: usize,
+    part_bytes: usize,
+) -> Result<u64> {
     let payload = fs::read(artifact_path).await.with_context(|| {
         format!(
             "failed reading generated MBTiles {}",
             artifact_path.display()
         )
     })?;
-    if payload.is_empty() || payload.len() > NATURAL_EARTH_IMPORT_MAX_ARTIFACT_BYTES {
-        bail!("generated MBTiles artifact is empty or exceeds the configured artifact size limit")
+    if payload.is_empty() {
+        bail!("generated MBTiles artifact is empty")
+    }
+    if payload.len() > max_artifact_bytes {
+        bail!("generated MBTiles artifact exceeds the configured artifact size limit")
+    }
+    if part_bytes == 0 {
+        bail!("generated MBTiles artifact part size must be greater than zero")
     }
     let mut parts = Vec::new();
     let mut offset = 0_u64;
-    for (index, part_payload) in payload.chunks(NATURAL_EARTH_IMPORT_PART_BYTES).enumerate() {
+    for (index, part_payload) in payload.chunks(part_bytes).enumerate() {
         let size_bytes =
             u64::try_from(part_payload.len()).context("map artifact part size overflow")?;
         let key = format!(
@@ -1845,25 +1870,24 @@ mod tests {
     }
 
     async fn wait_for_terminal_job(state: &ServerState) -> NaturalEarthImportJobView {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let job = state
-                .storage
-                .natural_earth_import
-                .lock()
-                .await
-                .job
-                .clone()
-                .expect("the Natural Earth job should exist");
-            if !matches!(job.state, NaturalEarthImportState::Running) {
-                return job;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let job = state
+                    .storage
+                    .natural_earth_import
+                    .lock()
+                    .await
+                    .job
+                    .clone()
+                    .expect("the Natural Earth job should exist");
+                if !matches!(job.state, NaturalEarthImportState::Running) {
+                    return job;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the Natural Earth test worker did not finish"
-            );
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("the Natural Earth test worker should finish within ten seconds")
     }
 
     #[test]
@@ -2353,6 +2377,104 @@ mod tests {
             "artifact is empty",
         );
 
+        let multipart_artifact = test_artifact(
+            "natural-earth-multipart",
+            map_config::MapVariantAssetKind::Raster,
+        );
+        let multipart_job = test_job(
+            NaturalEarthImportProfile::Physical,
+            vec![multipart_artifact.clone()],
+        );
+        let multipart_path = state.managed_paths.data_dir().join("multipart.mbtiles");
+        let multipart_payload = b"abcdefghij";
+        fs::write(&multipart_path, multipart_payload)
+            .await
+            .expect("the multipart artifact should be created");
+        let multipart_size = publish_generated_mbtiles_with_limits(
+            &state,
+            &multipart_job,
+            &multipart_artifact,
+            &multipart_path,
+            32,
+            4,
+        )
+        .await
+        .expect("the multipart artifact should publish");
+        assert_eq!(multipart_size, multipart_payload.len() as u64);
+
+        let multipart_manifest_payload = {
+            let store = read_store(&state, "test.natural_earth.read_multipart_manifest").await;
+            store
+                .get_object(
+                    &multipart_artifact.manifest_key,
+                    None,
+                    None,
+                    storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .expect("the multipart manifest should be readable")
+        };
+        let multipart_manifest: serde_json::Value =
+            serde_json::from_slice(&multipart_manifest_payload)
+                .expect("the multipart manifest should be JSON");
+        assert_eq!(multipart_manifest["logical_size_bytes"], 10);
+        assert_eq!(multipart_manifest["last_part_size_bytes"], 2);
+        assert_eq!(multipart_manifest["parts_count"], 3);
+        let multipart_parts = multipart_manifest["parts"]
+            .as_array()
+            .expect("the multipart manifest should list its parts");
+        for (index, (part, expected_payload)) in multipart_parts
+            .iter()
+            .zip([b"abcd".as_slice(), b"efgh".as_slice(), b"ij".as_slice()])
+            .enumerate()
+        {
+            assert_eq!(part["part_id"], ["aa", "ab", "ac"][index]);
+            assert_eq!(part["offset_bytes"], (index * 4) as u64);
+            assert_eq!(part["size_bytes"], expected_payload.len() as u64);
+            let part_key = part["key"]
+                .as_str()
+                .expect("each multipart manifest entry should have a key");
+            let stored_payload = {
+                let store = read_store(&state, "test.natural_earth.read_multipart_part").await;
+                store
+                    .get_object(part_key, None, None, storage::ObjectReadMode::Preferred)
+                    .await
+                    .expect("each multipart payload should be readable")
+            };
+            assert_eq!(stored_payload.as_ref(), expected_payload);
+        }
+
+        let oversized_path = state.managed_paths.data_dir().join("oversized.mbtiles");
+        fs::write(&oversized_path, b"12345")
+            .await
+            .expect("the oversized artifact should be created");
+        assert_error_contains(
+            publish_generated_mbtiles_with_limits(
+                &state,
+                &multipart_job,
+                &multipart_artifact,
+                &oversized_path,
+                4,
+                2,
+            )
+            .await
+            .expect_err("an oversized artifact must be rejected"),
+            "exceeds the configured artifact size limit",
+        );
+        assert_error_contains(
+            publish_generated_mbtiles_with_limits(
+                &state,
+                &multipart_job,
+                &multipart_artifact,
+                &multipart_path,
+                32,
+                0,
+            )
+            .await
+            .expect_err("a zero artifact part size must be rejected"),
+            "part size must be greater than zero",
+        );
+
         crate::tests::cleanup_natural_earth_test_state(&state).await;
     }
 
@@ -2525,9 +2647,10 @@ mod tests {
 
         assert_eq!(job.log_entries.len(), NATURAL_EARTH_IMPORT_LOG_MAX_ENTRIES);
         assert_eq!(job.log_entries[0].message, "entry-1");
+        let expected_last = format!("entry-{NATURAL_EARTH_IMPORT_LOG_MAX_ENTRIES}");
         assert_eq!(
             job.log_entries.last().map(|entry| entry.message.as_str()),
-            Some("entry-64")
+            Some(expected_last.as_str())
         );
     }
 }
