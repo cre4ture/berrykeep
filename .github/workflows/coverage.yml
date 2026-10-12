@@ -52,9 +52,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install Linux FUSE runtime
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes fuse3
+        uses: ./.github/actions/setup-linux-fuse
 
       - name: Setup Python
         uses: actions/setup-python@v5
