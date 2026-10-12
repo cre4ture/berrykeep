@@ -28342,6 +28342,25 @@ async fn update_runtime_log_config(
     headers: HeaderMap,
     Json(request): Json<UpdateRuntimeLogConfigRequest>,
 ) -> impl IntoResponse {
+    let action = "auth/logging/config/update";
+    let authz = match authorize_admin_request(
+        &state,
+        &headers,
+        action,
+        false,
+        true,
+        json!({
+            "filter_expression": request.filter_expression.as_deref(),
+            "default_level": request.default_level.as_deref(),
+            "directives": &request.directives,
+        }),
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+
     let filter_expression = match runtime_log_filter_expression_from_request(&request) {
         Ok(filter_expression) => filter_expression,
         Err(err) => {
@@ -28351,21 +28370,6 @@ async fn update_runtime_log_config(
             )
                 .into_response();
         }
-    };
-
-    let action = "auth/logging/config/update";
-    let authz = match authorize_admin_request(
-        &state,
-        &headers,
-        action,
-        false,
-        true,
-        json!({ "filter_expression": filter_expression }),
-    )
-    .await
-    {
-        Ok(request) => request,
-        Err(status) => return status.into_response(),
     };
 
     if let Err(err) = state

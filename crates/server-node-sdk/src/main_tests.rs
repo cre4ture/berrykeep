@@ -26341,6 +26341,34 @@ async fn admin_control_surface_routes_round_trip_runtime_configuration_impl(
         assert_eq!(status, StatusCode::UNAUTHORIZED, "path {path}");
     }
 
+    for (path, body) in [
+        (
+            logging_path,
+            serde_json::json!({ "default_level": "verbose" }),
+        ),
+        (
+            direct_endpoints_path,
+            serde_json::json!({
+                "public_urls": ["not a URL"],
+                "peer_urls": []
+            }),
+        ),
+        (
+            priority_path,
+            serde_json::json!({
+                "priority": transport_sdk::MAX_NODE_CONNECTION_PRIORITY + 1
+            }),
+        ),
+        (
+            rendezvous_path,
+            serde_json::json!({ "editable_urls": ["not a URL"] }),
+        ),
+    ] {
+        let (status, _) =
+            execute_admin_control_request(&app, Method::PUT, path, None, Some(body)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "path {path}");
+    }
+
     let (status, logging) =
         execute_admin_control_request(&app, Method::GET, logging_path, Some(&admin_token), None)
             .await;
