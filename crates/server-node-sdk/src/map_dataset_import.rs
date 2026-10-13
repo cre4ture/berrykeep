@@ -95,8 +95,6 @@ struct MapDatasetImportJob {
     #[serde(default)]
     representation_validator: Option<String>,
     #[serde(default)]
-    fallback_last_modified: Option<String>,
-    #[serde(default)]
     variant_id: Option<String>,
     #[serde(default)]
     asset: Option<map_config::MapVariantAssetKind>,
@@ -125,7 +123,6 @@ struct MapDatasetImportJob {
 struct MapDatasetProbe {
     source_url: String,
     representation_validator: Option<String>,
-    fallback_last_modified: Option<String>,
     dataset_filename: String,
     total_size_bytes: u64,
 }
@@ -421,7 +418,6 @@ async fn start_import_job(
         state: AdminMapDatasetImportState::Running,
         source_url: probe.source_url,
         representation_validator: probe.representation_validator,
-        fallback_last_modified: probe.fallback_last_modified,
         variant_id: configured_target
             .as_ref()
             .map(|target| target.variant_id.clone()),
@@ -630,7 +626,7 @@ async fn download_part_bytes_with_limits(
     let response = request
         .send()
         .await
-        .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?;
+        .map_err(redacted_transient_http_error)?;
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         let status = response.status();
         let message = format!(
@@ -646,18 +642,7 @@ async fn download_part_bytes_with_limits(
         job.total_size_bytes,
         &part.key,
     )?;
-    let fallback_last_modified = job
-        .fallback_last_modified
-        .as_deref()
-        .map(|validator| persisted_representation_validator(Some(validator)))
-        .transpose()
-        .map_err(ImportAdvanceError::Fatal)?;
-    validate_representation_validator(
-        response.headers(),
-        representation_validator,
-        fallback_last_modified,
-        &part.key,
-    )?;
+    validate_representation_validator(response.headers(), representation_validator, &part.key)?;
     let remaining_bytes = part
         .size_bytes
         .saturating_sub(job.current_part_downloaded_bytes);
@@ -680,7 +665,7 @@ async fn download_part_bytes_with_limits(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?
+        .map_err(redacted_transient_http_error)?
     {
         let received_bytes = downloaded_bytes
             .saturating_add(buffer.len() as u64)
@@ -1136,7 +1121,7 @@ async fn probe_download_source(
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()
         .await
-        .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?;
+        .map_err(redacted_transient_http_error)?;
 
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(classify_http_status(
@@ -1165,8 +1150,6 @@ async fn probe_download_source(
     }
 
     let dataset_filename = probe_dataset_filename(response.url(), configured_dataset_filename)?;
-    let strong_etag = strong_etag(response.headers()).map(ToString::to_string);
-    let fallback_last_modified = last_modified(response.headers()).map(ToString::to_string);
     let representation_validator =
         representation_validator(response.headers()).ok_or_else(|| {
             ImportAdvanceError::Fatal(
@@ -1179,7 +1162,6 @@ async fn probe_download_source(
         // signed CDN URLs and must be re-resolved after a restart.
         source_url: source_url.to_string(),
         representation_validator: Some(representation_validator),
-        fallback_last_modified: strong_etag.and(fallback_last_modified),
         dataset_filename,
         total_size_bytes,
     })
@@ -1211,30 +1193,17 @@ fn last_modified(headers: &HeaderMap) -> Option<&str> {
 fn validate_representation_validator(
     headers: &HeaderMap,
     expected: &str,
-    fallback_last_modified: Option<&str>,
     part_key: &str,
 ) -> std::result::Result<(), ImportAdvanceError> {
-    let (expected, observed) = if expected.starts_with('"') {
-        match strong_etag(headers) {
-            Some(observed) => (expected, observed),
-            None => match fallback_last_modified
-                .and_then(|expected| last_modified(headers).map(|observed| (expected, observed)))
-            {
-                Some((expected, observed)) => (expected, observed),
-                None => {
-                    return Err(ImportAdvanceError::Fatal(format!(
-                        "range download for {part_key} omitted the probed representation validator"
-                    )));
-                }
-            },
-        }
+    let observed = if expected.starts_with('"') {
+        strong_etag(headers)
     } else {
-        let Some(observed) = last_modified(headers) else {
-            return Err(ImportAdvanceError::Fatal(format!(
-                "range download for {part_key} omitted the probed representation validator"
-            )));
-        };
-        (expected, observed)
+        last_modified(headers)
+    };
+    let Some(observed) = observed else {
+        return Err(ImportAdvanceError::Fatal(format!(
+            "range download for {part_key} omitted the probed representation validator"
+        )));
     };
     if observed != expected {
         return Err(ImportAdvanceError::Fatal(format!(
@@ -1242,6 +1211,12 @@ fn validate_representation_validator(
         )));
     }
     Ok(())
+}
+
+fn redacted_transient_http_error(error: reqwest::Error) -> ImportAdvanceError {
+    // Source URLs can include short-lived credentials. The error becomes part of
+    // the persisted job state and is logged, so never retain its URL.
+    ImportAdvanceError::Transient(error.without_url().to_string())
 }
 
 fn persisted_representation_validator(validator: Option<&str>) -> Result<&str, String> {
@@ -1486,10 +1461,6 @@ fn validate_manifest_checkpoint(
 
 fn validate_persisted_job_checkpoint(job: &MapDatasetImportJob) -> std::result::Result<(), String> {
     persisted_representation_validator(job.representation_validator.as_deref())?;
-    job.fallback_last_modified
-        .as_deref()
-        .map(|validator| persisted_representation_validator(Some(validator)))
-        .transpose()?;
     if job.total_size_bytes == 0 {
         return Err("map import total size must be greater than zero".into());
     }
@@ -1604,7 +1575,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const TEST_STRONG_ETAG: &str = "\"dataset-v1\"";
-    const TEST_LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
 
     #[derive(Clone, Copy)]
     enum TestRangeBehavior {
@@ -1612,7 +1582,7 @@ mod tests {
         InvalidContentRange,
         OmitContentRange,
         OmitValidator,
-        OmitStrongEtagAfterProbe { last_modified: &'static str },
+        OmitStrongEtagAfterProbe,
         ChangedRepresentation,
         MismatchedValidator,
         OversizedBody,
@@ -1660,7 +1630,6 @@ mod tests {
         payload: Vec<u8>,
         content_range: Option<String>,
         etag: Option<&str>,
-        last_modified: Option<&str>,
     ) -> axum::response::Response {
         let mut response = axum::response::Response::new(Body::from(payload));
         *response.status_mut() = status;
@@ -1675,13 +1644,6 @@ mod tests {
             response.headers_mut().insert(
                 reqwest::header::ETAG,
                 HeaderValue::from_str(etag).expect("test ETag should be a valid header"),
-            );
-        }
-        if let Some(last_modified) = last_modified {
-            response.headers_mut().insert(
-                reqwest::header::LAST_MODIFIED,
-                HeaderValue::from_str(last_modified)
-                    .expect("test Last-Modified should be a valid header"),
             );
         }
         response
@@ -1730,7 +1692,7 @@ mod tests {
             .push(request);
 
         if let TestRangeBehavior::Status(status) = state.behavior {
-            return test_http_response(status, Vec::new(), None, None, None);
+            return test_http_response(status, Vec::new(), None, None);
         }
         if matches!(state.behavior, TestRangeBehavior::ChangedRepresentation) {
             return test_http_response(
@@ -1738,21 +1700,14 @@ mod tests {
                 b"changed".to_vec(),
                 None,
                 Some("\"dataset-v2\""),
-                None,
             );
         }
 
         let Some((start, end)) = parse_requested_test_range(&headers) else {
-            return test_http_response(StatusCode::BAD_REQUEST, Vec::new(), None, None, None);
+            return test_http_response(StatusCode::BAD_REQUEST, Vec::new(), None, None);
         };
         if start > end || end >= state.payload.len() {
-            return test_http_response(
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                Vec::new(),
-                None,
-                None,
-                None,
-            );
+            return test_http_response(StatusCode::RANGE_NOT_SATISFIABLE, Vec::new(), None, None);
         }
 
         let mut payload = state.payload[start..=end].to_vec();
@@ -1778,24 +1733,11 @@ mod tests {
         let is_probe = start == 0 && end == 0;
         let etag = match state.behavior {
             TestRangeBehavior::OmitValidator => None,
-            TestRangeBehavior::OmitStrongEtagAfterProbe { .. } if !is_probe => None,
+            TestRangeBehavior::OmitStrongEtagAfterProbe if !is_probe => None,
             TestRangeBehavior::MismatchedValidator => Some("\"dataset-v2\""),
             _ => Some(TEST_STRONG_ETAG),
         };
-        let last_modified = match state.behavior {
-            TestRangeBehavior::OmitValidator => None,
-            TestRangeBehavior::OmitStrongEtagAfterProbe { last_modified } if !is_probe => {
-                Some(last_modified)
-            }
-            _ => Some(TEST_LAST_MODIFIED),
-        };
-        test_http_response(
-            StatusCode::PARTIAL_CONTENT,
-            payload,
-            content_range,
-            etag,
-            last_modified,
-        )
+        test_http_response(StatusCode::PARTIAL_CONTENT, payload, content_range, etag)
     }
 
     async fn spawn_test_range_server(
@@ -1837,7 +1779,6 @@ mod tests {
             state: AdminMapDatasetImportState::Running,
             source_url: probe.source_url,
             representation_validator: probe.representation_validator,
-            fallback_last_modified: probe.fallback_last_modified,
             variant_id: None,
             asset: None,
             dataset_filename: probe.dataset_filename.clone(),
@@ -1920,11 +1861,6 @@ mod tests {
             probe.representation_validator.as_deref(),
             Some(TEST_STRONG_ETAG)
         );
-        assert_eq!(
-            probe.fallback_last_modified.as_deref(),
-            Some(TEST_LAST_MODIFIED)
-        );
-
         let job = test_import_job(probe, 6);
         install_test_import_job(&state, &job).await;
         assert!(has_running_job(&state).await);
@@ -2051,45 +1987,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_uses_last_modified_when_a_range_response_omits_the_strong_etag() {
-        let state = crate::tests::build_sqlite_test_state().await;
-        let server = spawn_test_range_server(
-            b"data",
-            TestRangeBehavior::OmitStrongEtagAfterProbe {
-                last_modified: TEST_LAST_MODIFIED,
-            },
-        )
-        .await;
-        let http = build_map_import_http_client().expect("HTTP client should build");
-        let probe = probe_download_source(&http, &server.source_url, None)
-            .await
-            .expect("loopback source should pass its range probe");
-        assert_eq!(
-            probe.representation_validator.as_deref(),
-            Some(TEST_STRONG_ETAG)
-        );
-        assert_eq!(
-            probe.fallback_last_modified.as_deref(),
-            Some(TEST_LAST_MODIFIED)
-        );
-        let job = test_import_job(probe, 4);
-        install_test_import_job(&state, &job).await;
-
-        spawn_resume_if_needed(state.clone()).await;
-        let completed = wait_for_terminal_import(&state).await;
-        assert_eq!(completed.state, AdminMapDatasetImportState::Completed);
-        assert_eq!(
-            server.requests(),
-            [
-                expected_test_range_request("bytes=0-0", None),
-                expected_test_range_request("bytes=0-3", Some(TEST_STRONG_ETAG)),
-            ]
-        );
-
-        crate::tests::cleanup_sqlite_test_state(&state).await;
-    }
-
-    #[tokio::test]
     async fn import_persists_fatal_content_range_mismatch() {
         let state = crate::tests::build_sqlite_test_state().await;
         let server = spawn_test_range_server(b"data", TestRangeBehavior::InvalidContentRange).await;
@@ -2097,7 +1994,6 @@ mod tests {
             MapDatasetProbe {
                 source_url: server.source_url.clone(),
                 representation_validator: Some(TEST_STRONG_ETAG.to_string()),
-                fallback_last_modified: None,
                 dataset_filename: "dataset.mbtiles".to_string(),
                 total_size_bytes: 4,
             },
@@ -2137,6 +2033,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_fails_when_a_range_response_omits_the_probed_strong_etag() {
+        let state = crate::tests::build_sqlite_test_state().await;
+        let server =
+            spawn_test_range_server(b"data", TestRangeBehavior::OmitStrongEtagAfterProbe).await;
+        let http = build_map_import_http_client().expect("HTTP client should build");
+        let probe = probe_download_source(&http, &server.source_url, None)
+            .await
+            .expect("range probe should receive the strong ETag");
+        let job = test_import_job(probe, 4);
+        install_test_import_job(&state, &job).await;
+
+        spawn_resume_if_needed(state.clone()).await;
+        let failed = wait_for_terminal_import(&state).await;
+        assert_eq!(failed.state, AdminMapDatasetImportState::Failed);
+        assert!(
+            failed
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("omitted the probed representation validator"))
+        );
+        assert_eq!(
+            server.requests(),
+            [
+                expected_test_range_request("bytes=0-0", None),
+                expected_test_range_request("bytes=0-3", Some(TEST_STRONG_ETAG)),
+            ]
+        );
+
+        crate::tests::cleanup_sqlite_test_state(&state).await;
+    }
+
+    #[tokio::test]
     async fn import_fails_if_the_probed_representation_changes() {
         let state = crate::tests::build_sqlite_test_state().await;
         let server =
@@ -2145,7 +2073,6 @@ mod tests {
             MapDatasetProbe {
                 source_url: server.source_url.clone(),
                 representation_validator: Some(TEST_STRONG_ETAG.to_string()),
-                fallback_last_modified: None,
                 dataset_filename: "dataset.mbtiles".to_string(),
                 total_size_bytes: 4,
             },
@@ -2180,7 +2107,6 @@ mod tests {
             MapDatasetProbe {
                 source_url: unsatisfiable.source_url.clone(),
                 representation_validator: Some(TEST_STRONG_ETAG.to_string()),
-                fallback_last_modified: None,
                 dataset_filename: "dataset.mbtiles".to_string(),
                 total_size_bytes: 4,
             },
@@ -2221,7 +2147,6 @@ mod tests {
             MapDatasetProbe {
                 source_url: server.source_url.clone(),
                 representation_validator: None,
-                fallback_last_modified: None,
                 dataset_filename: "dataset.mbtiles".to_string(),
                 total_size_bytes: 4,
             },
@@ -2262,7 +2187,6 @@ mod tests {
             MapDatasetProbe {
                 source_url: server.source_url.clone(),
                 representation_validator: Some(TEST_STRONG_ETAG.to_string()),
-                fallback_last_modified: None,
                 dataset_filename: "dataset.mbtiles".to_string(),
                 total_size_bytes: 10,
             },
@@ -2285,8 +2209,6 @@ mod tests {
         blank_validator.representation_validator = Some("   ".to_string());
         let mut invalid_header_validator = base.clone();
         invalid_header_validator.representation_validator = Some("invalid\nvalidator".to_string());
-        let mut invalid_fallback_validator = base.clone();
-        invalid_fallback_validator.fallback_last_modified = Some("invalid\nvalidator".to_string());
 
         for (job, expected_error) in [
             (wrong_part_geometry, "size and part size require 2"),
@@ -2297,7 +2219,6 @@ mod tests {
             ),
             (blank_validator, "without a representation validator"),
             (invalid_header_validator, "not a valid HTTP header value"),
-            (invalid_fallback_validator, "not a valid HTTP header value"),
         ] {
             install_test_import_job(&state, &job).await;
             let persisted = load_runtime(state.managed_paths.data_dir())
@@ -2342,7 +2263,6 @@ mod tests {
             MapDatasetProbe {
                 source_url: "https://example.invalid/dataset.mbtiles".to_string(),
                 representation_validator: Some(TEST_STRONG_ETAG.to_string()),
-                fallback_last_modified: None,
                 dataset_filename: "dataset.mbtiles".to_string(),
                 total_size_bytes: 4,
             },
@@ -2413,7 +2333,6 @@ mod tests {
                 MapDatasetProbe {
                     source_url: server.source_url.clone(),
                     representation_validator: Some(TEST_STRONG_ETAG.to_string()),
-                    fallback_last_modified: None,
                     dataset_filename: "dataset.mbtiles".to_string(),
                     total_size_bytes: 4,
                 },
@@ -2604,7 +2523,6 @@ mod tests {
             MapDatasetProbe {
                 source_url: "https://example.invalid/dataset.mbtiles".to_string(),
                 representation_validator: Some(TEST_STRONG_ETAG.to_string()),
-                fallback_last_modified: None,
                 dataset_filename: "dataset.mbtiles".to_string(),
                 total_size_bytes: 10,
             },
@@ -2685,7 +2603,6 @@ mod tests {
             state: AdminMapDatasetImportState::Running,
             source_url: "https://example.invalid/file.mbtiles".to_string(),
             representation_validator: None,
-            fallback_last_modified: None,
             variant_id: None,
             asset: None,
             dataset_filename: "file.mbtiles".to_string(),
