@@ -1235,7 +1235,11 @@ fn validate_representation_validator(
         last_modified(headers)
     };
     let Some(observed) = observed else {
-        return Err(ImportAdvanceError::Fatal(format!(
+        // A 206 response to If-Range is enough for a cooperating origin to
+        // establish continuity. Without an echoed validator, do not advance
+        // the import, but preserve completed parts for a retry rather than
+        // treating weaker evidence as proof that the representation changed.
+        return Err(ImportAdvanceError::Transient(format!(
             "range download for {part_key} omitted the probed representation validator"
         )));
     };
@@ -2067,7 +2071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_fails_when_a_range_response_omits_the_probed_strong_etag() {
+    async fn range_download_retries_when_a_range_response_omits_the_probed_strong_etag() {
         let state = crate::tests::build_sqlite_test_state().await;
         let server =
             spawn_test_range_server(b"data", TestRangeBehavior::OmitStrongEtagAfterProbe).await;
@@ -2078,15 +2082,16 @@ mod tests {
         let job = test_import_job(probe, 4);
         install_test_import_job(&state, &job).await;
 
-        spawn_resume_if_needed(state.clone()).await;
-        let failed = wait_for_terminal_import(&state).await;
-        assert_eq!(failed.state, AdminMapDatasetImportState::Failed);
-        assert!(
-            failed
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("omitted the probed representation validator"))
-        );
+        let part = current_part_spec(&job)
+            .expect("part specification should be valid")
+            .expect("test job should have a part");
+        let error = download_part_bytes(&state, &http, &job, &part)
+            .await
+            .expect_err("a missing response validator should be retried");
+        let ImportAdvanceError::Transient(error) = error else {
+            panic!("a missing response validator was fatal");
+        };
+        assert!(error.contains("omitted the probed representation validator"));
         assert_eq!(
             server.requests(),
             [
