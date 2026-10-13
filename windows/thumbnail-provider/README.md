@@ -60,6 +60,19 @@ The prototype package root should contain at least:
 
 The manifest now exposes the packaged `berrykeep-config-app.exe` as the visible user-facing entry point, registers `berrykeep-background-launcher.exe` as the login-time startup task, and keeps `berrykeep.exe`, `berrykeep-os-integration.exe`, plus `berrykeep-folder-agent.exe` as hidden packaged full-trust entry points. Legacy execution aliases remain available during the transition.
 
+The package deliberately keeps BerryKeep state in the shared, unvirtualized
+`%LocalAppData%\BerryKeep` directory. This lets the packaged services and an
+unpackaged `berrykeep` CLI use the same identities and managed-service
+configuration. On first startup after upgrading from a release that used MSIX
+AppData virtualization, the config app copies the complete BerryKeep state
+(including managed services and sync roots) from the package cache. Existing
+shared files always win; only missing legacy entries are added.
+
+The manifest uses Microsoft's compatibility pair: global AppData write
+de-virtualization is the Windows 10 fallback, while Windows 11 and later give
+the narrower `%LocalAppData%\BerryKeep` exclusion precedence. This capability
+needs a restricted-capability justification for Store certification.
+
 For normal packaged-client testing, start BerryKeep through the packaged config app and define instances there first. The direct `berrykeep-os-integration.exe serve ...` flow below remains useful when you need low-level CFAPI or thumbnail-provider verification.
 
 ## Typical manual prototype flow
