@@ -886,17 +886,144 @@ async fn complete_job(state: &ServerState) -> std::result::Result<(), ImportAdva
 }
 
 async fn fail_job(state: &ServerState, error: String) -> Result<()> {
-    {
+    let failed_job = {
         let mut runtime = state.storage.map_dataset_import.lock().await;
-        if let Some(job) = runtime.job.as_mut() {
+        runtime.job.as_mut().map(|job| {
             job.state = AdminMapDatasetImportState::Failed;
             job.last_error = Some(error);
             job.next_retry_at_unix = None;
             job.updated_at_unix = unix_ts();
             job.finished_at_unix = Some(job.updated_at_unix);
+            job.clone()
+        })
+    };
+    persist_runtime(state).await?;
+    if let Some(job) = failed_job {
+        let cleanup_failures = cleanup_failed_import_parts(state, &job).await;
+        if !cleanup_failures.is_empty() {
+            record_failed_part_cleanup_error(state, &job.job_id, cleanup_failures).await?;
         }
     }
+    Ok(())
+}
+
+async fn cleanup_failed_import_parts(
+    state: &ServerState,
+    job: &MapDatasetImportJob,
+) -> Vec<String> {
+    let part_keys = match completed_part_keys_for_cleanup(job) {
+        Ok(part_keys) => part_keys,
+        Err(error) => {
+            warn!(
+                job_id = %job.job_id,
+                error = %error,
+                "skipping cleanup of failed map import parts with an invalid checkpoint"
+            );
+            return vec![format!("invalid checkpoint: {error:#}")];
+        }
+    };
+
+    let mut failures = Vec::new();
+    for key in part_keys {
+        let tombstone = {
+            let mut store = lock_store(state, "map_dataset_import.cleanup_failed_part").await;
+            store
+                .tombstone_object_with_identity(
+                    &key,
+                    PutOptions {
+                        parent_version_ids: Vec::new(),
+                        state: VersionConsistencyState::Confirmed,
+                        inherit_preferred_parent: true,
+                        create_snapshot: false,
+                        explicit_version_id: None,
+                    },
+                )
+                .await
+        };
+        match tombstone {
+            Ok(tombstone) => register_put_outcome(state, &key, &tombstone.version_id).await,
+            Err(error) => {
+                warn!(
+                    job_id = %job.job_id,
+                    part_key = %key,
+                    error = %error,
+                    "failed cleaning up a map import part after a fatal error"
+                );
+                failures.push(key);
+            }
+        }
+    }
+    failures
+}
+
+async fn record_failed_part_cleanup_error(
+    state: &ServerState,
+    job_id: &str,
+    cleanup_failures: Vec<String>,
+) -> Result<()> {
+    let detail = cleanup_failures
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = cleanup_failures.len().saturating_sub(5);
+    let detail = if remaining == 0 {
+        detail
+    } else {
+        format!("{detail}, and {remaining} more")
+    };
+    {
+        let mut runtime = state.storage.map_dataset_import.lock().await;
+        let Some(job) = runtime.job.as_mut() else {
+            return Ok(());
+        };
+        if job.job_id != job_id || job.state != AdminMapDatasetImportState::Failed {
+            return Ok(());
+        }
+        let original_error = job.last_error.as_deref().unwrap_or("map import failed");
+        job.last_error = Some(format!(
+            "{original_error}; failed to clean up {} import part(s): {detail}",
+            cleanup_failures.len()
+        ));
+        job.updated_at_unix = unix_ts();
+    }
     persist_runtime(state).await
+}
+
+fn completed_part_keys_for_cleanup(job: &MapDatasetImportJob) -> Result<Vec<String>> {
+    if job.manifest_uploaded || job.completed_parts == 0 {
+        return Ok(Vec::new());
+    }
+    Uuid::parse_str(&job.job_id).context("map import job ID is not a UUID")?;
+    let expected_total_parts = part_count_for_size(job.total_size_bytes, job.part_size_bytes)?;
+    if job.total_parts != expected_total_parts {
+        bail!(
+            "map import declares {} parts but its size and part size require {expected_total_parts}",
+            job.total_parts
+        );
+    }
+    if job.completed_parts > job.total_parts {
+        bail!(
+            "map import completed {} of only {} parts",
+            job.completed_parts,
+            job.total_parts
+        );
+    }
+
+    (0..job.completed_parts)
+        .map(|index| {
+            part_spec(
+                &job.dataset_filename,
+                &job.job_id,
+                job.total_size_bytes,
+                job.part_size_bytes,
+                job.total_parts,
+                index,
+            )
+            .map(|part| part.key)
+        })
+        .collect()
 }
 
 async fn note_transient_failure(
@@ -2204,6 +2331,64 @@ mod tests {
                 .await
         };
         assert!(manifest_read.is_err());
+
+        crate::tests::cleanup_sqlite_test_state(&state).await;
+    }
+
+    #[tokio::test]
+    async fn fatal_import_failure_tombstones_completed_parts() {
+        let state = crate::tests::build_sqlite_test_state().await;
+        let mut job = test_import_job(
+            MapDatasetProbe {
+                source_url: "https://example.invalid/dataset.mbtiles".to_string(),
+                representation_validator: Some(TEST_STRONG_ETAG.to_string()),
+                fallback_last_modified: None,
+                dataset_filename: "dataset.mbtiles".to_string(),
+                total_size_bytes: 4,
+            },
+            4,
+        );
+        job.job_id = Uuid::now_v7().to_string();
+        let part = current_part_spec(&job)
+            .expect("part geometry should be valid")
+            .expect("the first part should exist");
+        let chunk = ingest_import_chunk(&state, b"data")
+            .await
+            .expect("part chunk should ingest");
+        job.current_part_downloaded_bytes = 4;
+        job.current_part_chunk_refs = vec![chunk];
+        install_test_import_job(&state, &job).await;
+        finalize_part_object(&state, &job, &part)
+            .await
+            .expect("completed part should publish");
+
+        let part_payload = {
+            let store = read_store(&state, "test.map_import.read_completed_part").await;
+            store
+                .get_object(&part.key, None, None, storage::ObjectReadMode::Preferred)
+                .await
+                .expect("completed part should be readable before failure")
+        };
+        assert_eq!(part_payload.as_ref(), b"data");
+
+        fail_job(&state, "source representation changed".to_string())
+            .await
+            .expect("fatal failure should persist");
+
+        let removed_part = {
+            let store = read_store(&state, "test.map_import.read_cleaned_part").await;
+            store
+                .get_object(&part.key, None, None, storage::ObjectReadMode::Preferred)
+                .await
+        };
+        assert!(removed_part.is_err());
+        let runtime = state.storage.map_dataset_import.lock().await;
+        let failed = runtime
+            .job
+            .as_ref()
+            .expect("failed job should remain visible");
+        assert_eq!(failed.state, AdminMapDatasetImportState::Failed);
+        drop(runtime);
 
         crate::tests::cleanup_sqlite_test_state(&state).await;
     }
