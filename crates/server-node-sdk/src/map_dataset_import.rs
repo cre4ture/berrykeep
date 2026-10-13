@@ -9,6 +9,7 @@ const MAP_IMPORT_MAX_PART_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAP_IMPORT_INGEST_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAP_IMPORT_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 const MAP_IMPORT_RETRY_MAX_DELAY_SECS: u64 = 60;
+const MAP_IMPORT_MAX_TRANSIENT_RETRIES: u32 = 10;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -534,6 +535,16 @@ async fn run_worker(state: ServerState) {
                 return;
             }
             Err(ImportAdvanceError::Transient(err)) => {
+                if transient_retries_exhausted(&job) {
+                    let _ = fail_job(
+                        &state,
+                        format!(
+                            "map import exhausted {MAP_IMPORT_MAX_TRANSIENT_RETRIES} consecutive retryable failures: {err}"
+                        ),
+                    )
+                    .await;
+                    return;
+                }
                 let retry_delay = transient_retry_delay_secs(&job);
                 let _ = note_transient_failure(&state, err, retry_delay).await;
                 tokio::time::sleep(Duration::from_secs(retry_delay)).await;
@@ -1235,13 +1246,12 @@ fn validate_representation_validator(
         last_modified(headers)
     };
     let Some(observed) = observed else {
-        // A 206 response to If-Range is enough for a cooperating origin to
-        // establish continuity. Without an echoed validator, do not advance
-        // the import, but preserve completed parts for a retry rather than
-        // treating weaker evidence as proof that the representation changed.
-        return Err(ImportAdvanceError::Transient(format!(
-            "range download for {part_key} omitted the probed representation validator"
-        )));
+        // RFC 7233 permits an If-Range conditional 206 to omit representation
+        // headers, notably Last-Modified. The 206 itself means a conforming
+        // origin accepted the stored If-Range validator. An echoed validator
+        // remains a useful backstop for origins that ignore If-Range: reject
+        // it only when it actually disagrees with the stored value.
+        return Ok(());
     };
     if observed != expected {
         return Err(ImportAdvanceError::Fatal(format!(
@@ -1385,6 +1395,10 @@ fn transient_retry_delay_secs(job: &MapDatasetImportJob) -> u64 {
     let exponent = job.retry_count.min(6);
     let base = 2u64.saturating_pow(exponent);
     base.clamp(2, MAP_IMPORT_RETRY_MAX_DELAY_SECS)
+}
+
+fn transient_retries_exhausted(job: &MapDatasetImportJob) -> bool {
+    job.retry_count.saturating_add(1) >= MAP_IMPORT_MAX_TRANSIENT_RETRIES
 }
 
 fn current_part_spec(
@@ -1613,6 +1627,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const TEST_STRONG_ETAG: &str = "\"dataset-v1\"";
+    const TEST_LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
 
     #[derive(Clone, Copy)]
     enum TestRangeBehavior {
@@ -1621,6 +1636,7 @@ mod tests {
         OmitContentRange,
         OmitValidator,
         OmitStrongEtagAfterProbe,
+        LastModifiedOnly,
         ChangedRepresentation,
         MismatchedValidator,
         OversizedBody,
@@ -1772,10 +1788,19 @@ mod tests {
         let etag = match state.behavior {
             TestRangeBehavior::OmitValidator => None,
             TestRangeBehavior::OmitStrongEtagAfterProbe if !is_probe => None,
+            TestRangeBehavior::LastModifiedOnly => None,
             TestRangeBehavior::MismatchedValidator => Some("\"dataset-v2\""),
             _ => Some(TEST_STRONG_ETAG),
         };
-        test_http_response(StatusCode::PARTIAL_CONTENT, payload, content_range, etag)
+        let mut response =
+            test_http_response(StatusCode::PARTIAL_CONTENT, payload, content_range, etag);
+        if matches!(state.behavior, TestRangeBehavior::LastModifiedOnly) && is_probe {
+            response.headers_mut().insert(
+                reqwest::header::LAST_MODIFIED,
+                HeaderValue::from_static(TEST_LAST_MODIFIED),
+            );
+        }
+        response
     }
 
     async fn spawn_test_range_server(
@@ -2071,7 +2096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_download_retries_when_a_range_response_omits_the_probed_strong_etag() {
+    async fn import_accepts_a_206_without_the_probed_strong_etag() {
         let state = crate::tests::build_sqlite_test_state().await;
         let server =
             spawn_test_range_server(b"data", TestRangeBehavior::OmitStrongEtagAfterProbe).await;
@@ -2082,21 +2107,43 @@ mod tests {
         let job = test_import_job(probe, 4);
         install_test_import_job(&state, &job).await;
 
-        let part = current_part_spec(&job)
-            .expect("part specification should be valid")
-            .expect("test job should have a part");
-        let error = download_part_bytes(&state, &http, &job, &part)
-            .await
-            .expect_err("a missing response validator should be retried");
-        let ImportAdvanceError::Transient(error) = error else {
-            panic!("a missing response validator was fatal");
-        };
-        assert!(error.contains("omitted the probed representation validator"));
+        spawn_resume_if_needed(state.clone()).await;
+        let completed = wait_for_terminal_import(&state).await;
+        assert_eq!(completed.state, AdminMapDatasetImportState::Completed);
         assert_eq!(
             server.requests(),
             [
                 expected_test_range_request("bytes=0-0", None),
                 expected_test_range_request("bytes=0-3", Some(TEST_STRONG_ETAG)),
+            ]
+        );
+
+        crate::tests::cleanup_sqlite_test_state(&state).await;
+    }
+
+    #[tokio::test]
+    async fn import_accepts_a_206_without_last_modified_echo() {
+        let state = crate::tests::build_sqlite_test_state().await;
+        let server = spawn_test_range_server(b"data", TestRangeBehavior::LastModifiedOnly).await;
+        let http = build_map_import_http_client().expect("HTTP client should build");
+        let probe = probe_download_source(&http, &server.source_url, None)
+            .await
+            .expect("range probe should receive Last-Modified");
+        assert_eq!(
+            probe.representation_validator.as_deref(),
+            Some(TEST_LAST_MODIFIED)
+        );
+        let job = test_import_job(probe, 4);
+        install_test_import_job(&state, &job).await;
+
+        spawn_resume_if_needed(state.clone()).await;
+        let completed = wait_for_terminal_import(&state).await;
+        assert_eq!(completed.state, AdminMapDatasetImportState::Completed);
+        assert_eq!(
+            server.requests(),
+            [
+                expected_test_range_request("bytes=0-0", None),
+                expected_test_range_request("bytes=0-3", Some(TEST_LAST_MODIFIED)),
             ]
         );
 
@@ -2594,6 +2641,23 @@ mod tests {
             TEST_STRONG_ETAG
         );
         assert!(persisted_representation_validator(Some("dataset\n-v1")).is_err());
+    }
+
+    #[test]
+    fn transient_retry_budget_is_bounded() {
+        let mut job = test_import_job(
+            MapDatasetProbe {
+                source_url: "https://example.invalid/dataset.mbtiles".to_string(),
+                representation_validator: Some(TEST_STRONG_ETAG.to_string()),
+                dataset_filename: "dataset.mbtiles".to_string(),
+                total_size_bytes: 4,
+            },
+            4,
+        );
+        job.retry_count = MAP_IMPORT_MAX_TRANSIENT_RETRIES.saturating_sub(2);
+        assert!(!transient_retries_exhausted(&job));
+        job.retry_count = MAP_IMPORT_MAX_TRANSIENT_RETRIES.saturating_sub(1);
+        assert!(transient_retries_exhausted(&job));
     }
 
     #[test]
