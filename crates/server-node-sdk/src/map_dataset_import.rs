@@ -705,7 +705,7 @@ async fn download_part_bytes_with_limits(
                     true,
                 )
                 .await
-                .map_err(|err| ImportAdvanceError::Fatal(err.to_string()))?;
+                .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?;
                 checkpoint_bytes = 0;
             }
         }
@@ -728,7 +728,7 @@ async fn download_part_bytes_with_limits(
         true,
     )
     .await
-    .map_err(|err| ImportAdvanceError::Fatal(err.to_string()))?;
+    .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?;
 
     if downloaded_bytes > part.size_bytes {
         return Err(ImportAdvanceError::Fatal(format!(
@@ -775,7 +775,7 @@ async fn finalize_part_object(
                 },
             )
             .await
-            .map_err(|err| ImportAdvanceError::Fatal(err.to_string()))?
+            .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?
     };
 
     register_put_outcome(state, &part.key, &put_result.version_id).await;
@@ -807,7 +807,7 @@ async fn finalize_part_object(
     }
     persist_runtime(state)
         .await
-        .map_err(|err| ImportAdvanceError::Fatal(err.to_string()))?;
+        .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?;
     Ok(())
 }
 
@@ -833,7 +833,7 @@ async fn finalize_manifest(
                 },
             )
             .await
-            .map_err(|err| ImportAdvanceError::Fatal(err.to_string()))?
+            .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?
     };
 
     register_put_outcome(state, &job.manifest_key, &put_result.version_id).await;
@@ -856,7 +856,7 @@ async fn finalize_manifest(
     }
     persist_runtime(state)
         .await
-        .map_err(|err| ImportAdvanceError::Fatal(err.to_string()))?;
+        .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?;
     complete_job(state).await
 }
 
@@ -877,7 +877,7 @@ async fn complete_job(state: &ServerState) -> std::result::Result<(), ImportAdva
     }
     persist_runtime(state)
         .await
-        .map_err(|err| ImportAdvanceError::Fatal(err.to_string()))?;
+        .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?;
     Ok(())
 }
 
@@ -1090,8 +1090,13 @@ async fn update_running_part_checkpoint(
         if job.job_id != job_id {
             bail!("import job changed while updating checkpoint");
         }
+        let made_progress = downloaded_bytes > job.current_part_downloaded_bytes;
         job.current_part_downloaded_bytes = downloaded_bytes;
         job.current_part_chunk_refs = chunk_refs.to_vec();
+        if made_progress {
+            job.retry_count = 0;
+            job.last_error = None;
+        }
         if let Some(retry_count) = retry_count {
             job.retry_count = retry_count;
         }
@@ -1127,7 +1132,7 @@ async fn ingest_import_chunk(
         .upload_chunk_ingestor
         .ingest_chunk_auto(payload)
         .await
-        .map_err(|err| ImportAdvanceError::Fatal(err.to_string()))?;
+        .map_err(|err| ImportAdvanceError::Transient(err.to_string()))?;
     Ok(UploadChunkRef {
         hash,
         size_bytes: payload.len(),
@@ -2658,6 +2663,46 @@ mod tests {
         assert!(!transient_retries_exhausted(&job));
         job.retry_count = MAP_IMPORT_MAX_TRANSIENT_RETRIES.saturating_sub(1);
         assert!(transient_retries_exhausted(&job));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_progress_resets_transient_retry_budget() {
+        let state = crate::tests::build_sqlite_test_state().await;
+        let mut job = test_import_job(
+            MapDatasetProbe {
+                source_url: "https://example.invalid/dataset.mbtiles".to_string(),
+                representation_validator: Some(TEST_STRONG_ETAG.to_string()),
+                dataset_filename: "dataset.mbtiles".to_string(),
+                total_size_bytes: 4,
+            },
+            4,
+        );
+        job.retry_count = MAP_IMPORT_MAX_TRANSIENT_RETRIES.saturating_sub(1);
+        job.last_error = Some("previous retryable error".to_string());
+        install_test_import_job(&state, &job).await;
+
+        update_running_part_checkpoint(
+            &state,
+            &job.job_id,
+            1,
+            &[UploadChunkRef {
+                hash: "checkpoint-progress".to_string(),
+                size_bytes: 1,
+            }],
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("progress checkpoint should persist");
+
+        let runtime = state.storage.map_dataset_import.lock().await;
+        let active = runtime.job.as_ref().expect("test job should remain active");
+        assert_eq!(active.retry_count, 0);
+        assert_eq!(active.last_error, None);
+        drop(runtime);
+
+        crate::tests::cleanup_sqlite_test_state(&state).await;
     }
 
     #[test]
