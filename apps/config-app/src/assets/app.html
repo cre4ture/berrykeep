@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script>
+    try {
+      const storageKey = "berrykeep-color-scheme";
+      const storedColorScheme = window.localStorage.getItem(storageKey);
+      const colorScheme =
+        storedColorScheme === "light" || storedColorScheme === "dark" || storedColorScheme === "auto"
+          ? storedColorScheme
+          : "auto";
+      const computedColorScheme =
+        colorScheme === "auto"
+          ? window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light"
+          : colorScheme;
+      document.documentElement.setAttribute("data-mantine-color-scheme", computedColorScheme);
+    } catch {}
+  </script>
+  <title>BerryKeep Desktop Config</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div class="shell-root">
+    <header class="shell-header">
+      <div class="shell-header-bar">
+        <div class="brand">
+          <svg class="brand-mark" viewBox="0 0 200 200" role="img" aria-label="berrykeep mark">
+            <defs>
+              <linearGradient id="config-brand-panel" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#7c3aed" />
+                <stop offset="1" stop-color="#c026d3" />
+              </linearGradient>
+              <linearGradient id="config-brand-leaf" x1="100" y1="6.24" x2="152.8" y2="37.92" gradientUnits="userSpaceOnUse">
+                <stop offset="0" stop-color="#86efac" />
+                <stop offset="1" stop-color="#22c55e" />
+              </linearGradient>
+            </defs>
+            <rect width="200" height="200" rx="44" fill="url(#config-brand-panel)" />
+            <path d="M100 22.08 Q126.4 6.24 152.8 16.8 Q140.92 37.92 113.2 37.92 Z" fill="url(#config-brand-leaf)" />
+            <line x1="100" y1="35.28" x2="100" y2="53.76" stroke="#22c55e" stroke-width="6.6" stroke-linecap="round" />
+            <g stroke="#ffffff" stroke-width="6.6" opacity="0.85" stroke-linecap="round">
+              <line x1="100" y1="69.6" x2="57.76" y2="109.2" />
+              <line x1="100" y1="69.6" x2="142.24" y2="109.2" />
+              <line x1="57.76" y1="109.2" x2="142.24" y2="109.2" />
+              <line x1="57.76" y1="109.2" x2="100" y2="162" />
+              <line x1="142.24" y1="109.2" x2="100" y2="162" />
+            </g>
+            <circle cx="100" cy="69.6" r="18.48" fill="#ffffff" />
+            <circle cx="57.76" cy="109.2" r="18.48" fill="#ffffff" />
+            <circle cx="142.24" cy="109.2" r="18.48" fill="#ffffff" />
+            <circle cx="100" cy="162" r="18.48" fill="#ffffff" />
+            <circle cx="93.4" cy="63" r="5.016" fill="#e9d5ff" opacity="0.75" />
+            <circle cx="51.16" cy="102.6" r="5.016" fill="#e9d5ff" opacity="0.75" />
+          </svg>
+          <div class="brand-copy">
+            <span class="brand-name">berrykeep</span>
+            <span class="brand-surface">Desktop Config</span>
+            <span id="desktop-config-header-version" class="brand-version" aria-label="Desktop Config build">Loading...</span>
+          </div>
+        </div>
+
+        <div class="header-actions">
+          <div class="scheme-control" role="group" aria-label="Color scheme">
+            <button type="button" data-color-scheme-option="auto" class="secondary">Auto</button>
+            <button type="button" data-color-scheme-option="light" class="secondary">Light</button>
+            <button type="button" data-color-scheme-option="dark" class="secondary">Dark</button>
+          </div>
+          <button id="refresh-button" class="secondary">Refresh</button>
+          <button id="launch-button">Run Enabled Services</button>
+          <button id="shutdown-button" class="secondary">Close</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="shell-body">
+      <aside class="shell-navbar">
+        <nav class="shell-nav" aria-label="Configuration sections">
+          <a class="shell-nav-link" href="#runtime-panel">
+            <span class="nav-title">Runtime</span>
+            <span class="nav-description">Package paths, startup integration, and the last recorded launcher run.</span>
+          </a>
+          <a class="shell-nav-link" href="#identity-panel">
+            <span class="nav-title">Client Identities</span>
+            <span class="nav-description">Enroll and manage reusable device identities for sync profiles.</span>
+          </a>
+          <a class="shell-nav-link" href="#client-panel">
+            <span class="nav-title">Client Services</span>
+            <span class="nav-description">Configure background berrykeep serve-web instances and their local bind addresses.</span>
+          </a>
+          <a id="os-nav-link" class="shell-nav-link" href="#os-panel">
+            <span id="os-nav-title" class="nav-title">OS Integration</span>
+            <span id="os-nav-description" class="nav-description">Configure platform-specific filesystem integration instances.</span>
+          </a>
+          <a class="shell-nav-link" href="#folder-panel">
+            <span class="nav-title">Folder Sync Jobs</span>
+            <span class="nav-description">Configure background folder synchronization jobs and startup behavior.</span>
+          </a>
+          <a class="shell-nav-link" href="#status-panel">
+            <span class="nav-title">Status</span>
+            <span class="nav-description">Request results, validation errors, and last action output.</span>
+          </a>
+        </nav>
+      </aside>
+
+      <main class="shell-main">
+        <div class="shell-content">
+          <section class="page-header">
+            <div class="page-copy">
+              <p class="eyebrow">Packaged Desktop Client</p>
+              <h1>Configure background sync services</h1>
+              <p class="lede">Define managed background services, review launcher output, and restart enabled instances from the same desktop configuration surface on Windows and Linux.</p>
+            </div>
+            <div class="page-summary">
+              <div class="summary-chip">
+                <span class="summary-label">Client Identities</span>
+                <strong id="identity-count">0</strong>
+              </div>
+              <div class="summary-chip">
+                <span class="summary-label">Client Services</span>
+                <strong id="client-instance-count">0</strong>
+              </div>
+              <div id="os-summary-chip" class="summary-chip">
+                <span id="os-summary-label" class="summary-label">OS Integration</span>
+                <strong id="os-instance-count">0</strong>
+              </div>
+              <div class="summary-chip">
+                <span class="summary-label">Folder Sync Jobs</span>
+                <strong id="folder-instance-count">0</strong>
+              </div>
+            </div>
+          </section>
+
+          <section id="runtime-panel" class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Runtime</h2>
+                <p>Current package paths, startup integration state, and the last recorded background launch report.</p>
+              </div>
+            </div>
+            <dl class="meta-grid">
+              <div><dt>Desktop Config Build</dt><dd id="desktop-config-version">Loading...</dd></div>
+              <div><dt>Config Store</dt><dd id="config-path">Loading...</dd></div>
+              <div><dt>Launch Report</dt><dd id="launch-report-path">Loading...</dd></div>
+              <div><dt>Service Logs</dt><dd id="service-log-dir">Loading...</dd></div>
+              <div><dt>Package Root</dt><dd id="package-root">Loading...</dd></div>
+              <div><dt id="startup-integration-label">Startup Integration</dt><dd id="startup-integration-value">Loading...</dd></div>
+            </dl>
+            <p id="startup-integration-note" class="panel-note">Loading...</p>
+            <pre id="launch-report">No launcher run recorded yet.</pre>
+          </section>
+
+          <section id="identity-panel" class="panel panel-split">
+            <div class="panel-column">
+              <div class="panel-header">
+                <div>
+                  <h2>Client Identities</h2>
+                  <p>Reusable bootstrap and device identity files for authenticated sync profiles.</p>
+                </div>
+                <button id="clear-identity-form" class="secondary">New Identity</button>
+              </div>
+              <div id="identity-list" class="instance-list"></div>
+            </div>
+            <form id="identity-form" class="instance-form panel-form">
+              <h3>Configure Client Identity</h3>
+              <input type="hidden" id="identity-id" />
+              <label class="wide-field">
+                <span class="field-label">Bootstrap File</span>
+                <span class="field-help">Paste the bootstrap JSON from the server. Its device_label is used when present; otherwise a managed identity name is generated.</span>
+                <textarea id="identity-bootstrap-content" spellcheck="false"></textarea>
+              </label>
+              <label class="checkbox checkbox-field">
+                <input type="checkbox" id="identity-enroll" checked />
+                <span class="checkbox-copy">
+                  <span class="field-label">Enroll using this bootstrap file</span>
+                  <span class="field-help">Enrolls this device identity and writes the managed client identity file.</span>
+                </span>
+              </label>
+              <p id="identity-form-status" class="form-feedback" role="status" aria-live="polite">Ready to enroll a client identity.</p>
+              <button id="save-identity-button" type="submit">Save Client Identity</button>
+            </form>
+          </section>
+
+          <section id="client-panel" class="panel panel-split">
+            <div class="panel-column">
+              <div class="panel-header">
+                <div>
+                  <h2>Client Services</h2>
+                  <p>Each entry runs one background berrykeep serve-web instance with its own local bind address and connection settings.</p>
+                </div>
+                <button id="clear-client-form" class="secondary">New Instance</button>
+              </div>
+              <div id="client-instance-list" class="instance-list"></div>
+            </div>
+            <form id="client-form" class="instance-form panel-form">
+              <h3>Configure Client Service</h3>
+              <p class="panel-note">Leave the connection fields empty to start the local client service disconnected and configure it later from the served UI.</p>
+              <input type="hidden" id="client-id" />
+              <label>
+                <span class="field-label">Instance Name</span>
+                <span class="field-help">Used only inside this config app so you can tell local client services apart.</span>
+                <input id="client-label" required />
+              </label>
+              <label class="checkbox checkbox-field">
+                <input type="checkbox" id="client-enabled" checked />
+                <span class="checkbox-copy">
+                  <span class="field-label">Start automatically after login</span>
+                  <span class="field-help">The launcher will try to restart this local client service when platform startup integration is available.</span>
+                </span>
+              </label>
+              <label>
+                <span class="field-label">Bind Address</span>
+                <span class="field-help">Optional local host and port for the service, for example 127.0.0.1:8081. Leave empty to use the CLI default.</span>
+                <input id="client-bind" placeholder="127.0.0.1:8081" />
+              </label>
+              <div class="form-section">
+                <h4>Connection</h4>
+                <label>
+                  <span class="field-label">Server Base URL</span>
+                  <span class="field-help">Optional explicit server-node base URL when not relying solely on bootstrap material.</span>
+                  <input id="client-server-base-url" placeholder="https://node.example" />
+                </label>
+                <label>
+                  <span class="field-label">Initial Setup File</span>
+                  <span class="field-help">Optional bootstrap JSON file used for live connection bootstrap and persisted updates.</span>
+                  <input id="client-bootstrap-file" />
+                </label>
+                <label>
+                  <span class="field-label">Managed Client Identity</span>
+                  <span class="field-help">Select a saved identity to use its bootstrap, client identity, and CA files.</span>
+                  <select id="client-client-identity-id"></select>
+                </label>
+                <input type="hidden" id="client-client-identity-file" />
+                <input type="hidden" id="client-server-ca-pem-file" />
+              </div>
+              <button type="submit">Save Client Service</button>
+            </form>
+          </section>
+
+          <section id="os-panel" class="panel panel-split">
+            <div class="panel-column">
+              <div class="panel-header">
+                <div>
+                  <h2 id="os-panel-title">OS Integration Instances</h2>
+                  <p id="os-panel-description">Each entry serves one packaged filesystem integration runtime for the current desktop platform.</p>
+                </div>
+                <button id="clear-os-form" class="secondary">New Instance</button>
+              </div>
+              <div id="os-instance-list" class="instance-list"></div>
+            </div>
+            <form id="os-form" class="instance-form panel-form">
+              <h3 id="os-form-title">Configure OS Integration</h3>
+              <p id="os-platform-note" class="panel-note">Loading...</p>
+              <input type="hidden" id="os-id" />
+              <label>
+                <span class="field-label">Instance Name</span>
+                <span class="field-help">Used only inside this config app so you can tell instances apart.</span>
+                <input id="os-label" required />
+              </label>
+              <label class="checkbox checkbox-field">
+                <input type="checkbox" id="os-enabled" checked />
+                <span class="checkbox-copy">
+                  <span class="field-label">Start automatically after login</span>
+                  <span class="field-help">The launcher will try to restart this instance when platform startup integration is available.</span>
+                </span>
+              </label>
+              <div id="os-windows-fields" class="form-section" hidden>
+                <h4>Windows Explorer</h4>
+                <label>
+                  <span class="field-label">Sync Root Identifier</span>
+                  <span class="field-help">Stable unique identifier for this Windows Explorer sync root.</span>
+                  <input id="os-sync-root-id" />
+                </label>
+                <label>
+                  <span class="field-label">Folder Name in Explorer</span>
+                  <span class="field-help">Name shown to the user for this sync root in Windows Explorer.</span>
+                  <input id="os-display-name" />
+                </label>
+              </div>
+              <label>
+                <span id="os-root-path-label" class="field-label">Local Folder Location</span>
+                <span id="os-root-path-help" class="field-help">Local folder path where this sync root is mounted.</span>
+                <input id="os-root-path" required />
+              </label>
+              <div class="form-section">
+                <h4>Connection</h4>
+                <label>
+                  <span class="field-label">Server Base URL</span>
+                  <span class="field-help">Optional explicit server-node base URL when not relying solely on bootstrap material.</span>
+                  <input id="os-server-base-url" placeholder="https://node.example" />
+                </label>
+                <label>
+                  <span class="field-label">Initial Setup File</span>
+                  <span class="field-help">Optional bootstrap JSON file used for first-time setup or live connection bootstrap.</span>
+                  <input id="os-bootstrap-file" />
+                </label>
+                <label>
+                  <span class="field-label">Managed Client Identity</span>
+                  <span class="field-help">Select a saved identity to fill the bootstrap and identity file paths for this profile.</span>
+                  <select id="os-client-identity-id"></select>
+                </label>
+                <input type="hidden" id="os-client-identity-file" />
+                <input type="hidden" id="os-server-ca-path" />
+                <label>
+                  <span class="field-label">Remote Folder Prefix</span>
+                  <span class="field-help">Optional remote subfolder or namespace prefix for this instance.</span>
+                  <input id="os-prefix" />
+                </label>
+              </div>
+              <div id="os-linux-fields" class="form-section" hidden>
+                <h4>Linux FUSE Options</h4>
+                <label>
+                  <span class="field-label">Snapshot File</span>
+                  <span class="field-help">Optional SyncSnapshot JSON file for offline or demo mounts. Leave Server Base URL and Initial Setup File empty when using this.</span>
+                  <input id="os-snapshot-file" />
+                </label>
+                <label>
+                  <span class="field-label">Client Edge State Directory</span>
+                  <span class="field-help">Optional persistent state directory for the live rights edge and hydrated-object cache.</span>
+                  <input id="os-client-edge-state-dir" />
+                </label>
+                <label>
+                  <span class="field-label">Filesystem Name</span>
+                  <span class="field-help">Optional mount name shown by FUSE tooling. The runtime defaults to berrykeep.</span>
+                  <input id="os-fs-name" placeholder="berrykeep" />
+                </label>
+                <label>
+                  <span class="field-label">Namespace Depth</span>
+                  <span class="field-help">Optional namespace traversal depth for live refreshes. Leave empty to use the runtime default.</span>
+                  <input id="os-depth" type="number" min="1" placeholder="64" />
+                </label>
+                <label>
+                  <span class="field-label">Remote Refresh Interval (ms)</span>
+                  <span class="field-help">Optional interval for refreshing live namespace state. Leave empty to use the runtime default.</span>
+                  <input id="os-remote-refresh-interval-ms" type="number" min="1" placeholder="3000" />
+                </label>
+                <label>
+                  <span class="field-label">GNOME Status File Override</span>
+                  <span class="field-help">Legacy direct-publisher override. Managed launches publish per-service telemetry for the config app.</span>
+                  <input id="os-gnome-status-file" />
+                </label>
+                <label>
+                  <span class="field-label">GNOME Status Poll Interval (ms)</span>
+                  <span class="field-help">Optional poll interval for service connection and replication telemetry.</span>
+                  <input id="os-remote-status-poll-interval-ms" type="number" min="1" placeholder="3000" />
+                </label>
+                <label class="checkbox checkbox-field">
+                  <input type="checkbox" id="os-allow-other" />
+                  <span class="checkbox-copy">
+                    <span class="field-label">Allow other local users</span>
+                    <span class="field-help">Passes --allow-other to FUSE so other local users can access the mount when the system FUSE policy allows it.</span>
+                  </span>
+                </label>
+                <label class="checkbox checkbox-field">
+                  <input type="checkbox" id="os-publish-gnome-status" />
+                  <span class="checkbox-copy">
+                    <span class="field-label">Legacy direct GNOME status</span>
+                    <span class="field-help">Managed launches ignore this and let the config app publish the merged indicator status.</span>
+                  </span>
+                </label>
+              </div>
+              <button id="os-submit-button" type="submit">Save OS Integration</button>
+            </form>
+          </section>
+
+          <section id="folder-panel" class="panel panel-split">
+            <div class="panel-column">
+              <div class="panel-header">
+                <div>
+                  <h2>Folder Sync Jobs</h2>
+                  <p>Each entry runs one background folder agent for local folder synchronization outside the Explorer surface.</p>
+                </div>
+                <button id="clear-folder-form" class="secondary">New Instance</button>
+              </div>
+              <div id="folder-instance-list" class="instance-list"></div>
+            </div>
+            <form id="folder-form" class="instance-form panel-form">
+              <h3>Configure Folder Sync Job</h3>
+              <input type="hidden" id="folder-id" />
+              <label>
+                <span class="field-label">Instance Name</span>
+                <span class="field-help">Used only inside this config app so you can tell sync jobs apart.</span>
+                <input id="folder-label" required />
+              </label>
+              <label class="checkbox checkbox-field">
+                <input type="checkbox" id="folder-enabled" checked />
+                <span class="checkbox-copy">
+                  <span class="field-label">Start automatically after login</span>
+                  <span class="field-help">The launcher will try to restart this sync job when platform startup integration is available.</span>
+                </span>
+              </label>
+              <label>
+                <span class="field-label">Folder to Sync</span>
+                <span class="field-help">Local folder that this sync job watches and synchronizes.</span>
+                <input id="folder-root-dir" required />
+              </label>
+              <label>
+                <span class="field-label">Local State Storage</span>
+                <span class="field-help">Optional folder for agent state, caches, and local bookkeeping.</span>
+                <input id="folder-state-root-dir" />
+              </label>
+              <label>
+                <span class="field-label">Remote Folder Prefix</span>
+                <span class="field-help">Optional remote subfolder or namespace prefix for this sync job.</span>
+                <input id="folder-prefix" />
+              </label>
+              <label>
+                <span class="field-label">Managed Client Identity</span>
+                <span class="field-help">Select a saved identity to use its bootstrap and client identity files.</span>
+                <select id="folder-client-identity-id"></select>
+              </label>
+              <label>
+                <span class="field-label">Initial Setup File</span>
+                <span class="field-help">Optional bootstrap JSON file used for first-time setup.</span>
+                <input id="folder-bootstrap-file" />
+              </label>
+              <input type="hidden" id="folder-client-identity-file" />
+              <input type="hidden" id="folder-server-ca-pem-file" />
+              <label>
+                <span class="field-label">Local Status UI Address</span>
+                <span class="field-help">Optional local address for the agent status UI, for example 127.0.0.1:3030.</span>
+                <input id="folder-ui-bind" placeholder="127.0.0.1:3030" />
+              </label>
+              <label class="checkbox checkbox-field">
+                <input type="checkbox" id="folder-run-once" />
+                <span class="checkbox-copy">
+                  <span class="field-label">Run one sync pass and exit</span>
+                  <span class="field-help">Useful for testing or one-shot repair runs.</span>
+                </span>
+              </label>
+              <label class="checkbox checkbox-field">
+                <input type="checkbox" id="folder-no-watch-local" />
+                <span class="checkbox-copy">
+                  <span class="field-label">Use polling only</span>
+                  <span class="field-help">Turns off filesystem watch events and relies on periodic scans instead.</span>
+                </span>
+              </label>
+              <button type="submit">Save Folder Sync Job</button>
+            </form>
+          </section>
+
+          <section id="status-panel" class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Status</h2>
+                <p>Recent request results, validation problems, and operational feedback from this configuration surface.</p>
+              </div>
+            </div>
+            <pre id="status-output">Ready.</pre>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -27,9 +27,9 @@ use desktop_client_config::{
     ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
     default_service_log_dir, generate_instance_id, launch_client_cli_instance,
     launch_enabled_instances, launch_folder_agent_instance, launch_os_integration_instance,
-    launch_report_with_updated_outcome, load_last_launch_report, package_root_from_current_exe,
-    save_launch_report, service_desktop_status_file_path, service_runtime_statuses,
-    stop_service_from_report,
+    launch_report_with_updated_outcome, load_last_launch_report,
+    migrate_legacy_virtualized_windows_state, package_root_from_current_exe, save_launch_report,
+    service_desktop_status_file_path, service_runtime_statuses, stop_service_from_report,
 };
 use desktop_status::{
     DesktopServiceStatus, DesktopStatusDocument, GNOME_EXTENSION_UUID, StatusFacet, StatusSnapshot,
@@ -284,12 +284,9 @@ impl UpsertClientIdentityRequest {
             .as_deref()
             .map(client_identity_label_from_bootstrap_content)
             .transpose()?
+            .flatten()
             .or_else(|| existing.map(|identity| identity.label.to_string()))
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    "bootstrap content must include device_label so the identity name can be derived",
-                )
-            })?;
+            .unwrap_or_else(|| default_client_identity_label(&id));
         let identity = ClientIdentityConfig {
             id,
             label,
@@ -325,6 +322,8 @@ struct ClientIdentityEnrollmentReport {
     identity_file: String,
     cluster_id: String,
     device_id: String,
+    #[serde(skip_serializing)]
+    connection_bootstrap_json: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     server_base_url: Option<String>,
 }
@@ -596,6 +595,12 @@ async fn main() -> Result<()> {
         return run_command(&cli, command);
     }
 
+    if let Err(error) = migrate_legacy_virtualized_windows_state() {
+        eprintln!(
+            "config-app: legacy MSIX state migration failed; continuing without migration: {error:#}"
+        );
+    }
+
     let bind_addr: SocketAddr = cli.bind.parse().context("failed parsing --bind address")?;
     let package_root = package_root_from_current_exe()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -624,56 +629,7 @@ async fn main() -> Result<()> {
             .context("failed saving launch report before config app startup")?;
     }
 
-    let app = Router::new()
-        .route("/", get(index_html))
-        .route("/berrykeep-favicon.svg", get(app_favicon))
-        .route("/app.css", get(app_css))
-        .route("/app.js", get(app_js))
-        .route("/api/config", get(get_config))
-        .route("/api/client-identities", post(upsert_client_identity))
-        .route(
-            "/api/client-cli-instances",
-            post(upsert_client_cli_instance),
-        )
-        .route(
-            "/api/os-integration-instances",
-            post(upsert_os_integration_instance),
-        )
-        .route(
-            "/api/folder-agent-instances",
-            post(upsert_folder_agent_instance),
-        )
-        .route(
-            "/api/os-integration-instances/{id}",
-            delete(delete_os_integration_instance),
-        )
-        .route(
-            "/api/folder-agent-instances/{id}",
-            delete(delete_folder_agent_instance),
-        )
-        .route(
-            "/api/client-identities/{id}",
-            delete(delete_client_identity),
-        )
-        .route(
-            "/api/client-cli-instances/{id}",
-            delete(delete_client_cli_instance),
-        )
-        .route(
-            "/api/services/{kind}/{id}/start",
-            post(start_service_instance),
-        )
-        .route(
-            "/api/services/{kind}/{id}/stop",
-            post(stop_service_instance),
-        )
-        .route(
-            "/api/services/{kind}/{id}/restart",
-            post(restart_service_instance),
-        )
-        .route("/api/launch-enabled", post(launch_enabled_now))
-        .route("/api/shutdown", post(shutdown_app))
-        .with_state(state.clone());
+    let app = build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
@@ -727,12 +683,68 @@ async fn main() -> Result<()> {
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
+            tokio::select! {
+                _ = shutdown_rx => {}
+                _ = common::shutdown::wait_for_shutdown_signal() => {}
+            }
         })
         .await
         .context("config UI server exited with error")?;
 
     Ok(())
+}
+
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(index_html))
+        .route(APP_FAVICON_PATH, get(app_favicon))
+        .route("/app.css", get(app_css))
+        .route("/app.js", get(app_js))
+        .route("/api/config", get(get_config))
+        .route("/api/client-identities", post(upsert_client_identity))
+        .route(
+            "/api/client-cli-instances",
+            post(upsert_client_cli_instance),
+        )
+        .route(
+            "/api/os-integration-instances",
+            post(upsert_os_integration_instance),
+        )
+        .route(
+            "/api/folder-agent-instances",
+            post(upsert_folder_agent_instance),
+        )
+        .route(
+            "/api/os-integration-instances/{id}",
+            delete(delete_os_integration_instance),
+        )
+        .route(
+            "/api/folder-agent-instances/{id}",
+            delete(delete_folder_agent_instance),
+        )
+        .route(
+            "/api/client-identities/{id}",
+            delete(delete_client_identity),
+        )
+        .route(
+            "/api/client-cli-instances/{id}",
+            delete(delete_client_cli_instance),
+        )
+        .route(
+            "/api/services/{kind}/{id}/start",
+            post(start_service_instance),
+        )
+        .route(
+            "/api/services/{kind}/{id}/stop",
+            post(stop_service_instance),
+        )
+        .route(
+            "/api/services/{kind}/{id}/restart",
+            post(restart_service_instance),
+        )
+        .route("/api/launch-enabled", post(launch_enabled_now))
+        .route("/api/shutdown", post(shutdown_app))
+        .with_state(state)
 }
 
 fn run_command(cli: &Cli, command: &Command) -> Result<()> {
@@ -1322,15 +1334,20 @@ async fn upsert_client_identity(
         .and_then(|id| store.client_identity(id));
     let (mut identity, bootstrap_content, enroll) =
         request.into_identity(existing, state.paths.instance_store_path())?;
-    if let Some(bootstrap_content) = bootstrap_content.as_deref() {
-        write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
-    }
     let enrollment = if enroll {
-        let report = enroll_client_identity(identity.clone()).await?;
+        let report = enroll_client_identity(identity.clone(), bootstrap_content.as_deref()).await?;
+        if let Some(bootstrap_content) =
+            persisted_bootstrap_content(&report, bootstrap_content.as_deref())
+        {
+            write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
+        }
         refresh_client_identity_metadata(&mut identity);
         identity.last_enrolled_at_unix_ms = Some(unix_ts_ms());
         Some(report)
     } else {
+        if let Some(bootstrap_content) = bootstrap_content.as_deref() {
+            write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
+        }
         refresh_client_identity_metadata(&mut identity);
         None
     };
@@ -1352,6 +1369,16 @@ async fn upsert_client_identity(
         config: load_config_response(&state).map_err(ApiError::internal)?,
         enrollment,
     }))
+}
+
+fn persisted_bootstrap_content<'a>(
+    enrollment: &'a ClientIdentityEnrollmentReport,
+    submitted_bootstrap_content: Option<&'a str>,
+) -> Option<&'a str> {
+    enrollment
+        .connection_bootstrap_json
+        .as_deref()
+        .or(submitted_bootstrap_content)
 }
 
 async fn upsert_client_cli_instance(
@@ -2305,26 +2332,33 @@ fn reconcile_managed_identity_target_blocking(
 
 async fn enroll_client_identity(
     identity: ClientIdentityConfig,
+    bootstrap_content: Option<&str>,
 ) -> Result<ClientIdentityEnrollmentReport, ApiError> {
-    tokio::task::spawn_blocking(move || enroll_client_identity_blocking(&identity))
-        .await
-        .map_err(|error| ApiError::internal(anyhow::anyhow!("enrollment task panicked: {error}")))?
+    let bootstrap_content = bootstrap_content.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let bootstrap_content = bootstrap_content.map(Ok).unwrap_or_else(|| {
+            std::fs::read_to_string(&identity.bootstrap_file).map_err(|error| {
+                ApiError::internal(anyhow::anyhow!(
+                    "failed reading managed bootstrap file {}: {error}",
+                    identity.bootstrap_file
+                ))
+            })
+        })?;
+        enroll_client_identity_blocking(&identity, &bootstrap_content)
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow::anyhow!("enrollment task panicked: {error}")))?
 }
 
 fn enroll_client_identity_blocking(
     identity: &ClientIdentityConfig,
+    bootstrap_content: &str,
 ) -> Result<ClientIdentityEnrollmentReport, ApiError> {
-    let bootstrap_content = std::fs::read_to_string(&identity.bootstrap_file).map_err(|error| {
-        ApiError::internal(anyhow::anyhow!(
-            "failed reading managed bootstrap file {}: {error}",
-            identity.bootstrap_file
-        ))
-    })?;
     let enrolled =
-        enroll_connection_input_blocking(&bootstrap_content, None, Some(identity.label.as_str()))
+        enroll_connection_input_blocking(bootstrap_content, None, Some(identity.label.as_str()))
             .map_err(|error| {
-            ApiError::bad_request(format!("client identity enrollment failed: {error}"))
-        })?;
+                ApiError::bad_request(format!("client identity enrollment failed: {error}"))
+            })?;
     let material = enrolled.client_identity_material().map_err(|error| {
         ApiError::internal(error.context("failed building client identity material"))
     })?;
@@ -2341,6 +2375,7 @@ fn enroll_client_identity_blocking(
         identity_file: identity.client_identity_file.clone(),
         cluster_id: material.cluster_id.to_string(),
         device_id: material.device_id.to_string(),
+        connection_bootstrap_json: enrolled.connection_bootstrap_json,
         server_base_url: enrolled.server_base_url,
     })
 }
@@ -2366,7 +2401,7 @@ fn refresh_client_identity_metadata(identity: &mut ClientIdentityConfig) {
             .and_then(|pem| rendezvous_client_identity_not_after_unix(pem.as_bytes()).ok());
 }
 
-fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<String, ApiError> {
+fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<Option<String>, ApiError> {
     let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
         ApiError::bad_request(format!("bootstrap content must be valid JSON: {error}"))
     })?;
@@ -2379,13 +2414,15 @@ fn client_identity_label_from_bootstrap_content(raw: &str) -> Result<String, Api
         &["bootstrap_bundle", "label"][..],
     ] {
         if let Some(label) = json_string_path(&value, path) {
-            return Ok(label);
+            return Ok(Some(label));
         }
     }
 
-    Err(ApiError::bad_request(
-        "bootstrap content must include device_label so the identity name can be derived",
-    ))
+    Ok(None)
+}
+
+fn default_client_identity_label(id: &str) -> String {
+    format!("Managed client identity {id}")
 }
 
 fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
@@ -2640,468 +2677,10 @@ fn open_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-const APP_HTML: &str = r###"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <script>
-    try {
-      const storageKey = "berrykeep-color-scheme";
-      const storedColorScheme = window.localStorage.getItem(storageKey);
-      const colorScheme =
-        storedColorScheme === "light" || storedColorScheme === "dark" || storedColorScheme === "auto"
-          ? storedColorScheme
-          : "auto";
-      const computedColorScheme =
-        colorScheme === "auto"
-          ? window.matchMedia("(prefers-color-scheme: dark)").matches
-            ? "dark"
-            : "light"
-          : colorScheme;
-      document.documentElement.setAttribute("data-mantine-color-scheme", computedColorScheme);
-    } catch {}
-  </script>
-  <title>BerryKeep Desktop Config</title>
-  <link rel="icon" type="image/svg+xml" href="/berrykeep-favicon.svg" />
-  <link rel="stylesheet" href="/app.css" />
-</head>
-<body>
-  <div class="shell-root">
-    <header class="shell-header">
-      <div class="shell-header-bar">
-        <div class="brand">
-          <svg class="brand-mark" viewBox="0 0 200 200" role="img" aria-label="berrykeep mark">
-            <defs>
-              <linearGradient id="config-brand-panel" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
-                <stop offset="0" stop-color="#7c3aed" />
-                <stop offset="1" stop-color="#c026d3" />
-              </linearGradient>
-              <linearGradient id="config-brand-leaf" x1="100" y1="6.24" x2="152.8" y2="37.92" gradientUnits="userSpaceOnUse">
-                <stop offset="0" stop-color="#86efac" />
-                <stop offset="1" stop-color="#22c55e" />
-              </linearGradient>
-            </defs>
-            <rect width="200" height="200" rx="44" fill="url(#config-brand-panel)" />
-            <path d="M100 22.08 Q126.4 6.24 152.8 16.8 Q140.92 37.92 113.2 37.92 Z" fill="url(#config-brand-leaf)" />
-            <line x1="100" y1="35.28" x2="100" y2="53.76" stroke="#22c55e" stroke-width="6.6" stroke-linecap="round" />
-            <g stroke="#ffffff" stroke-width="6.6" opacity="0.85" stroke-linecap="round">
-              <line x1="100" y1="69.6" x2="57.76" y2="109.2" />
-              <line x1="100" y1="69.6" x2="142.24" y2="109.2" />
-              <line x1="57.76" y1="109.2" x2="142.24" y2="109.2" />
-              <line x1="57.76" y1="109.2" x2="100" y2="162" />
-              <line x1="142.24" y1="109.2" x2="100" y2="162" />
-            </g>
-            <circle cx="100" cy="69.6" r="18.48" fill="#ffffff" />
-            <circle cx="57.76" cy="109.2" r="18.48" fill="#ffffff" />
-            <circle cx="142.24" cy="109.2" r="18.48" fill="#ffffff" />
-            <circle cx="100" cy="162" r="18.48" fill="#ffffff" />
-            <circle cx="93.4" cy="63" r="5.016" fill="#e9d5ff" opacity="0.75" />
-            <circle cx="51.16" cy="102.6" r="5.016" fill="#e9d5ff" opacity="0.75" />
-          </svg>
-          <div class="brand-copy">
-            <span class="brand-name">berrykeep</span>
-            <span class="brand-surface">Desktop Config</span>
-          </div>
-        </div>
+const APP_HTML: &str = include_str!("assets/app.html");
 
-        <div class="header-actions">
-          <div class="scheme-control" role="group" aria-label="Color scheme">
-            <button type="button" data-color-scheme-option="auto" class="secondary">Auto</button>
-            <button type="button" data-color-scheme-option="light" class="secondary">Light</button>
-            <button type="button" data-color-scheme-option="dark" class="secondary">Dark</button>
-          </div>
-          <button id="refresh-button" class="secondary">Refresh</button>
-          <button id="launch-button">Run Enabled Services</button>
-          <button id="shutdown-button" class="secondary">Close</button>
-        </div>
-      </div>
-    </header>
-
-    <div class="shell-body">
-      <aside class="shell-navbar">
-        <nav class="shell-nav" aria-label="Configuration sections">
-          <a class="shell-nav-link" href="#runtime-panel">
-            <span class="nav-title">Runtime</span>
-            <span class="nav-description">Package paths, startup integration, and the last recorded launcher run.</span>
-          </a>
-          <a class="shell-nav-link" href="#identity-panel">
-            <span class="nav-title">Client Identities</span>
-            <span class="nav-description">Enroll and manage reusable device identities for sync profiles.</span>
-          </a>
-          <a class="shell-nav-link" href="#client-panel">
-            <span class="nav-title">Client Services</span>
-            <span class="nav-description">Configure background berrykeep serve-web instances and their local bind addresses.</span>
-          </a>
-          <a id="os-nav-link" class="shell-nav-link" href="#os-panel">
-            <span id="os-nav-title" class="nav-title">OS Integration</span>
-            <span id="os-nav-description" class="nav-description">Configure platform-specific filesystem integration instances.</span>
-          </a>
-          <a class="shell-nav-link" href="#folder-panel">
-            <span class="nav-title">Folder Sync Jobs</span>
-            <span class="nav-description">Configure background folder synchronization jobs and startup behavior.</span>
-          </a>
-          <a class="shell-nav-link" href="#status-panel">
-            <span class="nav-title">Status</span>
-            <span class="nav-description">Request results, validation errors, and last action output.</span>
-          </a>
-        </nav>
-      </aside>
-
-      <main class="shell-main">
-        <div class="shell-content">
-          <section class="page-header">
-            <div class="page-copy">
-              <p class="eyebrow">Packaged Desktop Client</p>
-              <h1>Configure background sync services</h1>
-              <p class="lede">Define managed background services, review launcher output, and restart enabled instances from the same desktop configuration surface on Windows and Linux.</p>
-            </div>
-            <div class="page-summary">
-              <div class="summary-chip">
-                <span class="summary-label">Client Identities</span>
-                <strong id="identity-count">0</strong>
-              </div>
-              <div class="summary-chip">
-                <span class="summary-label">Client Services</span>
-                <strong id="client-instance-count">0</strong>
-              </div>
-              <div id="os-summary-chip" class="summary-chip">
-                <span id="os-summary-label" class="summary-label">OS Integration</span>
-                <strong id="os-instance-count">0</strong>
-              </div>
-              <div class="summary-chip">
-                <span class="summary-label">Folder Sync Jobs</span>
-                <strong id="folder-instance-count">0</strong>
-              </div>
-            </div>
-          </section>
-
-          <section id="runtime-panel" class="panel">
-            <div class="panel-header">
-              <div>
-                <h2>Runtime</h2>
-                <p>Current package paths, startup integration state, and the last recorded background launch report.</p>
-              </div>
-            </div>
-            <dl class="meta-grid">
-              <div><dt>Desktop Config Build</dt><dd id="desktop-config-version">Loading...</dd></div>
-              <div><dt>Config Store</dt><dd id="config-path">Loading...</dd></div>
-              <div><dt>Launch Report</dt><dd id="launch-report-path">Loading...</dd></div>
-              <div><dt>Service Logs</dt><dd id="service-log-dir">Loading...</dd></div>
-              <div><dt>Package Root</dt><dd id="package-root">Loading...</dd></div>
-              <div><dt id="startup-integration-label">Startup Integration</dt><dd id="startup-integration-value">Loading...</dd></div>
-            </dl>
-            <p id="startup-integration-note" class="panel-note">Loading...</p>
-            <pre id="launch-report">No launcher run recorded yet.</pre>
-          </section>
-
-          <section id="identity-panel" class="panel panel-split">
-            <div class="panel-column">
-              <div class="panel-header">
-                <div>
-                  <h2>Client Identities</h2>
-                  <p>Reusable bootstrap and device identity files for authenticated sync profiles.</p>
-                </div>
-                <button id="clear-identity-form" class="secondary">New Identity</button>
-              </div>
-              <div id="identity-list" class="instance-list"></div>
-            </div>
-            <form id="identity-form" class="instance-form panel-form">
-              <h3>Configure Client Identity</h3>
-              <input type="hidden" id="identity-id" />
-              <label class="wide-field">
-                <span class="field-label">Bootstrap File</span>
-                <span class="field-help">Paste the bootstrap JSON from the server. The identity name is derived from its device_label.</span>
-                <textarea id="identity-bootstrap-content" spellcheck="false"></textarea>
-              </label>
-              <label class="checkbox checkbox-field">
-                <input type="checkbox" id="identity-enroll" checked />
-                <span class="checkbox-copy">
-                  <span class="field-label">Enroll using this bootstrap file</span>
-                  <span class="field-help">Enrolls this device identity and writes the managed client identity file.</span>
-                </span>
-              </label>
-              <button type="submit">Save Client Identity</button>
-            </form>
-          </section>
-
-          <section id="client-panel" class="panel panel-split">
-            <div class="panel-column">
-              <div class="panel-header">
-                <div>
-                  <h2>Client Services</h2>
-                  <p>Each entry runs one background berrykeep serve-web instance with its own local bind address and connection settings.</p>
-                </div>
-                <button id="clear-client-form" class="secondary">New Instance</button>
-              </div>
-              <div id="client-instance-list" class="instance-list"></div>
-            </div>
-            <form id="client-form" class="instance-form panel-form">
-              <h3>Configure Client Service</h3>
-              <p class="panel-note">Leave the connection fields empty to start the local client service disconnected and configure it later from the served UI.</p>
-              <input type="hidden" id="client-id" />
-              <label>
-                <span class="field-label">Instance Name</span>
-                <span class="field-help">Used only inside this config app so you can tell local client services apart.</span>
-                <input id="client-label" required />
-              </label>
-              <label class="checkbox checkbox-field">
-                <input type="checkbox" id="client-enabled" checked />
-                <span class="checkbox-copy">
-                  <span class="field-label">Start automatically after login</span>
-                  <span class="field-help">The launcher will try to restart this local client service when platform startup integration is available.</span>
-                </span>
-              </label>
-              <label>
-                <span class="field-label">Bind Address</span>
-                <span class="field-help">Optional local host and port for the service, for example 127.0.0.1:8081. Leave empty to use the CLI default.</span>
-                <input id="client-bind" placeholder="127.0.0.1:8081" />
-              </label>
-              <div class="form-section">
-                <h4>Connection</h4>
-                <label>
-                  <span class="field-label">Server Base URL</span>
-                  <span class="field-help">Optional explicit server-node base URL when not relying solely on bootstrap material.</span>
-                  <input id="client-server-base-url" placeholder="https://node.example" />
-                </label>
-                <label>
-                  <span class="field-label">Initial Setup File</span>
-                  <span class="field-help">Optional bootstrap JSON file used for live connection bootstrap and persisted updates.</span>
-                  <input id="client-bootstrap-file" />
-                </label>
-                <label>
-                  <span class="field-label">Managed Client Identity</span>
-                  <span class="field-help">Select a saved identity to use its bootstrap, client identity, and CA files.</span>
-                  <select id="client-client-identity-id"></select>
-                </label>
-                <input type="hidden" id="client-client-identity-file" />
-                <input type="hidden" id="client-server-ca-pem-file" />
-              </div>
-              <button type="submit">Save Client Service</button>
-            </form>
-          </section>
-
-          <section id="os-panel" class="panel panel-split">
-            <div class="panel-column">
-              <div class="panel-header">
-                <div>
-                  <h2 id="os-panel-title">OS Integration Instances</h2>
-                  <p id="os-panel-description">Each entry serves one packaged filesystem integration runtime for the current desktop platform.</p>
-                </div>
-                <button id="clear-os-form" class="secondary">New Instance</button>
-              </div>
-              <div id="os-instance-list" class="instance-list"></div>
-            </div>
-            <form id="os-form" class="instance-form panel-form">
-              <h3 id="os-form-title">Configure OS Integration</h3>
-              <p id="os-platform-note" class="panel-note">Loading...</p>
-              <input type="hidden" id="os-id" />
-              <label>
-                <span class="field-label">Instance Name</span>
-                <span class="field-help">Used only inside this config app so you can tell instances apart.</span>
-                <input id="os-label" required />
-              </label>
-              <label class="checkbox checkbox-field">
-                <input type="checkbox" id="os-enabled" checked />
-                <span class="checkbox-copy">
-                  <span class="field-label">Start automatically after login</span>
-                  <span class="field-help">The launcher will try to restart this instance when platform startup integration is available.</span>
-                </span>
-              </label>
-              <div id="os-windows-fields" class="form-section" hidden>
-                <h4>Windows Explorer</h4>
-                <label>
-                  <span class="field-label">Sync Root Identifier</span>
-                  <span class="field-help">Stable unique identifier for this Windows Explorer sync root.</span>
-                  <input id="os-sync-root-id" />
-                </label>
-                <label>
-                  <span class="field-label">Folder Name in Explorer</span>
-                  <span class="field-help">Name shown to the user for this sync root in Windows Explorer.</span>
-                  <input id="os-display-name" />
-                </label>
-              </div>
-              <label>
-                <span id="os-root-path-label" class="field-label">Local Folder Location</span>
-                <span id="os-root-path-help" class="field-help">Local folder path where this sync root is mounted.</span>
-                <input id="os-root-path" required />
-              </label>
-              <div class="form-section">
-                <h4>Connection</h4>
-                <label>
-                  <span class="field-label">Server Base URL</span>
-                  <span class="field-help">Optional explicit server-node base URL when not relying solely on bootstrap material.</span>
-                  <input id="os-server-base-url" placeholder="https://node.example" />
-                </label>
-                <label>
-                  <span class="field-label">Initial Setup File</span>
-                  <span class="field-help">Optional bootstrap JSON file used for first-time setup or live connection bootstrap.</span>
-                  <input id="os-bootstrap-file" />
-                </label>
-                <label>
-                  <span class="field-label">Managed Client Identity</span>
-                  <span class="field-help">Select a saved identity to fill the bootstrap and identity file paths for this profile.</span>
-                  <select id="os-client-identity-id"></select>
-                </label>
-                <input type="hidden" id="os-client-identity-file" />
-                <input type="hidden" id="os-server-ca-path" />
-                <label>
-                  <span class="field-label">Remote Folder Prefix</span>
-                  <span class="field-help">Optional remote subfolder or namespace prefix for this instance.</span>
-                  <input id="os-prefix" />
-                </label>
-              </div>
-              <div id="os-linux-fields" class="form-section" hidden>
-                <h4>Linux FUSE Options</h4>
-                <label>
-                  <span class="field-label">Snapshot File</span>
-                  <span class="field-help">Optional SyncSnapshot JSON file for offline or demo mounts. Leave Server Base URL and Initial Setup File empty when using this.</span>
-                  <input id="os-snapshot-file" />
-                </label>
-                <label>
-                  <span class="field-label">Client Edge State Directory</span>
-                  <span class="field-help">Optional persistent state directory for the live rights edge and hydrated-object cache.</span>
-                  <input id="os-client-edge-state-dir" />
-                </label>
-                <label>
-                  <span class="field-label">Filesystem Name</span>
-                  <span class="field-help">Optional mount name shown by FUSE tooling. The runtime defaults to berrykeep.</span>
-                  <input id="os-fs-name" placeholder="berrykeep" />
-                </label>
-                <label>
-                  <span class="field-label">Namespace Depth</span>
-                  <span class="field-help">Optional namespace traversal depth for live refreshes. Leave empty to use the runtime default.</span>
-                  <input id="os-depth" type="number" min="1" placeholder="64" />
-                </label>
-                <label>
-                  <span class="field-label">Remote Refresh Interval (ms)</span>
-                  <span class="field-help">Optional interval for refreshing live namespace state. Leave empty to use the runtime default.</span>
-                  <input id="os-remote-refresh-interval-ms" type="number" min="1" placeholder="3000" />
-                </label>
-                <label>
-                  <span class="field-label">GNOME Status File Override</span>
-                  <span class="field-help">Legacy direct-publisher override. Managed launches publish per-service telemetry for the config app.</span>
-                  <input id="os-gnome-status-file" />
-                </label>
-                <label>
-                  <span class="field-label">GNOME Status Poll Interval (ms)</span>
-                  <span class="field-help">Optional poll interval for service connection and replication telemetry.</span>
-                  <input id="os-remote-status-poll-interval-ms" type="number" min="1" placeholder="3000" />
-                </label>
-                <label class="checkbox checkbox-field">
-                  <input type="checkbox" id="os-allow-other" />
-                  <span class="checkbox-copy">
-                    <span class="field-label">Allow other local users</span>
-                    <span class="field-help">Passes --allow-other to FUSE so other local users can access the mount when the system FUSE policy allows it.</span>
-                  </span>
-                </label>
-                <label class="checkbox checkbox-field">
-                  <input type="checkbox" id="os-publish-gnome-status" />
-                  <span class="checkbox-copy">
-                    <span class="field-label">Legacy direct GNOME status</span>
-                    <span class="field-help">Managed launches ignore this and let the config app publish the merged indicator status.</span>
-                  </span>
-                </label>
-              </div>
-              <button id="os-submit-button" type="submit">Save OS Integration</button>
-            </form>
-          </section>
-
-          <section id="folder-panel" class="panel panel-split">
-            <div class="panel-column">
-              <div class="panel-header">
-                <div>
-                  <h2>Folder Sync Jobs</h2>
-                  <p>Each entry runs one background folder agent for local folder synchronization outside the Explorer surface.</p>
-                </div>
-                <button id="clear-folder-form" class="secondary">New Instance</button>
-              </div>
-              <div id="folder-instance-list" class="instance-list"></div>
-            </div>
-            <form id="folder-form" class="instance-form panel-form">
-              <h3>Configure Folder Sync Job</h3>
-              <input type="hidden" id="folder-id" />
-              <label>
-                <span class="field-label">Instance Name</span>
-                <span class="field-help">Used only inside this config app so you can tell sync jobs apart.</span>
-                <input id="folder-label" required />
-              </label>
-              <label class="checkbox checkbox-field">
-                <input type="checkbox" id="folder-enabled" checked />
-                <span class="checkbox-copy">
-                  <span class="field-label">Start automatically after login</span>
-                  <span class="field-help">The launcher will try to restart this sync job when platform startup integration is available.</span>
-                </span>
-              </label>
-              <label>
-                <span class="field-label">Folder to Sync</span>
-                <span class="field-help">Local folder that this sync job watches and synchronizes.</span>
-                <input id="folder-root-dir" required />
-              </label>
-              <label>
-                <span class="field-label">Local State Storage</span>
-                <span class="field-help">Optional folder for agent state, caches, and local bookkeeping.</span>
-                <input id="folder-state-root-dir" />
-              </label>
-              <label>
-                <span class="field-label">Remote Folder Prefix</span>
-                <span class="field-help">Optional remote subfolder or namespace prefix for this sync job.</span>
-                <input id="folder-prefix" />
-              </label>
-              <label>
-                <span class="field-label">Managed Client Identity</span>
-                <span class="field-help">Select a saved identity to use its bootstrap and client identity files.</span>
-                <select id="folder-client-identity-id"></select>
-              </label>
-              <label>
-                <span class="field-label">Initial Setup File</span>
-                <span class="field-help">Optional bootstrap JSON file used for first-time setup.</span>
-                <input id="folder-bootstrap-file" />
-              </label>
-              <input type="hidden" id="folder-client-identity-file" />
-              <input type="hidden" id="folder-server-ca-pem-file" />
-              <label>
-                <span class="field-label">Local Status UI Address</span>
-                <span class="field-help">Optional local address for the agent status UI, for example 127.0.0.1:3030.</span>
-                <input id="folder-ui-bind" placeholder="127.0.0.1:3030" />
-              </label>
-              <label class="checkbox checkbox-field">
-                <input type="checkbox" id="folder-run-once" />
-                <span class="checkbox-copy">
-                  <span class="field-label">Run one sync pass and exit</span>
-                  <span class="field-help">Useful for testing or one-shot repair runs.</span>
-                </span>
-              </label>
-              <label class="checkbox checkbox-field">
-                <input type="checkbox" id="folder-no-watch-local" />
-                <span class="checkbox-copy">
-                  <span class="field-label">Use polling only</span>
-                  <span class="field-help">Turns off filesystem watch events and relies on periodic scans instead.</span>
-                </span>
-              </label>
-              <button type="submit">Save Folder Sync Job</button>
-            </form>
-          </section>
-
-          <section id="status-panel" class="panel">
-            <div class="panel-header">
-              <div>
-                <h2>Status</h2>
-                <p>Recent request results, validation problems, and operational feedback from this configuration surface.</p>
-              </div>
-            </div>
-            <pre id="status-output">Ready.</pre>
-          </section>
-        </div>
-      </main>
-    </div>
-  </div>
-  <script src="/app.js"></script>
-</body>
-</html>
-"###;
-
-const APP_FAVICON: &str = include_str!("../../../docs/assets/berrykeep-tray-mark.svg");
+const APP_FAVICON_PATH: &str = "/favicon.svg";
+const APP_FAVICON: &str = include_str!("../../../docs/assets/berrykeep-favicon.svg");
 
 const APP_CSS: &str = r###"
 html {
@@ -3149,6 +2728,9 @@ body {
   --nav-link-border: rgba(18, 184, 134, 0.16);
   --status-background: #f4f7f8;
   --status-foreground: #173039;
+  --form-feedback-pending: #865d00;
+  --form-feedback-success: #0d6b5c;
+  --form-feedback-error: #b42318;
 }
 
 :root[data-mantine-color-scheme="dark"] {
@@ -3177,6 +2759,9 @@ body {
   --nav-link-border: rgba(116, 228, 200, 0.14);
   --status-background: #0d171b;
   --status-foreground: #dff8f1;
+  --form-feedback-pending: #ffd58a;
+  --form-feedback-success: #74e4c8;
+  --form-feedback-error: #ffb4ab;
 }
 
 * {
@@ -3259,6 +2844,13 @@ input {
 .brand-surface {
   font-size: 15px;
   font-weight: 700;
+}
+
+.brand-version {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.025em;
 }
 
 .header-actions,
@@ -3586,6 +3178,26 @@ dd {
   line-height: 1.45;
 }
 
+.form-feedback {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.form-feedback[data-state="pending"] {
+  color: var(--form-feedback-pending);
+}
+
+.form-feedback[data-state="success"] {
+  color: var(--form-feedback-success);
+}
+
+.form-feedback[data-state="error"] {
+  color: var(--form-feedback-error);
+}
+
 .instance-form input,
 .instance-form select,
 .instance-form textarea {
@@ -3844,6 +3456,12 @@ function showStatus(value) {
     typeof value === 'string' ? value : JSON.stringify(value, null, 2);
 }
 
+function showIdentityFormStatus(message, state) {
+  const target = document.getElementById('identity-form-status');
+  target.textContent = message;
+  target.dataset.state = state;
+}
+
 function renderLaunchReport(report) {
   const target = document.getElementById('launch-report');
   if (!report) {
@@ -3892,6 +3510,11 @@ function formatFullVersion(version, revision) {
     return `${version} (${revision})`;
   }
   return version || revision || 'unknown';
+}
+
+function formatHeaderVersion(version, revision) {
+  const versionLabel = version ? `v${version}` : 'vunknown';
+  return revision ? `${versionLabel} · ${revision}` : versionLabel;
 }
 
 function formatUnixTimestamp(unix) {
@@ -4105,11 +3728,17 @@ function applyOsPlatformUi(platform) {
 
 function renderConfig(config) {
   currentConfig = config;
-  document.title = config.platform === 'windows'
+  const desktopConfigTitle = config.platform === 'windows'
     ? 'BerryKeep Windows Config'
     : config.platform === 'linux'
       ? 'BerryKeep Linux Config'
       : 'BerryKeep Desktop Config';
+  const headerVersion = formatHeaderVersion(
+    config.desktop_config_version,
+    config.desktop_config_revision
+  );
+  document.title = `${desktopConfigTitle} — ${headerVersion}`;
+  document.getElementById('desktop-config-header-version').textContent = headerVersion;
   document.getElementById('desktop-config-version').textContent = formatFullVersion(
     config.desktop_config_version,
     config.desktop_config_revision
@@ -4357,19 +3986,53 @@ window.controlService = async function(serviceKind, encodedId, action) {
 
 async function submitIdentityForm(event) {
   event.preventDefault();
+  const submitButton = document.getElementById('save-identity-button');
+  const enroll = document.getElementById('identity-enroll').checked;
+  submitButton.disabled = true;
+  submitButton.textContent = enroll ? 'Enrolling Client Identity...' : 'Saving Client Identity...';
+  showIdentityFormStatus(
+    enroll
+      ? 'Contacting the BerryKeep server and enrolling this device...'
+      : 'Saving the client identity...',
+    'pending',
+  );
   const payload = {
     id: document.getElementById('identity-id').value || null,
     bootstrap_content: document.getElementById('identity-bootstrap-content').value,
-    enroll: document.getElementById('identity-enroll').checked,
+    enroll,
   };
-  const response = await fetchJson('/api/client-identities', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  renderConfig(response.config);
-  clearIdentityForm();
-  showStatus(response.enrollment ? response.enrollment : 'Saved client identity.');
+  let response;
+  try {
+    response = await fetchJson('/api/client-identities', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showIdentityFormStatus(`Client identity was not saved: ${message}`, 'error');
+    showStatus({ error: message });
+    submitButton.disabled = false;
+    submitButton.textContent = 'Save Client Identity';
+    return;
+  }
+
+  try {
+    renderConfig(response.config);
+    clearIdentityForm();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showIdentityFormStatus(`Client identity was saved, but the form could not refresh: ${message}`, 'error');
+    showStatus({ error: message, saved: true });
+    return;
+  } finally {
+    submitButton.disabled = false;
+    submitButton.textContent = 'Save Client Identity';
+  }
+
+  const status = response.enrollment ? 'Client identity enrolled and saved.' : 'Client identity saved.';
+  showIdentityFormStatus(status, 'success');
+  showStatus(response.enrollment ? response.enrollment : status);
 }
 
 async function submitClientForm(event) {
@@ -4485,9 +4148,7 @@ window.addEventListener('DOMContentLoaded', async () => {
       updateColorSchemeControls();
     }
   });
-  document.getElementById('identity-form').addEventListener('submit', (event) => {
-    submitIdentityForm(event).catch((error) => showStatus({ error: error.message }));
-  });
+  document.getElementById('identity-form').addEventListener('submit', submitIdentityForm);
   document.getElementById('client-form').addEventListener('submit', (event) => {
     submitClientForm(event).catch((error) => showStatus({ error: error.message }));
   });
@@ -4534,6 +4195,64 @@ window.addEventListener('DOMContentLoaded', async () => {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn app_favicon_route_serves_the_product_favicon() {
+        let response = build_router(test_app_state())
+            .oneshot(
+                Request::builder()
+                    .uri(APP_FAVICON_PATH)
+                    .body(Body::empty())
+                    .expect("favicon request should build"),
+            )
+            .await
+            .expect("favicon route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/svg+xml; charset=utf-8")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("favicon response body should read");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("favicon response should be UTF-8")
+                .contains("connected grape cluster with a green leaf")
+        );
+    }
+
+    #[test]
+    fn embedded_ui_exposes_the_product_favicon_and_build_version_in_the_header() {
+        assert!(APP_HTML.contains(APP_FAVICON_PATH));
+        assert!(APP_HTML.contains("id=\"desktop-config-header-version\""));
+        assert!(APP_JS.contains("desktop-config-header-version"));
+        assert!(APP_JS.contains("function formatHeaderVersion"));
+        assert!(APP_JS.contains("document.title = `${desktopConfigTitle}"));
+        assert!(APP_FAVICON.contains("connected grape cluster with a green leaf"));
+    }
+
+    fn test_app_state() -> AppState {
+        AppState {
+            paths: ManagedPaths::new(
+                PathBuf::from("/test/instances.json"),
+                PathBuf::from("/test/launch-report.json"),
+                PathBuf::from("/test/package"),
+            ),
+            runtime: ConfigAppRuntime {
+                shutdown_tx: Arc::new(Mutex::new(None)),
+            },
+        }
+    }
 
     fn sample_identity(id: &str, client_identity_file: &str) -> ClientIdentityConfig {
         ClientIdentityConfig {
@@ -4550,6 +4269,49 @@ mod tests {
             rendezvous_client_identity_expires_at_unix: None,
             last_enrolled_at_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn claim_without_device_label_uses_a_generated_managed_identity_name() {
+        let request = UpsertClientIdentityRequest {
+            id: Some("claim-identity".to_string()),
+            bootstrap_content: r#"{"v":1,"c":"cluster","n":"node","r":[],"t":"trust","k":"claim"}"#
+                .to_string(),
+            enroll: true,
+        };
+
+        let (identity, _, enroll) = request
+            .into_identity(None, Path::new("/managed/instances.json"))
+            .expect("claim input should create a managed identity");
+
+        assert!(enroll);
+        assert_eq!(identity.label, "Managed client identity claim-identity");
+    }
+
+    #[test]
+    fn bootstrap_device_label_remains_the_managed_identity_name() {
+        let label = client_identity_label_from_bootstrap_content(
+            r#"{"bootstrap_bundle":{"device_label":"Desktop client"}}"#,
+        )
+        .expect("bootstrap JSON should parse");
+
+        assert_eq!(label.as_deref(), Some("Desktop client"));
+    }
+
+    #[test]
+    fn claim_enrollment_persists_the_redeemed_connection_bootstrap() {
+        let enrollment = ClientIdentityEnrollmentReport {
+            identity_file: "/managed/client-identity.json".to_string(),
+            cluster_id: "cluster".to_string(),
+            device_id: "device".to_string(),
+            connection_bootstrap_json: Some("{\"bootstrap_bundle\":true}".to_string()),
+            server_base_url: None,
+        };
+
+        assert_eq!(
+            persisted_bootstrap_content(&enrollment, Some("{\"k\":\"claim\"}")),
+            Some("{\"bootstrap_bundle\":true}")
+        );
     }
 
     const KNOWN_EXPIRED_RENDEZVOUS_CLIENT_IDENTITY_NOT_AFTER_UNIX: u64 = 1_776_690_574;

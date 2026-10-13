@@ -22,6 +22,28 @@ foreach ($file in $scriptFiles) {
     }
 }
 
+[xml]$manifest = Get-Content -Raw -Path (Join-Path $PSScriptRoot 'AppxManifest.xml')
+$namespaces = [System.Xml.XmlNamespaceManager]::new($manifest.NameTable)
+$namespaces.AddNamespace('f', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+$namespaces.AddNamespace('desktop6', 'http://schemas.microsoft.com/appx/manifest/desktop/windows10/6')
+$namespaces.AddNamespace('virtualization', 'http://schemas.microsoft.com/appx/manifest/virtualization/windows10')
+$namespaces.AddNamespace('rescap', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities')
+
+$legacyVirtualization = $manifest.SelectSingleNode('/f:Package/f:Properties/desktop6:FileSystemWriteVirtualization', $namespaces)
+if ($null -eq $legacyVirtualization -or $legacyVirtualization.InnerText.Trim() -ne 'disabled') {
+    throw 'AppxManifest.xml must disable legacy AppData file-system write virtualization for shared BerryKeep state.'
+}
+
+$externalStateDirectories = @($manifest.SelectNodes('/f:Package/f:Properties/virtualization:FileSystemWriteVirtualization/virtualization:ExcludedDirectories/virtualization:ExcludedDirectory', $namespaces) | Where-Object { $_.InnerText.Trim() -eq '$(KnownFolder:LocalAppData)\BerryKeep' })
+if ($externalStateDirectories.Count -eq 0) {
+    throw 'AppxManifest.xml must exclude %LOCALAPPDATA%\BerryKeep from Windows 11+ file-system write virtualization.'
+}
+
+$unvirtualizedResources = $manifest.SelectSingleNode('/f:Package/f:Capabilities/rescap:Capability[@Name="unvirtualizedResources"]', $namespaces)
+if ($null -eq $unvirtualizedResources) {
+    throw 'AppxManifest.xml must declare the unvirtualizedResources restricted capability.'
+}
+
 $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("berrykeep-msix-package-test-{0}" -f [Guid]::NewGuid())
 New-Item -ItemType Directory -Path $temporaryDirectory -Force | Out-Null
 try {

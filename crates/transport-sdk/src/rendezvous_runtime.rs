@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
-use common::{ClusterId, NodeId, normalize_node_hostname};
+use common::{ClusterId, NodeId, normalize_node_hostname, normalize_node_software_version};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use uuid::Uuid;
@@ -43,6 +43,10 @@ impl PresenceRegistry {
             .hostname
             .as_deref()
             .and_then(normalize_node_hostname);
+        registration.software_version = registration
+            .software_version
+            .as_deref()
+            .and_then(normalize_node_software_version);
         let entry = PresenceEntry {
             updated_at_unix: registration.connected_at_unix,
             registration,
@@ -855,6 +859,7 @@ mod tests {
             cluster_id,
             identity,
             hostname: None,
+            software_version: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: Some(peer_api_url.to_string()),
@@ -901,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn presence_registry_sanitizes_best_effort_hostname_metadata() {
+    fn presence_registry_sanitizes_best_effort_display_metadata() {
         let registry = PresenceRegistry::new();
         let cluster_id = ClusterId::now_v7();
         let identity = PeerIdentity::Node(NodeId::now_v7());
@@ -909,6 +914,7 @@ mod tests {
             presence_registration(cluster_id, identity, "https://node.example:7443");
 
         registration.hostname = Some(" edge-a ".to_string());
+        registration.software_version = Some(" 2.0.1 ".to_string());
         assert_eq!(
             registry
                 .register(registration.clone(), None)
@@ -917,12 +923,20 @@ mod tests {
                 .as_deref(),
             Some("edge-a")
         );
+        assert_eq!(
+            registry
+                .register(registration.clone(), None)
+                .registration
+                .software_version
+                .as_deref(),
+            Some("2.0.1")
+        );
 
         registration.hostname = Some("edge-\u{202e}a".to_string());
-        assert_eq!(
-            registry.register(registration, None).registration.hostname,
-            None
-        );
+        registration.software_version = Some("2.0.1\u{202e}".to_string());
+        let registration = registry.register(registration, None).registration;
+        assert_eq!(registration.hostname, None);
+        assert_eq!(registration.software_version, None);
     }
 
     #[tokio::test]

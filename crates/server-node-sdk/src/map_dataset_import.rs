@@ -897,8 +897,11 @@ pub(crate) async fn register_put_outcome(state: &ServerState, key: &str, version
 }
 
 pub(crate) async fn invalidate_cached_mbtiles_source(state: &ServerState, manifest_key: &str) {
-    let mut sources = state.storage.mbtiles_sources.write().await;
-    sources.remove(manifest_key);
+    {
+        let mut sources = state.storage.mbtiles_sources.write().await;
+        sources.remove(manifest_key);
+    }
+    super::web_maps::clear_mbtiles_source_initialization_failure(state, manifest_key).await;
 }
 
 fn build_map_import_http_client() -> Result<reqwest::Client> {

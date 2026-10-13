@@ -316,6 +316,7 @@ fn presence(cluster_id: Uuid, identity: PeerIdentity, endpoint: &str) -> Presenc
         cluster_id,
         identity,
         hostname: None,
+        software_version: None,
         public_api_url: None,
         public_direct_urls: Vec::new(),
         peer_api_url: None,

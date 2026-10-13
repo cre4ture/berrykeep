@@ -1001,7 +1001,9 @@ export function DashboardPage() {
                 <Table striped highlightOnHover withTableBorder>
                   <Table.Thead>
                     <Table.Tr>
-                      <Table.Th>Node</Table.Th>
+                      <Table.Th>Node ID</Table.Th>
+                      <Table.Th>Hostname</Table.Th>
+                      <Table.Th>Version</Table.Th>
                       <Table.Th>Status</Table.Th>
                       <Table.Th>Reachability</Table.Th>
                       <Table.Th>Capacity</Table.Th>
@@ -1024,7 +1026,9 @@ export function DashboardPage() {
 
                         return (
                         <Table.Tr key={node.node_id}>
-                          <Table.Td>{node.node_id}</Table.Td>
+                          <Table.Td><Code>{node.node_id}</Code></Table.Td>
+                          <Table.Td>{node.hostname ?? "unknown"}</Table.Td>
+                          <Table.Td><Code>{node.software_version ?? "unknown"}</Code></Table.Td>
                           <Table.Td>
                             <Badge color={node.status === "online" ? berrykeepPrimaryColor : "gray"} variant="light">
                               {node.status}
@@ -1075,7 +1079,7 @@ export function DashboardPage() {
                       )})
                     ) : (
                       <Table.Tr>
-                        <Table.Td colSpan={9}>
+                        <Table.Td colSpan={11}>
                           <Text c="dimmed">No nodes discovered yet.</Text>
                         </Table.Td>
                       </Table.Tr>
@@ -1322,6 +1326,8 @@ function formatStartupRepairStatus(status: string): string {
       return "skipped";
     case "completed":
       return "completed";
+    case "timed_out":
+      return "timed out";
     default:
       return status;
   }
@@ -1343,6 +1349,8 @@ function startupStatusColor(status: string | undefined): string {
   switch (status) {
     case "running":
       return "orange";
+    case "timed_out":
+      return "red";
     case "completed":
       return berrykeepPrimaryColor;
     case "skipped_no_gaps":

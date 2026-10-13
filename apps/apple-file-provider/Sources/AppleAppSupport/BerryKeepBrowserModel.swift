@@ -645,6 +645,19 @@ final class BerryKeepBrowserModel: ObservableObject {
         )
     }
 
+    func remoteDirectories(path: String) async throws -> [AppleBridgeItem] {
+        guard let configuration = draft.connectionConfiguration else {
+            throw AppleManualCBridgeError.notConnected
+        }
+
+        let remoteSession = remoteSession
+        let normalized = normalizedPath(path)
+        return try await Task.detached(priority: .userInitiated) {
+            try remoteSession.list(path: normalized, configuration: configuration)
+                .filter { $0.kind == .directory }
+        }.value
+    }
+
     func registerDomain() {
         let identifier = draft.domainIdentifier.nilIfBlank ?? bundleDefaults.domainIdentifier
         let displayName = draft.domainDisplayName.nilIfBlank ?? bundleDefaults.domainDisplayName

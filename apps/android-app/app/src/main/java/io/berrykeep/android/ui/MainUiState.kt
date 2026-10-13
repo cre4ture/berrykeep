@@ -149,6 +149,7 @@ data class MainUiState(
     val folderSyncHistory: Map<String, FolderSyncHistoryState> = emptyMap(),
     val newSyncLabel: String = "",
     val newSyncPrefix: String = "",
+    val remotePrefixPicker: RemotePrefixPickerState = RemotePrefixPickerState(),
     val newSyncLocalFolder: String = "",
     val newSyncLocalFolderTreeUri: String? = null,
     val newSyncAllowWifi: Boolean = true,

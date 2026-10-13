@@ -253,6 +253,21 @@ async fn start_import(
     state: &ServerState,
     profile: NaturalEarthImportProfile,
 ) -> std::result::Result<NaturalEarthImportJobView, (StatusCode, anyhow::Error)> {
+    start_import_with_worker(state, profile, |worker_state, worker_job| async move {
+        run_import(&worker_state, &worker_job).await
+    })
+    .await
+}
+
+async fn start_import_with_worker<Worker, WorkerFuture>(
+    state: &ServerState,
+    profile: NaturalEarthImportProfile,
+    worker: Worker,
+) -> std::result::Result<NaturalEarthImportJobView, (StatusCode, anyhow::Error)>
+where
+    Worker: FnOnce(ServerState, NaturalEarthImportJobView) -> WorkerFuture + Send + 'static,
+    WorkerFuture: std::future::Future<Output = Result<u64>> + Send + 'static,
+{
     if map_dataset_import::has_running_job(state).await {
         return Err((
             StatusCode::CONFLICT,
@@ -346,7 +361,7 @@ async fn start_import(
     let worker_state = state.clone();
     let worker_job = job.clone();
     tokio::spawn(async move {
-        let result = run_import(&worker_state, &worker_job).await;
+        let result = worker(worker_state.clone(), worker_job.clone()).await;
         match result {
             Ok(size) => {
                 finish_job(
@@ -1655,18 +1670,43 @@ async fn publish_generated_mbtiles(
     artifact: &NaturalEarthImportArtifactView,
     artifact_path: &Path,
 ) -> Result<u64> {
+    publish_generated_mbtiles_with_limits(
+        state,
+        job,
+        artifact,
+        artifact_path,
+        NATURAL_EARTH_IMPORT_MAX_ARTIFACT_BYTES,
+        NATURAL_EARTH_IMPORT_PART_BYTES,
+    )
+    .await
+}
+
+async fn publish_generated_mbtiles_with_limits(
+    state: &ServerState,
+    job: &NaturalEarthImportJobView,
+    artifact: &NaturalEarthImportArtifactView,
+    artifact_path: &Path,
+    max_artifact_bytes: usize,
+    part_bytes: usize,
+) -> Result<u64> {
     let payload = fs::read(artifact_path).await.with_context(|| {
         format!(
             "failed reading generated MBTiles {}",
             artifact_path.display()
         )
     })?;
-    if payload.is_empty() || payload.len() > NATURAL_EARTH_IMPORT_MAX_ARTIFACT_BYTES {
-        bail!("generated MBTiles artifact is empty or exceeds the configured artifact size limit")
+    if payload.is_empty() {
+        bail!("generated MBTiles artifact is empty")
+    }
+    if payload.len() > max_artifact_bytes {
+        bail!("generated MBTiles artifact exceeds the configured artifact size limit")
+    }
+    if part_bytes == 0 {
+        bail!("generated MBTiles artifact part size must be greater than zero")
     }
     let mut parts = Vec::new();
     let mut offset = 0_u64;
-    for (index, part_payload) in payload.chunks(NATURAL_EARTH_IMPORT_PART_BYTES).enumerate() {
+    for (index, part_payload) in payload.chunks(part_bytes).enumerate() {
         let size_bytes =
             u64::try_from(part_payload.len()).context("map artifact part size overflow")?;
         let key = format!(
@@ -1745,6 +1785,110 @@ fn split_part_id(index: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_artifact(
+        variant_id: &str,
+        asset: map_config::MapVariantAssetKind,
+    ) -> NaturalEarthImportArtifactView {
+        let logical_key = format!("sys/maps/{variant_id}.mbtiles");
+        NaturalEarthImportArtifactView {
+            variant_id: variant_id.to_string(),
+            asset,
+            manifest_key: format!("{logical_key}.manifest.json"),
+            logical_key,
+            logical_size_bytes: 0,
+        }
+    }
+
+    fn test_job(
+        profile: NaturalEarthImportProfile,
+        artifacts: Vec<NaturalEarthImportArtifactView>,
+    ) -> NaturalEarthImportJobView {
+        let primary = artifacts.first().expect("a test job needs an artifact");
+        NaturalEarthImportJobView {
+            id: "natural-earth-test-job".to_string(),
+            state: NaturalEarthImportState::Running,
+            profile,
+            phase: "Queued".to_string(),
+            source_url: natural_earth_source_url(profile).to_string(),
+            logical_key: primary.logical_key.clone(),
+            manifest_key: primary.manifest_key.clone(),
+            logical_size_bytes: 0,
+            artifacts,
+            error: None,
+            log_entries: Vec::new(),
+            started_at_unix: 1,
+            updated_at_unix: 1,
+        }
+    }
+
+    fn write_mbtiles_fixture(
+        path: &Path,
+        include_tile: bool,
+        format: Option<&str>,
+        metadata_json: Option<&str>,
+    ) {
+        let connection = Connection::open(path).expect("the MBTiles fixture should open");
+        connection
+            .execute_batch(
+                "create table tiles (zoom_level integer, tile_column integer, tile_row integer, tile_data blob);\
+                 create table metadata (name text, value text);",
+            )
+            .expect("the MBTiles fixture schema should be created");
+        if include_tile {
+            connection
+                .execute(
+                    "insert into tiles (zoom_level, tile_column, tile_row, tile_data) values (?1, ?2, ?3, ?4)",
+                    (0_i64, 0_i64, 0_i64, vec![1_u8, 2, 3]),
+                )
+                .expect("the MBTiles fixture tile should be inserted");
+        }
+        if let Some(format) = format {
+            connection
+                .execute(
+                    "insert into metadata (name, value) values (?1, ?2)",
+                    ("format", format),
+                )
+                .expect("the MBTiles fixture format should be inserted");
+        }
+        if let Some(metadata_json) = metadata_json {
+            connection
+                .execute(
+                    "insert into metadata (name, value) values (?1, ?2)",
+                    ("json", metadata_json),
+                )
+                .expect("the MBTiles fixture metadata should be inserted");
+        }
+    }
+
+    fn assert_error_contains(error: anyhow::Error, expected: &str) {
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(expected),
+            "expected {message:?} to contain {expected:?}"
+        );
+    }
+
+    async fn wait_for_terminal_job(state: &ServerState) -> NaturalEarthImportJobView {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let job = state
+                    .storage
+                    .natural_earth_import
+                    .lock()
+                    .await
+                    .job
+                    .clone()
+                    .expect("the Natural Earth job should exist");
+                if !matches!(job.state, NaturalEarthImportState::Running) {
+                    return job;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Natural Earth test worker should finish within ten seconds")
+    }
 
     #[test]
     fn split_part_ids_are_stable() {
@@ -1924,6 +2068,589 @@ mod tests {
                 r#"{"vector_layers":[{"id":"ne_places"}]}"#
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn raster_conversion_arguments_preserve_world_extent_and_rgba_band_order() {
+        let source = Path::new("/tmp/ne_10m_ocean.shp");
+        let destination = Path::new("/tmp/natural-earth.tif");
+        let create = rasterize_create_arguments(source, destination, [10, 20, 30, 40])
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            create,
+            [
+                "-of",
+                "GTiff",
+                "-te",
+                "-180",
+                "-90",
+                "180",
+                "90",
+                "-ts",
+                "4096",
+                "2048",
+                "-a_srs",
+                "EPSG:4326",
+                "-ot",
+                "Byte",
+                "-burn",
+                "10",
+                "-burn",
+                "20",
+                "-burn",
+                "30",
+                "-burn",
+                "40",
+                "/tmp/ne_10m_ocean.shp",
+                "/tmp/natural-earth.tif",
+            ]
+        );
+
+        let overlay = rasterize_overlay_arguments(source, destination, [10, 20, 30, 40])
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            overlay,
+            [
+                "-b",
+                "1",
+                "-burn",
+                "10",
+                "-b",
+                "2",
+                "-burn",
+                "20",
+                "-b",
+                "3",
+                "-burn",
+                "30",
+                "-b",
+                "4",
+                "-burn",
+                "40",
+                "/tmp/ne_10m_ocean.shp",
+                "/tmp/natural-earth.tif",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn import_worker_lifecycle_covers_every_profile_and_serializes_jobs() {
+        let state = crate::tests::build_natural_earth_test_state().await;
+        let profile_expectations = [
+            (
+                NaturalEarthImportProfile::Physical,
+                vec![(
+                    "natural-earth-globe",
+                    map_config::MapVariantAssetKind::Raster,
+                )],
+            ),
+            (
+                NaturalEarthImportProfile::PhysicalWithLabels,
+                vec![
+                    (
+                        "natural-earth-labels",
+                        map_config::MapVariantAssetKind::Raster,
+                    ),
+                    (
+                        "natural-earth-labels",
+                        map_config::MapVariantAssetKind::Vector,
+                    ),
+                ],
+            ),
+            (
+                NaturalEarthImportProfile::PhysicalVector,
+                vec![(
+                    "natural-earth-vector",
+                    map_config::MapVariantAssetKind::Vector,
+                )],
+            ),
+            (
+                NaturalEarthImportProfile::CrossBlendedHypso,
+                vec![(
+                    "natural-earth-hypso",
+                    map_config::MapVariantAssetKind::Raster,
+                )],
+            ),
+            (
+                NaturalEarthImportProfile::NaturalEarthOne,
+                vec![("natural-earth-1", map_config::MapVariantAssetKind::Raster)],
+            ),
+        ];
+
+        for (index, (profile, expected_artifacts)) in profile_expectations.into_iter().enumerate() {
+            let expected_size = 100 + index as u64;
+            let accepted =
+                start_import_with_worker(
+                    &state,
+                    profile,
+                    move |_worker_state, _worker_job| async move {
+                        Ok::<u64, anyhow::Error>(expected_size)
+                    },
+                )
+                .await
+                .expect("the synthetic Natural Earth worker should start");
+            assert_eq!(accepted.profile, profile);
+            assert_eq!(accepted.artifacts.len(), expected_artifacts.len());
+            for (artifact, (variant_id, asset)) in accepted.artifacts.iter().zip(expected_artifacts)
+            {
+                assert_eq!(artifact.variant_id, variant_id);
+                assert_eq!(artifact.asset, asset);
+            }
+
+            let finished = wait_for_terminal_job(&state).await;
+            assert!(matches!(finished.state, NaturalEarthImportState::Ready));
+            assert_eq!(finished.phase, "Ready");
+            assert_eq!(finished.logical_size_bytes, expected_size);
+            assert_eq!(finished.error, None);
+            assert!(
+                finished
+                    .log_entries
+                    .iter()
+                    .any(|entry| entry.message == "Import completed successfully")
+            );
+        }
+
+        start_import_with_worker(&state, NaturalEarthImportProfile::Physical, |_, _| async {
+            Err(anyhow!("synthetic conversion failure"))
+        })
+        .await
+        .expect("the failing synthetic worker should still be accepted");
+        let failed = wait_for_terminal_job(&state).await;
+        assert!(matches!(failed.state, NaturalEarthImportState::Failed));
+        assert_eq!(failed.phase, "Failed");
+        assert_eq!(failed.logical_size_bytes, 0);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("synthetic conversion failure")
+        );
+
+        let release_worker = Arc::new(tokio::sync::Notify::new());
+        let worker_release = release_worker.clone();
+        start_import_with_worker(&state, NaturalEarthImportProfile::Physical, move |_, _| {
+            let worker_release = worker_release.clone();
+            async move {
+                worker_release.notified().await;
+                Ok(7)
+            }
+        })
+        .await
+        .expect("the blocked synthetic worker should start");
+        assert!(is_running(&state).await);
+        let conflict = start_import_with_worker(
+            &state,
+            NaturalEarthImportProfile::PhysicalVector,
+            |_, _| async { Ok(1) },
+        )
+        .await
+        .expect_err("a second Natural Earth worker must be rejected");
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+        assert!(
+            conflict
+                .1
+                .to_string()
+                .contains("conversion is already running")
+        );
+        release_worker.notify_one();
+        assert!(matches!(
+            wait_for_terminal_job(&state).await.state,
+            NaturalEarthImportState::Ready
+        ));
+
+        crate::tests::cleanup_natural_earth_test_state(&state).await;
+    }
+
+    #[tokio::test]
+    async fn generated_raster_artifact_is_validated_published_and_accounted() {
+        let state = crate::tests::build_natural_earth_test_state().await;
+        let artifact = test_artifact(
+            "natural-earth-globe",
+            map_config::MapVariantAssetKind::Raster,
+        );
+        let job = test_job(NaturalEarthImportProfile::Physical, vec![artifact.clone()]);
+        state.storage.natural_earth_import.lock().await.job = Some(job.clone());
+        let artifact_path = state
+            .managed_paths
+            .data_dir()
+            .join("generated-natural-earth.mbtiles");
+        write_mbtiles_fixture(&artifact_path, true, Some("PNG"), None);
+
+        assert!(is_running(&state).await);
+        update_phase(&state, "Validating the generated raster").await;
+        validate_generated_mbtiles(&state, &artifact_path)
+            .await
+            .expect("valid raster MBTiles should pass validation");
+        assert_eq!(
+            required_job_artifact(&job, map_config::MapVariantAssetKind::Raster)
+                .expect("the raster artifact should be configured")
+                .manifest_key,
+            artifact.manifest_key
+        );
+        assert_error_contains(
+            required_job_artifact(&job, map_config::MapVariantAssetKind::Vector)
+                .expect_err("the raster-only job must not expose a vector artifact"),
+            "no configured Vector artifact",
+        );
+
+        let source_payload = fs::read(&artifact_path)
+            .await
+            .expect("the generated artifact should be readable");
+        let published_size = publish_generated_mbtiles(&state, &job, &artifact, &artifact_path)
+            .await
+            .expect("the generated artifact should publish");
+        assert_eq!(published_size, source_payload.len() as u64);
+        record_published_artifact(&state, &artifact.manifest_key, published_size).await;
+
+        let manifest_payload = {
+            let store = read_store(&state, "test.natural_earth.read_manifest").await;
+            store
+                .get_object(
+                    &artifact.manifest_key,
+                    None,
+                    None,
+                    storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .expect("the published manifest should be readable")
+        };
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_payload).expect("the manifest should be JSON");
+        assert_eq!(manifest["type"], "split_file_manifest");
+        assert_eq!(manifest["logical_key"], artifact.logical_key);
+        assert_eq!(manifest["logical_size_bytes"], published_size);
+        assert_eq!(manifest["last_part_size_bytes"], published_size);
+        assert_eq!(manifest["parts_count"], 1);
+        assert_eq!(manifest["parts"][0]["part_id"], "aa");
+        assert_eq!(manifest["parts"][0]["offset_bytes"], 0);
+        assert_eq!(manifest["parts"][0]["size_bytes"], published_size);
+        let part_key = manifest["parts"][0]["key"]
+            .as_str()
+            .expect("the manifest part should have a key");
+        assert_eq!(
+            part_key,
+            "sys/maps/natural-earth-globe.mbtiles.natural-earth-natural-earth-test-job-part-aa"
+        );
+        let published_payload = {
+            let store = read_store(&state, "test.natural_earth.read_part").await;
+            store
+                .get_object(part_key, None, None, storage::ObjectReadMode::Preferred)
+                .await
+                .expect("the published part should be readable")
+        };
+        assert_eq!(published_payload.as_ref(), source_payload.as_slice());
+
+        finish_job(
+            &state,
+            NaturalEarthImportState::Ready,
+            "Ready",
+            published_size,
+            None,
+        )
+        .await;
+        {
+            let runtime = state.storage.natural_earth_import.lock().await;
+            let finished = runtime.job.as_ref().expect("the job should remain visible");
+            assert!(matches!(finished.state, NaturalEarthImportState::Ready));
+            assert_eq!(finished.logical_size_bytes, published_size);
+            assert_eq!(finished.artifacts[0].logical_size_bytes, published_size);
+            assert!(
+                finished
+                    .log_entries
+                    .iter()
+                    .any(|entry| entry.message.contains("Published 1 map artifact part"))
+            );
+        }
+        assert!(!is_running(&state).await);
+
+        let empty_artifact = state.managed_paths.data_dir().join("empty.mbtiles");
+        fs::write(&empty_artifact, [])
+            .await
+            .expect("the empty artifact should be created");
+        assert_error_contains(
+            publish_generated_mbtiles(&state, &job, &artifact, &empty_artifact)
+                .await
+                .expect_err("an empty generated artifact must be rejected"),
+            "artifact is empty",
+        );
+
+        let multipart_artifact = test_artifact(
+            "natural-earth-multipart",
+            map_config::MapVariantAssetKind::Raster,
+        );
+        let multipart_job = test_job(
+            NaturalEarthImportProfile::Physical,
+            vec![multipart_artifact.clone()],
+        );
+        let multipart_path = state.managed_paths.data_dir().join("multipart.mbtiles");
+        let multipart_payload = b"abcdefghij";
+        fs::write(&multipart_path, multipart_payload)
+            .await
+            .expect("the multipart artifact should be created");
+        let multipart_size = publish_generated_mbtiles_with_limits(
+            &state,
+            &multipart_job,
+            &multipart_artifact,
+            &multipart_path,
+            32,
+            4,
+        )
+        .await
+        .expect("the multipart artifact should publish");
+        assert_eq!(multipart_size, multipart_payload.len() as u64);
+
+        let multipart_manifest_payload = {
+            let store = read_store(&state, "test.natural_earth.read_multipart_manifest").await;
+            store
+                .get_object(
+                    &multipart_artifact.manifest_key,
+                    None,
+                    None,
+                    storage::ObjectReadMode::Preferred,
+                )
+                .await
+                .expect("the multipart manifest should be readable")
+        };
+        let multipart_manifest: serde_json::Value =
+            serde_json::from_slice(&multipart_manifest_payload)
+                .expect("the multipart manifest should be JSON");
+        assert_eq!(multipart_manifest["logical_size_bytes"], 10);
+        assert_eq!(multipart_manifest["last_part_size_bytes"], 2);
+        assert_eq!(multipart_manifest["parts_count"], 3);
+        let multipart_parts = multipart_manifest["parts"]
+            .as_array()
+            .expect("the multipart manifest should list its parts");
+        for (index, (part, expected_payload)) in multipart_parts
+            .iter()
+            .zip([b"abcd".as_slice(), b"efgh".as_slice(), b"ij".as_slice()])
+            .enumerate()
+        {
+            assert_eq!(part["part_id"], ["aa", "ab", "ac"][index]);
+            assert_eq!(part["offset_bytes"], (index * 4) as u64);
+            assert_eq!(part["size_bytes"], expected_payload.len() as u64);
+            let part_key = part["key"]
+                .as_str()
+                .expect("each multipart manifest entry should have a key");
+            let stored_payload = {
+                let store = read_store(&state, "test.natural_earth.read_multipart_part").await;
+                store
+                    .get_object(part_key, None, None, storage::ObjectReadMode::Preferred)
+                    .await
+                    .expect("each multipart payload should be readable")
+            };
+            assert_eq!(stored_payload.as_ref(), expected_payload);
+        }
+
+        let oversized_path = state.managed_paths.data_dir().join("oversized.mbtiles");
+        fs::write(&oversized_path, b"12345")
+            .await
+            .expect("the oversized artifact should be created");
+        assert_error_contains(
+            publish_generated_mbtiles_with_limits(
+                &state,
+                &multipart_job,
+                &multipart_artifact,
+                &oversized_path,
+                4,
+                2,
+            )
+            .await
+            .expect_err("an oversized artifact must be rejected"),
+            "exceeds the configured artifact size limit",
+        );
+        assert_error_contains(
+            publish_generated_mbtiles_with_limits(
+                &state,
+                &multipart_job,
+                &multipart_artifact,
+                &multipart_path,
+                32,
+                0,
+            )
+            .await
+            .expect_err("a zero artifact part size must be rejected"),
+            "part size must be greater than zero",
+        );
+
+        crate::tests::cleanup_natural_earth_test_state(&state).await;
+    }
+
+    #[tokio::test]
+    async fn mbtiles_validation_reports_raster_and_vector_contract_failures() {
+        let state = crate::tests::build_natural_earth_test_state().await;
+        let fixture_root = state.managed_paths.data_dir().join("mbtiles-validation");
+        fs::create_dir_all(&fixture_root)
+            .await
+            .expect("the validation fixture directory should be created");
+
+        let blank = fixture_root.join("blank.mbtiles");
+        drop(Connection::open(&blank).expect("the blank SQLite fixture should open"));
+        assert_error_contains(
+            validate_generated_mbtiles(&state, &blank)
+                .await
+                .expect_err("an MBTiles database without a tiles table must fail"),
+            "no readable tiles table",
+        );
+
+        let empty_raster = fixture_root.join("empty-raster.mbtiles");
+        write_mbtiles_fixture(&empty_raster, false, Some("png"), None);
+        assert_error_contains(
+            validate_generated_mbtiles(&state, &empty_raster)
+                .await
+                .expect_err("a raster MBTiles database without tiles must fail"),
+            "contains no tiles",
+        );
+
+        let jpeg_raster = fixture_root.join("jpeg-raster.mbtiles");
+        write_mbtiles_fixture(&jpeg_raster, true, Some("jpeg"), None);
+        assert_error_contains(
+            validate_generated_mbtiles(&state, &jpeg_raster)
+                .await
+                .expect_err("a raster MBTiles database with JPEG metadata must fail"),
+            "must declare PNG tiles",
+        );
+
+        let empty_vector = fixture_root.join("empty-vector.mbtiles");
+        write_mbtiles_fixture(&empty_vector, false, Some("pbf"), Some("{}"));
+        assert_error_contains(
+            validate_generated_label_mbtiles(&state, &empty_vector)
+                .await
+                .expect_err("a vector MBTiles database without tiles must fail"),
+            "contains no tiles",
+        );
+
+        let wrong_vector_format = fixture_root.join("wrong-vector-format.mbtiles");
+        write_mbtiles_fixture(
+            &wrong_vector_format,
+            true,
+            Some("png"),
+            Some(r#"{"vector_layers":[]}"#),
+        );
+        assert_error_contains(
+            validate_generated_label_mbtiles(&state, &wrong_vector_format)
+                .await
+                .expect_err("a vector MBTiles database with PNG metadata must fail"),
+            "must declare PBF vector tiles",
+        );
+
+        let missing_json = fixture_root.join("missing-json.mbtiles");
+        write_mbtiles_fixture(&missing_json, true, Some("pbf"), None);
+        assert_error_contains(
+            validate_generated_label_mbtiles(&state, &missing_json)
+                .await
+                .expect_err("vector metadata is required"),
+            "has no json metadata",
+        );
+
+        let invalid_json = fixture_root.join("invalid-json.mbtiles");
+        write_mbtiles_fixture(&invalid_json, true, Some("pbf"), Some("{"));
+        assert_error_contains(
+            validate_generated_label_mbtiles(&state, &invalid_json)
+                .await
+                .expect_err("malformed vector metadata must fail"),
+            "metadata is invalid JSON",
+        );
+
+        let missing_array = fixture_root.join("missing-array.mbtiles");
+        write_mbtiles_fixture(
+            &missing_array,
+            true,
+            Some("pbf"),
+            Some(r#"{"name":"labels"}"#),
+        );
+        assert_error_contains(
+            validate_generated_label_mbtiles(&state, &missing_array)
+                .await
+                .expect_err("vector metadata without vector_layers must fail"),
+            "has no vector_layers array",
+        );
+
+        let missing_layer = fixture_root.join("missing-layer.mbtiles");
+        write_mbtiles_fixture(
+            &missing_layer,
+            true,
+            Some("pbf"),
+            Some(r#"{"vector_layers":[{"id":"ne_places"}]}"#),
+        );
+        assert_error_contains(
+            validate_generated_label_mbtiles(&state, &missing_layer)
+                .await
+                .expect_err("all required label layers must be present"),
+            "missing required vector layer(s): ne_boundaries",
+        );
+
+        let valid_vector = fixture_root.join("valid-vector.mbtiles");
+        write_mbtiles_fixture(
+            &valid_vector,
+            true,
+            Some("PBF"),
+            Some(
+                r#"{"vector_layers":[{"id":"ne_land"},{"id":"ne_ocean"},{"id":"ne_lakes"},{"id":"ne_rivers"},{"id":"ne_coastline"},{"id":"ne_places"},{"id":"ne_boundaries"}]}"#,
+            ),
+        );
+        validate_generated_label_mbtiles(&state, &valid_vector)
+            .await
+            .expect("a complete label overlay should pass validation");
+        validate_generated_vector_mbtiles(
+            &state,
+            &valid_vector,
+            "Natural Earth vector map",
+            &[
+                "ne_land",
+                "ne_ocean",
+                "ne_lakes",
+                "ne_rivers",
+                "ne_coastline",
+                "ne_places",
+                "ne_boundaries",
+            ],
+        )
+        .await
+        .expect("a complete Natural Earth vector map should pass validation");
+
+        crate::tests::cleanup_natural_earth_test_state(&state).await;
+    }
+
+    #[test]
+    fn layer_lookup_is_recursive_case_insensitive_and_diagnostic() {
+        let root = std::env::temp_dir().join(format!("natural-earth-layers-{}", Uuid::now_v7()));
+        let nested = root.join("archive").join("Physical");
+        std::fs::create_dir_all(&nested).expect("the layer fixture directory should be created");
+        let expected = nested.join("NE_10M_LAND.SHP");
+        std::fs::write(&expected, b"shape fixture").expect("the layer fixture should be written");
+
+        assert_eq!(
+            find_layer(&root, "ne_10m_land.shp").expect("the nested layer should be found"),
+            expected
+        );
+        assert_error_contains(
+            find_layer(&root, "ne_10m_ocean.shp").expect_err("a missing layer should be reported"),
+            "does not contain required layer ne_10m_ocean.shp",
+        );
+
+        std::fs::remove_dir_all(root).expect("the layer fixture should be removed");
+    }
+
+    #[test]
+    fn job_log_retains_only_the_most_recent_entries() {
+        let artifact = test_artifact(
+            "natural-earth-globe",
+            map_config::MapVariantAssetKind::Raster,
+        );
+        let mut job = test_job(NaturalEarthImportProfile::Physical, vec![artifact]);
+        for index in 0..=NATURAL_EARTH_IMPORT_LOG_MAX_ENTRIES {
+            append_job_log(&mut job, format!("entry-{index}"));
+        }
+
+        assert_eq!(job.log_entries.len(), NATURAL_EARTH_IMPORT_LOG_MAX_ENTRIES);
+        assert_eq!(job.log_entries[0].message, "entry-1");
+        let expected_last = format!("entry-{NATURAL_EARTH_IMPORT_LOG_MAX_ENTRIES}");
+        assert_eq!(
+            job.log_entries.last().map(|entry| entry.message.as_str()),
+            Some(expected_last.as_str())
         );
     }
 }

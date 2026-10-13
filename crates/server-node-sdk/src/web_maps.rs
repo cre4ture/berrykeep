@@ -17,6 +17,20 @@ pub(crate) use mbtiles::LogicalMbtilesSource;
 
 const MAX_FULL_LOGICAL_FILE_GET_BYTES: u64 = 64 * 1024 * 1024;
 const MAP_MANIFEST_PREFIX: &str = "sys/maps/";
+const MBTILES_SOURCE_INITIALIZATION_FAILURE_TTL: Duration = Duration::from_secs(10);
+const MBTILES_SOURCE_INITIALIZATION_FAILURE_CACHE_MAX_ENTRIES: usize = 128;
+const MBTILES_BLOCKING_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug)]
+struct MbtilesBlockingWorkBusy;
+
+impl std::fmt::Display for MbtilesBlockingWorkBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MBTiles blocking work is saturated")
+    }
+}
+
+impl std::error::Error for MbtilesBlockingWorkBusy {}
 
 /// Cancels a blocking tile lookup when its request handler is dropped.
 #[derive(Clone, Default)]
@@ -122,6 +136,9 @@ pub(crate) async fn mbtiles_metadata(
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
+        Err(error) if is_mbtiles_blocking_work_busy(&error) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         Err(err) => return error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     };
     let metadata = source.metadata();
@@ -275,10 +292,12 @@ pub(crate) async fn logical_file(
         })
         .unwrap_or(total_size_bytes);
     let body = match read_logical_range_bytes_from_store(
-        &state.store,
+        &state,
         &loaded_manifest,
         range_start,
         range_length,
+        selected_range.is_some(),
+        None,
     )
     .await
     {
@@ -322,12 +341,22 @@ pub(crate) async fn xyz_tile(
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
+        Err(error) if is_mbtiles_blocking_work_busy(&error) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let tile_lookup_permit = match acquire_mbtiles_blocking_permit(&state).await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let tile_lookup = tokio::task::spawn_blocking({
         let cancelled = request_cancellation.flag();
-        move || source.lookup_tile_with_cancellation(z, x, y, cancelled)
+        move || {
+            let _tile_lookup_permit = tile_lookup_permit;
+            source.lookup_tile_with_cancellation(z, x, y, cancelled)
+        }
     })
     .await;
     let tile = match tile_lookup {
@@ -374,12 +403,22 @@ pub(crate) async fn vector_tile(
 
     let source = match get_or_create_mbtiles_source(&state, &manifest_key).await {
         Ok(source) => source,
+        Err(error) if is_mbtiles_blocking_work_busy(&error) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let tile_lookup_permit = match acquire_mbtiles_blocking_permit(&state).await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let tile_lookup = tokio::task::spawn_blocking({
         let cancelled = request_cancellation.flag();
-        move || source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
+        move || {
+            let _tile_lookup_permit = tile_lookup_permit;
+            source.lookup_vector_tile_with_cancellation(z, x, y, cancelled)
+        }
     })
     .await;
     let tile = match tile_lookup {
@@ -514,16 +553,24 @@ pub(crate) fn resolve_map_glyphs_root(explicit: Option<PathBuf>) -> Option<PathB
 }
 
 pub(crate) async fn read_logical_range_bytes_from_store(
-    store: &Arc<TracedRwLock<PersistentStore>>,
+    state: &ServerState,
     loaded_manifest: &LoadedSplitLogicalFileManifest,
     start: u64,
     length: u64,
+    is_range_request: bool,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<Vec<u8>> {
     let end_exclusive = start
         .checked_add(length)
         .ok_or_else(|| anyhow!("logical MBTiles range overflow"))?;
     let mut body = Vec::with_capacity(length.min(1024 * 1024) as usize);
-    let store = store.read("maps.logical_range.read").await;
+    let recovery_deadline = Instant::now()
+        + if is_range_request {
+            content_recovery::READ_THROUGH_RECOVERY_BUDGET
+        } else {
+            content_recovery::FULL_OBJECT_RECOVERY_BUDGET_MAX
+        };
+    let mut recovered_chunk_count = 0_usize;
 
     for (part, resolved_part) in loaded_manifest
         .manifest
@@ -531,6 +578,7 @@ pub(crate) async fn read_logical_range_bytes_from_store(
         .iter()
         .zip(loaded_manifest.resolved_parts.iter())
     {
+        ensure_logical_range_read_not_cancelled(cancellation)?;
         let part_start = part.offset_bytes;
         let part_end_exclusive = part
             .offset_bytes
@@ -555,15 +603,27 @@ pub(crate) async fn read_logical_range_bytes_from_store(
         let local_end_exclusive = local_start
             .checked_add(segment_length)
             .ok_or_else(|| anyhow!("logical MBTiles local range overflow"))?;
-        let bytes = store
-            .read_object_range_by_manifest_hash(
-                &resolved_part.manifest_hash,
-                local_start,
-                local_end_exclusive,
+        let range = read_current_object_range_through_peer(
+            state,
+            CurrentObjectRangeRead {
+                key: &part.key,
+                manifest_hash: &resolved_part.manifest_hash,
+                range_start: local_start,
+                range_end_exclusive: local_end_exclusive,
+                is_range_request,
+                recovery_deadline: Some(recovery_deadline),
+            },
+        )
+        .await
+        .map_err(store_read_error_to_anyhow)
+        .with_context(|| {
+            format!(
+                "failed hydrating logical MBTiles part {} range {local_start}..{local_end_exclusive}",
+                part.key
             )
-            .await
-            .map_err(store_read_error_to_anyhow)?;
-        body.extend_from_slice(bytes.as_ref());
+        })?;
+        recovered_chunk_count = recovered_chunk_count.saturating_add(range.recovered_chunk_count);
+        body.extend_from_slice(range.bytes.as_ref());
     }
 
     if body.len() as u64 != length {
@@ -574,7 +634,18 @@ pub(crate) async fn read_logical_range_bytes_from_store(
         ));
     }
 
+    if recovered_chunk_count > 0 {
+        request_local_availability_refresh(state);
+    }
+
     Ok(body)
+}
+
+fn ensure_logical_range_read_not_cancelled(cancellation: Option<&AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+        bail!("logical MBTiles range read canceled");
+    }
+    Ok(())
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
@@ -732,53 +803,69 @@ async fn load_split_logical_file_manifest(
     manifest_key: &str,
 ) -> Result<LoadedSplitLogicalFileManifest> {
     let started = Instant::now();
-    let manifest_descriptor = {
-        let store = read_store(state, "maps.manifest.describe").await;
-        store
-            .describe_object(manifest_key, None, None, ObjectReadMode::Preferred)
-            .await
-            .map_err(store_read_error_to_anyhow)?
-    };
+    let recovery_deadline = Instant::now() + content_recovery::READ_THROUGH_RECOVERY_BUDGET;
+    let manifest_descriptor = describe_object_with_metadata_read_through(
+        state,
+        manifest_key,
+        None,
+        None,
+        ObjectReadMode::Preferred,
+        MetadataReadThroughPeers::Advertised,
+        Some(recovery_deadline),
+    )
+    .await
+    .map_err(store_read_error_to_anyhow)?;
 
-    let manifest_payload = {
-        let store = read_store(state, "maps.manifest.read").await;
-        store
-            .read_object_range_by_manifest_hash(
-                &manifest_descriptor.manifest_hash,
-                0,
-                manifest_descriptor.total_size_bytes,
-            )
-            .await
-            .map_err(store_read_error_to_anyhow)?
-    };
+    let manifest_payload = read_current_object_range_through_peer(
+        state,
+        CurrentObjectRangeRead {
+            key: manifest_key,
+            manifest_hash: &manifest_descriptor.manifest_hash,
+            range_start: 0,
+            range_end_exclusive: manifest_descriptor.total_size_bytes,
+            is_range_request: false,
+            recovery_deadline: Some(recovery_deadline),
+        },
+    )
+    .await
+    .map_err(store_read_error_to_anyhow)
+    .with_context(|| format!("failed hydrating split logical file manifest {manifest_key}"))?;
+    if manifest_payload.recovered_chunk_count > 0 {
+        request_local_availability_refresh(state);
+    }
 
-    let manifest = serde_json::from_slice::<SplitLogicalFileManifest>(manifest_payload.as_ref())
-        .with_context(|| format!("failed to parse split logical file manifest {manifest_key}"))?;
+    let manifest =
+        serde_json::from_slice::<SplitLogicalFileManifest>(manifest_payload.bytes.as_ref())
+            .with_context(|| {
+                format!("failed to parse split logical file manifest {manifest_key}")
+            })?;
     let manifest = validate_split_logical_file_manifest(manifest)?;
 
     let mut resolved_parts = Vec::with_capacity(manifest.parts.len());
-    {
-        let store = read_store(state, "maps.manifest.resolve_parts").await;
-        for part in &manifest.parts {
-            let descriptor = store
-                .describe_object(&part.key, None, None, ObjectReadMode::Preferred)
-                .await
-                .map_err(store_read_error_to_anyhow)
-                .with_context(|| {
-                    format!("failed to resolve split logical file part {}", part.key)
-                })?;
-            if descriptor.total_size_bytes as u64 != part.size_bytes {
-                bail!(
-                    "split logical file part size mismatch for {}: declared={} actual={}",
-                    part.key,
-                    part.size_bytes,
-                    descriptor.total_size_bytes
-                );
-            }
-            resolved_parts.push(LoadedSplitLogicalFilePart {
-                manifest_hash: descriptor.manifest_hash,
-            });
+    for part in &manifest.parts {
+        let descriptor = describe_object_with_metadata_read_through(
+            state,
+            &part.key,
+            None,
+            None,
+            ObjectReadMode::Preferred,
+            MetadataReadThroughPeers::Advertised,
+            Some(recovery_deadline),
+        )
+        .await
+        .map_err(store_read_error_to_anyhow)
+        .with_context(|| format!("failed to resolve split logical file part {}", part.key))?;
+        if descriptor.total_size_bytes as u64 != part.size_bytes {
+            bail!(
+                "split logical file part size mismatch for {}: declared={} actual={}",
+                part.key,
+                part.size_bytes,
+                descriptor.total_size_bytes
+            );
         }
+        resolved_parts.push(LoadedSplitLogicalFilePart {
+            manifest_hash: descriptor.manifest_hash,
+        });
     }
 
     if state.storage.map_perf_logging_enabled {
@@ -821,49 +908,248 @@ async fn get_or_create_mbtiles_source(
         }
         return Ok(source);
     }
+    if let Some(message) = cached_mbtiles_source_initialization_failure(state, manifest_key).await {
+        bail!("MBTiles source initialization remains unavailable: {message}");
+    }
 
-    let loaded_manifest = load_split_logical_file_manifest(state, manifest_key).await?;
-    let handle = tokio::runtime::Handle::current();
-    let manifest_key_owned = manifest_key.to_string();
-    let perf_logging_enabled = state.storage.map_perf_logging_enabled;
-    let source = tokio::task::spawn_blocking({
-        let store = state.store.clone();
-        move || {
-            mbtiles::LogicalMbtilesSource::new(
-                manifest_key_owned,
-                store,
-                handle,
-                loaded_manifest,
-                perf_logging_enabled,
-            )
-        }
-    })
-    .await
-    .context("MBTiles source construction task join failed")??;
-    let source = Arc::new(source);
+    let initialization_lock = {
+        let mut locks = state
+            .storage
+            .mbtiles_source_initialization_locks
+            .lock()
+            .await;
+        mbtiles_source_initialization_lock(&mut locks, manifest_key)
+    };
+    let _initialization_lock_cleanup = MbtilesSourceInitializationLockCleanup {
+        locks: Arc::clone(&state.storage.mbtiles_source_initialization_locks),
+        manifest_key: manifest_key.to_string(),
+        initialization_lock: Some(initialization_lock),
+    };
+    let _initialization_permit = Arc::clone(_initialization_lock_cleanup.initialization_lock())
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow!("MBTiles source initialization lock closed"))?;
 
-    let mut sources = state.storage.mbtiles_sources.write().await;
-    if let Some(existing) = sources.get(manifest_key) {
+    if let Some(source) = state
+        .storage
+        .mbtiles_sources
+        .read()
+        .await
+        .get(manifest_key)
+        .cloned()
+    {
+        clear_mbtiles_source_initialization_failure(state, manifest_key).await;
         if state.storage.map_perf_logging_enabled {
             info!(
                 manifest_key = %manifest_key,
-                cache = "race-hit",
+                cache = "single-flight-hit",
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "map perf: reusing concurrently initialized MBTiles source"
+                "map perf: reused concurrently initialized MBTiles source"
             );
         }
-        return Ok(existing.clone());
+        return Ok(source);
     }
-    sources.insert(manifest_key.to_string(), source.clone());
-    if state.storage.map_perf_logging_enabled {
-        info!(
-            manifest_key = %manifest_key,
-            cache = "miss",
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "map perf: initialized MBTiles source"
-        );
+    if let Some(message) = cached_mbtiles_source_initialization_failure(state, manifest_key).await {
+        bail!("MBTiles source initialization remains unavailable: {message}");
     }
-    Ok(source)
+
+    let initialization_result = async {
+        let loaded_manifest = load_split_logical_file_manifest(state, manifest_key).await?;
+        let handle = tokio::runtime::Handle::current();
+        let manifest_key_owned = manifest_key.to_string();
+        let perf_logging_enabled = state.storage.map_perf_logging_enabled;
+        let source_construction_permit = acquire_mbtiles_blocking_permit(state).await?;
+        let source = tokio::task::spawn_blocking({
+            let state = state.clone_for_mbtiles_read_through();
+            move || {
+                let _source_construction_permit = source_construction_permit;
+                mbtiles::LogicalMbtilesSource::new(
+                    manifest_key_owned,
+                    state,
+                    handle,
+                    loaded_manifest,
+                    perf_logging_enabled,
+                )
+            }
+        })
+        .await
+        .context("MBTiles source construction task join failed")??;
+        let source = Arc::new(source);
+
+        let mut sources = state.storage.mbtiles_sources.write().await;
+        if let Some(existing) = sources.get(manifest_key) {
+            if state.storage.map_perf_logging_enabled {
+                info!(
+                    manifest_key = %manifest_key,
+                    cache = "race-hit",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "map perf: reusing concurrently initialized MBTiles source"
+                );
+            }
+            return Ok(existing.clone());
+        }
+        sources.insert(manifest_key.to_string(), source.clone());
+        if state.storage.map_perf_logging_enabled {
+            info!(
+                manifest_key = %manifest_key,
+                cache = "miss",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "map perf: initialized MBTiles source"
+            );
+        }
+        Ok(source)
+    }
+    .await;
+
+    match &initialization_result {
+        Ok(_) => clear_mbtiles_source_initialization_failure(state, manifest_key).await,
+        Err(error) if is_mbtiles_blocking_work_busy(error) => {}
+        Err(error) => cache_mbtiles_source_initialization_failure(state, manifest_key, error).await,
+    }
+    initialization_result
+}
+
+async fn acquire_mbtiles_blocking_permit(
+    state: &ServerState,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    acquire_mbtiles_blocking_permit_from(
+        Arc::clone(&state.storage.mbtiles_blocking_permits),
+        MBTILES_BLOCKING_ACQUIRE_TIMEOUT,
+    )
+    .await
+}
+
+async fn acquire_mbtiles_blocking_permit_from(
+    permits: Arc<Semaphore>,
+    acquire_timeout: Duration,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    tokio::time::timeout(acquire_timeout, permits.acquire_owned())
+        .await
+        .map_err(|_| anyhow::Error::new(MbtilesBlockingWorkBusy))?
+        .map_err(|_| anyhow!("MBTiles blocking-work semaphore closed"))
+}
+
+fn is_mbtiles_blocking_work_busy(error: &anyhow::Error) -> bool {
+    error.is::<MbtilesBlockingWorkBusy>()
+}
+
+fn mbtiles_source_initialization_lock(
+    locks: &mut HashMap<String, std::sync::Weak<Semaphore>>,
+    manifest_key: &str,
+) -> Arc<Semaphore> {
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(manifest_key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(Semaphore::new(1));
+    locks.insert(manifest_key.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+struct MbtilesSourceInitializationLockCleanup {
+    locks: Arc<Mutex<HashMap<String, std::sync::Weak<Semaphore>>>>,
+    manifest_key: String,
+    initialization_lock: Option<Arc<Semaphore>>,
+}
+
+impl MbtilesSourceInitializationLockCleanup {
+    fn initialization_lock(&self) -> &Arc<Semaphore> {
+        self.initialization_lock
+            .as_ref()
+            .expect("initialization lock must exist before cleanup")
+    }
+}
+
+impl Drop for MbtilesSourceInitializationLockCleanup {
+    fn drop(&mut self) {
+        let locks = Arc::clone(&self.locks);
+        let manifest_key = self.manifest_key.clone();
+        let Some(initialization_lock) = self.initialization_lock.take() else {
+            return;
+        };
+        let initialization_lock_weak = Arc::downgrade(&initialization_lock);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        std::mem::drop(runtime.spawn(async move {
+            drop(initialization_lock);
+            let mut locks = locks.lock().await;
+            remove_dead_mbtiles_source_initialization_lock(
+                &mut locks,
+                &manifest_key,
+                &initialization_lock_weak,
+            );
+        }));
+    }
+}
+
+fn remove_dead_mbtiles_source_initialization_lock(
+    locks: &mut HashMap<String, std::sync::Weak<Semaphore>>,
+    manifest_key: &str,
+    initialization_lock: &std::sync::Weak<Semaphore>,
+) {
+    let is_dead_current_lock = locks
+        .get(manifest_key)
+        .is_some_and(|current| current.ptr_eq(initialization_lock))
+        && initialization_lock.strong_count() == 0;
+    if is_dead_current_lock {
+        locks.remove(manifest_key);
+    }
+}
+
+async fn cached_mbtiles_source_initialization_failure(
+    state: &ServerState,
+    manifest_key: &str,
+) -> Option<String> {
+    let mut failures = state
+        .storage
+        .mbtiles_source_initialization_failures
+        .lock()
+        .await;
+    let now = Instant::now();
+    failures.retain(|_, failure| failure.expires_at > now);
+    failures
+        .get(manifest_key)
+        .map(|failure| failure.message.clone())
+}
+
+async fn cache_mbtiles_source_initialization_failure(
+    state: &ServerState,
+    manifest_key: &str,
+    error: &anyhow::Error,
+) {
+    let mut failures = state
+        .storage
+        .mbtiles_source_initialization_failures
+        .lock()
+        .await;
+    let now = Instant::now();
+    failures.retain(|_, failure| failure.expires_at > now);
+    if failures.len() >= MBTILES_SOURCE_INITIALIZATION_FAILURE_CACHE_MAX_ENTRIES
+        && !failures.contains_key(manifest_key)
+    {
+        return;
+    }
+    failures.insert(
+        manifest_key.to_string(),
+        CachedMbtilesSourceInitializationFailure {
+            expires_at: now + MBTILES_SOURCE_INITIALIZATION_FAILURE_TTL,
+            message: error.to_string(),
+        },
+    );
+}
+
+pub(crate) async fn clear_mbtiles_source_initialization_failure(
+    state: &ServerState,
+    manifest_key: &str,
+) {
+    state
+        .storage
+        .mbtiles_source_initialization_failures
+        .lock()
+        .await
+        .remove(manifest_key);
 }
 
 fn is_safe_fontstack_segment(value: &str) -> bool {
@@ -908,12 +1194,18 @@ fn store_read_error_to_anyhow(error: StoreReadError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorResponseBody, RequestCancellation, error_response, is_safe_fontstack_segment,
-        is_safe_glyph_range_segment,
+        ErrorResponseBody, MbtilesBlockingWorkBusy, MbtilesSourceInitializationLockCleanup,
+        RequestCancellation, acquire_mbtiles_blocking_permit_from, error_response,
+        is_safe_fontstack_segment, is_safe_glyph_range_segment, mbtiles_source_initialization_lock,
+        remove_dead_mbtiles_source_initialization_lock,
     };
     use axum::body::to_bytes;
     use axum::http::StatusCode;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
 
     #[test]
     fn request_cancellation_sets_lookup_flag_when_request_ends() {
@@ -924,6 +1216,50 @@ mod tests {
         assert!(!flag.load(Ordering::Relaxed));
         drop(guard);
         assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn mbtiles_initialization_locks_are_removed_after_callers_leave() {
+        let manifest_key = "sys/maps/example.mbtiles.manifest.json";
+        let mut locks = HashMap::new();
+
+        let initialization_lock = mbtiles_source_initialization_lock(&mut locks, manifest_key);
+        let waiter = mbtiles_source_initialization_lock(&mut locks, manifest_key);
+        assert!(Arc::ptr_eq(&initialization_lock, &waiter));
+
+        let initialization_lock_weak = Arc::downgrade(&initialization_lock);
+        drop(waiter);
+        drop(initialization_lock);
+        remove_dead_mbtiles_source_initialization_lock(
+            &mut locks,
+            manifest_key,
+            &initialization_lock_weak,
+        );
+        assert!(!locks.contains_key(manifest_key));
+    }
+
+    #[tokio::test]
+    async fn mbtiles_initialization_lock_cleanup_runs_when_its_owner_is_dropped() {
+        let manifest_key = "sys/maps/canceled.mbtiles.manifest.json";
+        let locks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let initialization_lock = {
+            let mut locked = locks.lock().await;
+            mbtiles_source_initialization_lock(&mut locked, manifest_key)
+        };
+        let cleanup = MbtilesSourceInitializationLockCleanup {
+            locks: Arc::clone(&locks),
+            manifest_key: manifest_key.to_string(),
+            initialization_lock: Some(initialization_lock),
+        };
+
+        drop(cleanup);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if !locks.lock().await.contains_key(manifest_key) {
+                return;
+            }
+        }
+        assert!(!locks.lock().await.contains_key(manifest_key));
     }
 
     #[tokio::test]
@@ -944,6 +1280,19 @@ mod tests {
                 error: "bad manifest".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn mbtiles_blocking_work_returns_busy_after_a_bounded_wait() {
+        let permits = Arc::new(Semaphore::new(1));
+        let held_permit = Arc::clone(&permits).acquire_owned().await.unwrap();
+
+        let error = acquire_mbtiles_blocking_permit_from(permits, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+
+        assert!(error.is::<MbtilesBlockingWorkBusy>());
+        drop(held_permit);
     }
 
     #[test]

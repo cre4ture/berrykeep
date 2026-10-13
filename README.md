@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/berrykeep-favicon.svg" alt="BerryKeep logo" width="144" />
+  <img src="docs/assets/berrykeep-logo.svg" alt="BerryKeep logo" width="460" />
 </p>
 
 # BerryKeep

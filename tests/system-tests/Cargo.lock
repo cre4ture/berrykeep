@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-linux-fuse"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-windows-cfapi"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "berrykeep-config-app"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "berrykeep-folder-agent"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1300,7 +1300,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli-client"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "client-sdk"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-client-config"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "git-version",
@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-status"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "client-sdk",
@@ -2670,9 +2670,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hickory-net"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2295ed2f9c31e471e1428a8f88a3f0e1f4b27c15049592138d1eebe9c35b183"
+checksum = "084e7bd6a377435d568f652153e571b50970d7ccc1d1eeec0519f834632287e1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2699,9 +2699,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-proto"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
+checksum = "7e2da0694c15b44c6f68a6b05e0233617008c54080e31d6eb848d858a9c5b38d"
 dependencies = [
  "data-encoding",
  "idna",
@@ -2719,9 +2719,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0d58d28879ceecde6607729660c2667a081ccdc082e082675042793960f178c"
+checksum = "0e4f9f4603319422d482738f3f6fe5aac03157fdbfed1cd85a3ff45adb09072f"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -4508,7 +4508,7 @@ dependencies = [
 
 [[package]]
 name = "os-integration"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "adapter-linux-fuse",
  "adapter-windows-cfapi",
@@ -5015,9 +5015,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -5276,7 +5276,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-server"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5308,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-service"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -5889,7 +5889,7 @@ dependencies = [
 
 [[package]]
 name = "server-node"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5903,7 +5903,7 @@ dependencies = [
 
 [[package]]
 name = "server-node-sdk"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aead",
  "aes-gcm-siv",
@@ -6322,7 +6322,7 @@ dependencies = [
 
 [[package]]
 name = "sync-agent-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -6342,7 +6342,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "serde",
 ]
@@ -6423,6 +6423,7 @@ dependencies = [
  "hmac 0.12.1",
  "image",
  "libc",
+ "nix 0.31.3",
  "os-integration",
  "p256",
  "patchbay",
@@ -7058,7 +7059,7 @@ dependencies = [
 
 [[package]]
 name = "transport-sdk"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -7618,7 +7619,7 @@ dependencies = [
 
 [[package]]
 name = "web-ui-backend"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -8067,7 +8068,7 @@ dependencies = [
 
 [[package]]
 name = "windows-thumbnail-provider"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "adapter-windows-cfapi",
  "anyhow",

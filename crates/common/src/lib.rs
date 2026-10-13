@@ -6,6 +6,7 @@ pub mod content_fingerprint;
 pub mod legacy_compatibility;
 pub mod logging;
 pub mod range_chunk_cache;
+pub mod shutdown;
 pub mod task_queue;
 pub mod traced_mutex;
 pub mod traced_rwlock;
@@ -20,16 +21,31 @@ pub type DeviceId = Uuid;
 /// requiring the operating system's display value to be a DNS name.
 pub const MAX_NODE_HOSTNAME_BYTES: usize = 255;
 
+/// Maximum UTF-8 byte length accepted for a server-node software version
+/// shown in BerryKeep user interfaces.
+pub const MAX_NODE_SOFTWARE_VERSION_BYTES: usize = 255;
+
 /// Normalizes an operating-system supplied node host name for display and
 /// distribution. Host names are descriptive metadata only, never an identity
 /// or routing input.
 pub fn normalize_node_hostname(value: impl AsRef<str>) -> Option<String> {
+    normalize_node_display_metadata(value, MAX_NODE_HOSTNAME_BYTES)
+}
+
+/// Normalizes a server-node software version for display and distribution.
+/// The value is descriptive metadata only, never an identity or routing
+/// input.
+pub fn normalize_node_software_version(value: impl AsRef<str>) -> Option<String> {
+    normalize_node_display_metadata(value, MAX_NODE_SOFTWARE_VERSION_BYTES)
+}
+
+fn normalize_node_display_metadata(value: impl AsRef<str>, max_bytes: usize) -> Option<String> {
     let value = value.as_ref();
-    let hostname = value.trim();
+    let normalized = value.trim();
     (!value.chars().any(is_disallowed_hostname_character)
-        && !hostname.is_empty()
-        && hostname.len() <= MAX_NODE_HOSTNAME_BYTES)
-        .then(|| hostname.to_string())
+        && !normalized.is_empty()
+        && normalized.len() <= max_bytes)
+        .then(|| normalized.to_string())
 }
 
 /// Decodes the stable comma-separated label-filter format used by the node and
@@ -97,7 +113,10 @@ fn is_disallowed_hostname_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_NODE_HOSTNAME_BYTES, normalize_node_hostname, parse_comma_separated_labels};
+    use super::{
+        MAX_NODE_HOSTNAME_BYTES, MAX_NODE_SOFTWARE_VERSION_BYTES, normalize_node_hostname,
+        normalize_node_software_version, parse_comma_separated_labels,
+    };
 
     #[test]
     fn normalizes_display_hostnames_without_accepting_invalid_values() {
@@ -111,6 +130,21 @@ mod tests {
         assert_eq!(normalize_node_hostname("   "), None);
         assert_eq!(
             normalize_node_hostname("a".repeat(MAX_NODE_HOSTNAME_BYTES + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn normalizes_display_software_versions_without_accepting_invalid_values() {
+        assert_eq!(
+            normalize_node_software_version(" 2.0.1+build.7 ").as_deref(),
+            Some("2.0.1+build.7")
+        );
+        assert_eq!(normalize_node_software_version("2.0.1\u{202e}"), None);
+        assert_eq!(normalize_node_software_version("2.0.1\u{200b}"), None);
+        assert_eq!(normalize_node_software_version("   "), None);
+        assert_eq!(
+            normalize_node_software_version("a".repeat(MAX_NODE_SOFTWARE_VERSION_BYTES + 1)),
             None
         );
     }

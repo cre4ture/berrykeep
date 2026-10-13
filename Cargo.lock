@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-linux-fuse"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-windows-cfapi"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -153,7 +153,7 @@ checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
 
 [[package]]
 name = "android-app"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "android-server-node-app"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "jni 0.21.1",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "berrykeep-background-launcher"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "common",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "berrykeep-config-app"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -632,13 +632,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "windows-sys 0.61.2",
  "winres",
 ]
 
 [[package]]
 name = "berrykeep-folder-agent"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1033,7 +1034,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli-client"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1061,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "client-sdk"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1132,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1581,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-client-config"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "git-version",
@@ -1592,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-status"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "client-sdk",
@@ -2440,9 +2441,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hickory-net"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2295ed2f9c31e471e1428a8f88a3f0e1f4b27c15049592138d1eebe9c35b183"
+checksum = "084e7bd6a377435d568f652153e571b50970d7ccc1d1eeec0519f834632287e1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2469,9 +2470,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-proto"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
+checksum = "7e2da0694c15b44c6f68a6b05e0233617008c54080e31d6eb848d858a9c5b38d"
 dependencies = [
  "data-encoding",
  "idna",
@@ -2939,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "ios-app"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3656,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "mobile-client-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -4249,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "os-integration"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "adapter-linux-fuse",
  "adapter-windows-cfapi",
@@ -4747,9 +4748,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -5002,7 +5003,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-server"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5037,7 +5038,7 @@ dependencies = [
 
 [[package]]
 name = "rendezvous-service"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -5609,7 +5610,7 @@ dependencies = [
 
 [[package]]
 name = "server-node"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -5624,7 +5625,7 @@ dependencies = [
 
 [[package]]
 name = "server-node-sdk"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aead",
  "aes-gcm-siv",
@@ -5962,7 +5963,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stats-collector-server"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -6065,7 +6066,7 @@ dependencies = [
 
 [[package]]
 name = "sync-agent-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -6085,7 +6086,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "serde",
 ]
@@ -6406,7 +6407,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-display-status"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "embedded-graphics",
@@ -6776,7 +6777,7 @@ dependencies = [
 
 [[package]]
 name = "transport-sdk"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -7040,7 +7041,7 @@ version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
 dependencies = [
- "rand 0.10.2",
+ "rand 0.9.5",
 ]
 
 [[package]]
@@ -7341,7 +7342,7 @@ dependencies = [
 
 [[package]]
 name = "web-ui-backend"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -7765,7 +7766,7 @@ dependencies = [
 
 [[package]]
 name = "windows-thumbnail-provider"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "adapter-windows-cfapi",
  "anyhow",

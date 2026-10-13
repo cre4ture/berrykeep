@@ -5,6 +5,7 @@ use super::*;
 pub(crate) const MAP_CONFIGURATION_STORAGE_KEY: &str = "sys/maps/gallery-map-config.json";
 const MAP_CONFIGURATION_VERSION: u32 = 1;
 const MAX_MAP_VARIANTS: usize = 32;
+const MAP_CONFIGURATION_METADATA_MISS_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +79,17 @@ pub(crate) struct LoadedMapConfiguration {
     pub(crate) stored: bool,
     needs_persistence: bool,
 }
+
+#[derive(Debug)]
+struct MapConfigurationContentUnavailable;
+
+impl std::fmt::Display for MapConfigurationContentUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("gallery map configuration content is unavailable")
+    }
+}
+
+impl std::error::Error for MapConfigurationContentUnavailable {}
 
 fn default_configuration_version() -> u32 {
     MAP_CONFIGURATION_VERSION
@@ -287,6 +299,17 @@ pub(crate) async fn public_config(State(state): State<ServerState>) -> impl Into
             }),
         )
             .into_response(),
+        Err(err) if err.is::<MapConfigurationContentUnavailable>() => {
+            warn!(error = %err, "falling back to default gallery map configuration while content is unavailable");
+            (
+                StatusCode::OK,
+                Json(ClusterMapConfigurationResponse {
+                    configuration: default_configuration(),
+                    stored: false,
+                }),
+            )
+                .into_response()
+        }
         Err(err) => {
             warn!(error = %err, "failed loading gallery map configuration");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -385,6 +408,7 @@ pub(crate) async fn admin_put_config(
         &outcome.version_id,
     )
     .await;
+    clear_map_configuration_read_through_backoff(&state).await;
 
     append_admin_audit(
         &state,
@@ -416,43 +440,245 @@ pub(crate) async fn admin_put_config(
 pub(crate) async fn load_current_configuration(
     state: &ServerState,
 ) -> Result<LoadedMapConfiguration> {
-    let payload = {
-        let store = read_store(state, "maps.config.get").await;
-        match store
-            .get_object(
+    load_current_configuration_inner(state, false).await
+}
+
+async fn load_current_configuration_after_peer_read_through_lock(
+    state: &ServerState,
+) -> Result<LoadedMapConfiguration> {
+    // A cold node may have to probe every online peer for the configuration.
+    // Serialize only that recovery attempt so concurrent clients share its
+    // result (including the short-lived miss/unavailable backoff) instead of
+    // each issuing their own cluster-wide probe.
+    let _load_permit = Arc::clone(&state.storage.map_configuration_load_permit)
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow!("gallery map configuration load semaphore closed"))?;
+    Box::pin(load_current_configuration_inner(state, true)).await
+}
+
+async fn load_current_configuration_inner(
+    state: &ServerState,
+    peer_read_through_allowed: bool,
+) -> Result<LoadedMapConfiguration> {
+    let local_descriptor = {
+        let store = read_store(state, "maps.config.describe_local").await;
+        store
+            .describe_object(
                 MAP_CONFIGURATION_STORAGE_KEY,
                 None,
                 None,
                 ObjectReadMode::ConfirmedOnly,
             )
             .await
-        {
-            Ok(payload) => Some(payload),
-            Err(StoreReadError::NotFound) => None,
-            Err(StoreReadError::Corrupt(message)) => {
-                bail!("gallery map configuration is corrupt: {message}")
-            }
-            Err(StoreReadError::Internal(err)) => return Err(err),
+    };
+    let cached_backoff = cached_map_configuration_read_through_backoff(state).await;
+    let unavailable_backoff = match &cached_backoff {
+        Some(MapConfigurationReadThroughBackoff::MetadataUnavailable(message)) => {
+            Some((false, message.clone()))
         }
+        Some(MapConfigurationReadThroughBackoff::ContentUnavailable(message)) => {
+            Some((true, message.clone()))
+        }
+        Some(MapConfigurationReadThroughBackoff::Missing) | None => None,
+    };
+    let descriptor = match local_descriptor {
+        Ok(descriptor) => Some(descriptor),
+        Err(StoreReadError::NotFound)
+            if matches!(
+                cached_backoff,
+                Some(MapConfigurationReadThroughBackoff::Missing)
+            ) =>
+        {
+            None
+        }
+        Err(StoreReadError::NotFound | StoreReadError::Corrupt(_))
+            if unavailable_backoff.is_some() =>
+        {
+            let (content_unavailable, message) = unavailable_backoff.expect("guarded above");
+            if content_unavailable {
+                return Err(map_configuration_content_unavailable(message));
+            }
+            bail!("gallery map configuration remains unavailable: {message}")
+        }
+        Err(StoreReadError::NotFound | StoreReadError::Corrupt(_)) => {
+            if !peer_read_through_allowed {
+                return load_current_configuration_after_peer_read_through_lock(state).await;
+            }
+            match describe_object_with_metadata_read_through(
+                state,
+                MAP_CONFIGURATION_STORAGE_KEY,
+                None,
+                None,
+                ObjectReadMode::ConfirmedOnly,
+                MetadataReadThroughPeers::AnyOnline,
+                None,
+            )
+            .await
+            {
+                Ok(descriptor) => Some(descriptor),
+                Err(StoreReadError::NotFound) => {
+                    cache_map_configuration_read_through_backoff(
+                        state,
+                        MapConfigurationReadThroughBackoff::Missing,
+                    )
+                    .await;
+                    None
+                }
+                Err(StoreReadError::Corrupt(message)) => {
+                    cache_map_configuration_read_through_backoff(
+                        state,
+                        MapConfigurationReadThroughBackoff::MetadataUnavailable(message.clone()),
+                    )
+                    .await;
+                    bail!("gallery map configuration is corrupt: {message}")
+                }
+                Err(StoreReadError::Internal(err)) => {
+                    cache_map_configuration_read_through_backoff(
+                        state,
+                        MapConfigurationReadThroughBackoff::MetadataUnavailable(err.to_string()),
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
+        }
+        Err(StoreReadError::Internal(err)) => return Err(err),
     };
 
-    let Some(payload) = payload else {
+    let Some(descriptor) = descriptor else {
         return Ok(LoadedMapConfiguration {
             configuration: default_configuration(),
             stored: false,
             needs_persistence: true,
         });
     };
-    let stored_configuration = serde_json::from_slice::<ClusterMapConfiguration>(&payload)
+
+    let local_payload = read_current_object_range_locally(
+        state,
+        &descriptor.manifest_hash,
+        0,
+        descriptor.total_size_bytes,
+    )
+    .await;
+    let payload = match local_payload {
+        Ok(bytes) => ReadThroughObjectRange {
+            bytes,
+            recovered_chunk_count: 0,
+        },
+        Err(StoreReadError::Corrupt(_)) if unavailable_backoff.is_some() => {
+            let (content_unavailable, message) = unavailable_backoff.expect("guarded above");
+            if content_unavailable {
+                return Err(map_configuration_content_unavailable(message));
+            }
+            bail!("gallery map configuration remains unavailable: {message}")
+        }
+        Err(StoreReadError::Corrupt(_)) if !peer_read_through_allowed => {
+            return load_current_configuration_after_peer_read_through_lock(state).await;
+        }
+        Err(StoreReadError::Corrupt(_)) => match read_current_object_range_through_peer(
+            state,
+            CurrentObjectRangeRead {
+                key: MAP_CONFIGURATION_STORAGE_KEY,
+                manifest_hash: &descriptor.manifest_hash,
+                range_start: 0,
+                range_end_exclusive: descriptor.total_size_bytes,
+                is_range_request: false,
+                recovery_deadline: None,
+            },
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => return Err(map_configuration_payload_read_failure(state, error).await),
+        },
+        Err(error) => return Err(map_configuration_payload_read_failure(state, error).await),
+    };
+    if payload.recovered_chunk_count > 0 {
+        request_local_availability_refresh(state);
+    }
+
+    let stored_configuration = serde_json::from_slice::<ClusterMapConfiguration>(&payload.bytes)
         .context("failed parsing gallery map configuration")?;
     validate_configuration(&stored_configuration)?;
     let (configuration, needs_persistence) = add_default_map_variants(stored_configuration);
     validate_configuration(&configuration)?;
+    clear_map_configuration_read_through_backoff(state).await;
     Ok(LoadedMapConfiguration {
         configuration,
         stored: true,
         needs_persistence,
     })
+}
+
+fn map_configuration_content_unavailable(message: String) -> anyhow::Error {
+    anyhow::Error::new(MapConfigurationContentUnavailable).context(message)
+}
+
+async fn map_configuration_payload_read_failure(
+    state: &ServerState,
+    error: StoreReadError,
+) -> anyhow::Error {
+    let message = match map_configuration_content_unavailable_message(error) {
+        Ok(message) => message,
+        Err(error) => return error,
+    };
+    cache_map_configuration_read_through_backoff(
+        state,
+        MapConfigurationReadThroughBackoff::ContentUnavailable(message.clone()),
+    )
+    .await;
+    map_configuration_content_unavailable(message)
+}
+
+fn map_configuration_content_unavailable_message(error: StoreReadError) -> Result<String> {
+    match error {
+        StoreReadError::Internal(error) => Err(error),
+        error => Ok(format!(
+            "failed reading gallery map configuration through peer cache: {error}"
+        )),
+    }
+}
+
+async fn cached_map_configuration_read_through_backoff(
+    state: &ServerState,
+) -> Option<MapConfigurationReadThroughBackoff> {
+    let mut cached = state
+        .storage
+        .map_configuration_read_through_backoff
+        .lock()
+        .await;
+    let now = Instant::now();
+    match cached.as_ref() {
+        Some(entry) if entry.expires_at > now => Some(entry.outcome.clone()),
+        Some(_) => {
+            *cached = None;
+            None
+        }
+        None => None,
+    }
+}
+
+async fn cache_map_configuration_read_through_backoff(
+    state: &ServerState,
+    outcome: MapConfigurationReadThroughBackoff,
+) {
+    *state
+        .storage
+        .map_configuration_read_through_backoff
+        .lock()
+        .await = Some(CachedMapConfigurationReadThroughBackoff {
+        expires_at: Instant::now() + MAP_CONFIGURATION_METADATA_MISS_TTL,
+        outcome,
+    });
+}
+
+async fn clear_map_configuration_read_through_backoff(state: &ServerState) {
+    *state
+        .storage
+        .map_configuration_read_through_backoff
+        .lock()
+        .await = None;
 }
 
 /// The client endpoint can safely fall back while a just-added node catches up.
@@ -659,6 +885,17 @@ fn is_valid_manifest_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_map_configuration_read_errors_do_not_become_content_fallbacks() {
+        let error = map_configuration_content_unavailable_message(StoreReadError::Internal(
+            anyhow!("simulated local storage I/O failure"),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "simulated local storage I/O failure");
+        assert!(!error.is::<MapConfigurationContentUnavailable>());
+    }
 
     #[test]
     fn default_configuration_is_valid_and_uses_the_small_globe() {

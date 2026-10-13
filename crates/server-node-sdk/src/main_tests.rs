@@ -1121,6 +1121,9 @@ fn test_cluster_config_without_internal_tls(
         replication_repair_batch_size: 256,
         replication_repair_max_retries: 3,
         replication_repair_backoff_secs: 30,
+        replication_repair_execution_timeout_secs: super::DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS,
+        replication_repair_subject_inspection_timeout_secs:
+            super::DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS,
         repair_busy_throttle_enabled: false,
         repair_busy_inflight_threshold: 32,
         repair_busy_wait_millis: 100,
@@ -1239,6 +1242,7 @@ async fn register_cluster_node(
     cluster.register_node(super::cluster::NodeDescriptor {
         node_id,
         hostname: None,
+        software_version: None,
         reachability: test_node_reachability(public_api_url, peer_api_url, false),
         capabilities: super::cluster::NodeCapabilities {
             public_api: public_api_url.is_some(),
@@ -1290,6 +1294,7 @@ async fn register_direct_quic_cluster_node(
     let descriptor = cluster::NodeDescriptor {
         node_id,
         hostname: None,
+        software_version: None,
         reachability: cluster::NodeReachability {
             public_api_url: None,
             public_direct_urls: Vec::new(),
@@ -4426,7 +4431,7 @@ async fn s3_control_plane_admin_lifecycle_impl(backend: MainTestBackend) {
     let status_after: super::S3ControlPlaneStatusResponse =
         serde_json::from_slice(&status_after_body).unwrap();
     assert_eq!(status_after.bucket_count, 0);
-    assert_eq!(status_after.access_key_count, 1);
+    assert_eq!(status_after.access_key_count, 0);
     assert!(status_after.local_generation >= 4);
 
     cleanup_test_state(&state).await;
@@ -4636,7 +4641,7 @@ async fn s3_control_plane_import_merges_tombstones_and_revocations_impl(backend:
         serde_json::from_slice(&tombstone_import_body).unwrap();
     assert!(tombstone_report.changed);
     assert_eq!(tombstone_report.bucket_count, 0);
-    assert_eq!(tombstone_report.access_key_count, 1);
+    assert_eq!(tombstone_report.access_key_count, 0);
 
     let stale_import = super::import_s3_control_plane(
         State(state.clone()),
@@ -4664,7 +4669,7 @@ async fn s3_control_plane_import_merges_tombstones_and_revocations_impl(backend:
         serde_json::from_slice(&stale_import_body).unwrap();
     assert!(!stale_report.changed);
     assert_eq!(stale_report.bucket_count, 0);
-    assert_eq!(stale_report.access_key_count, 1);
+    assert_eq!(stale_report.access_key_count, 0);
 
     let control_plane = state.s3.control_plane.lock().await.clone();
     assert_eq!(control_plane.buckets.len(), 1);
@@ -8169,6 +8174,7 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
         cluster.register_node(cluster::NodeDescriptor {
             node_id: source.node_id,
             hostname: None,
+            software_version: None,
             reachability: cluster::NodeReachability {
                 public_api_url: Some("https://127.0.0.1:9".to_string()),
                 public_direct_urls: vec!["https://127.0.0.1:9".to_string()],
@@ -8197,6 +8203,7 @@ async fn bootstrap_bundle_builds_client_that_reaches_remote_authenticated_node()
         cluster.register_node(cluster::NodeDescriptor {
             node_id: target.node_id,
             hostname: None,
+            software_version: None,
             reachability: cluster::NodeReachability {
                 public_api_url: Some(public_url.clone()),
                 public_direct_urls: vec![public_url.clone()],
@@ -11707,6 +11714,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
         cluster_id: state.cluster_id,
         identity: transport_sdk::PeerIdentity::Node(state.node_id),
         hostname: None,
+        software_version: None,
         public_api_url: None,
         public_direct_urls: Vec::new(),
         peer_api_url: Some(format!("https://{internal_bind_addr}")),
@@ -11851,6 +11859,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
         cluster_id: state.cluster_id,
         identity: transport_sdk::PeerIdentity::Node(state.node_id),
         hostname: None,
+        software_version: None,
         public_api_url: None,
         public_direct_urls: Vec::new(),
         peer_api_url: None,
@@ -14170,6 +14179,99 @@ fn autonomous_post_write_repair_runtime_coalesces_pending_subjects() {
     assert!(runtime.active);
     assert_eq!(runtime.take_pending_subjects(), None);
     assert!(!runtime.active);
+
+    assert!(runtime.enqueue(["docs/retry.txt".to_string()]));
+    let retry_subjects = runtime.take_pending_subjects().unwrap();
+    assert_eq!(
+        runtime.requeue_after_timeout(retry_subjects.clone(), 1),
+        (1, 0)
+    );
+    assert_eq!(
+        runtime.take_pending_subjects(),
+        Some(retry_subjects.clone())
+    );
+    assert_eq!(runtime.requeue_after_timeout(retry_subjects, 1), (0, 1));
+    assert_eq!(runtime.take_pending_subjects(), None);
+    assert!(!runtime.active);
+    assert!(runtime.timeout_retries.is_empty());
+}
+
+#[tokio::test]
+async fn autonomous_post_write_repair_requeues_after_executor_timeout() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    *state.maintenance.startup_repair_status.lock().await = StartupRepairStatus::Disabled;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    {
+        let mut runtime = state.maintenance.autonomous_post_write_repair.lock().await;
+        assert!(runtime.enqueue(["docs/retry.txt".to_string()]));
+    }
+
+    let worker = tokio::spawn(super::run_autonomous_post_write_replication(state.clone()));
+    let first_run_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state
+                .maintenance
+                .repair_execution_gate
+                .queue_snapshot()
+                .automatic
+                > 0
+                && let Some(run_id) = state
+                    .maintenance
+                    .repair_activity
+                    .lock()
+                    .await
+                    .active_runs
+                    .first()
+                    .map(|run| run.run_id.clone())
+            {
+                break run_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first autonomous attempt should wait on the executor");
+
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if state
+                .maintenance
+                .repair_execution_gate
+                .queue_snapshot()
+                .automatic
+                > 0
+                && state
+                    .maintenance
+                    .repair_activity
+                    .lock()
+                    .await
+                    .active_runs
+                    .first()
+                    .is_some_and(|run| run.run_id != first_run_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a timed-out autonomous attempt should requeue its subjects");
+
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the requeued autonomous repair should finish after the executor is released")
+        .expect("the autonomous repair worker should not panic");
+    let runtime = state.maintenance.autonomous_post_write_repair.lock().await;
+    assert!(!runtime.active);
+    assert!(runtime.pending_subjects.is_empty());
+    drop(runtime);
+    cleanup_test_state(&state).await;
 }
 
 #[test]
@@ -14377,7 +14479,7 @@ async fn replication_repair_records_max_retry_skip_details_impl(backend: MainTes
         let mut repair_state = state.maintenance.repair_state.lock().await;
         for (subject, target_node_id) in &expected_skips {
             repair_state.attempts.insert(
-                format!("{subject}|{target_node_id}"),
+                super::replication::transfer_attempt_key(subject, *target_node_id),
                 super::RepairAttemptEntry {
                     attempts: state.repair_config.max_retries.saturating_add(1),
                     last_failure_unix: super::unix_ts(),
@@ -18657,6 +18759,445 @@ run_on_main_metadata_backends!(
     metadata_import_makes_store_index_visible_without_marking_local_replica_turso
 );
 
+async fn start_read_through_chunk_peer(
+    source: &ServerState,
+    target: &ServerState,
+    subjects: &[String],
+) -> tokio::task::JoinHandle<()> {
+    {
+        let mut cluster = source.cluster.lock().await;
+        for subject in subjects {
+            cluster.note_replica(subject, source.node_id);
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_base_url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route(
+            "/cluster/v2/replication/chunk/{hash}",
+            get(super::get_replication_chunk),
+        )
+        .route(
+            "/cluster/metadata/export",
+            get(super::export_metadata_bundle),
+        )
+        .with_state(source.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("chunk route should serve");
+    });
+
+    {
+        let mut cluster = target.cluster.lock().await;
+        cluster.register_node(super::cluster::NodeDescriptor {
+            node_id: source.node_id,
+            hostname: None,
+            software_version: None,
+            reachability: test_node_reachability(
+                Some(peer_base_url.as_str()),
+                Some(peer_base_url.as_str()),
+                false,
+            ),
+            capabilities: super::cluster::NodeCapabilities {
+                public_api: true,
+                peer_api: true,
+                relay_tunnel: false,
+            },
+            labels: HashMap::new(),
+            capacity_bytes: 1_000_000,
+            free_bytes: 900_000,
+            storage_stats: None,
+            last_heartbeat_unix: super::unix_ts(),
+            status: super::cluster::NodeStatus::Online,
+        });
+        for subject in subjects {
+            cluster.note_replica(subject, source.node_id);
+        }
+    }
+
+    handle
+}
+
+async fn map_configuration_read_through_fetches_missing_chunks_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let mut configuration = super::map_config::default_configuration();
+    configuration.variants[0].label = "Read-through configuration".to_string();
+    let key = super::map_config::MAP_CONFIGURATION_STORAGE_KEY;
+    let configuration_payload = serde_json::to_vec(&configuration).unwrap();
+    let configuration_payload_len = configuration_payload.len();
+    let put = {
+        let mut store = lock_store(&source, "tests.map_config.source.put").await;
+        store
+            .put_object_versioned(
+                key,
+                bytes::Bytes::from(configuration_payload),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let subjects = vec![key.to_string(), format!("{key}@{}", put.version_id)];
+    let handle = start_read_through_chunk_peer(&source, &target, &subjects).await;
+
+    let bundle = {
+        let store = lock_store(&source, "tests.map_config.source.export").await;
+        store
+            .export_metadata_bundle(key, None, super::storage::ObjectReadMode::ConfirmedOnly)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    {
+        let mut store = lock_store(&target, "tests.map_config.target.import").await;
+        store.import_metadata_bundle(&bundle).await.unwrap();
+        fs::remove_file(store.manifest_path_for_test(&put.manifest_hash))
+            .await
+            .unwrap();
+    }
+    let initial_error = {
+        let store = read_store(&target, "tests.map_config.target.describe").await;
+        store
+            .describe_object(
+                key,
+                None,
+                None,
+                super::storage::ObjectReadMode::ConfirmedOnly,
+            )
+            .await
+            .unwrap_err()
+    };
+    assert!(matches!(
+        initial_error,
+        super::storage::StoreReadError::Corrupt(_)
+    ));
+
+    let loaded = super::map_config::load_current_configuration(&target)
+        .await
+        .unwrap();
+    assert!(loaded.stored);
+    assert_eq!(loaded.configuration, configuration);
+
+    *target
+        .storage
+        .map_configuration_read_through_backoff
+        .lock()
+        .await = Some(super::CachedMapConfigurationReadThroughBackoff {
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        outcome: super::MapConfigurationReadThroughBackoff::ContentUnavailable(
+            "stale read-through failure".to_string(),
+        ),
+    });
+    let reloaded = super::map_config::load_current_configuration(&target)
+        .await
+        .unwrap();
+    assert!(reloaded.stored);
+    assert_eq!(reloaded.configuration, configuration);
+
+    let peer_read_through_permit = Arc::clone(&target.storage.map_configuration_load_permit)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let locally_loaded = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::map_config::load_current_configuration(&target),
+    )
+    .await
+    .expect("fully local map configuration should not wait for peer read-through")
+    .unwrap();
+    drop(peer_read_through_permit);
+    assert!(locally_loaded.stored);
+    assert_eq!(locally_loaded.configuration, configuration);
+
+    let missing_chunks = {
+        let store = read_store(&target, "tests.map_config.target.verify_cache").await;
+        store
+            .missing_chunks_for_manifest_range(&put.manifest_hash, 0, configuration_payload_len)
+            .await
+            .unwrap()
+    };
+    assert!(missing_chunks.is_empty());
+
+    *target
+        .storage
+        .map_configuration_read_through_backoff
+        .lock()
+        .await = Some(super::CachedMapConfigurationReadThroughBackoff {
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        outcome: super::MapConfigurationReadThroughBackoff::Missing,
+    });
+    {
+        let store = lock_store(&target, "tests.map_config.target.remove_manifest_with_miss").await;
+        fs::remove_file(store.manifest_path_for_test(&put.manifest_hash))
+            .await
+            .unwrap();
+    }
+    let recovered_after_cached_miss = super::map_config::load_current_configuration(&target)
+        .await
+        .unwrap();
+    assert!(recovered_after_cached_miss.stored);
+    assert_eq!(recovered_after_cached_miss.configuration, configuration);
+
+    {
+        let store = lock_store(&target, "tests.map_config.target.remove_cached_manifest").await;
+        fs::remove_file(store.manifest_path_for_test(&put.manifest_hash))
+            .await
+            .unwrap();
+    }
+    *target
+        .storage
+        .map_configuration_read_through_backoff
+        .lock()
+        .await = Some(super::CachedMapConfigurationReadThroughBackoff {
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        outcome: super::MapConfigurationReadThroughBackoff::ContentUnavailable(
+            "map content is temporarily unavailable".to_string(),
+        ),
+    });
+    let public_response = super::map_config::public_config(axum::extract::State(target.clone()))
+        .await
+        .into_response();
+    assert_eq!(public_response.status(), axum::http::StatusCode::OK);
+    let public_body = axum::body::to_bytes(public_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let public_payload: serde_json::Value = serde_json::from_slice(&public_body).unwrap();
+    assert_eq!(public_payload["stored"], false);
+
+    assert!(
+        target
+            .cluster
+            .lock()
+            .await
+            .subjects_for_node(target.node_id)
+            .is_empty()
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    map_configuration_read_through_fetches_missing_chunks_impl,
+    map_configuration_read_through_fetches_missing_chunks,
+    map_configuration_read_through_fetches_missing_chunks_turso
+);
+
+async fn logical_map_file_read_through_fetches_missing_chunks_impl(backend: MainTestBackend) {
+    let source = build_test_state(1, false, backend).await;
+    let target = build_test_state(1, false, backend).await;
+    let manifest_key = "sys/maps/read-through.mbtiles.manifest.json";
+    let part_key = "sys/maps/read-through.mbtiles.part-00000";
+    let part_payload = b"map data served through peer read-through".to_vec();
+    let part_put = {
+        let mut store = lock_store(&source, "tests.map_file.source.put_part").await;
+        store
+            .put_object_versioned(
+                part_key,
+                bytes::Bytes::from(part_payload.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let manifest_payload = serde_json::json!({
+        "manifest_version": 1,
+        "type": "split_file_manifest",
+        "logical_format": "mbtiles",
+        "logical_key": "sys/maps/read-through.mbtiles",
+        "logical_size_bytes": part_payload.len(),
+        "parts_count": 1,
+        "parts": [{
+            "part_id": "00000",
+            "key": part_key,
+            "offset_bytes": 0,
+            "size_bytes": part_payload.len(),
+        }],
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest_payload).unwrap();
+    let manifest_put = {
+        let mut store = lock_store(&source, "tests.map_file.source.put_manifest").await;
+        store
+            .put_object_versioned(
+                manifest_key,
+                bytes::Bytes::from(manifest_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap()
+    };
+    let subjects = vec![
+        manifest_key.to_string(),
+        format!("{manifest_key}@{}", manifest_put.version_id),
+        part_key.to_string(),
+        format!("{part_key}@{}", part_put.version_id),
+    ];
+    let handle = start_read_through_chunk_peer(&source, &target, &subjects).await;
+
+    let range_start = 4;
+    let range_end = 22;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::RANGE,
+        format!("bytes={range_start}-{range_end}").parse().unwrap(),
+    );
+    let response = axum::response::IntoResponse::into_response(
+        super::web_maps::logical_file(
+            axum::extract::State(target.clone()),
+            axum::http::Method::GET,
+            headers.clone(),
+            axum::extract::Query(
+                serde_json::from_value(serde_json::json!({ "manifest_key": manifest_key }))
+                    .unwrap(),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        &part_payload[range_start as usize..=range_end as usize]
+    );
+
+    // The same range helper is used by long-lived MBTiles VFS sources. When a
+    // resolved part manifest has been reclaimed locally, it must restore
+    // metadata from a peer before it can plan chunk hydration.
+    {
+        let store = lock_store(&target, "tests.map_file.target.remove_part_manifest").await;
+        fs::remove_file(store.manifest_path_for_test(&part_put.manifest_hash))
+            .await
+            .unwrap();
+    }
+    let recovered_range = super::read_current_object_range_through_peer(
+        &target,
+        super::CurrentObjectRangeRead {
+            key: part_key,
+            manifest_hash: &part_put.manifest_hash,
+            range_start: range_start as usize,
+            range_end_exclusive: range_end as usize + 1,
+            is_range_request: true,
+            recovery_deadline: None,
+        },
+    )
+    .await
+    .expect("a restored manifest must make the already-cached range readable");
+    assert_eq!(
+        recovered_range.bytes.as_ref(),
+        &part_payload[range_start as usize..=range_end as usize]
+    );
+    assert_eq!(recovered_range.recovered_chunk_count, 0);
+
+    let manifest_is_restored = {
+        let store = read_store(&target, "tests.map_file.target.verify_restored_manifest").await;
+        store
+            .missing_chunks_for_manifest_range(
+                &part_put.manifest_hash,
+                range_start as usize,
+                range_end as usize + 1,
+            )
+            .await
+    };
+    assert!(manifest_is_restored.unwrap().is_empty());
+
+    let recovered_response = axum::response::IntoResponse::into_response(
+        super::web_maps::logical_file(
+            axum::extract::State(target.clone()),
+            axum::http::Method::GET,
+            headers,
+            axum::extract::Query(
+                serde_json::from_value(serde_json::json!({ "manifest_key": manifest_key }))
+                    .unwrap(),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(recovered_response.status(), StatusCode::PARTIAL_CONTENT);
+    let recovered_body = to_bytes(recovered_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered_body.as_ref(),
+        &part_payload[range_start as usize..=range_end as usize]
+    );
+
+    for (put, payload_len) in [
+        (&manifest_put, manifest_bytes.len()),
+        (&part_put, part_payload.len()),
+    ] {
+        let missing_chunks = {
+            let store = read_store(&target, "tests.map_file.target.verify_cache").await;
+            store
+                .missing_chunks_for_manifest_range(&put.manifest_hash, 0, payload_len)
+                .await
+                .unwrap()
+        };
+        assert!(missing_chunks.is_empty());
+    }
+    assert!(
+        target
+            .cluster
+            .lock()
+            .await
+            .subjects_for_node(target.node_id)
+            .is_empty()
+    );
+
+    handle.abort();
+    let _ = handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+run_on_main_metadata_backends!(
+    logical_map_file_read_through_fetches_missing_chunks_impl,
+    logical_map_file_read_through_fetches_missing_chunks,
+    logical_map_file_read_through_fetches_missing_chunks_turso
+);
+
+async fn map_dataset_import_invalidation_clears_mbtiles_failure_backoff_impl(
+    backend: MainTestBackend,
+) {
+    let state = build_test_state(1, false, backend).await;
+    let manifest_key = "sys/maps/freshly-imported.mbtiles.manifest.json";
+    state
+        .storage
+        .mbtiles_source_initialization_failures
+        .lock()
+        .await
+        .insert(
+            manifest_key.to_string(),
+            super::CachedMbtilesSourceInitializationFailure {
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10),
+                message: "manifest was still being imported".to_string(),
+            },
+        );
+
+    super::map_dataset_import::invalidate_cached_mbtiles_source(&state, manifest_key).await;
+
+    assert!(
+        !state
+            .storage
+            .mbtiles_source_initialization_failures
+            .lock()
+            .await
+            .contains_key(manifest_key),
+        "an import invalidation must clear its matching initialization backoff"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    map_dataset_import_invalidation_clears_mbtiles_failure_backoff_impl,
+    map_dataset_import_invalidation_clears_mbtiles_failure_backoff,
+    map_dataset_import_invalidation_clears_mbtiles_failure_backoff_turso
+);
+
 async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
     backend: MainTestBackend,
 ) {
@@ -18700,6 +19241,7 @@ async fn read_through_fetch_serves_object_without_declaring_local_replica_impl(
         cluster.register_node(super::cluster::NodeDescriptor {
             node_id: source.node_id,
             hostname: None,
+            software_version: None,
             reachability: test_node_reachability(
                 Some(peer_base_url.as_str()),
                 Some(peer_base_url.as_str()),
@@ -18864,6 +19406,7 @@ async fn read_through_range_fetch_serves_partial_content_without_declaring_local
         cluster.register_node(super::cluster::NodeDescriptor {
             node_id: source.node_id,
             hostname: None,
+            software_version: None,
             reachability: test_node_reachability(
                 Some(peer_base_url.as_str()),
                 Some(peer_base_url.as_str()),
@@ -19929,6 +20472,7 @@ async fn build_test_state(
     service.register_node(cluster::NodeDescriptor {
         node_id: local_node_id,
         hostname: None,
+        software_version: None,
         reachability: test_node_reachability(
             Some("http://127.0.0.1:39080"),
             Some("https://127.0.0.1:49080"),
@@ -19951,6 +20495,7 @@ async fn build_test_state(
         service.register_node(cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
             hostname: None,
+            software_version: None,
             reachability: test_node_reachability(
                 Some("http://127.0.0.1:9"),
                 Some("https://127.0.0.1:10009"),
@@ -20018,10 +20563,17 @@ async fn build_test_state(
             )),
             map_perf_logging_enabled: false,
             map_glyphs_root: super::web_maps::resolve_map_glyphs_root(None),
+            map_configuration_read_through_backoff: Arc::new(Mutex::new(None)),
+            map_configuration_load_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             mbtiles_sources: Arc::new(tokio::sync::RwLock::new(HashMap::<
                 String,
                 Arc<super::web_maps::LogicalMbtilesSource>,
             >::new())),
+            mbtiles_source_initialization_locks: Arc::new(Mutex::new(HashMap::new())),
+            mbtiles_source_initialization_failures: Arc::new(Mutex::new(HashMap::new())),
+            mbtiles_blocking_permits: Arc::new(tokio::sync::Semaphore::new(
+                super::MBTILES_BLOCKING_MAX_CONCURRENCY,
+            )),
             last_gc_pass: Arc::new(std::sync::Mutex::new(None)),
         },
         access: super::ServerAccessRuntime {
@@ -20104,6 +20656,10 @@ async fn build_test_state(
         maintenance: super::ServerMaintenanceRuntime {
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_repair_status: Arc::new(Mutex::new(StartupRepairStatus::Scheduled)),
+            repair_execution_gate: Arc::new(super::RepairExecutionGate::default()),
+            manual_local_repair_request_admission: Arc::new(super::Semaphore::new(1)),
+            manual_cluster_repair_request_admission: Arc::new(super::Semaphore::new(1)),
+            peer_repair_request_admission: Arc::new(super::Semaphore::new(1)),
             repair_state: Arc::new(Mutex::new(RepairExecutorState::default())),
             content_repair_claims: Arc::new(crate::ContentRepairClaims::default()),
             content_repair_notify: Arc::new(tokio::sync::Notify::new()),
@@ -20142,6 +20698,8 @@ async fn build_test_state(
             batch_size: 32,
             max_retries: 3,
             backoff_secs: 0,
+            execution_timeout_secs: super::DEFAULT_REPAIR_EXECUTION_TIMEOUT_SECS,
+            subject_inspection_timeout_secs: super::DEFAULT_REPAIR_SUBJECT_INSPECTION_TIMEOUT_SECS,
             startup_repair_enabled: true,
             startup_repair_delay_secs: 0,
             busy_throttle_enabled: false,
@@ -20162,30 +20720,35 @@ async fn build_test_state(
     };
 
     if seed_gap {
-        let put = {
-            let mut locked = store.write("tests.store").await;
-            locked
-                .put_object_versioned(
-                    "startup-gap-key",
-                    bytes::Bytes::from_static(b"payload"),
-                    PutOptions {
-                        parent_version_ids: Vec::new(),
-                        state: VersionConsistencyState::Confirmed,
-                        inherit_preferred_parent: true,
-                        create_snapshot: true,
-                        explicit_version_id: None,
-                    },
-                )
-                .await
-                .unwrap()
-        };
-
-        let mut cluster = state.cluster.lock().await;
-        cluster.note_replica("startup-gap-key", local_node_id);
-        cluster.note_replica(format!("startup-gap-key@{}", put.version_id), local_node_id);
+        seed_test_replication_gap(&state, "startup-gap-key").await;
     }
 
     state
+}
+
+async fn seed_test_replication_gap(state: &ServerState, key: &str) -> String {
+    let put = {
+        let mut locked = state.store.write("tests.store").await;
+        locked
+            .put_object_versioned(
+                key,
+                bytes::Bytes::from_static(b"payload"),
+                PutOptions {
+                    parent_version_ids: Vec::new(),
+                    state: VersionConsistencyState::Confirmed,
+                    inherit_preferred_parent: true,
+                    create_snapshot: true,
+                    explicit_version_id: None,
+                },
+            )
+            .await
+            .unwrap()
+    };
+
+    let mut cluster = state.cluster.lock().await;
+    cluster.note_replica(key, state.node_id);
+    cluster.note_replica(format!("{key}@{}", put.version_id), state.node_id);
+    put.version_id
 }
 
 #[tokio::test]
@@ -20538,6 +21101,7 @@ async fn repair_activity_payload_includes_live_log_for_active_run_impl(backend: 
         super::RepairRunTrigger::ManualRequest,
     )
     .await;
+    tracker.set_phase(super::RepairActiveRunPhase::Running);
 
     let activity = tokio::time::timeout(
         Duration::from_millis(250),
@@ -20566,6 +21130,10 @@ async fn repair_activity_payload_includes_live_log_for_active_run_impl(backend: 
     assert_eq!(activity.state, super::RepairActivityState::Running);
     assert_eq!(activity.active_runs.len(), 1);
     assert_eq!(activity.active_runs[0].run_id, tracker.run_id);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Running
+    );
     assert_eq!(
         activity.active_runs[0].last_log_at_unix,
         Some(1_900_000_000)
@@ -20691,6 +21259,28 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
         repair.pending_subjects.insert("photos/a.jpg".to_string());
         repair.active = true;
     }
+    let active_repair = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let queued_repair = tokio::spawn({
+        let gate = Arc::clone(&state.maintenance.repair_execution_gate);
+        async move { gate.acquire(super::RepairExecutionPriority::Manual).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual repair should become visible in the executor queue");
 
     let snapshot = super::local_task_queue_snapshot(&state, false).await;
 
@@ -20711,7 +21301,7 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
         .iter()
         .find(|queue| queue.id == "replication_repair")
         .expect("repair queue should be present");
-    assert_eq!(repair.pending, 2);
+    assert_eq!(repair.pending, 3);
     assert_eq!(repair.active, 1);
 
     let first_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
@@ -20722,6 +21312,9 @@ async fn task_queue_snapshot_reports_observed_work_without_blocking_it() {
     let cached_cluster_snapshot = super::cached_cluster_task_queue_snapshot(&state).await;
     assert_eq!(cached_cluster_snapshot, first_cluster_snapshot);
 
+    queued_repair.abort();
+    let _ = queued_repair.await;
+    drop(active_repair);
     cleanup_test_state(&state).await;
 }
 
@@ -20816,6 +21409,7 @@ async fn register_online_source_node(
     cluster.register_node(super::cluster::NodeDescriptor {
         node_id: source.node_id,
         hostname: None,
+        software_version: None,
         reachability: test_node_reachability(Some(peer_base_url), Some(peer_base_url), false),
         capabilities: super::cluster::NodeCapabilities {
             public_api: true,
@@ -21316,6 +21910,10 @@ async fn rendezvous_presence_registration_includes_unique_direct_candidates() {
         transport_sdk::PeerIdentity::Node(state.node_id)
     );
     assert_eq!(
+        registration.software_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
         registration.public_direct_urls,
         vec!["https://public.example".to_string()]
     );
@@ -21417,6 +22015,7 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
             cluster_id: uuid::Uuid::now_v7(),
             identity: transport_sdk::PeerIdentity::Node(NodeId::new_v4()),
             hostname: Some("edge-a".to_string()),
+            software_version: Some("2.0.1".to_string()),
             public_api_url: Some("https://public.example/".to_string()),
             public_direct_urls: vec!["https://public.example/".to_string()],
             peer_api_url: Some("https://internal.example/".to_string()),
@@ -21450,6 +22049,7 @@ async fn rendezvous_presence_entry_projects_into_node_descriptor() {
     assert_eq!(descriptor.public_api_url(), Some("https://public.example"));
     assert_eq!(descriptor.peer_api_url(), Some("https://internal.example"));
     assert_eq!(descriptor.hostname.as_deref(), Some("edge-a"));
+    assert_eq!(descriptor.software_version.as_deref(), Some("2.0.1"));
     assert_eq!(descriptor.public_api_urls(), vec!["https://public.example"]);
     assert_eq!(descriptor.peer_api_urls(), vec!["https://internal.example"]);
     assert!(descriptor.capabilities.public_api);
@@ -21473,6 +22073,7 @@ async fn rendezvous_presence_entry_projects_direct_quic_only_node_descriptor() {
             cluster_id: uuid::Uuid::now_v7(),
             identity: transport_sdk::PeerIdentity::Node(node_id),
             hostname: None,
+            software_version: Some("2.0.1".to_string()),
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: None,
@@ -21492,6 +22093,7 @@ async fn rendezvous_presence_entry_projects_direct_quic_only_node_descriptor() {
         .expect("direct QUIC presence entry should project into a node descriptor");
 
     assert_eq!(descriptor.node_id, node_id);
+    assert_eq!(descriptor.software_version.as_deref(), Some("2.0.1"));
     assert_eq!(descriptor.peer_api_url(), None);
     assert_eq!(
         descriptor.reachability.peer_direct_candidates,
@@ -21529,6 +22131,7 @@ async fn backfill_cluster_nodes_from_replica_rows_preserves_existing_descriptors
     let existing = cluster::NodeDescriptor {
         node_id: remote_a,
         hostname: None,
+        software_version: None,
         reachability: test_node_reachability(
             Some("https://public.example"),
             Some("https://internal.example"),
@@ -21584,6 +22187,7 @@ async fn register_node_uses_structured_reachability_payload() {
             Path(node_id.to_string()),
             Json(super::RegisterNodeRequest {
                 hostname: Some("edge-a".to_string()),
+                software_version: Some("2.0.1".to_string()),
                 reachability: test_node_reachability(
                     Some("https://public.example"),
                     Some("https://internal.example"),
@@ -21617,6 +22221,7 @@ async fn register_node_uses_structured_reachability_payload() {
     assert_eq!(node.public_api_url(), Some("https://public.example"));
     assert_eq!(node.peer_api_url(), Some("https://internal.example"));
     assert_eq!(node.hostname.as_deref(), Some("edge-a"));
+    assert_eq!(node.software_version.as_deref(), Some("2.0.1"));
     assert!(node.relay_required());
     assert!(node.relay_capable());
     assert_eq!(node.capacity_bytes, 100);
@@ -21633,6 +22238,7 @@ async fn register_node_uses_structured_reachability_payload() {
     assert_eq!(persisted.public_api_url(), Some("https://public.example"));
     assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
     assert_eq!(persisted.hostname.as_deref(), Some("edge-a"));
+    assert_eq!(persisted.software_version.as_deref(), Some("2.0.1"));
     assert!(persisted.relay_required());
 
     cleanup_test_state(&state).await;
@@ -21646,6 +22252,7 @@ async fn rendezvous_presence_entry_projects_relay_only_node_descriptor() {
             cluster_id: uuid::Uuid::now_v7(),
             identity: transport_sdk::PeerIdentity::Node(node_id),
             hostname: None,
+            software_version: None,
             public_api_url: None,
             public_direct_urls: Vec::new(),
             peer_api_url: None,
@@ -21679,6 +22286,7 @@ async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
             cluster_id: state.cluster_id,
             identity: transport_sdk::PeerIdentity::Node(node_id),
             hostname: Some("edge-a".to_string()),
+            software_version: Some("2.0.1".to_string()),
             public_api_url: Some("https://public.example".to_string()),
             public_direct_urls: vec!["https://public.example".to_string()],
             peer_api_url: Some("https://internal.example".to_string()),
@@ -21714,25 +22322,25 @@ async fn rendezvous_presence_entries_persist_discovered_cluster_nodes() {
     assert_eq!(persisted.public_api_url(), Some("https://public.example"));
     assert_eq!(persisted.peer_api_url(), Some("https://internal.example"));
     assert_eq!(persisted.hostname.as_deref(), Some("edge-a"));
+    assert_eq!(persisted.software_version.as_deref(), Some("2.0.1"));
 
     entry.registration.hostname = None;
+    entry.registration.software_version = None;
     assert_eq!(
         super::apply_rendezvous_presence_entries(&state, std::slice::from_ref(&entry)).await,
         0,
-        "an older peer without hostname support must not erase known display metadata"
+        "an older peer without display metadata support must not erase known values"
     );
     let persisted_nodes = {
         let store = read_store(&state, "tests.load_cluster_nodes_after_legacy_discovery").await;
         store.load_cluster_nodes().await.unwrap()
     };
-    assert_eq!(
-        persisted_nodes
-            .into_iter()
-            .find(|node| node.node_id == node_id)
-            .and_then(|node| node.hostname)
-            .as_deref(),
-        Some("edge-a")
-    );
+    let persisted = persisted_nodes
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .expect("discovered node should remain persisted");
+    assert_eq!(persisted.hostname.as_deref(), Some("edge-a"));
+    assert_eq!(persisted.software_version.as_deref(), Some("2.0.1"));
 
     cleanup_test_state(&state).await;
 }
@@ -21750,6 +22358,7 @@ async fn remove_node_persists_forget_to_cluster_state() {
         let _ = cluster.register_node(cluster::NodeDescriptor {
             node_id,
             hostname: None,
+            software_version: None,
             reachability: test_node_reachability(
                 Some("https://public.example"),
                 Some("https://internal.example"),
@@ -21807,6 +22416,7 @@ async fn resolve_peer_base_url_prefers_internal_url() {
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         hostname: None,
+        software_version: None,
         reachability: test_node_reachability(
             Some("https://public.example"),
             Some("https://internal.example"),
@@ -21839,6 +22449,7 @@ async fn resolve_peer_base_url_rejects_missing_direct_candidates() {
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         hostname: None,
+        software_version: None,
         reachability: cluster::NodeReachability::default(),
         capabilities: cluster::NodeCapabilities::default(),
         labels: HashMap::new(),
@@ -21867,6 +22478,7 @@ async fn resolve_peer_base_url_rejects_public_api_only_candidate() {
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         hostname: None,
+        software_version: None,
         reachability: test_node_reachability(Some("https://public.example"), None, false),
         capabilities: cluster::NodeCapabilities {
             public_api: true,
@@ -22174,8 +22786,1683 @@ run_on_main_metadata_backends!(
     tracked_local_replication_repair_persists_history_turso
 );
 
+#[tokio::test]
+async fn timed_out_replication_export_finishes_run_and_releases_executor() {
+    const GAP_KEY: &str = "repair-timeout-gap-key";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::replication::block_replication_export_for_test(GAP_KEY);
+
+    let repair = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::execute_tracked_local_replication_repair(
+                &state,
+                None,
+                super::RepairRunTrigger::ManualRequest,
+                None,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
+        .await
+        .expect("repair should reach the blocked bundle export");
+
+    let report = tokio::time::timeout(Duration::from_secs(5), repair)
+        .await
+        .expect("blocked repair should respect its execution deadline")
+        .expect("repair task should not panic");
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.timed_out);
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(GAP_KEY);
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("repair activity should remain readable after timeout");
+    assert!(activity.active_runs.is_empty());
+    let timeout_record = repair_run_history(&state)
+        .await
+        .into_iter()
+        .find(|record| record.status == super::RepairRunStatus::TimedOut)
+        .expect("timed-out repair should be retained as a terminal run");
+    let events = timeout_record
+        .report
+        .as_ref()
+        .and_then(|report| report.get("detailed_log"))
+        .and_then(serde_json::Value::as_array)
+        .expect("timed-out repair should retain its progress log");
+    assert!(events.iter().any(|entry| {
+        entry.get("event").and_then(serde_json::Value::as_str) == Some("subject_evaluated")
+    }));
+    assert!(events.iter().any(|entry| {
+        entry.get("event").and_then(serde_json::Value::as_str) == Some("repair_run_timed_out")
+    }));
+
+    let follow_up = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::execute_tracked_targeted_local_manifest_repair(
+            &state,
+            Vec::new(),
+            super::RepairRunTrigger::ManualRequest,
+        ),
+    )
+    .await
+    .expect("a timed-out repair must release the executor for a later run");
+    assert_eq!(follow_up.run_status(), super::RepairRunStatus::Completed);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_report_retains_partial_transfer_counters() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+    super::with_active_repair_log_tracking(&tracker, async {
+        let mut log = Vec::new();
+        super::replication::push_repair_log_entry(
+            &mut log,
+            state.node_id,
+            "target_push_started",
+            "first transfer started",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(NodeId::new_v4()),
+            Some(serde_json::json!({"attempted_transfers": 1})),
+        );
+        super::replication::push_repair_log_entry(
+            &mut log,
+            state.node_id,
+            "target_push_completed",
+            "first transfer completed",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(NodeId::new_v4()),
+            None,
+        );
+        super::replication::push_repair_log_entry(
+            &mut log,
+            state.node_id,
+            "target_push_started",
+            "second transfer started",
+            None,
+            None,
+            None,
+            Some(state.node_id),
+            Some(NodeId::new_v4()),
+            Some(serde_json::json!({"attempted_transfers": 2})),
+        );
+        super::replication::push_repair_skipped_detail(
+            &mut Vec::new(),
+            state.node_id,
+            "deferred-subject".to_string(),
+            Some("deferred-key".to_string()),
+            None,
+            None,
+            Some(state.node_id),
+            super::replication::ReplicationRepairSkipReason::BackoffActive,
+            "retry backoff remains active",
+        );
+    })
+    .await;
+
+    let report = super::timed_out_repair_report(&state, &tracker, 17);
+    assert_eq!(report.attempted_transfers, 2);
+    assert_eq!(report.successful_transfers, 1);
+    assert_eq!(report.failed_transfers, 0);
+    assert_eq!(report.skipped_backoff, 1);
+    assert_eq!(report.skipped_details.len(), 1);
+    assert_eq!(report.skipped_details[0].subject, "deferred-subject");
+    assert_eq!(
+        report.skipped_details[0].reason,
+        super::replication::ReplicationRepairSkipReason::BackoffActive
+    );
+    assert_eq!(
+        report.last_error.as_deref(),
+        Some("repair execution timed out after 17 seconds")
+    );
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+
+    drop(tracker);
+    cleanup_test_state(&state).await;
+}
+
+#[test]
+fn timeout_progress_flags_remain_monotonic_across_a_baseline() {
+    let baseline = super::RepairActiveRunProgress {
+        had_chunk_progress: true,
+        waiting_for_source: true,
+        unresolved: true,
+        ..Default::default()
+    };
+    let progress = baseline.clone();
+    let mut report = super::replication::ReplicationRepairReport::timed_out(NodeId::new_v4(), 17);
+
+    progress.apply_delta_to_report(&baseline, &mut report);
+
+    assert!(report.had_chunk_progress);
+    assert!(report.waiting_for_source);
+    assert!(report.unresolved);
+}
+
+#[test]
+fn repair_in_progress_skip_does_not_rollback_an_unrelated_transfer() {
+    let node_id = NodeId::new_v4();
+    let mut progress = super::RepairActiveRunProgress {
+        attempted_transfers: 2,
+        ..Default::default()
+    };
+    progress.record_skipped_item(&super::replication::ReplicationRepairSkippedItem {
+        report_node_id: node_id,
+        subject: "manifest:claimed".to_string(),
+        key: None,
+        version_id: None,
+        source_node_id: None,
+        target_node_id: Some(node_id),
+        reason: super::replication::ReplicationRepairSkipReason::RepairInProgress,
+        detail: "another operation owns the manifest".to_string(),
+    });
+
+    assert_eq!(progress.attempted_transfers, 2);
+    assert_eq!(progress.skipped_items, 1);
+
+    progress.rollback_attempted_transfer();
+    assert_eq!(progress.attempted_transfers, 1);
+}
+
+#[tokio::test]
+async fn timed_out_report_uses_monotonic_cursor_after_live_log_truncation() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Cluster,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+
+    super::with_active_repair_log_tracking(&tracker, async {
+        let mut log = Vec::new();
+        for index in 0..2 {
+            super::replication::push_repair_log_entry(
+                &mut log,
+                state.node_id,
+                "before_local_phase",
+                format!("entry {index}"),
+                None,
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                None,
+            );
+        }
+    })
+    .await;
+    let cursor = super::repair_live_log_cursor(&tracker);
+    let baseline = super::repair_progress_snapshot(&tracker);
+
+    super::with_active_repair_log_tracking(&tracker, async {
+        let mut log = Vec::new();
+        for index in 0..(super::ACTIVE_REPAIR_LIVE_LOG_LIMIT + 1) {
+            super::replication::push_repair_log_entry(
+                &mut log,
+                state.node_id,
+                "local_phase_progress",
+                format!("entry {index}"),
+                None,
+                None,
+                None,
+                None,
+                Some(state.node_id),
+                None,
+            );
+        }
+    })
+    .await;
+
+    let report = super::timed_out_repair_report_since(&state, &tracker, cursor, &baseline, 17);
+    assert_eq!(
+        report
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "local_phase_progress")
+            .count(),
+        super::ACTIVE_REPAIR_LIVE_LOG_LIMIT,
+        "every still-retained local phase entry should survive the timeout splice"
+    );
+    assert_eq!(
+        report
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "repair_run_timed_out")
+            .count(),
+        1
+    );
+
+    drop(tracker);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn dropped_repair_tracker_removes_its_active_run() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+    let run_id = tracker.run_id.clone();
+    let activity = Arc::clone(&state.maintenance.repair_activity);
+    let locked_activity = activity.lock().await;
+
+    drop(tracker);
+    assert!(
+        locked_activity
+            .active_runs
+            .iter()
+            .any(|active_run| active_run.run_id == run_id)
+    );
+    drop(locked_activity);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if activity
+                .lock()
+                .await
+                .active_runs
+                .iter()
+                .all(|active_run| active_run.run_id != run_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping a tracker should remove its active repair entry");
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn repair_activity_reports_executor_queue_depth() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    *state.maintenance.startup_repair_status.lock().await = StartupRepairStatus::Disabled;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Local,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+    tracker.set_phase(super::RepairActiveRunPhase::Queued);
+    let waiter = tokio::spawn({
+        let gate = Arc::clone(&state.maintenance.repair_execution_gate);
+        async move { gate.acquire(super::RepairExecutionPriority::Manual).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual repair should become visible in the executor queue");
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("repair activity should be readable");
+    assert_eq!(activity.state, super::RepairActivityState::Scheduled);
+    assert_eq!(activity.queued_manual_repairs, 1);
+    assert_eq!(activity.queued_automatic_repairs, 0);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Queued
+    );
+
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(
+        repair.pending, 1,
+        "a tracked waiter must only be counted once"
+    );
+    assert_eq!(repair.active, 0, "a queued run is not executing yet");
+
+    waiter.abort();
+    drop(tracker);
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn cluster_tracker_runs_peer_phase_after_local_executor_timeout() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    *state.maintenance.startup_repair_status.lock().await = StartupRepairStatus::Disabled;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let tracker = super::begin_repair_run_tracking(
+        &state,
+        super::replication::ReplicationRepairScope::Cluster,
+        super::RepairRunTrigger::ManualRequest,
+    )
+    .await;
+
+    let (_, report) = super::execute_serialized_local_replication_repair_phase(
+        &state,
+        None,
+        None,
+        Some(&tracker.run_id),
+        super::RepairRunTrigger::ManualRequest,
+        Some(&tracker),
+        tokio::time::Instant::now() + Duration::from_millis(10),
+    )
+    .await;
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("cluster peer phase activity should remain visible");
+    assert_eq!(activity.state, super::RepairActivityState::Running);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Running
+    );
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(repair.pending, 0);
+    assert_eq!(repair.active, 1);
+
+    drop(tracker);
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn startup_executor_wait_is_counted_once() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    super::spawn_startup_replication_repair(state.clone(), 0);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup repair should wait on the executor");
+
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(
+        repair.pending, 1,
+        "startup repair must only be counted once"
+    );
+    assert_eq!(repair.active, 0);
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("startup repair activity should be readable");
+    assert_eq!(activity.state, super::RepairActivityState::Scheduled);
+    assert_eq!(activity.active_runs.len(), 1);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Queued
+    );
+
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = *state.maintenance.startup_repair_status.lock().await;
+            let active_runs_empty = state
+                .maintenance
+                .repair_activity
+                .lock()
+                .await
+                .active_runs
+                .is_empty();
+            if status != StartupRepairStatus::Scheduled
+                && status != StartupRepairStatus::Running
+                && active_runs_empty
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup repair should finish after the executor is released");
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn startup_executor_wait_uses_absolute_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    super::spawn_startup_replication_repair(state.clone(), 0);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = *state.maintenance.startup_repair_status.lock().await;
+            let active_runs_empty = state
+                .maintenance
+                .repair_activity
+                .lock()
+                .await
+                .active_runs
+                .is_empty();
+            let timed_out_recorded = repair_run_history(&state).await.iter().any(|record| {
+                record.trigger == super::RepairRunTrigger::StartupRepair
+                    && record.status == super::RepairRunStatus::TimedOut
+            });
+            if status == StartupRepairStatus::TimedOut && active_runs_empty && timed_out_recorded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup repair should time out while waiting for the executor");
+
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic,
+        0,
+        "timed-out startup repair must leave no executor waiter"
+    );
+    let task_queues = super::local_task_queue_snapshot(&state, false).await;
+    let repair = task_queues
+        .queues
+        .iter()
+        .find(|queue| queue.id == "replication_repair")
+        .expect("repair queue should be present");
+    assert_eq!(repair.pending, 0);
+    assert_eq!(repair.active, 0);
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn busy_peer_cluster_scope_is_forced_local_and_waits_within_budget() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let request = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::build_internal_peer_api()
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(
+                            "/cluster/replication/repair?scope=cluster&execution_budget_millis=3000",
+                        )
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("peer repair route should respond")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer repair should queue behind active automatic work");
+
+    drop(active);
+    let response = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("queued peer repair should finish after the executor is released")
+        .expect("peer repair handler task should not panic");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "completed peer work must leave no queued waiter"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn peer_executor_wait_is_bounded_by_coordinator_budget() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=local&execution_budget_millis=100")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("peer executor wait should respect the coordinator budget")
+    .expect("peer repair route should respond");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("peer timeout response body should be readable"),
+    )
+    .expect("peer timeout response should be JSON");
+    assert_eq!(
+        body["error"],
+        "peer replication repair executor wait exceeded its execution deadline"
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "timed-out peer work must unregister its executor waiter"
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits(),
+        1,
+        "timed-out peer work must release HTTP admission"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn peer_repair_requests_share_http_admission() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+    let first = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::build_internal_peer_api()
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/cluster/replication/repair?scope=local")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("peer repair route should respond")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first peer repair should hold the HTTP admission slot");
+
+    let duplicate = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=local")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("duplicate peer repair should be shed before availability synchronization")
+    .expect("peer repair route should respond");
+    assert_eq!(duplicate.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let duplicate_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("duplicate peer response body should be readable"),
+    )
+    .expect("duplicate peer response should be JSON");
+    assert_eq!(
+        duplicate_body["error"],
+        "another peer replication repair request is already admitted"
+    );
+
+    drop(refresh_guard);
+    let first_response = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("admitted peer repair should finish after availability sync resumes")
+        .expect("peer repair handler task should not panic");
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn peer_availability_sync_uses_coordinator_execution_budget() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        super::build_internal_peer_api()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cluster/replication/repair?scope=local&execution_budget_millis=100")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            ),
+    )
+    .await
+    .expect("peer preparation should respect the local execution deadline")
+    .expect("peer repair route should respond");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("peer timeout response body should be readable"),
+    )
+    .expect("peer timeout response should be JSON");
+    assert_eq!(
+        body["error"],
+        "peer replication repair preparation exceeded its execution deadline"
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits(),
+        1,
+        "timed-out preparation must release peer admission"
+    );
+    assert!(!state.maintenance.repair_execution_gate.is_occupied());
+
+    drop(refresh_guard);
+    cleanup_test_state(&state).await;
+}
+
+#[test]
+fn repair_timeout_diagnostics_round_the_assigned_budget_up() {
+    assert_eq!(
+        super::repair_duration_budget_secs(Duration::from_millis(1_001)),
+        2
+    );
+    assert_eq!(
+        super::repair_duration_budget_secs(Duration::from_millis(1_000)),
+        1
+    );
+    assert_eq!(super::repair_duration_budget_secs(Duration::ZERO), 1);
+}
+
+#[test]
+fn legacy_repair_attempt_keys_migrate_without_prefix_ambiguity() {
+    let node_id = NodeId::new_v4();
+    let ambiguous_key = format!("inspection|foo|{node_id}");
+    let legacy = HashMap::from([(
+        ambiguous_key.clone(),
+        super::storage::RepairAttemptRecord {
+            attempts: 3,
+            last_failure_unix: 17,
+            key_version: 1,
+        },
+    )]);
+    let (legacy, migrated) = super::migrate_persisted_repair_attempts(legacy);
+    assert!(migrated);
+    assert!(legacy.contains_key(&format!("transfer|{ambiguous_key}")));
+
+    let current = HashMap::from([(
+        ambiguous_key.clone(),
+        super::storage::RepairAttemptRecord {
+            attempts: 2,
+            last_failure_unix: 11,
+            key_version: super::REPAIR_ATTEMPT_KEY_VERSION,
+        },
+    )]);
+    let (current, migrated) = super::migrate_persisted_repair_attempts(current);
+    assert!(!migrated);
+    assert!(current.contains_key(&ambiguous_key));
+}
+
+#[tokio::test]
+async fn admitted_manual_repair_takes_priority_over_peer_synchronization() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+    let peer = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::build_internal_peer_api()
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/cluster/replication/repair?scope=local")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("peer repair route should respond")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .peer_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer request should enter availability synchronization");
+
+    let manual = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+            super::replication::execute_replication_repair_public(
+                State(state),
+                headers,
+                axum::extract::Query(super::replication::ReplicationRepairQuery {
+                    batch_size: None,
+                    scope: Some(super::replication::ReplicationRepairScope::Local),
+                    execution_budget_millis: None,
+                }),
+            )
+            .await
+            .into_response()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .manual_local_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual request should be admitted independently of the peer request");
+
+    drop(refresh_guard);
+    let peer_response = tokio::time::timeout(Duration::from_secs(5), peer)
+        .await
+        .expect("peer repair should yield to the admitted manual request")
+        .expect("peer repair handler task should not panic");
+    assert_eq!(peer_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let peer_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(peer_response.into_body(), usize::MAX)
+            .await
+            .expect("peer response body should be readable"),
+    )
+    .expect("peer response should be JSON");
+    assert_eq!(
+        peer_body["error"],
+        "a manual replication repair request is already admitted"
+    );
+    let manual_response = tokio::time::timeout(Duration::from_secs(5), manual)
+        .await
+        .expect("manual repair should finish after the peer yields")
+        .expect("manual repair handler task should not panic");
+    assert_eq!(manual_response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn cluster_repair_gate_wait_uses_local_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_cluster_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("cluster repair should not wait indefinitely for the local executor");
+    assert_eq!(report.totals.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.totals.timed_out);
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "timed-out cluster repair must leave no queued waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn manual_local_repair_gate_wait_uses_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("manual local repair should not wait indefinitely for the executor");
+    assert_eq!(report.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.timed_out);
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual,
+        0,
+        "timed-out local repair must leave no queued waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn targeted_repair_gate_waits_share_the_execution_deadline() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+
+    let manifest_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_targeted_local_manifest_repair(
+            &state,
+            vec!["blocked-manifest".to_string()],
+            super::RepairRunTrigger::DataScrubAutoRepair,
+        ),
+    )
+    .await
+    .expect("targeted manifest repair should bound its executor wait");
+    assert_eq!(
+        manifest_report.run_status(),
+        super::RepairRunStatus::TimedOut
+    );
+
+    let subject_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_targeted_replication_repair(
+            &state,
+            vec!["blocked-subject".to_string()],
+            super::RepairRunTrigger::AutonomousPostWrite,
+        ),
+    )
+    .await
+    .expect("targeted subject repair should bound its executor wait");
+    assert_eq!(
+        subject_report.run_status(),
+        super::RepairRunStatus::TimedOut
+    );
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic,
+        0,
+        "timed-out targeted repairs must leave no queued waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn manual_cluster_repair_admits_only_one_waiting_request() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+    let query = super::replication::ReplicationRepairQuery {
+        batch_size: None,
+        scope: Some(super::replication::ReplicationRepairScope::Cluster),
+        execution_budget_millis: None,
+    };
+
+    let first = tokio::spawn({
+        let state = state.clone();
+        let headers = headers.clone();
+        async move {
+            super::replication::execute_replication_repair_public(
+                State(state),
+                headers,
+                axum::extract::Query(query),
+            )
+            .await
+            .into_response()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first manual request should be admitted and wait for the executor");
+
+    let duplicate = super::replication::execute_replication_repair_public(
+        State(state.clone()),
+        headers,
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Cluster),
+            execution_budget_millis: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(duplicate.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let duplicate_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("duplicate manual response body should be readable"),
+    )
+    .expect("duplicate manual response should be JSON");
+    assert_eq!(
+        duplicate_body["error"],
+        "another manual replication repair request is already admitted"
+    );
+
+    drop(active);
+    let first_response = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("admitted manual repair should finish after the executor is released")
+        .expect("manual repair handler task should not panic");
+    assert_eq!(first_response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn manual_local_repair_has_separate_admission_from_cluster_scope() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let cluster_admission = Arc::clone(&state.maintenance.manual_cluster_repair_request_admission)
+        .try_acquire_owned()
+        .expect("cluster admission should initially be available");
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+
+    let response = super::replication::execute_replication_repair_public(
+        State(state.clone()),
+        headers,
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Local),
+            execution_budget_millis: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state
+            .maintenance
+            .manual_cluster_repair_request_admission
+            .available_permits(),
+        0,
+        "the local request must not consume or release cluster admission"
+    );
+
+    drop(cluster_admission);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn manual_availability_sync_does_not_hold_repair_executor() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let refresh_guard = state
+        .maintenance
+        .local_availability_refresh_lock
+        .lock()
+        .await;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+
+    let request = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::replication::execute_replication_repair_public(
+                State(state),
+                headers,
+                axum::extract::Query(super::replication::ReplicationRepairQuery {
+                    batch_size: None,
+                    scope: Some(super::replication::ReplicationRepairScope::Local),
+                    execution_budget_millis: None,
+                }),
+            )
+            .await
+            .into_response()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .manual_local_repair_request_admission
+            .available_permits()
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manual request should hold its admission slot while availability sync waits");
+
+    let activity = super::local_repair_activity_payload(&state)
+        .await
+        .expect("manual repair activity should remain readable during preparation");
+    assert_eq!(
+        activity.active_runs.len(),
+        1,
+        "admitted manual preparation must be visible as an active repair run"
+    );
+    assert_eq!(activity.state, super::RepairActivityState::Scheduled);
+    assert_eq!(
+        activity.active_runs[0].phase,
+        super::RepairActiveRunPhase::Preparing
+    );
+
+    let executor_probe = state
+        .maintenance
+        .repair_execution_gate
+        .try_acquire()
+        .expect("availability synchronization must run outside the repair executor");
+    drop(executor_probe);
+    drop(refresh_guard);
+
+    let response = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("manual repair should finish after availability sync resumes")
+        .expect("manual repair handler task should not panic");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_audit_planning_releases_executor() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let unrelated_state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    assert_ne!(state.node_id, unrelated_state.node_id);
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::block_replication_planning_for_test(state.node_id);
+
+    let audit = tokio::spawn({
+        let state = state.clone();
+        async move { super::run_replication_audit_once(&state).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
+        .await
+        .expect("audit should reach replication planning while holding the executor");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        super::planning_replication_subjects(&unrelated_state),
+    )
+    .await
+    .expect("a node-scoped planning blocker must not stall unrelated test nodes");
+    tokio::time::timeout(Duration::from_secs(5), audit)
+        .await
+        .expect("stalled audit planning should respect the shared execution deadline")
+        .expect("audit task should not panic");
+
+    let follow_up = tokio::time::timeout(
+        Duration::from_secs(1),
+        state
+            .maintenance
+            .repair_execution_gate
+            .acquire(super::RepairExecutionPriority::Manual),
+    )
+    .await
+    .expect("timed-out audit planning must release the executor");
+    drop(follow_up);
+
+    blocker.release();
+    super::clear_replication_planning_blocker_for_test(state.node_id);
+    cleanup_test_state(&unrelated_state).await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_audit_executor_wait_leaves_no_waiter() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+
+    let audit = tokio::spawn({
+        let state = state.clone();
+        async move { super::run_replication_audit_once(&state).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background audit should wait for the active executor");
+
+    tokio::time::timeout(Duration::from_secs(3), audit)
+        .await
+        .expect("background audit executor wait should respect its execution deadline")
+        .expect("audit task should not panic");
+    assert_eq!(
+        state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .automatic,
+        0,
+        "timed-out background work must unregister its executor waiter"
+    );
+
+    drop(active);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn stalled_subject_inspection_does_not_block_later_subjects() {
+    const STALLED_KEY: &str = "a-stalled-repair-subject";
+    const LATER_KEY: &str = "z-later-repair-subject";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, STALLED_KEY).await;
+    seed_test_replication_gap(&state, LATER_KEY).await;
+    state.repair_config.execution_timeout_secs = 5;
+    state.repair_config.subject_inspection_timeout_secs = 1;
+    state.repair_config.backoff_secs = 60;
+    state.repair_config.max_retries = 0;
+    let blocker = super::replication::block_replication_export_for_test(STALLED_KEY);
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("repair should move past a subject whose inspection stalls");
+
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(STALLED_KEY);
+    assert!(report.detailed_log.iter().any(|entry| {
+        entry.event == "local_replica_inspection_failed"
+            && entry.key.as_deref() == Some(STALLED_KEY)
+    }));
+    assert!(report.detailed_log.iter().any(|entry| {
+        entry.event == "subject_evaluated" && entry.key.as_deref() == Some(LATER_KEY)
+    }));
+    assert!(
+        report.attempted_transfers > 0,
+        "the later subject should still perform actual transfer work"
+    );
+
+    let retry_blocker = super::replication::block_replication_export_for_test(STALLED_KEY);
+    let retry_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("failed inspection retry state should shed the stalled subject");
+    retry_blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(STALLED_KEY);
+    assert!(
+        retry_report.skipped_max_retries >= 1,
+        "persisted inspection failures should shed every matching stalled subject"
+    );
+    assert!(
+        retry_report.detailed_log.iter().any(|entry| {
+            entry.event == "subject_skipped"
+                && entry
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with(STALLED_KEY))
+                && entry
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get("phase"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("local_replica_inspection")
+        }),
+        "retry log: {:#?}",
+        retry_report.detailed_log
+    );
+    assert!(!retry_report.detailed_log.iter().any(|entry| {
+        entry.event == "local_replica_inspection_failed"
+            && entry
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(STALLED_KEY))
+    }));
+
+    {
+        let mut repair_state = state.maintenance.repair_state.lock().await;
+        let inspection_attempts = repair_state
+            .attempts
+            .iter_mut()
+            .filter(|(attempt_key, _)| {
+                attempt_key.starts_with(&format!("inspection|{STALLED_KEY}"))
+            })
+            .map(|(_, attempt)| attempt)
+            .collect::<Vec<_>>();
+        assert!(!inspection_attempts.is_empty());
+        for attempt in inspection_attempts {
+            attempt.last_failure_unix = 0;
+        }
+    }
+    let reset_report = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::execute_tracked_local_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("an expired inspection retry window should become retryable");
+    assert!(reset_report.detailed_log.iter().any(|entry| {
+        entry.event == "local_replica_inspection_retry_reset"
+            && entry
+                .key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(STALLED_KEY))
+    }));
+    assert!(
+        !state
+            .maintenance
+            .repair_state
+            .lock()
+            .await
+            .attempts
+            .keys()
+            .any(|attempt_key| attempt_key.starts_with(&format!("inspection|{STALLED_KEY}"))),
+        "successful inspection should clear the expired retry state"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn cancelled_peer_handler_leaves_detached_repair_to_finish() {
+    const GAP_KEY: &str = "cancelled-peer-handler-gap-key";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::replication::block_replication_export_for_test(GAP_KEY);
+    let handler = tokio::spawn(super::replication::execute_replication_repair_peer(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Local),
+            execution_budget_millis: None,
+        }),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), blocker.wait_until_started())
+        .await
+        .expect("peer repair should reach the blocked bundle export");
+
+    handler.abort();
+    assert!(
+        handler.await.is_err(),
+        "the simulated disconnected peer handler should be cancelled"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let activity = super::local_repair_activity_payload(&state)
+                .await
+                .expect("repair activity should remain readable");
+            let timed_out = repair_run_history(&state)
+                .await
+                .iter()
+                .any(|record| record.status == super::RepairRunStatus::TimedOut);
+            if activity.active_runs.is_empty() && timed_out {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached peer repair should reach a terminal timeout record");
+
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(GAP_KEY);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn queued_background_repair_refreshes_its_plan_after_acquiring_executor() {
+    const GAP_KEY: &str = "queued-audit-gap-key";
+
+    let state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    let version_id = seed_test_replication_gap(&state, GAP_KEY).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Manual)
+        .await;
+    let repair = tokio::spawn({
+        let state = state.clone();
+        async move { super::run_replication_audit_once(&state).await }
+    });
+    tokio::task::yield_now().await;
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        for node_id in cluster
+            .list_nodes()
+            .into_iter()
+            .map(|node| node.node_id)
+            .collect::<Vec<_>>()
+        {
+            cluster.note_replica(GAP_KEY, node_id);
+            cluster.note_replica(format!("{GAP_KEY}@{version_id}"), node_id);
+        }
+    }
+    drop(active);
+
+    tokio::time::timeout(Duration::from_secs(5), repair)
+        .await
+        .expect("queued background repair should finish after the executor is released")
+        .expect("background repair task should not panic");
+    assert!(
+        repair_run_history(&state).await.is_empty(),
+        "a refreshed empty plan should not create a repair run"
+    );
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn queued_cluster_repair_builds_its_plan_after_acquiring_executor() {
+    const GAP_KEY: &str = "queued-cluster-gap-key";
+
+    let state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    let active = state
+        .maintenance
+        .repair_execution_gate
+        .acquire(super::RepairExecutionPriority::Automatic)
+        .await;
+    let repair = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::execute_tracked_cluster_replication_repair(
+                &state,
+                None,
+                super::RepairRunTrigger::ManualRequest,
+                None,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state
+            .maintenance
+            .repair_execution_gate
+            .queue_snapshot()
+            .manual
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cluster repair should queue before planning");
+
+    {
+        let mut cluster = state.cluster.lock().await;
+        for node_id in cluster
+            .list_nodes()
+            .into_iter()
+            .map(|node| node.node_id)
+            .filter(|node_id| *node_id != state.node_id)
+            .collect::<Vec<_>>()
+        {
+            cluster.remove_node(node_id);
+        }
+    }
+    drop(active);
+
+    let report = tokio::time::timeout(Duration::from_secs(5), repair)
+        .await
+        .expect("cluster repair should finish after the executor is released")
+        .expect("cluster repair task should not panic");
+    assert_eq!(report.totals.attempted_transfers, 0);
+    let history = repair_run_history(&state).await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].plan_summary.item_count, 0);
+    assert_eq!(history[0].plan_summary.under_replicated, 0);
+
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn timed_out_cluster_local_phase_retains_progress_log() {
+    const GAP_KEY: &str = "cluster-timeout-gap-key";
+
+    let mut state = build_test_state(2, false, MainTestBackend::Sqlite).await;
+    seed_test_replication_gap(&state, GAP_KEY).await;
+    state.repair_config.execution_timeout_secs = 1;
+    let blocker = super::replication::block_replication_export_for_test(GAP_KEY);
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        super::execute_tracked_cluster_replication_repair(
+            &state,
+            None,
+            super::RepairRunTrigger::ManualRequest,
+            None,
+        ),
+    )
+    .await
+    .expect("cluster repair should finish after its local phase times out");
+    blocker.release();
+    super::replication::clear_replication_export_blocker_for_test(GAP_KEY);
+
+    assert_eq!(report.totals.run_status(), super::RepairRunStatus::TimedOut);
+    assert!(report.totals.detailed_log.iter().any(|entry| {
+        entry.event == "subject_evaluated" && entry.key.as_deref() == Some(GAP_KEY)
+    }));
+    assert!(
+        report
+            .totals
+            .detailed_log
+            .iter()
+            .any(|entry| entry.event == "repair_run_timed_out")
+    );
+    assert_eq!(
+        report
+            .totals
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "repair_run_timed_out")
+            .count(),
+        1,
+        "cluster local-phase timeout should be recorded exactly once"
+    );
+    assert_eq!(
+        report
+            .totals
+            .detailed_log
+            .iter()
+            .filter(|entry| entry.event == "cluster_repair_started")
+            .count(),
+        1
+    );
+
+    cleanup_test_state(&state).await;
+}
+
 async fn cluster_replication_repair_report_includes_skipped_details_impl(backend: MainTestBackend) {
-    let state = build_test_state(2, true, backend).await;
+    let mut state = build_test_state(2, true, backend).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
 
     let keys = super::planning_replication_subjects(&state).await;
     let plan = {
@@ -22203,7 +24490,7 @@ async fn cluster_replication_repair_report_includes_skipped_details_impl(backend
         let mut repair_state = state.maintenance.repair_state.lock().await;
         for (subject, target_node_id) in &expected_skips {
             repair_state.attempts.insert(
-                format!("{subject}|{target_node_id}"),
+                super::replication::transfer_attempt_key(subject, *target_node_id),
                 super::RepairAttemptEntry {
                     attempts: state.repair_config.max_retries.saturating_add(1),
                     last_failure_unix: super::unix_ts(),
@@ -22212,17 +24499,19 @@ async fn cluster_replication_repair_report_includes_skipped_details_impl(backend
         }
     }
 
-    let response = super::build_internal_peer_api()
-        .with_state(state.clone())
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/cluster/replication/repair?scope=cluster")
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("cluster repair route should respond");
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+    let response = super::replication::execute_replication_repair_public(
+        State(state.clone()),
+        headers,
+        axum::extract::Query(super::replication::ReplicationRepairQuery {
+            batch_size: None,
+            scope: Some(super::replication::ReplicationRepairScope::Cluster),
+            execution_budget_millis: None,
+        }),
+    )
+    .await
+    .into_response();
 
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -22337,6 +24626,7 @@ async fn plan_peer_transport_falls_back_to_relay_when_direct_urls_are_missing() 
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         hostname: None,
+        software_version: None,
         reachability: cluster::NodeReachability::default(),
         capabilities: cluster::NodeCapabilities {
             public_api: false,
@@ -22372,6 +24662,7 @@ async fn plan_peer_transport_uses_relay_when_required_even_with_direct_urls() {
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         hostname: None,
+        software_version: None,
         reachability: test_node_reachability(
             Some("https://public.example"),
             Some("https://internal.example"),
@@ -22411,6 +24702,7 @@ async fn plan_peer_transport_prefers_direct_quic_when_runtime_is_active() {
     let node = cluster::NodeDescriptor {
         node_id: NodeId::new_v4(),
         hostname: None,
+        software_version: None,
         reachability: cluster::NodeReachability {
             public_api_url: None,
             public_direct_urls: Vec::new(),
@@ -22470,6 +24762,7 @@ async fn execute_replication_cleanup_routes_remote_drop_through_relay() {
             let node = cluster::NodeDescriptor {
                 node_id: NodeId::new_v4(),
                 hostname: None,
+                software_version: None,
                 reachability: test_node_reachability(
                     Some("https://relay-cleanup-remote.example"),
                     Some("https://relay-cleanup-remote-internal.example"),
@@ -22713,6 +25006,7 @@ async fn execute_peer_request_reuses_warm_relay_session() {
         let node = cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
             hostname: None,
+            software_version: None,
             reachability: test_node_reachability(
                 Some("https://relay-reuse-remote.example"),
                 Some("https://relay-reuse-remote-internal.example"),
@@ -22802,6 +25096,7 @@ async fn execute_peer_request_reconnects_after_relay_session_closes() {
         let node = cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
             hostname: None,
+            software_version: None,
             reachability: test_node_reachability(
                 Some("https://relay-reconnect-remote.example"),
                 Some("https://relay-reconnect-remote-internal.example"),
@@ -23590,6 +25885,7 @@ async fn execute_peer_request_streams_object_reads_over_relay() {
         let node = cluster::NodeDescriptor {
             node_id: NodeId::new_v4(),
             hostname: None,
+            software_version: None,
             reachability: cluster::NodeReachability {
                 public_api_url: Some("https://relay-object-read-remote.example".to_string()),
                 public_direct_urls: Vec::new(),
@@ -24020,6 +26316,1245 @@ async fn rendezvous_config_view_includes_endpoint_registration_state() {
     cleanup_test_state(&state).await;
 }
 
+async fn execute_admin_control_request(
+    app: &Router,
+    method: Method,
+    path: &str,
+    admin_token: Option<&str>,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut request = Request::builder().method(method).uri(path);
+    if let Some(admin_token) = admin_token {
+        request = request.header(super::ADMIN_TOKEN_HEADER, admin_token);
+    }
+    let body = match body {
+        Some(body) => {
+            request = request.header(axum::http::header::CONTENT_TYPE, "application/json");
+            Body::from(serde_json::to_vec(&body).unwrap())
+        }
+        None => Body::empty(),
+    };
+    let response = app
+        .clone()
+        .oneshot(request.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    (status, payload)
+}
+
+async fn expect_admin_control_response(
+    app: &Router,
+    method: Method,
+    path: &str,
+    admin_token: Option<&str>,
+    body: Option<serde_json::Value>,
+    expected_status: StatusCode,
+) -> serde_json::Value {
+    let (status, payload) =
+        execute_admin_control_request(app, method, path, admin_token, body).await;
+    assert_eq!(status, expected_status, "path {path}, payload {payload}");
+    payload
+}
+
+fn test_storage_stats_sample(collected_at_unix: u64) -> super::storage::StorageStatsSample {
+    super::storage::StorageStatsSample {
+        collected_at_unix,
+        latest_snapshot_id: Some(format!("snapshot-{collected_at_unix}")),
+        latest_snapshot_created_at_unix: Some(collected_at_unix.saturating_sub(10)),
+        latest_snapshot_object_count: collected_at_unix as usize / 1_000,
+        chunk_store_bytes: collected_at_unix + 10,
+        manifest_store_bytes: collected_at_unix + 20,
+        metadata_db_bytes: collected_at_unix + 30,
+        media_cache_bytes: collected_at_unix + 40,
+        latest_snapshot_logical_bytes: collected_at_unix + 50,
+        latest_snapshot_unique_chunk_bytes: collected_at_unix + 60,
+        storage_paths: Vec::new(),
+    }
+}
+
+fn test_process_stats_sample(collected_at_unix: u64) -> super::ProcessStatsSample {
+    super::ProcessStatsSample {
+        collected_at_unix,
+        main_cpu_percent: 12.5,
+        main_memory_bytes: 512 * 1024 * 1024,
+        main_disk_read_bytes_per_sec: 4_096,
+        main_disk_write_bytes_per_sec: 2_048,
+        children_cpu_percent: 6.25,
+        children_memory_bytes: 128 * 1024 * 1024,
+        children_disk_read_bytes_per_sec: 1_024,
+        children_disk_write_bytes_per_sec: 512,
+        children_count: 1,
+        temperature_component_count: 1,
+        temperature_reporting_component_count: 1,
+        hottest_temperature_celsius: Some(68.25),
+        average_temperature_celsius: Some(68.25),
+    }
+}
+
+async fn spawn_task_queue_response_server(
+    status: StatusCode,
+    body: String,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("task queue fixture listener should bind");
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().route(
+        "/cluster/task-queues/local",
+        get(move || {
+            let body = body.clone();
+            async move { (status, body) }
+        }),
+    );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("task queue fixture should serve");
+    });
+    (base_url, handle)
+}
+
+async fn register_task_queue_test_node(
+    state: &ServerState,
+    peer_api_url: Option<&str>,
+    status: super::cluster::NodeStatus,
+) -> NodeId {
+    let node_id = NodeId::new_v4();
+    let descriptor = super::cluster::NodeDescriptor {
+        node_id,
+        hostname: None,
+        software_version: None,
+        reachability: test_node_reachability(peer_api_url, peer_api_url, false),
+        capabilities: super::cluster::NodeCapabilities {
+            public_api: peer_api_url.is_some(),
+            peer_api: peer_api_url.is_some(),
+            relay_tunnel: false,
+        },
+        labels: HashMap::new(),
+        capacity_bytes: 1_000_000,
+        free_bytes: 900_000,
+        storage_stats: None,
+        last_heartbeat_unix: 0,
+        status: status.clone(),
+    };
+    let mut cluster = state.cluster.lock().await;
+    if status == super::cluster::NodeStatus::Online {
+        cluster.register_node(descriptor);
+    } else {
+        cluster.import_nodes(vec![descriptor]);
+    }
+    node_id
+}
+
+async fn admin_control_surface_routes_round_trip_runtime_configuration_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    let admin_token = fresh_test_secret("admin-control-surface");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
+
+    let (_reload_layer, reload_handle) = tracing_subscriber::reload::Layer::<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::Registry,
+    >::new(tracing_subscriber::EnvFilter::new("info"));
+    state.runtime_log_control = super::RuntimeLogControl::with_reload_handle("info", reload_handle);
+
+    let app = super::build_server_apps(&state).public_app;
+    let logging_path = "/api/v1/auth/logging/config";
+    let direct_endpoints_path = "/api/v1/auth/direct-endpoints-config";
+    let priority_path = "/api/v1/auth/node-connection-priority";
+    let rendezvous_path = "/api/v1/auth/rendezvous-config";
+
+    for path in [
+        logging_path,
+        direct_endpoints_path,
+        priority_path,
+        rendezvous_path,
+    ] {
+        let (status, _) = execute_admin_control_request(&app, Method::GET, path, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "path {path}");
+    }
+
+    for (path, body) in [
+        (
+            logging_path,
+            serde_json::json!({ "default_level": "verbose" }),
+        ),
+        (
+            direct_endpoints_path,
+            serde_json::json!({
+                "public_urls": ["not a URL"],
+                "peer_urls": []
+            }),
+        ),
+        (
+            priority_path,
+            serde_json::json!({
+                "priority": transport_sdk::MAX_NODE_CONNECTION_PRIORITY + 1
+            }),
+        ),
+        (
+            rendezvous_path,
+            serde_json::json!({ "editable_urls": ["not a URL"] }),
+        ),
+    ] {
+        let (status, _) =
+            execute_admin_control_request(&app, Method::PUT, path, None, Some(body)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "path {path}");
+    }
+
+    let (status, logging) =
+        execute_admin_control_request(&app, Method::GET, logging_path, Some(&admin_token), None)
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(logging["filter_expression"], "info");
+    assert_eq!(logging["default_level"], "info");
+    assert_eq!(logging["directives"], serde_json::json!([]));
+    assert_eq!(logging["runtime_reconfigurable"], true);
+
+    let (status, invalid_logging) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        logging_path,
+        Some(&admin_token),
+        Some(serde_json::json!({ "default_level": "verbose" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_logging["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported log level")
+    );
+
+    let (status, logging) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        logging_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "default_level": "debug",
+            "directives": [{
+                "target": "server_node_sdk::replication",
+                "level": "trace"
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        logging["filter_expression"],
+        "debug,server_node_sdk::replication=trace"
+    );
+    assert_eq!(logging["default_level"], "debug");
+    assert_eq!(
+        logging["directives"],
+        serde_json::json!([{
+            "target": "server_node_sdk::replication",
+            "level": "trace"
+        }])
+    );
+    assert_eq!(logging["runtime_reconfigurable"], true);
+
+    let (status, invalid_direct_endpoints) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        direct_endpoints_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "public_urls": ["not a URL"],
+            "peer_urls": []
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_direct_endpoints["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid direct endpoint URL")
+    );
+
+    let (status, direct_endpoints) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        direct_endpoints_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "public_urls": [
+                " https://operator-public.example:8443/ ",
+                "https://operator-public.example:8443"
+            ],
+            "peer_urls": ["https://operator-peer.example:9443/"]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        direct_endpoints["effective_public_urls"],
+        serde_json::json!([
+            "http://127.0.0.1:39080",
+            "https://operator-public.example:8443"
+        ])
+    );
+    assert_eq!(
+        direct_endpoints["editable_public_urls"],
+        serde_json::json!(["https://operator-public.example:8443"])
+    );
+    assert_eq!(
+        direct_endpoints["effective_peer_urls"],
+        serde_json::json!([
+            "https://127.0.0.1:49080",
+            "https://operator-peer.example:9443"
+        ])
+    );
+    assert_eq!(
+        direct_endpoints["editable_peer_urls"],
+        serde_json::json!(["https://operator-peer.example:9443"])
+    );
+    assert_eq!(direct_endpoints["persistence_source"], "runtime_only");
+    assert_eq!(direct_endpoints["persisted"], false);
+
+    let (status, invalid_priority) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        priority_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "priority": transport_sdk::MAX_NODE_CONNECTION_PRIORITY + 1
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_priority["error"]
+            .as_str()
+            .unwrap()
+            .contains("node connection priority must be between")
+    );
+
+    let (status, priority) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        priority_path,
+        Some(&admin_token),
+        Some(serde_json::json!({ "priority": -7 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(priority["priority"], -7);
+    assert_eq!(
+        priority["min_priority"],
+        transport_sdk::MIN_NODE_CONNECTION_PRIORITY
+    );
+    assert_eq!(
+        priority["max_priority"],
+        transport_sdk::MAX_NODE_CONNECTION_PRIORITY
+    );
+    assert_eq!(priority["persistence_source"], "runtime_only");
+    assert_eq!(priority["persisted"], false);
+
+    let (status, invalid_rendezvous) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        rendezvous_path,
+        Some(&admin_token),
+        Some(serde_json::json!({ "editable_urls": ["not a URL"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_rendezvous["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid rendezvous URL")
+    );
+
+    let (status, rendezvous) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        rendezvous_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "editable_urls": [
+                " https://rendezvous-a.example:9443 ",
+                "https://rendezvous-a.example:9443/",
+                ""
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        rendezvous["effective_urls"],
+        serde_json::json!(["https://rendezvous-a.example:9443/"])
+    );
+    assert_eq!(
+        rendezvous["editable_urls"],
+        serde_json::json!(["https://rendezvous-a.example:9443/"])
+    );
+    assert_eq!(rendezvous["managed_embedded_url"], serde_json::Value::Null);
+    assert_eq!(rendezvous["registration_enabled"], false);
+    assert_eq!(rendezvous["persistence_source"], "runtime_only");
+    assert_eq!(rendezvous["persisted"], false);
+
+    for (path, expected) in [
+        (logging_path, logging),
+        (direct_endpoints_path, direct_endpoints),
+        (priority_path, priority),
+        (rendezvous_path, rendezvous),
+    ] {
+        let (status, actual) =
+            execute_admin_control_request(&app, Method::GET, path, Some(&admin_token), None).await;
+        assert_eq!(status, StatusCode::OK, "path {path}");
+        assert_eq!(actual, expected, "path {path}");
+    }
+
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    admin_control_surface_routes_round_trip_runtime_configuration_impl,
+    admin_control_surface_routes_round_trip_runtime_configuration,
+    admin_control_surface_routes_round_trip_runtime_configuration_turso
+);
+
+async fn admin_operations_router_exposes_s3_lifecycle_and_health_views_impl(
+    backend: MainTestBackend,
+) {
+    let mut state = build_test_state(1, false, backend).await;
+    let admin_token = fresh_test_secret("admin-operations");
+    state.access.admin_control.admin_token = Some(admin_token.clone());
+
+    {
+        let store = lock_store(&state, "tests.admin_operations.seed_storage_stats").await;
+        for collected_at_unix in [1_000, 2_000, 3_000, 4_000, 5_000] {
+            store
+                .persist_storage_stats_sample(&test_storage_stats_sample(collected_at_unix))
+                .await
+                .expect("storage stats sample should persist");
+        }
+    }
+    {
+        let mut runtime = state
+            .process_stats_runtime
+            .lock()
+            .expect("process stats runtime lock should not be poisoned");
+        runtime.push(test_process_stats_sample(1_000), Vec::new(), Vec::new(), 8);
+        runtime.push(
+            test_process_stats_sample(2_000),
+            vec![super::ChildProcessStat {
+                pid: 4_242,
+                name: "worker".to_string(),
+                cpu_percent: 6.25,
+                memory_bytes: 128 * 1024 * 1024,
+                disk_read_bytes_per_sec: 1_024,
+                disk_write_bytes_per_sec: 512,
+            }],
+            vec![super::TemperatureComponentStat {
+                label: "CPU package".to_string(),
+                temperature_celsius: Some(68.25),
+                max_celsius: Some(85.0),
+                critical_celsius: Some(100.0),
+            }],
+            8,
+        );
+    }
+
+    let app = super::build_server_apps(&state).public_app;
+    let s3_status_path = "/api/v1/auth/s3/status";
+    let s3_buckets_path = "/api/v1/auth/s3/buckets";
+    let s3_access_keys_path = "/api/v1/auth/s3/access-keys";
+    let valid_bucket_request = serde_json::json!({
+        "bucket_name": "Photos.Example",
+        "root_prefix": " /tenant/photos/ ",
+        "versioning_status": "enabled",
+        "read_only": false
+    });
+    let valid_access_key_request = serde_json::json!({
+        "description": " photos writer ",
+        "bucket_scope": ["photos.example"],
+        "prefix_scope": ["tenant/photos/inbox/"],
+        "allow_list": true,
+        "allow_read": true,
+        "allow_write": true,
+        "allow_delete": false,
+        "allow_manage": false
+    });
+
+    for (method, path, body) in [
+        (Method::GET, s3_status_path, None),
+        (Method::GET, s3_buckets_path, None),
+        (Method::GET, s3_access_keys_path, None),
+        (
+            Method::POST,
+            s3_buckets_path,
+            Some(valid_bucket_request.clone()),
+        ),
+        (
+            Method::POST,
+            s3_access_keys_path,
+            Some(valid_access_key_request.clone()),
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/auth/s3/buckets/unknown.example",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/auth/s3/access-keys/IMUNKNOWN/revoke",
+            None,
+        ),
+    ] {
+        expect_admin_control_response(&app, method, path, None, body, StatusCode::UNAUTHORIZED)
+            .await;
+    }
+
+    for bucket_name in ["ab", "-abc", ".abc", "a..b", "bad/name"] {
+        let payload = expect_admin_control_response(
+            &app,
+            Method::POST,
+            s3_buckets_path,
+            Some(&admin_token),
+            Some(serde_json::json!({ "bucket_name": bucket_name })),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("bucket_name")),
+            "bucket {bucket_name}, payload {payload}"
+        );
+    }
+
+    let initial_status = expect_admin_control_response(
+        &app,
+        Method::GET,
+        s3_status_path,
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(initial_status["listener_enabled"], false);
+    assert_eq!(initial_status["bucket_count"], 0);
+    assert_eq!(initial_status["access_key_count"], 0);
+
+    let created_bucket = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_buckets_path,
+        Some(&admin_token),
+        Some(valid_bucket_request),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(created_bucket["bucket_name"], "photos.example");
+    assert_eq!(created_bucket["root_prefix"], "tenant/photos/");
+    assert_eq!(created_bucket["versioning_status"], "enabled");
+    assert_eq!(created_bucket["read_only"], false);
+
+    let updated_bucket = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_buckets_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "bucket_name": "photos.example",
+            "root_prefix": "tenant/photos",
+            "versioning_status": "disabled",
+            "read_only": true
+        })),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(updated_bucket["bucket_name"], "photos.example");
+    assert_eq!(updated_bucket["versioning_status"], "disabled");
+    assert_eq!(updated_bucket["read_only"], true);
+
+    let conflicting_bucket = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_buckets_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "bucket_name": "videos.example",
+            "root_prefix": "tenant/photos/archive"
+        })),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert!(
+        conflicting_bucket["error"]
+            .as_str()
+            .unwrap()
+            .contains("overlaps")
+    );
+
+    let missing_permissions = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_access_keys_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "allow_list": false,
+            "allow_read": false,
+            "allow_write": false,
+            "allow_delete": false,
+            "allow_manage": false
+        })),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        missing_permissions["error"]
+            .as_str()
+            .unwrap()
+            .contains("at least one S3 permission")
+    );
+
+    let unknown_scope = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_access_keys_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "bucket_scope": ["missing.example"],
+            "allow_read": true
+        })),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(
+        unknown_scope["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown bucket")
+    );
+
+    let created_access_key = expect_admin_control_response(
+        &app,
+        Method::POST,
+        s3_access_keys_path,
+        Some(&admin_token),
+        Some(serde_json::json!({
+            "description": " photos writer ",
+            "bucket_scope": ["photos.example", "", "photos.example"],
+            "prefix_scope": [
+                "tenant/photos/inbox/",
+                " tenant/photos/archive/ ",
+                "tenant/photos/inbox/"
+            ],
+            "allow_list": true,
+            "allow_read": true,
+            "allow_write": true,
+            "allow_delete": false,
+            "allow_manage": false
+        })),
+        StatusCode::CREATED,
+    )
+    .await;
+    let access_key_id = created_access_key["access_key_id"]
+        .as_str()
+        .expect("created access key id should be returned")
+        .to_string();
+    assert!(access_key_id.starts_with("IM"));
+    assert!(
+        !created_access_key["secret_access_key"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(created_access_key["view"]["description"], "photos writer");
+    assert_eq!(
+        created_access_key["view"]["bucket_scope"],
+        serde_json::json!(["photos.example"])
+    );
+    assert_eq!(
+        created_access_key["view"]["prefix_scope"],
+        serde_json::json!(["tenant/photos/archive/", "tenant/photos/inbox/"])
+    );
+
+    let buckets = expect_admin_control_response(
+        &app,
+        Method::GET,
+        s3_buckets_path,
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(buckets.as_array().unwrap().len(), 1);
+    assert_eq!(buckets[0]["bucket_name"], "photos.example");
+
+    let access_keys = expect_admin_control_response(
+        &app,
+        Method::GET,
+        s3_access_keys_path,
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(access_keys.as_array().unwrap().len(), 1);
+    assert_eq!(access_keys[0]["access_key_id"], access_key_id);
+    assert!(access_keys[0].get("secret_access_key").is_none());
+
+    expect_admin_control_response(
+        &app,
+        Method::DELETE,
+        "/api/v1/auth/s3/buckets/unknown.example",
+        Some(&admin_token),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    expect_admin_control_response(
+        &app,
+        Method::POST,
+        "/api/v1/auth/s3/access-keys/IMUNKNOWN/revoke",
+        Some(&admin_token),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    expect_admin_control_response(
+        &app,
+        Method::POST,
+        &format!("/api/v1/auth/s3/access-keys/{access_key_id}/revoke"),
+        Some(&admin_token),
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    expect_admin_control_response(
+        &app,
+        Method::DELETE,
+        "/api/v1/auth/s3/buckets/photos.example",
+        Some(&admin_token),
+        None,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+
+    let final_status = expect_admin_control_response(
+        &app,
+        Method::GET,
+        s3_status_path,
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(final_status["bucket_count"], 0);
+    assert_eq!(final_status["access_key_count"], 0);
+    assert!(final_status["local_generation"].as_u64().unwrap() >= 4);
+
+    let operational_read_paths = [
+        "/api/v1/storage/stats/current",
+        "/api/v1/storage/stats/history?since_unix=1000&max_points=3",
+        "/api/v1/process/stats/current",
+        "/api/v1/process/stats/history?limit=1",
+        "/api/v1/process/stats/memory",
+        "/api/v1/auth/storage/pool",
+        "/api/v1/auth/storage/host/volumes",
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        "/api/v1/auth/host/dependencies",
+        "/api/v1/auth/node-certificates/status",
+        "/api/v1/auth/repair/activity",
+        "/api/v1/auth/repair/history?since_unix=1",
+        "/api/v1/auth/repair/actions",
+        "/api/v1/auth/repair/actions/activity",
+        "/api/v1/auth/repair/actions/history?since_unix=1",
+        "/api/v1/auth/scrub/activity",
+        "/api/v1/auth/scrub/history?since_unix=1",
+        "/api/v1/auth/scrub/cluster?since_unix=1",
+        "/api/v1/auth/client-connections",
+        "/api/v1/auth/data-changes",
+    ];
+    for path in operational_read_paths {
+        expect_admin_control_response(
+            &app,
+            Method::GET,
+            path,
+            None,
+            None,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+    }
+
+    let storage_current = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/storage/stats/current",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(storage_current["sample"]["collected_at_unix"], 5_000);
+    assert_eq!(storage_current["sample"]["chunk_store_bytes"], 5_010);
+    assert_eq!(storage_current["collecting"], false);
+
+    let storage_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/storage/stats/history?since_unix=1000&max_points=3",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        storage_history
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|sample| sample["collected_at_unix"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![5_000, 3_000, 1_000]
+    );
+
+    let process_current = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/process/stats/current",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(process_current["sample"]["collected_at_unix"], 2_000);
+    assert_eq!(process_current["children"][0]["name"], "worker");
+    assert_eq!(process_current["logical_cpu_count"], 8);
+
+    let process_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/process/stats/history?limit=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(process_history.as_array().unwrap().len(), 1);
+    assert_eq!(process_history[0]["collected_at_unix"], 2_000);
+
+    let process_memory = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/process/stats/memory",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(process_memory["in_flight_upload_session_count"], 0);
+    assert_eq!(process_memory["current_objects_total_count"], 0);
+
+    let storage_pool = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/storage/pool",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(storage_pool["config_path"].as_str().is_some());
+    assert!(storage_pool["config"].is_object());
+    assert!(storage_pool["paths"].is_array());
+
+    let host_volumes = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/storage/host/volumes",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(host_volumes["platform"], std::env::consts::OS);
+    assert!(host_volumes["volumes"].is_array());
+
+    let metadata_distribution = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(metadata_distribution["state"], "idle");
+    assert!(metadata_distribution["backend"].is_string());
+
+    expect_admin_control_response(
+        &app,
+        Method::POST,
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        None,
+        None,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    let metadata_distribution_trigger = expect_admin_control_response(
+        &app,
+        Method::POST,
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        Some(&admin_token),
+        None,
+        StatusCode::ACCEPTED,
+    )
+    .await;
+    assert_eq!(metadata_distribution_trigger["started"], true);
+    assert_eq!(metadata_distribution_trigger["status"]["state"], "running");
+    wait_for_condition(
+        "metadata db logical distribution analysis",
+        Duration::from_secs(5),
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .storage
+                    .metadata_db_distribution_runtime
+                    .lock()
+                    .map(|runtime| !runtime.running && runtime.distribution.is_some())
+                    .unwrap_or(false)
+            }
+        },
+    )
+    .await;
+    let metadata_distribution = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/storage/stats/metadata-db/logical",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(metadata_distribution["state"], "idle");
+    assert!(metadata_distribution["finished_at_unix"].as_u64().is_some());
+    assert!(metadata_distribution["distribution"].is_object());
+    assert_eq!(metadata_distribution["last_error"], serde_json::Value::Null);
+
+    let host_dependencies = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/host/dependencies",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(host_dependencies["host_os"], std::env::consts::OS);
+    assert!(!host_dependencies["checks"].as_array().unwrap().is_empty());
+
+    let certificate_status = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/node-certificates/status",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(certificate_status["public_tls"]["state"], "not_configured");
+    assert_eq!(
+        certificate_status["internal_tls"]["state"],
+        "not_configured"
+    );
+    assert_eq!(certificate_status["auto_renew"]["enabled"], false);
+
+    let cluster_status = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/cluster/status",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(cluster_status["total_nodes"], 1);
+
+    let cluster_nodes = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/cluster/nodes",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(cluster_nodes.as_array().unwrap().len(), 1);
+    assert_eq!(cluster_nodes[0]["node_id"], state.node_id.to_string());
+
+    let repair_activity = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/activity",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(repair_activity["state"], "scheduled");
+    assert!(
+        repair_activity["active_runs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let repair_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/history?since_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(repair_history["retention_secs"].as_u64().is_some());
+    assert!(repair_history["runs"].as_array().unwrap().is_empty());
+
+    let repair_actions = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/actions",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(repair_actions["actions"].as_array().unwrap().len(), 4);
+
+    let repair_action_activity = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/actions/activity",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(repair_action_activity["state"], "idle");
+    assert!(
+        repair_action_activity["active_runs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let repair_action_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/repair/actions/history?since_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(repair_action_history["runs"].as_array().unwrap().is_empty());
+
+    let scrub_activity = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/scrub/activity",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(scrub_activity["state"], "idle");
+    assert_eq!(scrub_activity["enabled"], true);
+
+    let scrub_history = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/scrub/history?since_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(scrub_history["runs"].as_array().unwrap().is_empty());
+
+    let scrub_cluster = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/scrub/cluster?since_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(scrub_cluster["nodes"].as_array().unwrap().len(), 1);
+    assert!(
+        scrub_cluster["skipped_nodes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(scrub_cluster["runs"].as_array().unwrap().is_empty());
+
+    let client_connections = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/client-connections?limit=1",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(client_connections["summary"].is_object());
+    assert!(client_connections["entries"].as_array().unwrap().is_empty());
+    expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/client-connections?before_connected_at_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let data_changes = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/data-changes?limit=1&path_prefix=%20%20",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(data_changes["entries"].is_array());
+    expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/auth/data-changes?before_created_at_unix=1",
+        Some(&admin_token),
+        None,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let (healthy_url, healthy_handle) = spawn_task_queue_response_server(
+        StatusCode::OK,
+        serde_json::json!({
+            "node_id": "healthy-peer",
+            "queues": [{
+                "id": "requests",
+                "label": "API requests",
+                "pending": 0,
+                "active": 1,
+                "state": "running"
+            }]
+        })
+        .to_string(),
+    )
+    .await;
+    let (invalid_url, invalid_handle) =
+        spawn_task_queue_response_server(StatusCode::OK, "not-json".to_string()).await;
+    let (error_url, error_handle) = spawn_task_queue_response_server(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable".to_string(),
+    )
+    .await;
+    for (url, expected_status) in [
+        (&healthy_url, StatusCode::OK),
+        (&invalid_url, StatusCode::OK),
+        (&error_url, StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let response = reqwest::get(format!("{url}/cluster/task-queues/local"))
+            .await
+            .expect("task queue fixture should accept HTTP requests");
+        assert_eq!(response.status(), expected_status, "fixture {url}");
+    }
+    let _healthy_id = register_task_queue_test_node(
+        &state,
+        Some(&healthy_url),
+        super::cluster::NodeStatus::Online,
+    )
+    .await;
+    let invalid_id = register_task_queue_test_node(
+        &state,
+        Some(&invalid_url),
+        super::cluster::NodeStatus::Online,
+    )
+    .await;
+    let error_id =
+        register_task_queue_test_node(&state, Some(&error_url), super::cluster::NodeStatus::Online)
+            .await;
+    let unreachable_id = register_task_queue_test_node(
+        &state,
+        Some("http://127.0.0.1:9"),
+        super::cluster::NodeStatus::Online,
+    )
+    .await;
+    let offline_id =
+        register_task_queue_test_node(&state, None, super::cluster::NodeStatus::Offline).await;
+
+    let task_queues = expect_admin_control_response(
+        &app,
+        Method::GET,
+        "/api/v1/cluster/task-queues",
+        Some(&admin_token),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        task_queues["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["node_id"] == "healthy-peer")
+    );
+    let unavailable = task_queues["unavailable_nodes"].as_array().unwrap();
+    for (node_id, expected_error) in [
+        (invalid_id, "invalid task queue response"),
+        (error_id, "task queue request returned HTTP 503"),
+        (unreachable_id, "task queue request failed"),
+        (offline_id, "node is offline"),
+    ] {
+        let entry = unavailable
+            .iter()
+            .find(|entry| entry["node_id"] == node_id.to_string())
+            .unwrap_or_else(|| panic!("missing unavailable node {node_id}: {task_queues}"));
+        assert!(
+            entry["error"].as_str().unwrap().contains(expected_error),
+            "node {node_id}, expected {expected_error}, entry {entry}, payload {task_queues}"
+        );
+    }
+
+    healthy_handle.abort();
+    invalid_handle.abort();
+    error_handle.abort();
+    let _ = healthy_handle.await;
+    let _ = invalid_handle.await;
+    let _ = error_handle.await;
+    cleanup_test_state(&state).await;
+}
+
+run_on_main_metadata_backends!(
+    admin_operations_router_exposes_s3_lifecycle_and_health_views_impl,
+    admin_operations_router_exposes_s3_lifecycle_and_health_views,
+    admin_operations_router_exposes_s3_lifecycle_and_health_views_turso
+);
+
 #[tokio::test]
 async fn local_node_connection_priority_updates_presence_labels() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
@@ -24062,6 +27597,14 @@ async fn local_node_connection_priority_updates_presence_labels() {
         0
     );
     cleanup_test_state(&state).await;
+}
+
+pub(super) async fn build_natural_earth_test_state() -> ServerState {
+    build_test_state(1, false, MainTestBackend::Sqlite).await
+}
+
+pub(super) async fn cleanup_natural_earth_test_state(state: &ServerState) {
+    cleanup_test_state(state).await;
 }
 
 async fn cleanup_test_state(state: &ServerState) {

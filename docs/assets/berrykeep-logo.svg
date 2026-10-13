@@ -1,51 +1,242 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 260" role="img" aria-labelledby="title desc">
-  <title id="title">BerryKeep logo</title>
-  <desc id="desc">The BerryKeep logo with a connected grape cluster, wordmark, and connected status line.</desc>
-  <defs>
-    <linearGradient id="panel" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#7c3aed"/>
-      <stop offset="1" stop-color="#c026d3"/>
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   viewBox="0 0 920 260"
+   role="img"
+   aria-labelledby="title desc"
+   version="1.1"
+   id="svg20"
+   sodipodi:docname="berrykeep-logo.svg"
+   inkscape:version="1.4.3 (0d15f75, 2025-12-25)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview20"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="1.5021739"
+     inkscape:cx="301.2301"
+     inkscape:cy="247.30825"
+     inkscape:window-width="2880"
+     inkscape:window-height="1694"
+     inkscape:window-x="-11"
+     inkscape:window-y="-11"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="g20" />
+  <title
+     id="title">BerryKeep logo</title>
+  <desc
+     id="desc">The BerryKeep logo with a connected grape cluster, wordmark, and connected status line.</desc>
+  <defs
+     id="defs6">
+    <linearGradient
+       id="panel"
+       x1="0"
+       y1="0"
+       x2="200"
+       y2="200"
+       gradientUnits="userSpaceOnUse">
+      <stop
+         offset="0"
+         stop-color="#7c3aed"
+         id="stop1" />
+      <stop
+         offset="1"
+         stop-color="#c026d3"
+         id="stop2" />
     </linearGradient>
-    <linearGradient id="leaf" x1="100" y1="6.24" x2="152.8" y2="37.92" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#86efac"/>
-      <stop offset="1" stop-color="#22c55e"/>
+    <linearGradient
+       id="leaf"
+       x1="100"
+       y1="6.24"
+       x2="152.8"
+       y2="37.92"
+       gradientUnits="userSpaceOnUse">
+      <stop
+         offset="0"
+         stop-color="#86efac"
+         id="stop3" />
+      <stop
+         offset="1"
+         stop-color="#22c55e"
+         id="stop4" />
     </linearGradient>
-    <linearGradient id="status-line" x1="6" y1="0" x2="520" y2="0" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#a855f7"/>
-      <stop offset="1" stop-color="#d946ef"/>
+    <linearGradient
+       id="status-line"
+       x1="6"
+       y1="0"
+       x2="520"
+       y2="0"
+       gradientUnits="userSpaceOnUse">
+      <stop
+         offset="0"
+         stop-color="#a855f7"
+         id="stop5" />
+      <stop
+         offset="1"
+         stop-color="#d946ef"
+         id="stop6" />
     </linearGradient>
   </defs>
-
-  <g transform="translate(38 30)">
-    <rect width="200" height="200" rx="44" fill="url(#panel)"/>
-    <path d="M100 22.08 Q126.4 6.24 152.8 16.8 Q140.92 37.92 113.2 37.92 Z" fill="url(#leaf)"/>
-    <line x1="100" y1="35.28" x2="100" y2="53.76" stroke="#22c55e" stroke-width="6.6" stroke-linecap="round"/>
-    <g stroke="#ffffff" stroke-width="6.6" opacity="0.85" stroke-linecap="round">
-      <line x1="100" y1="69.6" x2="57.76" y2="109.2"/>
-      <line x1="100" y1="69.6" x2="142.24" y2="109.2"/>
-      <line x1="57.76" y1="109.2" x2="142.24" y2="109.2"/>
-      <line x1="57.76" y1="109.2" x2="100" y2="162"/>
-      <line x1="142.24" y1="109.2" x2="100" y2="162"/>
+  <g
+     transform="translate(38 30)"
+     id="g16">
+    <rect
+       width="200"
+       height="200"
+       rx="44"
+       fill="url(#panel)"
+       id="rect6" />
+    <path
+       d="M100 22.08 Q126.4 6.24 152.8 16.8 Q140.92 37.92 113.2 37.92 Z"
+       fill="url(#leaf)"
+       id="path6" />
+    <line
+       x1="100"
+       y1="35.28"
+       x2="100"
+       y2="53.76"
+       stroke="#22c55e"
+       stroke-width="6.6"
+       stroke-linecap="round"
+       id="line6" />
+    <g
+       stroke="#ffffff"
+       stroke-width="6.6"
+       opacity="0.85"
+       stroke-linecap="round"
+       id="g11">
+      <line
+         x1="100"
+         y1="69.6"
+         x2="57.76"
+         y2="109.2"
+         id="line7" />
+      <line
+         x1="100"
+         y1="69.6"
+         x2="142.24"
+         y2="109.2"
+         id="line8" />
+      <line
+         x1="57.76"
+         y1="109.2"
+         x2="142.24"
+         y2="109.2"
+         id="line9" />
+      <line
+         x1="57.76"
+         y1="109.2"
+         x2="100"
+         y2="162"
+         id="line10" />
+      <line
+         x1="142.24"
+         y1="109.2"
+         x2="100"
+         y2="162"
+         id="line11" />
     </g>
-    <circle cx="100" cy="69.6" r="18.48" fill="#ffffff"/>
-    <circle cx="57.76" cy="109.2" r="18.48" fill="#ffffff"/>
-    <circle cx="142.24" cy="109.2" r="18.48" fill="#ffffff"/>
-    <circle cx="100" cy="162" r="18.48" fill="#ffffff"/>
-    <circle cx="93.4" cy="63" r="5.016" fill="#e9d5ff" opacity="0.75"/>
-    <circle cx="51.16" cy="102.6" r="5.016" fill="#e9d5ff" opacity="0.75"/>
+    <circle
+       cx="100"
+       cy="69.6"
+       r="18.48"
+       fill="#ffffff"
+       id="circle11" />
+    <circle
+       cx="57.76"
+       cy="109.2"
+       r="18.48"
+       fill="#ffffff"
+       id="circle12" />
+    <circle
+       cx="142.24"
+       cy="109.2"
+       r="18.48"
+       fill="#ffffff"
+       id="circle13" />
+    <circle
+       cx="100"
+       cy="162"
+       r="18.48"
+       fill="#ffffff"
+       id="circle14" />
+    <circle
+       cx="93.4"
+       cy="63"
+       r="5.016"
+       fill="#e9d5ff"
+       opacity="0.75"
+       id="circle15" />
+    <circle
+       cx="51.16"
+       cy="102.6"
+       r="5.016"
+       fill="#e9d5ff"
+       opacity="0.75"
+       id="circle16" />
   </g>
-
-  <g transform="translate(286 0)">
-    <text x="0" y="122" fill="#4c1d95" font-family="Space Grotesk, Segoe UI, Arial, sans-serif" font-size="94" font-weight="700" letter-spacing="-3">
+  <g
+     transform="translate(286 0)"
+     id="g20">
+    <text
+       x="0"
+       y="122"
+       fill="#4c1d95"
+       font-family="Space Grotesk, Segoe UI, Arial, sans-serif"
+       font-size="94"
+       font-weight="700"
+       letter-spacing="-3"
+       id="text16"
+       style="fill:#38ce6f;fill-opacity:1">
       BerryKeep
     </text>
-    <text x="4" y="166" fill="#a21caf" font-family="Space Grotesk, Segoe UI, Arial, sans-serif" font-size="24" font-weight="600" letter-spacing="3.4">
+    <text
+       x="4"
+       y="166"
+       fill="#a21caf"
+       font-family="Space Grotesk, Segoe UI, Arial, sans-serif"
+       font-size="24"
+       font-weight="600"
+       letter-spacing="3.4"
+       id="text17">
       DISTRIBUTED EDGE STORAGE
     </text>
-    <path d="M6 190 H520" stroke="url(#status-line)" stroke-width="6" stroke-linecap="round"/>
-    <circle cx="6" cy="190" r="6" fill="#22c55e"/>
-    <circle cx="180" cy="190" r="6" fill="#a855f7"/>
-    <circle cx="348" cy="190" r="6" fill="#d946ef"/>
-    <circle cx="520" cy="190" r="6" fill="#22c55e"/>
+    <path
+       d="M6 190 H520"
+       stroke="url(#status-line)"
+       stroke-width="6"
+       stroke-linecap="round"
+       id="path17" />
+    <circle
+       cx="6"
+       cy="190"
+       r="6"
+       fill="#22c55e"
+       id="circle17" />
+    <circle
+       cx="180"
+       cy="190"
+       r="6"
+       fill="#a855f7"
+       id="circle18" />
+    <circle
+       cx="348"
+       cy="190"
+       r="6"
+       fill="#d946ef"
+       id="circle19" />
+    <circle
+       cx="520"
+       cy="190"
+       r="6"
+       fill="#22c55e"
+       id="circle20" />
   </g>
 </svg>

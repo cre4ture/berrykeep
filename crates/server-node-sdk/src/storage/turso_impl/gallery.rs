@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use common::xmp::XmpGeoLocation;
 use tracing::warn;
-use turso::transaction::{DropBehavior, Transaction, TransactionBehavior};
+use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Value, params_from_iter};
 use uuid::Uuid;
 
@@ -25,7 +25,10 @@ use super::super::{
 };
 #[cfg(test)]
 use super::turso_test_db_path;
-use super::{TursoMetadataStore, row_string, row_u64, upsert_version_index_head_projection};
+use super::{
+    TursoMetadataStore, finish_read_transaction, row_string, row_u64,
+    upsert_version_index_head_projection,
+};
 
 const GALLERY_CHANGE_LOG_RETENTION: u64 = 100_000;
 const GALLERY_SPATIAL_BACKFILL_CHUNK_ROWS: i64 = 1_000;
@@ -342,7 +345,7 @@ async fn backfill_gallery_spatial_positions(connection: &turso::Connection) -> R
 
 impl TursoMetadataStore {
     pub(super) async fn backfill_gallery_objects(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -381,6 +384,7 @@ impl TursoMetadataStore {
                     },
                 ));
             }
+            drop(rows);
             for (key, entry) in entries {
                 upsert_gallery_object(connection, &key, &entry).await?;
             }
@@ -404,7 +408,7 @@ impl TursoMetadataStore {
         key: &str,
         entry: &CurrentObjectEntry,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -426,7 +430,7 @@ impl TursoMetadataStore {
     }
 
     pub(super) async fn remove_current_object_with_gallery(&self, key: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -454,7 +458,7 @@ impl TursoMetadataStore {
         labels: &[String],
     ) -> Result<()> {
         let labels_json = encode_gallery_labels(labels)?;
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -479,7 +483,7 @@ impl TursoMetadataStore {
         key: &str,
         location: Option<XmpGeoLocation>,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -544,7 +548,7 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(metadata)?;
         let content_fingerprint = metadata.content_fingerprint.clone();
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -578,7 +582,7 @@ impl TursoMetadataStore {
         &self,
         content_fingerprint: &str,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -609,7 +613,7 @@ impl TursoMetadataStore {
         content_fingerprint: &str,
         payload: &[u8],
     ) -> Result<bool> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -644,7 +648,7 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let total_size_bytes =
             i64::try_from(summary.total_size_bytes).context("manifest summary size overflow")?;
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -684,7 +688,7 @@ impl TursoMetadataStore {
     ) -> Result<()> {
         let payload = serde_json::to_vec_pretty(index)?;
         let head_projection = version_index_head_projection(object_id, index);
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let connection = &self.connection;
         let transaction =
             Transaction::new_unchecked(connection, TransactionBehavior::Immediate).await?;
@@ -726,7 +730,7 @@ impl TursoMetadataStore {
             query_gallery_index(&transaction, query, history_id, revision).await
         }
         .await;
-        finish_gallery_read_transaction(transaction, result).await
+        finish_read_transaction(transaction, result).await
     }
 
     pub(super) async fn query_turso_gallery_map_clusters(
@@ -767,7 +771,7 @@ impl TursoMetadataStore {
                 ))
             }
             .await;
-            finish_gallery_read_transaction(transaction, result).await?
+            finish_read_transaction(transaction, result).await?
         };
 
         let (total_entry_count, media_summary, summary_status) = self
@@ -892,7 +896,7 @@ impl TursoMetadataStore {
             query_gallery_map_cluster_entries(&transaction, query, history_id, revision).await
         }
         .await;
-        finish_gallery_read_transaction(transaction, result).await
+        finish_read_transaction(transaction, result).await
     }
 
     pub(super) async fn query_turso_gallery_delta(
@@ -907,7 +911,7 @@ impl TursoMetadataStore {
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
         let result =
             query_gallery_delta(&transaction, history_id, since_revision, limit, scope).await;
-        finish_gallery_read_transaction(transaction, result).await
+        finish_read_transaction(transaction, result).await
     }
 }
 
@@ -918,23 +922,6 @@ async fn finish_gallery_transaction<T>(
     match result {
         Ok(value) => {
             transaction.commit().await?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
-        }
-    }
-}
-
-async fn finish_gallery_read_transaction<T>(
-    mut transaction: Transaction<'_>,
-    result: Result<T>,
-) -> Result<T> {
-    match result {
-        Ok(value) => {
-            transaction.set_drop_behavior(DropBehavior::Commit);
-            transaction.finish().await?;
             Ok(value)
         }
         Err(error) => {
@@ -1138,6 +1125,7 @@ async fn refresh_gallery_objects_for_content_fingerprint(
     while let Some(row) = rows.next().await? {
         manifests.push(row_string(&row, 0, "manifest_summaries.manifest_hash")?);
     }
+    drop(rows);
     for manifest_hash in manifests {
         refresh_gallery_objects_for_manifest(connection, &manifest_hash).await?;
     }
@@ -1411,6 +1399,7 @@ async fn query_gallery_index(
         video_count: count(5, "gallery summary video")?,
         geotagged_count: count(6, "gallery summary geotagged")?,
     };
+    drop(summary_rows);
     let sort_direction = match query.captured_sort {
         GalleryIndexCapturedSort::Asc => "ASC",
         GalleryIndexCapturedSort::Desc => "DESC",
@@ -1958,7 +1947,7 @@ pub(super) async fn query_gallery_map_summary(
         })
     }
     .await;
-    finish_gallery_read_transaction(transaction, result).await
+    finish_read_transaction(transaction, result).await
 }
 
 async fn query_gallery_map_cluster_entries(
@@ -2115,6 +2104,7 @@ async fn query_gallery_delta(
         None => None,
     }
     .unwrap_or(current_revision.saturating_add(1));
+    drop(oldest_rows);
     if since_revision.saturating_add(1) < oldest_revision {
         return Ok(Err(GalleryDeltaCursorError::Expired {
             history_id: current_history_id,
@@ -2155,6 +2145,7 @@ async fn query_gallery_delta(
             row_string(&row, 6, "gallery_changes.previous_labels_json")?,
         ));
     }
+    drop(rows);
     let has_more = raw_changes.len() > limit;
     raw_changes.truncate(limit);
     let next_revision = raw_changes
@@ -3498,7 +3489,7 @@ mod tests {
             Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)
                 .await
                 .expect("gallery read transaction should begin");
-        let read_error = finish_gallery_read_transaction::<()>(
+        let read_error = finish_read_transaction::<()>(
             read_transaction,
             Err(anyhow::anyhow!("forced gallery read failure")),
         )
@@ -3520,8 +3511,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gallery_writes_share_the_turso_writer_with_other_transactions() {
-        let metadata_db_path = turso_test_db_path("gallery-shared-writer-lock");
+    async fn gallery_writes_share_the_primary_turso_connection_lock() {
+        let metadata_db_path = turso_test_db_path("gallery-shared-connection-lock");
         let store = TursoMetadataStore::open(&metadata_db_path)
             .await
             .expect("turso metadata store should open");
@@ -3534,18 +3525,21 @@ mod tests {
             RepairAttemptRecord {
                 attempts: 1,
                 last_failure_unix: 2,
+                key_version: 2,
             },
         )]);
         let credentials = ClientCredentialState::default();
 
-        let (gallery, repair, credentials) = tokio::join!(
+        let (gallery, repair, credentials, current_object) = tokio::join!(
             store.upsert_current_object_with_gallery("gallery/shared-writer.jpg", &entry),
             store.persist_repair_attempts(&attempts),
             store.persist_client_credential_state(&credentials),
+            store.get_current_object("gallery/shared-writer.jpg"),
         );
         gallery.expect("gallery write should commit");
         repair.expect("repair attempt write should commit");
         credentials.expect("client credential write should commit");
+        current_object.expect("concurrent primary-connection point read should succeed");
 
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);

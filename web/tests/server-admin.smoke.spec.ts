@@ -212,9 +212,13 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await expect(page.getByRole("button", { name: "30d", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "All", exact: true })).toBeVisible();
   await expect(page.getByRole("columnheader", { name: "Chunk Store" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Hostname" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "Version" })).toBeVisible();
   await expect(page.getByText("Latest snapshot ID:")).toBeVisible();
   await expect(page.getByText("Snapshot logical size:")).toBeVisible();
   await expect(page.getByRole("cell", { name: "node-alpha", exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("cell", { name: "edge-alpha", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "2.0.1", exact: true })).toBeVisible();
   await expect(page.locator("td").filter({ hasText: /logical/ }).first()).toBeVisible();
   await expect(page.getByRole("code").filter({ hasText: "https://node-alpha.local" })).toBeVisible();
   await expect(
@@ -529,6 +533,46 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   expect(requestedPaths).not.toContain("/health");
   expect(requestedPaths).not.toContain("/storage/stats/current");
   expect(requestedPaths).not.toContain("/auth/bootstrap-claims/issue");
+});
+
+test("server-admin preserves control-plane drafts while the initial configuration loads", async ({ page }) => {
+  let markDirectEndpointsConfigRequestStarted: () => void;
+  const directEndpointsConfigRequestStarted = new Promise<void>((resolve) => {
+    markDirectEndpointsConfigRequestStarted = resolve;
+  });
+  let releaseDirectEndpointsConfigResponse: () => void;
+  const directEndpointsConfigResponseAllowed = new Promise<void>((resolve) => {
+    releaseDirectEndpointsConfigResponse = resolve;
+  });
+  await installServerAdminMocks(page, {
+    directEndpointsConfigResponseAllowed,
+    markDirectEndpointsConfigRequestStarted: () => markDirectEndpointsConfigRequestStarted()
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByText("Control Plane", { exact: true }).click();
+  await directEndpointsConfigRequestStarted;
+  const publicUrls = page.getByRole("textbox", { name: "Additional public API URLs" });
+  const peerUrls = page.getByRole("textbox", { name: "Additional peer API URLs" });
+  const rendezvousUrls = page.getByRole("textbox", { name: "Editable operator-managed URLs" });
+  const contactUrls = page.getByRole("textbox", { name: "Rendezvous contact URLs" });
+  await publicUrls.fill("https://draft.example:8443");
+  await peerUrls.fill("https://draft.example:18443");
+  await rendezvousUrls.fill("https://draft-rendezvous.example:9443");
+  await contactUrls.fill("https://draft-contact.example:19080");
+
+  releaseDirectEndpointsConfigResponse();
+  await expect(page.locator("pre").filter({ hasText: "node-alpha.local" }).first()).toBeVisible();
+  await expect(publicUrls).toHaveValue("https://draft.example:8443");
+  await expect(peerUrls).toHaveValue("https://draft.example:18443");
+  await expect(rendezvousUrls).toHaveValue("https://draft-rendezvous.example:9443");
+  await expect(contactUrls).toHaveValue("https://draft-contact.example:19080");
 });
 
 test("server-admin mobile drawer is available only when its navigation is available", async ({ page }) => {
@@ -2014,6 +2058,8 @@ async function installServerAdminMocks(
     mapConfiguration?: GalleryMapConfiguration;
     mapConfigurationStatus?: number;
     legacyGalleryMapApiOnly?: boolean;
+    directEndpointsConfigResponseAllowed?: Promise<void>;
+    markDirectEndpointsConfigRequestStarted?: () => void;
   }
 ) {
   const imageBody = tinyPngBuffer();
@@ -2727,6 +2773,8 @@ async function installServerAdminMocks(
       return json(route, [
         {
           node_id: "node-alpha",
+          hostname: "edge-alpha",
+          software_version: "2.0.1",
           reachability: {
             public_api_url: "https://node-alpha.local",
             peer_api_url: "https://node-alpha-peer.local",
@@ -2759,6 +2807,8 @@ async function installServerAdminMocks(
         },
         {
           node_id: "node-beta",
+          hostname: "edge-beta",
+          software_version: "2.0.0",
           reachability: {
             public_api_url: null,
             peer_api_url: null,
@@ -2802,6 +2852,7 @@ async function installServerAdminMocks(
             scope: "local",
             trigger: "background_audit",
             started_at_unix: 1_900_000_001,
+            phase: "running",
             last_log_at_unix: 1_900_000_009,
             live_log_truncated: false,
             live_log: [
@@ -3470,6 +3521,8 @@ async function installServerAdminMocks(
         await route.fulfill({ status: 401 });
         return;
       }
+      options?.markDirectEndpointsConfigRequestStarted?.();
+      await options?.directEndpointsConfigResponseAllowed;
       return json(route, directEndpointsConfig);
     }
 

@@ -722,6 +722,8 @@ mod tests {
         for _ in 0..120 {
             if let Ok(response) = http
                 .get(format!("https://{bind}/auth/admin/session"))
+                .header(reqwest::header::CONNECTION, "close")
+                .timeout(Duration::from_secs(2))
                 .send()
                 .await
                 && response.status() == StatusCode::OK

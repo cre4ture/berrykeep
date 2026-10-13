@@ -3977,6 +3977,7 @@ async fn persist_and_load_repair_attempts_roundtrip_impl(backend: StorageTestBac
         RepairAttemptRecord {
             attempts: 2,
             last_failure_unix: 123,
+            key_version: 2,
         },
     );
 
@@ -3986,6 +3987,7 @@ async fn persist_and_load_repair_attempts_roundtrip_impl(backend: StorageTestBac
     let entry = loaded.get("subject@version|node").unwrap();
     assert_eq!(entry.attempts, 2);
     assert_eq!(entry.last_failure_unix, 123);
+    assert_eq!(entry.key_version, 2);
 
     let _ = fs::remove_dir_all(root).await;
 }
@@ -7937,8 +7939,9 @@ async fn persist_and_load_cluster_replica_views_roundtrip_impl(backend: StorageT
         .await
         .unwrap();
 
-    assert_eq!(store.load_cluster_replicas().await.unwrap(), replicas);
-    assert_eq!(store.load_cluster_availability().await.unwrap(), available);
+    let loaded = store.load_cluster_replica_views().await.unwrap();
+    assert_eq!(loaded.replicas, replicas);
+    assert_eq!(loaded.available, available);
 
     drop(store);
     let _ = fs::remove_dir_all(root).await;
@@ -7983,6 +7986,7 @@ async fn persist_and_load_cluster_nodes_roundtrip_impl(backend: StorageTestBacke
     let nodes = vec![crate::cluster::NodeDescriptor {
         node_id: remote_node_id,
         hostname: None,
+        software_version: None,
         reachability: crate::cluster::NodeReachability {
             public_api_url: Some("https://remote.example".to_string()),
             public_direct_urls: vec!["https://remote.example".to_string()],

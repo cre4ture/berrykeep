@@ -23,13 +23,13 @@ use crate::operations::{OperationResultChunk, OperationRun, OperationRunStatus};
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS,
     CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT, CachedChunkRecord, CachedMediaMetadata,
-    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY,
-    GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
-    GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange, GalleryDeltaCursorError,
-    GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope, GalleryIndexCapturedSort,
-    GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage, GalleryIndexQuery,
-    GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
+    ClientCredentialState, ClusterReplicaViews, CurrentObjectEntry, CurrentState, DataChangeEvent,
+    DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex,
+    GALLERY_CAPTURE_FALLBACK_BACKFILL_KEY, GALLERY_LABELS_COLUMN, GALLERY_LABELS_COLUMN_DEFINITION,
+    GALLERY_SIDECAR_GPS_BACKFILL_KEY, GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaChange,
+    GalleryDeltaCursorError, GalleryDeltaKind, GalleryDeltaPage, GalleryDeltaScope,
+    GalleryIndexCapturedSort, GalleryIndexEntry, GalleryIndexMediaSummary, GalleryIndexPage,
+    GalleryIndexQuery, GalleryMapCluster, GalleryMapClusterEntriesQuery, GalleryMapClusterPage,
     GalleryMapClusterQuery, GallerySummaryCache, GallerySummaryCacheValue, GallerySummaryMiss,
     GallerySummaryProgress, GallerySummaryRefreshStatus, GallerySummaryScope,
     GalleryViewportBounds, HISTORY_HEAD_PROJECTION_BACKFILL_COMPLETE_KEY,
@@ -2760,7 +2760,7 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<std::collections::HashMap<String, RepairAttemptRecord>> {
         self.read(|db| {
             let mut stmt = db.prepare(
-                "SELECT subject, attempts, last_failure_unix
+                "SELECT subject, attempts, last_failure_unix, key_version
                  FROM repair_attempts",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -2769,6 +2769,7 @@ impl MetadataStore for SqliteMetadataStore {
                     RepairAttemptRecord {
                         attempts: row.get::<_, u32>(1)?,
                         last_failure_unix: row.get::<_, u64>(2)?,
+                        key_version: row.get::<_, u8>(3)?,
                     },
                 ))
             })?;
@@ -2791,14 +2792,15 @@ impl MetadataStore for SqliteMetadataStore {
         self.write_tx(move |db| {
             db.execute("DELETE FROM repair_attempts", [])?;
             let mut stmt = db.prepare(
-                "INSERT INTO repair_attempts (subject, attempts, last_failure_unix)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO repair_attempts (subject, attempts, last_failure_unix, key_version)
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (subject, record) in attempts {
                 stmt.execute(params![
                     subject,
                     record.attempts,
-                    u64_to_i64(record.last_failure_unix)?
+                    u64_to_i64(record.last_failure_unix)?,
+                    record.key_version,
                 ])?;
             }
             Ok(())
@@ -3444,56 +3446,51 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn load_cluster_replicas(
-        &self,
-    ) -> Result<std::collections::HashMap<String, Vec<NodeId>>> {
+    async fn load_cluster_replica_views(&self) -> Result<ClusterReplicaViews> {
         self.read(|db| {
-            let mut stmt = db.prepare(
-                "SELECT subject, node_id
-                 FROM cluster_replicas
-                 ORDER BY subject, node_id",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-
-            let mut replicas: std::collections::HashMap<String, Vec<NodeId>> =
-                std::collections::HashMap::new();
-            for row in rows {
-                let (subject, node_id) = row?;
-                let node_id = node_id
-                    .parse::<NodeId>()
-                    .with_context(|| format!("invalid node id in cluster replicas: {node_id}"))?;
-                replicas.entry(subject).or_default().push(node_id);
-            }
-            Ok(replicas)
-        })
-        .await
-    }
-
-    async fn load_cluster_availability(
-        &self,
-    ) -> Result<std::collections::HashMap<String, Vec<NodeId>>> {
-        self.read(|db| {
-            let mut stmt = db.prepare(
-                "SELECT subject, node_id
-                 FROM cluster_available
-                 ORDER BY subject, node_id",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-
-            let mut available: std::collections::HashMap<String, Vec<NodeId>> =
-                std::collections::HashMap::new();
-            for row in rows {
-                let (subject, node_id) = row?;
-                let node_id = node_id.parse::<NodeId>().with_context(|| {
-                    format!("invalid node id in cluster availability: {node_id}")
+            let transaction = db.transaction()?;
+            let mut replicas = HashMap::<String, Vec<NodeId>>::new();
+            {
+                let mut stmt = transaction.prepare(
+                    "SELECT subject, node_id
+                     FROM cluster_replicas
+                     ORDER BY subject, node_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?;
-                available.entry(subject).or_default().push(node_id);
+                for row in rows {
+                    let (subject, node_id) = row?;
+                    let node_id = node_id.parse::<NodeId>().with_context(|| {
+                        format!("invalid node id in cluster replicas: {node_id}")
+                    })?;
+                    replicas.entry(subject).or_default().push(node_id);
+                }
             }
-            Ok(available)
+
+            let mut available = HashMap::<String, Vec<NodeId>>::new();
+            {
+                let mut stmt = transaction.prepare(
+                    "SELECT subject, node_id
+                     FROM cluster_available
+                     ORDER BY subject, node_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (subject, node_id) = row?;
+                    let node_id = node_id.parse::<NodeId>().with_context(|| {
+                        format!("invalid node id in cluster availability: {node_id}")
+                    })?;
+                    available.entry(subject).or_default().push(node_id);
+                }
+            }
+            transaction.commit()?;
+            Ok(ClusterReplicaViews {
+                replicas,
+                available,
+            })
         })
         .await
     }
@@ -5592,7 +5589,8 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS repair_attempts (
             subject TEXT PRIMARY KEY,
             attempts INTEGER NOT NULL,
-            last_failure_unix INTEGER NOT NULL
+            last_failure_unix INTEGER NOT NULL,
+            key_version INTEGER NOT NULL DEFAULT 2
         );
 
         CREATE TABLE IF NOT EXISTS content_repair_tasks (
@@ -5926,6 +5924,12 @@ fn init_metadata_db(db: &Connection) -> Result<()> {
             return Err(err).context("failed to migrate sqlite s3_access_keys.allow_manage");
         }
     }
+    add_sqlite_column_if_missing(
+        db,
+        "repair_attempts",
+        "key_version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
     add_sqlite_column_if_missing(
         db,
         "content_repair_tasks",
@@ -6466,6 +6470,32 @@ mod tests {
             )
             .expect("schema version should be restored");
         assert_eq!(schema_version, METADATA_SCHEMA_VERSION_CURRENT.to_string());
+    }
+
+    #[test]
+    fn init_metadata_db_marks_legacy_repair_attempt_keys_for_migration() {
+        let db = Connection::open_in_memory().expect("in-memory sqlite should open");
+        db.execute_batch(
+            "CREATE TABLE repair_attempts (
+                 subject TEXT PRIMARY KEY,
+                 attempts INTEGER NOT NULL,
+                 last_failure_unix INTEGER NOT NULL
+             );
+             INSERT INTO repair_attempts (subject, attempts, last_failure_unix)
+             VALUES ('legacy|node', 3, 17);",
+        )
+        .expect("legacy repair attempt table should initialize");
+
+        init_metadata_db(&db).expect("metadata schema should migrate");
+
+        let key_version: u8 = db
+            .query_row(
+                "SELECT key_version FROM repair_attempts WHERE subject = 'legacy|node'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy repair attempt should remain readable");
+        assert_eq!(key_version, 1);
     }
 
     #[test]

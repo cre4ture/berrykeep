@@ -8,6 +8,7 @@ use common::NodeId;
 use common::xmp::XmpGeoLocation;
 use tracing::warn;
 use turso::params_from_iter;
+use turso::transaction::{DropBehavior, Transaction, TransactionBehavior};
 
 use super::content_recovery::ContentRepairTask;
 use crate::cluster::NodeDescriptor;
@@ -19,12 +20,14 @@ mod gallery;
 
 const DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT: usize = 4;
 const DEFAULT_TURSO_GALLERY_SUMMARY_READ_CONNECTION_COUNT: usize = 1;
+const DEFAULT_TURSO_SCAN_READ_CONNECTION_COUNT: usize = 4;
+const DEFAULT_TURSO_LOOKUP_READ_CONNECTION_COUNT: usize = 4;
 
 use super::{
     ActiveSnapshotBatch, AdminAuditEvent, CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS,
     CONTENT_REPAIR_TASK_LEGACY_FINGERPRINT, CachedChunkRecord, CachedMediaMetadata,
-    ClientCredentialState, CurrentObjectEntry, CurrentState, DataChangeEvent, DataChangeEventQuery,
-    DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
+    ClientCredentialState, ClusterReplicaViews, CurrentObjectEntry, CurrentState, DataChangeEvent,
+    DataChangeEventQuery, DataScrubRunRecord, FileVersionIndex, GALLERY_SIDECAR_GPS_BACKFILL_KEY,
     GALLERY_SIDECAR_LABEL_BACKFILL_KEY, GalleryDeltaCursorError, GalleryDeltaPage,
     GalleryDeltaScope, GalleryIndexPage, GalleryIndexQuery, GalleryMapClusterEntriesQuery,
     GalleryMapClusterPage, GalleryMapClusterQuery, GallerySummaryCache,
@@ -46,29 +49,50 @@ use super::{
 pub(super) struct TursoMetadataStore {
     database: turso::Database,
     connection: turso::Connection,
-    writer_lock: tokio::sync::Mutex<()>,
+    /// Turso rejects concurrent statements on one connection. Hold this guard until every row
+    /// produced by the primary connection has been consumed, not just until `query` returns.
+    connection_lock: tokio::sync::Mutex<()>,
+    scan_read_permits: Arc<tokio::sync::Semaphore>,
+    lookup_read_permits: Arc<tokio::sync::Semaphore>,
     gallery_read_permits: Arc<tokio::sync::Semaphore>,
     gallery_summary_read_permits: Arc<tokio::sync::Semaphore>,
     metadata_path: PathBuf,
     gallery_map_summary_cache: Arc<GallerySummaryCache>,
 }
 
-/// A gallery read connection, valid for exactly one transaction.
+/// A bounded read connection, valid for exactly one operation or transaction.
 ///
 /// Turso 0.6 connections do not survive being reused across `BEGIN`/`COMMIT` cycles: after a
 /// handful of transactions on the same connection, the next commit fails with "cannot commit - no
 /// transaction is active". So instead of pooling long-lived connections, each read opens a fresh
 /// connection and drops it when done; the semaphore is what actually bounds concurrency.
-pub(super) struct GalleryReadConnection {
+pub(super) struct TursoReadConnection {
     connection: turso::Connection,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl std::ops::Deref for GalleryReadConnection {
+impl std::ops::Deref for TursoReadConnection {
     type Target = turso::Connection;
 
     fn deref(&self) -> &turso::Connection {
         &self.connection
+    }
+}
+
+async fn finish_read_transaction<T>(
+    mut transaction: Transaction<'_>,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => {
+            transaction.set_drop_behavior(DropBehavior::Commit);
+            transaction.finish().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
     }
 }
 
@@ -80,28 +104,34 @@ pub(super) struct GalleryReadConnectionFactory {
 }
 
 impl GalleryReadConnectionFactory {
-    pub(super) async fn open(&self) -> Result<GalleryReadConnection> {
-        open_gallery_read_connection(&self.database, &self.metadata_path, self.permits.clone())
-            .await
+    pub(super) async fn open(&self) -> Result<TursoReadConnection> {
+        open_bounded_read_connection(
+            &self.database,
+            &self.metadata_path,
+            self.permits.clone(),
+            "gallery",
+        )
+        .await
     }
 }
 
-async fn open_gallery_read_connection(
+async fn open_bounded_read_connection(
     database: &turso::Database,
     metadata_path: &Path,
     permits: Arc<tokio::sync::Semaphore>,
-) -> Result<GalleryReadConnection> {
+    operation: &str,
+) -> Result<TursoReadConnection> {
     let permit = permits
         .acquire_owned()
         .await
-        .context("gallery read semaphore should not be closed")?;
+        .with_context(|| format!("{operation} read semaphore should not be closed"))?;
     let connection = database.connect().with_context(|| {
         format!(
-            "failed to open a Turso gallery read connection to {}",
+            "failed to open a Turso read connection for {operation} from {}",
             metadata_path.display()
         )
     })?;
-    Ok(GalleryReadConnection {
+    Ok(TursoReadConnection {
         connection,
         _permit: permit,
     })
@@ -134,7 +164,13 @@ impl TursoMetadataStore {
         let store = Self {
             database: db,
             connection: conn,
-            writer_lock: tokio::sync::Mutex::new(()),
+            connection_lock: tokio::sync::Mutex::new(()),
+            scan_read_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_TURSO_SCAN_READ_CONNECTION_COUNT,
+            )),
+            lookup_read_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_TURSO_LOOKUP_READ_CONNECTION_COUNT,
+            )),
             gallery_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_TURSO_GALLERY_READ_CONNECTION_COUNT,
             )),
@@ -148,6 +184,30 @@ impl TursoMetadataStore {
         Ok(store)
     }
 
+    /// Keep unbounded reads off the primary connection so decoding a large result set cannot
+    /// block unrelated metadata traffic behind `connection_lock`.
+    async fn open_scan_connection(&self, operation: &str) -> Result<TursoReadConnection> {
+        open_bounded_read_connection(
+            &self.database,
+            &self.metadata_path,
+            self.scan_read_permits.clone(),
+            operation,
+        )
+        .await
+    }
+
+    /// Keep request- and key-bounded reads responsive when background full-table scans saturate
+    /// their separate connection budget.
+    async fn open_lookup_connection(&self, operation: &str) -> Result<TursoReadConnection> {
+        open_bounded_read_connection(
+            &self.database,
+            &self.metadata_path,
+            self.lookup_read_permits.clone(),
+            operation,
+        )
+        .await
+    }
+
     async fn discard_invalid_content_repair_tasks(
         &self,
         invalid_tasks: Vec<(String, Option<Vec<u8>>)>,
@@ -155,7 +215,7 @@ impl TursoMetadataStore {
         if invalid_tasks.is_empty() {
             return Ok(());
         }
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         for (manifest_hash, task_json) in invalid_tasks {
             match task_json {
                 Some(task_json) => {
@@ -186,11 +246,12 @@ impl TursoMetadataStore {
         let _ = self.connection.execute_batch("ROLLBACK").await;
     }
 
-    async fn gallery_read_connection(&self) -> Result<GalleryReadConnection> {
-        open_gallery_read_connection(
+    async fn gallery_read_connection(&self) -> Result<TursoReadConnection> {
+        open_bounded_read_connection(
             &self.database,
             &self.metadata_path,
             self.gallery_read_permits.clone(),
+            "gallery",
         )
         .await
     }
@@ -223,6 +284,7 @@ impl TursoMetadataStore {
 #[async_trait]
 impl MetadataStore for TursoMetadataStore {
     async fn object_id_backfill_needed(&self) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -234,7 +296,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_object_id_backfill_complete(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
@@ -246,6 +308,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn gallery_sidecar_labels_backfill_needed(&self) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -257,7 +320,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_gallery_sidecar_labels_backfill_complete(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
@@ -269,6 +332,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn gallery_sidecar_gps_backfill_needed(&self) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -280,7 +344,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_gallery_sidecar_gps_backfill_complete(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO metadata_meta(key, value) VALUES(?1, 'complete')
@@ -292,8 +356,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_current_state(&self) -> Result<CurrentState> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("current state").await?;
+        let mut rows = connection
             .query(
                 "SELECT key, manifest_hash, object_id
                  FROM current_objects",
@@ -320,6 +384,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn get_current_object(&self, key: &str) -> Result<Option<CurrentObjectEntry>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -362,18 +427,18 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         keys: &[String],
     ) -> Result<HashMap<String, Vec<String>>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let connection = self.open_lookup_connection("gallery object labels").await?;
         const LABEL_LOOKUP_CHUNK_SIZE: usize = 500;
         let mut labels_by_key = HashMap::new();
         for keys in keys.chunks(LABEL_LOOKUP_CHUNK_SIZE) {
-            if keys.is_empty() {
-                continue;
-            }
             let placeholders = (1..=keys.len())
                 .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT key, labels_json FROM gallery_objects WHERE key IN ({placeholders})"
@@ -394,18 +459,18 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         keys: &[String],
     ) -> Result<HashMap<String, MediaGpsCoordinates>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let connection = self.open_lookup_connection("gallery object GPS").await?;
         const GPS_LOOKUP_CHUNK_SIZE: usize = 500;
         let mut gps_by_key = HashMap::new();
         for keys in keys.chunks(GPS_LOOKUP_CHUNK_SIZE) {
-            if keys.is_empty() {
-                continue;
-            }
             let placeholders = (1..=keys.len())
                 .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT key, latitude, longitude FROM gallery_objects WHERE key IN ({placeholders})"
@@ -472,8 +537,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn count_current_objects(&self) -> Result<usize> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("current object count").await?;
+        let mut rows = connection
             .query("SELECT COUNT(*) FROM current_objects", ())
             .await?;
         let Some(row) = rows.next().await? else {
@@ -483,8 +548,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_current_object_keys(&self) -> Result<Vec<String>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("current object keys").await?;
+        let mut rows = connection
             .query("SELECT key FROM current_objects", ())
             .await?;
         let mut keys = Vec::new();
@@ -495,8 +560,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_keys_for_object_id(&self, object_id: &str) -> Result<Vec<String>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_lookup_connection("object keys by ID").await?;
+        let mut rows = connection
             .query(
                 "SELECT key FROM current_objects WHERE object_id = ?1",
                 (object_id,),
@@ -510,6 +575,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn content_repair_pending(&self, manifest_hash: &str) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -521,8 +587,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_content_repair_tasks(&self) -> Result<Vec<ContentRepairTask>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("content repair tasks").await?;
+        let mut rows = connection
             .query(
                 "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks
                  ORDER BY manifest_hash",
@@ -548,6 +614,7 @@ impl MetadataStore for TursoMetadataStore {
             }
         }
         drop(rows);
+        drop(connection);
         self.discard_invalid_content_repair_tasks(invalid_tasks)
             .await?;
         Ok(tasks)
@@ -562,12 +629,14 @@ impl MetadataStore for TursoMetadataStore {
         if manifest_hashes.is_empty() {
             return Ok(Vec::new());
         }
+        let connection = self
+            .open_lookup_connection("selected content repair tasks")
+            .await?;
         let mut tasks = Vec::<ContentRepairTask>::new();
         let mut invalid_tasks = Vec::new();
         for batch in manifest_hashes.chunks(CONTENT_REPAIR_TASK_QUERY_BATCH_SIZE) {
             let placeholders = (0..batch.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     &format!(
                         "SELECT manifest_hash, CAST(task_json AS BLOB) FROM content_repair_tasks \
@@ -598,14 +667,17 @@ impl MetadataStore for TursoMetadataStore {
                 .manifest_hash
                 .cmp(&right.reference.manifest_hash)
         });
+        drop(connection);
         self.discard_invalid_content_repair_tasks(invalid_tasks)
             .await?;
         Ok(tasks)
     }
 
     async fn content_repair_task_hashes(&self) -> Result<Vec<String>> {
-        let mut rows = self
-            .connection
+        let connection = self
+            .open_scan_connection("content repair task hashes")
+            .await?;
+        let mut rows = connection
             .query(
                 "SELECT manifest_hash FROM content_repair_tasks ORDER BY manifest_hash",
                 (),
@@ -624,6 +696,7 @@ impl MetadataStore for TursoMetadataStore {
         source_fingerprint: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let source_change_retry_before_unix = i64::try_from(
             now_unix.saturating_sub(CONTENT_REPAIR_SOURCE_CHANGE_MIN_RETRY_INTERVAL_SECS),
         )
@@ -681,7 +754,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_content_repair_task(&self, task: &ContentRepairTask) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO content_repair_tasks (
@@ -707,7 +780,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_content_repair_task(&self, manifest_hash: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM content_repair_tasks WHERE manifest_hash=?1",
@@ -718,10 +791,10 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_repair_attempts(&self) -> Result<HashMap<String, RepairAttemptRecord>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("repair attempts").await?;
+        let mut rows = connection
             .query(
-                "SELECT subject, attempts, last_failure_unix
+                "SELECT subject, attempts, last_failure_unix, key_version
                  FROM repair_attempts",
                 (),
             )
@@ -732,11 +805,14 @@ impl MetadataStore for TursoMetadataStore {
             let attempts_count = u32::try_from(row_u64(&row, 1, "repair_attempts.attempts")?)
                 .context("repair attempt count overflow")?;
             let last_failure_unix = row_u64(&row, 2, "repair_attempts.last_failure_unix")?;
+            let key_version = u8::try_from(row_u64(&row, 3, "repair_attempts.key_version")?)
+                .context("repair attempt key version overflow")?;
             attempts.insert(
                 subject,
                 RepairAttemptRecord {
                     attempts: attempts_count,
                     last_failure_unix,
+                    key_version,
                 },
             );
         }
@@ -747,7 +823,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         attempts: &HashMap<String, RepairAttemptRecord>,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -756,13 +832,14 @@ impl MetadataStore for TursoMetadataStore {
             for (subject, record) in attempts {
                 self.connection
                     .execute(
-                        "INSERT INTO repair_attempts (subject, attempts, last_failure_unix)
-                         VALUES (?1, ?2, ?3)",
+                        "INSERT INTO repair_attempts (subject, attempts, last_failure_unix, key_version)
+                         VALUES (?1, ?2, ?3, ?4)",
                         (
                             subject.as_str(),
                             i64::from(record.attempts),
                             i64::try_from(record.last_failure_unix)
                                 .context("repair failure timestamp overflow")?,
+                            i64::from(record.key_version),
                         ),
                     )
                     .await?;
@@ -782,9 +859,10 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         finished_since_unix: Option<u64>,
     ) -> Result<Vec<RepairRunRecord>> {
+        let connection = self.open_scan_connection("repair run history").await?;
         let mut rows = match (finished_since_unix, limit) {
             (Some(finished_since_unix), Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM repair_run_history\n                         WHERE finished_at_unix >= ?1\n                         ORDER BY finished_at_unix DESC, run_id DESC\n                         LIMIT ?2",
                         (
@@ -796,7 +874,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (Some(finished_since_unix), None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM repair_run_history\n                         WHERE finished_at_unix >= ?1\n                         ORDER BY finished_at_unix DESC, run_id DESC",
                         (i64::try_from(finished_since_unix)
@@ -805,7 +883,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM repair_run_history\n                         ORDER BY finished_at_unix DESC, run_id DESC\n                         LIMIT ?1",
                         (i64::try_from(limit).context("repair run history limit overflow")?,),
@@ -813,7 +891,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM repair_run_history\n                         ORDER BY finished_at_unix DESC, run_id DESC",
                         (),
@@ -835,7 +913,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_repair_run_record(&self, record: &RepairRunRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -852,7 +930,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_repair_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM repair_run_history\n                 WHERE finished_at_unix < ?1",
@@ -868,9 +946,12 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         finished_since_unix: Option<u64>,
     ) -> Result<Vec<ManualRepairActionRunRecord>> {
+        let connection = self
+            .open_scan_connection("manual repair action run history")
+            .await?;
         let mut rows = match (finished_since_unix, limit) {
             (Some(finished_since_unix), Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM manual_repair_action_run_history\n                         WHERE finished_at_unix >= ?1\n                         ORDER BY finished_at_unix DESC, run_id DESC\n                         LIMIT ?2",
                         (
@@ -883,7 +964,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (Some(finished_since_unix), None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM manual_repair_action_run_history\n                         WHERE finished_at_unix >= ?1\n                         ORDER BY finished_at_unix DESC, run_id DESC",
                         (i64::try_from(finished_since_unix)
@@ -892,7 +973,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM manual_repair_action_run_history\n                         ORDER BY finished_at_unix DESC, run_id DESC\n                         LIMIT ?1",
                         (i64::try_from(limit)
@@ -901,7 +982,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM manual_repair_action_run_history\n                         ORDER BY finished_at_unix DESC, run_id DESC",
                         (),
@@ -926,7 +1007,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         record: &ManualRepairActionRunRecord,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -946,7 +1027,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         finished_before_unix: u64,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM manual_repair_action_run_history\n                 WHERE finished_at_unix < ?1",
@@ -962,9 +1043,10 @@ impl MetadataStore for TursoMetadataStore {
         operation_id: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<OperationRun>> {
+        let connection = self.open_scan_connection("operation runs").await?;
         let mut rows = match (operation_id, limit) {
             (Some(operation_id), Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json FROM operation_runs WHERE operation_id = ?1
                      ORDER BY created_at_unix DESC, run_id DESC LIMIT ?2",
@@ -976,7 +1058,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (Some(operation_id), None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json FROM operation_runs WHERE operation_id = ?1
                      ORDER BY created_at_unix DESC, run_id DESC",
@@ -985,7 +1067,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json FROM operation_runs
                      ORDER BY created_at_unix DESC, run_id DESC LIMIT ?1",
@@ -994,7 +1076,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json FROM operation_runs
                      ORDER BY created_at_unix DESC, run_id DESC",
@@ -1015,6 +1097,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_operation_run(&self, run_id: &str) -> Result<Option<OperationRun>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1032,7 +1115,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_operation_run(&self, run: &OperationRun) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(run)?;
         let status = serde_json::to_value(run.status)?
             .as_str()
@@ -1068,7 +1151,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_operation_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let finished_before_unix = i64::try_from(finished_before_unix)
             .context("operation run history prune timestamp overflow")?;
         let result = async {
@@ -1110,7 +1193,7 @@ impl MetadataStore for TursoMetadataStore {
         finished_at_unix: u64,
         termination_reason: &str,
     ) -> Result<usize> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let result = async {
             self.connection.execute_batch("BEGIN IMMEDIATE").await?;
             let mut rows = self
@@ -1136,6 +1219,7 @@ impl MetadataStore for TursoMetadataStore {
                 run.progress.message = Some("Interrupted after server restart.".to_string());
                 interrupted.push((run_id, serde_json::to_vec_pretty(&run)?));
             }
+            drop(rows);
             for (run_id, payload) in &interrupted {
                 self.connection
                     .execute(
@@ -1167,9 +1251,12 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<Vec<OperationResultChunk>> {
+        let connection = self
+            .open_lookup_connection("operation result chunks")
+            .await?;
         let mut rows = match limit {
             Some(limit) => {
-                self.connection
+                connection
                     .query(
                         "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
                      ORDER BY created_at_unix ASC, chunk_id ASC LIMIT ?2 OFFSET ?3",
@@ -1184,7 +1271,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             None => {
-                self.connection
+                connection
                     .query(
                         "SELECT payload_json FROM operation_result_chunks WHERE run_id = ?1
                      ORDER BY created_at_unix ASC, chunk_id ASC LIMIT -1 OFFSET ?2",
@@ -1209,7 +1296,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_operation_result_chunk(&self, chunk: &OperationResultChunk) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(chunk)?;
         self.connection
             .execute(
@@ -1237,9 +1324,10 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         finished_since_unix: Option<u64>,
     ) -> Result<Vec<DataScrubRunRecord>> {
+        let connection = self.open_scan_connection("data scrub run history").await?;
         let mut rows = match (finished_since_unix, limit) {
             (Some(finished_since_unix), Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM data_scrub_run_history\n                         WHERE finished_at_unix >= ?1\n                         ORDER BY finished_at_unix DESC, run_id DESC\n                         LIMIT ?2",
                         (
@@ -1252,7 +1340,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (Some(finished_since_unix), None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM data_scrub_run_history\n                         WHERE finished_at_unix >= ?1\n                         ORDER BY finished_at_unix DESC, run_id DESC",
                         (i64::try_from(finished_since_unix)
@@ -1261,7 +1349,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM data_scrub_run_history\n                         ORDER BY finished_at_unix DESC, run_id DESC\n                         LIMIT ?1",
                         (i64::try_from(limit)
@@ -1270,7 +1358,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT record_json\n                         FROM data_scrub_run_history\n                         ORDER BY finished_at_unix DESC, run_id DESC",
                         (),
@@ -1292,7 +1380,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_data_scrub_run_record(&self, record: &DataScrubRunRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -1309,7 +1397,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_data_scrub_run_history_before(&self, finished_before_unix: u64) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM data_scrub_run_history\n                 WHERE finished_at_unix < ?1",
@@ -1321,8 +1409,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_cluster_nodes(&self) -> Result<Vec<NodeDescriptor>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("cluster nodes").await?;
+        let mut rows = connection
             .query(
                 "SELECT node_id, descriptor_json
                  FROM cluster_nodes
@@ -1349,7 +1437,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_cluster_nodes(&self, nodes: &[NodeDescriptor]) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -1374,48 +1462,56 @@ impl MetadataStore for TursoMetadataStore {
         result
     }
 
-    async fn load_cluster_replicas(&self) -> Result<HashMap<String, Vec<NodeId>>> {
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT subject, node_id
-                 FROM cluster_replicas
-                 ORDER BY subject, node_id",
-                (),
-            )
-            .await?;
-        let mut replicas = HashMap::<String, Vec<NodeId>>::new();
-        while let Some(row) = rows.next().await? {
-            let subject = row_string(&row, 0, "cluster_replicas.subject")?;
-            let node_id = row_string(&row, 1, "cluster_replicas.node_id")?
-                .parse::<NodeId>()
-                .with_context(|| format!("invalid node id in cluster replicas for {subject}"))?;
-            replicas.entry(subject).or_default().push(node_id);
-        }
-        Ok(replicas)
-    }
+    async fn load_cluster_replica_views(&self) -> Result<ClusterReplicaViews> {
+        let connection = self.open_scan_connection("cluster replica views").await?;
+        let transaction =
+            Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
+        let result = async {
+            let mut rows = transaction
+                .query(
+                    "SELECT subject, node_id
+                     FROM cluster_replicas
+                     ORDER BY subject, node_id",
+                    (),
+                )
+                .await?;
+            let mut replicas = HashMap::<String, Vec<NodeId>>::new();
+            while let Some(row) = rows.next().await? {
+                let subject = row_string(&row, 0, "cluster_replicas.subject")?;
+                let node_id = row_string(&row, 1, "cluster_replicas.node_id")?
+                    .parse::<NodeId>()
+                    .with_context(|| {
+                        format!("invalid node id in cluster replicas for {subject}")
+                    })?;
+                replicas.entry(subject).or_default().push(node_id);
+            }
+            drop(rows);
 
-    async fn load_cluster_availability(&self) -> Result<HashMap<String, Vec<NodeId>>> {
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT subject, node_id
-                 FROM cluster_available
-                 ORDER BY subject, node_id",
-                (),
-            )
-            .await?;
-        let mut available = HashMap::<String, Vec<NodeId>>::new();
-        while let Some(row) = rows.next().await? {
-            let subject = row_string(&row, 0, "cluster_available.subject")?;
-            let node_id = row_string(&row, 1, "cluster_available.node_id")?
-                .parse::<NodeId>()
-                .with_context(|| {
-                    format!("invalid node id in cluster availability for {subject}")
-                })?;
-            available.entry(subject).or_default().push(node_id);
+            let mut rows = transaction
+                .query(
+                    "SELECT subject, node_id
+                     FROM cluster_available
+                     ORDER BY subject, node_id",
+                    (),
+                )
+                .await?;
+            let mut available = HashMap::<String, Vec<NodeId>>::new();
+            while let Some(row) = rows.next().await? {
+                let subject = row_string(&row, 0, "cluster_available.subject")?;
+                let node_id = row_string(&row, 1, "cluster_available.node_id")?
+                    .parse::<NodeId>()
+                    .with_context(|| {
+                        format!("invalid node id in cluster availability for {subject}")
+                    })?;
+                available.entry(subject).or_default().push(node_id);
+            }
+            Ok(ClusterReplicaViews {
+                replicas,
+                available,
+            })
         }
-        Ok(available)
+        .await;
+        finish_read_transaction(transaction, result).await
     }
 
     async fn persist_cluster_replica_views(
@@ -1423,7 +1519,7 @@ impl MetadataStore for TursoMetadataStore {
         replicas: &HashMap<String, Vec<NodeId>>,
         available: &HashMap<String, Vec<NodeId>>,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -1465,6 +1561,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_client_credential_state(&self) -> Result<ClientCredentialState> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1480,7 +1577,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_client_credential_state(&self, state: &ClientCredentialState) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(state)?;
         self.connection
             .execute(
@@ -1494,79 +1591,87 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_s3_control_plane_state(&self) -> Result<S3ControlPlaneState> {
-        let mut bucket_rows = self
-            .connection
-            .query(
-                "SELECT bucket_name, root_prefix, versioning_status, read_only,
-                        created_at_unix, updated_at_unix, created_by, deleted_at_unix
-                 FROM s3_buckets
-                 ORDER BY bucket_name",
-                (),
-            )
-            .await?;
-        let mut buckets = Vec::new();
-        while let Some(row) = bucket_rows.next().await? {
-            let versioning_status = row_string(&row, 2, "s3_buckets.versioning_status")?;
-            buckets.push(S3BucketRecord {
-                bucket_name: row_string(&row, 0, "s3_buckets.bucket_name")?,
-                root_prefix: row_string(&row, 1, "s3_buckets.root_prefix")?,
-                versioning_status: S3BucketVersioningStatus::parse(&versioning_status)
-                    .with_context(|| {
-                        format!(
-                            "invalid s3 bucket versioning status in Turso metadata database {}: {versioning_status}",
-                            self.metadata_path.display()
-                        )
-                    })?,
-                read_only: row_bool(&row, 3, "s3_buckets.read_only")?,
-                created_at_unix: row_u64(&row, 4, "s3_buckets.created_at_unix")?,
-                updated_at_unix: row_u64(&row, 5, "s3_buckets.updated_at_unix")?,
-                created_by: row_opt_string(&row, 6, "s3_buckets.created_by")?,
-                deleted_at_unix: row_opt_u64(&row, 7, "s3_buckets.deleted_at_unix")?,
-            });
-        }
+        let connection = self.open_scan_connection("S3 control plane state").await?;
+        let transaction =
+            Transaction::new_unchecked(&connection, TransactionBehavior::Deferred).await?;
+        let result = async {
+            let mut bucket_rows = transaction
+                .query(
+                    "SELECT bucket_name, root_prefix, versioning_status, read_only,
+                            created_at_unix, updated_at_unix, created_by, deleted_at_unix
+                     FROM s3_buckets
+                     ORDER BY bucket_name",
+                    (),
+                )
+                .await?;
+            let mut buckets = Vec::new();
+            while let Some(row) = bucket_rows.next().await? {
+                let versioning_status = row_string(&row, 2, "s3_buckets.versioning_status")?;
+                buckets.push(S3BucketRecord {
+                    bucket_name: row_string(&row, 0, "s3_buckets.bucket_name")?,
+                    root_prefix: row_string(&row, 1, "s3_buckets.root_prefix")?,
+                    versioning_status: S3BucketVersioningStatus::parse(&versioning_status)
+                        .with_context(|| {
+                            format!(
+                                "invalid s3 bucket versioning status in Turso metadata database {}: {versioning_status}",
+                                self.metadata_path.display()
+                            )
+                        })?,
+                    read_only: row_bool(&row, 3, "s3_buckets.read_only")?,
+                    created_at_unix: row_u64(&row, 4, "s3_buckets.created_at_unix")?,
+                    updated_at_unix: row_u64(&row, 5, "s3_buckets.updated_at_unix")?,
+                    created_by: row_opt_string(&row, 6, "s3_buckets.created_by")?,
+                    deleted_at_unix: row_opt_u64(&row, 7, "s3_buckets.deleted_at_unix")?,
+                });
+            }
+            drop(bucket_rows);
 
-        let mut access_key_rows = self
-            .connection
-            .query(
-                "SELECT access_key_id, secret_material, description, bucket_scope_json,
-                        prefix_scope_json, allow_list, allow_read, allow_write,
-                        allow_delete, allow_manage, created_at_unix, updated_at_unix,
-                        last_used_at_unix, revoked_at_unix
-                 FROM s3_access_keys
-                 ORDER BY access_key_id",
-                (),
-            )
-            .await?;
-        let mut access_keys = Vec::new();
-        while let Some(row) = access_key_rows.next().await? {
-            let bucket_scope_json = row_blob(&row, 3, "s3_access_keys.bucket_scope_json")?;
-            let prefix_scope_json = row_blob(&row, 4, "s3_access_keys.prefix_scope_json")?;
-            access_keys.push(S3AccessKeyRecord {
-                access_key_id: row_string(&row, 0, "s3_access_keys.access_key_id")?,
-                secret_material: row_string(&row, 1, "s3_access_keys.secret_material")?,
-                description: row_opt_string(&row, 2, "s3_access_keys.description")?,
-                bucket_scope: self.decode_json(bucket_scope_json, "s3 access key bucket scope")?,
-                prefix_scope: self.decode_json(prefix_scope_json, "s3 access key prefix scope")?,
-                allow_list: row_bool(&row, 5, "s3_access_keys.allow_list")?,
-                allow_read: row_bool(&row, 6, "s3_access_keys.allow_read")?,
-                allow_write: row_bool(&row, 7, "s3_access_keys.allow_write")?,
-                allow_delete: row_bool(&row, 8, "s3_access_keys.allow_delete")?,
-                allow_manage: row_bool(&row, 9, "s3_access_keys.allow_manage")?,
-                created_at_unix: row_u64(&row, 10, "s3_access_keys.created_at_unix")?,
-                updated_at_unix: row_u64(&row, 11, "s3_access_keys.updated_at_unix")?,
-                last_used_at_unix: row_opt_u64(&row, 12, "s3_access_keys.last_used_at_unix")?,
-                revoked_at_unix: row_opt_u64(&row, 13, "s3_access_keys.revoked_at_unix")?,
-            });
-        }
+            let mut access_key_rows = transaction
+                .query(
+                    "SELECT access_key_id, secret_material, description, bucket_scope_json,
+                            prefix_scope_json, allow_list, allow_read, allow_write,
+                            allow_delete, allow_manage, created_at_unix, updated_at_unix,
+                            last_used_at_unix, revoked_at_unix
+                     FROM s3_access_keys
+                     ORDER BY access_key_id",
+                    (),
+                )
+                .await?;
+            let mut access_keys = Vec::new();
+            while let Some(row) = access_key_rows.next().await? {
+                let bucket_scope_json = row_blob(&row, 3, "s3_access_keys.bucket_scope_json")?;
+                let prefix_scope_json = row_blob(&row, 4, "s3_access_keys.prefix_scope_json")?;
+                access_keys.push(S3AccessKeyRecord {
+                    access_key_id: row_string(&row, 0, "s3_access_keys.access_key_id")?,
+                    secret_material: row_string(&row, 1, "s3_access_keys.secret_material")?,
+                    description: row_opt_string(&row, 2, "s3_access_keys.description")?,
+                    bucket_scope: self
+                        .decode_json(bucket_scope_json, "s3 access key bucket scope")?,
+                    prefix_scope: self
+                        .decode_json(prefix_scope_json, "s3 access key prefix scope")?,
+                    allow_list: row_bool(&row, 5, "s3_access_keys.allow_list")?,
+                    allow_read: row_bool(&row, 6, "s3_access_keys.allow_read")?,
+                    allow_write: row_bool(&row, 7, "s3_access_keys.allow_write")?,
+                    allow_delete: row_bool(&row, 8, "s3_access_keys.allow_delete")?,
+                    allow_manage: row_bool(&row, 9, "s3_access_keys.allow_manage")?,
+                    created_at_unix: row_u64(&row, 10, "s3_access_keys.created_at_unix")?,
+                    updated_at_unix: row_u64(&row, 11, "s3_access_keys.updated_at_unix")?,
+                    last_used_at_unix: row_opt_u64(&row, 12, "s3_access_keys.last_used_at_unix")?,
+                    revoked_at_unix: row_opt_u64(&row, 13, "s3_access_keys.revoked_at_unix")?,
+                });
+            }
 
-        Ok(S3ControlPlaneState {
-            buckets,
-            access_keys,
-        })
+            Ok(S3ControlPlaneState {
+                buckets,
+                access_keys,
+            })
+        }
+        .await;
+        finish_read_transaction(transaction, result).await
     }
 
     async fn persist_s3_control_plane_state(&self, state: &S3ControlPlaneState) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -1677,8 +1782,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_manifest(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("snapshot manifest by ID").await?;
+        let mut rows = connection
             .query(
                 "SELECT snapshot_json FROM snapshots WHERE snapshot_id = ?1",
                 (snapshot_id,),
@@ -1697,6 +1802,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_batch_state(&self) -> Result<Option<ActiveSnapshotBatch>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1720,7 +1826,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         state: Option<&ActiveSnapshotBatch>,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         match state {
             Some(state) => {
                 let payload = serde_json::to_vec_pretty(state)?;
@@ -1747,6 +1853,7 @@ impl MetadataStore for TursoMetadataStore {
         content_fingerprint: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
         let payload = {
+            let _connection_guard = self.connection_lock.lock().await;
             let mut rows = self
                 .connection
                 .query(
@@ -1793,8 +1900,13 @@ impl MetadataStore for TursoMetadataStore {
     ) -> Result<HashMap<String, CachedMediaMetadata>> {
         const TURSO_MEDIA_CACHE_QUERY_BATCH_SIZE: usize = 500;
 
+        if content_fingerprints.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut metadata_by_content_fingerprint =
             HashMap::with_capacity(content_fingerprints.len());
+        let connection = self.open_lookup_connection("cached media metadata").await?;
+        let mut invalid_rows = Vec::new();
 
         for chunk in content_fingerprints.chunks(TURSO_MEDIA_CACHE_QUERY_BATCH_SIZE) {
             if chunk.is_empty() {
@@ -1804,8 +1916,7 @@ impl MetadataStore for TursoMetadataStore {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT content_fingerprint, metadata_json
@@ -1816,7 +1927,6 @@ impl MetadataStore for TursoMetadataStore {
                 )
                 .await?;
 
-            let mut invalid_rows = Vec::new();
             while let Some(row) = rows.next().await? {
                 let content_fingerprint = row_string(&row, 0, "media_cache.content_fingerprint")?;
                 let payload = row_blob(&row, 1, "media_cache.metadata_json")?;
@@ -1827,26 +1937,26 @@ impl MetadataStore for TursoMetadataStore {
                     Err(err) => invalid_rows.push((content_fingerprint, payload, err.to_string())),
                 }
             }
+            drop(rows);
+        }
+        drop(connection);
 
-            for (content_fingerprint, payload, error) in invalid_rows {
-                let deleted = self
-                    .delete_invalid_media_cache_record_if_payload_matches(
-                        &content_fingerprint,
-                        &payload,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to delete invalid media metadata row for {content_fingerprint}"
-                        )
-                    })?;
-                if deleted {
-                    warn!(
-                        content_fingerprint = %content_fingerprint,
-                        error,
-                        "deleted invalid cached media metadata row from Turso"
-                    );
-                }
+        for (content_fingerprint, payload, error) in invalid_rows {
+            let deleted = self
+                .delete_invalid_media_cache_record_if_payload_matches(
+                    &content_fingerprint,
+                    &payload,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to delete invalid media metadata row for {content_fingerprint}")
+                })?;
+            if deleted {
+                warn!(
+                    content_fingerprint = %content_fingerprint,
+                    error,
+                    "deleted invalid cached media metadata row from Turso"
+                );
             }
         }
 
@@ -1859,6 +1969,7 @@ impl MetadataStore for TursoMetadataStore {
 
     #[cfg(test)]
     async fn has_media_cache_record(&self, content_fingerprint: &str) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -1881,8 +1992,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_snapshot_infos(&self) -> Result<Vec<SnapshotInfo>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("snapshot metadata").await?;
+        let mut rows = connection
             .query(
                 "SELECT snapshot_id, created_at_unix, object_count
                  FROM snapshots
@@ -1906,6 +2017,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         query: &DataChangeEventQuery,
     ) -> Result<Vec<DataChangeEvent>> {
+        let connection = self.open_lookup_connection("data change events").await?;
         let limit = match query.limit {
             Some(limit) => i64::try_from(limit).context("data change event limit overflow")?,
             None => i64::MAX,
@@ -1931,20 +2043,26 @@ impl MetadataStore for TursoMetadataStore {
             .context("data change event cursor timestamp overflow")?;
         let before_event_id = query.before.as_ref().map(|cursor| cursor.event_id.as_str());
 
-        let mut rows = self
-                    .connection
-                    .query(
-                        "SELECT event_json
-                         FROM data_change_events
-                         WHERE (?1 IS NULL OR action = ?1)
-                           AND (?2 IS NULL OR path LIKE ?2 OR COALESCE(from_path, '') LIKE ?2 OR COALESCE(to_path, '') LIKE ?2)
-                           AND (?3 IS NULL OR COALESCE(actor_id, '') LIKE ?3 OR COALESCE(actor_label, '') LIKE ?3 OR COALESCE(actor_credential_fingerprint, '') LIKE ?3)
-                                                     AND (?4 IS NULL OR created_at_unix < ?4 OR (created_at_unix = ?4 AND event_id < ?5))
-                                                 ORDER BY created_at_unix DESC, event_id DESC
-                                                 LIMIT ?6",
-                                                (action_filter, path_filter, actor_filter, before_created_at_unix, before_event_id, limit),
-                    )
-                    .await?;
+        let mut rows = connection
+            .query(
+                "SELECT event_json
+                 FROM data_change_events
+                 WHERE (?1 IS NULL OR action = ?1)
+                   AND (?2 IS NULL OR path LIKE ?2 OR COALESCE(from_path, '') LIKE ?2 OR COALESCE(to_path, '') LIKE ?2)
+                   AND (?3 IS NULL OR COALESCE(actor_id, '') LIKE ?3 OR COALESCE(actor_label, '') LIKE ?3 OR COALESCE(actor_credential_fingerprint, '') LIKE ?3)
+                   AND (?4 IS NULL OR created_at_unix < ?4 OR (created_at_unix = ?4 AND event_id < ?5))
+                 ORDER BY created_at_unix DESC, event_id DESC
+                 LIMIT ?6",
+                (
+                    action_filter,
+                    path_filter,
+                    actor_filter,
+                    before_created_at_unix,
+                    before_event_id,
+                    limit,
+                ),
+            )
+            .await?;
 
         let mut events = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -1959,7 +2077,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn append_admin_audit_event(&self, event: &AdminAuditEvent) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec(event)?;
         self.connection
             .execute(
@@ -1980,7 +2098,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn append_data_change_event(&self, event: &DataChangeEvent) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec(event)?;
         self.connection
             .execute(
@@ -2032,6 +2150,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         object_id: &str,
     ) -> Result<Option<FileVersionIndex>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2055,17 +2174,16 @@ impl MetadataStore for TursoMetadataStore {
     ) -> Result<HashMap<String, ManifestSummary>> {
         const TURSO_SUMMARY_QUERY_BATCH_SIZE: usize = 500;
 
+        if manifest_hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let connection = self.open_lookup_connection("manifest summaries").await?;
         let mut summaries = HashMap::with_capacity(manifest_hashes.len());
         for chunk in manifest_hashes.chunks(TURSO_SUMMARY_QUERY_BATCH_SIZE) {
-            if chunk.is_empty() {
-                continue;
-            }
-
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT manifest_hash, total_size_bytes, content_fingerprint
@@ -2098,6 +2216,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         version_id: &str,
     ) -> Result<Option<ObjectVersionMetadataRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2136,7 +2255,7 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         metadata: &ObjectVersionMetadataRecord,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO object_version_metadata (
@@ -2180,7 +2299,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_object_version_metadata(&self, version_id: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM object_version_metadata WHERE version_id = ?1",
@@ -2195,6 +2314,7 @@ impl MetadataStore for TursoMetadataStore {
         bucket_name: &str,
         version_id: &str,
     ) -> Result<Option<S3ObjectVersionRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2223,8 +2343,10 @@ impl MetadataStore for TursoMetadataStore {
         bucket_name: &str,
         berrykeep_key: &str,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
-        let mut rows = self
-            .connection
+        let connection = self
+            .open_lookup_connection("S3 object versions for key")
+            .await?;
+        let mut rows = connection
             .query(
                 "SELECT version_id, etag, multipart_part_count, created_at_unix
                  FROM s3_object_versions
@@ -2256,10 +2378,11 @@ impl MetadataStore for TursoMetadataStore {
         bucket_name: &str,
         berrykeep_key_prefix: Option<&str>,
     ) -> Result<Vec<S3ObjectVersionRecord>> {
+        let connection = self.open_scan_connection("S3 object versions").await?;
         let mut records = Vec::new();
         let mut rows = if let Some(prefix) = berrykeep_key_prefix {
             let like_pattern = super::sqlite_like_prefix_pattern(prefix);
-            self.connection
+            connection
                 .query(
                     "SELECT berrykeep_key, version_id, etag, multipart_part_count, created_at_unix
                      FROM s3_object_versions
@@ -2269,7 +2392,7 @@ impl MetadataStore for TursoMetadataStore {
                 )
                 .await?
         } else {
-            self.connection
+            connection
                 .query(
                     "SELECT berrykeep_key, version_id, etag, multipart_part_count, created_at_unix
                      FROM s3_object_versions
@@ -2298,7 +2421,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_s3_object_version(&self, record: &S3ObjectVersionRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO s3_object_versions (
@@ -2329,7 +2452,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_s3_object_version(&self, bucket_name: &str, version_id: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM s3_object_versions
@@ -2359,8 +2482,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_all_version_indexes(&self) -> Result<Vec<FileVersionIndex>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("version indexes").await?;
+        let mut rows = connection
             .query(
                 "SELECT object_id, index_json
                  FROM version_indexes
@@ -2383,6 +2506,7 @@ impl MetadataStore for TursoMetadataStore {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<FileVersionIndex>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
         let mut rows = if let Some(after_object_id) = after_object_id {
             self.connection
@@ -2421,6 +2545,7 @@ impl MetadataStore for TursoMetadataStore {
         after_object_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let limit = i64::try_from(limit.max(1)).context("version index page limit overflow")?;
         let mut rows = if let Some(after_object_id) = after_object_id {
             self.connection
@@ -2461,6 +2586,9 @@ impl MetadataStore for TursoMetadataStore {
         depth: usize,
         max_entries: usize,
     ) -> Result<RecoverableHistoryListing> {
+        let connection = self
+            .open_scan_connection("recoverable history listing")
+            .await?;
         let prefix = prefix.trim().trim_matches('/').to_string();
         let path_lower_bound = (!prefix.is_empty()).then(|| format!("{prefix}/"));
         let path_upper_bound = (!prefix.is_empty()).then(|| format!("{prefix}0"));
@@ -2472,8 +2600,7 @@ impl MetadataStore for TursoMetadataStore {
             .and_then(|value| i64::try_from(value).ok())
             .unwrap_or(i64::MAX);
         let query = recoverable_history_listing_query(!prefix.is_empty());
-        let mut rows = self
-            .connection
+        let mut rows = connection
             .query(
                 &query,
                 (
@@ -2532,6 +2659,7 @@ impl MetadataStore for TursoMetadataStore {
     async fn history_head_projection_backfill_state(
         &self,
     ) -> Result<HistoryHeadProjectionBackfillState> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2567,7 +2695,7 @@ impl MetadataStore for TursoMetadataStore {
         next_after_object_id: Option<&str>,
         complete: bool,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         for projection in projections {
             insert_version_index_head_projection_if_missing(&self.connection, projection).await?;
         }
@@ -2601,7 +2729,7 @@ impl MetadataStore for TursoMetadataStore {
 
     #[cfg(test)]
     async fn clear_history_head_projections_for_test(&self) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute("DELETE FROM version_index_heads", ())
             .await?;
@@ -2618,8 +2746,10 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_version_index_object_ids(&self) -> Result<Vec<String>> {
-        let mut rows = self
-            .connection
+        let connection = self
+            .open_scan_connection("version index object IDs")
+            .await?;
+        let mut rows = connection
             .query(
                 "SELECT object_id FROM version_indexes ORDER BY object_id",
                 (),
@@ -2633,8 +2763,12 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_snapshot_manifest(&self, manifest: &SnapshotManifest) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
         let payload = compress_snapshot_json(&serde_json::to_vec_pretty(manifest)?)?;
+        let created_at_unix =
+            i64::try_from(manifest.created_at_unix).context("snapshot timestamp overflow")?;
+        let object_count =
+            i64::try_from(manifest.objects.len()).context("snapshot object count overflow")?;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO snapshots (snapshot_id, created_at_unix, object_count, snapshot_json)
@@ -2643,14 +2777,7 @@ impl MetadataStore for TursoMetadataStore {
                      created_at_unix = excluded.created_at_unix,
                      object_count = excluded.object_count,
                      snapshot_json = excluded.snapshot_json",
-                (
-                    manifest.id.as_str(),
-                    i64::try_from(manifest.created_at_unix)
-                        .context("snapshot timestamp overflow")?,
-                    i64::try_from(manifest.objects.len())
-                        .context("snapshot object count overflow")?,
-                    payload,
-                ),
+                (manifest.id.as_str(), created_at_unix, object_count, payload),
             )
             .await?;
         Ok(())
@@ -2658,8 +2785,8 @@ impl MetadataStore for TursoMetadataStore {
 
     #[cfg(test)]
     async fn load_all_snapshots(&self) -> Result<Vec<SnapshotManifest>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("snapshot manifests").await?;
+        let mut rows = connection
             .query(
                 "SELECT snapshot_json
                  FROM snapshots
@@ -2681,27 +2808,13 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_snapshot_by_id(&self, snapshot_id: &str) -> Result<Option<SnapshotManifest>> {
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT snapshot_json FROM snapshots WHERE snapshot_id = ?1",
-                (snapshot_id,),
-            )
-            .await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        let payload = row_blob(&row, 0, "snapshots.snapshot_json")?;
-        let payload = decompress_snapshot_json(&payload)?;
-        let mut manifest = self.decode_json::<SnapshotManifest>(payload, "snapshot manifest")?;
-        normalize_snapshot_manifest_object_ids(&mut manifest);
-        Ok(Some(manifest))
+        self.load_snapshot_manifest(snapshot_id).await
     }
 
     async fn list_uncompressed_snapshot_ids(&self) -> Result<Vec<String>> {
+        let connection = self.open_scan_connection("uncompressed snapshots").await?;
         const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
-        let mut rows = self
-            .connection
+        let mut rows = connection
             .query("SELECT snapshot_id, snapshot_json FROM snapshots", ())
             .await?;
         let mut ids = Vec::new();
@@ -2722,7 +2835,7 @@ impl MetadataStore for TursoMetadataStore {
             return Ok(());
         }
 
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             for chunk in snapshot_ids.chunks(TURSO_SNAPSHOT_DELETE_BATCH_SIZE) {
@@ -2748,7 +2861,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn vacuum_metadata_store(&self) -> Result<bool> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         match self.connection.execute("VACUUM", ()).await {
             Ok(_) => Ok(true),
             Err(err) => {
@@ -2769,6 +2882,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_storage_stats_state(&self) -> Result<Option<StorageStatsState>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2787,7 +2901,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_storage_stats_state(&self, state: &StorageStatsState) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(state)?;
         self.connection
             .execute(
@@ -2801,8 +2915,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_storage_locations(&self) -> Result<Vec<StorageLocationRecord>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("storage locations").await?;
+        let mut rows = connection
             .query(
                 "SELECT content_kind, content_hash, path_id, size_bytes, state
                  FROM storage_locations",
@@ -2825,7 +2939,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_storage_location(&self, location: &StorageLocationRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO storage_locations
@@ -2848,7 +2962,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_storage_location(&self, kind: StorageContentKind, hash: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM storage_locations WHERE content_kind = ?1 AND content_hash = ?2",
@@ -2859,6 +2973,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_cached_chunk_record(&self, hash: &str) -> Result<Option<CachedChunkRecord>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -2877,7 +2992,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn persist_cached_chunk_record(&self, record: &CachedChunkRecord) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         let payload = serde_json::to_vec_pretty(record)?;
         self.connection
             .execute(
@@ -2891,7 +3006,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_cached_chunk_record(&self, hash: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute("DELETE FROM cached_chunks WHERE hash = ?1", (hash,))
             .await?;
@@ -2899,8 +3014,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_cached_chunk_records(&self) -> Result<Vec<CachedChunkRecord>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("cached chunk records").await?;
+        let mut rows = connection
             .query(
                 "SELECT record_json
                  FROM cached_chunks
@@ -2921,7 +3036,7 @@ impl MetadataStore for TursoMetadataStore {
         manifest_hash: &str,
         owned_at_unix: u64,
     ) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO locally_owned_manifests (manifest_hash, owned_at_unix)
@@ -2937,7 +3052,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_locally_owned_manifest(&self, manifest_hash: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM locally_owned_manifests WHERE manifest_hash = ?1",
@@ -2948,8 +3063,8 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_locally_owned_manifests(&self) -> Result<Vec<String>> {
-        let mut rows = self
-            .connection
+        let connection = self.open_scan_connection("locally owned manifests").await?;
+        let mut rows = connection
             .query(
                 "SELECT manifest_hash
                  FROM locally_owned_manifests
@@ -2974,17 +3089,18 @@ impl MetadataStore for TursoMetadataStore {
     ) -> Result<std::collections::HashSet<String>> {
         const TURSO_LOCALLY_OWNED_QUERY_BATCH_SIZE: usize = 500;
 
+        if manifest_hashes.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let connection = self
+            .open_scan_connection("locally owned manifest filter")
+            .await?;
         let mut owned = std::collections::HashSet::with_capacity(manifest_hashes.len());
         for chunk in manifest_hashes.chunks(TURSO_LOCALLY_OWNED_QUERY_BATCH_SIZE) {
-            if chunk.is_empty() {
-                continue;
-            }
-
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(
                     format!(
                         "SELECT manifest_hash
@@ -3008,6 +3124,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn load_current_storage_stats(&self) -> Result<Option<StorageStatsSample>> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -3030,9 +3147,10 @@ impl MetadataStore for TursoMetadataStore {
         limit: Option<usize>,
         collected_since_unix: Option<u64>,
     ) -> Result<Vec<StorageStatsSample>> {
+        let connection = self.open_scan_connection("storage stats history").await?;
         let mut rows = match (collected_since_unix, limit) {
             (Some(collected_since_unix), Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT sample_json
                          FROM storage_stats_history
@@ -3048,7 +3166,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (Some(collected_since_unix), None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT sample_json
                          FROM storage_stats_history
@@ -3060,7 +3178,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, Some(limit)) => {
-                self.connection
+                connection
                     .query(
                         "SELECT sample_json
                          FROM storage_stats_history
@@ -3071,7 +3189,7 @@ impl MetadataStore for TursoMetadataStore {
                     .await?
             }
             (None, None) => {
-                self.connection
+                connection
                     .query(
                         "SELECT sample_json
                          FROM storage_stats_history
@@ -3095,6 +3213,9 @@ impl MetadataStore for TursoMetadataStore {
         &self,
         progress: Option<MetadataDbLogicalProgressCallback>,
     ) -> Result<Vec<MetadataDbTableLogicalBreakdown>> {
+        // This report scans every metadata table. Keep it off the latency-sensitive primary
+        // connection, just as the SQLite backend opens a dedicated analysis connection.
+        let connection = self.open_scan_connection("logical distribution").await?;
         let specs = metadata_db_logical_table_specs();
         let mut tables = Vec::with_capacity(specs.len());
         for (index, spec) in specs.iter().enumerate() {
@@ -3105,8 +3226,7 @@ impl MetadataStore for TursoMetadataStore {
                     current_table: Some(spec.table.to_string()),
                 });
             }
-            let mut rows = self
-                .connection
+            let mut rows = connection
                 .query(&metadata_db_logical_summary_query(*spec), ())
                 .await
                 .with_context(|| {
@@ -3151,7 +3271,7 @@ impl MetadataStore for TursoMetadataStore {
 
     async fn persist_storage_stats_sample(&self, sample: &StorageStatsSample) -> Result<()> {
         let payload = serde_json::to_vec_pretty(sample)?;
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection.execute_batch("BEGIN IMMEDIATE").await?;
         let result: Result<()> = async {
             self.connection
@@ -3184,7 +3304,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn prune_storage_stats_history_before(&self, collected_before_unix: u64) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM storage_stats_history
@@ -3197,6 +3317,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn has_version_index(&self, object_id: &str) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -3208,7 +3329,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn delete_version_index_by_object_id(&self, object_id: &str) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "DELETE FROM version_indexes WHERE object_id = ?1",
@@ -3225,8 +3346,10 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn list_media_cache_fingerprints(&self) -> Result<Vec<String>> {
-        let mut rows = self
-            .connection
+        let connection = self
+            .open_scan_connection("media cache fingerprints")
+            .await?;
+        let mut rows = connection
             .query(
                 "SELECT content_fingerprint
                  FROM media_cache
@@ -3248,6 +3371,7 @@ impl MetadataStore for TursoMetadataStore {
         key: &str,
         source_version_id: &str,
     ) -> Result<bool> {
+        let _connection_guard = self.connection_lock.lock().await;
         let mut rows = self
             .connection
             .query(
@@ -3261,7 +3385,7 @@ impl MetadataStore for TursoMetadataStore {
     }
 
     async fn mark_reconciled(&self, marker: &ReconcileMarker) -> Result<()> {
-        let _writer = self.writer_lock.lock().await;
+        let _connection_guard = self.connection_lock.lock().await;
         self.connection
             .execute(
                 "INSERT INTO reconcile_markers (
@@ -3527,7 +3651,8 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS repair_attempts (
                 subject TEXT PRIMARY KEY,
                 attempts INTEGER NOT NULL,
-                last_failure_unix INTEGER NOT NULL
+                last_failure_unix INTEGER NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 2
             );
 
             CREATE TABLE IF NOT EXISTS content_repair_tasks (
@@ -3780,6 +3905,13 @@ async fn init_metadata_db(connection: &turso::Connection) -> Result<()> {
             (),
         )
         .await?;
+    add_column_if_missing(
+        connection,
+        "repair_attempts",
+        "key_version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    .await?;
     add_column_if_missing(
         connection,
         "content_repair_tasks",
@@ -4122,6 +4254,226 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unbounded_reads_use_dedicated_connections() {
+        let metadata_db_path = turso_test_db_path("turso-unbounded-read-connections");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let snapshot = SnapshotManifest {
+            id: "scan-read-snapshot".to_string(),
+            created_at_unix: 1,
+            objects: HashMap::from([("snapshot/key".to_string(), "snapshot-manifest".to_string())]),
+            object_ids: HashMap::from([(
+                "snapshot/key".to_string(),
+                "snapshot-object".to_string(),
+            )]),
+        };
+        store
+            .persist_snapshot_manifest(&snapshot)
+            .await
+            .expect("snapshot fixture should persist");
+        let primary_connection_guard = store.connection_lock.lock().await;
+        store
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .await
+            .expect("primary write transaction should begin");
+        store
+            .connection
+            .execute(
+                "INSERT INTO metadata_meta(key, value) VALUES(?1, ?2)",
+                ("scan-read-concurrency-test", "uncommitted"),
+            )
+            .await
+            .expect("primary write transaction should remain active");
+
+        let scan_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let missing_keys = vec!["missing".to_string()];
+            let current_state = store.load_current_state().await?;
+            assert!(current_state.objects.is_empty());
+            assert!(current_state.object_ids.is_empty());
+            assert_eq!(store.count_current_objects().await?, 0);
+            assert!(store.list_current_object_keys().await?.is_empty());
+            assert!(store.list_keys_for_object_id("missing").await?.is_empty());
+            assert!(
+                store
+                    .gallery_object_labels_by_key(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .gallery_object_gps_by_key(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
+            assert!(store.load_content_repair_tasks().await?.is_empty());
+            assert!(
+                store
+                    .load_content_repair_tasks_for_manifests(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
+            assert!(store.content_repair_task_hashes().await?.is_empty());
+            assert!(store.load_repair_attempts().await?.is_empty());
+            assert!(store.list_repair_run_history(None, None).await?.is_empty());
+            assert!(
+                store
+                    .list_manual_repair_action_run_history(None, None)
+                    .await?
+                    .is_empty()
+            );
+            assert!(store.list_operation_runs(None, None).await?.is_empty());
+            assert!(
+                store
+                    .list_operation_result_chunks("missing", None, 0)
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .list_data_scrub_run_history(None, None)
+                    .await?
+                    .is_empty()
+            );
+            assert!(store.load_cluster_nodes().await?.is_empty());
+            let cluster_replica_views = store.load_cluster_replica_views().await?;
+            assert!(cluster_replica_views.replicas.is_empty());
+            assert!(cluster_replica_views.available.is_empty());
+            let s3_state = store.load_s3_control_plane_state().await?;
+            assert!(s3_state.buckets.is_empty());
+            assert!(s3_state.access_keys.is_empty());
+            assert_eq!(store.list_snapshot_infos().await?.len(), 1);
+            assert!(
+                store
+                    .list_data_change_events(&DataChangeEventQuery::default())
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .list_s3_object_versions_for_key("missing", "missing")
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .list_s3_object_versions("missing", None)
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .load_manifest_summaries(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .load_cached_media_metadata_many(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
+            assert!(store.load_all_version_indexes().await?.is_empty());
+            assert!(store.list_version_index_object_ids().await?.is_empty());
+            assert_eq!(store.load_all_snapshots().await?.len(), 1);
+            let snapshot_manifest = store
+                .load_snapshot_manifest("scan-read-snapshot")
+                .await?
+                .expect("snapshot manifest should load through a scan connection");
+            assert_eq!(snapshot_manifest.id, "scan-read-snapshot");
+            assert_eq!(snapshot_manifest.objects.len(), 1);
+            let snapshot_by_id = store
+                .load_snapshot_by_id("scan-read-snapshot")
+                .await?
+                .expect("snapshot by ID should load through a scan connection");
+            assert_eq!(snapshot_by_id.id, "scan-read-snapshot");
+            assert_eq!(snapshot_by_id.object_ids.len(), 1);
+            let history_listing = store.list_recoverable_history_listing("", 1, 1).await?;
+            assert!(history_listing.entries.is_empty());
+            assert!(!history_listing.truncated);
+            assert!(store.list_media_cache_fingerprints().await?.is_empty());
+            assert!(store.list_uncompressed_snapshot_ids().await?.is_empty());
+            assert!(store.load_storage_locations().await?.is_empty());
+            assert!(store.list_cached_chunk_records().await?.is_empty());
+            assert!(store.list_locally_owned_manifests().await?.is_empty());
+            assert!(
+                store
+                    .filter_locally_owned_manifests(&missing_keys)
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .list_storage_stats_history(None, None)
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                !store
+                    .load_metadata_db_logical_breakdown(None)
+                    .await?
+                    .is_empty()
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+
+        store
+            .connection
+            .execute_batch("ROLLBACK")
+            .await
+            .expect("primary write transaction should roll back");
+        scan_result
+            .expect("unbounded reads must not wait for the primary write transaction")
+            .expect("unbounded reads should complete");
+
+        drop(primary_connection_guard);
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn scan_read_connections_are_bounded() {
+        let metadata_db_path = turso_test_db_path("turso-bounded-scan-read-connections");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+
+        let mut connections = Vec::new();
+        for _ in 0..DEFAULT_TURSO_SCAN_READ_CONNECTION_COUNT {
+            connections.push(
+                store
+                    .open_scan_connection("semaphore test")
+                    .await
+                    .expect("scan connection within the limit should open"),
+            );
+        }
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                store.open_scan_connection("blocked semaphore test"),
+            )
+            .await
+            .is_err(),
+            "a scan connection beyond the configured limit must wait for a permit"
+        );
+
+        drop(connections.pop());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.open_scan_connection("released semaphore test"),
+        )
+        .await
+        .expect("a released scan permit should unblock the next connection")
+        .expect("scan connection should open after a permit is released");
+
+        drop(connections);
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
     async fn unreadable_raw_content_repair_task_is_discarded_by_hash() {
         let metadata_db_path = turso_test_db_path("turso-unreadable-raw-content-repair-task");
         let store = TursoMetadataStore::open(&metadata_db_path)
@@ -4288,6 +4640,119 @@ mod tests {
             "unfinished operations are never removed by retention"
         );
 
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn lookup_read_connections_are_isolated_and_bounded() {
+        let metadata_db_path = turso_test_db_path("turso-bounded-lookup-read-connections");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+
+        let mut scan_connections = Vec::new();
+        for _ in 0..DEFAULT_TURSO_SCAN_READ_CONNECTION_COUNT {
+            scan_connections.push(
+                store
+                    .open_scan_connection("occupied scan slot")
+                    .await
+                    .expect("scan connection should open within its budget"),
+            );
+        }
+
+        let mut lookup_connections = Vec::new();
+        for _ in 0..DEFAULT_TURSO_LOOKUP_READ_CONNECTION_COUNT {
+            lookup_connections.push(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    store.open_lookup_connection("lookup isolation test"),
+                )
+                .await
+                .expect("scan saturation must not block lookup reads")
+                .expect("lookup connection should open within its budget"),
+            );
+        }
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            store.open_lookup_connection("blocked lookup test"),
+        )
+        .await;
+        assert!(blocked.is_err(), "lookup connection budget must be bounded");
+
+        drop(lookup_connections.pop());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.open_lookup_connection("released lookup test"),
+        )
+        .await
+        .expect("a released lookup permit should unblock the next reader")
+        .expect("lookup connection should open after a permit is released");
+
+        drop(lookup_connections);
+        drop(scan_connections);
+        drop(store);
+        let _ = std::fs::remove_file(metadata_db_path);
+    }
+
+    #[tokio::test]
+    async fn scan_reads_do_not_consume_lookup_capacity() {
+        let metadata_db_path = turso_test_db_path("turso-scan-read-lookup-isolation");
+        let store = TursoMetadataStore::open(&metadata_db_path)
+            .await
+            .expect("turso metadata store should open");
+        let snapshot = SnapshotManifest {
+            id: "scan-budget-snapshot".to_string(),
+            created_at_unix: 1,
+            objects: HashMap::from([("snapshot/key".to_string(), "manifest".to_string())]),
+            object_ids: HashMap::from([("snapshot/key".to_string(), "object".to_string())]),
+        };
+        store
+            .persist_snapshot_manifest(&snapshot)
+            .await
+            .expect("snapshot fixture should persist");
+
+        let mut lookup_connections = Vec::new();
+        for _ in 0..DEFAULT_TURSO_LOOKUP_READ_CONNECTION_COUNT {
+            lookup_connections.push(
+                store
+                    .open_lookup_connection("occupied lookup slot")
+                    .await
+                    .expect("lookup connection should open within its budget"),
+            );
+        }
+
+        let loaded = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.load_snapshot_manifest("scan-budget-snapshot"),
+        )
+        .await
+        .expect("lookup saturation must not block snapshot scan reads")
+        .expect("snapshot manifest should load")
+        .expect("snapshot manifest should exist");
+        assert_eq!(loaded.id, snapshot.id);
+        assert_eq!(loaded.created_at_unix, snapshot.created_at_unix);
+        assert_eq!(loaded.objects, snapshot.objects);
+        assert_eq!(loaded.object_ids, snapshot.object_ids);
+        let s3_versions = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.list_s3_object_versions("missing", None),
+        )
+        .await
+        .expect("lookup saturation must not block S3 version scans")
+        .expect("S3 object versions should load");
+        assert!(s3_versions.is_empty());
+        let owned_manifests = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.filter_locally_owned_manifests(&["missing".to_string()]),
+        )
+        .await
+        .expect("lookup saturation must not block locally owned manifest scans")
+        .expect("locally owned manifests should load");
+        assert!(owned_manifests.is_empty());
+
+        drop(lookup_connections);
         drop(store);
         let _ = std::fs::remove_file(metadata_db_path);
     }

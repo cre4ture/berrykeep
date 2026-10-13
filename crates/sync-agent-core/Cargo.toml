@@ -12,7 +12,7 @@ blake3.workspace = true
 clap.workspace = true
 client-sdk = { path = "../client-sdk" }
 common = { path = "../common" }
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 notify.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde.workspace = true

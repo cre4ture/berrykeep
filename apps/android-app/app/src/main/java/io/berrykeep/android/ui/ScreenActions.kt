@@ -8,6 +8,8 @@ data class SyncScreenActions(
     val runNow: () -> Unit,
     val updateNewProfileLabel: (String) -> Unit,
     val updateNewProfilePrefix: (String) -> Unit,
+    val openRemotePrefixPicker: () -> Unit,
+    val browseRemotePrefixPicker: (String) -> Unit,
     val updateNewProfileLocalFolder: (String) -> Unit,
     val updateNewProfileAllowWifi: (Boolean) -> Unit,
     val updateNewProfileAllowCellular: (Boolean) -> Unit,
