@@ -497,4 +497,4 @@ Write-Host ''
 Write-Host 'Next steps:' -ForegroundColor Yellow
 Write-Host '  1. Upload the .msixupload file to Partner Center.'
 Write-Host '  2. Fill Store metadata, screenshots, privacy policy, and age rating.'
-Write-Host '  3. Add certification notes for login, backend access, sync-root setup, and runFullTrust usage.'
+Write-Host '  3. Add certification notes for login, backend access, sync-root setup, runFullTrust usage, and unvirtualizedResources (shared %LOCALAPPDATA%\\BerryKeep storage for the unpackaged CLI).'

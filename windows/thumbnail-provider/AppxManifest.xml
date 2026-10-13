@@ -7,10 +7,12 @@
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3"
   xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
   xmlns:cloudfiles2="http://schemas.microsoft.com/appx/manifest/cloudfiles/windows10/2"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap uap3 mp desktop desktop3 desktop4 com cloudfiles2 rescap">
+  xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
+  IgnorableNamespaces="uap uap3 mp desktop desktop3 desktop4 desktop6 com cloudfiles2 rescap virtualization">
   <Identity
     Name="UlrichHornung.IronMesh"
     Publisher="CN=53536D7F-3E42-40F5-ACA9-B14F636B5B21"
@@ -20,6 +22,13 @@
     <PublisherDisplayName>Ulrich Hornung</PublisherDisplayName>
     <Description>Configure BerryKeep shared folders and Windows filesystem integration.</Description>
     <Logo>Assets\StoreLogo.png</Logo>
+    <!-- Windows 10 fallback; Windows 11 gives the targeted exclusion below precedence. -->
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+    <virtualization:FileSystemWriteVirtualization>
+      <virtualization:ExcludedDirectories>
+        <virtualization:ExcludedDirectory>$(KnownFolder:LocalAppData)\BerryKeep</virtualization:ExcludedDirectory>
+      </virtualization:ExcludedDirectories>
+    </virtualization:FileSystemWriteVirtualization>
   </Properties>
   <Resources>
     <Resource Language="en-us" />
@@ -30,6 +39,8 @@
   <Capabilities>
     <Capability Name="internetClient" />
     <rescap:Capability Name="runFullTrust" />
+    <!-- Required for the shared, unpackaged-CLI-compatible AppData directory. -->
+    <rescap:Capability Name="unvirtualizedResources" />
   </Capabilities>
   <Applications>
     <Application

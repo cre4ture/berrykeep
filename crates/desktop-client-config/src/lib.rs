@@ -749,6 +749,33 @@ pub fn default_instance_store_path() -> PathBuf {
     }
 }
 
+/// Migrates BerryKeep state written by releases that relied on
+/// MSIX AppData write virtualization into the shared LocalAppData location.
+///
+/// The migration only runs from a packaged Windows process and never replaces
+/// existing external state. This keeps `%LOCALAPPDATA%\\BerryKeep`
+/// available to both the packaged app and an unpackaged CLI installation.
+pub fn migrate_legacy_virtualized_windows_state() -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let Some(package_family_name) = current_package_family_name_from_executable()? else {
+            return Ok(false);
+        };
+        let legacy_state_dir = local_appdata_base_dir()
+            .join("Packages")
+            .join(package_family_name)
+            .join("LocalCache")
+            .join("Local")
+            .join(LOCAL_STATE_ROOT_DIR);
+        migrate_legacy_virtualized_state_dir(&legacy_state_dir, &local_appdata_root())
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
 pub fn default_launch_report_path() -> PathBuf {
     #[cfg(windows)]
     {
@@ -1613,6 +1640,329 @@ fn local_appdata_root() -> PathBuf {
     local_appdata_base_dir().join(LOCAL_STATE_ROOT_DIR)
 }
 
+#[cfg(windows)]
+fn current_package_family_name_from_executable() -> Result<Option<String>> {
+    let package_root = package_root_from_current_exe()?;
+    if !is_windows_apps_package_root(&package_root) {
+        return Ok(None);
+    }
+
+    let package_full_name = package_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("failed reading MSIX package directory name")?;
+    Ok(package_family_name_from_full_name(package_full_name))
+}
+
+#[cfg(any(windows, test))]
+fn package_family_name_from_full_name(package_full_name: &str) -> Option<String> {
+    let mut components = package_full_name.rsplitn(5, '_');
+    let publisher_id = components.next()?;
+    let _resource_id = components.next()?;
+    let architecture = components.next()?;
+    let version = components.next()?;
+    let name = components.next()?;
+    if name.is_empty() || publisher_id.is_empty() || architecture.is_empty() || version.is_empty() {
+        return None;
+    }
+
+    Some(format!("{name}_{publisher_id}"))
+}
+
+#[cfg(any(windows, test))]
+fn migrate_legacy_virtualized_state_dir(
+    legacy_state_dir: &Path,
+    external_state_dir: &Path,
+) -> Result<bool> {
+    if !legacy_state_dir.is_dir() {
+        return Ok(false);
+    }
+    let Some(_migration_lock) = acquire_migration_lock(external_state_dir)? else {
+        return Ok(false);
+    };
+
+    if !path_exists(external_state_dir)? {
+        return copy_state_item_atomically(legacy_state_dir, external_state_dir);
+    }
+
+    merge_missing_state_items(legacy_state_dir, external_state_dir)
+}
+
+#[cfg(any(windows, test))]
+struct MigrationLock {
+    path: PathBuf,
+}
+
+#[cfg(any(windows, test))]
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(any(windows, test))]
+fn acquire_migration_lock(external_state_dir: &Path) -> Result<Option<MigrationLock>> {
+    let lock_path = migration_lock_path(external_state_dir)?;
+    let lock_parent = lock_path
+        .parent()
+        .context("BerryKeep migration lock has no parent directory")?;
+    fs::create_dir_all(lock_parent).with_context(|| {
+        format!(
+            "failed creating BerryKeep migration lock directory {}",
+            lock_parent.display()
+        )
+    })?;
+
+    for _ in 0..2 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = writeln!(file, "{}", std::process::id()) {
+                    let _ = fs::remove_file(&lock_path);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed writing BerryKeep migration lock {}",
+                            lock_path.display()
+                        )
+                    });
+                }
+                return Ok(Some(MigrationLock { path: lock_path }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if migration_lock_owner_is_running(&lock_path)? {
+                    return Ok(None);
+                }
+                if let Err(remove_error) = fs::remove_file(&lock_path)
+                    && remove_error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(remove_error).with_context(|| {
+                        format!(
+                            "failed removing stale BerryKeep migration lock {}",
+                            lock_path.display()
+                        )
+                    });
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed acquiring BerryKeep migration lock {}",
+                        lock_path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(any(windows, test))]
+fn migration_lock_path(external_state_dir: &Path) -> Result<PathBuf> {
+    let parent = external_state_dir
+        .parent()
+        .context("shared BerryKeep state directory has no parent")?;
+    Ok(parent.join(format!(".{LOCAL_STATE_ROOT_DIR}.migration.lock")))
+}
+
+#[cfg(any(windows, test))]
+fn migration_lock_owner_is_running(lock_path: &Path) -> Result<bool> {
+    let owner_pid = fs::read_to_string(lock_path)
+        .with_context(|| {
+            format!(
+                "failed reading BerryKeep migration lock {}",
+                lock_path.display()
+            )
+        })?
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid BerryKeep migration lock {}", lock_path.display()))?;
+    Ok(process_is_running(owner_pid))
+}
+
+#[cfg(any(windows, test))]
+fn merge_missing_state_items(source: &Path, destination: &Path) -> Result<bool> {
+    let destination_type = fs::symlink_metadata(destination).with_context(|| {
+        format!(
+            "failed inspecting existing shared BerryKeep state {}",
+            destination.display()
+        )
+    })?;
+    if !destination_type.is_dir() {
+        bail!(
+            "cannot merge legacy BerryKeep state into non-directory {}",
+            destination.display()
+        );
+    }
+
+    let mut migrated = false;
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("failed reading legacy BerryKeep state {}", source.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed enumerating legacy BerryKeep state {}",
+                source.display()
+            )
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let source_type = state_item_file_type(&source_path)?;
+
+        if !path_exists(&destination_path)? {
+            migrated |= copy_state_item_atomically(&source_path, &destination_path)?;
+            continue;
+        }
+
+        let destination_type = state_item_file_type(&destination_path)?;
+        match (source_type.is_dir(), destination_type.is_dir()) {
+            (true, true) => migrated |= merge_missing_state_items(&source_path, &destination_path)?,
+            (false, false) => {}
+            _ => bail!(
+                "cannot merge legacy BerryKeep state item {} into incompatible shared item {}",
+                source_path.display(),
+                destination_path.display()
+            ),
+        }
+    }
+
+    Ok(migrated)
+}
+
+#[cfg(any(windows, test))]
+fn copy_state_item_atomically(source: &Path, destination: &Path) -> Result<bool> {
+    if path_exists(destination)? {
+        return Ok(false);
+    }
+
+    let temporary_destination = migration_temporary_path(destination)?;
+    let copy_result = match state_item_file_type(source)?.is_dir() {
+        true => copy_directory_recursively(source, &temporary_destination),
+        false => copy_file(source, &temporary_destination),
+    };
+    if let Err(error) = copy_result {
+        remove_state_item(&temporary_destination);
+        return Err(error);
+    }
+
+    if path_exists(destination)? {
+        remove_state_item(&temporary_destination);
+        return Ok(false);
+    }
+
+    if let Err(error) = fs::rename(&temporary_destination, destination) {
+        remove_state_item(&temporary_destination);
+        if path_exists(destination)? {
+            return Ok(false);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "failed atomically publishing migrated BerryKeep state {}",
+                destination.display()
+            )
+        });
+    }
+
+    Ok(true)
+}
+
+#[cfg(any(windows, test))]
+fn copy_directory_recursively(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "failed creating migrated BerryKeep state directory {}",
+            destination.display()
+        )
+    })?;
+
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("failed reading legacy BerryKeep state {}", source.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed enumerating legacy BerryKeep state {}",
+                source.display()
+            )
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if state_item_file_type(&source_path)?.is_dir() {
+            copy_directory_recursively(&source_path, &destination_path)?;
+        } else {
+            copy_file(&source_path, &destination_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn copy_file(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("migrated BerryKeep state file has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed creating migrated BerryKeep state directory {}",
+            parent.display()
+        )
+    })?;
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "failed migrating BerryKeep state {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn state_item_file_type(path: &Path) -> Result<fs::FileType> {
+    let file_type = fs::symlink_metadata(path)
+        .with_context(|| format!("failed inspecting BerryKeep state item {}", path.display()))?
+        .file_type();
+    if !file_type.is_dir() && !file_type.is_file() {
+        bail!(
+            "cannot safely migrate non-regular BerryKeep state item {}",
+            path.display()
+        );
+    }
+    Ok(file_type)
+}
+
+#[cfg(any(windows, test))]
+fn migration_temporary_path(destination: &Path) -> Result<PathBuf> {
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("migrated BerryKeep state item has no file name")?;
+    Ok(destination.with_file_name(format!(
+        ".{file_name}.migration-{}-{}",
+        std::process::id(),
+        unix_ts_ms()
+    )))
+}
+
+#[cfg(any(windows, test))]
+fn path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed checking BerryKeep state item {}", path.display())),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn remove_state_item(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+    let _ = fs::remove_file(path);
+}
+
 #[cfg(not(windows))]
 fn config_home_root() -> PathBuf {
     xdg_dir("XDG_CONFIG_HOME", &[".config"])
@@ -2065,6 +2415,142 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn legacy_virtualized_state_migration_merges_missing_entries_without_overwriting_shared_state()
+    {
+        let path = temp_path("legacy-virtualized-state-migration");
+        let root = path.parent().expect("temp path should have parent");
+        let legacy_state_dir = root.join("legacy").join(LOCAL_STATE_ROOT_DIR);
+        let external_state_dir = root.join("external").join(LOCAL_STATE_ROOT_DIR);
+        let legacy_config_dir = legacy_state_dir.join(CONFIG_SUBDIR);
+        let external_config_dir = external_state_dir.join(CONFIG_SUBDIR);
+        let legacy_identity = legacy_config_dir
+            .join("client-identities")
+            .join("identity.json");
+        let legacy_sync_root_identity = legacy_state_dir
+            .join("sync-roots")
+            .join("atuh-main")
+            .join("client-identity.json");
+        std::fs::create_dir_all(
+            legacy_identity
+                .parent()
+                .expect("legacy identity should have a parent"),
+        )
+        .expect("legacy identity parent should create");
+        std::fs::write(&legacy_identity, "legacy identity").expect("legacy identity should write");
+        std::fs::write(
+            legacy_config_dir.join(INSTANCE_STORE_FILE_NAME),
+            "legacy config",
+        )
+        .expect("legacy instance store should write");
+        std::fs::create_dir_all(
+            legacy_sync_root_identity
+                .parent()
+                .expect("legacy sync-root identity should have a parent"),
+        )
+        .expect("legacy sync-root identity parent should create");
+        std::fs::write(&legacy_sync_root_identity, "legacy sync-root identity")
+            .expect("legacy sync-root identity should write");
+        std::fs::create_dir_all(&external_state_dir)
+            .expect("external state directory should create");
+        std::fs::write(
+            external_state_dir.join("thumbnail-provider.log"),
+            "external thumbnail log",
+        )
+        .expect("external thumbnail log should write");
+
+        assert!(
+            migrate_legacy_virtualized_state_dir(&legacy_state_dir, &external_state_dir)
+                .expect("legacy state should migrate")
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_config_dir.join(INSTANCE_STORE_FILE_NAME))
+                .expect("migrated instance store should read"),
+            "legacy config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                external_config_dir
+                    .join("client-identities")
+                    .join("identity.json")
+            )
+            .expect("migrated identity should read"),
+            "legacy identity"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                external_state_dir
+                    .join("sync-roots")
+                    .join("atuh-main")
+                    .join("client-identity.json")
+            )
+            .expect("migrated sync-root identity should read"),
+            "legacy sync-root identity"
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_state_dir.join("thumbnail-provider.log"))
+                .expect("external thumbnail log should remain readable"),
+            "external thumbnail log"
+        );
+
+        std::fs::write(
+            external_config_dir.join(INSTANCE_STORE_FILE_NAME),
+            "external config",
+        )
+        .expect("external instance store should overwrite");
+        assert!(
+            !migrate_legacy_virtualized_state_dir(&legacy_state_dir, &external_state_dir)
+                .expect("existing external state should be left intact")
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_config_dir.join(INSTANCE_STORE_FILE_NAME))
+                .expect("external instance store should remain readable"),
+            "external config"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_virtualized_state_migration_skips_while_another_process_holds_the_lock() {
+        let path = temp_path("legacy-virtualized-state-lock");
+        let root = path.parent().expect("temp path should have parent");
+        let legacy_state_dir = root.join("legacy").join(LOCAL_STATE_ROOT_DIR);
+        let external_state_dir = root.join("external").join(LOCAL_STATE_ROOT_DIR);
+        std::fs::create_dir_all(&legacy_state_dir).expect("legacy state directory should create");
+        std::fs::write(legacy_state_dir.join("state.json"), "legacy state")
+            .expect("legacy state should write");
+
+        let lock_path =
+            migration_lock_path(&external_state_dir).expect("migration lock path should resolve");
+        std::fs::create_dir_all(lock_path.parent().expect("lock should have a parent"))
+            .expect("migration lock parent should create");
+        std::fs::write(&lock_path, std::process::id().to_string())
+            .expect("migration lock should write");
+
+        assert!(
+            !migrate_legacy_virtualized_state_dir(&legacy_state_dir, &external_state_dir)
+                .expect("active migration lock should skip migration")
+        );
+        assert!(
+            !external_state_dir.exists(),
+            "active migration lock must prevent publishing any state"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn package_family_name_is_derived_from_an_msix_package_full_name() {
+        assert_eq!(
+            package_family_name_from_full_name(
+                "UlrichHornung.IronMesh_2.0.1.0_neutral__bnh81bg69mtt8",
+            ),
+            Some("UlrichHornung.IronMesh_bnh81bg69mtt8".to_string())
+        );
+        assert_eq!(package_family_name_from_full_name("berrykeep"), None);
     }
 
     #[cfg(target_os = "linux")]

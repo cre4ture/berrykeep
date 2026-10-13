@@ -310,7 +310,7 @@ Conditionally required fields that matter for BerryKeep:
 - Restricted capability justification
   - required if the app declares restricted capabilities
 
-For this repo, the privacy policy item should be treated as required because BerryKeep handles user files, account identity, and networked synchronization. The current package also declares `runFullTrust`, so the restricted-capability explanation path should be expected.
+For this repo, the privacy policy item should be treated as required because BerryKeep handles user files, account identity, and networked synchronization. The current package also declares `runFullTrust` and `unvirtualizedResources`; certification notes must explain that the latter keeps `%LOCALAPPDATA%\BerryKeep` shared with the unpackaged CLI.
 
 ### Certification notes likely required for BerryKeep
 
