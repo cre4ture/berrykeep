@@ -1246,17 +1246,33 @@ fn validate_representation_validator(
     part_key: &str,
 ) -> std::result::Result<(), ImportAdvanceError> {
     let observed = if expected.starts_with('"') {
-        strong_etag(headers)
+        match headers.get(reqwest::header::ETAG) {
+            Some(_) => strong_etag(headers).ok_or_else(|| {
+                ImportAdvanceError::Fatal(format!(
+                    "range download for {part_key} returned a non-strong ETag"
+                ))
+            })?,
+            None if headers.contains_key(reqwest::header::LAST_MODIFIED) => {
+                return Err(ImportAdvanceError::Fatal(format!(
+                    "range download for {part_key} omitted the probed ETag while returning Last-Modified"
+                )));
+            }
+            None => return Ok(()),
+        }
     } else {
-        last_modified(headers)
-    };
-    let Some(observed) = observed else {
-        // RFC 7233 permits an If-Range conditional 206 to omit representation
-        // headers, notably Last-Modified. The 206 itself means a conforming
-        // origin accepted the stored If-Range validator. An echoed validator
-        // remains a useful backstop for origins that ignore If-Range: reject
-        // it only when it actually disagrees with the stored value.
-        return Ok(());
+        match headers.get(reqwest::header::LAST_MODIFIED) {
+            Some(_) => last_modified(headers).ok_or_else(|| {
+                ImportAdvanceError::Fatal(format!(
+                    "range download for {part_key} returned an invalid Last-Modified validator"
+                ))
+            })?,
+            None if headers.contains_key(reqwest::header::ETAG) => {
+                return Err(ImportAdvanceError::Fatal(format!(
+                    "range download for {part_key} omitted the probed Last-Modified while returning ETag"
+                )));
+            }
+            None => return Ok(()),
+        }
     };
     if observed != expected {
         return Err(ImportAdvanceError::Fatal(format!(
@@ -1641,6 +1657,7 @@ mod tests {
         OmitContentRange,
         OmitValidator,
         OmitStrongEtagAfterProbe,
+        WeakEtagAfterProbe,
         LastModifiedOnly,
         ChangedRepresentation,
         MismatchedValidator,
@@ -1793,6 +1810,7 @@ mod tests {
         let etag = match state.behavior {
             TestRangeBehavior::OmitValidator => None,
             TestRangeBehavior::OmitStrongEtagAfterProbe if !is_probe => None,
+            TestRangeBehavior::WeakEtagAfterProbe if !is_probe => Some("W/\"dataset-v2\""),
             TestRangeBehavior::LastModifiedOnly => None,
             TestRangeBehavior::MismatchedValidator => Some("\"dataset-v2\""),
             _ => Some(TEST_STRONG_ETAG),
@@ -2453,6 +2471,10 @@ mod tests {
             (
                 TestRangeBehavior::MismatchedValidator,
                 "changed representation validator",
+            ),
+            (
+                TestRangeBehavior::WeakEtagAfterProbe,
+                "returned a non-strong ETag",
             ),
             (
                 TestRangeBehavior::OversizedBody,
