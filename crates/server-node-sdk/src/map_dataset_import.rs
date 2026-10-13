@@ -884,9 +884,20 @@ async fn fail_job(state: &ServerState, error: String) -> Result<()> {
     };
     persist_runtime(state).await?;
     if let Some(job) = failed_job {
-        let cleanup_failures = cleanup_failed_import_parts(state, &job).await;
-        if !cleanup_failures.is_empty() {
-            record_failed_part_cleanup_error(state, &job.job_id, cleanup_failures).await?;
+        match cleanup_failed_import_parts(state, &job).await {
+            Ok(cleanup_failures) if !cleanup_failures.is_empty() => {
+                record_failed_part_cleanup_error(state, &job.job_id, cleanup_failures).await?;
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                record_invalid_part_cleanup_checkpoint_error(
+                    state,
+                    &job.job_id,
+                    job.completed_parts,
+                    &reason,
+                )
+                .await?;
+            }
         }
     }
     Ok(())
@@ -895,7 +906,7 @@ async fn fail_job(state: &ServerState, error: String) -> Result<()> {
 async fn cleanup_failed_import_parts(
     state: &ServerState,
     job: &MapDatasetImportJob,
-) -> Vec<String> {
+) -> std::result::Result<Vec<String>, String> {
     let part_keys = match completed_part_keys_for_cleanup(job) {
         Ok(part_keys) => part_keys,
         Err(error) => {
@@ -904,7 +915,7 @@ async fn cleanup_failed_import_parts(
                 error = %error,
                 "skipping cleanup of failed map import parts with an invalid checkpoint"
             );
-            return vec![format!("invalid checkpoint: {error:#}")];
+            return Err(format!("{error:#}"));
         }
     };
 
@@ -938,7 +949,7 @@ async fn cleanup_failed_import_parts(
             }
         }
     }
-    failures
+    Ok(failures)
 }
 
 async fn record_failed_part_cleanup_error(
@@ -970,6 +981,29 @@ async fn record_failed_part_cleanup_error(
         job.last_error = Some(format!(
             "{original_error}; failed to clean up {} import part(s): {detail}",
             cleanup_failures.len()
+        ));
+        job.updated_at_unix = unix_ts();
+    }
+    persist_runtime(state).await
+}
+
+async fn record_invalid_part_cleanup_checkpoint_error(
+    state: &ServerState,
+    job_id: &str,
+    completed_parts: usize,
+    reason: &str,
+) -> Result<()> {
+    {
+        let mut runtime = state.storage.map_dataset_import.lock().await;
+        let Some(job) = runtime.job.as_mut() else {
+            return Ok(());
+        };
+        if job.job_id != job_id || job.state != AdminMapDatasetImportState::Failed {
+            return Ok(());
+        }
+        let original_error = job.last_error.as_deref().unwrap_or("map import failed");
+        job.last_error = Some(format!(
+            "{original_error}; skipped cleanup of {completed_parts} potentially orphaned import part(s) because the checkpoint is invalid: {reason}"
         ));
         job.updated_at_unix = unix_ts();
     }
@@ -2308,6 +2342,46 @@ mod tests {
             .as_ref()
             .expect("failed job should remain visible");
         assert_eq!(failed.state, AdminMapDatasetImportState::Failed);
+        drop(runtime);
+
+        crate::tests::cleanup_sqlite_test_state(&state).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_cleanup_checkpoint_reports_potential_orphan_count() {
+        let state = crate::tests::build_sqlite_test_state().await;
+        let mut job = test_import_job(
+            MapDatasetProbe {
+                source_url: "https://example.invalid/dataset.mbtiles".to_string(),
+                representation_validator: Some(TEST_STRONG_ETAG.to_string()),
+                dataset_filename: "dataset.mbtiles".to_string(),
+                total_size_bytes: 10,
+            },
+            6,
+        );
+        job.job_id = Uuid::now_v7().to_string();
+        job.total_parts = 3;
+        job.completed_parts = 1;
+        job.completed_bytes = 5;
+        job.current_part_index = 1;
+        install_test_import_job(&state, &job).await;
+
+        fail_job(&state, "source representation changed".to_string())
+            .await
+            .expect("fatal failure should persist");
+
+        let runtime = state.storage.map_dataset_import.lock().await;
+        let failed = runtime
+            .job
+            .as_ref()
+            .expect("failed job should remain visible");
+        let error = failed
+            .last_error
+            .as_deref()
+            .expect("failed job should include its cleanup diagnostic");
+        assert!(error.contains("skipped cleanup of 1 potentially orphaned import part(s)"));
+        assert!(error.contains("size and part size require 2"));
+        assert!(!error.contains("failed to clean up 1 import part(s)"));
         drop(runtime);
 
         crate::tests::cleanup_sqlite_test_state(&state).await;
