@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
+import { isGalleryMapLocationOccluded } from "../packages/ui/src/components/GallerySurface/gallery-map-occlusion";
 import {
   createInitialOverviewGalleryEntries,
   createLiveClusterGalleryEntries,
@@ -55,6 +56,46 @@ test("client-ui store-index mock excludes the queried marker only for children",
   expect(projectMockStoreChildrenEntries(entries, "docs", 1).map((entry) => entry.path)).toEqual([
     "docs/readme.txt"
   ]);
+});
+
+test("client-ui uses the MapLibre v6 camera transform for globe occlusion", () => {
+  const backSideLocation = { longitude: 180, latitude: 0 };
+  const map = {
+    _camera: {
+      transform: {
+        isLocationOccluded: (location: typeof backSideLocation) => location === backSideLocation
+      }
+    }
+  };
+
+  expect(isGalleryMapLocationOccluded(map, backSideLocation)).toBe(true);
+});
+
+test("client-ui preserves the MapLibre transform receiver for globe occlusion", () => {
+  const backSideLocation = { longitude: 180, latitude: 0 };
+  const transform = {
+    backSideLocation,
+    isLocationOccluded(location: typeof backSideLocation) {
+      return location === this.backSideLocation;
+    }
+  };
+
+  expect(isGalleryMapLocationOccluded({ _camera: { transform } }, backSideLocation)).toBe(true);
+});
+
+test("client-ui retains the MapLibre v5 transform fallback for globe occlusion", () => {
+  const backSideLocation = { longitude: 180, latitude: 0 };
+  const map = {
+    transform: {
+      isLocationOccluded: (location: typeof backSideLocation) => location === backSideLocation
+    }
+  };
+
+  expect(isGalleryMapLocationOccluded(map, backSideLocation)).toBe(true);
+});
+
+test("client-ui reports an unavailable globe occlusion hook", () => {
+  expect(isGalleryMapLocationOccluded({}, { longitude: 180, latitude: 0 })).toBeNull();
 });
 
 function createDeferred(): { promise: Promise<void>; resolve: () => void } {

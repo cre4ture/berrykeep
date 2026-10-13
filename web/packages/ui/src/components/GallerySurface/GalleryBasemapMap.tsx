@@ -10,6 +10,10 @@ import { EmbeddedViewportModal } from "../EmbeddedViewportModal";
 import { updateGalleryMapClusterGrid } from "./gallery-map-cluster-grid";
 import { galleryMapClusterCellSizeForViewport } from "./gallery-map-cluster-density";
 import {
+  isGalleryMapLocationOccluded,
+  type GalleryMapOcclusionAdapter
+} from "./gallery-map-occlusion";
+import {
   clusterScreenPoints,
   type ClusterableScreenPoint,
   type ScreenPointCluster
@@ -40,10 +44,6 @@ const TRANSPARENT_PNG_BYTES = base64ToUint8Array(
 type GalleryBasemapMarkerPoint = ClusterableScreenPoint<GalleryBasemapMapCluster> & {
   latitude: number;
   longitude: number;
-};
-
-type GalleryBasemapOcclusionTransform = {
-  isLocationOccluded?: (location: maplibregl.LngLat) => boolean;
 };
 
 type GalleryBasemapMapEntry = {
@@ -207,6 +207,7 @@ const mbtilesSourceCache = new Map<string, Promise<MbtilesSource>>();
 const mbtilesConfigRegistry = new Map<string, GalleryRasterBasemapConfig>();
 const cachedMarkerImages = new Map<string, CachedMarkerImage>();
 let mbtilesProtocolRegistered = false;
+const mapsWithUnresolvedGlobeOcclusion = new WeakSet<object>();
 
 export function GalleryBasemapMap({
   basemap,
@@ -1249,7 +1250,13 @@ function projectVisibleBasemapMarkerPoint(
   map: maplibregl.Map,
   cluster: GalleryBasemapMapCluster
 ): GalleryBasemapMarkerPoint | null {
-  if (isBasemapLocationOccluded(map, cluster.longitude, cluster.latitude)) {
+  const locationOccluded = isBasemapLocationOccluded(map, cluster.longitude, cluster.latitude);
+  if (locationOccluded === true) {
+    return null;
+  }
+
+  if (locationOccluded === null && currentMapProjectionType(map) !== "mercator") {
+    reportUnresolvedGlobeOcclusion(map);
     return null;
   }
 
@@ -1306,11 +1313,21 @@ function isBasemapLocationOccluded(
   map: maplibregl.Map,
   longitude: number,
   latitude: number
-): boolean {
-  // Match MapLibre Marker's globe occlusion behavior by using the same internal transform hook.
-  const transform = (map as maplibregl.Map & { transform?: GalleryBasemapOcclusionTransform })
-    .transform;
-  return transform?.isLocationOccluded?.(new maplibregl.LngLat(longitude, latitude)) ?? false;
+): boolean | null {
+  return isGalleryMapLocationOccluded(
+    map as unknown as GalleryMapOcclusionAdapter<maplibregl.LngLat>,
+    new maplibregl.LngLat(longitude, latitude)
+  );
+}
+
+function reportUnresolvedGlobeOcclusion(map: object): void {
+  if (mapsWithUnresolvedGlobeOcclusion.has(map)) {
+    return;
+  }
+  mapsWithUnresolvedGlobeOcclusion.add(map);
+  console.warn(
+    "Gallery map markers are hidden because this MapLibre version does not expose globe occlusion."
+  );
 }
 
 function formatClusterCount(count: number): string {
