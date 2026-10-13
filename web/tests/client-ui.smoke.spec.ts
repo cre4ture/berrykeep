@@ -1688,6 +1688,48 @@ test("client-ui gallery recovers from a basemap metadata failure", async ({ page
   expect(pageErrors).toEqual([]);
 });
 
+test("client-ui gallery loads gzipped Natural Earth vector tiles for rendering", async ({ page }) => {
+  const vectorTileStatuses: number[] = [];
+  page.on("response", (response) => {
+    if (new URL(response.url()).pathname.startsWith(apiV1("/maps/vector-tiles/"))) {
+      vectorTileStatuses.push(response.status());
+    }
+  });
+  await installClientUiMocks(page, {
+    mapConfiguration: {
+      active_variant_id: "natural-earth-vector",
+      variants: [
+        {
+          id: "natural-earth-vector",
+          label: "Natural Earth Vector",
+          mode_label: "Vector",
+          description: "Natural Earth physical world map rendered from vector tiles.",
+          attribution: "Made with Natural Earth.",
+          kind: "vector",
+          style: "natural_earth",
+          enabled: true,
+          vector_manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json"
+        }
+      ]
+    },
+    mapMetadataCenter: [0, 0, 0],
+    vectorTileBody: readFileSync("tests/fixtures/natural-earth-land.pbf.gz")
+  });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await page.getByRole("button", { name: "Map" }).click();
+  await expect(page.getByRole("textbox", { name: "Map display", exact: true })).toHaveValue(
+    "Natural Earth Vector"
+  );
+  await expect(page.locator(".maplibregl-canvas")).toBeVisible();
+  await expect
+    .poll(() => vectorTileStatuses, {
+      message: "expected MapLibre to load a vector tile for the Natural Earth map"
+    })
+    .toContain(200);
+});
+
 test("client-ui gallery exposes all sort orders", async ({ page }) => {
   await installClientUiMocks(page);
   await page.goto("/");
@@ -2296,6 +2338,7 @@ type InstallClientUiMocksOptions = {
   cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapMetadataCenter?: [number, number, number];
+  vectorTileBody?: Buffer;
   mapConfigurationStatus?: number;
   mapConfiguration?: MockGalleryMapConfiguration;
   mapClusterRefreshDelayMs?: number;
@@ -2341,7 +2384,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const imageBody = tinyPngBuffer();
   const movieBody = Buffer.from("mock-movie-payload");
   const logicalMapBody = readFileSync("tests/fixtures/smoke.mbtiles");
-  const emptyVectorTileBody = gzipSync(Buffer.alloc(0));
+  const vectorTileBody = options?.vectorTileBody ?? gzipSync(Buffer.alloc(0));
   const glyphRangeBody = Buffer.alloc(0);
   let uploadSessionStartCount = 0;
   const uploadSizes = new Map<string, number>();
@@ -2917,7 +2960,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
           "content-encoding": "gzip",
           "cache-control": "public, max-age=3600"
         },
-        body: emptyVectorTileBody
+        body: vectorTileBody
       });
       return;
     }

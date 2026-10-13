@@ -1,0 +1,13 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "Regression test land" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-45, -30], [45, -30], [45, 30], [-45, 30], [-45, -30]]]
+      }
+    }
+  ]
+}
