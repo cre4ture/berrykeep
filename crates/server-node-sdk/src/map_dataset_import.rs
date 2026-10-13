@@ -596,15 +596,9 @@ async fn download_part_bytes_with_limits(
             "map import download limits must be greater than zero".to_string(),
         ));
     }
-    let representation_validator = job
-        .representation_validator
-        .as_deref()
-        .filter(|validator| !validator.trim().is_empty())
-        .ok_or_else(|| {
-            ImportAdvanceError::Fatal(
-                "cannot safely resume a map import without a representation validator".to_string(),
-            )
-        })?;
+    let representation_validator =
+        persisted_representation_validator(job.representation_validator.as_deref())
+            .map_err(ImportAdvanceError::Fatal)?;
     let absolute_start = part
         .offset_bytes
         .saturating_add(job.current_part_downloaded_bytes);
@@ -628,15 +622,7 @@ async fn download_part_bytes_with_limits(
             "range download for {} returned unexpected status {status}",
             part.key
         );
-        return Err(
-            if status == reqwest::StatusCode::OK
-                || status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE
-            {
-                ImportAdvanceError::Fatal(message)
-            } else {
-                classify_http_status(status, message)
-            },
-        );
+        return Err(classify_http_status(status, message));
     }
     validate_content_range(
         response.headers(),
@@ -1048,14 +1034,8 @@ fn strong_etag(headers: &HeaderMap) -> Option<&str> {
         .get(reqwest::header::ETAG)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
-        .filter(|value| {
-            value.len() >= 2
-                && value.starts_with('"')
-                && value.ends_with('"')
-                && !value
-                    .get(..2)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
-        })
+        .filter(|value| !value.starts_with("W/"))
+        .filter(|value| value.len() > 2 && value.starts_with('"') && value.ends_with('"'))
 }
 
 fn representation_validator(headers: &HeaderMap) -> Option<String> {
@@ -1094,6 +1074,20 @@ fn validate_representation_validator(
         )));
     }
     Ok(())
+}
+
+fn persisted_representation_validator(validator: Option<&str>) -> Result<&str, String> {
+    let validator = validator
+        .map(str::trim)
+        .filter(|validator| !validator.is_empty())
+        .ok_or_else(|| {
+            "cannot safely resume a map import without a representation validator".to_string()
+        })?;
+    HeaderValue::from_str(validator).map_err(|_| {
+        "cannot safely resume a map import with a representation validator that is not a valid HTTP header value"
+            .to_string()
+    })?;
+    Ok(validator)
 }
 
 fn probe_dataset_filename(
@@ -1323,13 +1317,7 @@ fn validate_manifest_checkpoint(
 }
 
 fn validate_persisted_job_checkpoint(job: &MapDatasetImportJob) -> std::result::Result<(), String> {
-    if job
-        .representation_validator
-        .as_deref()
-        .is_none_or(|validator| validator.trim().is_empty())
-    {
-        return Err("cannot safely resume a map import without a representation validator".into());
-    }
+    persisted_representation_validator(job.representation_validator.as_deref())?;
     if job.total_size_bytes == 0 {
         return Err("map import total size must be greater than zero".into());
     }
@@ -2042,6 +2030,8 @@ mod tests {
         }];
         let mut blank_validator = base.clone();
         blank_validator.representation_validator = Some("   ".to_string());
+        let mut invalid_header_validator = base.clone();
+        invalid_header_validator.representation_validator = Some("invalid\nvalidator".to_string());
 
         for (job, expected_error) in [
             (wrong_part_geometry, "size and part size require 2"),
@@ -2051,6 +2041,7 @@ mod tests {
                 "2 bytes in chunk refs but records 3 downloaded bytes",
             ),
             (blank_validator, "without a representation validator"),
+            (invalid_header_validator, "not a valid HTTP header value"),
         ] {
             install_test_import_job(&state, &job).await;
             let persisted = load_runtime(state.managed_paths.data_dir())
@@ -2267,6 +2258,12 @@ mod tests {
             Some("Wed, 21 Oct 2015 07:28:00 GMT")
         );
 
+        headers.insert(reqwest::header::ETAG, HeaderValue::from_static("\"\""));
+        assert_eq!(
+            representation_validator(&headers).as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+
         headers.insert(
             reqwest::header::ETAG,
             HeaderValue::from_static(TEST_STRONG_ETAG),
@@ -2275,6 +2272,15 @@ mod tests {
             representation_validator(&headers).as_deref(),
             Some(TEST_STRONG_ETAG)
         );
+    }
+
+    #[test]
+    fn persisted_representation_validator_is_trimmed_and_header_safe() {
+        assert_eq!(
+            persisted_representation_validator(Some("  \"dataset-v1\"\t")).unwrap(),
+            TEST_STRONG_ETAG
+        );
+        assert!(persisted_representation_validator(Some("dataset\n-v1")).is_err());
     }
 
     #[test]
