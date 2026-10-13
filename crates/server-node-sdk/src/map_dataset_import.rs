@@ -9,7 +9,6 @@ const MAP_IMPORT_MAX_PART_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAP_IMPORT_INGEST_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAP_IMPORT_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 const MAP_IMPORT_RETRY_MAX_DELAY_SECS: u64 = 60;
-const MAP_IMPORT_MAX_TRANSIENT_RETRIES: u32 = 10;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -535,18 +534,8 @@ async fn run_worker(state: ServerState) {
                 return;
             }
             Err(ImportAdvanceError::Transient(err)) => {
-                if transient_retries_exhausted(&job) {
-                    let _ = fail_job(
-                        &state,
-                        format!(
-                            "map import exhausted {MAP_IMPORT_MAX_TRANSIENT_RETRIES} consecutive retryable failures: {err}"
-                        ),
-                    )
-                    .await;
-                    return;
-                }
                 let retry_delay = transient_retry_delay_secs(&job);
-                let _ = note_transient_failure(&state, err, retry_delay).await;
+                let _ = note_transient_failure(&state, &job.job_id, err, retry_delay).await;
                 tokio::time::sleep(Duration::from_secs(retry_delay)).await;
             }
         }
@@ -1058,12 +1047,16 @@ fn completed_part_keys_for_cleanup(job: &MapDatasetImportJob) -> Result<Vec<Stri
 
 async fn note_transient_failure(
     state: &ServerState,
+    job_id: &str,
     error: String,
     retry_delay_secs: u64,
 ) -> Result<()> {
     {
         let mut runtime = state.storage.map_dataset_import.lock().await;
-        if let Some(job) = runtime.job.as_mut() {
+        if let Some(job) = runtime.job.as_mut()
+            && job.job_id == job_id
+            && job.state == AdminMapDatasetImportState::Running
+        {
             job.retry_count = job.retry_count.saturating_add(1);
             job.last_error = Some(error);
             job.next_retry_at_unix = Some(unix_ts().saturating_add(retry_delay_secs));
@@ -1090,13 +1083,8 @@ async fn update_running_part_checkpoint(
         if job.job_id != job_id {
             bail!("import job changed while updating checkpoint");
         }
-        let made_progress = downloaded_bytes > job.current_part_downloaded_bytes;
         job.current_part_downloaded_bytes = downloaded_bytes;
         job.current_part_chunk_refs = chunk_refs.to_vec();
-        if made_progress {
-            job.retry_count = 0;
-            job.last_error = None;
-        }
         if let Some(retry_count) = retry_count {
             job.retry_count = retry_count;
         }
@@ -1416,10 +1404,6 @@ fn transient_retry_delay_secs(job: &MapDatasetImportJob) -> u64 {
     let exponent = job.retry_count.min(6);
     let base = 2u64.saturating_pow(exponent);
     base.clamp(2, MAP_IMPORT_RETRY_MAX_DELAY_SECS)
-}
-
-fn transient_retries_exhausted(job: &MapDatasetImportJob) -> bool {
-    job.retry_count.saturating_add(1) >= MAP_IMPORT_MAX_TRANSIENT_RETRIES
 }
 
 fn current_part_spec(
@@ -1963,7 +1947,7 @@ mod tests {
         assert!(retry_error.contains("ended after 3 of 6 bytes"));
         // Keep the persisted retry deadline due immediately. Delayed restart
         // scheduling is a separate contract from checkpoint resumption.
-        note_transient_failure(&state, retry_error.clone(), 0)
+        note_transient_failure(&state, &job.job_id, retry_error.clone(), 0)
             .await
             .expect("retry state should persist");
 
@@ -2670,27 +2654,10 @@ mod tests {
         assert!(persisted_representation_validator(Some("dataset\n-v1")).is_err());
     }
 
-    #[test]
-    fn transient_retry_budget_is_bounded() {
-        let mut job = test_import_job(
-            MapDatasetProbe {
-                source_url: "https://example.invalid/dataset.mbtiles".to_string(),
-                representation_validator: Some(TEST_STRONG_ETAG.to_string()),
-                dataset_filename: "dataset.mbtiles".to_string(),
-                total_size_bytes: 4,
-            },
-            4,
-        );
-        job.retry_count = MAP_IMPORT_MAX_TRANSIENT_RETRIES.saturating_sub(2);
-        assert!(!transient_retries_exhausted(&job));
-        job.retry_count = MAP_IMPORT_MAX_TRANSIENT_RETRIES.saturating_sub(1);
-        assert!(transient_retries_exhausted(&job));
-    }
-
     #[tokio::test]
-    async fn checkpoint_progress_resets_transient_retry_budget() {
+    async fn transient_failure_does_not_modify_a_completed_job() {
         let state = crate::tests::build_sqlite_test_state().await;
-        let mut job = test_import_job(
+        let job = test_import_job(
             MapDatasetProbe {
                 source_url: "https://example.invalid/dataset.mbtiles".to_string(),
                 representation_validator: Some(TEST_STRONG_ETAG.to_string()),
@@ -2699,29 +2666,29 @@ mod tests {
             },
             4,
         );
-        job.retry_count = MAP_IMPORT_MAX_TRANSIENT_RETRIES.saturating_sub(1);
-        job.last_error = Some("previous retryable error".to_string());
         install_test_import_job(&state, &job).await;
+        {
+            let mut runtime = state.storage.map_dataset_import.lock().await;
+            runtime
+                .job
+                .as_mut()
+                .expect("test job should remain active")
+                .state = AdminMapDatasetImportState::Completed;
+        }
 
-        update_running_part_checkpoint(
-            &state,
-            &job.job_id,
-            1,
-            &[UploadChunkRef {
-                hash: "checkpoint-progress".to_string(),
-                size_bytes: 1,
-            }],
-            None,
-            None,
-            true,
-        )
-        .await
-        .expect("progress checkpoint should persist");
+        note_transient_failure(&state, &job.job_id, "late persistence error".to_string(), 2)
+            .await
+            .expect("ignoring a completed job should succeed");
 
         let runtime = state.storage.map_dataset_import.lock().await;
-        let active = runtime.job.as_ref().expect("test job should remain active");
-        assert_eq!(active.retry_count, 0);
-        assert_eq!(active.last_error, None);
+        let completed = runtime
+            .job
+            .as_ref()
+            .expect("completed job should remain visible");
+        assert_eq!(completed.state, AdminMapDatasetImportState::Completed);
+        assert_eq!(completed.retry_count, 0);
+        assert_eq!(completed.last_error, None);
+        assert_eq!(completed.next_retry_at_unix, None);
         drop(runtime);
 
         crate::tests::cleanup_sqlite_test_state(&state).await;
