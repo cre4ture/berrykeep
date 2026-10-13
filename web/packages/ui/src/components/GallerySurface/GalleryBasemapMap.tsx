@@ -22,8 +22,10 @@ import {
   galleryMapPrefetchViewport,
   type GalleryMapViewport
 } from "./gallery-map-viewport";
+import maplibreWorkerUrl from "./maplibre-worker-url";
 
 const MBTILES_PROTOCOL = "berrykeep-mbtiles";
+maplibregl.setWorkerUrl(maplibreWorkerUrl);
 const SQLJS_WORKER_URL = new URL(
   "sql.js-httpvfs/dist/sqlite.worker.js",
   import.meta.url

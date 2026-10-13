@@ -1,11 +1,12 @@
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { gzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import { isGalleryMapLocationOccluded } from "../packages/ui/src/components/GallerySurface/gallery-map-occlusion";
 import {
   createInitialOverviewGalleryEntries,
   createLiveClusterGalleryEntries,
+  naturalEarthVectorVariant,
   registerGalleryMapContractTests
 } from "./gallery-map.contract";
 import { GalleryMapMockSession } from "./gallery-map.mock";
@@ -1688,6 +1689,53 @@ test("client-ui gallery recovers from a basemap metadata failure", async ({ page
   expect(pageErrors).toEqual([]);
 });
 
+test("client-ui gallery renders Natural Earth vector tiles", async ({ page }) => {
+  const pageErrors: string[] = [];
+  const consoleErrors: string[] = [];
+  const vectorTileStatuses: number[] = [];
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+  });
+  page.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  page.on("response", (response) => {
+    if (new URL(response.url()).pathname.startsWith(apiV1("/maps/vector-tiles/"))) {
+      vectorTileStatuses.push(response.status());
+    }
+  });
+  await installClientUiMocks(page, {
+    mapConfiguration: {
+      active_variant_id: "natural-earth-vector",
+      variants: [naturalEarthVectorVariant]
+    },
+    vectorTileBody: gunzipSync(readFileSync("tests/fixtures/natural-earth-land.pbf.gz")),
+    vectorTileContentEncoding: null
+  });
+  await page.goto("/");
+  await page.getByText("Gallery", { exact: true }).click();
+
+  await page.getByRole("button", { name: "Map" }).click();
+  await expect(page.getByRole("textbox", { name: "Map display", exact: true })).toHaveValue(
+    "Natural Earth Vector"
+  );
+  await expect(page.locator(".maplibregl-canvas")).toBeVisible();
+  await expect
+    .poll(() => vectorTileStatuses, {
+      timeout: 20_000,
+      message: "expected MapLibre to load a vector tile for the Natural Earth map"
+    })
+    .toContain(200);
+  await expect
+    .poll(() => mapCanvasPixelCount(page, [232, 228, 216]), {
+      timeout: 20_000,
+      message: "expected MapLibre to render the fixture's ne_land polygon"
+    })
+    .toBeGreaterThan(1_000);
+  expect(pageErrors).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+});
+
 test("client-ui gallery exposes all sort orders", async ({ page }) => {
   await installClientUiMocks(page);
   await page.goto("/");
@@ -2296,6 +2344,8 @@ type InstallClientUiMocksOptions = {
   cacheScope?: string | null;
   mapMetadataStatus?: number;
   mapMetadataCenter?: [number, number, number];
+  vectorTileBody?: Buffer;
+  vectorTileContentEncoding?: "gzip" | null;
   mapConfigurationStatus?: number;
   mapConfiguration?: MockGalleryMapConfiguration;
   mapClusterRefreshDelayMs?: number;
@@ -2341,7 +2391,7 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
   const imageBody = tinyPngBuffer();
   const movieBody = Buffer.from("mock-movie-payload");
   const logicalMapBody = readFileSync("tests/fixtures/smoke.mbtiles");
-  const emptyVectorTileBody = gzipSync(Buffer.alloc(0));
+  const vectorTileBody = options?.vectorTileBody ?? gzipSync(Buffer.alloc(0));
   const glyphRangeBody = Buffer.alloc(0);
   let uploadSessionStartCount = 0;
   const uploadSizes = new Map<string, number>();
@@ -2914,10 +2964,12 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         status: 200,
         headers: {
           "content-type": "application/vnd.mapbox-vector-tile",
-          "content-encoding": "gzip",
+          ...(options?.vectorTileContentEncoding === null
+            ? {}
+            : { "content-encoding": options?.vectorTileContentEncoding ?? "gzip" }),
           "cache-control": "public, max-age=3600"
         },
-        body: emptyVectorTileBody
+        body: vectorTileBody
       });
       return;
     }
@@ -3728,5 +3780,44 @@ function tinyPngBuffer(): Buffer {
   return Buffer.from(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0N8AAAAASUVORK5CYII=",
     "base64"
+  );
+}
+
+async function mapCanvasPixelCount(
+  page: Page,
+  expectedRgb: readonly [number, number, number]
+): Promise<number> {
+  const screenshot = await page.locator(".maplibregl-canvas").screenshot();
+  return page.evaluate(
+    async ({ dataUrl, expectedRgb }) => {
+      const image = new Image();
+      image.src = dataUrl;
+      await image.decode();
+      const copy = document.createElement("canvas");
+      copy.width = image.naturalWidth;
+      copy.height = image.naturalHeight;
+      const context = copy.getContext("2d");
+      if (!context) {
+        throw new Error("2D canvas context is unavailable");
+      }
+      context.drawImage(image, 0, 0);
+      const pixels = context.getImageData(0, 0, copy.width, copy.height).data;
+      let matches = 0;
+      for (let offset = 0; offset < pixels.length; offset += 4) {
+        if (
+          pixels[offset] === expectedRgb[0] &&
+          pixels[offset + 1] === expectedRgb[1] &&
+          pixels[offset + 2] === expectedRgb[2] &&
+          pixels[offset + 3] === 255
+        ) {
+          matches += 1;
+        }
+      }
+      return matches;
+    },
+    {
+      dataUrl: `data:image/png;base64,${screenshot.toString("base64")}`,
+      expectedRgb
+    }
   );
 }

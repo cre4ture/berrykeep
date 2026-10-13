@@ -14,6 +14,18 @@ export type GalleryMapContractTarget = {
   openGallery: (page: Page) => Promise<void>;
 };
 
+export const naturalEarthVectorVariant: GalleryMapConfiguration["variants"][number] = {
+  id: "natural-earth-vector",
+  label: "Natural Earth Vector",
+  mode_label: "Vector",
+  description: "Natural Earth physical world map rendered from vector tiles.",
+  attribution: "Made with Natural Earth.",
+  kind: "vector",
+  style: "natural_earth",
+  enabled: true,
+  vector_manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json"
+};
+
 const configuredMapVariants: GalleryMapConfiguration = {
   version: 1,
   active_variant_id: "natural-earth-globe",
@@ -41,17 +53,7 @@ const configuredMapVariants: GalleryMapConfiguration = {
       raster_manifest_key: "sys/maps/natural-earth-globe.mbtiles.manifest.json",
       vector_manifest_key: "sys/maps/natural-earth-labels.mbtiles.manifest.json"
     },
-    {
-      id: "natural-earth-vector",
-      label: "Natural Earth Vector",
-      mode_label: "Vector",
-      description: "Natural Earth physical world map rendered from vector tiles.",
-      attribution: "Made with Natural Earth.",
-      kind: "vector",
-      style: "natural_earth",
-      enabled: true,
-      vector_manifest_key: "sys/maps/natural-earth-vector.mbtiles.manifest.json"
-    },
+    naturalEarthVectorVariant,
     {
       id: "natural-earth-1",
       label: "Natural Earth I Relief + Water",
