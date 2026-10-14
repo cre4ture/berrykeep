@@ -3434,7 +3434,7 @@ function GalleryWorldMap({
         usesEmbeddedViewport={usesEmbeddedViewport}
         opened={clusterDialog !== null}
         onClose={() => setClusterDialog(null)}
-        title={clusterDialog ? `${clusterDialog.totalEntryCount} items in map cluster` : "Map cluster"}
+        title={clusterDialog ? `${clusterDialog.totalEntryCount} items in this area` : "Nearby items"}
         centered
       >
         <Stack gap="xs">

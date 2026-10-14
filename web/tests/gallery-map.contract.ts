@@ -1,5 +1,6 @@
 import type { GalleryMapConfiguration } from "@berrykeep/api";
 import { expect, test, type Page } from "@playwright/test";
+import { rotatingClusterDialogPageRequests } from "../packages/ui/src/components/GallerySurface/gallery-map-cluster-pagination";
 
 export type GalleryMapContractSetup = {
   mapConfiguration?: GalleryMapConfiguration;
@@ -89,6 +90,44 @@ const configuredMapVariants: GalleryMapConfiguration = {
     }
   ]
 };
+
+test("paginates dense merged map clusters without dropping sources", () => {
+  const sources = Array.from({ length: 13 }, (_, id) => ({
+    id,
+    count: 1,
+    nextOffset: 0,
+    hasMore: true,
+    totalEntryCount: null
+  }));
+  const page = (currentSources: typeof sources, startIndex: number) =>
+    rotatingClusterDialogPageRequests(currentSources, startIndex, 100, 6, (source) => source.count);
+  const sourceIds = (requests: ReturnType<typeof page>["requests"]) =>
+    requests.map(({ source }) => source.id);
+  const markLoaded = (
+    currentSources: typeof sources,
+    requests: ReturnType<typeof page>["requests"]
+  ) =>
+    currentSources.map((source) =>
+      requests.some((request) => request.source.id === source.id)
+        ? { ...source, hasMore: false }
+        : source
+    );
+
+  const firstPage = page(sources, 0);
+  expect(sourceIds(firstPage.requests)).toEqual([0, 1, 2, 3, 4, 5]);
+  expect(firstPage.nextSourceIndex).toBe(6);
+
+  const secondPage = page(markLoaded(sources, firstPage.requests), firstPage.nextSourceIndex);
+  expect(sourceIds(secondPage.requests)).toEqual([6, 7, 8, 9, 10, 11]);
+  expect(secondPage.nextSourceIndex).toBe(12);
+
+  const thirdPage = page(
+    markLoaded(markLoaded(sources, firstPage.requests), secondPage.requests),
+    secondPage.nextSourceIndex
+  );
+  expect(sourceIds(thirdPage.requests)).toEqual([12]);
+  expect(thirdPage.nextSourceIndex).toBe(0);
+});
 
 /**
  * Registers the shared gallery-map behavior that both the client and admin
