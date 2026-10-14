@@ -743,7 +743,7 @@ export function GalleryBasemapMap({
       nextSourceIndex: pageSources.nextSourceIndex,
       queryToken,
       entries: mergeClusterEntries(existingEntries, loadedEntries),
-      totalEntryCount,
+      totalEntryCount: totalClusterDialogEntryCount(nextSources),
       hasMore: !pageLoad.stale && nextSources.some((source) => source.hasMore),
       loading: false,
       error: errors.length > 0 ? errors.join(" ") : null
@@ -1230,6 +1230,13 @@ function GalleryBasemapClusterEntryButton({
 
 function totalClusterEntryCount(clusters: GalleryBasemapMapCluster[]): number {
   return clusters.reduce((count, cluster) => count + cluster.count, 0);
+}
+
+function totalClusterDialogEntryCount(sources: GalleryBasemapClusterDialogSource[]): number {
+  return sources.reduce(
+    (count, source) => count + (source.totalEntryCount ?? source.cluster.count),
+    0
+  );
 }
 
 function isClusterDialogStaleError(error: unknown): boolean {
