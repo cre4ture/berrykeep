@@ -1143,7 +1143,7 @@ test("client-ui keeps an open server cluster stable across viewport refreshes", 
   await expect.poll(() => mapClusterRequests.length).toBeGreaterThan(1);
   await cluster.click();
 
-  const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
+  const chooser = page.getByRole("dialog", { name: "2 items in this area" });
   await expect(chooser).toBeVisible();
   await expect(chooser.getByRole("button", { name: "gallery/cat.png" })).toBeVisible();
   await expect(chooser.getByRole("button", { name: "gallery/dog.jpg" })).toBeVisible();
