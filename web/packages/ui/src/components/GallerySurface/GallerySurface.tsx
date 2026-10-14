@@ -523,6 +523,7 @@ export function GallerySurface({
   const gridPagesRef = useRef<Record<number, GalleryGridPageState>>({});
   const gridPageCacheRef = useRef<GalleryGridPageCache>(new Map());
   const mapClusterRequestVersionRef = useRef(0);
+  const mapClusterStaleRecoveryRef = useRef<Promise<GalleryMapClustersPayload | null> | null>(null);
   const initialMapOverviewRequestPendingRef = useRef(true);
   const lastMapViewportRequestRef = useRef({
     viewport: GALLERY_MAP_INITIAL_VIEWPORT,
@@ -1215,10 +1216,31 @@ export function GallerySurface({
       if (!isGalleryMapClusterStaleError(clusterError)) {
         throw clusterError;
       }
-      const { viewport, zoom, clusterCellSizePx, resolutionViewport } =
-        lastMapViewportRequestRef.current;
-      await loadMapClustersForViewport(viewport, zoom, clusterCellSizePx, resolutionViewport);
-      throw new Error("The gallery changed. Map clusters were refreshed; select the cluster again.");
+      const pendingRecovery = mapClusterStaleRecoveryRef.current;
+      if (pendingRecovery) {
+        await pendingRecovery;
+      } else {
+        const { viewport, zoom, clusterCellSizePx, resolutionViewport } =
+          lastMapViewportRequestRef.current;
+        const recovery = loadMapClustersForViewport(
+          viewport,
+          zoom,
+          clusterCellSizePx,
+          resolutionViewport
+        );
+        mapClusterStaleRecoveryRef.current = recovery;
+        try {
+          await recovery;
+        } finally {
+          if (mapClusterStaleRecoveryRef.current === recovery) {
+            mapClusterStaleRecoveryRef.current = null;
+          }
+        }
+      }
+      throw Object.assign(
+        new Error("The gallery changed. Map clusters were refreshed; select the cluster again."),
+        { code: "gallery_map_cluster_stale" }
+      );
     }
   }
 

@@ -716,13 +716,14 @@ export function GalleryBasemapMap({
     });
     const requestVersion = clusterDialogRequestVersionRef.current + 1;
     clusterDialogRequestVersionRef.current = requestVersion;
-    const pages = await loadClusterDialogPages(
+    const pageLoad = await loadClusterDialogPages(
       queryToken,
       requestedSources
     );
     if (requestVersion !== clusterDialogRequestVersionRef.current) {
       return;
     }
+    const { pages } = pageLoad;
     const nextSources = sources.map((source) => {
       const result = pages.find((candidate) => candidate.source.cluster.cluster_id === source.cluster.cluster_id);
       if (!result?.page) {
@@ -730,7 +731,7 @@ export function GalleryBasemapMap({
       }
       return {
         ...source,
-        nextOffset: result.page.offset + result.page.entries.length,
+        nextOffset: result.page.offset + result.page.limit,
         hasMore: result.page.has_more,
         totalEntryCount: result.page.total_entry_count
       };
@@ -743,7 +744,7 @@ export function GalleryBasemapMap({
       queryToken,
       entries: mergeClusterEntries(existingEntries, loadedEntries),
       totalEntryCount,
-      hasMore: nextSources.some((source) => source.hasMore),
+      hasMore: !pageLoad.stale && nextSources.some((source) => source.hasMore),
       loading: false,
       error: errors.length > 0 ? errors.join(" ") : null
     });
@@ -762,8 +763,12 @@ export function GalleryBasemapMap({
       | undefined
     > = Array.from({ length: requestedSources.length });
     let nextSourceIndex = 0;
+    let stale = false;
 
     async function loadNextPage(): Promise<void> {
+      if (stale) {
+        return;
+      }
       const requestIndex = nextSourceIndex;
       const nextRequest = requestedSources[requestIndex];
       nextSourceIndex += 1;
@@ -783,6 +788,7 @@ export function GalleryBasemapMap({
           error: null
         };
       } catch (error) {
+        stale ||= isClusterDialogStaleError(error);
         pages[requestIndex] = {
           source: nextRequest.source,
           page: null,
@@ -790,7 +796,9 @@ export function GalleryBasemapMap({
         };
       }
 
-      await loadNextPage();
+      if (!stale) {
+        await loadNextPage();
+      }
     }
 
     // A screen-space bubble can combine many server clusters. Keep the initial
@@ -801,7 +809,7 @@ export function GalleryBasemapMap({
         () => loadNextPage()
       )
     );
-    return pages.flatMap((page) => (page ? [page] : []));
+    return { pages: pages.flatMap((page) => (page ? [page] : [])), stale };
   }
 
   // Keep the error return below all hooks so a failed metadata request cannot
@@ -1222,6 +1230,14 @@ function GalleryBasemapClusterEntryButton({
 
 function totalClusterEntryCount(clusters: GalleryBasemapMapCluster[]): number {
   return clusters.reduce((count, cluster) => count + cluster.count, 0);
+}
+
+function isClusterDialogStaleError(error: unknown): boolean {
+  return (
+    Boolean(error) &&
+    typeof error === "object" &&
+    (error as { code?: unknown }).code === "gallery_map_cluster_stale"
+  );
 }
 
 function mergeClusterEntries(
