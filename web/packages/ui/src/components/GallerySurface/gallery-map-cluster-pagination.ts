@@ -13,15 +13,14 @@ export function rotatingClusterDialogPageRequests<TSource extends CursorPagedSou
   sources: TSource[],
   startIndex: number,
   pageSize: number,
-  maxSources: number,
   estimatedTotalEntryCount: (source: TSource) => number
 ): {
   requests: ClusterDialogPageRequest<TSource>[];
   nextSourceIndex: number;
 } {
   // A screen-space bubble can contain a large number of server clusters.
-  // Rotate a bounded subset through each dialog page so opening the bubble
-  // stays responsive while every contained source remains reachable.
+  // Each selected source receives at least one entry, so pageSize also bounds
+  // the number of requests while every contained source remains reachable.
   const selectedSourceIndexes: number[] = [];
   for (let offset = 0; offset < sources.length; offset += 1) {
     const sourceIndex = (startIndex + offset) % sources.length;
@@ -30,7 +29,7 @@ export function rotatingClusterDialogPageRequests<TSource extends CursorPagedSou
       continue;
     }
     selectedSourceIndexes.push(sourceIndex);
-    if (selectedSourceIndexes.length >= maxSources) {
+    if (selectedSourceIndexes.length >= pageSize) {
       break;
     }
   }

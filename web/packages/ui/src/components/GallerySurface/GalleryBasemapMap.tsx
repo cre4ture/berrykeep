@@ -39,8 +39,8 @@ const BASEMAP_MARKER_CLUSTER_RADIUS_PX_MIN = 26;
 const BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX = 68;
 const BASEMAP_CLUSTER_LEAF_ZOOM_THRESHOLD = 19;
 const GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE = 100;
+const GALLERY_MAP_MERGED_CLUSTER_ENTRY_PAGE_SIZE = 24;
 const MAX_CONCURRENT_CLUSTER_ENTRY_REQUESTS = 6;
-const MAX_CLUSTER_DIALOG_SOURCES_PER_PAGE = 6;
 const BASEMAP_CLUSTER_GEO_EPSILON = 0.00001;
 const TRANSPARENT_PNG_BYTES = base64ToUint8Array(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0N8AAAAASUVORK5CYII="
@@ -684,11 +684,14 @@ export function GalleryBasemapMap({
           totalEntryCount: null
         }));
     const nextSourceIndex = append ? clusterDialog?.nextSourceIndex ?? 0 : 0;
+    const pageSize =
+      sources.length > 1
+        ? GALLERY_MAP_MERGED_CLUSTER_ENTRY_PAGE_SIZE
+        : GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE;
     const pageSources = rotatingClusterDialogPageRequests(
       sources,
       nextSourceIndex,
-      GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE,
-      MAX_CLUSTER_DIALOG_SOURCES_PER_PAGE,
+      pageSize,
       (source) => source.cluster.count
     );
     const requestedSources = pageSources.requests;
