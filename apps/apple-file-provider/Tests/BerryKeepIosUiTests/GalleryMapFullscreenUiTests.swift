@@ -110,7 +110,7 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
             return
         }
 
-        let chooser = element(in: webView, labelled: "2 items in map cluster")
+        let chooser = element(in: webView, labelled: "2 items in this area")
         XCTAssertTrue(chooser.waitForExistence(timeout: 45), "Selecting a map bubble should open its image chooser")
         XCTAssertGreaterThan(chooser.frame.height, 0, "The image chooser must have a visible height")
         XCTAssertTrue(
