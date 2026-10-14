@@ -18,6 +18,7 @@ import {
   type ClusterableScreenPoint,
   type ScreenPointCluster
 } from "./gallery-marker-clusters";
+import { rotatingClusterDialogPageRequests } from "./gallery-map-cluster-pagination";
 import {
   galleryMapPrefetchViewport,
   type GalleryMapViewport
@@ -39,7 +40,7 @@ const BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX = 68;
 const BASEMAP_CLUSTER_LEAF_ZOOM_THRESHOLD = 19;
 const GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE = 100;
 const MAX_CONCURRENT_CLUSTER_ENTRY_REQUESTS = 6;
-const MAX_CLIENT_MERGED_CLUSTER_SOURCES = 12;
+const MAX_CLUSTER_DIALOG_SOURCES_PER_PAGE = 6;
 const BASEMAP_CLUSTER_GEO_EPSILON = 0.00001;
 const TRANSPARENT_PNG_BYTES = base64ToUint8Array(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0N8AAAAASUVORK5CYII="
@@ -262,6 +263,7 @@ export function GalleryBasemapMap({
   const [viewportVersion, setViewportVersion] = useState(0);
   const [clusterDialog, setClusterDialog] = useState<{
     sources: GalleryBasemapClusterDialogSource[];
+    nextSourceIndex: number;
     queryToken: string;
     entries: GalleryBasemapMapEntry[];
     totalEntryCount: number;
@@ -633,27 +635,16 @@ export function GalleryBasemapMap({
       return;
     }
 
-    if (serverClusters.length > MAX_CLIENT_MERGED_CLUSTER_SOURCES) {
-      if (zoomToClusters(serverClusters, true)) {
-        return;
-      }
-      showMergedClusterDensityNotice(serverClusters, queryToken);
-      return;
-    }
-
     await loadClusterDialogPage(serverClusters, false, queryToken);
   }
 
-  function zoomToClusters(
-    serverClusters: GalleryBasemapMapCluster[],
-    allowMaximumZoom = false
-  ): boolean {
+  function zoomToClusters(serverClusters: GalleryBasemapMapCluster[]): boolean {
     const currentMap = mapRef.current;
     const bounds = boundsForClusters(serverClusters);
     if (
       !currentMap ||
       !bounds ||
-      currentMap.getZoom() >= (allowMaximumZoom ? 20 : BASEMAP_CLUSTER_LEAF_ZOOM_THRESHOLD) ||
+      currentMap.getZoom() >= BASEMAP_CLUSTER_LEAF_ZOOM_THRESHOLD ||
       !boundsHaveGeoSpread(bounds)
     ) {
       return false;
@@ -665,22 +656,6 @@ export function GalleryBasemapMap({
       duration: 240
     });
     return true;
-  }
-
-  function showMergedClusterDensityNotice(
-    serverClusters: GalleryBasemapMapCluster[],
-    queryToken: string
-  ) {
-    clusterDialogRequestVersionRef.current += 1;
-    setClusterDialog({
-      sources: [],
-      queryToken,
-      entries: [],
-      totalEntryCount: totalClusterEntryCount(serverClusters),
-      hasMore: false,
-      loading: false,
-      error: "There are too many nearby groups to load at once. Zoom in to choose photos."
-    });
   }
 
   function closeClusterDialog() {
@@ -708,7 +683,15 @@ export function GalleryBasemapMap({
           hasMore: cluster.count > 0,
           totalEntryCount: null
         }));
-    const requestedSources = clusterDialogPageSources(sources);
+    const nextSourceIndex = append ? clusterDialog?.nextSourceIndex ?? 0 : 0;
+    const pageSources = rotatingClusterDialogPageRequests(
+      sources,
+      nextSourceIndex,
+      GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE,
+      MAX_CLUSTER_DIALOG_SOURCES_PER_PAGE,
+      (source) => source.cluster.count
+    );
+    const requestedSources = pageSources.requests;
     if (requestedSources.length === 0) {
       if (append && clusterDialog) {
         setClusterDialog({ ...clusterDialog, hasMore: false });
@@ -720,6 +703,7 @@ export function GalleryBasemapMap({
       : totalClusterEntryCount(initialClusters);
     setClusterDialog({
       sources,
+      nextSourceIndex: pageSources.nextSourceIndex,
       queryToken,
       entries: existingEntries,
       totalEntryCount,
@@ -752,6 +736,7 @@ export function GalleryBasemapMap({
     const loadedEntries = pages.flatMap((result) => result.page?.entries ?? []);
     setClusterDialog({
       sources: nextSources,
+      nextSourceIndex: pageSources.nextSourceIndex,
       queryToken,
       entries: mergeClusterEntries(existingEntries, loadedEntries),
       totalEntryCount,
@@ -1230,41 +1215,6 @@ function GalleryBasemapClusterEntryButton({
       {entry.path}
     </Button>
   );
-}
-
-function clusterDialogPageSources(sources: GalleryBasemapClusterDialogSource[]) {
-  // The dialog represents the merged bubble as one paginated collection while
-  // retaining an independent cursor for every server-provided cluster.
-  const remainingEntries = sources.map((source) =>
-    source.hasMore
-      ? Math.max(1, (source.totalEntryCount ?? source.cluster.count) - source.nextOffset)
-      : 0
-  );
-  const limits = remainingEntries.map(() => 0);
-  let remainingPageCapacity = Math.min(
-    GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE,
-    remainingEntries.reduce((total, count) => total + count, 0)
-  );
-
-  while (remainingPageCapacity > 0) {
-    let addedEntry = false;
-    for (let index = 0; index < sources.length && remainingPageCapacity > 0; index += 1) {
-      if (limits[index]! >= remainingEntries[index]!) {
-        continue;
-      }
-      limits[index]! += 1;
-      remainingPageCapacity -= 1;
-      addedEntry = true;
-    }
-    if (!addedEntry) {
-      break;
-    }
-  }
-
-  return sources.flatMap((source, index) => {
-    const limit = limits[index] ?? 0;
-    return limit > 0 ? [{ source, limit }] : [];
-  });
 }
 
 function totalClusterEntryCount(clusters: GalleryBasemapMapCluster[]): number {
