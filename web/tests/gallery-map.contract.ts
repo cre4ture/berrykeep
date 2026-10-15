@@ -1,5 +1,6 @@
 import type { GalleryMapConfiguration } from "@berrykeep/api";
 import { expect, test, type Page } from "@playwright/test";
+import { rotatingClusterDialogPageRequests } from "../packages/ui/src/components/GallerySurface/gallery-map-cluster-pagination";
 
 export type GalleryMapContractSetup = {
   mapConfiguration?: GalleryMapConfiguration;
@@ -89,6 +90,46 @@ const configuredMapVariants: GalleryMapConfiguration = {
     }
   ]
 };
+
+test("paginates dense merged map clusters without dropping sources", () => {
+  const sources = Array.from({ length: 50 }, (_, id) => ({
+    id,
+    count: 1,
+    nextOffset: 0,
+    hasMore: true,
+    totalEntryCount: null
+  }));
+  const page = (currentSources: typeof sources, startIndex: number) =>
+    rotatingClusterDialogPageRequests(currentSources, startIndex, 24, (source) => source.count);
+  const sourceIds = (requests: ReturnType<typeof page>["requests"]) =>
+    requests.map(({ source }) => source.id);
+  const markLoaded = (
+    currentSources: typeof sources,
+    requests: ReturnType<typeof page>["requests"]
+  ) =>
+    currentSources.map((source) =>
+      requests.some((request) => request.source.id === source.id)
+        ? { ...source, hasMore: false }
+        : source
+    );
+
+  const firstPage = page(sources, 0);
+  expect(sourceIds(firstPage.requests)).toEqual(Array.from({ length: 24 }, (_, id) => id));
+  expect(firstPage.nextSourceIndex).toBe(24);
+
+  const secondPage = page(markLoaded(sources, firstPage.requests), firstPage.nextSourceIndex);
+  expect(sourceIds(secondPage.requests)).toEqual(
+    Array.from({ length: 24 }, (_, offset) => offset + 24)
+  );
+  expect(secondPage.nextSourceIndex).toBe(48);
+
+  const thirdPage = page(
+    markLoaded(markLoaded(sources, firstPage.requests), secondPage.requests),
+    secondPage.nextSourceIndex
+  );
+  expect(sourceIds(thirdPage.requests)).toEqual([48, 49]);
+  expect(thirdPage.nextSourceIndex).toBe(0);
+});
 
 /**
  * Registers the shared gallery-map behavior that both the client and admin
@@ -248,7 +289,7 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await expect(page.locator('[aria-label="Geotagged gallery map"]')).toHaveCount(0);
   });
 
-  test(`${target.name} gallery map contract fits the initial server overview and opens cluster choices`, async ({
+  test(`${target.name} gallery map contract fits the initial server overview and opens item choices`, async ({
     page
   }) => {
     await target.setupInitialOverviewScenario(page);
@@ -261,7 +302,7 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     await expect(clusterButtons.nth(1)).toBeVisible();
 
     await clusterButtons.first().click();
-    const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
+    const chooser = page.getByRole("dialog", { name: "2 items in this area" });
     await expect(chooser).toBeVisible();
     await expect(chooser.getByRole("button", { name: "gallery/new-york-a.png" })).toBeVisible();
     await expect(chooser.getByRole("button", { name: "gallery/new-york-b.png" })).toBeVisible();
@@ -302,7 +343,7 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     });
 
     await zoomedClusterResponse;
-    await expect(page.getByRole("dialog", { name: "2 items in map cluster" })).toHaveCount(0);
+    await expect(page.getByRole("dialog", { name: "2 items in this area" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Open map cluster with 2 items" })).toHaveCount(0);
   });
 
@@ -314,10 +355,15 @@ export function registerGalleryMapContractTests(target: GalleryMapContractTarget
     const mergedCluster = page.getByRole("button", { name: "Open map cluster with 4 items" });
     await expect(mergedCluster).toBeVisible();
     await mergedCluster.click();
-    const chooser = page.getByRole("dialog", { name: "4 items in nearby map clusters" });
+    const chooser = page.getByRole("dialog", { name: "4 items in this area" });
     await expect(chooser).toBeVisible();
-    await expect(chooser.getByRole("button", { name: "Server cluster 1: 2 items" })).toBeVisible();
-    await expect(chooser.getByRole("button", { name: "Server cluster 2: 2 items" })).toBeVisible();
+    await expect(chooser.getByRole("button", { name: "gallery/pittsburgh-a.png" })).toBeVisible();
+    await expect(chooser.getByRole("button", { name: "gallery/pittsburgh-b.png" })).toBeVisible();
+    await expect(chooser.getByRole("button", { name: "gallery/philadelphia-a.png" })).toBeVisible();
+    await expect(chooser.getByRole("button", { name: "gallery/philadelphia-b.png" })).toBeVisible();
+    await expect(
+      chooser.locator("[data-gallery-map-cluster-thumbnail='true'] img")
+    ).toHaveCount(4);
   });
 }
 

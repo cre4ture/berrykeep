@@ -18,6 +18,7 @@ import {
   type ClusterableScreenPoint,
   type ScreenPointCluster
 } from "./gallery-marker-clusters";
+import { rotatingClusterDialogPageRequests } from "./gallery-map-cluster-pagination";
 import {
   galleryMapPrefetchViewport,
   type GalleryMapViewport
@@ -38,6 +39,8 @@ const BASEMAP_MARKER_CLUSTER_RADIUS_PX_MIN = 26;
 const BASEMAP_MARKER_CLUSTER_RADIUS_PX_MAX = 68;
 const BASEMAP_CLUSTER_LEAF_ZOOM_THRESHOLD = 19;
 const GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE = 100;
+const GALLERY_MAP_MERGED_CLUSTER_ENTRY_PAGE_SIZE = 24;
+const MAX_CONCURRENT_CLUSTER_ENTRY_REQUESTS = 6;
 const BASEMAP_CLUSTER_GEO_EPSILON = 0.00001;
 const TRANSPARENT_PNG_BYTES = base64ToUint8Array(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0N8AAAAASUVORK5CYII="
@@ -68,6 +71,13 @@ type GalleryBasemapMapCluster = {
   longitude: number;
   bounds: GalleryBasemapMapViewport;
   entry?: GalleryBasemapMapEntry | null;
+};
+
+type GalleryBasemapClusterDialogSource = {
+  cluster: GalleryBasemapMapCluster;
+  nextOffset: number;
+  hasMore: boolean;
+  totalEntryCount: number | null;
 };
 
 type GalleryBasemapClustersPayload = {
@@ -235,6 +245,7 @@ export function GalleryBasemapMap({
   const mapRef = useRef<maplibregl.Map | null>(null);
   const cameraStateRef = useRef<MapCameraState | null>(null);
   const viewportFrameRef = useRef<number | null>(null);
+  const clusterDialogRequestVersionRef = useRef(0);
   const onViewportChangeRef = useRef(onViewportChange);
   const emitViewportRequestRef = useRef<() => void>(() => undefined);
   const appliedInitialOverviewRef = useRef<GalleryBasemapClustersPayload | null>(null);
@@ -251,19 +262,14 @@ export function GalleryBasemapMap({
   const [isInteracting, setIsInteracting] = useState(false);
   const [viewportVersion, setViewportVersion] = useState(0);
   const [clusterDialog, setClusterDialog] = useState<{
-    cluster: GalleryBasemapMapCluster;
+    sources: GalleryBasemapClusterDialogSource[];
+    nextSourceIndex: number;
     queryToken: string;
     entries: GalleryBasemapMapEntry[];
-    nextOffset: number;
     totalEntryCount: number;
     hasMore: boolean;
     loading: boolean;
     error: string | null;
-  } | null>(null);
-  const [clientClusterDialog, setClientClusterDialog] = useState<{
-    clusters: GalleryBasemapMapCluster[];
-    queryToken: string;
-    totalEntryCount: number;
   } | null>(null);
   const serverRasterBasemap = isServerRasterBasemap(basemap) ? basemap : null;
   const localRasterBasemap = isLocalRasterBasemap(basemap) ? basemap : null;
@@ -604,7 +610,7 @@ export function GalleryBasemapMap({
       }
     }
 
-    await loadClusterDialogPage(cluster, false, queryToken);
+    await loadClusterDialogPage([cluster], false, queryToken);
   }
 
   async function handleVisibleClusterClick(
@@ -628,11 +634,8 @@ export function GalleryBasemapMap({
     if (!queryToken) {
       return;
     }
-    setClientClusterDialog({
-      clusters: serverClusters,
-      queryToken,
-      totalEntryCount: serverClusters.reduce((count, serverCluster) => count + serverCluster.count, 0)
-    });
+
+    await loadClusterDialogPage(serverClusters, false, queryToken);
   }
 
   function zoomToClusters(serverClusters: GalleryBasemapMapCluster[]): boolean {
@@ -655,8 +658,13 @@ export function GalleryBasemapMap({
     return true;
   }
 
+  function closeClusterDialog() {
+    clusterDialogRequestVersionRef.current += 1;
+    setClusterDialog(null);
+  }
+
   async function loadClusterDialogPage(
-    cluster: GalleryBasemapMapCluster,
+    initialClusters: GalleryBasemapMapCluster[],
     append: boolean,
     initialQueryToken?: string
   ) {
@@ -667,46 +675,141 @@ export function GalleryBasemapMap({
       return;
     }
     const existingEntries = append ? clusterDialog?.entries ?? [] : [];
-    const nextOffset = append ? clusterDialog?.nextOffset ?? 0 : 0;
+    const sources = append
+      ? clusterDialog?.sources ?? []
+      : initialClusters.map((cluster) => ({
+          cluster,
+          nextOffset: 0,
+          hasMore: cluster.count > 0,
+          totalEntryCount: null
+        }));
+    const nextSourceIndex = append ? clusterDialog?.nextSourceIndex ?? 0 : 0;
+    const pageSize =
+      sources.length > 1
+        ? GALLERY_MAP_MERGED_CLUSTER_ENTRY_PAGE_SIZE
+        : GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE;
+    const pageSources = rotatingClusterDialogPageRequests(
+      sources,
+      nextSourceIndex,
+      pageSize,
+      (source) => source.cluster.count
+    );
+    const requestedSources = pageSources.requests;
+    if (requestedSources.length === 0) {
+      if (append && clusterDialog) {
+        setClusterDialog({ ...clusterDialog, hasMore: false });
+      }
+      return;
+    }
+    const totalEntryCount = append
+      ? clusterDialog?.totalEntryCount ?? totalClusterEntryCount(initialClusters)
+      : totalClusterEntryCount(initialClusters);
     setClusterDialog({
-      cluster,
+      sources,
+      nextSourceIndex: pageSources.nextSourceIndex,
       queryToken,
       entries: existingEntries,
-      nextOffset,
-      totalEntryCount: append ? clusterDialog?.totalEntryCount ?? cluster.count : cluster.count,
-      hasMore: append ? clusterDialog?.hasMore ?? true : true,
+      totalEntryCount,
+      hasMore: true,
       loading: true,
       error: null
     });
-    try {
-      const page = await loadClusterEntries(
-        queryToken,
-        cluster.cluster_id,
-        nextOffset,
-        GALLERY_MAP_CLUSTER_ENTRY_PAGE_SIZE
-      );
-      setClusterDialog({
-        cluster,
-        queryToken,
-        entries: [...existingEntries, ...page.entries],
-        nextOffset: page.offset + page.limit,
-        totalEntryCount: page.total_entry_count,
-        hasMore: page.has_more,
-        loading: false,
-        error: null
-      });
-    } catch (error) {
-      setClusterDialog({
-        cluster,
-        queryToken,
-        entries: existingEntries,
-        nextOffset,
-        totalEntryCount: cluster.count,
-        hasMore: append,
-        loading: false,
-        error: error instanceof Error ? error.message : "Failed to load map cluster entries"
-      });
+    const requestVersion = clusterDialogRequestVersionRef.current + 1;
+    clusterDialogRequestVersionRef.current = requestVersion;
+    const pageLoad = await loadClusterDialogPages(
+      queryToken,
+      requestedSources
+    );
+    if (requestVersion !== clusterDialogRequestVersionRef.current) {
+      return;
     }
+    const { pages } = pageLoad;
+    const nextSources = sources.map((source) => {
+      const result = pages.find((candidate) => candidate.source.cluster.cluster_id === source.cluster.cluster_id);
+      if (!result?.page) {
+        return source;
+      }
+      return {
+        ...source,
+        nextOffset: result.page.offset + result.page.limit,
+        hasMore: result.page.has_more,
+        totalEntryCount: result.page.total_entry_count
+      };
+    });
+    const errors = [...new Set(pages.flatMap((result) => (result.error ? [result.error] : [])))];
+    const loadedEntries = pages.flatMap((result) => result.page?.entries ?? []);
+    setClusterDialog({
+      sources: nextSources,
+      nextSourceIndex: pageSources.nextSourceIndex,
+      queryToken,
+      entries: mergeClusterEntries(existingEntries, loadedEntries),
+      totalEntryCount: totalClusterDialogEntryCount(nextSources),
+      hasMore: !pageLoad.stale && nextSources.some((source) => source.hasMore),
+      loading: false,
+      error: errors.length > 0 ? errors.join(" ") : null
+    });
+  }
+
+  async function loadClusterDialogPages(
+    queryToken: string,
+    requestedSources: Array<{ source: GalleryBasemapClusterDialogSource; limit: number }>
+  ) {
+    const pages: Array<
+      | {
+          source: GalleryBasemapClusterDialogSource;
+          page: GalleryBasemapClusterEntriesPayload | null;
+          error: string | null;
+        }
+      | undefined
+    > = Array.from({ length: requestedSources.length });
+    let nextSourceIndex = 0;
+    let stale = false;
+
+    async function loadNextPage(): Promise<void> {
+      if (stale) {
+        return;
+      }
+      const requestIndex = nextSourceIndex;
+      const nextRequest = requestedSources[requestIndex];
+      nextSourceIndex += 1;
+      if (!nextRequest) {
+        return;
+      }
+
+      try {
+        pages[requestIndex] = {
+          source: nextRequest.source,
+          page: await loadClusterEntries(
+            queryToken,
+            nextRequest.source.cluster.cluster_id,
+            nextRequest.source.nextOffset,
+            nextRequest.limit
+          ),
+          error: null
+        };
+      } catch (error) {
+        stale ||= isClusterDialogStaleError(error);
+        pages[requestIndex] = {
+          source: nextRequest.source,
+          page: null,
+          error: error instanceof Error ? error.message : "Failed to load map cluster entries"
+        };
+      }
+
+      if (!stale) {
+        await loadNextPage();
+      }
+    }
+
+    // A screen-space bubble can combine many server clusters. Keep the initial
+    // selection responsive without creating an unbounded burst of requests.
+    await Promise.all(
+      Array.from(
+        { length: Math.min(MAX_CONCURRENT_CLUSTER_ENTRY_REQUESTS, requestedSources.length) },
+        () => loadNextPage()
+      )
+    );
+    return { pages: pages.flatMap((page) => (page ? [page] : [])), stale };
   }
 
   // Keep the error return below all hooks so a failed metadata request cannot
@@ -983,28 +1086,26 @@ export function GalleryBasemapMap({
         data-gallery-map-cluster-dialog="true"
         usesEmbeddedViewport={usesEmbeddedViewport}
         opened={clusterDialog !== null}
-        onClose={() => setClusterDialog(null)}
-        title={clusterDialog ? `${clusterDialog.totalEntryCount} items in map cluster` : "Map cluster"}
+        onClose={closeClusterDialog}
+        title={clusterDialog ? `${clusterDialog.totalEntryCount} items in this area` : "Nearby items"}
         centered
       >
         <Stack gap="xs">
           <Text size="sm" c="dimmed">
-            Select an item from this cluster to open it in the gallery viewer.
+            Select an item to open it in the gallery viewer.
           </Text>
           <Stack gap="xs">
             {clusterDialog?.entries.map((entry) => (
-              <Button
+              <GalleryBasemapClusterEntryButton
                 key={entry.path}
-                variant="default"
-                fullWidth
+                entry={entry}
+                request={getMarkerRequest(entry)}
                 onClick={() => {
                   const visibleEntries = clusterDialog.entries;
-                  setClusterDialog(null);
+                  closeClusterDialog();
                   onSelectPath(entry.path, visibleEntries);
                 }}
-              >
-                {entry.path}
-              </Button>
+              />
             ))}
           </Stack>
           {clusterDialog?.error ? (
@@ -1016,51 +1117,147 @@ export function GalleryBasemapMap({
           {clusterDialog?.hasMore && !clusterDialog.loading ? (
             <Button
               variant="light"
-              onClick={() => void loadClusterDialogPage(clusterDialog.cluster, true)}
+              onClick={() => void loadClusterDialogPage([], true)}
             >
               Load more
             </Button>
           ) : null}
         </Stack>
       </EmbeddedViewportModal>
-
-      <EmbeddedViewportModal
-        data-gallery-map-client-cluster-dialog="true"
-        usesEmbeddedViewport={usesEmbeddedViewport}
-        opened={clientClusterDialog !== null}
-        onClose={() => setClientClusterDialog(null)}
-        title={
-          clientClusterDialog
-            ? `${clientClusterDialog.totalEntryCount} items in nearby map clusters`
-            : "Nearby map clusters"
-        }
-        centered
-      >
-        <Stack gap="xs">
-          <Text size="sm" c="dimmed">
-            Nearby server clusters are grouped live while the map moves. Select one to inspect its
-            items, or Ctrl- or Cmd-click the bubble to zoom into all of them.
-          </Text>
-          <Stack gap="xs">
-            {clientClusterDialog?.clusters.map((serverCluster, index) => (
-              <Button
-                key={serverCluster.cluster_id}
-                variant="default"
-                fullWidth
-                onClick={() => {
-                  setClientClusterDialog(null);
-                  void handleServerClusterClick(serverCluster, false, clientClusterDialog.queryToken);
-                }}
-              >
-                Server cluster {index + 1}: {formatClusterCount(serverCluster.count)} item
-                {serverCluster.count === 1 ? "" : "s"}
-              </Button>
-            ))}
-          </Stack>
-        </Stack>
-      </EmbeddedViewportModal>
     </>
   );
+}
+
+type GalleryBasemapClusterEntryButtonProps = {
+  entry: GalleryBasemapMapEntry;
+  request: GalleryBasemapPreviewRequest | null;
+  onClick: () => void;
+};
+
+function GalleryBasemapClusterEntryButton({
+  entry,
+  request,
+  onClick
+}: GalleryBasemapClusterEntryButtonProps) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const signature = requestSignature(request);
+  const thumbnailRef = useRef<HTMLDivElement | null>(null);
+  const [thumbnailVisible, setThumbnailVisible] = useState(false);
+  const { resolvedSrc, failed } = useResolvedImageRequest(
+    thumbnailVisible ? request : null,
+    { cache: false }
+  );
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [signature]);
+
+  useEffect(() => {
+    if (!request) {
+      setThumbnailVisible(false);
+      return;
+    }
+    const thumbnail = thumbnailRef.current;
+    if (!thumbnail || typeof IntersectionObserver === "undefined") {
+      setThumbnailVisible(true);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) {
+          setThumbnailVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "160px 0px" }
+    );
+    observer.observe(thumbnail);
+    return () => observer.disconnect();
+  }, [signature]);
+
+  return (
+    <Button
+      variant="default"
+      fullWidth
+      justify="flex-start"
+      leftSection={
+        <div
+          ref={thumbnailRef}
+          data-gallery-map-cluster-thumbnail="true"
+          style={{
+            width: 56,
+            height: 56,
+            marginLeft: -8,
+            overflow: "hidden",
+            borderRadius: 4,
+            background: "var(--mantine-color-dark-8)",
+            flex: "0 0 auto"
+          }}
+        >
+          {failed || imageFailed || !resolvedSrc ? (
+            <Center style={{ width: "100%", height: "100%" }}>
+              <IconMapPin size={18} />
+            </Center>
+          ) : (
+            <img
+              src={resolvedSrc}
+              alt=""
+              loading="lazy"
+              decoding="async"
+              onError={() => setImageFailed(true)}
+              style={{ width: "100%", height: "100%", objectFit: "cover" }}
+            />
+          )}
+        </div>
+      }
+      onClick={onClick}
+      styles={{
+        root: { minHeight: 64, paddingTop: 4, paddingBottom: 4 },
+        inner: { alignItems: "center" },
+        label: {
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          textAlign: "left"
+        }
+      }}
+    >
+      {entry.path}
+    </Button>
+  );
+}
+
+function totalClusterEntryCount(clusters: GalleryBasemapMapCluster[]): number {
+  return clusters.reduce((count, cluster) => count + cluster.count, 0);
+}
+
+function totalClusterDialogEntryCount(sources: GalleryBasemapClusterDialogSource[]): number {
+  return sources.reduce(
+    (count, source) => count + (source.totalEntryCount ?? source.cluster.count),
+    0
+  );
+}
+
+function isClusterDialogStaleError(error: unknown): boolean {
+  return (
+    Boolean(error) &&
+    typeof error === "object" &&
+    (error as { code?: unknown }).code === "gallery_map_cluster_stale"
+  );
+}
+
+function mergeClusterEntries(
+  existingEntries: GalleryBasemapMapEntry[],
+  loadedEntries: GalleryBasemapMapEntry[]
+): GalleryBasemapMapEntry[] {
+  const entriesByPath = new Map<string, GalleryBasemapMapEntry>();
+  for (const entry of [...existingEntries, ...loadedEntries]) {
+    if (!entriesByPath.has(entry.path)) {
+      entriesByPath.set(entry.path, entry);
+    }
+  }
+  return [...entriesByPath.values()];
 }
 
 type GalleryBasemapMarkerProps = {
@@ -2585,12 +2782,14 @@ async function promoteDecodedImage(
 }
 
 function useResolvedImageRequest(
-  request: GalleryBasemapPreviewRequest | null | undefined
+  request: GalleryBasemapPreviewRequest | null | undefined,
+  options?: { cache?: boolean }
 ): { resolvedSrc: string | null; failed: boolean } {
   const [failed, setFailed] = useState(false);
   const [resolvedSrc, setResolvedSrc] = useState<string | null>(request?.url ?? null);
   const hasHeaders = Boolean(request?.headers && Object.keys(request.headers).length > 0);
   const signature = requestSignature(request);
+  const cache = options?.cache ?? true;
 
   useEffect(() => {
     setFailed(false);
@@ -2605,15 +2804,18 @@ function useResolvedImageRequest(
       return;
     }
 
-    const cached = cachedMarkerImages.get(signature);
-    if (cached) {
-      cached.lastAccessedAt = Date.now();
-      setResolvedSrc(cached.resolvedSrc);
-      return;
+    if (cache) {
+      const cached = cachedMarkerImages.get(signature);
+      if (cached) {
+        cached.lastAccessedAt = Date.now();
+        setResolvedSrc(cached.resolvedSrc);
+        return;
+      }
     }
 
     const controller = new AbortController();
     let active = true;
+    let objectUrl: string | null = null;
 
     setResolvedSrc(null);
 
@@ -2633,11 +2835,15 @@ function useResolvedImageRequest(
         }
 
         const nextResolvedSrc = URL.createObjectURL(blob);
-        cachedMarkerImages.set(signature, {
-          lastAccessedAt: Date.now(),
-          resolvedSrc: nextResolvedSrc
-        });
-        trimCachedMarkerImages();
+        if (cache) {
+          cachedMarkerImages.set(signature, {
+            lastAccessedAt: Date.now(),
+            resolvedSrc: nextResolvedSrc
+          });
+          trimCachedMarkerImages();
+        } else {
+          objectUrl = nextResolvedSrc;
+        }
         setResolvedSrc(nextResolvedSrc);
       })
       .catch(() => {
@@ -2650,8 +2856,11 @@ function useResolvedImageRequest(
     return () => {
       active = false;
       controller.abort();
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
     };
-  }, [hasHeaders, request?.url, signature]);
+  }, [cache, hasHeaders, request?.url, signature]);
 
   return { resolvedSrc, failed };
 }

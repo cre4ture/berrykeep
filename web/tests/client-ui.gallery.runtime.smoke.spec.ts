@@ -24,7 +24,7 @@ test("client-ui runtime fits the gallery overview through the client proxy", asy
   const clusters = page.getByRole("button", { name: "Open map cluster with 2 items" });
   await expect(clusters).toHaveCount(2);
   await clusters.first().click();
-  const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
+  const chooser = page.getByRole("dialog", { name: "2 items in this area" });
   await expect(chooser).toBeVisible();
   await expect(chooser.getByRole("button", { name: "gallery/runtime-map-a.png" })).toBeVisible();
   await expect(chooser.getByRole("button", { name: "gallery/runtime-map-b.png" })).toBeVisible();
@@ -63,7 +63,7 @@ test("client-ui runtime keeps the map photo viewer visible in an embedded viewpo
   await expect(cluster).toBeVisible();
   await cluster.click();
 
-  const chooser = page.getByRole("dialog", { name: "2 items in map cluster" });
+  const chooser = page.getByRole("dialog", { name: "2 items in this area" });
   await expect(chooser).toBeVisible();
   await expect(chooser.getByRole("button", { name: "gallery/runtime-map-a.png" })).toBeVisible();
   await expect(chooser.getByRole("button", { name: "gallery/runtime-map-b.png" })).toBeVisible();

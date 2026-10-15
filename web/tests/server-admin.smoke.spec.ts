@@ -1727,11 +1727,11 @@ test("server-admin gallery clusters nearby map markers", async ({ page }) => {
   await expect(clusterButton).toBeVisible();
   await clusterButton.click();
 
-  await expect(page.getByRole("dialog").getByText("12 items in map cluster", { exact: true })).toBeVisible();
+  await expect(page.getByRole("dialog").getByText("12 items in this area", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "gallery/cluster-03.png", exact: true }).click();
 
   await expect(
-    page.getByRole("dialog").getByText("12 items in map cluster", { exact: true })
+    page.getByRole("dialog").getByText("12 items in this area", { exact: true })
   ).toHaveCount(0);
   await expect(
     page.getByRole("dialog").getByRole("button", { name: "gallery/cluster-03.png", exact: true })
@@ -2610,7 +2610,10 @@ async function installServerAdminMocks(
       return json(route, updatedMedia);
     }
 
-    if (pathname === apiV1("/auth/media/thumbnail") && method === "GET") {
+    if (
+      (pathname === apiV1("/auth/media/thumbnail") || pathname === apiV1("/media/thumbnail")) &&
+      method === "GET"
+    ) {
       await route.fulfill({
         status: 200,
         contentType: "image/png",

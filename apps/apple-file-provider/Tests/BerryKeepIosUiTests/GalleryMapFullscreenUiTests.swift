@@ -51,12 +51,8 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         XCTAssertTrue(cluster.waitForExistence(timeout: 45), "The Gallery map should expose its cluster")
         cluster.tap()
 
-        // Nearby server clusters can now merge live while the map camera moves. Selecting a
-        // merged bubble opens a server-cluster chooser before the existing image chooser.
-        let serverCluster = firstServerCluster(in: webView)
-        if serverCluster.waitForExistence(timeout: 10) {
-            serverCluster.tap()
-        }
+        // Nearby server clusters can merge live while the map camera moves. Selecting a
+        // merged bubble opens the image chooser directly.
 
         let shareOriginal = element(in: webView, labelled: "Share original")
         if !shareOriginal.waitForExistence(timeout: 10) {
@@ -104,13 +100,7 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
         XCTAssertTrue(cluster.waitForExistence(timeout: 45), "The fullscreen map should expose the clustered image bubble")
         cluster.tap()
 
-        let serverCluster = firstServerCluster(in: webView)
-        if serverCluster.waitForExistence(timeout: 10) {
-            XCTAssertGreaterThan(serverCluster.frame.height, 0, "The live cluster chooser must be visible")
-            return
-        }
-
-        let chooser = element(in: webView, labelled: "2 items in map cluster")
+        let chooser = element(in: webView, labelled: "2 items in this area")
         XCTAssertTrue(chooser.waitForExistence(timeout: 45), "Selecting a map bubble should open its image chooser")
         XCTAssertGreaterThan(chooser.frame.height, 0, "The image chooser must have a visible height")
         XCTAssertTrue(
@@ -137,14 +127,6 @@ final class GalleryMapFullscreenUiTests: XCTestCase {
     private func largestElement(in webView: XCUIElement, labelled label: String) -> XCUIElement {
         let matches = elements(in: webView, labelled: label).allElementsBoundByIndex
         return matches.max(by: { $0.frame.height < $1.frame.height }) ?? element(in: webView, labelled: label)
-    }
-
-    @MainActor
-    private func firstServerCluster(in webView: XCUIElement) -> XCUIElement {
-        webView
-            .descendants(matching: .any)
-            .matching(NSPredicate(format: "label BEGINSWITH %@", "Server cluster "))
-            .firstMatch
     }
 
     @MainActor
