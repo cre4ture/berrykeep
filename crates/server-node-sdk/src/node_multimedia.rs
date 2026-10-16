@@ -142,19 +142,25 @@ fn view(state: &ServerState, persisted: bool) -> NodeMultimediaView {
 }
 
 pub(super) async fn get_config(State(state): State<ServerState>, headers: HeaderMap) -> Response {
-    if let Err(status) = authorize_admin_request(
-        &state,
-        &headers,
-        "auth/node-multimedia/get",
-        true,
-        true,
-        json!({}),
-    )
-    .await
+    let action = "auth/node-multimedia/get";
+    let authz = match authorize_admin_request(&state, &headers, action, true, true, json!({})).await
     {
-        return status.into_response();
-    }
-    Json(view(&state, state.network.node_enrollment_path.is_some())).into_response()
+        Ok(authz) => authz,
+        Err(status) => return status.into_response(),
+    };
+    let view = view(&state, state.network.node_enrollment_path.is_some());
+    append_admin_audit(
+        &state,
+        action,
+        &authz,
+        true,
+        true,
+        true,
+        "success",
+        json!({ "enabled": view.enabled }),
+    )
+    .await;
+    Json(view).into_response()
 }
 
 pub(super) async fn update_config(

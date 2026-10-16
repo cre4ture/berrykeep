@@ -27809,6 +27809,47 @@ run_on_main_metadata_backends!(
 );
 
 #[tokio::test]
+async fn node_multimedia_successful_read_records_admin_audit() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-actor", "audit-reader".parse().unwrap());
+    let response = super::node_multimedia::get_config(State(state.clone()), headers).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let root = read_store(&state, "tests.multimedia.audit_path")
+        .await
+        .root_dir()
+        .to_path_buf();
+    let event: super::AdminAuditEvent = {
+        let db = rusqlite::Connection::open(root.join("state/metadata.sqlite")).unwrap();
+        let mut statement = db
+            .prepare("SELECT event_json FROM admin_audit_events")
+            .unwrap();
+        let rows: Vec<Vec<u8>> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a successful settings read must leave an audit event"
+        );
+        serde_json::from_slice(&rows[0]).unwrap()
+    };
+    assert_eq!(event.action, "auth/node-multimedia/get");
+    assert_eq!(event.actor.as_deref(), Some("audit-reader"));
+    assert!(event.authorized);
+    assert_eq!(event.outcome, "success");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&event.details_json).unwrap()["enabled"],
+        true
+    );
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn node_multimedia_retry_maps_disable_after_admission_to_application_refusal() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let key = "gallery/admitted-retry.png";
