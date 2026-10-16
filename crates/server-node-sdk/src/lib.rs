@@ -18569,7 +18569,7 @@ async fn list_gallery_map_clusters_admin(
     if let Err(status) = authorize_admin_request(
         &state,
         &headers,
-        "auth/store/map/clusters/get",
+        crate::node_multimedia::AdminMultimediaAction::MapClusters.as_str(),
         true,
         true,
         json!({
@@ -18607,7 +18607,7 @@ async fn list_gallery_map_cluster_entries_admin(
     if let Err(status) = authorize_admin_request(
         &state,
         &headers,
-        "auth/store/map/cluster-entries/get",
+        crate::node_multimedia::AdminMultimediaAction::MapEntries.as_str(),
         true,
         true,
         json!({
@@ -22618,7 +22618,7 @@ async fn get_media_thumbnail_admin(
     headers: HeaderMap,
     Query(query): Query<MediaThumbnailQuery>,
 ) -> impl IntoResponse {
-    let action = "auth/media/thumbnail/get";
+    let action = crate::node_multimedia::AdminMultimediaAction::Thumbnail.as_str();
     if let Err(status) = authorize_admin_request(
         &state,
         &headers,
@@ -22669,7 +22669,7 @@ async fn retry_media_cache_admin(
     headers: HeaderMap,
     Query(query): Query<MediaThumbnailQuery>,
 ) -> impl IntoResponse {
-    let action = "auth/media/cache/retry";
+    let action = crate::node_multimedia::AdminMultimediaAction::CacheRetry.as_str();
     if let Err(status) = authorize_admin_request(
         &state,
         &headers,

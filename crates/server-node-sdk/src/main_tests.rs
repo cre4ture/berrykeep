@@ -28202,19 +28202,88 @@ async fn node_multimedia_denied_admin_audit_keeps_route_and_query() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
     let app = super::build_server_apps(&state).public_app;
+    let cases = [
+        (
+            "HEAD",
+            "/api/v1/auth/maps/import",
+            "auth/maps/import/status",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/media/thumbnail",
+            "auth/media/thumbnail/get",
+        ),
+        (
+            "POST",
+            "/api/v1/auth/media/cache/retry",
+            "auth/media/cache/retry",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/store/map/clusters",
+            "auth/store/map/clusters/get",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/gallery/map/clusters",
+            "auth/store/map/clusters/get",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/store/map/cluster-entries",
+            "auth/store/map/cluster-entries/get",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/gallery/map/cluster-entries",
+            "auth/store/map/cluster-entries/get",
+        ),
+        ("GET", "/api/v1/auth/maps/config", "auth/maps/config/get"),
+        ("PUT", "/api/v1/auth/maps/config", "auth/maps/config/put"),
+        ("GET", "/api/v1/auth/maps/import", "auth/maps/import/status"),
+        ("POST", "/api/v1/auth/maps/import", "auth/maps/import/run"),
+        (
+            "GET",
+            "/api/v1/auth/maps/import/natural-earth",
+            "auth/maps/import/natural-earth/status",
+        ),
+        (
+            "POST",
+            "/api/v1/auth/maps/import/natural-earth",
+            "auth/maps/import/natural-earth/run",
+        ),
+        (
+            "POST",
+            "/api/v1/auth/operations/multimedia.geolocation.propose/runs",
+            "auth/operations/run",
+        ),
+    ];
     for enabled in [true, false] {
         state.multimedia.set_enabled(enabled);
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/auth/media/thumbnail?key=photos%2Fcat.png&snapshot=snapshot-id")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for (method, path, _) in cases {
+            let uri = if path.ends_with("/thumbnail") {
+                format!("{path}?key=photos%2Fcat.png&snapshot=snapshot-id")
+            } else {
+                path.to_string()
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}, enabled={enabled}"
+            );
+        }
     }
     let root = read_store(&state, "tests.multimedia.denied_audit_path")
         .await
@@ -28231,18 +28300,23 @@ async fn node_multimedia_denied_admin_audit_keeps_route_and_query() {
         .unwrap();
     assert_eq!(
         rows.len(),
-        2,
+        cases.len() * 2,
         "one denial audit is required for each request"
     );
     for bytes in rows {
         let event: super::AdminAuditEvent = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(event.action, "auth/media/thumbnail/get");
         assert!(!event.authorized);
         assert_eq!(event.outcome, "denied_auth");
         let details: serde_json::Value = serde_json::from_str(&event.details_json).unwrap();
-        assert_eq!(details["path"], "/api/v1/auth/media/thumbnail");
-        assert_eq!(details["query"]["key"], "photos/cat.png");
-        assert_eq!(details["query"]["snapshot"], "snapshot-id");
+        let (_, path, expected_action) = cases
+            .iter()
+            .find(|(method, path, _)| details["method"] == *method && details["path"] == *path)
+            .unwrap();
+        assert_eq!(event.action, *expected_action, "{path}");
+        if path.ends_with("/thumbnail") {
+            assert_eq!(details["query"]["key"], "photos/cat.png");
+            assert_eq!(details["query"]["snapshot"], "snapshot-id");
+        }
     }
     drop(statement);
     drop(db);

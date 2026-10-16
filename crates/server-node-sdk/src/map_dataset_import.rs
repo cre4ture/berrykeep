@@ -258,7 +258,7 @@ pub(crate) async fn admin_status(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let action = "auth/maps/import/status";
+    let action = crate::node_multimedia::AdminMultimediaAction::MapImportStatus.as_str();
     if let Err(status) =
         authorize_admin_request(&state, &headers, action, true, true, json!({})).await
     {
@@ -277,7 +277,7 @@ pub(crate) async fn start_admin_import(
     headers: HeaderMap,
     Json(request): Json<StartAdminMapDatasetImportRequest>,
 ) -> impl IntoResponse {
-    let action = "auth/maps/import/run";
+    let action = crate::node_multimedia::AdminMultimediaAction::MapImportRun.as_str();
     let authz = match authorize_admin_request(
         &state,
         &headers,

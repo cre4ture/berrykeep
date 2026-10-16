@@ -182,7 +182,7 @@ pub(crate) async fn admin_status(State(state): State<ServerState>, headers: Head
     if let Err(status) = authorize_admin_request(
         &state,
         &headers,
-        "auth/maps/import/natural-earth/status",
+        crate::node_multimedia::AdminMultimediaAction::NaturalEarthStatus.as_str(),
         true,
         true,
         json!({}),
@@ -207,7 +207,7 @@ pub(crate) async fn start_admin_import(
     headers: HeaderMap,
     request: Option<Json<StartNaturalEarthImportRequest>>,
 ) -> Response {
-    let action = "auth/maps/import/natural-earth/run";
+    let action = crate::node_multimedia::AdminMultimediaAction::NaturalEarthRun.as_str();
     let profile = request
         .map(|Json(request)| request.profile)
         .unwrap_or_default();

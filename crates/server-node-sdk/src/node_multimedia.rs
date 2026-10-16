@@ -22,6 +22,65 @@ pub(crate) const MULTIMEDIA_ENABLED_LABEL: &str = "multimedia_enabled";
 pub(crate) const MULTIMEDIA_ENABLED_ENV: &str = "BERRYKEEP_NODE_MULTIMEDIA_ENABLED";
 pub(crate) const MULTIMEDIA_DISABLED_CODE: &str = "node_multimedia_disabled";
 
+/// Canonical audit identities shared by handlers and the pre-extraction gate.
+#[derive(Clone, Copy)]
+pub(super) enum AdminMultimediaAction {
+    Thumbnail,
+    CacheRetry,
+    MapClusters,
+    MapEntries,
+    MapConfigGet,
+    MapConfigPut,
+    MapImportStatus,
+    MapImportRun,
+    NaturalEarthStatus,
+    NaturalEarthRun,
+    OperationRun,
+}
+
+impl AdminMultimediaAction {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Thumbnail => "auth/media/thumbnail/get",
+            Self::CacheRetry => "auth/media/cache/retry",
+            Self::MapClusters => "auth/store/map/clusters/get",
+            Self::MapEntries => "auth/store/map/cluster-entries/get",
+            Self::MapConfigGet => "auth/maps/config/get",
+            Self::MapConfigPut => "auth/maps/config/put",
+            Self::MapImportStatus => "auth/maps/import/status",
+            Self::MapImportRun => "auth/maps/import/run",
+            Self::NaturalEarthStatus => "auth/maps/import/natural-earth/status",
+            Self::NaturalEarthRun => "auth/maps/import/natural-earth/run",
+            Self::OperationRun => "auth/operations/run",
+        }
+    }
+
+    fn from_route(method: &Method, path: &str) -> Option<Self> {
+        // Axum also dispatches HEAD requests through GET handlers.
+        let method = if method == Method::HEAD {
+            "GET"
+        } else {
+            method.as_str()
+        };
+        Some(match (method, path) {
+            ("GET", "/auth/media/thumbnail") => Self::Thumbnail,
+            ("POST", "/auth/media/cache/retry") => Self::CacheRetry,
+            ("GET", "/auth/store/map/clusters" | "/auth/gallery/map/clusters") => Self::MapClusters,
+            ("GET", "/auth/store/map/cluster-entries" | "/auth/gallery/map/cluster-entries") => {
+                Self::MapEntries
+            }
+            ("GET", "/auth/maps/config") => Self::MapConfigGet,
+            ("PUT", "/auth/maps/config") => Self::MapConfigPut,
+            ("GET", "/auth/maps/import") => Self::MapImportStatus,
+            ("POST", "/auth/maps/import") => Self::MapImportRun,
+            ("GET", "/auth/maps/import/natural-earth") => Self::NaturalEarthStatus,
+            ("POST", "/auth/maps/import/natural-earth") => Self::NaturalEarthRun,
+            ("POST", "/auth/operations/{operation_id}/runs") => Self::OperationRun,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MultimediaDisabled;
 
@@ -335,11 +394,9 @@ pub(super) async fn require_multimedia(
             .strip_prefix(super::PUBLIC_API_V1_PREFIX)
             .unwrap_or(path.as_str());
         if normalized_path.starts_with("/auth/") {
-            let action = format!(
-                "{}/{}",
-                normalized_path.trim_start_matches('/'),
-                request.method().as_str().to_ascii_lowercase(),
-            );
+            let action = AdminMultimediaAction::from_route(request.method(), normalized_path)
+                .map(AdminMultimediaAction::as_str)
+                .unwrap_or("node_multimedia/access");
             let uri = request
                 .extensions()
                 .get::<axum::extract::OriginalUri>()
@@ -351,7 +408,7 @@ pub(super) async fn require_multimedia(
             if let Err(status) = authorize_admin_request(
                 &state,
                 request.headers(),
-                &action,
+                action,
                 true,
                 true,
                 json!({ "path": uri.path(), "method": request.method().as_str(), "query": query }),

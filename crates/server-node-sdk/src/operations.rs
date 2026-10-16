@@ -1036,7 +1036,7 @@ pub(super) async fn start_operation_run(
     let authorization = match authorize_admin_request(
         &state,
         &headers,
-        "auth/operations/run",
+        crate::node_multimedia::AdminMultimediaAction::OperationRun.as_str(),
         false,
         approval_granted,
         json!({
