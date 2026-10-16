@@ -20125,11 +20125,23 @@ async fn node_multimedia_derives_from_storage_only_peer(advertised: bool) {
         None,
         &manifest_hash,
         false,
+        super::MediaSourceRecovery::Disabled,
     )
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(metadata.status, super::storage::MediaCacheStatus::Ready);
+    assert_eq!(
+        metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    assert!(
+        !read_store(&target, "tests.multimedia.no_background_chunks")
+            .await
+            .missing_chunks_for_manifest_range(&manifest_hash, 0, sample_png_bytes().len())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let response = super::get_media_thumbnail_response(
         &target,
         super::MediaThumbnailQuery {
@@ -20239,6 +20251,7 @@ async fn node_multimedia_does_not_recover_for_an_unrelated_storage_only_peer() {
         None,
         &manifest_hash,
         false,
+        super::MediaSourceRecovery::Foreground,
     )
     .await
     .unwrap()
@@ -27760,6 +27773,40 @@ run_on_main_metadata_backends!(
 );
 
 #[tokio::test]
+async fn node_multimedia_disabled_does_not_break_client_storage_route() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.multimedia.set_enabled(false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let app = super::build_server_apps(&state).public_app;
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = client_sdk::BerryKeepClient::from_direct_base_url(address);
+    for _ in 0..4 {
+        let response = client
+            .get_relative_path("/media/thumbnail?key=photos/cat.png")
+            .await
+            .expect("a disabled convenience endpoint must return an application response");
+        assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+    }
+    let diagnostics = client.connection_diagnostics();
+    assert_eq!(diagnostics.endpoints[0].consecutive_failures, 0);
+    assert_eq!(diagnostics.endpoints[0].total_failures, 0);
+    assert_eq!(
+        client
+            .get_relative_path("/store/index")
+            .await
+            .unwrap()
+            .status,
+        StatusCode::OK
+    );
+    server.abort();
+    let _ = server.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn node_multimedia_setting_disables_convenience_but_keeps_storage_available() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
@@ -27849,7 +27896,7 @@ async fn node_multimedia_setting_disables_convenience_but_keeps_storage_availabl
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
     }
 
     // Both the thumbnail fast path and fallback routers honor the switch.
@@ -27879,7 +27926,7 @@ async fn node_multimedia_setting_disables_convenience_but_keeps_storage_availabl
             )
             .await
             .unwrap();
-            assert_eq!(response.status, 503, "{path}");
+            assert_eq!(response.status, 501, "{path}");
         }
     }
     let peer_response = super::build_server_apps(&state)
@@ -27896,7 +27943,7 @@ async fn node_multimedia_setting_disables_convenience_but_keeps_storage_availabl
         )
         .await
         .unwrap();
-    assert_eq!(peer_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(peer_response.status(), StatusCode::NOT_IMPLEMENTED);
 
     // A media file remains ordinary stored content, including keys that resemble API routes.
     for key in ["photos/cat.png", "maps/config", "map/clusters"] {

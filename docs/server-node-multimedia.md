@@ -42,7 +42,7 @@ advertised with the node descriptor and Rendezvous presence, independently of
 - Media workers reject new metadata extraction and thumbnail generation, even
   when a caller retained a worker before the setting changed.
 - Thumbnail, gallery map, map serving/configuration/import, and multimedia
-  operation start endpoints return HTTP 503 with code `node_multimedia_disabled`.
+  operation start endpoints return HTTP 501 with code `node_multimedia_disabled`.
   This applies to versioned and legacy HTTP endpoints and multiplexed transports.
 - Cache clearing and operation history remain available. Clearing the cache does
   not restart multimedia backfill while multimedia is disabled.
@@ -50,19 +50,24 @@ advertised with the node descriptor and Rendezvous presence, independently of
   upload/download, directory browsing, replication, repair, and scrubbing continue.
   Directory listings may still expose metadata already cached on disk.
 
-The client SDK already retries HTTP 503 on another route. Configure at least one
-reachable node with multimedia enabled for convenience features. A browser using
-a node's admin UI directly must connect to an enabled node to use those features.
-This release does not add capability-based client route scoring; a disabled node
-may receive an initial request before failover. Priority can reduce those attempts.
+The response is an application-level refusal: it does not open the client's route
+circuit breaker or mark the storage host unreachable. Use connection priority to
+prefer multimedia-enabled hosts, or connect to an enabled node directly. This
+release does not add capability-based client routing or automatic multimedia
+failover; client priority overrides remain routing preferences.
 
 When an enabled node has only metadata and a known storage-only source holds the original,
 it first tries other enabled peers for an existing derivative. If none is available,
-it uses the existing bounded chunk-recovery path to cache the original chunks in
-its storage pool and derive metadata/thumbnails locally. Storage-only peers serve
+an explicit thumbnail or cache-retry request can use the existing chunk-recovery
+path to cache the original chunks in its storage pool and derive locally.
+Background startup, re-enable, and cache-clear backfill never recover full source
+content; they derive from local content or import existing peer artifacts.
+Storage-only peers serve
 ordinary chunks without decoding media. The capable node therefore needs storage
 capacity for recovered source content as well as derivative caches. Existing
-incomplete-artifact retry backoff still applies when recovery cannot complete.
+incomplete-artifact retry backoff still applies. Foreground source recovery has
+a separate, bounded, per-manifest runtime retry cache with a ten-minute backoff,
+so a background metadata miss does not delay the first user-requested recovery.
 Unrelated storage-only nodes do not trigger recovery for other nodes' media.
 
 Changes affect new work immediately. Work already admitted may finish; the switch

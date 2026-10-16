@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use axum::Json;
@@ -8,6 +8,7 @@ use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use common::range_chunk_cache::RangeChunkCache;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -34,21 +35,27 @@ impl std::error::Error for MultimediaDisabled {}
 
 /// Shared by the request layer and every media worker, including existing clones.
 #[derive(Clone)]
-pub(crate) struct MultimediaControl(Arc<AtomicBool>);
+pub(crate) struct MultimediaControl {
+    enabled: Arc<AtomicBool>,
+    source_recovery_retries: Arc<Mutex<RangeChunkCache<String, u64>>>,
+}
 
 impl Default for MultimediaControl {
     fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(true)))
+        Self {
+            enabled: Arc::new(AtomicBool::new(true)),
+            source_recovery_retries: Arc::new(Mutex::new(RangeChunkCache::new(1024))),
+        }
     }
 }
 
 impl MultimediaControl {
     pub(crate) fn enabled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.enabled.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_enabled(&self, enabled: bool) {
-        self.0.store(enabled, Ordering::Release);
+        self.enabled.store(enabled, Ordering::Release);
     }
 
     pub(crate) fn ensure_enabled(&self) -> Result<()> {
@@ -56,6 +63,24 @@ impl MultimediaControl {
             return Err(MultimediaDisabled.into());
         }
         Ok(())
+    }
+
+    /// A foreground request may bypass metadata-only backoff once, but repeated
+    /// source-recovery failures must not create an unbounded retry or state queue.
+    pub(crate) fn admit_source_recovery(&self, manifest_hash: &str, now_unix: u64) -> bool {
+        let mut retries = self
+            .source_recovery_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = manifest_hash.to_string();
+        if retries
+            .get(&key)
+            .is_some_and(|retry_at| *retry_at > now_unix)
+        {
+            return false;
+        }
+        retries.insert(key, now_unix.saturating_add(10 * 60));
+        true
     }
 }
 
@@ -199,7 +224,7 @@ async fn apply_config(state: &ServerState, enabled: bool) -> Result<bool> {
 }
 
 pub(super) fn unavailable_response() -> Response {
-    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+    (StatusCode::NOT_IMPLEMENTED, Json(json!({
         "error": "Multimedia functionality is disabled on this server node. Use a multimedia-enabled node.",
         "code": MULTIMEDIA_DISABLED_CODE,
     }))).into_response()
@@ -244,6 +269,16 @@ pub(super) async fn require_multimedia(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multimedia_source_recovery_backoff_is_shared_and_expires() {
+        let control = MultimediaControl::default();
+        assert!(control.admit_source_recovery("manifest-a", 100));
+        assert!(!control.clone().admit_source_recovery("manifest-a", 101));
+        assert!(control.admit_source_recovery("manifest-b", 101));
+        assert!(!control.admit_source_recovery("manifest-a", 699));
+        assert!(control.admit_source_recovery("manifest-a", 700));
+    }
 
     #[test]
     fn multimedia_environment_accepts_empty_as_unset_but_rejects_invalid_values() {

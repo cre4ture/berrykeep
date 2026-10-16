@@ -15907,6 +15907,12 @@ async fn run_autonomous_post_write_replication(state: ServerState) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaSourceRecovery {
+    Disabled,
+    Foreground,
+}
+
 fn spawn_media_metadata_warmup(state: ServerState, key: String, manifest_hash: String) {
     if !state.multimedia.enabled() {
         return;
@@ -15919,6 +15925,7 @@ fn spawn_media_metadata_warmup(state: ServerState, key: String, manifest_hash: S
             None,
             &manifest_hash,
             false,
+            MediaSourceRecovery::Disabled,
         )
         .await
         {
@@ -15976,6 +15983,7 @@ fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
                 None,
                 &manifest_hash,
                 false,
+                MediaSourceRecovery::Disabled,
             )
             .await
             {
@@ -21832,7 +21840,7 @@ async fn fetch_peer_media_artifact(
     )
     .await?;
 
-    if response.status == StatusCode::SERVICE_UNAVAILABLE.as_u16()
+    if response.status == StatusCode::NOT_IMPLEMENTED.as_u16()
         && response
             .json::<serde_json::Value>()
             .ok()
@@ -21893,6 +21901,7 @@ async fn ensure_media_artifact_with_remote_import(
     version_id: Option<&str>,
     manifest_hash: &str,
     include_thumbnail: bool,
+    source_recovery: MediaSourceRecovery,
 ) -> Result<Option<CachedMediaMetadata>> {
     state.multimedia.ensure_enabled()?;
     let now_unix = unix_ts();
@@ -21924,12 +21933,18 @@ async fn ensure_media_artifact_with_remote_import(
         return Ok(None);
     };
 
-    if !should_attempt_remote_media_artifact_import(
+    let attempt_remote_import = should_attempt_remote_media_artifact_import(
         previous_metadata.as_ref(),
         &local_metadata,
         include_thumbnail,
         now_unix,
-    ) {
+    );
+    let attempt_source_recovery = source_recovery == MediaSourceRecovery::Foreground
+        && local_metadata.status == MediaCacheStatus::Incomplete
+        && state
+            .multimedia
+            .admit_source_recovery(manifest_hash, now_unix);
+    if !attempt_remote_import && !attempt_source_recovery {
         return Ok(Some(local_metadata));
     }
 
@@ -21991,7 +22006,7 @@ async fn ensure_media_artifact_with_remote_import(
 
     // A storage-only replica cannot produce derivatives. Recover verified source
     // chunks onto this capable node instead, using the same bounded path as previews.
-    if has_storage_only_source && local_metadata.status == MediaCacheStatus::Incomplete {
+    if attempt_source_recovery && has_storage_only_source {
         state.multimedia.ensure_enabled()?;
         match hydrate_missing_chunks_for_media_preview(
             state,
@@ -22846,6 +22861,7 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
         query.version.as_deref(),
         &manifest_hash,
         include_thumbnail,
+        MediaSourceRecovery::Foreground,
     )
     .await
     {
@@ -23123,6 +23139,7 @@ async fn retry_media_cache_response(
         query.version.as_deref(),
         &manifest_hash,
         true,
+        MediaSourceRecovery::Foreground,
     )
     .await
     {
