@@ -48,7 +48,8 @@ advertised with the node descriptor and Rendezvous presence, independently of
   Existing client/admin authentication runs before the capability response.
   Disabled responses use `Cache-Control: no-store`, so re-enabling takes effect
   without cached refusals.
-- Cache clearing and operation history remain available. Clearing the cache does
+- Authenticated map-import status reads, cache clearing, and operation history
+  remain available. Clearing the cache does
   not restart multimedia backfill while multimedia is disabled.
 - Original media and map datasets remain ordinary replicated objects. File
   upload/download, directory browsing, replication, repair, and scrubbing continue.
@@ -90,10 +91,13 @@ backoff through cache churn. Capability observations use a separate 1,024-entry 
 cache and expire after ten minutes; they cannot displace retry deadlines.
 Unrelated storage-only nodes do not trigger recovery for other nodes' media.
 
-Changes affect new work immediately. Work already admitted may finish; the switch
-does not forcibly terminate a decoder or map import. Backfill and operation batches
-stop at their next eligibility check. Re-enabling starts metadata backfill and
-resumes a pending map import.
+Changes affect new work immediately. An admitted decoder or Natural Earth import
+may finish. Map dataset imports pause between parts: the current part may finish,
+then the worker waits without downloading the next part or losing completed progress.
+Authenticated `GET /auth/maps/import` and `GET /auth/maps/import/natural-earth`
+status reads remain available while disabled. Backfill and operation batches stop
+at their next eligibility check. Re-enabling starts metadata backfill and wakes a
+paused map import or resumes one loaded from disk, without creating duplicate workers.
 
 ## Memory isolation
 

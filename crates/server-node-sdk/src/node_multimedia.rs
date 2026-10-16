@@ -96,6 +96,7 @@ impl std::error::Error for MultimediaDisabled {}
 #[derive(Clone)]
 pub(crate) struct MultimediaControl {
     enabled: Arc<AtomicBool>,
+    enabled_notification: Arc<tokio::sync::Notify>,
     source_recovery_retries: Arc<Mutex<MediaRecoveryBackoffs>>,
     storage_only_sources: Arc<Mutex<RangeChunkCache<String, u64>>>,
 }
@@ -183,6 +184,7 @@ impl Default for MultimediaControl {
     fn default() -> Self {
         Self {
             enabled: Arc::new(AtomicBool::new(true)),
+            enabled_notification: Arc::new(tokio::sync::Notify::new()),
             source_recovery_retries: Arc::new(Mutex::new(MediaRecoveryBackoffs::default())),
             storage_only_sources: Arc::new(Mutex::new(RangeChunkCache::new(1024))),
         }
@@ -196,6 +198,24 @@ impl MultimediaControl {
 
     pub(crate) fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Release);
+        if enabled {
+            self.enabled_notification.notify_waiters();
+        }
+    }
+
+    /// Park a resumable worker without losing its ownership or polling the flag.
+    pub(crate) async fn wait_until_enabled(&self) {
+        loop {
+            let notification = self.enabled_notification.notified();
+            tokio::pin!(notification);
+            // Register before checking the flag so a concurrent enable cannot
+            // be lost between observing disabled and awaiting the notification.
+            notification.as_mut().enable();
+            if self.enabled() {
+                return;
+            }
+            notification.await;
+        }
     }
 
     pub(crate) fn ensure_enabled(&self) -> Result<()> {
@@ -445,8 +465,9 @@ pub(super) async fn require_multimedia(
             .as_str()
             .strip_prefix(super::PUBLIC_API_V1_PREFIX)
             .unwrap_or(path.as_str());
+        let admin_action = AdminMultimediaAction::from_route(request.method(), normalized_path);
         if normalized_path.starts_with("/auth/") {
-            let action = AdminMultimediaAction::from_route(request.method(), normalized_path)
+            let action = admin_action
                 .map(AdminMultimediaAction::as_str)
                 .unwrap_or("node_multimedia/access");
             let uri = request
@@ -470,7 +491,13 @@ pub(super) async fn require_multimedia(
                 return status.into_response();
             }
         }
-        if !state.multimedia.enabled() {
+        let import_status = matches!(
+            admin_action,
+            Some(
+                AdminMultimediaAction::MapImportStatus | AdminMultimediaAction::NaturalEarthStatus
+            )
+        );
+        if !state.multimedia.enabled() && !import_status {
             return unavailable_response();
         }
     }
@@ -480,6 +507,26 @@ pub(super) async fn require_multimedia(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn multimedia_resumable_workers_wake_after_reenable() {
+        let control = MultimediaControl::default();
+        control.set_enabled(false);
+        let waiting = control.wait_until_enabled();
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        control.clone().set_enabled(true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("an already parked worker must wake when a cloned control enables multimedia");
+        // Enabling before a worker subscribes must also avoid a missed wakeup.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            control.wait_until_enabled(),
+        )
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn multimedia_retry_backoffs_survive_capacity_pressure() {
