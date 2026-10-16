@@ -20052,7 +20052,9 @@ async fn media_thumbnail_request_imports_peer_artifact_and_persists_locally_impl
     assert!(
         target
             .multimedia
-            .admit_source_recovery(&manifest_hash, super::unix_ts()),
+            .admit_source_recovery(&manifest_hash, super::unix_ts())
+            .unwrap()
+            .is_some(),
         "importing a ready peer artifact must not consume source-recovery backoff"
     );
 
@@ -20246,17 +20248,48 @@ async fn node_multimedia_derives_from_storage_only_peer(advertised: bool) {
             .unwrap()
             .is_empty()
     );
-    let response = super::get_media_thumbnail_response(
-        &target,
-        super::MediaThumbnailQuery {
-            key: key.to_string(),
-            snapshot: None,
-            version: None,
-            read_mode: None,
-            profile: None,
-        },
-    )
-    .await;
+    let thumbnail_query = || super::MediaThumbnailQuery {
+        key: key.to_string(),
+        snapshot: None,
+        version: None,
+        read_mode: None,
+        profile: None,
+    };
+    let first = target
+        .multimedia
+        .admit_source_recovery("other-source-a", super::unix_ts())
+        .unwrap()
+        .unwrap();
+    let second = target
+        .multimedia
+        .admit_source_recovery("other-source-b", super::unix_ts())
+        .unwrap()
+        .unwrap();
+    let busy = super::get_media_thumbnail_response(&target, thumbnail_query()).await;
+    assert_eq!(
+        busy.status(),
+        StatusCode::NOT_FOUND,
+        "busy recovery must defer instead of queueing"
+    );
+    assert_eq!(
+        busy.headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "a temporary busy refusal must not be cached"
+    );
+    assert!(
+        !read_store(&target, "tests.multimedia.no_busy_recovery_chunks")
+            .await
+            .missing_chunks_for_manifest_range(&manifest_hash, 0, sample_png_bytes().len())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(first);
+    drop(second);
+    // Deferral must leave this manifest's source cooldown available immediately.
+    let response = super::get_media_thumbnail_response(&target, thumbnail_query()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let thumbnail = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let decoded = image::load_from_memory(&thumbnail).unwrap();

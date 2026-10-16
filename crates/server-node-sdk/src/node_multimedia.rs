@@ -92,11 +92,19 @@ impl std::fmt::Display for MultimediaDisabled {
 
 impl std::error::Error for MultimediaDisabled {}
 
+/// Required by every optional whole-original recovery path. The private field
+/// ensures callers obtain admission from the node's shared control.
+#[derive(Debug)]
+pub(crate) struct MediaSourceRecoveryPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// Shared by the request layer and every media worker, including existing clones.
 #[derive(Clone)]
 pub(crate) struct MultimediaControl {
     enabled: Arc<AtomicBool>,
     enabled_notification: Arc<tokio::sync::Notify>,
+    source_recovery_slots: Arc<tokio::sync::Semaphore>,
     source_recovery_retries: Arc<Mutex<MediaRecoveryBackoffs>>,
     storage_only_sources: Arc<Mutex<RangeChunkCache<String, u64>>>,
 }
@@ -108,6 +116,7 @@ struct MediaRecoveryBackoff {
 }
 
 const MEDIA_RECOVERY_BACKOFF_CAPACITY: usize = 1024;
+const MAX_CONCURRENT_MEDIA_SOURCE_RECOVERIES: usize = 2;
 
 /// Retry deadlines are admission state: active entries must never be evicted.
 /// At capacity, new manifests wait until an existing entry fully expires.
@@ -185,6 +194,9 @@ impl Default for MultimediaControl {
         Self {
             enabled: Arc::new(AtomicBool::new(true)),
             enabled_notification: Arc::new(tokio::sync::Notify::new()),
+            source_recovery_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_MEDIA_SOURCE_RECOVERIES,
+            )),
             source_recovery_retries: Arc::new(Mutex::new(MediaRecoveryBackoffs::default())),
             storage_only_sources: Arc::new(Mutex::new(RangeChunkCache::new(1024))),
         }
@@ -226,6 +238,9 @@ impl MultimediaControl {
     }
 
     pub(crate) fn source_recovery_due(&self, manifest_hash: &str, now_unix: u64) -> bool {
+        if !self.enabled() || self.source_recovery_slots.available_permits() == 0 {
+            return false;
+        }
         self.source_recovery_retries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -251,9 +266,37 @@ impl MultimediaControl {
         self.admit_retry(manifest_hash, now_unix, MediaRetryKind::HolderRecheck)
     }
 
+    /// Legacy profile hydration shares the same global limit without changing
+    /// its existing retry policy.
+    pub(crate) fn try_source_recovery_slot(&self) -> Result<Option<MediaSourceRecoveryPermit>> {
+        self.ensure_enabled()?;
+        Ok(self
+            .source_recovery_slots
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| MediaSourceRecoveryPermit { _permit: permit }))
+    }
+
+    /// Bound transfer and derivation together without queueing gallery requests.
+    /// Reserve the source cooldown only after a global slot is available.
+    pub(crate) fn admit_source_recovery(
+        &self,
+        manifest_hash: &str,
+        now_unix: u64,
+    ) -> Result<Option<MediaSourceRecoveryPermit>> {
+        let Some(permit) = self.try_source_recovery_slot()? else {
+            return Ok(None);
+        };
+        if !self.reserve_source_recovery_backoff(manifest_hash, now_unix) {
+            return Ok(None);
+        }
+        Ok(Some(permit))
+    }
+
     /// Reserve backoff only once a foreground request has an actual source holder
     /// and needs chunk recovery; artifact imports and missing holders use no slot.
-    pub(crate) fn admit_source_recovery(&self, manifest_hash: &str, now_unix: u64) -> bool {
+    fn reserve_source_recovery_backoff(&self, manifest_hash: &str, now_unix: u64) -> bool {
         self.admit_retry(manifest_hash, now_unix, MediaRetryKind::SourceRecovery)
     }
 
@@ -529,34 +572,91 @@ mod tests {
     }
 
     #[test]
+    fn multimedia_source_recovery_admission_is_globally_bounded() {
+        let control = MultimediaControl::default();
+        let first = control
+            .admit_source_recovery("first", 100)
+            .unwrap()
+            .unwrap();
+        let second = control.clone().try_source_recovery_slot().unwrap().unwrap();
+        assert!(
+            !control.source_recovery_due("third", 100),
+            "distinct manifests must share a bounded number of active recoveries"
+        );
+        assert!(
+            control
+                .admit_source_recovery("third", 100)
+                .unwrap()
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            control.source_recovery_due("third", 101),
+            "a busy request must not consume its per-manifest recovery cooldown"
+        );
+        let third = control
+            .admit_source_recovery("third", 101)
+            .unwrap()
+            .unwrap();
+        assert!(!control.source_recovery_due("fourth", 101));
+        drop(second);
+        drop(third);
+        assert!(
+            !control.source_recovery_due("first", 101),
+            "releasing concurrency admission must retain its retry deadline"
+        );
+        assert!(control.source_recovery_due("fourth", 101));
+        assert!(
+            control
+                .admit_source_recovery("first", 101)
+                .unwrap()
+                .is_none()
+        );
+        control.set_enabled(false);
+        assert!(
+            control
+                .admit_source_recovery("fourth", 101)
+                .unwrap_err()
+                .is::<MultimediaDisabled>()
+        );
+        control.set_enabled(true);
+        assert!(
+            control
+                .admit_source_recovery("fourth", 101)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn multimedia_retry_backoffs_survive_capacity_pressure() {
         let control = MultimediaControl::default();
         assert!(control.admit_holder_recheck("first", 100));
-        assert!(control.admit_source_recovery("first", 100));
+        assert!(control.reserve_source_recovery_backoff("first", 100));
         for index in 1..1024 {
-            assert!(control.admit_source_recovery(&format!("manifest-{index}"), 100));
+            assert!(control.reserve_source_recovery_backoff(&format!("manifest-{index}"), 100));
         }
         assert!(!control.source_recovery_due("overflow", 101));
         assert!(
-            !control.admit_source_recovery("overflow", 101),
+            !control.reserve_source_recovery_backoff("overflow", 101),
             "new manifests must wait instead of evicting an active recovery deadline"
         );
         assert!(!control.admit_holder_recheck("overflow", 101));
         assert!(!control.source_recovery_due("first", 101));
         assert!(!control.admit_holder_recheck("first", 101));
-        assert!(!control.admit_source_recovery("first", 699));
+        assert!(!control.reserve_source_recovery_backoff("first", 699));
         assert!(
-            control.admit_source_recovery("overflow", 700),
+            control.reserve_source_recovery_backoff("overflow", 700),
             "expired entries must release admission capacity"
         );
-        assert!(control.admit_source_recovery("first", 700));
+        assert!(control.reserve_source_recovery_backoff("first", 700));
     }
 
     #[test]
     fn multimedia_retry_backoffs_survive_observation_churn_and_partial_expiry() {
         let control = MultimediaControl::default();
         assert!(control.admit_holder_recheck("first", 100));
-        assert!(control.admit_source_recovery("first", 101));
+        assert!(control.reserve_source_recovery_backoff("first", 101));
         for index in 0..2048 {
             control.note_storage_only_source(&format!("observed-{index}"), 101);
         }
@@ -569,16 +669,16 @@ mod tests {
             assert!(control.admit_holder_recheck(&format!("holder-{index}"), 101));
         }
         assert!(
-            control.admit_source_recovery("new", 131),
+            control.reserve_source_recovery_backoff("new", 131),
             "expired holder-only entries must be reclaimed"
         );
         assert!(
-            !control.admit_source_recovery("first", 131),
+            !control.reserve_source_recovery_backoff("first", 131),
             "expiry of the holder deadline must retain the later source deadline"
         );
         assert!(control.admit_holder_recheck("first", 131));
-        assert!(!control.admit_source_recovery("first", 700));
-        assert!(control.admit_source_recovery("first", 701));
+        assert!(!control.reserve_source_recovery_backoff("first", 700));
+        assert!(control.reserve_source_recovery_backoff("first", 701));
     }
 
     #[test]
@@ -593,7 +693,7 @@ mod tests {
         );
         assert!(control.source_recovery_due("manifest", 101));
         assert!(control.admit_holder_recheck("manifest", 101));
-        assert!(control.admit_source_recovery("manifest", 101));
+        assert!(control.reserve_source_recovery_backoff("manifest", 101));
         assert!(control.storage_only_source_observed("manifest", 699));
         assert!(!control.storage_only_source_observed("manifest", 700));
     }
@@ -604,7 +704,7 @@ mod tests {
         assert!(control.admit_holder_recheck("manifest", 100));
         assert!(!control.clone().admit_holder_recheck("manifest", 101));
         assert!(control.source_recovery_due("manifest", 101));
-        assert!(control.admit_source_recovery("manifest", 101));
+        assert!(control.reserve_source_recovery_backoff("manifest", 101));
         assert!(!control.admit_holder_recheck("manifest", 129));
         assert!(control.admit_holder_recheck("manifest", 130));
         assert!(!control.source_recovery_due("manifest", 130));
@@ -615,11 +715,15 @@ mod tests {
         let control = MultimediaControl::default();
         assert!(control.source_recovery_due("manifest-a", 100));
         assert!(control.clone().source_recovery_due("manifest-a", 100));
-        assert!(control.admit_source_recovery("manifest-a", 100));
-        assert!(!control.clone().admit_source_recovery("manifest-a", 101));
-        assert!(control.admit_source_recovery("manifest-b", 101));
-        assert!(!control.admit_source_recovery("manifest-a", 699));
-        assert!(control.admit_source_recovery("manifest-a", 700));
+        assert!(control.reserve_source_recovery_backoff("manifest-a", 100));
+        assert!(
+            !control
+                .clone()
+                .reserve_source_recovery_backoff("manifest-a", 101)
+        );
+        assert!(control.reserve_source_recovery_backoff("manifest-b", 101));
+        assert!(!control.reserve_source_recovery_backoff("manifest-a", 699));
+        assert!(control.reserve_source_recovery_backoff("manifest-a", 700));
     }
 
     #[test]

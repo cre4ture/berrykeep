@@ -69,11 +69,16 @@ Background startup, re-enable, and cache-clear backfill never recover full sourc
 content; they derive from local content or import existing peer artifacts.
 Storage-only peers serve
 ordinary chunks without decoding media. The capable node therefore needs storage
-capacity for recovered source content as well as derivative caches. Existing
-incomplete-artifact retry backoff still applies. Foreground source recovery has
-a separate, bounded, per-manifest runtime admission table with a ten-minute backoff,
+capacity for recovered source content as well as derivative caches. At most two
+foreground source recoveries run per node, including their local derivation step.
+Admission is nonblocking: busy requests remain incomplete and may retry later;
+they do not consume the source-recovery cooldown. Busy refusals are not cached.
+Each admitted transfer retains the existing deadline of at most two minutes and
+at most four concurrent chunk fetches. Large originals can still be recovered whole; this is not a file-size cap.
+Existing incomplete-artifact retry backoff still applies. The storage-only fallback
+uses a separate, bounded, per-manifest runtime admission table with a ten-minute backoff,
 so a background metadata miss does not delay the first user-requested recovery.
-Backoff is reserved only when chunk recovery starts. Importing an existing artifact
+Source cooldown is reserved only when a recovery/derivation attempt is admitted. Importing an existing artifact
 or finding no storage-only holder leaves recovery available. During metadata backoff,
 foreground requests can recheck known holders without probing unrelated nodes.
 Early holder discovery and rechecks have an independent thirty-second per-manifest

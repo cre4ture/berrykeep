@@ -22048,15 +22048,17 @@ async fn ensure_media_artifact_with_remote_import(
 
     // A storage-only replica cannot produce derivatives. Recover verified source
     // chunks onto this capable node instead, using the same bounded path as previews.
-    if source_recovery_eligible
-        && has_storage_only_source
-        && state
+    if source_recovery_eligible && has_storage_only_source {
+        let Some(_source_recovery_permit) = state
             .multimedia
-            .admit_source_recovery(manifest_hash, now_unix)
-    {
+            .admit_source_recovery(manifest_hash, now_unix)?
+        else {
+            return Ok(Some(local_metadata));
+        };
         state.multimedia.ensure_enabled()?;
         match hydrate_missing_chunks_for_media_preview(
             state,
+            &_source_recovery_permit,
             key,
             snapshot_id,
             version_id,
@@ -22098,6 +22100,7 @@ async fn ensure_media_artifact_with_remote_import(
 
 async fn hydrate_missing_chunks_for_media_preview(
     state: &ServerState,
+    permit: &node_multimedia::MediaSourceRecoveryPermit,
     key: &str,
     snapshot_id: Option<&str>,
     version_id: Option<&str>,
@@ -22121,6 +22124,7 @@ async fn hydrate_missing_chunks_for_media_preview(
 
     recover_missing_chunks_for_media_preview(
         state,
+        permit,
         &subject,
         &missing_chunks,
         content_recovery::full_object_recovery_budget(missing_chunks.len()),
@@ -22130,6 +22134,7 @@ async fn hydrate_missing_chunks_for_media_preview(
 
 async fn recover_missing_chunks_for_media_preview(
     state: &ServerState,
+    _permit: &node_multimedia::MediaSourceRecoveryPermit,
     subject: &str,
     missing_chunks: &[ReplicationChunkInfo],
     budget: Duration,
@@ -22841,6 +22846,10 @@ async fn clear_media_cache_admin(
     }
 }
 
+fn media_thumbnail_not_ready_response() -> Response {
+    (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response()
+}
+
 async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnailQuery) -> Response {
     // This handler is also invoked directly by the multiplexed transport fast path.
     if !state.multimedia.enabled() {
@@ -22941,12 +22950,12 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
     }
 
     if metadata.status != MediaCacheStatus::Ready {
-        return StatusCode::NOT_FOUND.into_response();
+        return media_thumbnail_not_ready_response();
     }
 
     if include_thumbnail {
         let Some(thumbnail) = metadata.thumbnail.as_ref() else {
-            return StatusCode::NOT_FOUND.into_response();
+            return media_thumbnail_not_ready_response();
         };
 
         let path_lookup_started_at = Instant::now();
@@ -23035,6 +23044,12 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
     {
         Ok(Some(payload)) => Some(payload),
         Ok(None) => {
+            let _profile_source_recovery_permit = match state.multimedia.try_source_recovery_slot()
+            {
+                Ok(Some(permit)) => permit,
+                Ok(None) => return media_thumbnail_not_ready_response(),
+                Err(_) => return node_multimedia::unavailable_response(),
+            };
             let descriptor = {
                 let store = read_store(state, "media_thumbnail.describe_object").await;
                 match store
@@ -23069,6 +23084,7 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
 
             match hydrate_missing_chunks_for_media_preview(
                 state,
+                &_profile_source_recovery_permit,
                 &query.key,
                 query.snapshot.as_deref(),
                 query.version.as_deref(),
@@ -23131,7 +23147,7 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
         ],
         match profile_payload {
             Some(payload) => payload,
-            None => return StatusCode::NOT_FOUND.into_response(),
+            None => return media_thumbnail_not_ready_response(),
         },
     )
         .into_response()

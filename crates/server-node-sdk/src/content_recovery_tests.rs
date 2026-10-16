@@ -1636,11 +1636,17 @@ async fn media_preview_budget_exhaustion_is_retryable_impl(backend: MainTestBack
         hash: blake3::hash(b"missing preview bytes").to_hex().to_string(),
         size_bytes: 21,
     };
+    let permit = target
+        .multimedia
+        .try_source_recovery_slot()
+        .unwrap()
+        .unwrap();
 
     let result = tokio::time::timeout(
         Duration::from_secs(1),
         crate::recover_missing_chunks_for_media_preview(
             &target,
+            &permit,
             "preview.bin@v1",
             &[missing_chunk],
             Duration::from_millis(50),
