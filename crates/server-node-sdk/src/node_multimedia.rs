@@ -252,23 +252,34 @@ pub(super) async fn update_config(
 }
 
 async fn apply_config(state: &ServerState, enabled: bool) -> Result<bool> {
-    let persisted = {
-        let mut cluster = state.cluster.lock().await;
-        let Some(mut descriptor) = cluster
-            .list_nodes()
-            .into_iter()
-            .find(|node| node.node_id == state.node_id)
-        else {
-            bail!("local node descriptor is unavailable");
-        };
-        // Validate the runtime target before committing the enrollment change.
-        let persisted = update_persisted_node_enrollment_if_possible(state, |package| {
+    // Validate before writing, but leave heartbeats and replication free to run
+    // while the enrollment file is read and written on a blocking worker.
+    let original_descriptor = state
+        .cluster
+        .lock()
+        .await
+        .node(state.node_id)
+        .cloned()
+        .context("local node descriptor is unavailable")?;
+    let persistence_state = state.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        update_persisted_node_enrollment_if_possible(&persistence_state, |package| {
             set_enabled_label(&mut package.bootstrap.labels, enabled);
-        })?;
+        })
+    })
+    .await
+    .context("node multimedia persistence worker failed")??;
+    {
+        let mut cluster = state.cluster.lock().await;
+        // Preserve concurrent heartbeat/storage updates. The node owns its local
+        // descriptor, so restore the validated one if membership was reloaded.
+        let mut descriptor = cluster
+            .node(state.node_id)
+            .cloned()
+            .unwrap_or(original_descriptor);
         set_enabled_label(&mut descriptor.labels, enabled);
         cluster.register_node(descriptor);
-        persisted
-    };
+    }
     let was_enabled = state.multimedia.enabled();
     state.multimedia.set_enabled(enabled);
     if enabled && !was_enabled {
@@ -323,18 +334,32 @@ pub(super) async fn require_multimedia(
             .as_str()
             .strip_prefix(super::PUBLIC_API_V1_PREFIX)
             .unwrap_or(path.as_str());
-        if normalized_path.starts_with("/auth/")
-            && let Err(status) = authorize_admin_request(
+        if normalized_path.starts_with("/auth/") {
+            let action = format!(
+                "{}/{}",
+                normalized_path.trim_start_matches('/'),
+                request.method().as_str().to_ascii_lowercase(),
+            );
+            let uri = request
+                .extensions()
+                .get::<axum::extract::OriginalUri>()
+                .map(|original| &original.0)
+                .unwrap_or_else(|| request.uri());
+            let query = axum::extract::Query::<HashMap<String, String>>::try_from_uri(uri)
+                .ok()
+                .map(|query| query.0);
+            if let Err(status) = authorize_admin_request(
                 &state,
                 request.headers(),
-                "node_multimedia/access",
+                &action,
                 true,
                 true,
-                json!({}),
+                json!({ "path": uri.path(), "method": request.method().as_str(), "query": query }),
             )
             .await
-        {
-            return status.into_response();
+            {
+                return status.into_response();
+            }
         }
         if !state.multimedia.enabled() {
             return unavailable_response();

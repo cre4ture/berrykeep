@@ -28155,6 +28155,101 @@ async fn node_multimedia_reenable_survives_cluster_persistence_failure() {
 }
 
 #[tokio::test]
+async fn node_multimedia_enrollment_writers_share_renewal_serialization() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let app = super::build_server_apps(&state).public_app;
+    for (path, body) in [
+        (
+            "/api/v1/auth/node-connection-priority",
+            serde_json::json!({ "priority": 5 }),
+        ),
+        (
+            "/api/v1/auth/direct-endpoints-config",
+            serde_json::json!({ "public_urls": [], "peer_urls": [] }),
+        ),
+        (
+            "/api/v1/auth/rendezvous-config",
+            serde_json::json!({ "editable_urls": [] }),
+        ),
+        (
+            "/api/v1/auth/node-multimedia",
+            serde_json::json!({ "enabled": false }),
+        ),
+    ] {
+        let guard = state.network.node_enrollment_renewal_lock.lock().await;
+        let mut request = Box::pin(execute_admin_control_request(
+            &app,
+            Method::PUT,
+            path,
+            Some("admin-secret"),
+            Some(body),
+        ));
+        let early_result = tokio::time::timeout(Duration::from_millis(100), request.as_mut()).await;
+        drop(guard);
+        assert!(
+            early_result.is_err(),
+            "{path} must serialize enrollment changes with renewal and multimedia writes"
+        );
+        let (status, _) = request.await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+    }
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_denied_admin_audit_keeps_route_and_query() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let app = super::build_server_apps(&state).public_app;
+    for enabled in [true, false] {
+        state.multimedia.set_enabled(enabled);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/media/thumbnail?key=photos%2Fcat.png&snapshot=snapshot-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let root = read_store(&state, "tests.multimedia.denied_audit_path")
+        .await
+        .root_dir()
+        .to_path_buf();
+    let db = rusqlite::Connection::open(root.join("state/metadata.sqlite")).unwrap();
+    let mut statement = db
+        .prepare("SELECT event_json FROM admin_audit_events")
+        .unwrap();
+    let rows: Vec<Vec<u8>> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "one denial audit is required for each request"
+    );
+    for bytes in rows {
+        let event: super::AdminAuditEvent = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(event.action, "auth/media/thumbnail/get");
+        assert!(!event.authorized);
+        assert_eq!(event.outcome, "denied_auth");
+        let details: serde_json::Value = serde_json::from_str(&event.details_json).unwrap();
+        assert_eq!(details["path"], "/api/v1/auth/media/thumbnail");
+        assert_eq!(details["query"]["key"], "photos/cat.png");
+        assert_eq!(details["query"]["snapshot"], "snapshot-id");
+    }
+    drop(statement);
+    drop(db);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn node_multimedia_successful_read_records_admin_audit() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());

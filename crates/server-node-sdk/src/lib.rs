@@ -28982,6 +28982,7 @@ async fn update_node_connection_priority(
             .into_response();
     }
 
+    let _enrollment_guard = state.network.node_enrollment_renewal_lock.lock().await;
     let persisted = match persist_node_connection_priority_if_possible(&state, request.priority) {
         Ok(persisted) => persisted,
         Err(error) => {
@@ -29338,6 +29339,7 @@ async fn update_direct_endpoints_config(
         }
     };
 
+    let _enrollment_guard = state.network.node_enrollment_renewal_lock.lock().await;
     let persisted = match persist_direct_endpoints_if_possible(&state, &effective_endpoints) {
         Ok(persisted) => persisted,
         Err(err) => {
@@ -29504,6 +29506,7 @@ async fn update_rendezvous_config(
         }
     };
 
+    let _enrollment_guard = state.network.node_enrollment_renewal_lock.lock().await;
     let persisted = match persist_rendezvous_urls_if_possible(&state, &configured_urls) {
         Ok(persisted) => persisted,
         Err(err) => {
