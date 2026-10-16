@@ -69,6 +69,17 @@ pub(crate) fn enabled_from_labels(labels: &HashMap<String, String>) -> Result<bo
         })
 }
 
+pub(crate) fn enabled_from_environment(raw: Option<&str>) -> Result<Option<bool>> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse()
+                .context("invalid BERRYKEEP_NODE_MULTIMEDIA_ENABLED: expected true or false")
+        })
+        .transpose()
+}
+
 fn set_enabled_label(labels: &mut HashMap<String, String>, enabled: bool) {
     if enabled {
         labels.remove(MULTIMEDIA_ENABLED_LABEL);
@@ -233,6 +244,21 @@ pub(super) async fn require_multimedia(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multimedia_environment_accepts_empty_as_unset_but_rejects_invalid_values() {
+        for raw in [None, Some(""), Some("  ")] {
+            assert_eq!(enabled_from_environment(raw).unwrap(), None);
+        }
+        assert_eq!(
+            enabled_from_environment(Some(" false ")).unwrap(),
+            Some(false)
+        );
+        assert_eq!(enabled_from_environment(Some("true")).unwrap(), Some(true));
+        for raw in ["0", "FALSE", "disabled"] {
+            assert!(enabled_from_environment(Some(raw)).is_err());
+        }
+    }
 
     #[test]
     fn multimedia_labels_default_to_enabled_and_reject_invalid_values() {

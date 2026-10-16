@@ -6840,12 +6840,11 @@ impl ServerNodeConfig {
             }
         }
 
-        if let Ok(raw) = common::legacy_compatibility::var(node_multimedia::MULTIMEDIA_ENABLED_ENV)
+        let raw_multimedia_enabled =
+            common::legacy_compatibility::var(node_multimedia::MULTIMEDIA_ENABLED_ENV).ok();
+        if let Some(enabled) =
+            node_multimedia::enabled_from_environment(raw_multimedia_enabled.as_deref())?
         {
-            let enabled: bool = raw
-                .trim()
-                .parse()
-                .context("invalid BERRYKEEP_NODE_MULTIMEDIA_ENABLED: expected true or false")?;
             labels.insert(
                 node_multimedia::MULTIMEDIA_ENABLED_LABEL.to_string(),
                 enabled.to_string(),
@@ -21743,10 +21742,15 @@ pub(crate) async fn describe_object_with_metadata_read_through(
     }
 }
 
+struct MediaArtifactSource {
+    node: NodeDescriptor,
+    holds_subject: bool,
+}
+
 async fn media_artifact_source_nodes(
     state: &ServerState,
     subject_hint: Option<&str>,
-) -> Vec<NodeDescriptor> {
+) -> Vec<MediaArtifactSource> {
     let mut cluster = state.cluster.lock().await;
     cluster.update_health_and_detect_offline_transition();
 
@@ -21756,7 +21760,10 @@ async fn media_artifact_source_nodes(
     if let Some(subject) = subject_hint {
         for node in cluster.available_nodes_for_subject(subject) {
             if node.node_id != state.node_id && seen.insert(node.node_id) {
-                nodes.push(node);
+                nodes.push(MediaArtifactSource {
+                    node,
+                    holds_subject: true,
+                });
             }
         }
     }
@@ -21766,7 +21773,10 @@ async fn media_artifact_source_nodes(
             continue;
         }
         if seen.insert(node.node_id) {
-            nodes.push(node);
+            nodes.push(MediaArtifactSource {
+                node,
+                holds_subject: false,
+            });
         }
     }
 
@@ -21927,14 +21937,19 @@ async fn ensure_media_artifact_with_remote_import(
         expected_content_fingerprint.unwrap_or_else(|| local_metadata.content_fingerprint.clone());
     let subject_hint = read_through_replication_subject(key, snapshot_id, version_id);
     let source_nodes = media_artifact_source_nodes(state, subject_hint.as_deref()).await;
-    let mut has_storage_only_peer = source_nodes.iter().any(|node| {
-        matches!(
-            node_multimedia::enabled_from_labels(&node.labels),
-            Ok(false)
-        )
+    let mut has_storage_only_source = source_nodes.iter().any(|source| {
+        source.holds_subject
+            && matches!(
+                node_multimedia::enabled_from_labels(&source.node.labels),
+                Ok(false)
+            )
     });
 
-    for node in source_nodes {
+    for MediaArtifactSource {
+        node,
+        holds_subject,
+    } in source_nodes
+    {
         if matches!(
             node_multimedia::enabled_from_labels(&node.labels),
             Ok(false)
@@ -21959,7 +21974,7 @@ async fn ensure_media_artifact_with_remote_import(
             Ok(None) => continue,
             Err(err) if err.is::<node_multimedia::MultimediaDisabled>() => {
                 // The peer may have been disabled since its latest presence update.
-                has_storage_only_peer = true;
+                has_storage_only_source |= holds_subject;
             }
             Err(err) => {
                 warn!(
@@ -21976,7 +21991,7 @@ async fn ensure_media_artifact_with_remote_import(
 
     // A storage-only replica cannot produce derivatives. Recover verified source
     // chunks onto this capable node instead, using the same bounded path as previews.
-    if has_storage_only_peer && local_metadata.status == MediaCacheStatus::Incomplete {
+    if has_storage_only_source && local_metadata.status == MediaCacheStatus::Incomplete {
         state.multimedia.ensure_enabled()?;
         match hydrate_missing_chunks_for_media_preview(
             state,

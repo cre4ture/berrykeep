@@ -31,7 +31,8 @@ to retain the setting after a restart:
 - Bootstrap or enrollment JSON: set `bootstrap.labels.multimedia_enabled` to
   the string `"false"` (or `labels.multimedia_enabled` in a standalone bootstrap).
 
-Both accept only `true` or `false`. A missing label means enabled. The label is
+Both accept `true` or `false`; an empty environment value is treated as unset.
+A missing label means enabled. The label is
 advertised with the node descriptor and Rendezvous presence, independently of
 `client_connection_priority`.
 
@@ -55,13 +56,14 @@ a node's admin UI directly must connect to an enabled node to use those features
 This release does not add capability-based client route scoring; a disabled node
 may receive an initial request before failover. Priority can reduce those attempts.
 
-When an enabled node has only metadata and a storage-only peer holds the original,
+When an enabled node has only metadata and a known storage-only source holds the original,
 it first tries other enabled peers for an existing derivative. If none is available,
 it uses the existing bounded chunk-recovery path to cache the original chunks in
 its storage pool and derive metadata/thumbnails locally. Storage-only peers serve
 ordinary chunks without decoding media. The capable node therefore needs storage
 capacity for recovered source content as well as derivative caches. Existing
 incomplete-artifact retry backoff still applies when recovery cannot complete.
+Unrelated storage-only nodes do not trigger recovery for other nodes' media.
 
 Changes affect new work immediately. Work already admitted may finish; the switch
 does not forcibly terminate a decoder or map import. Backfill and operation batches

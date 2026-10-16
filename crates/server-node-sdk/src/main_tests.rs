@@ -20097,28 +20097,9 @@ async fn node_multimedia_derives_when_peer_capability_advertisement_is_stale() {
 }
 
 async fn node_multimedia_derives_from_storage_only_peer(advertised: bool) {
-    let source = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    let target = build_test_state(1, false, MainTestBackend::Sqlite).await;
-    source.multimedia.set_enabled(false);
     let key = "gallery/storage-only.png";
-    let (manifest_hash, bundle) = {
-        let mut store = lock_store(&source, "tests.multimedia.source").await;
-        let put = store
-            .put_object_versioned(key, Bytes::from(sample_png_bytes()), PutOptions::default())
-            .await
-            .unwrap();
-        let bundle = store
-            .export_metadata_bundle(key, None, super::storage::ObjectReadMode::Preferred)
-            .await
-            .unwrap()
-            .unwrap();
-        (put.manifest_hash, bundle)
-    };
-    lock_store(&target, "tests.multimedia.import")
-        .await
-        .import_metadata_bundle(&bundle)
-        .await
-        .unwrap();
+    let (source, target, manifest_hash) = build_metadata_only_media_pair(key).await;
+    source.multimedia.set_enabled(false);
     let (peer_url, peer_handle) = spawn_internal_peer_api_server(source.clone()).await;
     register_online_source_node(&target, &source, &peer_url).await;
     {
@@ -20173,6 +20154,103 @@ async fn node_multimedia_derives_from_storage_only_peer(advertised: bool) {
             .unwrap()
             .metadata
             .is_none()
+    );
+    peer_handle.abort();
+    let _ = peer_handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+async fn build_metadata_only_media_pair(key: &str) -> (ServerState, ServerState, String) {
+    let source = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let target = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (manifest_hash, bundle) = {
+        let mut store = lock_store(&source, "tests.multimedia.source").await;
+        let put = store
+            .put_object_versioned(key, Bytes::from(sample_png_bytes()), PutOptions::default())
+            .await
+            .unwrap();
+        let bundle = store
+            .export_metadata_bundle(key, None, super::storage::ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .unwrap();
+        (put.manifest_hash, bundle)
+    };
+    lock_store(&target, "tests.multimedia.import")
+        .await
+        .import_metadata_bundle(&bundle)
+        .await
+        .unwrap();
+    (source, target, manifest_hash)
+}
+
+#[tokio::test]
+async fn node_multimedia_does_not_recover_for_an_unrelated_storage_only_peer() {
+    let key = "gallery/capable-source.png";
+    let (source, target, manifest_hash) = build_metadata_only_media_pair(key).await;
+    let chunk_reads = Arc::new(AtomicUsize::new(0));
+    let counted_reads = chunk_reads.clone();
+    let app = super::build_internal_peer_api()
+        .with_state(source.clone())
+        .layer(axum::middleware::from_fn(
+            move |request: Request<Body>, next: axum::middleware::Next| {
+                let counted_reads = counted_reads.clone();
+                async move {
+                    if request.uri().path() == super::PEER_MEDIA_ARTIFACT_ROUTE {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    if request
+                        .uri()
+                        .path()
+                        .starts_with("/cluster/v2/replication/chunk/")
+                    {
+                        counted_reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_url = format!("http://{}", listener.local_addr().unwrap());
+    let peer_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    register_online_source_node(&target, &source, &peer_url).await;
+    {
+        let mut cluster = target.cluster.lock().await;
+        let mut descriptor = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == source.node_id)
+            .unwrap();
+        descriptor.node_id = NodeId::new_v4();
+        descriptor.labels.insert(
+            super::node_multimedia::MULTIMEDIA_ENABLED_LABEL.to_string(),
+            "false".to_string(),
+        );
+        cluster.register_node(descriptor);
+        cluster.note_replica(key, source.node_id);
+    }
+    let metadata = super::ensure_media_artifact_with_remote_import(
+        &target,
+        key,
+        None,
+        None,
+        &manifest_hash,
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    assert_eq!(
+        chunk_reads.load(Ordering::Relaxed),
+        0,
+        "unrelated storage-only nodes must not turn metadata backfill into content recovery"
     );
     peer_handle.abort();
     let _ = peer_handle.await;
