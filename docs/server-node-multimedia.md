@@ -76,6 +76,9 @@ foreground requests can recheck known holders without probing unrelated nodes.
 Holder rechecks have an independent thirty-second per-manifest throttle, including
 probes performed by the initial foreground request. Repeated gallery polling does
 not re-probe those holders on every request during metadata backoff.
+Early rechecks require an advertised storage-only holder or a recent disabled-source
+response. Ordinary deployments with all hosts enabled retain their existing artifact
+backoff without extra peer requests. Disabled-source observations expire after ten minutes.
 Unrelated storage-only nodes do not trigger recovery for other nodes' media.
 
 Changes affect new work immediately. Work already admitted may finish; the switch

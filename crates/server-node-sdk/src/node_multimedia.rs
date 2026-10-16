@@ -44,6 +44,7 @@ pub(crate) struct MultimediaControl {
 struct MediaRecoveryBackoff {
     source_retry_after_unix: u64,
     holder_recheck_after_unix: u64,
+    storage_only_source_until_unix: u64,
 }
 
 enum MediaRetryKind {
@@ -82,6 +83,25 @@ impl MultimediaControl {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&manifest_hash.to_string())
             .is_none_or(|backoff| backoff.source_retry_after_unix <= now_unix)
+    }
+
+    pub(crate) fn storage_only_source_observed(&self, manifest_hash: &str, now_unix: u64) -> bool {
+        self.source_recovery_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&manifest_hash.to_string())
+            .is_some_and(|backoff| backoff.storage_only_source_until_unix > now_unix)
+    }
+
+    pub(crate) fn note_storage_only_source(&self, manifest_hash: &str, now_unix: u64) {
+        let mut retries = self
+            .source_recovery_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = manifest_hash.to_string();
+        let mut backoff = retries.get(&key).map(|cached| *cached).unwrap_or_default();
+        backoff.storage_only_source_until_unix = now_unix.saturating_add(10 * 60);
+        retries.insert(key, backoff);
     }
 
     pub(crate) fn admit_holder_recheck(&self, manifest_hash: &str, now_unix: u64) -> bool {
@@ -324,6 +344,23 @@ pub(super) async fn require_multimedia(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multimedia_storage_only_observations_expire_without_spending_retry_budget() {
+        let control = MultimediaControl::default();
+        assert!(!control.storage_only_source_observed("manifest", 100));
+        control.note_storage_only_source("manifest", 100);
+        assert!(
+            control
+                .clone()
+                .storage_only_source_observed("manifest", 101)
+        );
+        assert!(control.source_recovery_due("manifest", 101));
+        assert!(control.admit_holder_recheck("manifest", 101));
+        assert!(control.admit_source_recovery("manifest", 101));
+        assert!(control.storage_only_source_observed("manifest", 699));
+        assert!(!control.storage_only_source_observed("manifest", 700));
+    }
 
     #[test]
     fn multimedia_holder_rechecks_are_throttled_independently_of_source_recovery() {

@@ -21971,6 +21971,16 @@ async fn ensure_media_artifact_with_remote_import(
                 Ok(false)
             )
     });
+    // Preserve existing incomplete-artifact backoff in ordinary clusters. Only
+    // an advertised or recently observed disabled holder justifies an early probe.
+    if !attempt_remote_import
+        && !has_storage_only_source
+        && !state
+            .multimedia
+            .storage_only_source_observed(manifest_hash, now_unix)
+    {
+        return Ok(Some(local_metadata));
+    }
     let recheck_holders = source_recovery == MediaSourceRecovery::Foreground
         && source_nodes.iter().any(|source| {
             source.holds_subject
@@ -22017,7 +22027,12 @@ async fn ensure_media_artifact_with_remote_import(
             Ok(None) => continue,
             Err(err) if err.is::<node_multimedia::MultimediaDisabled>() => {
                 // The peer may have been disabled since its latest presence update.
-                has_storage_only_source |= holds_subject;
+                if holds_subject {
+                    has_storage_only_source = true;
+                    state
+                        .multimedia
+                        .note_storage_only_source(manifest_hash, now_unix);
+                }
             }
             Err(err) => {
                 warn!(

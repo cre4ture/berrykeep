@@ -20093,6 +20093,65 @@ run_on_main_metadata_backends!(
 );
 
 #[tokio::test]
+async fn node_multimedia_preserves_backoff_for_capable_source_holders() {
+    let key = "gallery/capable-restart.png";
+    let (source, target, manifest_hash) = build_metadata_only_media_pair(key).await;
+    let metadata = super::ensure_media_artifact_with_remote_import(
+        &target,
+        key,
+        None,
+        None,
+        &manifest_hash,
+        false,
+        super::MediaSourceRecovery::Disabled,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    let (peer_url, peer_handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &peer_url).await;
+    target
+        .cluster
+        .lock()
+        .await
+        .note_replica(key, source.node_id);
+    let response = super::get_media_thumbnail_response(
+        &target,
+        super::MediaThumbnailQuery {
+            key: key.to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+            profile: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a capable holder becoming reachable must not bypass incomplete-artifact backoff"
+    );
+    assert!(
+        read_store(&source, "tests.multimedia.unprobed_capable_holder")
+            .await
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .is_none()
+    );
+    peer_handle.abort();
+    let _ = peer_handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+#[tokio::test]
 async fn node_multimedia_derives_from_storage_only_peer_without_a_local_replica() {
     node_multimedia_derives_from_storage_only_peer(true).await;
 }
