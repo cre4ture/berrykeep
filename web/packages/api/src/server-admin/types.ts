@@ -1246,6 +1246,12 @@ export type NodeConnectionPriorityView = {
   persisted: boolean;
 };
 
+export type NodeMultimediaView = {
+  enabled: boolean;
+  persistence_source: "node_enrollment" | "runtime_only";
+  persisted: boolean;
+};
+
 export type ManagedControlPlanePromotionPackage = {
   signer_backup: Record<string, unknown>;
   rendezvous_failover: Record<string, unknown>;

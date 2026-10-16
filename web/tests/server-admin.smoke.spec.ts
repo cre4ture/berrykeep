@@ -56,6 +56,30 @@ registerGalleryMapContractTests({
   }
 });
 
+test("hardware multimedia setting can be saved and survives navigation", async ({ page }) => {
+  await installServerAdminMocks(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByText("Hardware", { exact: true }).click();
+  const toggle = page.getByRole("switch", { name: "Enable multimedia functionality" });
+  await expect(toggle).toBeChecked();
+  await expect(toggle).toBeEnabled();
+  await page.getByText("Enable multimedia functionality", { exact: true }).click();
+  await expect(toggle).not.toBeChecked();
+  const saved = page.waitForResponse((response) =>
+    response.url().endsWith(apiV1("/auth/node-multimedia")) && response.request().method() === "PUT"
+  );
+  await page.getByRole("button", { name: "Save multimedia settings" }).click();
+  expect((await saved).request().postDataJSON()).toEqual({ enabled: false });
+  await page.getByText("Dashboard", { exact: true }).click();
+  await page.getByText("Hardware", { exact: true }).click();
+  await expect(toggle).not.toBeChecked();
+});
+
 test("embedded iOS accent color overrides the browser-local preference", async ({ page }) => {
   await page.addInitScript(() => {
     window.localStorage.setItem("berrykeep-accent-color", "#db2777");
@@ -2067,6 +2091,7 @@ async function installServerAdminMocks(
   const emptyVectorTileBody = gzipSync(Buffer.alloc(0));
   const glyphRangeBody = Buffer.alloc(0);
   let authenticated = false;
+  let multimediaEnabled = true;
   let sessionConfirmed = false;
   let sessionStatusRequestCount = 0;
   let remainingPostLoginUnauthenticatedSessionResponses =
@@ -2285,6 +2310,13 @@ async function installServerAdminMocks(
     const { pathname, searchParams } = url;
     const method = route.request().method();
     requestedPaths.add(pathname);
+
+    if (pathname === apiV1("/auth/node-multimedia")) {
+      if (method === "PUT") {
+        multimediaEnabled = route.request().postDataJSON().enabled;
+      }
+      return json(route, { enabled: multimediaEnabled, persistence_source: "runtime_only", persisted: false });
+    }
 
     if (pathname === apiV1("/auth/admin/session") && method === "GET") {
       let sessionAuthenticated = authenticated;

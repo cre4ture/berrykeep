@@ -63,6 +63,7 @@ import type {
   MetadataDbLogicalDistributionTriggerResponse,
   NodeCertificateStatusResponse,
   NodeConnectionPriorityView,
+  NodeMultimediaView,
   NodeDescriptor,
   NodeEnrollmentPackage,
   OperationCatalogResponse,
@@ -1559,6 +1560,21 @@ export async function getNodeConnectionPriority(
 ): Promise<NodeConnectionPriorityView> {
   return fetchAdminJson<NodeConnectionPriorityView>(apiV1("/auth/node-connection-priority"), {
     adminTokenOverride
+  });
+}
+
+export async function getNodeMultimedia(adminTokenOverride?: string): Promise<NodeMultimediaView> {
+  return fetchAdminJson<NodeMultimediaView>(apiV1("/auth/node-multimedia"), { adminTokenOverride });
+}
+
+export async function updateNodeMultimedia(
+  enabled: boolean,
+  adminTokenOverride?: string
+): Promise<NodeMultimediaView> {
+  return fetchAdminJson<NodeMultimediaView>(apiV1("/auth/node-multimedia"), {
+    method: "PUT",
+    adminTokenOverride,
+    body: { enabled }
   });
 }
 

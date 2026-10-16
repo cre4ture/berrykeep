@@ -8,6 +8,9 @@ BerryKeep clients can prefer stronger server hardware without turning the prefer
 
 Priority is a soft input to route scoring. Each priority step contributes a 25 ms score bias. Measured latency, route failures, circuit breaking, direct-versus-relay selection, and failover continue to apply.
 
+For constrained hosts, use the separate [node multimedia setting](server-node-multimedia.md)
+to disable optional media and map workloads. Priority alone does not prevent that work.
+
 ## Server configuration
 
 The node-local admin panel exposes **Hardware → Client connection priority**. The corresponding authenticated API is:

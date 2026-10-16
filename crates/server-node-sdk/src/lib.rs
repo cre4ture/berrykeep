@@ -169,6 +169,7 @@ mod listing;
 mod map_config;
 mod map_dataset_import;
 mod natural_earth_import;
+mod node_multimedia;
 mod operations;
 mod reliability_telemetry;
 mod rendezvous_contact_config;
@@ -362,6 +363,7 @@ struct ServerState {
     cluster_id: ClusterId,
     node_id: NodeId,
     node_hostname: Option<String>,
+    multimedia: node_multimedia::MultimediaControl,
     store: Arc<TracedRwLock<PersistentStore>>,
     cluster: Arc<Mutex<ClusterService>>,
     cluster_task_queue_cache: Arc<Mutex<Option<CachedClusterTaskQueueSnapshot>>>,
@@ -6434,6 +6436,7 @@ impl ServerNodeConfig {
         bootstrap.validate()?;
         transport_sdk::node_connection_priority_from_labels(&bootstrap.labels)
             .context("invalid node connection priority in bootstrap labels")?;
+        node_multimedia::enabled_from_labels(&bootstrap.labels)?;
 
         ensure_non_traversing_path(FsPath::new(&bootstrap.data_dir), "node data directory")?;
         let data_dir = normalize_non_traversing_path(FsPath::new(&bootstrap.data_dir));
@@ -6835,6 +6838,18 @@ impl ServerNodeConfig {
                     priority.to_string(),
                 );
             }
+        }
+
+        if let Ok(raw) = common::legacy_compatibility::var(node_multimedia::MULTIMEDIA_ENABLED_ENV)
+        {
+            let enabled: bool = raw
+                .trim()
+                .parse()
+                .context("invalid BERRYKEEP_NODE_MULTIMEDIA_ENABLED: expected true or false")?;
+            labels.insert(
+                node_multimedia::MULTIMEDIA_ENABLED_LABEL.to_string(),
+                enabled.to_string(),
+            );
         }
 
         let default_replication_factor = 3;
@@ -7596,6 +7611,11 @@ async fn run_inner(
         let store_guard = store.read("server.init.chunk_ingestor").await;
         store_guard.chunk_ingestor()
     };
+    let multimedia = store
+        .read("server.init.multimedia")
+        .await
+        .multimedia_control();
+    multimedia.set_enabled(node_multimedia::enabled_from_labels(&config.labels)?);
     info!(
         data_dir = %config.data_dir.display(),
         metadata_backend = ?config.metadata_backend(),
@@ -7988,6 +8008,7 @@ async fn run_inner(
     let managed_paths = ManagedPaths::from_config(&config);
     let state = ServerState {
         managed_paths,
+        multimedia,
         cluster_id: config.cluster_id,
         node_id: config.node_id,
         node_hostname,
@@ -8176,7 +8197,9 @@ async fn start_background_runtimes(
     startup_phase_anchor: Instant,
 ) {
     spawn_upload_session_store_persister(state.clone());
-    map_dataset_import::spawn_resume_if_needed(state.clone()).await;
+    if state.multimedia.enabled() {
+        map_dataset_import::spawn_resume_if_needed(state.clone()).await;
+    }
     let refresh_local_node_storage_phase_started_at =
         log_server_startup_phase_begin("refresh_local_node_storage", startup_phase_anchor);
     refresh_local_node_storage(state).await;
@@ -8509,6 +8532,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             get(get_node_connection_priority).put(update_node_connection_priority),
         )
         .route(
+            "/auth/node-multimedia",
+            get(node_multimedia::get_config).put(node_multimedia::update_config),
+        )
+        .route(
             "/auth/rendezvous-config",
             get(get_rendezvous_config).put(update_rendezvous_config),
         )
@@ -8777,6 +8804,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .nest(PUBLIC_API_V1_PREFIX, public_api_v1)
         .merge(legacy_public_api)
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            node_multimedia::require_multimedia,
+        ))
         .layer(middleware::from_fn(record_server_request_timing))
         .layer(middleware::from_fn(log_named_client_request))
         .layer(middleware::from_fn_with_state(
@@ -8867,6 +8898,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .merge(build_internal_peer_api())
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            node_multimedia::require_multimedia,
+        ))
         .layer(middleware::from_fn(record_server_request_timing))
         .layer(middleware::from_fn(log_named_client_request))
         .layer(middleware::from_fn_with_state(
@@ -15874,6 +15909,9 @@ async fn run_autonomous_post_write_replication(state: ServerState) {
 }
 
 fn spawn_media_metadata_warmup(state: ServerState, key: String, manifest_hash: String) {
+    if !state.multimedia.enabled() {
+        return;
+    }
     tokio::spawn(async move {
         if let Err(err) = ensure_media_artifact_with_remote_import(
             &state,
@@ -15896,6 +15934,9 @@ fn spawn_media_metadata_warmup(state: ServerState, key: String, manifest_hash: S
 }
 
 fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
+    if !state.multimedia.enabled() {
+        return;
+    }
     tokio::spawn(async move {
         let targets = {
             let store = read_store(&state, "media_metadata_backfill.snapshot").await;
@@ -15926,6 +15967,9 @@ fn spawn_media_metadata_backfill(state: ServerState, reason: &'static str) {
             "starting media metadata backfill"
         );
         for (manifest_hash, key) in targets {
+            if !state.multimedia.enabled() {
+                return;
+            }
             if let Err(err) = ensure_media_artifact_with_remote_import(
                 &state,
                 &key,
@@ -21778,6 +21822,14 @@ async fn fetch_peer_media_artifact(
     )
     .await?;
 
+    if response.status == StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        && response
+            .json::<serde_json::Value>()
+            .ok()
+            .is_some_and(|payload| payload["code"] == node_multimedia::MULTIMEDIA_DISABLED_CODE)
+    {
+        return Err(node_multimedia::MultimediaDisabled.into());
+    }
     if !response.is_success() {
         return Ok(None);
     }
@@ -21832,6 +21884,7 @@ async fn ensure_media_artifact_with_remote_import(
     manifest_hash: &str,
     include_thumbnail: bool,
 ) -> Result<Option<CachedMediaMetadata>> {
+    state.multimedia.ensure_enabled()?;
     let now_unix = unix_ts();
     let (media_cache_worker, store_index_inspector) = {
         let store = read_store(state, "media_cache.remote_import.clone_worker").await;
@@ -21873,8 +21926,21 @@ async fn ensure_media_artifact_with_remote_import(
     let expected_content_fingerprint =
         expected_content_fingerprint.unwrap_or_else(|| local_metadata.content_fingerprint.clone());
     let subject_hint = read_through_replication_subject(key, snapshot_id, version_id);
+    let source_nodes = media_artifact_source_nodes(state, subject_hint.as_deref()).await;
+    let mut has_storage_only_peer = source_nodes.iter().any(|node| {
+        matches!(
+            node_multimedia::enabled_from_labels(&node.labels),
+            Ok(false)
+        )
+    });
 
-    for node in media_artifact_source_nodes(state, subject_hint.as_deref()).await {
+    for node in source_nodes {
+        if matches!(
+            node_multimedia::enabled_from_labels(&node.labels),
+            Ok(false)
+        ) {
+            continue;
+        }
         match fetch_peer_media_artifact(
             state,
             &node,
@@ -21891,6 +21957,10 @@ async fn ensure_media_artifact_with_remote_import(
                 return Ok(Some(imported));
             }
             Ok(None) => continue,
+            Err(err) if err.is::<node_multimedia::MultimediaDisabled>() => {
+                // The peer may have been disabled since its latest presence update.
+                has_storage_only_peer = true;
+            }
             Err(err) => {
                 warn!(
                     peer_node_id = %node.node_id,
@@ -21900,6 +21970,33 @@ async fn ensure_media_artifact_with_remote_import(
                     error = %err,
                     "peer media artifact import failed"
                 );
+            }
+        }
+    }
+
+    // A storage-only replica cannot produce derivatives. Recover verified source
+    // chunks onto this capable node instead, using the same bounded path as previews.
+    if has_storage_only_peer && local_metadata.status == MediaCacheStatus::Incomplete {
+        state.multimedia.ensure_enabled()?;
+        match hydrate_missing_chunks_for_media_preview(
+            state,
+            key,
+            snapshot_id,
+            version_id,
+            manifest_hash,
+            local_metadata.source_size_bytes,
+        )
+        .await
+        {
+            Ok(true) => {
+                state.multimedia.ensure_enabled()?;
+                return media_cache_worker
+                    .ensure_media_artifact_after_source_recovery(manifest_hash, include_thumbnail)
+                    .await;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(%error, key, manifest_hash, "failed recovering multimedia source from storage peers")
             }
         }
     }
@@ -22521,6 +22618,9 @@ async fn get_peer_media_artifact(
     State(state): State<ServerState>,
     Query(query): Query<PeerMediaArtifactQuery>,
 ) -> Response {
+    if !state.multimedia.enabled() {
+        return node_multimedia::unavailable_response();
+    }
     if query.manifest_hash.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -22662,6 +22762,10 @@ async fn clear_media_cache_admin(
 }
 
 async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnailQuery) -> Response {
+    // This handler is also invoked directly by the multiplexed transport fast path.
+    if !state.multimedia.enabled() {
+        return node_multimedia::unavailable_response();
+    }
     let request_id = Uuid::new_v4();
     let read_mode = match parse_read_mode(query.read_mode.as_deref()) {
         Some(value) => value,
@@ -22733,6 +22837,9 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
         Ok(Some(metadata)) => metadata,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
+            if err.is::<node_multimedia::MultimediaDisabled>() {
+                return node_multimedia::unavailable_response();
+            }
             tracing::error!(key = %query.key, error = %err, "failed to build media thumbnail cache");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }

@@ -756,7 +756,11 @@ fn build_public_transport_router(state: ServerState) -> Router {
     Router::new()
         .nest(PUBLIC_API_V1_PREFIX, public_api_v1)
         .merge(legacy_public_api)
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state,
+            crate::node_multimedia::require_multimedia,
+        ))
 }
 
 fn build_internal_transport_router(state: ServerState) -> Router {
@@ -839,6 +843,10 @@ fn build_internal_transport_router(state: ServerState) -> Router {
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .merge(build_internal_peer_api())
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::node_multimedia::require_multimedia,
+        ))
         .layer(middleware::from_fn_with_state(
             state,
             require_internal_caller,

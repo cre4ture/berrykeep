@@ -15,6 +15,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { formatBytes, formatUnixTs } from "../lib/format";
 import { useAdminAccess } from "../lib/admin-access";
 import { TelemetryConfigurationCard } from "../components/TelemetryConfigurationCard";
+import { NodeMultimediaCard } from "../components/NodeMultimediaCard";
 
 export function HardwarePage() {
   const { adminTokenOverride, sessionStatus, sessionLoading } = useAdminAccess();
@@ -157,6 +158,8 @@ export function HardwarePage() {
           </Text>
         </Stack>
       </Card>
+
+      <NodeMultimediaCard canConfigure={canInspectHardware} adminTokenOverride={normalizedAdminTokenOverride} />
 
       <Grid>
         <Grid.Col span={{ base: 12, md: 4, xl: 3 }}>
