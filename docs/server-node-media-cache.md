@@ -2,6 +2,9 @@
 
 `server-node` now maintains a server-side cache for image and video metadata plus optional thumbnails so mobile and web clients can list media-heavy directories without downloading original objects first.
 
+The per-node [multimedia setting](server-node-multimedia.md) can disable optional
+media processing and map functionality on hosts with limited resources.
+
 ## Goals
 
 - Keep the primary object store immutable and version-oriented.

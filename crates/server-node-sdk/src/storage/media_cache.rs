@@ -307,6 +307,7 @@ pub(crate) struct MediaCacheWorker {
     pub(super) media_cache_build_config: MediaCacheBuildConfig,
     pub(super) metadata_store: Arc<dyn MetadataStore>,
     pub(super) media_tools: MediaToolPaths,
+    multimedia: crate::node_multimedia::MultimediaControl,
 }
 
 impl MediaCacheWorker {
@@ -317,6 +318,7 @@ impl MediaCacheWorker {
         media_cache_build_config: MediaCacheBuildConfig,
         metadata_store: Arc<dyn MetadataStore>,
         media_tools: MediaToolPaths,
+        multimedia: crate::node_multimedia::MultimediaControl,
     ) -> Self {
         Self {
             storage_pool,
@@ -325,6 +327,7 @@ impl MediaCacheWorker {
             media_cache_build_config,
             metadata_store,
             media_tools,
+            multimedia,
         }
     }
 
@@ -332,14 +335,26 @@ impl MediaCacheWorker {
         &self,
         manifest_hash: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
-        self.ensure_media_artifact(manifest_hash, false).await
+        self.ensure_media_artifact(manifest_hash, false, false)
+            .await
     }
 
     pub(crate) async fn ensure_media_cache(
         &self,
         manifest_hash: &str,
     ) -> Result<Option<CachedMediaMetadata>> {
-        self.ensure_media_artifact(manifest_hash, true).await
+        self.ensure_media_artifact(manifest_hash, true, false).await
+    }
+
+    /// Recovery resolved the missing-source backoff. Keep existing artifacts intact
+    /// while rebuilding, including those concurrently published by another worker.
+    pub(crate) async fn ensure_media_artifact_after_source_recovery(
+        &self,
+        manifest_hash: &str,
+        include_thumbnail: bool,
+    ) -> Result<Option<CachedMediaMetadata>> {
+        self.ensure_media_artifact(manifest_hash, include_thumbnail, true)
+            .await
     }
 
     pub(crate) async fn ensure_image_thumbnail_profile_payload(
@@ -347,6 +362,7 @@ impl MediaCacheWorker {
         manifest_hash: &str,
         profile: ThumbnailProfileSpec,
     ) -> Result<Option<Vec<u8>>> {
+        self.multimedia.ensure_enabled()?;
         let Some(manifest) = self.load_manifest_by_hash(manifest_hash).await? else {
             return Ok(None);
         };
@@ -417,7 +433,9 @@ impl MediaCacheWorker {
         &self,
         manifest_hash: &str,
         include_thumbnail: bool,
+        source_recovered: bool,
     ) -> Result<Option<CachedMediaMetadata>> {
+        self.multimedia.ensure_enabled()?;
         let ensure_started_at = Instant::now();
         let now_unix = unix_ts();
         if manifest_hash == TOMBSTONE_MANIFEST_HASH {
@@ -433,7 +451,8 @@ impl MediaCacheWorker {
                 .await?,
         );
         if let Some(existing) = existing.as_ref() {
-            let retry_due = media_cache_retry_due(existing, now_unix);
+            let retry_due = media_cache_retry_due(existing, now_unix)
+                || (source_recovered && existing.status == MediaCacheStatus::Incomplete);
             let cache_satisfies_request = if retry_due {
                 false
             } else {

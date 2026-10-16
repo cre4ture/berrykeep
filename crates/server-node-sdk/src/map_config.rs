@@ -321,7 +321,7 @@ pub(crate) async fn admin_get_config(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let action = "auth/maps/config/get";
+    let action = crate::node_multimedia::AdminMultimediaAction::MapConfigGet.as_str();
     if let Err(status) =
         authorize_admin_request(&state, &headers, action, true, true, json!({})).await
     {
@@ -349,7 +349,7 @@ pub(crate) async fn admin_put_config(
     headers: HeaderMap,
     Json(configuration): Json<ClusterMapConfiguration>,
 ) -> impl IntoResponse {
-    let action = "auth/maps/config/put";
+    let action = crate::node_multimedia::AdminMultimediaAction::MapConfigPut.as_str();
     let authz = match authorize_admin_request(
         &state,
         &headers,
