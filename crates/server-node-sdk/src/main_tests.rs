@@ -28368,32 +28368,77 @@ async fn node_multimedia_successful_read_records_admin_audit() {
 async fn node_multimedia_retry_maps_disable_after_admission_to_application_refusal() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     let key = "gallery/admitted-retry.png";
-    lock_store(&state, "tests.multimedia.retry_source")
+    let put = lock_store(&state, "tests.multimedia.retry_source")
         .await
         .put_object_versioned(key, Bytes::from(sample_png_bytes()), PutOptions::default())
         .await
         .unwrap();
-    // The handler body represents a request already past the route admission check.
-    state.multimedia.set_enabled(false);
-    let response = super::retry_media_cache_response(
-        &state,
-        super::MediaThumbnailQuery {
-            key: key.to_string(),
-            snapshot: None,
-            version: None,
-            read_mode: None,
-            profile: None,
-        },
-        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    let payload: serde_json::Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(
-        payload["code"],
-        super::node_multimedia::MULTIMEDIA_DISABLED_CODE
-    );
+    let worker = read_store(&state, "tests.multimedia.retry_worker")
+        .await
+        .media_cache_worker();
+    let metadata = worker
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let thumbnail = metadata.thumbnail.as_ref().unwrap();
+    let path = read_store(&state, "tests.multimedia.retry_thumbnail_path")
+        .await
+        .media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
+    let original_payload = tokio::fs::read(&path).await.unwrap();
+    let original_metadata = serde_json::to_value(&metadata).unwrap();
+    for disabled_at_start in [false, true] {
+        state.multimedia.set_enabled(!disabled_at_start);
+        let store_guard = if disabled_at_start {
+            None
+        } else {
+            Some(lock_store(&state, "tests.multimedia.retry_waiting_store").await)
+        };
+        // The handler is already past route admission. Also exercise a toggle
+        // after its entry check while it waits to resolve the object's manifest.
+        let mut retry = Box::pin(super::retry_media_cache_response(
+            &state,
+            super::MediaThumbnailQuery {
+                key: key.to_string(),
+                snapshot: None,
+                version: None,
+                read_mode: None,
+                profile: None,
+            },
+            super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+        ));
+        if !disabled_at_start {
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            state.multimedia.set_enabled(false);
+        }
+        drop(store_guard);
+        let response = retry.await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            payload["code"],
+            super::node_multimedia::MULTIMEDIA_DISABLED_CODE
+        );
+        let remaining = read_store(&state, "tests.multimedia.retry_retained_cache")
+            .await
+            .lookup_media_cache(&put.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata;
+        assert_eq!(
+            serde_json::to_value(remaining).unwrap(),
+            original_metadata,
+            "a disabled retry must preserve the existing derivative metadata"
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            original_payload,
+            "a disabled retry must preserve the existing thumbnail file"
+        );
+    }
     cleanup_test_state(&state).await;
 }
 

@@ -23142,6 +23142,9 @@ async fn retry_media_cache_response(
     query: MediaThumbnailQuery,
     thumbnail_route: &str,
 ) -> Response {
+    if !state.multimedia.enabled() {
+        return node_multimedia::unavailable_response();
+    }
     if query.key.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -23177,6 +23180,11 @@ async fn retry_media_cache_response(
 
     {
         let store = lock_store(state, "media_cache.retry.clear").await;
+        // The request may have waited for the store after its entry check.
+        // Admit the destructive clear only while multimedia is still enabled.
+        if !state.multimedia.enabled() {
+            return node_multimedia::unavailable_response();
+        }
         if let Err(err) = store.clear_media_cache_for_manifest(&manifest_hash).await {
             tracing::error!(
                 key = %query.key,
