@@ -70,18 +70,24 @@ Storage-only peers serve
 ordinary chunks without decoding media. The capable node therefore needs storage
 capacity for recovered source content as well as derivative caches. Existing
 incomplete-artifact retry backoff still applies. Foreground source recovery has
-a separate, bounded, per-manifest runtime retry cache with a ten-minute backoff,
+a separate, bounded, per-manifest runtime admission table with a ten-minute backoff,
 so a background metadata miss does not delay the first user-requested recovery.
 Backoff is reserved only when chunk recovery starts. Importing an existing artifact
 or finding no storage-only holder leaves recovery available. During metadata backoff,
 foreground requests can recheck known holders without probing unrelated nodes.
 Early holder discovery and rechecks have an independent thirty-second per-manifest
 throttle, applied before taking the cluster lock or cloning peer descriptors.
-Normal artifact retries do not consume this early-recheck allowance. A capability
-change may therefore take up to thirty seconds to discover during metadata backoff.
+Normal artifact retries do not consume this early-recheck allowance. With available
+admission capacity, a capability change may take up to thirty seconds to discover
+during metadata backoff.
 Early rechecks require an advertised storage-only holder or a recent disabled-source
 response. Ordinary deployments with all hosts enabled retain their existing artifact
-backoff without extra peer requests. Disabled-source observations expire after ten minutes.
+backoff without extra peer requests. Active retry deadlines are never evicted: the
+admission table holds at most 1,024 manifests and defers new source recovery and early
+discovery until an entry expires when full. An entry expires only after both its source
+and holder deadlines have elapsed. This keeps large-gallery browsing from resetting
+backoff through cache churn. Capability observations use a separate 1,024-entry LRU
+cache and expire after ten minutes; they cannot displace retry deadlines.
 Unrelated storage-only nodes do not trigger recovery for other nodes' media.
 
 Changes affect new work immediately. Work already admitted may finish; the switch

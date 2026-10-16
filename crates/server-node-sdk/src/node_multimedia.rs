@@ -96,14 +96,82 @@ impl std::error::Error for MultimediaDisabled {}
 #[derive(Clone)]
 pub(crate) struct MultimediaControl {
     enabled: Arc<AtomicBool>,
-    source_recovery_retries: Arc<Mutex<RangeChunkCache<String, MediaRecoveryBackoff>>>,
+    source_recovery_retries: Arc<Mutex<MediaRecoveryBackoffs>>,
+    storage_only_sources: Arc<Mutex<RangeChunkCache<String, u64>>>,
 }
 
 #[derive(Clone, Copy, Default)]
 struct MediaRecoveryBackoff {
     source_retry_after_unix: u64,
     holder_recheck_after_unix: u64,
-    storage_only_source_until_unix: u64,
+}
+
+const MEDIA_RECOVERY_BACKOFF_CAPACITY: usize = 1024;
+
+/// Retry deadlines are admission state: active entries must never be evicted.
+/// At capacity, new manifests wait until an existing entry fully expires.
+#[derive(Default)]
+struct MediaRecoveryBackoffs {
+    entries: HashMap<String, MediaRecoveryBackoff>,
+    next_expiration_unix: Option<u64>,
+}
+
+impl MediaRecoveryBackoff {
+    fn expires_at(self) -> u64 {
+        self.source_retry_after_unix
+            .max(self.holder_recheck_after_unix)
+    }
+}
+
+impl MediaRecoveryBackoffs {
+    fn expire(&mut self, now_unix: u64) {
+        if self
+            .next_expiration_unix
+            .is_some_and(|expiration| expiration <= now_unix)
+        {
+            self.entries
+                .retain(|_, backoff| backoff.expires_at() > now_unix);
+            self.next_expiration_unix = self
+                .entries
+                .values()
+                .map(|backoff| backoff.expires_at())
+                .min();
+        }
+    }
+
+    fn can_admit(&mut self, manifest_hash: &str, now_unix: u64, kind: &MediaRetryKind) -> bool {
+        self.expire(now_unix);
+        self.entries.get(manifest_hash).map_or(
+            self.entries.len() < MEDIA_RECOVERY_BACKOFF_CAPACITY,
+            |backoff| match kind {
+                MediaRetryKind::SourceRecovery => backoff.source_retry_after_unix <= now_unix,
+                MediaRetryKind::HolderRecheck => backoff.holder_recheck_after_unix <= now_unix,
+            },
+        )
+    }
+
+    fn admit(&mut self, manifest_hash: &str, now_unix: u64, kind: MediaRetryKind) -> bool {
+        if !self.can_admit(manifest_hash, now_unix, &kind) {
+            return false;
+        }
+        let backoff = self.entries.entry(manifest_hash.to_string()).or_default();
+        match kind {
+            MediaRetryKind::SourceRecovery => {
+                backoff.source_retry_after_unix = now_unix.saturating_add(10 * 60)
+            }
+            MediaRetryKind::HolderRecheck => {
+                backoff.holder_recheck_after_unix = now_unix.saturating_add(30)
+            }
+        }
+        let expiration = backoff.expires_at();
+        // A stale earlier minimum is harmless: expire() will rescan once when
+        // that boundary arrives, rather than scanning a full table on each miss.
+        self.next_expiration_unix = Some(
+            self.next_expiration_unix
+                .map_or(expiration, |next| next.min(expiration)),
+        );
+        true
+    }
 }
 
 enum MediaRetryKind {
@@ -115,7 +183,8 @@ impl Default for MultimediaControl {
     fn default() -> Self {
         Self {
             enabled: Arc::new(AtomicBool::new(true)),
-            source_recovery_retries: Arc::new(Mutex::new(RangeChunkCache::new(1024))),
+            source_recovery_retries: Arc::new(Mutex::new(MediaRecoveryBackoffs::default())),
+            storage_only_sources: Arc::new(Mutex::new(RangeChunkCache::new(1024))),
         }
     }
 }
@@ -140,27 +209,22 @@ impl MultimediaControl {
         self.source_recovery_retries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&manifest_hash.to_string())
-            .is_none_or(|backoff| backoff.source_retry_after_unix <= now_unix)
+            .can_admit(manifest_hash, now_unix, &MediaRetryKind::SourceRecovery)
     }
 
     pub(crate) fn storage_only_source_observed(&self, manifest_hash: &str, now_unix: u64) -> bool {
-        self.source_recovery_retries
+        self.storage_only_sources
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&manifest_hash.to_string())
-            .is_some_and(|backoff| backoff.storage_only_source_until_unix > now_unix)
+            .is_some_and(|until| *until > now_unix)
     }
 
     pub(crate) fn note_storage_only_source(&self, manifest_hash: &str, now_unix: u64) {
-        let mut retries = self
-            .source_recovery_retries
+        self.storage_only_sources
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = manifest_hash.to_string();
-        let mut backoff = retries.get(&key).map(|cached| *cached).unwrap_or_default();
-        backoff.storage_only_source_until_unix = now_unix.saturating_add(10 * 60);
-        retries.insert(key, backoff);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(manifest_hash.to_string(), now_unix.saturating_add(10 * 60));
     }
 
     pub(crate) fn admit_holder_recheck(&self, manifest_hash: &str, now_unix: u64) -> bool {
@@ -174,22 +238,10 @@ impl MultimediaControl {
     }
 
     fn admit_retry(&self, manifest_hash: &str, now_unix: u64, kind: MediaRetryKind) -> bool {
-        let mut retries = self
-            .source_recovery_retries
+        self.source_recovery_retries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = manifest_hash.to_string();
-        let mut backoff = retries.get(&key).map(|cached| *cached).unwrap_or_default();
-        let (retry_after, delay) = match kind {
-            MediaRetryKind::SourceRecovery => (&mut backoff.source_retry_after_unix, 10 * 60),
-            MediaRetryKind::HolderRecheck => (&mut backoff.holder_recheck_after_unix, 30),
-        };
-        if *retry_after > now_unix {
-            return false;
-        }
-        *retry_after = now_unix.saturating_add(delay);
-        retries.insert(key, backoff);
-        true
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admit(manifest_hash, now_unix, kind)
     }
 }
 
@@ -428,6 +480,59 @@ pub(super) async fn require_multimedia(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multimedia_retry_backoffs_survive_capacity_pressure() {
+        let control = MultimediaControl::default();
+        assert!(control.admit_holder_recheck("first", 100));
+        assert!(control.admit_source_recovery("first", 100));
+        for index in 1..1024 {
+            assert!(control.admit_source_recovery(&format!("manifest-{index}"), 100));
+        }
+        assert!(!control.source_recovery_due("overflow", 101));
+        assert!(
+            !control.admit_source_recovery("overflow", 101),
+            "new manifests must wait instead of evicting an active recovery deadline"
+        );
+        assert!(!control.admit_holder_recheck("overflow", 101));
+        assert!(!control.source_recovery_due("first", 101));
+        assert!(!control.admit_holder_recheck("first", 101));
+        assert!(!control.admit_source_recovery("first", 699));
+        assert!(
+            control.admit_source_recovery("overflow", 700),
+            "expired entries must release admission capacity"
+        );
+        assert!(control.admit_source_recovery("first", 700));
+    }
+
+    #[test]
+    fn multimedia_retry_backoffs_survive_observation_churn_and_partial_expiry() {
+        let control = MultimediaControl::default();
+        assert!(control.admit_holder_recheck("first", 100));
+        assert!(control.admit_source_recovery("first", 101));
+        for index in 0..2048 {
+            control.note_storage_only_source(&format!("observed-{index}"), 101);
+        }
+        assert!(
+            !control.source_recovery_due("first", 102),
+            "capability observations must not evict recovery admission state"
+        );
+        assert!(!control.admit_holder_recheck("first", 102));
+        for index in 1..1024 {
+            assert!(control.admit_holder_recheck(&format!("holder-{index}"), 101));
+        }
+        assert!(
+            control.admit_source_recovery("new", 131),
+            "expired holder-only entries must be reclaimed"
+        );
+        assert!(
+            !control.admit_source_recovery("first", 131),
+            "expiry of the holder deadline must retain the later source deadline"
+        );
+        assert!(control.admit_holder_recheck("first", 131));
+        assert!(!control.admit_source_recovery("first", 700));
+        assert!(control.admit_source_recovery("first", 701));
+    }
 
     #[test]
     fn multimedia_storage_only_observations_expire_without_spending_retry_budget() {
