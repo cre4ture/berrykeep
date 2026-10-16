@@ -10486,6 +10486,22 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
         );
     }
 
+    let original_package = std::fs::read(&package_path).unwrap();
+    assert!(state.cluster.lock().await.remove_node(state.node_id));
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/node-multimedia",
+        Some("admin-secret"),
+        Some(serde_json::json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        std::fs::read(&package_path).unwrap() == original_package,
+        "a missing local descriptor must not change the persisted enrollment"
+    );
+    assert!(state.multimedia.enabled());
     cleanup_test_state(&state).await;
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -20145,6 +20161,29 @@ async fn node_multimedia_preserves_backoff_for_capable_source_holders() {
             .metadata
             .is_none()
     );
+    // A repeated foreground miss must avoid cluster discovery while throttled.
+    let cluster_guard = target.cluster.lock().await;
+    let metadata = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::ensure_media_artifact_with_remote_import(
+            &target,
+            key,
+            None,
+            None,
+            &manifest_hash,
+            false,
+            super::MediaSourceRecovery::Foreground,
+        ),
+    )
+    .await
+    .expect("backoff requests must not wait for the cluster mutex")
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    drop(cluster_guard);
     peer_handle.abort();
     let _ = peer_handle.await;
     cleanup_test_state(&source).await;
@@ -20336,6 +20375,12 @@ async fn node_multimedia_does_not_recover_for_an_unrelated_storage_only_peer() {
     );
     let initial_queries = artifact_queries.load(Ordering::Relaxed);
     assert!(initial_queries > 0);
+    assert!(
+        target
+            .multimedia
+            .admit_holder_recheck(&manifest_hash, super::unix_ts()),
+        "an ordinary artifact import must leave early-holder recheck admission available"
+    );
     for _ in 0..3 {
         let response = super::get_media_thumbnail_response(
             &target,
@@ -20369,6 +20414,24 @@ async fn node_multimedia_does_not_recover_for_an_unrelated_storage_only_peer() {
         );
         cluster.register_node(descriptor);
     }
+    assert!(
+        target
+            .multimedia
+            .source_recovery_due(&manifest_hash, super::unix_ts())
+    );
+    // A normal artifact retry must also discover the newly changed capability,
+    // even while the independent early-holder discovery throttle is active.
+    {
+        let worker = read_store(&target, "tests.multimedia.retry_due")
+            .await
+            .media_cache_worker();
+        let mut retry_due = metadata;
+        retry_due.retry_after_unix = Some(0);
+        worker
+            .import_media_cache_artifact(retry_due, None)
+            .await
+            .unwrap();
+    }
     let retry = super::get_media_thumbnail_response(
         &target,
         super::MediaThumbnailQuery {
@@ -20383,7 +20446,7 @@ async fn node_multimedia_does_not_recover_for_an_unrelated_storage_only_peer() {
     assert_eq!(
         retry.status(),
         StatusCode::OK,
-        "discovering an actual storage-only holder must allow immediate recovery"
+        "a newly discovered storage-only holder must retain its source recovery budget"
     );
     peer_handle.abort();
     let _ = peer_handle.await;
@@ -28010,6 +28073,88 @@ async fn node_multimedia_capability_check_preserves_authentication() {
 }
 
 #[tokio::test]
+async fn node_multimedia_reenable_survives_cluster_persistence_failure() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let app = super::build_server_apps(&state).public_app;
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/node-multimedia",
+        Some("admin-secret"),
+        Some(serde_json::json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (root, manifest_hash) = {
+        let mut store = lock_store(&state, "tests.multimedia.persistence_source").await;
+        let put = store
+            .put_object_versioned(
+                "gallery/reenable.png",
+                Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        (store.root_dir().to_path_buf(), put.manifest_hash)
+    };
+    let db = rusqlite::Connection::open(root.join("state/metadata.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_multimedia_node_persist BEFORE INSERT ON cluster_nodes BEGIN SELECT RAISE(FAIL, 'injected node persistence failure'); END;").unwrap();
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/node-multimedia",
+        Some("admin-secret"),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(state.multimedia.enabled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let metadata = read_store(&state, "tests.multimedia.reenabled_backfill")
+                .await
+                .lookup_media_cache(&manifest_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata;
+            if metadata.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("re-enabling must start backfill despite a cluster-cache persistence error");
+    db.execute_batch("DROP TRIGGER fail_multimedia_node_persist")
+        .unwrap();
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/node-multimedia",
+        Some("admin-secret"),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let descriptor_bytes: Vec<u8> = db
+        .query_row(
+            "SELECT descriptor_json FROM cluster_nodes WHERE node_id = ?1",
+            [state.node_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let descriptor: cluster::NodeDescriptor = serde_json::from_slice(&descriptor_bytes).unwrap();
+    assert!(
+        super::node_multimedia::enabled_from_labels(&descriptor.labels).unwrap(),
+        "a retry must persist the current setting even if the descriptor no longer changes"
+    );
+    drop(db);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn node_multimedia_successful_read_records_admin_audit() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
@@ -28208,6 +28353,11 @@ async fn node_multimedia_setting_disables_convenience_but_keeps_storage_availabl
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-store",
+            "{path}"
+        );
     }
 
     // Both the thumbnail fast path and fallback routers honor the switch.

@@ -21963,6 +21963,17 @@ async fn ensure_media_artifact_with_remote_import(
     let expected_content_fingerprint =
         expected_content_fingerprint.unwrap_or_else(|| local_metadata.content_fingerprint.clone());
     let subject_hint = read_through_replication_subject(key, snapshot_id, version_id);
+    // Admission covers discovery itself, not just RPCs: repeated misses must not
+    // contend with heartbeats and replication on the cluster mutex. Normal
+    // artifact retries do not consume the separate early-recheck allowance.
+    if !attempt_remote_import
+        && (subject_hint.is_none()
+            || !state
+                .multimedia
+                .admit_holder_recheck(manifest_hash, now_unix))
+    {
+        return Ok(Some(local_metadata));
+    }
     let source_nodes = media_artifact_source_nodes(state, subject_hint.as_deref()).await;
     let mut has_storage_only_source = source_nodes.iter().any(|source| {
         source.holds_subject
@@ -21981,18 +21992,6 @@ async fn ensure_media_artifact_with_remote_import(
     {
         return Ok(Some(local_metadata));
     }
-    let recheck_holders = source_recovery == MediaSourceRecovery::Foreground
-        && source_nodes.iter().any(|source| {
-            source.holds_subject
-                && !matches!(
-                    node_multimedia::enabled_from_labels(&source.node.labels),
-                    Ok(false)
-                )
-        })
-        && state
-            .multimedia
-            .admit_holder_recheck(manifest_hash, now_unix);
-
     for MediaArtifactSource {
         node,
         holds_subject,
@@ -22000,7 +21999,7 @@ async fn ensure_media_artifact_with_remote_import(
     {
         // During metadata backoff, only recheck known holders for changed
         // capability. Do not turn a foreground retry into cluster-wide probing.
-        if !attempt_remote_import && (!holds_subject || !recheck_holders) {
+        if !attempt_remote_import && !holds_subject {
             continue;
         }
         if matches!(

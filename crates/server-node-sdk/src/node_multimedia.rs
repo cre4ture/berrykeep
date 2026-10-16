@@ -252,10 +252,7 @@ pub(super) async fn update_config(
 }
 
 async fn apply_config(state: &ServerState, enabled: bool) -> Result<bool> {
-    let persisted = update_persisted_node_enrollment_if_possible(state, |package| {
-        set_enabled_label(&mut package.bootstrap.labels, enabled);
-    })?;
-    let changed = {
+    let persisted = {
         let mut cluster = state.cluster.lock().await;
         let Some(mut descriptor) = cluster
             .list_nodes()
@@ -264,23 +261,28 @@ async fn apply_config(state: &ServerState, enabled: bool) -> Result<bool> {
         else {
             bail!("local node descriptor is unavailable");
         };
+        // Validate the runtime target before committing the enrollment change.
+        let persisted = update_persisted_node_enrollment_if_possible(state, |package| {
+            set_enabled_label(&mut package.bootstrap.labels, enabled);
+        })?;
         set_enabled_label(&mut descriptor.labels, enabled);
-        cluster.register_node(descriptor)
+        cluster.register_node(descriptor);
+        persisted
     };
     let was_enabled = state.multimedia.enabled();
     state.multimedia.set_enabled(enabled);
-    if changed {
-        persist_cluster_nodes_state(state).await?;
-    }
     if enabled && !was_enabled {
         super::spawn_media_metadata_backfill(state.clone(), "multimedia_enabled");
         super::map_dataset_import::spawn_resume_if_needed(state.clone()).await;
     }
+    // Runtime and enrollment already agree. A cluster-cache write failure must
+    // not skip enable side effects, and an identical PUT must retry that write.
+    persist_cluster_nodes_state(state).await?;
     Ok(persisted)
 }
 
 pub(super) fn unavailable_response() -> Response {
-    (StatusCode::NOT_IMPLEMENTED, Json(json!({
+    (StatusCode::NOT_IMPLEMENTED, [(axum::http::header::CACHE_CONTROL, "no-store")], Json(json!({
         "error": "Multimedia functionality is disabled on this server node. Use a multimedia-enabled node.",
         "code": MULTIMEDIA_DISABLED_CODE,
     }))).into_response()

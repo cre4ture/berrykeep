@@ -46,6 +46,8 @@ advertised with the node descriptor and Rendezvous presence, independently of
   operation start endpoints return HTTP 501 with code `node_multimedia_disabled`.
   This applies to versioned and legacy HTTP endpoints and multiplexed transports.
   Existing client/admin authentication runs before the capability response.
+  Disabled responses use `Cache-Control: no-store`, so re-enabling takes effect
+  without cached refusals.
 - Cache clearing and operation history remain available. Clearing the cache does
   not restart multimedia backfill while multimedia is disabled.
 - Original media and map datasets remain ordinary replicated objects. File
@@ -73,9 +75,10 @@ so a background metadata miss does not delay the first user-requested recovery.
 Backoff is reserved only when chunk recovery starts. Importing an existing artifact
 or finding no storage-only holder leaves recovery available. During metadata backoff,
 foreground requests can recheck known holders without probing unrelated nodes.
-Holder rechecks have an independent thirty-second per-manifest throttle, including
-probes performed by the initial foreground request. Repeated gallery polling does
-not re-probe those holders on every request during metadata backoff.
+Early holder discovery and rechecks have an independent thirty-second per-manifest
+throttle, applied before taking the cluster lock or cloning peer descriptors.
+Normal artifact retries do not consume this early-recheck allowance. A capability
+change may therefore take up to thirty seconds to discover during metadata backoff.
 Early rechecks require an advertised storage-only holder or a recent disabled-source
 response. Ordinary deployments with all hosts enabled retain their existing artifact
 backoff without extra peer requests. Disabled-source observations expire after ten minutes.
