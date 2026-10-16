@@ -21959,6 +21959,17 @@ async fn ensure_media_artifact_with_remote_import(
                 Ok(false)
             )
     });
+    let recheck_holders = source_recovery == MediaSourceRecovery::Foreground
+        && source_nodes.iter().any(|source| {
+            source.holds_subject
+                && !matches!(
+                    node_multimedia::enabled_from_labels(&source.node.labels),
+                    Ok(false)
+                )
+        })
+        && state
+            .multimedia
+            .admit_holder_recheck(manifest_hash, now_unix);
 
     for MediaArtifactSource {
         node,
@@ -21967,7 +21978,7 @@ async fn ensure_media_artifact_with_remote_import(
     {
         // During metadata backoff, only recheck known holders for changed
         // capability. Do not turn a foreground retry into cluster-wide probing.
-        if !attempt_remote_import && !holds_subject {
+        if !attempt_remote_import && (!holds_subject || !recheck_holders) {
             continue;
         }
         if matches!(

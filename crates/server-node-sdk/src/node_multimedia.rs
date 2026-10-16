@@ -37,7 +37,18 @@ impl std::error::Error for MultimediaDisabled {}
 #[derive(Clone)]
 pub(crate) struct MultimediaControl {
     enabled: Arc<AtomicBool>,
-    source_recovery_retries: Arc<Mutex<RangeChunkCache<String, u64>>>,
+    source_recovery_retries: Arc<Mutex<RangeChunkCache<String, MediaRecoveryBackoff>>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MediaRecoveryBackoff {
+    source_retry_after_unix: u64,
+    holder_recheck_after_unix: u64,
+}
+
+enum MediaRetryKind {
+    SourceRecovery,
+    HolderRecheck,
 }
 
 impl Default for MultimediaControl {
@@ -70,24 +81,35 @@ impl MultimediaControl {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&manifest_hash.to_string())
-            .is_none_or(|retry_at| *retry_at <= now_unix)
+            .is_none_or(|backoff| backoff.source_retry_after_unix <= now_unix)
+    }
+
+    pub(crate) fn admit_holder_recheck(&self, manifest_hash: &str, now_unix: u64) -> bool {
+        self.admit_retry(manifest_hash, now_unix, MediaRetryKind::HolderRecheck)
     }
 
     /// Reserve backoff only once a foreground request has an actual source holder
     /// and needs chunk recovery; artifact imports and missing holders use no slot.
     pub(crate) fn admit_source_recovery(&self, manifest_hash: &str, now_unix: u64) -> bool {
+        self.admit_retry(manifest_hash, now_unix, MediaRetryKind::SourceRecovery)
+    }
+
+    fn admit_retry(&self, manifest_hash: &str, now_unix: u64, kind: MediaRetryKind) -> bool {
         let mut retries = self
             .source_recovery_retries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = manifest_hash.to_string();
-        if retries
-            .get(&key)
-            .is_some_and(|retry_at| *retry_at > now_unix)
-        {
+        let mut backoff = retries.get(&key).map(|cached| *cached).unwrap_or_default();
+        let (retry_after, delay) = match kind {
+            MediaRetryKind::SourceRecovery => (&mut backoff.source_retry_after_unix, 10 * 60),
+            MediaRetryKind::HolderRecheck => (&mut backoff.holder_recheck_after_unix, 30),
+        };
+        if *retry_after > now_unix {
             return false;
         }
-        retries.insert(key, now_unix.saturating_add(10 * 60));
+        *retry_after = now_unix.saturating_add(delay);
+        retries.insert(key, backoff);
         true
     }
 }
@@ -105,10 +127,10 @@ pub(crate) fn enabled_from_labels(labels: &HashMap<String, String>) -> Result<bo
 pub(crate) fn enabled_from_environment(raw: Option<&str>) -> Result<Option<bool>> {
     raw.map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| {
-            value
-                .parse()
-                .context("invalid BERRYKEEP_NODE_MULTIMEDIA_ENABLED: expected true or false")
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            _ => bail!("invalid BERRYKEEP_NODE_MULTIMEDIA_ENABLED: expected true/false, 1/0, yes/no, or on/off"),
         })
         .transpose()
 }
@@ -285,6 +307,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multimedia_holder_rechecks_are_throttled_independently_of_source_recovery() {
+        let control = MultimediaControl::default();
+        assert!(control.admit_holder_recheck("manifest", 100));
+        assert!(!control.clone().admit_holder_recheck("manifest", 101));
+        assert!(control.source_recovery_due("manifest", 101));
+        assert!(control.admit_source_recovery("manifest", 101));
+        assert!(!control.admit_holder_recheck("manifest", 129));
+        assert!(control.admit_holder_recheck("manifest", 130));
+        assert!(!control.source_recovery_due("manifest", 130));
+    }
+
+    #[test]
     fn multimedia_source_recovery_backoff_is_shared_and_expires() {
         let control = MultimediaControl::default();
         assert!(control.source_recovery_due("manifest-a", 100));
@@ -301,12 +335,21 @@ mod tests {
         for raw in [None, Some(""), Some("  ")] {
             assert_eq!(enabled_from_environment(raw).unwrap(), None);
         }
-        assert_eq!(
-            enabled_from_environment(Some(" false ")).unwrap(),
-            Some(false)
-        );
-        assert_eq!(enabled_from_environment(Some("true")).unwrap(), Some(true));
-        for raw in ["0", "FALSE", "disabled"] {
+        for raw in [" false ", "FALSE", "0", "no", "No", "off", "OFF"] {
+            assert_eq!(
+                enabled_from_environment(Some(raw)).unwrap(),
+                Some(false),
+                "{raw}"
+            );
+        }
+        for raw in ["true", "TRUE", "1", "yes", "Yes", "on", " ON "] {
+            assert_eq!(
+                enabled_from_environment(Some(raw)).unwrap(),
+                Some(true),
+                "{raw}"
+            );
+        }
+        for raw in ["unknown", "2", "disabled"] {
             assert!(enabled_from_environment(Some(raw)).is_err());
         }
     }

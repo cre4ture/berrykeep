@@ -31,8 +31,9 @@ to retain the setting after a restart:
 - Bootstrap or enrollment JSON: set `bootstrap.labels.multimedia_enabled` to
   the string `"false"` (or `labels.multimedia_enabled` in a standalone bootstrap).
 
-Both accept `true` or `false`; an empty environment value is treated as unset.
-A missing label means enabled. The label is
+Environment values accept case-insensitive `true/false`, `1/0`, `yes/no`, or
+`on/off`; an empty value is treated as unset. Bootstrap labels use the canonical
+strings `true` and `false`. A missing label means enabled. The label is
 advertised with the node descriptor and Rendezvous presence, independently of
 `client_connection_priority`.
 
@@ -71,6 +72,9 @@ so a background metadata miss does not delay the first user-requested recovery.
 Backoff is reserved only when chunk recovery starts. Importing an existing artifact
 or finding no storage-only holder leaves recovery available. During metadata backoff,
 foreground requests can recheck known holders without probing unrelated nodes.
+Holder rechecks have an independent thirty-second per-manifest throttle, including
+probes performed by the initial foreground request. Repeated gallery polling does
+not re-probe those holders on every request during metadata backoff.
 Unrelated storage-only nodes do not trigger recovery for other nodes' media.
 
 Changes affect new work immediately. Work already admitted may finish; the switch

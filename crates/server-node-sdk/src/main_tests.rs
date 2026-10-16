@@ -20208,14 +20208,18 @@ async fn node_multimedia_does_not_recover_for_an_unrelated_storage_only_peer() {
     let key = "gallery/capable-source.png";
     let (source, target, manifest_hash) = build_metadata_only_media_pair(key).await;
     let chunk_reads = Arc::new(AtomicUsize::new(0));
+    let artifact_queries = Arc::new(AtomicUsize::new(0));
     let counted_reads = chunk_reads.clone();
+    let counted_queries = artifact_queries.clone();
     let app = super::build_internal_peer_api()
         .with_state(source.clone())
         .layer(axum::middleware::from_fn(
             move |request: Request<Body>, next: axum::middleware::Next| {
                 let counted_reads = counted_reads.clone();
+                let counted_queries = counted_queries.clone();
                 async move {
                     if request.uri().path() == super::PEER_MEDIA_ARTIFACT_ROUTE {
+                        counted_queries.fetch_add(1, Ordering::Relaxed);
                         return StatusCode::NOT_FOUND.into_response();
                     }
                     if request
@@ -20270,6 +20274,27 @@ async fn node_multimedia_does_not_recover_for_an_unrelated_storage_only_peer() {
         chunk_reads.load(Ordering::Relaxed),
         0,
         "unrelated storage-only nodes must not turn metadata backfill into content recovery"
+    );
+    let initial_queries = artifact_queries.load(Ordering::Relaxed);
+    assert!(initial_queries > 0);
+    for _ in 0..3 {
+        let response = super::get_media_thumbnail_response(
+            &target,
+            super::MediaThumbnailQuery {
+                key: key.to_string(),
+                snapshot: None,
+                version: None,
+                read_mode: None,
+                profile: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        artifact_queries.load(Ordering::Relaxed),
+        initial_queries,
+        "foreground misses must not repeatedly probe holders during backoff"
     );
     source.multimedia.set_enabled(false);
     {
