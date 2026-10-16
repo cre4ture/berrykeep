@@ -68,6 +68,9 @@ capacity for recovered source content as well as derivative caches. Existing
 incomplete-artifact retry backoff still applies. Foreground source recovery has
 a separate, bounded, per-manifest runtime retry cache with a ten-minute backoff,
 so a background metadata miss does not delay the first user-requested recovery.
+Backoff is reserved only when chunk recovery starts. Importing an existing artifact
+or finding no storage-only holder leaves recovery available. During metadata backoff,
+foreground requests can recheck known holders without probing unrelated nodes.
 Unrelated storage-only nodes do not trigger recovery for other nodes' media.
 
 Changes affect new work immediately. Work already admitted may finish; the switch

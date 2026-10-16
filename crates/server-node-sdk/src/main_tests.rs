@@ -20033,6 +20033,12 @@ async fn media_thumbnail_request_imports_peer_artifact_and_persists_locally_impl
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body.as_ref(), source_thumbnail_bytes.as_slice());
+    assert!(
+        target
+            .multimedia
+            .admit_source_recovery(&manifest_hash, super::unix_ts()),
+        "importing a ready peer artifact must not consume source-recovery backoff"
+    );
 
     let imported_thumbnail_path = {
         let locked = lock_store(&target, "tests.target.store").await;
@@ -20264,6 +20270,36 @@ async fn node_multimedia_does_not_recover_for_an_unrelated_storage_only_peer() {
         chunk_reads.load(Ordering::Relaxed),
         0,
         "unrelated storage-only nodes must not turn metadata backfill into content recovery"
+    );
+    source.multimedia.set_enabled(false);
+    {
+        let mut cluster = target.cluster.lock().await;
+        let mut descriptor = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == source.node_id)
+            .unwrap();
+        descriptor.labels.insert(
+            super::node_multimedia::MULTIMEDIA_ENABLED_LABEL.to_string(),
+            "false".to_string(),
+        );
+        cluster.register_node(descriptor);
+    }
+    let retry = super::get_media_thumbnail_response(
+        &target,
+        super::MediaThumbnailQuery {
+            key: key.to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+            profile: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        retry.status(),
+        StatusCode::OK,
+        "discovering an actual storage-only holder must allow immediate recovery"
     );
     peer_handle.abort();
     let _ = peer_handle.await;
@@ -27771,6 +27807,39 @@ run_on_main_metadata_backends!(
     admin_operations_router_exposes_s3_lifecycle_and_health_views,
     admin_operations_router_exposes_s3_lifecycle_and_health_views_turso
 );
+
+#[tokio::test]
+async fn node_multimedia_retry_maps_disable_after_admission_to_application_refusal() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let key = "gallery/admitted-retry.png";
+    lock_store(&state, "tests.multimedia.retry_source")
+        .await
+        .put_object_versioned(key, Bytes::from(sample_png_bytes()), PutOptions::default())
+        .await
+        .unwrap();
+    // The handler body represents a request already past the route admission check.
+    state.multimedia.set_enabled(false);
+    let response = super::retry_media_cache_response(
+        &state,
+        super::MediaThumbnailQuery {
+            key: key.to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+            profile: None,
+        },
+        super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        payload["code"],
+        super::node_multimedia::MULTIMEDIA_DISABLED_CODE
+    );
+    cleanup_test_state(&state).await;
+}
 
 #[tokio::test]
 async fn node_multimedia_disabled_does_not_break_client_storage_route() {

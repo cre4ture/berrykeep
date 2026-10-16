@@ -65,8 +65,16 @@ impl MultimediaControl {
         Ok(())
     }
 
-    /// A foreground request may bypass metadata-only backoff once, but repeated
-    /// source-recovery failures must not create an unbounded retry or state queue.
+    pub(crate) fn source_recovery_due(&self, manifest_hash: &str, now_unix: u64) -> bool {
+        self.source_recovery_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&manifest_hash.to_string())
+            .is_none_or(|retry_at| *retry_at <= now_unix)
+    }
+
+    /// Reserve backoff only once a foreground request has an actual source holder
+    /// and needs chunk recovery; artifact imports and missing holders use no slot.
     pub(crate) fn admit_source_recovery(&self, manifest_hash: &str, now_unix: u64) -> bool {
         let mut retries = self
             .source_recovery_retries
@@ -273,6 +281,8 @@ mod tests {
     #[test]
     fn multimedia_source_recovery_backoff_is_shared_and_expires() {
         let control = MultimediaControl::default();
+        assert!(control.source_recovery_due("manifest-a", 100));
+        assert!(control.clone().source_recovery_due("manifest-a", 100));
         assert!(control.admit_source_recovery("manifest-a", 100));
         assert!(!control.clone().admit_source_recovery("manifest-a", 101));
         assert!(control.admit_source_recovery("manifest-b", 101));

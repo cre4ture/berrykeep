@@ -21939,12 +21939,12 @@ async fn ensure_media_artifact_with_remote_import(
         include_thumbnail,
         now_unix,
     );
-    let attempt_source_recovery = source_recovery == MediaSourceRecovery::Foreground
+    let source_recovery_eligible = source_recovery == MediaSourceRecovery::Foreground
         && local_metadata.status == MediaCacheStatus::Incomplete
         && state
             .multimedia
-            .admit_source_recovery(manifest_hash, now_unix);
-    if !attempt_remote_import && !attempt_source_recovery {
+            .source_recovery_due(manifest_hash, now_unix);
+    if !attempt_remote_import && !source_recovery_eligible {
         return Ok(Some(local_metadata));
     }
 
@@ -21965,6 +21965,11 @@ async fn ensure_media_artifact_with_remote_import(
         holds_subject,
     } in source_nodes
     {
+        // During metadata backoff, only recheck known holders for changed
+        // capability. Do not turn a foreground retry into cluster-wide probing.
+        if !attempt_remote_import && !holds_subject {
+            continue;
+        }
         if matches!(
             node_multimedia::enabled_from_labels(&node.labels),
             Ok(false)
@@ -22006,7 +22011,12 @@ async fn ensure_media_artifact_with_remote_import(
 
     // A storage-only replica cannot produce derivatives. Recover verified source
     // chunks onto this capable node instead, using the same bounded path as previews.
-    if attempt_source_recovery && has_storage_only_source {
+    if source_recovery_eligible
+        && has_storage_only_source
+        && state
+            .multimedia
+            .admit_source_recovery(manifest_hash, now_unix)
+    {
         state.multimedia.ensure_enabled()?;
         match hydrate_missing_chunks_for_media_preview(
             state,
@@ -22672,6 +22682,9 @@ async fn get_peer_media_artifact(
         Ok(Some(metadata)) => metadata,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
+            if err.is::<node_multimedia::MultimediaDisabled>() {
+                return node_multimedia::unavailable_response();
+            }
             tracing::error!(
                 manifest_hash = %query.manifest_hash,
                 include_thumbnail = query.include_thumbnail,
@@ -23033,6 +23046,9 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
                 {
                     Ok(payload) => payload,
                     Err(err) => {
+                        if err.is::<node_multimedia::MultimediaDisabled>() {
+                            return node_multimedia::unavailable_response();
+                        }
                         tracing::error!(
                             key = %query.key,
                             manifest_hash = %manifest_hash,
@@ -23057,6 +23073,9 @@ async fn get_media_thumbnail_response(state: &ServerState, query: MediaThumbnail
             }
         }
         Err(err) => {
+            if err.is::<node_multimedia::MultimediaDisabled>() {
+                return node_multimedia::unavailable_response();
+            }
             tracing::error!(
                 key = %query.key,
                 manifest_hash = %manifest_hash,
@@ -23146,6 +23165,9 @@ async fn retry_media_cache_response(
         Ok(Some(metadata)) => metadata,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
+            if err.is::<node_multimedia::MultimediaDisabled>() {
+                return node_multimedia::unavailable_response();
+            }
             tracing::error!(
                 key = %query.key,
                 manifest_hash = %manifest_hash,
