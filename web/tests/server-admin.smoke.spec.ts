@@ -173,7 +173,10 @@ function defaultServerAdminGalleryMapConfiguration(): GalleryMapConfiguration {
 }
 
 test("server-admin runtime smoke flow renders and navigates", async ({ page }) => {
-  const mockState = await installServerAdminMocks(page);
+  let originalImageResponseAllowed = Promise.resolve();
+  const mockState = await installServerAdminMocks(page, {
+    waitForOriginalImageResponse: () => originalImageResponseAllowed
+  });
 
   await page.goto("/");
 
@@ -404,9 +407,17 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Map" }).click();
   await expect(page.locator('[aria-label="Geotagged gallery map"]')).toBeVisible();
   await expect(page.getByText("2 markers")).toBeVisible();
-  await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
-  await expect(page.getByRole("dialog")).toBeVisible();
-  await expect(page.getByText("Loading original image")).toBeVisible();
+  let releaseOriginalImage = () => {};
+  originalImageResponseAllowed = new Promise<void>((resolve) => {
+    releaseOriginalImage = resolve;
+  });
+  try {
+    await page.getByRole("button", { name: "Open map marker for gallery/cat.png" }).click();
+    await expect(page.getByRole("dialog")).toBeVisible();
+    await expect(page.getByText("Loading original image")).toBeVisible();
+  } finally {
+    releaseOriginalImage();
+  }
   await expect(page.getByText("Loading original image")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "gallery/cat.png", exact: true })).toHaveAttribute(
     "aria-current",
@@ -2084,6 +2095,7 @@ async function installServerAdminMocks(
     legacyGalleryMapApiOnly?: boolean;
     directEndpointsConfigResponseAllowed?: Promise<void>;
     markDirectEndpointsConfigRequestStarted?: () => void;
+    waitForOriginalImageResponse?: () => Promise<void>;
   }
 ) {
   const imageBody = tinyPngBuffer();
@@ -2656,7 +2668,7 @@ async function installServerAdminMocks(
 
     if (pathname.startsWith(apiV1("/auth/store/")) && method === "GET") {
       if (pathname === apiV1("/auth/store/gallery%2Fcat.png")) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        await options?.waitForOriginalImageResponse?.();
       }
       await route.fulfill({
         status: 200,
