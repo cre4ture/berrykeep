@@ -8381,6 +8381,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            node_multimedia::require_multimedia,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             require_client_auth,
         ));
 
@@ -8637,7 +8641,11 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
             "/auth/telemetry/rotate-identity",
             post(reliability_telemetry::telemetry_rotate_identity_post),
         )
-        .route("/auth/pairing-tokens/issue", post(issue_pairing_token));
+        .route("/auth/pairing-tokens/issue", post(issue_pairing_token))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            node_multimedia::require_multimedia,
+        ));
 
     let public_maps_api = Router::new()
         .route("/maps/mbtiles-metadata", get(web_maps::mbtiles_metadata))
@@ -8648,6 +8656,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .route("/maps/tiles/{z}/{x}/{y}", get(web_maps::xyz_tile))
         .route("/maps/vector-tiles/{z}/{x}/{y}", get(web_maps::vector_tile))
         .route("/maps/fonts/{fontstack}/{range}", get(web_maps::font_range))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            node_multimedia::require_multimedia,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_client_or_admin_auth,
@@ -8727,6 +8739,10 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            node_multimedia::require_multimedia,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             require_client_or_admin_auth,
         ));
 
@@ -8803,10 +8819,6 @@ fn build_server_apps(state: &ServerState) -> ServerApps {
         .nest(PUBLIC_API_V1_PREFIX, public_api_v1)
         .merge(legacy_public_api)
         .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            node_multimedia::require_multimedia,
-        ))
         .layer(middleware::from_fn(record_server_request_timing))
         .layer(middleware::from_fn(log_named_client_request))
         .layer(middleware::from_fn_with_state(

@@ -45,6 +45,7 @@ advertised with the node descriptor and Rendezvous presence, independently of
 - Thumbnail, gallery map, map serving/configuration/import, and multimedia
   operation start endpoints return HTTP 501 with code `node_multimedia_disabled`.
   This applies to versioned and legacy HTTP endpoints and multiplexed transports.
+  Existing client/admin authentication runs before the capability response.
 - Cache clearing and operation history remain available. Clearing the cache does
   not restart multimedia backfill while multimedia is disabled.
 - Original media and map datasets remain ordinary replicated objects. File

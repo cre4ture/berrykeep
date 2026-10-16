@@ -291,13 +291,32 @@ pub(super) async fn require_multimedia(
     request: Request,
     next: Next,
 ) -> Response {
-    if !state.multimedia.enabled()
-        && request
-            .extensions()
-            .get::<MatchedPath>()
-            .is_some_and(|path| is_multimedia_route(request.method(), path.as_str()))
+    if let Some(path) = request.extensions().get::<MatchedPath>()
+        && is_multimedia_route(request.method(), path.as_str())
     {
-        return unavailable_response();
+        // Client/map routers and internal transports authenticate in their outer
+        // middleware. Admin handlers authenticate internally, so do their check
+        // here before either capability rejection or request-body extraction.
+        let normalized_path = path
+            .as_str()
+            .strip_prefix(super::PUBLIC_API_V1_PREFIX)
+            .unwrap_or(path.as_str());
+        if normalized_path.starts_with("/auth/")
+            && let Err(status) = authorize_admin_request(
+                &state,
+                request.headers(),
+                "node_multimedia/access",
+                true,
+                true,
+                json!({}),
+            )
+            .await
+        {
+            return status.into_response();
+        }
+        if !state.multimedia.enabled() {
+            return unavailable_response();
+        }
     }
     next.run(request).await
 }

@@ -27834,6 +27834,123 @@ run_on_main_metadata_backends!(
 );
 
 #[tokio::test]
+async fn node_multimedia_capability_check_preserves_authentication() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.client_auth_control.require_client_auth = true;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let apps = super::build_server_apps(&state);
+    for enabled in [true, false] {
+        state.multimedia.set_enabled(enabled);
+        for path in [
+            "/api/v1/media/thumbnail?key=photos/cat.png",
+            "/api/v1/gallery/map/clusters",
+            "/api/v1/maps/config",
+            "/api/v1/maps/vector-tiles/0/0/0",
+            "/api/maps/tiles/0/0/0",
+            "/api/v1/auth/media/thumbnail?key=photos/cat.png",
+            "/api/v1/auth/media/thumbnail",
+            "/api/v1/auth/maps/config",
+            "/api/v1/auth/maps/import",
+        ] {
+            let response = apps
+                .public_app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "enabled={enabled}, {path}"
+            );
+        }
+        let operation_path = format!(
+            "/api/v1/auth/operations/{}/runs",
+            super::operations::GEOLOCATION_PROPOSE_OPERATION_ID
+        );
+        let response = apps
+            .public_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(operation_path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "operation start, enabled={enabled}"
+        );
+        for path in [
+            "/media/thumbnail?key=photos/cat.png",
+            "/gallery/map/clusters",
+            "/maps/config",
+        ] {
+            let request = transport_sdk::BufferedTransportRequest::new(
+                transport_sdk::TransportStreamKind::Rpc,
+                "GET",
+                path,
+                Vec::new(),
+                Vec::new(),
+            );
+            let response = super::transport_service::execute_buffered_transport_request(
+                &state,
+                &super::transport_service::TransportExecutionScope::Public,
+                &request,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status, 401, "multiplex, enabled={enabled}, {path}");
+        }
+        let response = apps
+            .internal_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/media/thumbnail?key=photos/cat.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "internal, enabled={enabled}"
+        );
+    }
+    for path in [
+        "/api/v1/auth/media/thumbnail?key=photos/cat.png",
+        "/api/v1/auth/maps/config",
+        "/api/v1/maps/vector-tiles/0/0/0",
+    ] {
+        let response = apps
+            .public_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("x-berrykeep-admin-token", "admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "authenticated, {path}"
+        );
+    }
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn node_multimedia_successful_read_records_admin_audit() {
     let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
     state.access.admin_control.admin_token = Some("admin-secret".to_string());
