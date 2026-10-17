@@ -81,6 +81,7 @@ ci-required:
     if [[ "$(uname -s)" == "Linux" ]]; then just test-quic-network; fi
 
 ci-ios:
+    apps/apple-file-provider/scripts/test-upload-ios-testflight-ipa.sh
     cargo test --locked -p ios-app
     cd apps/apple-file-provider && swift test
     DEST="$(BERRYKEEP_IOS_SIMULATOR_APP_BUNDLE_ID=dev.berrykeep.apple.iosapp apps/apple-file-provider/scripts/prepare-ios-simulator.sh apps/apple-file-provider/BerryKeepAppleFileProvider.xcodeproj BerryKeepIosProject)" && \

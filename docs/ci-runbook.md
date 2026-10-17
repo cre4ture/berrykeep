@@ -325,13 +325,41 @@ Artifact behavior:
 
 - When Apple signing secrets are not configured, CI uploads an unsigned `Release` `.xcarchive` for inspection.
 - When Apple signing secrets are configured, CI also exports a downloadable `.ipa` for manual device installation with `Release` performance characteristics.
+- When TestFlight upload is explicitly enabled, the signed `app-store-connect` IPA is also uploaded to App Store Connect. Apple processes the build asynchronously; assign the processed build to a TestFlight group in App Store Connect before external testers can install it.
 
 Configure these repository secrets for signed iOS artifacts:
 
-- `BERRYKEEP_IOS_SIGNING_CERT_B64` — base64-encoded `.p12` signing certificate
-- `BERRYKEEP_IOS_SIGNING_CERT_PASSWORD` — password for that `.p12`
-- `BERRYKEEP_IOS_APP_PROFILE_B64` — base64-encoded provisioning profile for `dev.berrykeep.apple.iosapp`
-- `BERRYKEEP_IOS_EXTENSION_PROFILE_B64` — base64-encoded provisioning profile for `dev.berrykeep.apple.iosapp.fileprovider`
+- `IRONMESH_IOS_SIGNING_CERT_B64` — base64-encoded `.p12` signing certificate
+- `IRONMESH_IOS_SIGNING_CERT_PASSWORD` — password for that `.p12`
+- `IRONMESH_IOS_APP_PROFILE_B64` — base64-encoded provisioning profile for `dev.berrykeep.apple.iosapp`
+- `IRONMESH_IOS_EXTENSION_PROFILE_B64` — base64-encoded provisioning profile for `dev.berrykeep.apple.iosapp.fileprovider`
+
+To enable CI uploads to TestFlight, create an App Store Connect API key with the
+Developer, App Manager, Admin, or Account Holder role, then configure these
+repository secrets (the private key is the downloaded `.p8` file, base64-encoded
+without changing its contents):
+
+- `IRONMESH_APP_STORE_CONNECT_API_KEY_ID` — App Store Connect API key ID
+- `IRONMESH_APP_STORE_CONNECT_API_ISSUER_ID` — App Store Connect issuer ID
+- `IRONMESH_APP_STORE_CONNECT_API_PRIVATE_KEY_B64` — base64-encoded API-key `.p8`
+
+Also configure these repository variables:
+
+- `IRONMESH_IOS_EXPORT_METHOD` — set to `app-store-connect`
+- `IRONMESH_IOS_TESTFLIGHT_UPLOAD_ENABLED` — set to `true`
+
+The workflow also accepts the legacy `app-store` export value for older Xcode
+installations, but `app-store-connect` is the current Xcode spelling.
+
+For this export method, use an Apple Distribution certificate and App Store
+provisioning profiles for both the host app and its File Provider extension;
+development and ad-hoc profiles cannot be uploaded to TestFlight.
+
+The workflow only uploads after a signed export, and a requested release build
+fails early when this explicit switch is on but its signing or App Store Connect
+credentials are missing. Do not set the switch for repositories where
+pull-request builds should never appear in TestFlight; a PR additionally needs
+the `ci:ios-release` label to reach the upload step.
 
 Both provisioning profiles must grant the App Group `group.dev.berrykeep.apple.shared`
 and the resolved Keychain Sharing group
@@ -351,7 +379,7 @@ for both the iOS host and extension configurations.
 
 Optional repository variable:
 
-- `BERRYKEEP_IOS_EXPORT_METHOD` — defaults to `development`; set to `ad-hoc` when you want shareable sideload builds for registered devices.
+- `IRONMESH_IOS_EXPORT_METHOD` — defaults to `development`; set to `ad-hoc` when you want shareable sideload builds for registered devices.
 
 Useful per-lane shortcuts:
 
