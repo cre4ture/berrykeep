@@ -410,6 +410,10 @@ jobs:
       BERRYKEEP_IOS_APP_PROFILE_B64: ${{ secrets.IRONMESH_IOS_APP_PROFILE_B64 }}
       BERRYKEEP_IOS_EXTENSION_PROFILE_B64: ${{ secrets.IRONMESH_IOS_EXTENSION_PROFILE_B64 }}
       BERRYKEEP_IOS_EXPORT_METHOD: ${{ vars.IRONMESH_IOS_EXPORT_METHOD }}
+      BERRYKEEP_IOS_TESTFLIGHT_UPLOAD_ENABLED: ${{ vars.IRONMESH_IOS_TESTFLIGHT_UPLOAD_ENABLED }}
+      BERRYKEEP_APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.IRONMESH_APP_STORE_CONNECT_API_KEY_ID }}
+      BERRYKEEP_APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.IRONMESH_APP_STORE_CONNECT_API_ISSUER_ID }}
+      BERRYKEEP_APP_STORE_CONNECT_API_PRIVATE_KEY_B64: ${{ secrets.IRONMESH_APP_STORE_CONNECT_API_PRIVATE_KEY_B64 }}
       IOS_APP_SCHEME: BerryKeepIosApp
       IOS_ARCHIVE_PATH: ${{ github.workspace }}/.tmp/BerryKeepIosApp.xcarchive
       IOS_DERIVED_DATA_PATH: ${{ github.workspace }}/.tmp/berrykeep-ios-derived-data
@@ -438,16 +442,42 @@ jobs:
           echo "BUILD_NAME_SUFFIX=${BUILD_SUFFIX}" >> "$GITHUB_ENV"
           echo "IOS_BUILD_NUMBER=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
 
+      - name: Test TestFlight upload helper
+        run: apps/apple-file-provider/scripts/test-upload-ios-testflight-ipa.sh
+
       - name: Determine iOS signing mode
         run: |
           if [ -n "$BERRYKEEP_IOS_SIGNING_CERT_B64" ] && [ -n "$BERRYKEEP_IOS_SIGNING_CERT_PASSWORD" ] && [ -n "$BERRYKEEP_IOS_APP_PROFILE_B64" ] && [ -n "$BERRYKEEP_IOS_EXTENSION_PROFILE_B64" ]; then
-            echo "IOS_SIGNED_EXPORT_ENABLED=true" >> "$GITHUB_ENV"
+            SIGNED_EXPORT_ENABLED=true
           else
-            echo "IOS_SIGNED_EXPORT_ENABLED=false" >> "$GITHUB_ENV"
+            SIGNED_EXPORT_ENABLED=false
           fi
+          echo "IOS_SIGNED_EXPORT_ENABLED=${SIGNED_EXPORT_ENABLED}" >> "$GITHUB_ENV"
 
           EXPORT_METHOD="${BERRYKEEP_IOS_EXPORT_METHOD:-development}"
           echo "BERRYKEEP_IOS_EXPORT_METHOD=${EXPORT_METHOD}" >> "$GITHUB_ENV"
+
+          RELEASE_BUILD_REQUESTED=false
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ] || [ "$IOS_RELEASE_REQUESTED" = "true" ]; then
+            RELEASE_BUILD_REQUESTED=true
+          fi
+
+          if [ "$RELEASE_BUILD_REQUESTED" = "true" ] && [ "${BERRYKEEP_IOS_TESTFLIGHT_UPLOAD_ENABLED:-false}" = "true" ]; then
+            case "$EXPORT_METHOD" in
+              app-store-connect | app-store) ;;
+              *)
+                echo "TestFlight upload requires BERRYKEEP_IOS_EXPORT_METHOD=app-store-connect" >&2
+                exit 1
+                ;;
+            esac
+            if [ "$SIGNED_EXPORT_ENABLED" != "true" ] || [ -z "$BERRYKEEP_APP_STORE_CONNECT_API_KEY_ID" ] || [ -z "$BERRYKEEP_APP_STORE_CONNECT_API_ISSUER_ID" ] || [ -z "$BERRYKEEP_APP_STORE_CONNECT_API_PRIVATE_KEY_B64" ]; then
+              echo "TestFlight upload is enabled but signing or App Store Connect API secrets are missing" >&2
+              exit 1
+            fi
+            echo "IOS_TESTFLIGHT_UPLOAD_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "IOS_TESTFLIGHT_UPLOAD_ENABLED=false" >> "$GITHUB_ENV"
+          fi
 
       - name: Create iOS temp workspace
         run: mkdir -p "$(dirname "$IOS_ARCHIVE_PATH")"
@@ -628,6 +658,16 @@ jobs:
             ${{ env.IOS_EXPORT_PATH }}/*.ipa
             ${{ env.IOS_ARCHIVE_PATH }}/dSYMs
           if-no-files-found: error
+
+      - name: Upload signed iOS IPA to TestFlight
+        if: ${{ env.IOS_TESTFLIGHT_UPLOAD_ENABLED == 'true' && (github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true') }}
+        run: |
+          set -- "$IOS_EXPORT_PATH"/*.ipa
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "expected exactly one exported IPA in $IOS_EXPORT_PATH" >&2
+            exit 1
+          fi
+          apps/apple-file-provider/scripts/upload-ios-testflight-ipa.sh "$1"
 
       - name: Upload unsigned iOS release archive
         if: ${{ env.IOS_SIGNED_EXPORT_ENABLED != 'true' && (github.event_name != 'pull_request' || env.IOS_RELEASE_REQUESTED == 'true') }}
