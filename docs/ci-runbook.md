@@ -1,5 +1,9 @@
 # CI runbook
 
+For the supported platforms, release triggers, observed publication state,
+and manual home-cluster steps, read
+[Release automation and home-cluster rollout](release-and-rollout.md).
+
 ## Signed Windows Server Node releases
 
 Pushing an annotated stable `vX.Y.Z` tag whose value matches
@@ -24,12 +28,12 @@ Configure these values before tagging:
 
 Keep the PFX and its password as *environment* secrets in `release-signing`,
 not repository secrets. Require independent environment approval, prevent
-self-approval, disallow administrator bypass, and limit the environment to
-the protected default branch. Start a protected signing run through
-`workflow_dispatch` from that branch. The signing job checks out the protected
-default branch only for the minimal signing utilities; the MSI itself is always
-built from the requested release tag. This also lets `workflow_dispatch` repair
-a failed publication of an existing immutable tag without recreating it.
+self-approval, and disallow administrator bypass. Allow the protected default
+branch and intended stable release tags in the deployment policy. Tag pushes request
+signing automatically; a `workflow_dispatch` from the permitted default branch
+can repair an existing immutable tag's publication without recreating it. The
+signing job checks out the protected default branch only for the minimal signing
+utilities; the MSI itself is always built from the requested release tag.
 
 The unsigned release artifact has one-day retention and is never published.
 Protect `.github/workflows/release.yml` and
@@ -107,10 +111,11 @@ Configure these values before a client-signed release:
   `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD` - PFX password.
 
 Keep both secrets in the `windows-client-signing` environment, not
-as repository secrets. Configure independent approval, prevent
-self-approval/admin bypass, and limit the environment to the protected
-default branch. Run a protected client signing release through
-`workflow_dispatch` from that branch.
+as repository secrets. Configure independent approval, prevent self-approval,
+and disallow administrator bypass. Allow the protected default branch and
+intended stable release tags in the deployment policy. Tag pushes request
+client signing automatically; a protected `workflow_dispatch` from the
+permitted default branch is also available for publication repair.
 The certificate subject must exactly match the `Publisher` in
 `windows/thumbnail-provider/AppxManifest.xml`; the signing helper refuses a
 mismatch. Protect `.github/workflows/release.yml` and
@@ -142,9 +147,11 @@ The Android Server Node release APK is intentionally excluded from ordinary
 `main` pushes and manual CI runs. It is built only for a pull request bearing
 that label or for an explicit stable `vX.Y.Z` release tag.
 
-This requires the repository secrets `BERRYKEEP_ANDROID_INTERNAL_RELEASE_STORE_B64`
-and the corresponding release-signing credentials. For pull requests from
-forks, GitHub does not expose these secrets to the standard `pull_request`
+This requires the repository secrets `IRONMESH_ANDROID_INTERNAL_RELEASE_STORE_B64`
+and the corresponding `IRONMESH_ANDROID_INTERNAL_RELEASE_*` signing credentials.
+The workflow maps these existing secret names to `BERRYKEEP_*` environment
+variables. Without the keystore, release matrix entries are omitted. For pull
+requests from forks, GitHub does not expose these secrets to the standard `pull_request`
 workflow, so the release legs remain unavailable there by design.
 
 ## iOS release archive builds on pull requests
@@ -160,6 +167,16 @@ build the `Release` archive, matching the Android release-variant behavior.
 The `ios-build` job still reports `success` on a pull request without the
 label: the skipped steps are not failures, so the `Required CI` aggregate
 check (which depends on `ios-build`) is unaffected.
+
+Signed IPA export additionally requires the iOS signing certificate/password
+and both provisioning profiles. Without them the uploaded archive is unsigned.
+TestFlight upload is implemented and additionally requires the upload flag,
+an App Store export method, and App Store Connect API credentials. Current
+GitHub setting names still use the `IRONMESH_IOS_*` and
+`IRONMESH_APP_STORE_CONNECT_API_*` prefixes; inspect the `ios-build` job's `env`
+block in `check.yml` before configuring them. The
+[validated snapshot](release-and-rollout.md#validated-snapshot-2026-10-18)
+distinguishes implemented automation from configured, successful delivery.
 
 ## Required checks (branch protection alignment)
 

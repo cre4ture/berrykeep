@@ -17,12 +17,17 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - Workspace toolchain pinned in `rust-toolchain.toml`: `nightly-2026-02-17`
 - CI check lanes include:
   - Rust checks/lints/tests
-  - Android debug build + artifact (`android-debug-apk`)
+  - Android JVM/emulator tests and conditional internal release APK artifacts
   - Generic static x86_64 Server Node build + artifact
     (`static-server-node-linux-amd64`), included in `Required CI`
   - Linux FUSE mount binary build + artifact (`linux-fuse-mount-binary-ubuntu`)
   - Windows CFAPI compile check lane
 - Coverage gate excludes `crates/adapter-linux-fuse/` for current MVP stage.
+- Release/rollout capabilities, the OS/package matrix, current signing gaps,
+  and manual deployment steps are maintained in
+  [release-and-rollout.md](release-and-rollout.md). Validate that reference
+  against workflow source and live runs before a release; Windows GitHub and
+  signed Linux APT publication are independent, and neither upgrades LAN hosts.
 
 ## Current state (latest implemented)
 
