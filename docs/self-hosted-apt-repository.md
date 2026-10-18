@@ -10,7 +10,7 @@ The primary BerryKeep repository URL is:
 https://creax.de/apt/berrykeep
 ```
 
-The former `https://creax.de/apt/berrykeep` location is retained as a signed
+The former `https://creax.de/apt/ironmesh` location is retained as a signed
 compatibility mirror. Existing clients can keep using it, but new
 installations should use the BerryKeep URL.
 
@@ -168,14 +168,14 @@ same signed repository to both locations:
 APT_REPO_SIGN_KEY=5D7762BDB9A2A564D500DE702A2E3C589C188616 \
   ./scripts/build-apt-repository.sh \
     --server-node-matrix server-node-debian-matrix.txt \
-    --import-remote creature@creax.de:/home/creature/html/apt/berrykeep
+    --import-remote creature@creax.de:/home/creature/html/apt/ironmesh
 
 ./scripts/deploy-apt-repository.sh \
   --server-node-matrix server-node-debian-matrix.txt
 ./scripts/deploy-apt-repository.sh \
   --server-node-matrix server-node-debian-matrix.txt \
-  --remote-dir /home/creature/html/apt/berrykeep \
-  --url https://creax.de/apt/berrykeep
+  --remote-dir /home/creature/html/apt/ironmesh \
+  --url https://creax.de/apt/ironmesh
 ```
 
 ## CI build, signing, and deployment
@@ -212,9 +212,9 @@ Add these environment variables:
 - `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE`: SSH target of the legacy
   mirror, normally `creature@creax.de`.
 - `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE_DIR`: legacy mirror directory,
-  `/home/creature/html/apt/berrykeep`.
+  `/home/creature/html/apt/ironmesh`.
 - `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_URL`: legacy mirror URL,
-  `https://creax.de/apt/berrykeep`.
+  `https://creax.de/apt/ironmesh`.
 
 The publish job imports the private key into a fresh temporary keyring,
 confirms its fingerprint, imports the primary archive, and deploys identical
@@ -290,10 +290,16 @@ needed.
 
 ## Publishing updates
 
-For a new release, bump `[workspace.package].version` in `Cargo.toml`, build the
-local `.deb` packages, rebuild the repository metadata, and deploy again. The
-packaging helpers update the upstream portion of `debian/changelog`
-automatically while preserving the existing Debian revision suffix:
+For a stable Server Node release, follow the
+[release preparation procedure](release-and-rollout.md#release-preparation-and-verification).
+The annotated tag automatically builds, signs, and publishes the five-target
+Server Node matrix through the protected `apt-repository` environment. Approve
+the environment job and verify publication; a local rebuild is not required.
+
+The commands below are a separate manual path for explicitly requested full
+package publication or repair. The packaging helpers update the upstream
+portion of `debian/changelog` automatically while preserving its Debian
+revision suffix:
 
 ```bash
 ./scripts/build-local-debs.sh -- -jauto

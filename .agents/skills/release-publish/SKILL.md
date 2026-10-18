@@ -1,12 +1,39 @@
 ---
 name: release-publish
-description: Publish and verify a signed BerryKeep GitHub release from an existing annotated stable tag. Use to follow the tag-triggered release workflow, verify artifact provenance, or repair publication without creating a new product release.
+description: Verify or repair BerryKeep Windows GitHub and Linux APT release publication from an existing annotated stable tag, and check requested mobile CI artifacts without creating a new product release.
 ---
 
 # Release Publish
 
-1. Start only from an existing annotated `vX.Y.Z` tag whose workspace version matches the tag. Treat the tag as immutable.
-2. Treat the tag-triggered `Release` workflow as the source of truth; never publish pull-request CI artifacts.
-3. Fail closed on signing. Require the protected `release-signing` environment for the Windows Server Node MSI and never attach an unsigned MSI to a public release.
-4. Verify artifact provenance: the release must contain the versioned MSI, `berrykeep-server-node-stable.json`, its `.p7s` signature, and `SHA256SUMS`; manifest version, MSI SHA-256, CMS signer thumbprint, and Authenticode signer must describe the same release.
-5. Make retries idempotent by updating the draft or existing release assets. Never move, delete, or retag the release tag. Report the release URL and final workflow status; escalate missing signing material, certificate failures, or tag/version mismatches instead of bypassing them.
+Read [the release automation reference](../../../docs/release-and-rollout.md)
+for the platform/artifact matrix, protected environments, evidence, and manual
+store/hardware work. Recheck current workflow and GitHub configuration.
+
+1. Start from an existing annotated `vX.Y.Z` tag whose workspace version matches
+   the tag. Treat it as immutable. APT additionally requires reachability from
+   `main`; use the exact tag commit for provenance.
+2. Follow both `Release` and `Server Node Debian packages`. They publish
+   independently; neither alone proves the full release is published. Never
+   promote PR artifacts. Inspect tag `CI` for requested Android/iOS outputs.
+3. Require `release-signing` for the Windows Server Node MSI,
+   `windows-client-signing` for the client MSIX, and `apt-repository` for Linux
+   publication. Honor existing deployment authorization and environment review
+   rules; do not bypass missing credentials or approvals.
+4. Verify the versioned MSI, stable JSON manifest, detached CMS signature,
+   versioned client MSIX and public certificate, and `SHA256SUMS`. Check hashes,
+   manifest version, MSI Authenticode/CMS signer agreement, and the client MSIX
+   signature/publisher/certificate. The `.msixupload` remains an Actions artifact
+   for manual Partner Center submission.
+5. Verify signed APT metadata and expected Server Node versions/checksums in
+   every configured suite/architecture, on primary and compatibility archives.
+   APT packages are published in the archive, not attached to GitHub Releases.
+6. Repair Windows publication by dispatching `Release` with the existing tag
+   from a permitted branch; asset updates are idempotent. The Debian workflow's
+   manual `publish=true` builds the selected `main`, not an arbitrary old tag.
+   Do not use it to relabel newer binaries as an old release. Never move,
+   delete, or retag the release tag.
+7. Report the GitHub Release URL, both publication run results, APT version
+   availability, and requested mobile artifact/signing status. Android/iOS
+   Actions artifacts, TestFlight upload, store submission, and cluster rollout
+   are separate outcomes. Escalate actual publication blockers rather than
+   declaring the release complete after only the Windows workflow succeeds.
