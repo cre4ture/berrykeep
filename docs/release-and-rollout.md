@@ -211,6 +211,10 @@ These observations establish what has worked; recheck them before execution.
 - `release-signing`, `windows-client-signing`, and `apt-repository` exist, have
   required-reviewer rules, and permit `main` and stable-style tags. The configured
   APT URLs are `/apt/berrykeep` and `/apt/ironmesh` on `creax.de`.
+  Their current rules allow self-review and administrator bypass; the runbook's
+  independent-approval/no-bypass signing requirements are configuration gaps,
+  not protections already enforced by the live settings. This audit did not
+  change environment configuration.
 - Android internal signing secrets are configured. iOS signing, App Store
   Connect secrets, and iOS upload/export variables are absent. The latest iOS
   run archived successfully but skipped signing, IPA export, and TestFlight.

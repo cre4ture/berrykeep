@@ -27,13 +27,13 @@ Configure these values before tagging:
   endpoint, required for public releases and optional for self-signed tests.
 
 Keep the PFX and its password as *environment* secrets in `release-signing`,
-not repository secrets. Configure its required-reviewer policy and allow the
-protected default branch and intended stable release tags. Tag pushes request
+not repository secrets. Require independent environment approval, prevent
+self-approval, and disallow administrator bypass. Allow the protected default
+branch and intended stable release tags in the deployment policy. Tag pushes request
 signing automatically; a `workflow_dispatch` from the permitted default branch
-can repair an existing tag's publication. The signing job checks out the protected
-default branch only for the minimal signing utilities; the MSI itself is always
-built from the requested release tag. This also lets `workflow_dispatch` repair
-a failed publication of an existing immutable tag without recreating it.
+can repair an existing immutable tag's publication without recreating it. The
+signing job checks out the protected default branch only for the minimal signing
+utilities; the MSI itself is always built from the requested release tag.
 
 The unsigned release artifact has one-day retention and is never published.
 Protect `.github/workflows/release.yml` and
@@ -111,8 +111,9 @@ Configure these values before a client-signed release:
   `BERRYKEEP_WINDOWS_CLIENT_SIGNING_CERTIFICATE_PASSWORD` - PFX password.
 
 Keep both secrets in the `windows-client-signing` environment, not
-as repository secrets. Configure its required-reviewer policy and allow the
-protected default branch and intended stable release tags. Tag pushes request
+as repository secrets. Configure independent approval, prevent self-approval,
+and disallow administrator bypass. Allow the protected default branch and
+intended stable release tags in the deployment policy. Tag pushes request
 client signing automatically; a protected `workflow_dispatch` from the
 permitted default branch is also available for publication repair.
 The certificate subject must exactly match the `Publisher` in
