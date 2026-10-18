@@ -134,7 +134,7 @@ package increments the legacy repository revision, so it supersedes an
 otherwise identical `~repo1~ubuntu…` package in APT's version comparison.
 
 When a server-only matrix refreshes an already-published suite, the matrix
-discovers and publishes the matching `berrykeep-server-node` transition package
+discovers and publishes the matching `ironmesh-server-node` transition package
 beside each `berrykeep-server-node` input. Its existing client, rendezvous, and
 map-tools `.deb` files are retained from both the legacy shared pool and the
 previous BerryKeep suite pool, then copied into the new BerryKeep suite pool
@@ -240,9 +240,9 @@ curl -fsSL https://creax.de/apt/berrykeep/dists/focal/main/binary-arm64/Packages
   | gzip -dc \
   | grep '^Package: '
 
-# Existing BerryKeep clients continue to receive the same signed metadata.
+# Existing IronMesh clients continue to receive the same signed metadata.
 cmp <(curl -fsSL https://creax.de/apt/berrykeep/dists/noble/InRelease) \
-  <(curl -fsSL https://creax.de/apt/berrykeep/dists/noble/InRelease)
+  <(curl -fsSL https://creax.de/apt/ironmesh/dists/noble/InRelease)
 ```
 
 ## Client setup
@@ -256,7 +256,7 @@ curl -fsSL https://creax.de/apt/berrykeep/berrykeep-archive-keyring.asc \
 
 Add exactly one apt source, matching the distribution suite and architecture of
 the host. New installations use `berrykeep.list`; existing clients can retain
-their `berrykeep.list` source because the legacy URL is a compatibility mirror:
+their `ironmesh.list` source because the legacy URL is a compatibility mirror:
 
 ```bash
 # Ubuntu 20.04 ARM64
@@ -276,17 +276,20 @@ echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gp
   | sudo tee /etc/apt/sources.list.d/berrykeep.list
 ```
 
-Install or update packages through apt:
+Install or update the Server Node through apt:
 
 ```bash
 sudo apt update
-sudo apt install berrykeep-client
+sudo apt install berrykeep-server-node
 ```
 
-Headless targets install only `berrykeep-server-node`. The desktop package set
-can additionally install `berrykeep-rendezvous-service`; add
-`berrykeep-server-node-map-tools` when the optional Natural Earth imports are
-needed.
+The automated release matrix publishes the Server Node and its transition
+packages. The full desktop package set (`berrykeep-client` and
+`berrykeep-rendezvous-service`) needs separate publication; check its actual
+APT candidate before trying to install it. Retained legacy client/rendezvous
+packages can be older than the Server Node. Add `berrykeep-server-node-map-tools`
+when the optional Natural Earth imports are needed and that package is available
+for the host's suite/architecture.
 
 ## Publishing updates
 
