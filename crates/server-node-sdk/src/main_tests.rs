@@ -10458,6 +10458,50 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
     assert_eq!(stored_internal_metadata, internal_material.metadata);
     assert_eq!(stored_public_metadata, public_material.metadata);
 
+    // Operator settings survive restart without discarding enrollment TLS material.
+    state.network.node_enrollment_path = Some(package_path.clone());
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let app = super::build_server_apps(&state).public_app;
+    for enabled in [false, true] {
+        let (status, view) = execute_admin_control_request(
+            &app,
+            Method::PUT,
+            "/api/v1/auth/node-multimedia",
+            Some("admin-secret"),
+            Some(serde_json::json!({ "enabled": enabled })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["persisted"], true);
+        let package = transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap();
+        assert_eq!(
+            package.public_tls_material.unwrap().cert_pem,
+            public_material.cert_pem
+        );
+        let restarted_config =
+            super::ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+        assert_eq!(
+            super::node_multimedia::enabled_from_labels(&restarted_config.labels).unwrap(),
+            enabled
+        );
+    }
+
+    let original_package = std::fs::read(&package_path).unwrap();
+    assert!(state.cluster.lock().await.remove_node(state.node_id));
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/node-multimedia",
+        Some("admin-secret"),
+        Some(serde_json::json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        std::fs::read(&package_path).unwrap() == original_package,
+        "a missing local descriptor must not change the persisted enrollment"
+    );
+    assert!(state.multimedia.enabled());
     cleanup_test_state(&state).await;
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -20005,6 +20049,14 @@ async fn media_thumbnail_request_imports_peer_artifact_and_persists_locally_impl
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body.as_ref(), source_thumbnail_bytes.as_slice());
+    assert!(
+        target
+            .multimedia
+            .admit_source_recovery(&manifest_hash, super::unix_ts())
+            .unwrap()
+            .is_some(),
+        "importing a ready peer artifact must not consume source-recovery backoff"
+    );
 
     let imported_thumbnail_path = {
         let locked = lock_store(&target, "tests.target.store").await;
@@ -20057,6 +20109,383 @@ run_on_main_metadata_backends!(
     media_thumbnail_request_imports_peer_artifact_and_persists_locally,
     media_thumbnail_request_imports_peer_artifact_and_persists_locally_turso
 );
+
+#[tokio::test]
+async fn node_multimedia_preserves_backoff_for_capable_source_holders() {
+    let key = "gallery/capable-restart.png";
+    let (source, target, manifest_hash) = build_metadata_only_media_pair(key).await;
+    let metadata = super::ensure_media_artifact_with_remote_import(
+        &target,
+        key,
+        None,
+        None,
+        &manifest_hash,
+        false,
+        super::MediaSourceRecovery::Disabled,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    let (peer_url, peer_handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &peer_url).await;
+    target
+        .cluster
+        .lock()
+        .await
+        .note_replica(key, source.node_id);
+    let response = super::get_media_thumbnail_response(
+        &target,
+        super::MediaThumbnailQuery {
+            key: key.to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+            profile: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a capable holder becoming reachable must not bypass incomplete-artifact backoff"
+    );
+    assert!(
+        read_store(&source, "tests.multimedia.unprobed_capable_holder")
+            .await
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .is_none()
+    );
+    // A repeated foreground miss must avoid cluster discovery while throttled.
+    let cluster_guard = target.cluster.lock().await;
+    let metadata = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::ensure_media_artifact_with_remote_import(
+            &target,
+            key,
+            None,
+            None,
+            &manifest_hash,
+            false,
+            super::MediaSourceRecovery::Foreground,
+        ),
+    )
+    .await
+    .expect("backoff requests must not wait for the cluster mutex")
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    drop(cluster_guard);
+    peer_handle.abort();
+    let _ = peer_handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_derives_from_storage_only_peer_without_a_local_replica() {
+    node_multimedia_derives_from_storage_only_peer(true).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_derives_when_peer_capability_advertisement_is_stale() {
+    node_multimedia_derives_from_storage_only_peer(false).await;
+}
+
+async fn node_multimedia_derives_from_storage_only_peer(advertised: bool) {
+    let key = "gallery/storage-only.png";
+    let (source, target, manifest_hash) = build_metadata_only_media_pair(key).await;
+    source.multimedia.set_enabled(false);
+    let (peer_url, peer_handle) = spawn_internal_peer_api_server(source.clone()).await;
+    register_online_source_node(&target, &source, &peer_url).await;
+    {
+        let mut cluster = target.cluster.lock().await;
+        let mut descriptor = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == source.node_id)
+            .unwrap();
+        if advertised {
+            descriptor.labels.insert(
+                super::node_multimedia::MULTIMEDIA_ENABLED_LABEL.to_string(),
+                "false".to_string(),
+            );
+        }
+        cluster.register_node(descriptor);
+        cluster.note_replica(key, source.node_id);
+    }
+    let metadata = super::ensure_media_artifact_with_remote_import(
+        &target,
+        key,
+        None,
+        None,
+        &manifest_hash,
+        false,
+        super::MediaSourceRecovery::Disabled,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    assert!(
+        !read_store(&target, "tests.multimedia.no_background_chunks")
+            .await
+            .missing_chunks_for_manifest_range(&manifest_hash, 0, sample_png_bytes().len())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let thumbnail_query = || super::MediaThumbnailQuery {
+        key: key.to_string(),
+        snapshot: None,
+        version: None,
+        read_mode: None,
+        profile: None,
+    };
+    let first = target
+        .multimedia
+        .admit_source_recovery("other-source-a", super::unix_ts())
+        .unwrap()
+        .unwrap();
+    let second = target
+        .multimedia
+        .admit_source_recovery("other-source-b", super::unix_ts())
+        .unwrap()
+        .unwrap();
+    let busy = super::get_media_thumbnail_response(&target, thumbnail_query()).await;
+    assert_eq!(
+        busy.status(),
+        StatusCode::NOT_FOUND,
+        "busy recovery must defer instead of queueing"
+    );
+    assert_eq!(
+        busy.headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "a temporary busy refusal must not be cached"
+    );
+    assert!(
+        !read_store(&target, "tests.multimedia.no_busy_recovery_chunks")
+            .await
+            .missing_chunks_for_manifest_range(&manifest_hash, 0, sample_png_bytes().len())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(first);
+    drop(second);
+    // Deferral must leave this manifest's source cooldown available immediately.
+    let response = super::get_media_thumbnail_response(&target, thumbnail_query()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let thumbnail = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let decoded = image::load_from_memory(&thumbnail).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (256, 192));
+    assert!(
+        read_store(&source, "tests.multimedia.source_cache")
+            .await
+            .lookup_media_cache(&manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .is_none()
+    );
+    peer_handle.abort();
+    let _ = peer_handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
+
+async fn build_metadata_only_media_pair(key: &str) -> (ServerState, ServerState, String) {
+    let source = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let target = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let (manifest_hash, bundle) = {
+        let mut store = lock_store(&source, "tests.multimedia.source").await;
+        let put = store
+            .put_object_versioned(key, Bytes::from(sample_png_bytes()), PutOptions::default())
+            .await
+            .unwrap();
+        let bundle = store
+            .export_metadata_bundle(key, None, super::storage::ObjectReadMode::Preferred)
+            .await
+            .unwrap()
+            .unwrap();
+        (put.manifest_hash, bundle)
+    };
+    lock_store(&target, "tests.multimedia.import")
+        .await
+        .import_metadata_bundle(&bundle)
+        .await
+        .unwrap();
+    (source, target, manifest_hash)
+}
+
+#[tokio::test]
+async fn node_multimedia_does_not_recover_for_an_unrelated_storage_only_peer() {
+    let key = "gallery/capable-source.png";
+    let (source, target, manifest_hash) = build_metadata_only_media_pair(key).await;
+    let chunk_reads = Arc::new(AtomicUsize::new(0));
+    let artifact_queries = Arc::new(AtomicUsize::new(0));
+    let counted_reads = chunk_reads.clone();
+    let counted_queries = artifact_queries.clone();
+    let app = super::build_internal_peer_api()
+        .with_state(source.clone())
+        .layer(axum::middleware::from_fn(
+            move |request: Request<Body>, next: axum::middleware::Next| {
+                let counted_reads = counted_reads.clone();
+                let counted_queries = counted_queries.clone();
+                async move {
+                    if request.uri().path() == super::PEER_MEDIA_ARTIFACT_ROUTE {
+                        counted_queries.fetch_add(1, Ordering::Relaxed);
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    if request
+                        .uri()
+                        .path()
+                        .starts_with("/cluster/v2/replication/chunk/")
+                    {
+                        counted_reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_url = format!("http://{}", listener.local_addr().unwrap());
+    let peer_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    register_online_source_node(&target, &source, &peer_url).await;
+    {
+        let mut cluster = target.cluster.lock().await;
+        let mut descriptor = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == source.node_id)
+            .unwrap();
+        descriptor.node_id = NodeId::new_v4();
+        descriptor.labels.insert(
+            super::node_multimedia::MULTIMEDIA_ENABLED_LABEL.to_string(),
+            "false".to_string(),
+        );
+        cluster.register_node(descriptor);
+        cluster.note_replica(key, source.node_id);
+    }
+    let metadata = super::ensure_media_artifact_with_remote_import(
+        &target,
+        key,
+        None,
+        None,
+        &manifest_hash,
+        false,
+        super::MediaSourceRecovery::Foreground,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        metadata.status,
+        super::storage::MediaCacheStatus::Incomplete
+    );
+    assert_eq!(
+        chunk_reads.load(Ordering::Relaxed),
+        0,
+        "unrelated storage-only nodes must not turn metadata backfill into content recovery"
+    );
+    let initial_queries = artifact_queries.load(Ordering::Relaxed);
+    assert!(initial_queries > 0);
+    assert!(
+        target
+            .multimedia
+            .admit_holder_recheck(&manifest_hash, super::unix_ts()),
+        "an ordinary artifact import must leave early-holder recheck admission available"
+    );
+    for _ in 0..3 {
+        let response = super::get_media_thumbnail_response(
+            &target,
+            super::MediaThumbnailQuery {
+                key: key.to_string(),
+                snapshot: None,
+                version: None,
+                read_mode: None,
+                profile: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        artifact_queries.load(Ordering::Relaxed),
+        initial_queries,
+        "foreground misses must not repeatedly probe holders during backoff"
+    );
+    source.multimedia.set_enabled(false);
+    {
+        let mut cluster = target.cluster.lock().await;
+        let mut descriptor = cluster
+            .list_nodes()
+            .into_iter()
+            .find(|node| node.node_id == source.node_id)
+            .unwrap();
+        descriptor.labels.insert(
+            super::node_multimedia::MULTIMEDIA_ENABLED_LABEL.to_string(),
+            "false".to_string(),
+        );
+        cluster.register_node(descriptor);
+    }
+    assert!(
+        target
+            .multimedia
+            .source_recovery_due(&manifest_hash, super::unix_ts())
+    );
+    // A normal artifact retry must also discover the newly changed capability,
+    // even while the independent early-holder discovery throttle is active.
+    {
+        let worker = read_store(&target, "tests.multimedia.retry_due")
+            .await
+            .media_cache_worker();
+        let mut retry_due = metadata;
+        retry_due.retry_after_unix = Some(0);
+        worker
+            .import_media_cache_artifact(retry_due, None)
+            .await
+            .unwrap();
+    }
+    let retry = super::get_media_thumbnail_response(
+        &target,
+        super::MediaThumbnailQuery {
+            key: key.to_string(),
+            snapshot: None,
+            version: None,
+            read_mode: None,
+            profile: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        retry.status(),
+        StatusCode::OK,
+        "a newly discovered storage-only holder must retain its source recovery budget"
+    );
+    peer_handle.abort();
+    let _ = peer_handle.await;
+    cleanup_test_state(&source).await;
+    cleanup_test_state(&target).await;
+}
 
 async fn media_thumbnail_request_marks_cache_incomplete_when_no_peer_artifact_available_impl(
     backend: MainTestBackend,
@@ -20518,6 +20947,10 @@ async fn build_test_state(
     let (namespace_change_tx, _) = tokio::sync::watch::channel(0);
     let state = ServerState {
         managed_paths: super::ManagedPaths::from_data_dir(root.clone()),
+        multimedia: store
+            .read("test.build_state.multimedia")
+            .await
+            .multimedia_control(),
         cluster_id: uuid::Uuid::now_v7(),
         node_id: local_node_id,
         node_hostname: None,
@@ -27556,6 +27989,729 @@ run_on_main_metadata_backends!(
 );
 
 #[tokio::test]
+async fn node_multimedia_capability_check_preserves_authentication() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.client_auth_control.require_client_auth = true;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let apps = super::build_server_apps(&state);
+    for enabled in [true, false] {
+        state.multimedia.set_enabled(enabled);
+        for path in [
+            "/api/v1/media/thumbnail?key=photos/cat.png",
+            "/api/v1/gallery/map/clusters",
+            "/api/v1/maps/config",
+            "/api/v1/maps/vector-tiles/0/0/0",
+            "/api/maps/tiles/0/0/0",
+            "/api/v1/auth/media/thumbnail?key=photos/cat.png",
+            "/api/v1/auth/media/thumbnail",
+            "/api/v1/auth/maps/config",
+            "/api/v1/auth/maps/import",
+        ] {
+            let response = apps
+                .public_app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "enabled={enabled}, {path}"
+            );
+        }
+        let operation_path = format!(
+            "/api/v1/auth/operations/{}/runs",
+            super::operations::GEOLOCATION_PROPOSE_OPERATION_ID
+        );
+        let response = apps
+            .public_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(operation_path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "operation start, enabled={enabled}"
+        );
+        for path in [
+            "/media/thumbnail?key=photos/cat.png",
+            "/gallery/map/clusters",
+            "/maps/config",
+        ] {
+            let request = transport_sdk::BufferedTransportRequest::new(
+                transport_sdk::TransportStreamKind::Rpc,
+                "GET",
+                path,
+                Vec::new(),
+                Vec::new(),
+            );
+            let response = super::transport_service::execute_buffered_transport_request(
+                &state,
+                &super::transport_service::TransportExecutionScope::Public,
+                &request,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status, 401, "multiplex, enabled={enabled}, {path}");
+        }
+        let response = apps
+            .internal_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/media/thumbnail?key=photos/cat.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "internal, enabled={enabled}"
+        );
+    }
+    for path in [
+        "/api/v1/auth/media/thumbnail?key=photos/cat.png",
+        "/api/v1/auth/maps/config",
+        "/api/v1/maps/vector-tiles/0/0/0",
+    ] {
+        let response = apps
+            .public_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("x-berrykeep-admin-token", "admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "authenticated, {path}"
+        );
+    }
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_reenable_survives_cluster_persistence_failure() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let app = super::build_server_apps(&state).public_app;
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/node-multimedia",
+        Some("admin-secret"),
+        Some(serde_json::json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (root, manifest_hash) = {
+        let mut store = lock_store(&state, "tests.multimedia.persistence_source").await;
+        let put = store
+            .put_object_versioned(
+                "gallery/reenable.png",
+                Bytes::from(sample_png_bytes()),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        (store.root_dir().to_path_buf(), put.manifest_hash)
+    };
+    let db = rusqlite::Connection::open(root.join("state/metadata.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_multimedia_node_persist BEFORE INSERT ON cluster_nodes BEGIN SELECT RAISE(FAIL, 'injected node persistence failure'); END;").unwrap();
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/node-multimedia",
+        Some("admin-secret"),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(state.multimedia.enabled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let metadata = read_store(&state, "tests.multimedia.reenabled_backfill")
+                .await
+                .lookup_media_cache(&manifest_hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata;
+            if metadata.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("re-enabling must start backfill despite a cluster-cache persistence error");
+    db.execute_batch("DROP TRIGGER fail_multimedia_node_persist")
+        .unwrap();
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/node-multimedia",
+        Some("admin-secret"),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let descriptor_bytes: Vec<u8> = db
+        .query_row(
+            "SELECT descriptor_json FROM cluster_nodes WHERE node_id = ?1",
+            [state.node_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let descriptor: cluster::NodeDescriptor = serde_json::from_slice(&descriptor_bytes).unwrap();
+    assert!(
+        super::node_multimedia::enabled_from_labels(&descriptor.labels).unwrap(),
+        "a retry must persist the current setting even if the descriptor no longer changes"
+    );
+    drop(db);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_enrollment_writers_share_renewal_serialization() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let app = super::build_server_apps(&state).public_app;
+    for (path, body) in [
+        (
+            "/api/v1/auth/node-connection-priority",
+            serde_json::json!({ "priority": 5 }),
+        ),
+        (
+            "/api/v1/auth/direct-endpoints-config",
+            serde_json::json!({ "public_urls": [], "peer_urls": [] }),
+        ),
+        (
+            "/api/v1/auth/rendezvous-config",
+            serde_json::json!({ "editable_urls": [] }),
+        ),
+        (
+            "/api/v1/auth/node-multimedia",
+            serde_json::json!({ "enabled": false }),
+        ),
+    ] {
+        let guard = state.network.node_enrollment_renewal_lock.lock().await;
+        let mut request = Box::pin(execute_admin_control_request(
+            &app,
+            Method::PUT,
+            path,
+            Some("admin-secret"),
+            Some(body),
+        ));
+        let early_result = tokio::time::timeout(Duration::from_millis(100), request.as_mut()).await;
+        drop(guard);
+        assert!(
+            early_result.is_err(),
+            "{path} must serialize enrollment changes with renewal and multimedia writes"
+        );
+        let (status, _) = request.await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+    }
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_denied_admin_audit_keeps_route_and_query() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let app = super::build_server_apps(&state).public_app;
+    let cases = [
+        (
+            "HEAD",
+            "/api/v1/auth/maps/import",
+            "auth/maps/import/status",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/media/thumbnail",
+            "auth/media/thumbnail/get",
+        ),
+        (
+            "POST",
+            "/api/v1/auth/media/cache/retry",
+            "auth/media/cache/retry",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/store/map/clusters",
+            "auth/store/map/clusters/get",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/gallery/map/clusters",
+            "auth/store/map/clusters/get",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/store/map/cluster-entries",
+            "auth/store/map/cluster-entries/get",
+        ),
+        (
+            "GET",
+            "/api/v1/auth/gallery/map/cluster-entries",
+            "auth/store/map/cluster-entries/get",
+        ),
+        ("GET", "/api/v1/auth/maps/config", "auth/maps/config/get"),
+        ("PUT", "/api/v1/auth/maps/config", "auth/maps/config/put"),
+        ("GET", "/api/v1/auth/maps/import", "auth/maps/import/status"),
+        ("POST", "/api/v1/auth/maps/import", "auth/maps/import/run"),
+        (
+            "GET",
+            "/api/v1/auth/maps/import/natural-earth",
+            "auth/maps/import/natural-earth/status",
+        ),
+        (
+            "POST",
+            "/api/v1/auth/maps/import/natural-earth",
+            "auth/maps/import/natural-earth/run",
+        ),
+        (
+            "POST",
+            "/api/v1/auth/operations/multimedia.geolocation.propose/runs",
+            "auth/operations/run",
+        ),
+    ];
+    for enabled in [true, false] {
+        state.multimedia.set_enabled(enabled);
+        for (method, path, _) in cases {
+            let uri = if path.ends_with("/thumbnail") {
+                format!("{path}?key=photos%2Fcat.png&snapshot=snapshot-id")
+            } else {
+                path.to_string()
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}, enabled={enabled}"
+            );
+        }
+    }
+    let root = read_store(&state, "tests.multimedia.denied_audit_path")
+        .await
+        .root_dir()
+        .to_path_buf();
+    let db = rusqlite::Connection::open(root.join("state/metadata.sqlite")).unwrap();
+    let mut statement = db
+        .prepare("SELECT event_json FROM admin_audit_events")
+        .unwrap();
+    let rows: Vec<Vec<u8>> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        cases.len() * 2,
+        "one denial audit is required for each request"
+    );
+    for bytes in rows {
+        let event: super::AdminAuditEvent = serde_json::from_slice(&bytes).unwrap();
+        assert!(!event.authorized);
+        assert_eq!(event.outcome, "denied_auth");
+        let details: serde_json::Value = serde_json::from_str(&event.details_json).unwrap();
+        let (_, path, expected_action) = cases
+            .iter()
+            .find(|(method, path, _)| details["method"] == *method && details["path"] == *path)
+            .unwrap();
+        assert_eq!(event.action, *expected_action, "{path}");
+        if path.ends_with("/thumbnail") {
+            assert_eq!(details["query"]["key"], "photos/cat.png");
+            assert_eq!(details["query"]["snapshot"], "snapshot-id");
+        }
+    }
+    drop(statement);
+    drop(db);
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_successful_read_records_admin_audit() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-berrykeep-admin-token", "admin-secret".parse().unwrap());
+    headers.insert("x-berrykeep-admin-actor", "audit-reader".parse().unwrap());
+    let response = super::node_multimedia::get_config(State(state.clone()), headers).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let root = read_store(&state, "tests.multimedia.audit_path")
+        .await
+        .root_dir()
+        .to_path_buf();
+    let event: super::AdminAuditEvent = {
+        let db = rusqlite::Connection::open(root.join("state/metadata.sqlite")).unwrap();
+        let mut statement = db
+            .prepare("SELECT event_json FROM admin_audit_events")
+            .unwrap();
+        let rows: Vec<Vec<u8>> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a successful settings read must leave an audit event"
+        );
+        serde_json::from_slice(&rows[0]).unwrap()
+    };
+    assert_eq!(event.action, "auth/node-multimedia/get");
+    assert_eq!(event.actor.as_deref(), Some("audit-reader"));
+    assert!(event.authorized);
+    assert_eq!(event.outcome, "success");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&event.details_json).unwrap()["enabled"],
+        true
+    );
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_retry_maps_disable_after_admission_to_application_refusal() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    let key = "gallery/admitted-retry.png";
+    let put = lock_store(&state, "tests.multimedia.retry_source")
+        .await
+        .put_object_versioned(key, Bytes::from(sample_png_bytes()), PutOptions::default())
+        .await
+        .unwrap();
+    let worker = read_store(&state, "tests.multimedia.retry_worker")
+        .await
+        .media_cache_worker();
+    let metadata = worker
+        .ensure_media_cache(&put.manifest_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let thumbnail = metadata.thumbnail.as_ref().unwrap();
+    let path = read_store(&state, "tests.multimedia.retry_thumbnail_path")
+        .await
+        .media_thumbnail_path(&metadata.content_fingerprint, &thumbnail.profile);
+    let original_payload = tokio::fs::read(&path).await.unwrap();
+    let original_metadata = serde_json::to_value(&metadata).unwrap();
+    for disabled_at_start in [false, true] {
+        state.multimedia.set_enabled(!disabled_at_start);
+        let store_guard = if disabled_at_start {
+            None
+        } else {
+            Some(lock_store(&state, "tests.multimedia.retry_waiting_store").await)
+        };
+        // The handler is already past route admission. Also exercise a toggle
+        // after its entry check while it waits to resolve the object's manifest.
+        let mut retry = Box::pin(super::retry_media_cache_response(
+            &state,
+            super::MediaThumbnailQuery {
+                key: key.to_string(),
+                snapshot: None,
+                version: None,
+                read_mode: None,
+                profile: None,
+            },
+            super::PUBLIC_API_V1_MEDIA_THUMBNAIL_ROUTE,
+        ));
+        if !disabled_at_start {
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            state.multimedia.set_enabled(false);
+        }
+        drop(store_guard);
+        let response = retry.await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            payload["code"],
+            super::node_multimedia::MULTIMEDIA_DISABLED_CODE
+        );
+        let remaining = read_store(&state, "tests.multimedia.retry_retained_cache")
+            .await
+            .lookup_media_cache(&put.manifest_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata;
+        assert_eq!(
+            serde_json::to_value(remaining).unwrap(),
+            original_metadata,
+            "a disabled retry must preserve the existing derivative metadata"
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            original_payload,
+            "a disabled retry must preserve the existing thumbnail file"
+        );
+    }
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_disabled_does_not_break_client_storage_route() {
+    let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.multimedia.set_enabled(false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let app = super::build_server_apps(&state).public_app;
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = client_sdk::BerryKeepClient::from_direct_base_url(address);
+    for _ in 0..4 {
+        let response = client
+            .get_relative_path("/media/thumbnail?key=photos/cat.png")
+            .await
+            .expect("a disabled convenience endpoint must return an application response");
+        assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+    }
+    let diagnostics = client.connection_diagnostics();
+    assert_eq!(diagnostics.endpoints[0].consecutive_failures, 0);
+    assert_eq!(diagnostics.endpoints[0].total_failures, 0);
+    assert_eq!(
+        client
+            .get_relative_path("/store/index")
+            .await
+            .unwrap()
+            .status,
+        StatusCode::OK
+    );
+    server.abort();
+    let _ = server.await;
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn node_multimedia_setting_disables_convenience_but_keeps_storage_available() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some("admin-secret".to_string());
+    let app = super::build_server_apps(&state).public_app;
+    let retained_worker = state
+        .store
+        .read("tests.multimedia.worker")
+        .await
+        .media_cache_worker();
+    for method in [Method::GET, Method::PUT] {
+        let (status, _) = execute_admin_control_request(
+            &app,
+            method,
+            "/api/v1/auth/node-multimedia",
+            None,
+            Some(serde_json::json!({ "enabled": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    assert!(state.multimedia.enabled());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/auth/node-multimedia")
+                .header("x-berrykeep-admin-token", "admin-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"enabled":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let view: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(view["enabled"], false);
+    assert_eq!(view["persisted"], false);
+    assert!(
+        retained_worker
+            .ensure_media_metadata("unused")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("disabled")
+    );
+    assert!(
+        retained_worker
+            .ensure_image_thumbnail_profile_payload("unused", super::grid_thumbnail_profile())
+            .await
+            .is_err()
+    );
+    let descriptor = state
+        .cluster
+        .lock()
+        .await
+        .list_nodes()
+        .into_iter()
+        .find(|node| node.node_id == state.node_id)
+        .unwrap();
+    let presence = super::build_rendezvous_presence_registration(&state, Some(&descriptor));
+    assert_eq!(
+        presence
+            .labels
+            .get(super::node_multimedia::MULTIMEDIA_ENABLED_LABEL)
+            .map(String::as_str),
+        Some("false")
+    );
+
+    for path in [
+        "/api/v1/media/thumbnail?key=photos/cat.png",
+        "/api/v1/maps/config",
+        "/api/v1/maps/vector-tiles/0/0/0",
+        "/api/maps/tiles/0/0/0",
+        "/api/v1/gallery/map/clusters",
+        "/api/v1/auth/store/map/cluster-entries",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("x-berrykeep-admin-token", "admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-store",
+            "{path}"
+        );
+    }
+
+    // Both the thumbnail fast path and fallback routers honor the switch.
+    let internal_scope =
+        super::transport_service::TransportExecutionScope::Internal(super::InternalCaller {
+            node_id: state.node_id,
+            cluster_id: state.cluster_id,
+        });
+    for scope in [
+        super::transport_service::TransportExecutionScope::Public,
+        internal_scope,
+    ] {
+        for path in [
+            "/media/thumbnail?key=photos/cat.png",
+            "/gallery/map/clusters",
+            "/store/map/cluster-entries",
+        ] {
+            let request = transport_sdk::BufferedTransportRequest::new(
+                transport_sdk::TransportStreamKind::Rpc,
+                "GET",
+                path,
+                Vec::new(),
+                Vec::new(),
+            );
+            let response = super::transport_service::execute_buffered_transport_request(
+                &state, &scope, &request,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status, 501, "{path}");
+        }
+    }
+    let peer_response = super::build_server_apps(&state)
+        .internal_app
+        .oneshot(
+            Request::builder()
+                .uri("/cluster/media/artifact?manifest_hash=unused")
+                .extension(super::InternalCaller {
+                    node_id: state.node_id,
+                    cluster_id: state.cluster_id,
+                })
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(peer_response.status(), StatusCode::NOT_IMPLEMENTED);
+
+    // A media file remains ordinary stored content, including keys that resemble API routes.
+    for key in ["photos/cat.png", "maps/config", "map/clusters"] {
+        let encoded_key =
+            percent_encoding::utf8_percent_encode(key, percent_encoding::NON_ALPHANUMERIC);
+        let path = format!("/api/v1/store/{encoded_key}");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(&path)
+                    .body(Body::from(sample_png_bytes()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{path}: {}",
+            response.status()
+        );
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            sample_png_bytes()
+        );
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/store/index")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (status, _) = execute_admin_control_request(
+        &super::build_server_apps(&state).public_app,
+        Method::PUT,
+        "/api/v1/auth/node-multimedia",
+        Some("admin-secret"),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(state.multimedia.enabled());
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
 async fn local_node_connection_priority_updates_presence_labels() {
     let state = build_test_state(1, false, MainTestBackend::Sqlite).await;
 
@@ -27599,11 +28755,11 @@ async fn local_node_connection_priority_updates_presence_labels() {
     cleanup_test_state(&state).await;
 }
 
-pub(super) async fn build_natural_earth_test_state() -> ServerState {
+pub(super) async fn build_map_import_test_state() -> ServerState {
     build_test_state(1, false, MainTestBackend::Sqlite).await
 }
 
-pub(super) async fn cleanup_natural_earth_test_state(state: &ServerState) {
+pub(super) async fn cleanup_map_import_test_state(state: &ServerState) {
     cleanup_test_state(state).await;
 }
 

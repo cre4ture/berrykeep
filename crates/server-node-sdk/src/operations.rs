@@ -1036,7 +1036,7 @@ pub(super) async fn start_operation_run(
     let authorization = match authorize_admin_request(
         &state,
         &headers,
-        "auth/operations/run",
+        crate::node_multimedia::AdminMultimediaAction::OperationRun.as_str(),
         false,
         approval_granted,
         json!({
@@ -1050,6 +1050,10 @@ pub(super) async fn start_operation_run(
         Ok(authorization) => authorization,
         Err(status) => return status.into_response(),
     };
+
+    if !state.multimedia.enabled() {
+        return crate::node_multimedia::unavailable_response();
+    }
 
     let (input, priority, task) = match operation_id.as_str() {
         GEOLOCATION_PROPOSE_OPERATION_ID => match validated_geo_proposal_input(&request) {
@@ -2420,6 +2424,7 @@ async fn release_multimedia_slot_activity(
 /// multimedia batch boundary. Timeout is a terminal run failure because the
 /// serialized slot has no user-visible cancellation mechanism in V1.
 async fn wait_for_multimedia_turn(state: &ServerState, run: &mut OperationRun) -> Result<()> {
+    state.multimedia.ensure_enabled()?;
     if timeout(
         Duration::from_secs(MULTIMEDIA_OPERATION_PRIORITY_WAIT_SECONDS),
         wait_for_higher_priority_work(state),
@@ -2432,7 +2437,7 @@ async fn wait_for_multimedia_turn(state: &ServerState, run: &mut OperationRun) -
             "higher-priority repair or scrub work did not become idle within {MULTIMEDIA_OPERATION_PRIORITY_WAIT_SECONDS} seconds"
         );
     }
-    Ok(())
+    state.multimedia.ensure_enabled()
 }
 
 async fn wait_for_higher_priority_work(state: &ServerState) {

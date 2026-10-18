@@ -649,6 +649,10 @@ fn build_public_transport_router(state: ServerState) -> Router {
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            crate::node_multimedia::require_multimedia,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             require_client_auth,
         ));
 
@@ -839,6 +843,10 @@ fn build_internal_transport_router(state: ServerState) -> Router {
         .route("/versions/{key}/commit/{version_id}", post(commit_version))
         .merge(build_internal_peer_api())
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::node_multimedia::require_multimedia,
+        ))
         .layer(middleware::from_fn_with_state(
             state,
             require_internal_caller,

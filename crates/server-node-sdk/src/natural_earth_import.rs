@@ -182,7 +182,7 @@ pub(crate) async fn admin_status(State(state): State<ServerState>, headers: Head
     if let Err(status) = authorize_admin_request(
         &state,
         &headers,
-        "auth/maps/import/natural-earth/status",
+        crate::node_multimedia::AdminMultimediaAction::NaturalEarthStatus.as_str(),
         true,
         true,
         json!({}),
@@ -207,7 +207,7 @@ pub(crate) async fn start_admin_import(
     headers: HeaderMap,
     request: Option<Json<StartNaturalEarthImportRequest>>,
 ) -> Response {
-    let action = "auth/maps/import/natural-earth/run";
+    let action = crate::node_multimedia::AdminMultimediaAction::NaturalEarthRun.as_str();
     let profile = request
         .map(|Json(request)| request.profile)
         .unwrap_or_default();
@@ -2140,7 +2140,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_worker_lifecycle_covers_every_profile_and_serializes_jobs() {
-        let state = crate::tests::build_natural_earth_test_state().await;
+        let state = crate::tests::build_map_import_test_state().await;
         let profile_expectations = [
             (
                 NaturalEarthImportProfile::Physical,
@@ -2261,12 +2261,12 @@ mod tests {
             NaturalEarthImportState::Ready
         ));
 
-        crate::tests::cleanup_natural_earth_test_state(&state).await;
+        crate::tests::cleanup_map_import_test_state(&state).await;
     }
 
     #[tokio::test]
     async fn generated_raster_artifact_is_validated_published_and_accounted() {
-        let state = crate::tests::build_natural_earth_test_state().await;
+        let state = crate::tests::build_map_import_test_state().await;
         let artifact = test_artifact(
             "natural-earth-globe",
             map_config::MapVariantAssetKind::Raster,
@@ -2475,12 +2475,12 @@ mod tests {
             "part size must be greater than zero",
         );
 
-        crate::tests::cleanup_natural_earth_test_state(&state).await;
+        crate::tests::cleanup_map_import_test_state(&state).await;
     }
 
     #[tokio::test]
     async fn mbtiles_validation_reports_raster_and_vector_contract_failures() {
-        let state = crate::tests::build_natural_earth_test_state().await;
+        let state = crate::tests::build_map_import_test_state().await;
         let fixture_root = state.managed_paths.data_dir().join("mbtiles-validation");
         fs::create_dir_all(&fixture_root)
             .await
@@ -2611,7 +2611,7 @@ mod tests {
         .await
         .expect("a complete Natural Earth vector map should pass validation");
 
-        crate::tests::cleanup_natural_earth_test_state(&state).await;
+        crate::tests::cleanup_map_import_test_state(&state).await;
     }
 
     #[test]

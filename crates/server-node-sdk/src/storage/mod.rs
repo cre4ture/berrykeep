@@ -2771,6 +2771,7 @@ pub struct PersistentStore {
     media_thumbnails_dir: PathBuf,
     media_cache_build_permits: Arc<Semaphore>,
     media_cache_build_config: MediaCacheBuildConfig,
+    multimedia: crate::node_multimedia::MultimediaControl,
     current_objects_cache: std::sync::Mutex<RangeChunkCache<String, CurrentObjectEntry>>,
     gc_manifest_load_batch_size: usize,
     snapshot_batch: Option<ActiveSnapshotBatch>,
@@ -4509,6 +4510,7 @@ impl PersistentStore {
             media_thumbnails_dir,
             media_cache_build_permits,
             media_cache_build_config,
+            multimedia: crate::node_multimedia::MultimediaControl::default(),
             current_objects_cache,
             gc_manifest_load_batch_size: GC_MANIFEST_LOAD_BATCH_SIZE,
             snapshot_batch,
@@ -5121,7 +5123,12 @@ impl PersistentStore {
             self.media_cache_build_config.clone(),
             self.metadata_store.clone(),
             self.media_tools.clone(),
+            self.multimedia.clone(),
         )
+    }
+
+    pub(crate) fn multimedia_control(&self) -> crate::node_multimedia::MultimediaControl {
+        self.multimedia.clone()
     }
 
     pub(crate) fn host_dependency_report(&self) -> HostDependencyReport {

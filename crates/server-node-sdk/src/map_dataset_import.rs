@@ -258,7 +258,7 @@ pub(crate) async fn admin_status(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let action = "auth/maps/import/status";
+    let action = crate::node_multimedia::AdminMultimediaAction::MapImportStatus.as_str();
     if let Err(status) =
         authorize_admin_request(&state, &headers, action, true, true, json!({})).await
     {
@@ -277,7 +277,7 @@ pub(crate) async fn start_admin_import(
     headers: HeaderMap,
     Json(request): Json<StartAdminMapDatasetImportRequest>,
 ) -> impl IntoResponse {
-    let action = "auth/maps/import/run";
+    let action = crate::node_multimedia::AdminMultimediaAction::MapImportRun.as_str();
     let authz = match authorize_admin_request(
         &state,
         &headers,
@@ -455,7 +455,7 @@ async fn start_import_job(
 async fn spawn_worker_if_needed(state: &ServerState) {
     let should_spawn = {
         let mut runtime = state.storage.map_dataset_import.lock().await;
-        if runtime.worker_running {
+        if !state.multimedia.enabled() || runtime.worker_running {
             false
         } else if matches!(
             runtime.job.as_ref().map(|job| job.state),
@@ -490,6 +490,7 @@ async fn run_worker(state: ServerState) {
     };
 
     loop {
+        state.multimedia.wait_until_enabled().await;
         let job = {
             let runtime = state.storage.map_dataset_import.lock().await;
             match runtime.job.clone() {
@@ -1250,9 +1251,8 @@ mod tests {
         assert!(probe_dataset_filename(&signed_download, None).is_err());
     }
 
-    #[test]
-    fn manifest_builder_uses_variable_part_size() {
-        let job = MapDatasetImportJob {
+    fn test_import_job() -> MapDatasetImportJob {
+        MapDatasetImportJob {
             job_id: "job".to_string(),
             state: AdminMapDatasetImportState::Running,
             source_url: "https://example.invalid/file.mbtiles".to_string(),
@@ -1276,7 +1276,154 @@ mod tests {
             started_at_unix: 1,
             updated_at_unix: 1,
             finished_at_unix: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn multimedia_map_import_pauses_between_parts_and_resumes_without_duplicates() {
+        use tower::ServiceExt;
+        let mut state = crate::tests::build_map_import_test_state().await;
+        state.access.admin_control.admin_token = Some("admin-secret".to_string());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let source_requests = requests.clone();
+        let source_control = state.multimedia.clone();
+        let app = axum::Router::new().route(
+            "/file.mbtiles",
+            axum::routing::get(move |headers: HeaderMap| {
+                let requests = source_requests.clone();
+                let control = source_control.clone();
+                async move {
+                    let range = headers
+                        .get(reqwest::header::RANGE)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    let first = {
+                        let mut requests = requests.lock().unwrap();
+                        requests.push(range.clone());
+                        requests.len() == 1
+                    };
+                    // The first part was already admitted before this setting change.
+                    if first {
+                        control.set_enabled(false);
+                    }
+                    let (start, end) = range
+                        .strip_prefix("bytes=")
+                        .unwrap()
+                        .split_once('-')
+                        .unwrap();
+                    let size = end.parse::<usize>().unwrap() - start.parse::<usize>().unwrap() + 1;
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        [(
+                            reqwest::header::CONTENT_RANGE,
+                            format!("bytes {start}-{end}/32"),
+                        )],
+                        Bytes::from(vec![42; size]),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_url = format!("http://{}/file.mbtiles", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut job = test_import_job();
+        job.source_url = source_url;
+        job.total_size_bytes = 32;
+        job.part_size_bytes = 16;
+        job.total_parts = 2;
+        state.storage.map_dataset_import.lock().await.job = Some(job.clone());
+        spawn_worker_if_needed(&state).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .storage
+                    .map_dataset_import
+                    .lock()
+                    .await
+                    .job
+                    .as_ref()
+                    .unwrap()
+                    .completed_parts
+                    >= 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let runtime = state.storage.map_dataset_import.lock().await;
+            assert!(runtime.worker_running);
+            let job = runtime.job.as_ref().unwrap();
+            assert_eq!(job.state, AdminMapDatasetImportState::Running);
+            assert_eq!(
+                job.completed_parts, 1,
+                "disable must pause before the next part"
+            );
+            assert_eq!(job.completed_bytes, 16);
+        }
+        assert_eq!(*requests.lock().unwrap(), ["bytes=0-15"]);
+        let app = crate::build_server_apps(&state).public_app;
+        for path in [
+            "/api/v1/auth/maps/import",
+            "/api/v1/auth/maps/import/natural-earth",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .header("x-berrykeep-admin-token", "admin-secret")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "status must remain observable while disabled: {path}"
+            );
+        }
+        state.multimedia.set_enabled(true);
+        spawn_resume_if_needed(state.clone()).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let runtime = state.storage.map_dataset_import.lock().await;
+                if !runtime.worker_running
+                    && runtime.job.as_ref().unwrap().state == AdminMapDatasetImportState::Completed
+                {
+                    break;
+                }
+                drop(runtime);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("re-enable must wake the existing worker and finish the import");
+        assert_eq!(*requests.lock().unwrap(), ["bytes=0-15", "bytes=16-31"]);
+        state.multimedia.set_enabled(false);
+        state.storage.map_dataset_import.lock().await.job = Some(job);
+        spawn_resume_if_needed(state.clone()).await;
+        assert!(
+            !state.storage.map_dataset_import.lock().await.worker_running,
+            "resume must not create a worker while multimedia is disabled"
+        );
+        server.abort();
+        let _ = server.await;
+        crate::tests::cleanup_map_import_test_state(&state).await;
+    }
+
+    #[test]
+    fn manifest_builder_uses_variable_part_size() {
+        let job = test_import_job();
 
         let payload = build_split_manifest_bytes(&job).expect("manifest should build");
         let json: serde_json::Value =

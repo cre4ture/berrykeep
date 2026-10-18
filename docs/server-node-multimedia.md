@@ -1,0 +1,131 @@
+# Optional multimedia on server nodes
+
+Each server node has an independent **Hardware → Multimedia functionality** setting.
+Disable it on constrained hosts to dedicate their resources to object storage,
+replication, automatic repair, and scrubbing. The default is enabled, preserving
+the behavior of existing nodes.
+
+Connection priority and multimedia eligibility solve different problems. Priority
+is a soft client routing preference; even a low-priority node may receive requests.
+Disabling multimedia is enforced by the server. A client priority override cannot
+enable it again.
+
+## Configuration
+
+The authenticated node-local admin API uses the same configuration pattern as
+connection priority:
+
+```text
+GET /api/v1/auth/node-multimedia
+PUT /api/v1/auth/node-multimedia
+Content-Type: application/json
+
+{"enabled": false}
+```
+
+An enrollment-based node writes the setting to its enrollment package. Other
+nodes report `persistence_source: "runtime_only"`; configure their startup source
+to retain the setting after a restart:
+
+- Environment-based startup: `BERRYKEEP_NODE_MULTIMEDIA_ENABLED=false`.
+- Bootstrap or enrollment JSON: set `bootstrap.labels.multimedia_enabled` to
+  the string `"false"` (or `labels.multimedia_enabled` in a standalone bootstrap).
+
+Environment values accept case-insensitive `true/false`, `1/0`, `yes/no`, or
+`on/off`; an empty value is treated as unset. Bootstrap labels use the canonical
+strings `true` and `false`. A missing label means enabled. The label is
+advertised with the node descriptor and Rendezvous presence, independently of
+`client_connection_priority`.
+
+## Disabled behavior
+
+- No startup media metadata backfill or media warmup after uploads.
+- Media workers reject new metadata extraction and thumbnail generation, even
+  when a caller retained a worker before the setting changed.
+- Thumbnail, gallery map, map serving/configuration/import, and multimedia
+  operation start endpoints return HTTP 501 with code `node_multimedia_disabled`.
+  This applies to versioned and legacy HTTP endpoints and multiplexed transports.
+  Existing client/admin authentication runs before the capability response.
+  Disabled responses use `Cache-Control: no-store`, so re-enabling takes effect
+  without cached refusals.
+- Authenticated map-import status reads, cache clearing, and operation history
+  remain available. Clearing the cache does
+  not restart multimedia backfill while multimedia is disabled.
+- Original media and map datasets remain ordinary replicated objects. File
+  upload/download, directory browsing, replication, repair, and scrubbing continue.
+  Directory listings may still expose metadata already cached on disk.
+
+The response is an application-level refusal: it does not open the client's route
+circuit breaker or mark the storage host unreachable. Use connection priority to
+prefer multimedia-enabled hosts, or connect to an enabled node directly. This
+release does not add capability-based client routing or automatic multimedia
+failover; client priority overrides remain routing preferences.
+
+When an enabled node has only metadata and a known storage-only source holds the original,
+it first tries other enabled peers for an existing derivative. If none is available,
+an explicit thumbnail or cache-retry request can use the existing chunk-recovery
+path to cache the original chunks in its storage pool and derive locally.
+Background startup, re-enable, and cache-clear backfill never recover full source
+content; they derive from local content or import existing peer artifacts.
+Storage-only peers serve
+ordinary chunks without decoding media. The capable node therefore needs storage
+capacity for recovered source content as well as derivative caches. At most two
+foreground source recoveries run per node, including their local derivation step.
+Admission is nonblocking: busy requests remain incomplete and may retry later;
+they do not consume the source-recovery cooldown. Busy refusals are not cached.
+Each admitted transfer retains the existing deadline of at most two minutes and
+at most four concurrent chunk fetches. Large originals can still be recovered whole; this is not a file-size cap.
+Existing incomplete-artifact retry backoff still applies. The storage-only fallback
+uses a separate, bounded, per-manifest runtime admission table with a ten-minute backoff,
+so a background metadata miss does not delay the first user-requested recovery.
+Source cooldown is reserved only when a recovery/derivation attempt is admitted. Importing an existing artifact
+or finding no storage-only holder leaves recovery available. During metadata backoff,
+foreground requests can recheck known holders without probing unrelated nodes.
+Early holder discovery and rechecks have an independent thirty-second per-manifest
+throttle, applied before taking the cluster lock or cloning peer descriptors.
+Normal artifact retries do not consume this early-recheck allowance. With available
+admission capacity, a capability change may take up to thirty seconds to discover
+during metadata backoff.
+Early rechecks require an advertised storage-only holder or a recent disabled-source
+response. Ordinary deployments with all hosts enabled retain their existing artifact
+backoff without extra peer requests. Active retry deadlines are never evicted: the
+admission table holds at most 1,024 manifests and defers new source recovery and early
+discovery until an entry expires when full. An entry expires only after both its source
+and holder deadlines have elapsed. This keeps large-gallery browsing from resetting
+backoff through cache churn. Capability observations use a separate 1,024-entry LRU
+cache and expire after ten minutes; they cannot displace retry deadlines.
+Unrelated storage-only nodes do not trigger recovery for other nodes' media.
+
+Changes affect new work immediately. An admitted decoder or Natural Earth import
+may finish. Map dataset imports pause between parts: the current part may finish,
+then the worker waits without downloading the next part or losing completed progress.
+Authenticated `GET /auth/maps/import` and `GET /auth/maps/import/natural-earth`
+status reads remain available while disabled. Backfill and operation batches stop
+at their next eligibility check. Re-enabling starts metadata backfill and wakes a
+paused map import or resumes one loaded from disk, without creating duplicate workers.
+
+## Memory isolation
+
+Disabling multimedia removes its decode and map-serving memory demand from a weak
+node. It does not bound memory used by storage, concurrent transfers, or other
+processes on the host, and cannot guarantee that the operating system never kills
+the service.
+
+Image decoding currently runs inside the server process; video tools are child
+processes. Decoder limits and media build admission reduce peaks, but are not an
+operating-system memory boundary.
+
+A future isolation layer should move optional processing behind a bounded job
+interface into a separately supervised worker. On Linux the worker needs its own
+cgroup/service with a memory limit, CPU/concurrency limits, timeouts, and bounded
+IPC results. The storage service should retain ownership of the database and
+publish validated derivatives atomically. Worker failure must fail only the
+optional request, with bounded retries. Map queries/imports and media extraction
+both need coverage; moving only image codecs leaves other optional allocations
+inside storage.
+
+Merely spawning another process in the same service does not provide this
+boundary. A cgroup memory limit contains cgroup-local OOM kills, while host-wide
+memory exhaustion can still affect other services. See the
+[Linux cgroup v2 memory controller documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory).
+Worker process isolation is not implemented by this setting.
