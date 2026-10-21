@@ -14,6 +14,7 @@ import {
   type ManagedRendezvousFailoverPackage,
   type RendezvousContactConfigurationResponse,
   type RendezvousConfigView,
+  type RendezvousServiceConfig,
   updateDirectEndpointsConfig,
   updateRendezvousContactConfiguration,
   updateRendezvousConfig
@@ -34,6 +35,7 @@ import {
   Textarea
 } from "@mantine/core";
 import { useEffect, useRef, useState } from "react";
+import { RendezvousServiceEditor, servicesFromUrls } from "../components/RendezvousServiceEditor";
 import { RendezvousRegistrationStateSection } from "../components/RendezvousRegistrationStateSection";
 import { useAdminAccess } from "../lib/admin-access";
 
@@ -45,12 +47,12 @@ export function ControlPlanePage() {
   const directEndpointsDirtyRef = useRef(false);
   const [directEndpointsConfigLoading, setDirectEndpointsConfigLoading] = useState(true);
   const [rendezvousConfig, setRendezvousConfig] = useState<RendezvousConfigView | null>(null);
-  const [editableRendezvousUrlsText, setEditableRendezvousUrlsText] = useState("");
+  const [editableRendezvousServices, setEditableRendezvousServices] = useState<RendezvousServiceConfig[]>([]);
   const rendezvousUrlsDirtyRef = useRef(false);
   const [rendezvousConfigLoading, setRendezvousConfigLoading] = useState(true);
   const [rendezvousContactConfiguration, setRendezvousContactConfiguration] =
     useState<RendezvousContactConfigurationResponse | null>(null);
-  const [rendezvousContactUrlsText, setRendezvousContactUrlsText] = useState("");
+  const [rendezvousContactServices, setRendezvousContactServices] = useState<RendezvousServiceConfig[]>([]);
   const rendezvousContactUrlsDirtyRef = useRef(false);
   const [rendezvousContactConfigurationLoading, setRendezvousContactConfigurationLoading] = useState(true);
   const [rendezvousPassphrase, setRendezvousPassphrase] = useState("");
@@ -108,11 +110,11 @@ export function ControlPlanePage() {
         }
         setRendezvousConfig(rendezvousPayload);
         if (!rendezvousUrlsDirtyRef.current) {
-          setEditableRendezvousUrlsText(rendezvousPayload.editable_urls.join("\n"));
+          setEditableRendezvousServices(servicesFromUrls(rendezvousPayload.editable_urls, rendezvousPayload.editable_services));
         }
         setRendezvousContactConfiguration(rendezvousContactsPayload);
         if (!rendezvousContactUrlsDirtyRef.current) {
-          setRendezvousContactUrlsText(rendezvousContactsPayload.configuration.rendezvous_urls.join("\n"));
+          setRendezvousContactServices(servicesFromUrls(rendezvousContactsPayload.configuration.rendezvous_urls, rendezvousContactsPayload.configuration.rendezvous_services));
         }
       } catch (actionError) {
         if (cancelled) {
@@ -167,13 +169,11 @@ export function ControlPlanePage() {
     setPendingAction("rendezvous-config-save");
     setError(null);
     try {
-      const editable_urls = editableRendezvousUrlsText
-        .split(/\r?\n/)
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0);
-      const payload = await updateRendezvousConfig({ editable_urls }, adminTokenOverride);
+      const editable_services = editableRendezvousServices.map((service) => ({ ...service, url: service.url.trim() }));
+      const editable_urls = editable_services.map((service) => service.url);
+      const payload = await updateRendezvousConfig({ editable_urls, editable_services }, adminTokenOverride);
       setRendezvousConfig(payload);
-      setEditableRendezvousUrlsText(payload.editable_urls.join("\n"));
+      setEditableRendezvousServices(servicesFromUrls(payload.editable_urls, payload.editable_services));
       rendezvousUrlsDirtyRef.current = false;
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError));
@@ -186,19 +186,18 @@ export function ControlPlanePage() {
     setPendingAction("rendezvous-contacts-save");
     setError(null);
     try {
-      const rendezvous_urls = rendezvousContactUrlsText
-        .split(/\r?\n/)
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0);
+      const rendezvous_services = rendezvousContactServices.map((service) => ({ ...service, url: service.url.trim() }));
+      const rendezvous_urls = rendezvous_services.map((service) => service.url);
       const payload = await updateRendezvousContactConfiguration(
         {
           schema_version: rendezvousContactConfiguration?.configuration.schema_version ?? 1,
-          rendezvous_urls
+          rendezvous_urls,
+          rendezvous_services
         },
         adminTokenOverride
       );
       setRendezvousContactConfiguration(payload);
-      setRendezvousContactUrlsText(payload.configuration.rendezvous_urls.join("\n"));
+      setRendezvousContactServices(servicesFromUrls(payload.configuration.rendezvous_urls, payload.configuration.rendezvous_services));
       rendezvousContactUrlsDirtyRef.current = false;
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError));
@@ -426,20 +425,18 @@ export function ControlPlanePage() {
             <Grid.Col span={{ base: 12, xl: 6 }}>
               <Stack gap="sm">
                 <Text fw={600}>Editable operator-managed URLs</Text>
-                <Textarea
-                  label="Editable operator-managed URLs"
-                  minRows={10}
-                  autosize
-                  value={editableRendezvousUrlsText}
-                  onChange={(event) => {
+                <RendezvousServiceEditor
+                  services={editableRendezvousServices}
+                  label="Operator-managed rendezvous"
+                  addLabel="Add rendezvous service"
+                  onChange={(services) => {
                     rendezvousUrlsDirtyRef.current = true;
-                    setEditableRendezvousUrlsText(event.currentTarget.value);
+                    setEditableRendezvousServices(services);
                   }}
-                  placeholder={"https://rendezvous-a.example:9443\nhttps://rendezvous-b.example:9443"}
                 />
                 <Text size="sm" c="dimmed">
-                  One URL per line. These are merged with the embedded managed rendezvous URL when that role is active
-                  on this node.
+                  Enable global registration only for services that host independent clusters.
+                  Your embedded rendezvous service stays cluster-specific.
                 </Text>
                 <Group>
                   <Button
@@ -490,19 +487,17 @@ export function ControlPlanePage() {
             <Grid.Col span={{ base: 12, xl: 6 }}>
               <Stack gap="sm">
                 <Text fw={600}>Client contact URLs</Text>
-                <Textarea
-                  label="Rendezvous contact URLs"
-                  minRows={6}
-                  autosize
-                  value={rendezvousContactUrlsText}
-                  onChange={(event) => {
+                <RendezvousServiceEditor
+                  services={rendezvousContactServices}
+                  label="Cluster rendezvous contact"
+                  addLabel="Add cluster contact"
+                  onChange={(services) => {
                     rendezvousContactUrlsDirtyRef.current = true;
-                    setRendezvousContactUrlsText(event.currentTarget.value);
+                    setRendezvousContactServices(services);
                   }}
-                  placeholder={"https://relay.example:19080\nhttps://fallback.example:19080"}
                 />
                 <Text size="sm" c="dimmed">
-                  One URL per line. Keep at least one stable bootstrap or fallback rendezvous service configured outside
+                  Each contact’s global registration setting is replicated with its URL. Keep at least one stable bootstrap or fallback rendezvous service configured outside
                   this list so newly enrolled and offline clients can still reach the cluster.
                 </Text>
                 <Group>

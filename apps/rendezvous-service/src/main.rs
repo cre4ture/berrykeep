@@ -1620,6 +1620,7 @@ mod tests {
                 cert_path: tls_paths.1.display().to_string(),
                 key_path: tls_paths.2.display().to_string(),
             }),
+            rendezvous_services: Vec::new(),
             rendezvous_urls,
             rendezvous_mtls_required,
             direct_endpoints: Vec::new(),

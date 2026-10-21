@@ -50,6 +50,43 @@ These names are the Phase-2 contract. The service and node must not silently
 substitute alternate names or treat node opt-in as permission to bypass the
 global service gate.
 
+## Per-service registration policy
+
+The Server Admin Control Plane page stores a **Global rendezvous service**
+setting beside each operator-managed URL and each cluster contact. Enable it
+only for a service that accepts self-registration of independent clusters.
+The service-side registration gate must also be enabled.
+
+The node configuration API accepts `editable_services`, and the replicated
+contact configuration accepts `rendezvous_services`. Each entry contains:
+
+```json
+{
+  "url": "https://rendezvous.example.com/",
+  "global_registration_enabled": true
+}
+```
+
+Node-local entries are persisted in the node enrollment package. Cluster
+contacts carry their policy in the versioned contact object and replicate with
+it. A node-local entry takes precedence when the same URL is also a cluster
+contact. The embedded managed rendezvous always remains cluster-specific.
+
+The URL-only API fields remain available for existing clients and bootstraps.
+Old entries default to cluster-specific. For startup URLs without an explicit
+per-service policy, `BERRYKEEP_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED=true`
+retains its legacy meaning of enabling global registration. An explicit
+per-service setting overrides that default, including `false`; selecting a
+global service in the UI does not require setting this environment variable.
+
+Global services require HTTPS, rendezvous mTLS, and the service's trusted CA
+material. A node holding the cluster CA signing key performs the ownership
+proof before publishing presence. Other nodes use their existing cluster
+identities after enrollment. Registration changes apply live; failures are
+reported and retried per endpoint without blocking other services or node
+startup. Successful enrollment is reused until a connection failure requires
+another attempt.
+
 ## Registry and admission
 
 - [ ] Enforce exactly one active P-256 CA per `cluster_id`. The cluster SAN on

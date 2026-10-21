@@ -934,6 +934,7 @@ async fn start_new_cluster(
         internal_bind_addr: Some(internal_bind_addr.to_string()),
         internal_url: Some(internal_url.clone()),
         internal_tls: Some(managed_internal_tls_files()),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: vec![managed_rendezvous_public_url.clone()],
         rendezvous_mtls_required: true,
         direct_endpoints: vec![
@@ -2624,6 +2625,7 @@ mod tests {
             internal_ca_key_path: None,
             local_status_bind_addr: None,
             rendezvous_ca_cert_path: None,
+            rendezvous_services: Vec::new(),
             rendezvous_urls: vec![format!("http://{bind_addr}")],
             rendezvous_registration_enabled: false,
             global_rendezvous_registration_enabled: false,
@@ -2695,6 +2697,7 @@ mod tests {
                 cert_path: "managed/runtime/internal/node.pem".to_string(),
                 key_path: "managed/runtime/internal/node.key".to_string(),
             }),
+            rendezvous_services: Vec::new(),
             rendezvous_urls: vec![rendezvous_url.clone()],
             rendezvous_mtls_required: true,
             direct_endpoints: vec![
@@ -3110,6 +3113,7 @@ mod tests {
                 cert_path: "managed/runtime/internal/node.pem".to_string(),
                 key_path: "managed/runtime/internal/node.key".to_string(),
             }),
+            rendezvous_services: Vec::new(),
             rendezvous_urls: vec!["https://node-a.local:9443".to_string()],
             rendezvous_mtls_required: true,
             direct_endpoints: vec![
@@ -3370,6 +3374,7 @@ mod tests {
                 cert_path: "managed/runtime/internal/node.pem".to_string(),
                 key_path: "managed/runtime/internal/node.key".to_string(),
             }),
+            rendezvous_services: Vec::new(),
             rendezvous_urls: vec!["https://node-a.local:9443".to_string()],
             rendezvous_mtls_required: true,
             direct_endpoints: vec![
@@ -3454,6 +3459,7 @@ mod tests {
                 cert_path: "managed/runtime/internal/node.pem".to_string(),
                 key_path: "managed/runtime/internal/node.key".to_string(),
             }),
+            rendezvous_services: Vec::new(),
             rendezvous_urls: vec!["https://node-a.local:9443".to_string()],
             rendezvous_mtls_required: true,
             direct_endpoints: vec![

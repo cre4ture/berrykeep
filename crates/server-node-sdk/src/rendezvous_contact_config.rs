@@ -18,6 +18,8 @@ pub(crate) struct RendezvousContactConfiguration {
     pub(crate) schema_version: u32,
     #[serde(default)]
     pub(crate) rendezvous_urls: Vec<String>,
+    #[serde(default)]
+    pub(crate) rendezvous_services: Vec<transport_sdk::RendezvousServiceConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +45,7 @@ fn default_configuration() -> RendezvousContactConfiguration {
     RendezvousContactConfiguration {
         schema_version: RENDEZVOUS_CONTACT_CONFIGURATION_SCHEMA_VERSION,
         rendezvous_urls: Vec::new(),
+        rendezvous_services: Vec::new(),
     }
 }
 
@@ -269,11 +272,13 @@ async fn load_current_configuration(
     })
 }
 
-pub(crate) async fn load_current_rendezvous_urls(state: &ServerState) -> Result<Vec<String>> {
+pub(crate) async fn load_current_rendezvous_services(
+    state: &ServerState,
+) -> Result<Vec<transport_sdk::RendezvousServiceConfig>> {
     Ok(load_current_configuration(state)
         .await?
         .configuration
-        .rendezvous_urls)
+        .rendezvous_services)
 }
 
 fn normalize_configuration(
@@ -286,13 +291,22 @@ fn normalize_configuration(
             RENDEZVOUS_CONTACT_CONFIGURATION_SCHEMA_VERSION
         );
     }
-    if configuration.rendezvous_urls.len() > MAX_RENDEZVOUS_CONTACT_URLS {
+    configuration.rendezvous_services = transport_sdk::resolve_rendezvous_services(
+        &configuration.rendezvous_urls,
+        &configuration.rendezvous_services,
+        false,
+    )?;
+    if configuration.rendezvous_services.len() > MAX_RENDEZVOUS_CONTACT_URLS {
         bail!(
             "rendezvous contact configuration supports at most {MAX_RENDEZVOUS_CONTACT_URLS} URLs"
         );
     }
 
-    configuration.rendezvous_urls = normalize_rendezvous_url_list(&configuration.rendezvous_urls)?;
+    configuration.rendezvous_urls = configuration
+        .rendezvous_services
+        .iter()
+        .map(|service| service.url.clone())
+        .collect();
     Ok(configuration)
 }
 
@@ -304,6 +318,7 @@ mod tests {
     fn normalizes_duplicate_urls_without_reordering_contacts() {
         let configuration = normalize_configuration(RendezvousContactConfiguration {
             schema_version: RENDEZVOUS_CONTACT_CONFIGURATION_SCHEMA_VERSION,
+            rendezvous_services: Vec::new(),
             rendezvous_urls: vec![
                 "https://relay.example:19080".to_string(),
                 "https://relay.example:19080".to_string(),
@@ -325,6 +340,7 @@ mod tests {
     fn rejects_unknown_schema_version() {
         let err = normalize_configuration(RendezvousContactConfiguration {
             schema_version: RENDEZVOUS_CONTACT_CONFIGURATION_SCHEMA_VERSION + 1,
+            rendezvous_services: Vec::new(),
             rendezvous_urls: Vec::new(),
         })
         .expect_err("unknown schema version must be rejected");

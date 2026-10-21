@@ -172,6 +172,7 @@ mod natural_earth_import;
 mod operations;
 mod reliability_telemetry;
 mod rendezvous_contact_config;
+mod rendezvous_registration_policy;
 mod repair_execution_gate;
 mod replication;
 mod s3_frontend;
@@ -467,8 +468,9 @@ struct ServerNetworkRuntime {
     primary_public_direct_url: Option<String>,
     primary_peer_direct_url: Option<String>,
     advertised_direct_endpoints: Arc<StdMutex<Vec<BootstrapEndpoint>>>,
-    configured_rendezvous_urls: Arc<StdMutex<Vec<String>>>,
-    cluster_rendezvous_contact_urls: Arc<StdMutex<Vec<String>>>,
+    configured_rendezvous_services: Arc<StdMutex<Vec<transport_sdk::RendezvousServiceConfig>>>,
+    cluster_rendezvous_services: Arc<StdMutex<Vec<transport_sdk::RendezvousServiceConfig>>>,
+    globally_registered_rendezvous_urls: Arc<Mutex<HashSet<String>>>,
     rendezvous_urls: Arc<StdMutex<Vec<String>>>,
     rendezvous_registration_enabled: bool,
     rendezvous_mtls_required: bool,
@@ -3332,6 +3334,7 @@ pub struct ServerNodeConfig {
     pub internal_ca_key_path: Option<PathBuf>,
     pub local_status_bind_addr: Option<SocketAddr>,
     pub rendezvous_ca_cert_path: Option<PathBuf>,
+    pub rendezvous_services: Vec<transport_sdk::RendezvousServiceConfig>,
     pub rendezvous_urls: Vec<String>,
     pub rendezvous_registration_enabled: bool,
     pub global_rendezvous_registration_enabled: bool,
@@ -5138,21 +5141,19 @@ fn current_rendezvous_urls(state: &ServerState) -> Vec<String> {
 }
 
 fn current_configured_rendezvous_urls(state: &ServerState) -> Vec<String> {
-    state
-        .network
-        .configured_rendezvous_urls
-        .lock()
-        .expect("configured rendezvous URL mutex poisoned")
-        .clone()
+    rendezvous_registration_policy::service_urls(
+        &rendezvous_registration_policy::current_configured_services(state),
+    )
 }
 
 fn current_cluster_rendezvous_contact_urls(state: &ServerState) -> Vec<String> {
-    state
-        .network
-        .cluster_rendezvous_contact_urls
-        .lock()
-        .expect("cluster rendezvous contact URL mutex poisoned")
-        .clone()
+    rendezvous_registration_policy::service_urls(
+        &state
+            .network
+            .cluster_rendezvous_services
+            .lock()
+            .expect("rendezvous contacts mutex poisoned"),
+    )
 }
 
 fn combine_rendezvous_urls(
@@ -5171,15 +5172,19 @@ fn combine_rendezvous_urls(
     combined
 }
 
-fn replace_configured_rendezvous_urls(state: &ServerState, configured_urls: Vec<String>) -> bool {
+fn replace_configured_rendezvous_services(
+    state: &ServerState,
+    services: Vec<transport_sdk::RendezvousServiceConfig>,
+) -> bool {
+    let configured_urls = rendezvous_registration_policy::service_urls(&services);
     let cluster_contact_urls = current_cluster_rendezvous_contact_urls(state);
     let effective_urls = combine_rendezvous_urls(&configured_urls, &cluster_contact_urls);
 
     *state
         .network
-        .configured_rendezvous_urls
+        .configured_rendezvous_services
         .lock()
-        .expect("configured rendezvous URL mutex poisoned") = configured_urls;
+        .expect("configured rendezvous services mutex poisoned") = services;
 
     let mut current_urls = state
         .network
@@ -5194,21 +5199,21 @@ fn replace_configured_rendezvous_urls(state: &ServerState, configured_urls: Vec<
 }
 
 async fn synchronize_cluster_rendezvous_contact_urls(state: &ServerState) -> Result<bool> {
-    let cluster_contact_urls =
-        rendezvous_contact_config::load_current_rendezvous_urls(state).await?;
+    let services = rendezvous_contact_config::load_current_rendezvous_services(state).await?;
+    let cluster_contact_urls = rendezvous_registration_policy::service_urls(&services);
     let configured_urls = current_configured_rendezvous_urls(state);
     let effective_urls = combine_rendezvous_urls(&configured_urls, &cluster_contact_urls);
 
     let contacts_changed = {
         let mut current_contacts = state
             .network
-            .cluster_rendezvous_contact_urls
+            .cluster_rendezvous_services
             .lock()
             .expect("cluster rendezvous contact URL mutex poisoned");
-        if *current_contacts == cluster_contact_urls {
+        if *current_contacts == services {
             false
         } else {
-            *current_contacts = cluster_contact_urls;
+            *current_contacts = services;
             true
         }
     };
@@ -5805,7 +5810,14 @@ fn build_rendezvous_control_clients(
 }
 
 fn validate_global_rendezvous_registration_config(config: &ServerNodeConfig) -> Result<()> {
-    if !config.global_rendezvous_registration_enabled {
+    let services = rendezvous_registration_policy::configured_services(config)?;
+    if services.is_empty() && config.global_rendezvous_registration_enabled {
+        bail!("global rendezvous registration requires at least one explicit rendezvous URL");
+    }
+    if !services
+        .iter()
+        .any(|service| service.global_registration_enabled)
+    {
         return Ok(());
     }
 
@@ -5813,9 +5825,6 @@ fn validate_global_rendezvous_registration_config(config: &ServerNodeConfig) -> 
         bail!(
             "global rendezvous registration requires normal rendezvous registration to be enabled"
         );
-    }
-    if config.rendezvous_urls.is_empty() {
-        bail!("global rendezvous registration requires at least one explicit rendezvous URL");
     }
     if !config.rendezvous_mtls_required {
         bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
@@ -6492,7 +6501,8 @@ impl ServerNodeConfig {
             &bootstrap.direct_endpoints,
             bootstrap.node_id,
         )?;
-        let rendezvous_configured = !bootstrap.rendezvous_urls.is_empty();
+        let rendezvous_configured =
+            !bootstrap.rendezvous_urls.is_empty() || !bootstrap.rendezvous_services.is_empty();
 
         Ok(Self {
             mode,
@@ -6519,6 +6529,7 @@ impl ServerNodeConfig {
             internal_ca_key_path: None,
             local_status_bind_addr: parse_local_status_bind_addr()?,
             rendezvous_ca_cert_path: None,
+            rendezvous_services: bootstrap.rendezvous_services,
             rendezvous_urls: bootstrap.rendezvous_urls,
             rendezvous_registration_enabled: rendezvous_configured,
             global_rendezvous_registration_enabled: env_flag_enabled(
@@ -6886,6 +6897,7 @@ impl ServerNodeConfig {
             rendezvous_ca_cert_path,
             rendezvous_urls,
             rendezvous_registration_enabled,
+            rendezvous_services: Vec::new(),
             global_rendezvous_registration_enabled,
             rendezvous_mtls_required,
             managed_rendezvous: None,
@@ -7831,17 +7843,10 @@ async fn run_inner(
         .clone()
         .or_else(|| public_ca_pem.clone())
         .or_else(|| cluster_ca_pem.clone());
-    let normalized_rendezvous_urls = normalize_rendezvous_url_list(&config.rendezvous_urls)?;
-    if config.global_rendezvous_registration_enabled {
-        register_cluster_with_global_rendezvous_services(
-            config.cluster_id,
-            &normalized_rendezvous_urls,
-            cluster_ca_pem.as_deref(),
-            internal_ca_key_pem.as_deref(),
-            configured_rendezvous_service_ca_pem.as_deref(),
-        )
-        .await?;
-    }
+    let configured_rendezvous_services =
+        rendezvous_registration_policy::configured_services(&config)?;
+    let normalized_rendezvous_urls =
+        rendezvous_registration_policy::service_urls(&configured_rendezvous_services);
     let rendezvous_client_identity_pem = config
         .internal_tls
         .as_ref()
@@ -8061,8 +8066,9 @@ async fn run_inner(
             primary_public_direct_url: normalize_optional_url(Some(public_url.as_str())),
             primary_peer_direct_url: normalize_optional_url(Some(internal_url.as_str())),
             advertised_direct_endpoints: Arc::new(StdMutex::new(advertised_direct_endpoints)),
-            configured_rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls.clone())),
-            cluster_rendezvous_contact_urls: Arc::new(StdMutex::new(Vec::new())),
+            configured_rendezvous_services: Arc::new(StdMutex::new(configured_rendezvous_services)),
+            cluster_rendezvous_services: Arc::new(StdMutex::new(Vec::new())),
+            globally_registered_rendezvous_urls: Arc::new(Mutex::new(HashSet::new())),
             rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls)),
             rendezvous_registration_enabled: config.rendezvous_registration_enabled,
             rendezvous_mtls_required: config.rendezvous_mtls_required,
@@ -9427,10 +9433,16 @@ fn spawn_rendezvous_presence_heartbeat(
                 let url = endpoint.url.clone();
                 let client = endpoint.control.clone();
                 let registration = registration.clone();
+                let state = state.clone();
                 registrations.spawn(async move {
                     let result = tokio::time::timeout(
                         Duration::from_secs(RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS),
-                        client.register_presence(&registration),
+                        rendezvous_registration_policy::register_endpoint_presence(
+                            &state,
+                            &url,
+                            &client,
+                            &registration,
+                        ),
                     )
                     .await;
                     (url, client, result)
@@ -23576,6 +23588,8 @@ struct ManagedControlPlanePromotionImportResponse {
 
 #[derive(Debug, Serialize)]
 struct RendezvousConfigView {
+    editable_services: Vec<transport_sdk::RendezvousServiceConfig>,
+    effective_services: Vec<transport_sdk::RendezvousServiceConfig>,
     effective_urls: Vec<String>,
     editable_urls: Vec<String>,
     managed_embedded_url: Option<String>,
@@ -23616,7 +23630,10 @@ struct UpdateNodeConnectionPriorityRequest {
 
 #[derive(Debug, Deserialize)]
 struct UpdateRendezvousConfigRequest {
-    editable_urls: Vec<String>,
+    #[serde(default)]
+    editable_urls: Option<Vec<String>>,
+    #[serde(default)]
+    editable_services: Option<Vec<transport_sdk::RendezvousServiceConfig>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25548,6 +25565,10 @@ fn build_issued_node_bootstrap(
         internal_bind_addr: internal_bind_addr.clone(),
         internal_url: internal_url.clone(),
         internal_tls: request.internal_tls,
+        rendezvous_services: rendezvous_registration_policy::current_services(state)
+            .into_iter()
+            .filter(|service| rendezvous_urls.contains(&service.url))
+            .collect(),
         rendezvous_urls,
         rendezvous_mtls_required: state.network.rendezvous_mtls_required,
         direct_endpoints,
@@ -28987,6 +29008,8 @@ async fn build_rendezvous_config_view(
     let effective_urls = normalize_rendezvous_url_list(&current_rendezvous_urls(state))
         .unwrap_or_else(|_| current_rendezvous_urls(state));
     RendezvousConfigView {
+        editable_services: rendezvous_registration_policy::editable_services(state),
+        effective_services: rendezvous_registration_policy::current_services(state),
         effective_urls,
         editable_urls: current_editable_rendezvous_urls(state),
         managed_embedded_url: state.network.managed_rendezvous_public_url.clone(),
@@ -29047,12 +29070,13 @@ fn build_effective_rendezvous_urls(
     Ok(effective_urls)
 }
 
-fn persist_rendezvous_urls_if_possible(
+fn persist_rendezvous_services_if_possible(
     state: &ServerState,
-    effective_urls: &[String],
+    services: &[transport_sdk::RendezvousServiceConfig],
 ) -> Result<bool> {
     update_persisted_node_enrollment_if_possible(state, |package| {
-        package.bootstrap.rendezvous_urls = effective_urls.to_vec();
+        package.bootstrap.rendezvous_urls = rendezvous_registration_policy::service_urls(services);
+        package.bootstrap.rendezvous_services = services.to_vec();
     })
 }
 
@@ -29249,7 +29273,7 @@ async fn update_rendezvous_config(
         action,
         true,
         true,
-        json!({ "editable_urls": request.editable_urls }),
+        json!({ "editable_urls": request.editable_urls, "editable_services": request.editable_services }),
     )
     .await
     {
@@ -29257,28 +29281,30 @@ async fn update_rendezvous_config(
         Err(status) => return status.into_response(),
     };
 
-    let configured_urls = match build_effective_rendezvous_urls(&state, &request.editable_urls) {
-        Ok(urls) => urls,
-        Err(err) => {
-            append_admin_audit(
-                &state,
-                action,
-                &authz,
-                true,
-                true,
-                true,
-                "error",
-                json!({ "error": err.to_string() }),
-            )
-            .await;
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": err.to_string() })),
-            )
-                .into_response();
-        }
-    };
+    let configured_services =
+        match rendezvous_registration_policy::updated_services(&state, &request) {
+            Ok(urls) => urls,
+            Err(err) => {
+                append_admin_audit(
+                    &state,
+                    action,
+                    &authz,
+                    true,
+                    true,
+                    true,
+                    "error",
+                    json!({ "error": err.to_string() }),
+                )
+                .await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        };
 
+    let configured_urls = rendezvous_registration_policy::service_urls(&configured_services);
     let effective_urls = combine_rendezvous_urls(
         &configured_urls,
         &current_cluster_rendezvous_contact_urls(&state),
@@ -29306,7 +29332,7 @@ async fn update_rendezvous_config(
         }
     };
 
-    let persisted = match persist_rendezvous_urls_if_possible(&state, &configured_urls) {
+    let persisted = match persist_rendezvous_services_if_possible(&state, &configured_services) {
         Ok(persisted) => persisted,
         Err(err) => {
             append_admin_audit(
@@ -29328,7 +29354,7 @@ async fn update_rendezvous_config(
         }
     };
 
-    replace_configured_rendezvous_urls(&state, configured_urls);
+    replace_configured_rendezvous_services(&state, configured_services);
     replace_outbound_clients(&state, outbound_clients).await;
     sync_rendezvous_registration_state(&state).await;
     let view = build_rendezvous_config_view(&state, persisted).await;
@@ -29344,6 +29370,7 @@ async fn update_rendezvous_config(
         json!({
             "effective_urls": view.effective_urls,
             "editable_urls": view.editable_urls,
+            "editable_services": view.editable_services,
             "persistence_source": view.persistence_source,
             "persisted": view.persisted,
         }),

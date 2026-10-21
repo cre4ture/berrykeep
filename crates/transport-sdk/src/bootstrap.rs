@@ -133,6 +133,8 @@ pub struct NodeBootstrap {
     pub internal_url: Option<String>,
     #[serde(default)]
     pub internal_tls: Option<BootstrapTlsFiles>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendezvous_services: Vec<crate::RendezvousServiceConfig>,
     pub rendezvous_urls: Vec<String>,
     #[serde(default)]
     pub rendezvous_mtls_required: bool,
@@ -313,6 +315,11 @@ impl NodeBootstrap {
             bail!("node bootstrap internal_tls requires internal_bind_addr");
         }
         validate_url_list("rendezvous_urls", &self.rendezvous_urls)?;
+        crate::resolve_rendezvous_services(
+            &self.rendezvous_urls,
+            &self.rendezvous_services,
+            false,
+        )?;
         validate_endpoint_list(&self.direct_endpoints)?;
         validate_trust_roots(&self.trust_roots)?;
         Ok(())
@@ -685,6 +692,7 @@ mod tests {
                 cert_path: "tls/node.pem".to_string(),
                 key_path: "tls/node.key".to_string(),
             }),
+            rendezvous_services: Vec::new(),
             rendezvous_urls: vec!["https://rendezvous.example".to_string()],
             rendezvous_mtls_required: true,
             direct_endpoints: vec![BootstrapEndpoint {
@@ -759,6 +767,7 @@ mod tests {
                     cert_path: "tls/node.pem".to_string(),
                     key_path: "tls/node.key".to_string(),
                 }),
+                rendezvous_services: Vec::new(),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),
@@ -802,6 +811,7 @@ mod tests {
                     cert_path: "tls/node.pem".to_string(),
                     key_path: "tls/node.key".to_string(),
                 }),
+                rendezvous_services: Vec::new(),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),
@@ -845,6 +855,7 @@ mod tests {
                     cert_path: "tls/node.pem".to_string(),
                     key_path: "tls/node.key".to_string(),
                 }),
+                rendezvous_services: Vec::new(),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),
@@ -890,6 +901,7 @@ mod tests {
                     cert_path: "tls/node.pem".to_string(),
                     key_path: "tls/node.key".to_string(),
                 }),
+                rendezvous_services: Vec::new(),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),

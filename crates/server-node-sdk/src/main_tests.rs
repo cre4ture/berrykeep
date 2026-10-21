@@ -1100,6 +1100,7 @@ fn test_cluster_config_without_internal_tls(
         internal_ca_key_path: None,
         local_status_bind_addr: None,
         rendezvous_ca_cert_path: None,
+        rendezvous_services: Vec::new(),
         rendezvous_urls: vec![format!("http://{bind_addr}")],
         rendezvous_registration_enabled: false,
         global_rendezvous_registration_enabled: false,
@@ -1161,6 +1162,7 @@ fn install_internal_tls_for_test_config(
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: config.rendezvous_urls.clone(),
         rendezvous_mtls_required: config.rendezvous_mtls_required,
         direct_endpoints: Vec::new(),
@@ -1881,6 +1883,24 @@ fn spawn_global_rendezvous_registration_capture_server(
             "/global/cluster-registration/complete",
             post(capture_global_rendezvous_registration_completion),
         )
+        .route(
+            "/control/presence/register",
+            post(
+                |Json(registration): Json<transport_sdk::PresenceRegistration>| async move {
+                    Json(transport_sdk::RegisterPresenceResponse {
+                        accepted: true,
+                        software_version: None,
+                        iroh_relay: None,
+                        updated_at_unix: super::unix_ts(),
+                        entry: transport_sdk::PresenceEntry {
+                            registration,
+                            updated_at_unix: super::unix_ts(),
+                            observed_source_addr: None,
+                        },
+                    })
+                },
+            ),
+        )
         .with_state(state);
     let tls_config =
         build_optional_client_auth_rustls_config(client_ca_cert_path, cert_path, key_path);
@@ -2108,12 +2128,41 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
         captured_client_certificate.clone(),
     );
 
-    super::register_cluster_with_global_rendezvous_services(
-        cluster_id,
-        &[format!("https://{bind_addr}")],
-        Some(&cluster_ca_pem),
-        Some(&cluster_ca_key_pem),
+    let mut node = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    node.cluster_id = cluster_id;
+    node.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    node.network.internal_ca_key_pem = Some(cluster_ca_key_pem.clone());
+    node.network.rendezvous_ca_pem = Some(service_ca_pem.clone());
+    node.network.rendezvous_mtls_required = true;
+    let url = format!("https://{bind_addr}/");
+    let client = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id,
+            rendezvous_urls: vec![url.clone()],
+            heartbeat_interval_secs: 30,
+        },
         Some(&service_ca_pem),
+        None,
+    )
+    .unwrap();
+    let presence = super::build_rendezvous_presence_registration(&node, None);
+    // A service without the flag receives ordinary presence only.
+    *node.network.configured_rendezvous_services.lock().unwrap() =
+        vec![transport_sdk::RendezvousServiceConfig {
+            url: url.clone(),
+            global_registration_enabled: false,
+        }];
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert!(state.challenge_request.lock().await.is_none());
+    // Toggling the same entry live must enroll it before publishing presence.
+    node.network.configured_rendezvous_services.lock().unwrap()[0].global_registration_enabled =
+        true;
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
     )
     .await
     .unwrap();
@@ -2173,6 +2222,28 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
         "initial global registration must not send a rendezvous client identity"
     );
 
+    // Successful enrollment is reused on subsequent heartbeats.
+    *state.challenge_request.lock().await = None;
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert!(state.challenge_request.lock().await.is_none());
+    // A regular node without the signer uses its enrolled cluster identity.
+    node.network.internal_ca_key_pem = None;
+    node.network
+        .globally_registered_rendezvous_urls
+        .lock()
+        .await
+        .clear();
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert!(state.challenge_request.lock().await.is_none());
+    cleanup_test_state(&node).await;
     server.abort();
     let _ = server.await;
     let _ = std::fs::remove_dir_all(root);
@@ -9282,6 +9353,7 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: true,
         direct_endpoints: vec![
@@ -9581,6 +9653,7 @@ async fn internal_node_tls_material_uses_identity_only_sans() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: Vec::new(),
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -10397,6 +10470,7 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -10500,6 +10574,7 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: vec!["http://127.0.0.1:9".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: vec![transport_sdk::BootstrapEndpoint {
@@ -10910,6 +10985,7 @@ async fn manual_node_enrollment_renewal_forces_live_tls_reload() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -11211,6 +11287,7 @@ async fn automatic_renewal_migrates_missing_identity_uri_sans() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -11526,6 +11603,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: true,
         direct_endpoints: Vec::new(),
@@ -11609,6 +11687,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
             cert_path: "tls/capture-internal.pem".to_string(),
             key_path: "tls/capture-internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: Vec::new(),
         rendezvous_mtls_required: true,
         direct_endpoints: Vec::new(),
@@ -11819,6 +11898,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
                 cert_path: "tls/internal.pem".to_string(),
                 key_path: "tls/internal.key".to_string(),
             }),
+            rendezvous_services: Vec::new(),
             rendezvous_urls: vec![rendezvous_url.clone()],
             rendezvous_mtls_required: false,
             direct_endpoints: Vec::new(),
@@ -11970,6 +12050,7 @@ async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metada
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -20624,10 +20705,16 @@ async fn build_test_state(
             rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
                 "http://127.0.0.1:39080".to_string(),
             ])),
-            configured_rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
-                "http://127.0.0.1:39080".to_string(),
+            configured_rendezvous_services: Arc::new(std::sync::Mutex::new(vec![
+                transport_sdk::RendezvousServiceConfig {
+                    url: "http://127.0.0.1:39080/".to_string(),
+                    global_registration_enabled: false,
+                },
             ])),
-            cluster_rendezvous_contact_urls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            cluster_rendezvous_services: Arc::new(std::sync::Mutex::new(Vec::new())),
+            globally_registered_rendezvous_urls: Arc::new(Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             rendezvous_registration_enabled: false,
             rendezvous_mtls_required: false,
             managed_rendezvous_public_url: None,
@@ -27804,4 +27891,111 @@ async fn wait_for_http_status(
         }
     })
     .await;
+}
+
+#[tokio::test]
+async fn rendezvous_service_policies_round_trip_and_survive_enrollment_reload() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    state.network.rendezvous_mtls_required = true;
+    let root = fresh_test_dir("rendezvous-service-persistence");
+    let package_path = root.join("enrollment.json");
+    let bootstrap: transport_sdk::NodeBootstrap = serde_json::from_value(serde_json::json!({
+        "version": 1, "cluster_id": state.cluster_id, "node_id": state.node_id,
+        "data_dir": root.join("node"), "bind_addr": "127.0.0.1:39080",
+        "internal_bind_addr": "127.0.0.1:49080",
+        "internal_tls": { "ca_cert_path": "tls/ca.pem", "cert_path": "tls/node.pem", "key_path": "tls/node.key" },
+        "rendezvous_urls": [], "rendezvous_mtls_required": true,
+        "trust_roots": { "cluster_ca_pem": "ca" }
+    })).unwrap();
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: None,
+        internal_tls_material: Some(sample_tls_material()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+    state.network.node_enrollment_path = Some(package_path.clone());
+    let app = super::build_server_apps(&state).public_app;
+    let path = "/api/v1/auth/rendezvous-config";
+    let services = serde_json::json!([
+        { "url": "http://private.example/", "global_registration_enabled": false },
+        { "url": "https://global.example/", "global_registration_enabled": true }
+    ]);
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_services": services})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["editable_services"], services);
+    assert_eq!(payload["persisted"], true);
+    let reloaded = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&reloaded.rendezvous_services).unwrap(),
+        services
+    );
+    assert_eq!(
+        reloaded.rendezvous_urls,
+        vec!["http://private.example/", "https://global.example/"]
+    );
+    // An older API client editing URLs must retain an existing global flag.
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_urls": ["https://global.example"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["editable_services"][0]["global_registration_enabled"],
+        true
+    );
+    // Invalid global HTTP configuration must leave both runtime and disk intact.
+    let (status, _) = execute_admin_control_request(&app, Method::PUT, path, Some(TEST_ADMIN_TOKEN), Some(serde_json::json!({"editable_services": [{"url": "http://global.example", "global_registration_enabled": true}]}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        ServerNodeConfig::from_enrollment_path(&package_path)
+            .unwrap()
+            .rendezvous_services[0]
+            .global_registration_enabled
+    );
+    cleanup_test_state(&state).await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn rendezvous_contact_policy_changes_apply_without_changing_urls() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let app = super::build_server_apps(&state).public_app;
+    let path = "/api/v1/auth/cluster/rendezvous-contacts";
+    for global in [false, true, false] {
+        let (status, payload) = execute_admin_control_request(&app, Method::PUT, path, Some(TEST_ADMIN_TOKEN), Some(serde_json::json!({
+            "schema_version": 1,
+            "rendezvous_services": [{"url": "https://contact.example", "global_registration_enabled": global}]
+        }))).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(
+            payload["configuration"]["rendezvous_urls"],
+            serde_json::json!(["https://contact.example/"])
+        );
+        let services = super::rendezvous_registration_policy::current_services(&state);
+        assert_eq!(services.last().unwrap().global_registration_enabled, global);
+        assert_eq!(
+            super::rendezvous_contact_config::load_current_rendezvous_services(&state)
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .global_registration_enabled,
+            global
+        );
+    }
+    cleanup_test_state(&state).await;
 }
