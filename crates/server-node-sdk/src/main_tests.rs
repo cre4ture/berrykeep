@@ -2144,6 +2144,11 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
     let (cluster_ca_pem, cluster_ca_key_pem) = generate_test_internal_ca();
     let (service_ca_pem, _, service_cert_pem, service_key_pem) =
         generate_test_https_ca_and_server_material(bind_addr, "global-rendezvous");
+    // Mixed private/global configurations use a shared CA bundle. The service
+    // CA is deliberately second so both presence and enrollment must trust
+    // certificates beyond the first PEM block.
+    let (other_service_ca_pem, _) = generate_test_internal_ca();
+    let service_trust_bundle = format!("{other_service_ca_pem}\n{service_ca_pem}");
     let client_ca_cert_path = root.join("cluster-ca.pem");
     let service_cert_path = root.join("service.pem");
     let service_key_path = root.join("service.key");
@@ -2185,7 +2190,7 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
     node.cluster_id = cluster_id;
     node.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
     node.network.internal_ca_key_pem = Some(cluster_ca_key_pem.clone());
-    node.network.rendezvous_ca_pem = Some(service_ca_pem.clone());
+    node.network.rendezvous_ca_pem = Some(service_trust_bundle.clone());
     install_global_policy_identity(&mut node);
     let url = format!("https://{bind_addr}/");
     let client = transport_sdk::RendezvousControlClient::new(
@@ -2194,7 +2199,7 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
             rendezvous_urls: vec![url.clone()],
             heartbeat_interval_secs: 30,
         },
-        Some(&service_ca_pem),
+        Some(&service_trust_bundle),
         None,
     )
     .unwrap();

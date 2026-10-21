@@ -86,6 +86,14 @@ Retaining a replicated global entry does not require changing a node's legacy
 local mTLS switch. Issued node bootstraps require mTLS whenever they include a
 global service.
 
+The rendezvous trust setting is node-wide and accepts a concatenated PEM CA
+bundle with the trust roots for all configured services. When private and global
+services use independent CAs, include both roots. Configure a dedicated bundle
+file using `BERRYKEEP_RENDEZVOUS_CA_CERT`, or supply the bundle in the enrollment
+package's `trust_roots.rendezvous_ca_pem`. Keep the cluster identity CA file
+separate; adding service trust roots must not change the cluster ownership CA.
+Selecting a global role does not automatically install that service's CA.
+
 Nodes first publish presence using their existing cluster identity. If the
 service rejects presence, a node holding the cluster CA signing key and an
 internal TLS identity can perform the ownership proof, then retry presence.
