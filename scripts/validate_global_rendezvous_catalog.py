@@ -29,6 +29,10 @@ def canonical_origin(url):
     except ValueError:
         host = host.lower().rstrip(".")
         labels = host.split(".")
+        # Rust's WHATWG URL parser accepts legacy IPv4 forms that Python's
+        # ipaddress rejects. Do not reinterpret them as unrelated DNS names.
+        if re.fullmatch(r"(?:[0-9]+|0x[0-9a-f]*)", labels[-1]):
+            raise ValueError(f"noncanonical IPv4 service hostname: {url}") from None
         if len(host) > 253 or any(
             not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
             for label in labels

@@ -112,5 +112,7 @@ python3 scripts/validate_global_rendezvous_catalog.py
 
 Canonical origin comparison normalizes host case, IPv6 spelling, an omitted
 HTTPS port versus port 443, a terminal DNS dot, and an optional root slash.
+Noncanonical IPv4 spellings (octal, hexadecimal, shortened, or single-integer)
+are rejected to avoid disagreement with Rust's URL parser.
 The setup consumer must enforce these same checks; CI validation complements
 runtime validation rather than replacing it.

@@ -38,9 +38,10 @@ class CatalogValidationTests(unittest.TestCase):
         self.validate(json.loads(re.search(r"```json\n(.*?)\n```", text, re.S).group(1)))
 
     def test_optional_port_and_root_slash(self):
-        catalog = example()
-        catalog["rendezvous_services"][0]["url"] = "https://rendezvous.example.com:9443/"
-        self.validate(catalog)
+        for url in ["https://rendezvous.example.com:9443/", "https://192.0.2.1"]:
+            catalog = example()
+            catalog["rendezvous_services"][0]["url"] = url
+            self.validate(catalog)
 
     def test_rejects_duplicate_json_keys(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -74,6 +75,8 @@ class CatalogValidationTests(unittest.TestCase):
             "https://example.com/rendezvous/", "https://:443/",
             "https://example.com:0", "https://example.com:65536",
             "https://example.com:", "https://-invalid.example/",
+            "https://192.168.001.001", "https://127.1", "https://0177.0.0.1",
+            "https://0x7f000001", "https://2130706433",
         ]:
             with self.subTest(url=url):
                 catalog = example()
