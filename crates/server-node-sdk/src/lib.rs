@@ -469,7 +469,8 @@ struct ServerNetworkRuntime {
     primary_public_direct_url: Option<String>,
     primary_peer_direct_url: Option<String>,
     advertised_direct_endpoints: Arc<StdMutex<Vec<BootstrapEndpoint>>>,
-    configured_rendezvous_services: Arc<StdMutex<Vec<transport_sdk::RendezvousServiceConfig>>>,
+    configured_rendezvous_services:
+        Arc<StdMutex<rendezvous_registration_policy::ConfiguredServices>>,
     cluster_rendezvous_services: Arc<StdMutex<Vec<transport_sdk::RendezvousServiceConfig>>>,
     global_rendezvous_enrollments:
         Arc<Mutex<HashMap<String, rendezvous_registration_policy::GlobalEnrollmentState>>>,
@@ -5176,9 +5177,9 @@ fn combine_rendezvous_urls(
 
 fn replace_configured_rendezvous_services(
     state: &ServerState,
-    services: Vec<transport_sdk::RendezvousServiceConfig>,
+    services: rendezvous_registration_policy::ConfiguredServices,
 ) -> bool {
-    let configured_urls = rendezvous_registration_policy::service_urls(&services);
+    let configured_urls = rendezvous_registration_policy::service_urls(services.services());
     let cluster_contact_urls = current_cluster_rendezvous_contact_urls(state);
     let effective_urls = combine_rendezvous_urls(&configured_urls, &cluster_contact_urls);
 
@@ -7846,9 +7847,9 @@ async fn run_inner(
         .or_else(|| public_ca_pem.clone())
         .or_else(|| cluster_ca_pem.clone());
     let configured_rendezvous_services =
-        rendezvous_registration_policy::configured_services(&config)?;
+        rendezvous_registration_policy::ConfiguredServices::from_config(&config)?;
     let normalized_rendezvous_urls =
-        rendezvous_registration_policy::service_urls(&configured_rendezvous_services);
+        rendezvous_registration_policy::service_urls(configured_rendezvous_services.services());
     let rendezvous_client_identity_pem = config
         .internal_tls
         .as_ref()
@@ -25522,12 +25523,17 @@ fn build_issued_node_bootstrap(
     )
     .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let rendezvous_services: Vec<_> = rendezvous_registration_policy::current_services(state)
+    let effective_services: Vec<_> = rendezvous_registration_policy::current_services(state)
         .into_iter()
         .filter(|service| rendezvous_urls.contains(&service.url))
         .collect();
+    let rendezvous_services: Vec<_> =
+        rendezvous_registration_policy::explicit_configured_services(state)
+            .into_iter()
+            .filter(|service| rendezvous_urls.contains(&service.url))
+            .collect();
     let rendezvous_mtls_required = state.network.rendezvous_mtls_required
-        || rendezvous_services
+        || effective_services
             .iter()
             .any(|service| service.global_registration_enabled);
     let bootstrap = TransportNodeBootstrap {
@@ -29051,11 +29057,16 @@ fn build_effective_rendezvous_urls(
 
 fn persist_rendezvous_services_if_possible(
     state: &ServerState,
-    services: &[transport_sdk::RendezvousServiceConfig],
+    services: &rendezvous_registration_policy::ConfiguredServices,
 ) -> Result<bool> {
     update_persisted_node_enrollment_if_possible(state, |package| {
-        package.bootstrap.rendezvous_urls = rendezvous_registration_policy::service_urls(services);
-        package.bootstrap.rendezvous_services = services.to_vec();
+        package.bootstrap.rendezvous_urls =
+            rendezvous_registration_policy::service_urls(services.services());
+        package.bootstrap.rendezvous_services = services.explicit_services();
+        package.bootstrap.rendezvous_mtls_required |= services
+            .services()
+            .iter()
+            .any(|service| service.global_registration_enabled);
     })
 }
 
@@ -29286,7 +29297,8 @@ async fn update_rendezvous_config(
             }
         };
 
-    let configured_urls = rendezvous_registration_policy::service_urls(&configured_services);
+    let configured_urls =
+        rendezvous_registration_policy::service_urls(configured_services.services());
     let effective_urls = combine_rendezvous_urls(
         &configured_urls,
         &current_cluster_rendezvous_contact_urls(&state),

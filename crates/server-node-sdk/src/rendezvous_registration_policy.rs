@@ -1,6 +1,56 @@
 use super::*;
 use transport_sdk::{RendezvousServiceConfig, resolve_rendezvous_services};
 
+/// URL-only bootstrap hints remain fallbacks; only explicit operator policies
+/// may shadow the replicated contact object.
+#[derive(Clone, Default)]
+pub(super) struct ConfiguredServices {
+    services: Vec<RendezvousServiceConfig>,
+    explicit_policy_urls: HashSet<String>,
+}
+
+impl ConfiguredServices {
+    pub(super) fn from_config(config: &ServerNodeConfig) -> Result<Self> {
+        let services = configured_services(config)?;
+        let mut explicit_policy_urls = if config.global_rendezvous_registration_enabled {
+            service_urls(&services).into_iter().collect()
+        } else {
+            config
+                .rendezvous_services
+                .iter()
+                .map(|service| canonicalize_rendezvous_url(&service.url))
+                .collect::<Result<HashSet<_>>>()?
+        };
+        if let Some(managed) = &config.managed_rendezvous {
+            explicit_policy_urls.insert(canonicalize_rendezvous_url(&managed.public_url)?);
+        }
+        Ok(Self {
+            services,
+            explicit_policy_urls,
+        })
+    }
+
+    pub(super) fn explicit(services: Vec<RendezvousServiceConfig>) -> Self {
+        let explicit_policy_urls = service_urls(&services).into_iter().collect();
+        Self {
+            services,
+            explicit_policy_urls,
+        }
+    }
+
+    pub(super) fn services(&self) -> &[RendezvousServiceConfig] {
+        &self.services
+    }
+
+    pub(super) fn explicit_services(&self) -> Vec<RendezvousServiceConfig> {
+        self.services
+            .iter()
+            .filter(|service| self.explicit_policy_urls.contains(&service.url))
+            .cloned()
+            .collect()
+    }
+}
+
 pub(super) fn service_urls(services: &[RendezvousServiceConfig]) -> Vec<String> {
     services.iter().map(|service| service.url.clone()).collect()
 }
@@ -32,19 +82,49 @@ pub(super) fn current_configured_services(state: &ServerState) -> Vec<Rendezvous
         .configured_rendezvous_services
         .lock()
         .expect("rendezvous services mutex poisoned")
+        .services
         .clone()
 }
 
+pub(super) fn explicit_configured_services(state: &ServerState) -> Vec<RendezvousServiceConfig> {
+    state
+        .network
+        .configured_rendezvous_services
+        .lock()
+        .expect("rendezvous services mutex poisoned")
+        .explicit_services()
+}
+
 pub(super) fn current_services(state: &ServerState) -> Vec<RendezvousServiceConfig> {
-    let mut services = current_configured_services(state);
+    let configured = state
+        .network
+        .configured_rendezvous_services
+        .lock()
+        .expect("rendezvous services mutex poisoned")
+        .clone();
     let contacts = state
         .network
         .cluster_rendezvous_services
         .lock()
         .expect("rendezvous contacts mutex poisoned")
         .clone();
+    let contact_policies: HashMap<_, _> = contacts
+        .iter()
+        .map(|service| (&service.url, service))
+        .collect();
+    let mut services: Vec<_> = configured
+        .services
+        .iter()
+        .map(|service| {
+            if !configured.explicit_policy_urls.contains(&service.url)
+                && let Some(contact) = contact_policies.get(&service.url)
+            {
+                return (*contact).clone();
+            }
+            service.clone()
+        })
+        .collect();
     let mut seen: HashSet<_> = services.iter().map(|service| service.url.clone()).collect();
-    // Node-local configuration takes precedence over a replicated contact for the same URL.
     services.extend(
         contacts
             .into_iter()
@@ -55,7 +135,7 @@ pub(super) fn current_services(state: &ServerState) -> Vec<RendezvousServiceConf
 
 pub(super) fn editable_services(state: &ServerState) -> Vec<RendezvousServiceConfig> {
     let editable_urls = current_editable_rendezvous_urls(state);
-    current_configured_services(state)
+    current_services(state)
         .into_iter()
         .filter(|service| editable_urls.contains(&service.url))
         .collect()
@@ -64,24 +144,39 @@ pub(super) fn editable_services(state: &ServerState) -> Vec<RendezvousServiceCon
 pub(super) async fn updated_services(
     state: &ServerState,
     request: &UpdateRendezvousConfigRequest,
-) -> Result<Vec<RendezvousServiceConfig>> {
-    let services = match &request.editable_services {
-        Some(services) => resolve_rendezvous_services(&[], services, false)?,
+) -> Result<ConfiguredServices> {
+    let (services, mut explicit_policy_urls) = match &request.editable_services {
+        Some(services) => {
+            let prepared =
+                ConfiguredServices::explicit(resolve_rendezvous_services(&[], services, false)?);
+            (prepared.services, prepared.explicit_policy_urls)
+        }
         None => {
-            // URL-only API clients preserve the policy of entries they retain.
             let urls = normalize_rendezvous_url_list(request.editable_urls.as_deref().context(
                 "rendezvous configuration requires editable_urls or editable_services",
             )?)?;
-            let retained: Vec<_> = editable_services(state)
+            // URL-only clients preserve explicit overrides without promoting
+            // replicated policies or bootstrap hints into local overrides.
+            let retained: Vec<_> = explicit_configured_services(state)
                 .into_iter()
                 .filter(|service| urls.contains(&service.url))
                 .collect();
-            resolve_rendezvous_services(&urls, &retained, false)?
+            let explicit = service_urls(&retained).into_iter().collect::<HashSet<_>>();
+            (
+                resolve_rendezvous_services(&urls, &retained, false)?,
+                explicit,
+            )
         }
     };
     validate_services(state, &services, &editable_services(state)).await?;
     let urls = build_effective_rendezvous_urls(state, &service_urls(&services))?;
-    resolve_rendezvous_services(&urls, &services, false)
+    if let Some(managed) = state.network.managed_rendezvous_public_url.as_deref() {
+        explicit_policy_urls.insert(canonicalize_rendezvous_url(managed)?);
+    }
+    Ok(ConfiguredServices {
+        services: resolve_rendezvous_services(&urls, &services, false)?,
+        explicit_policy_urls,
+    })
 }
 
 pub(super) async fn validate_services(

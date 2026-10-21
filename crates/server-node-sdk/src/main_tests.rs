@@ -2205,11 +2205,15 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
     .unwrap();
     let presence = super::build_rendezvous_presence_registration(&node, None);
     // A service without the flag receives ordinary presence only.
-    *node.network.configured_rendezvous_services.lock().unwrap() =
-        vec![transport_sdk::RendezvousServiceConfig {
-            url: url.clone(),
-            global_registration_enabled: false,
-        }];
+    super::replace_configured_rendezvous_services(
+        &node,
+        super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+            transport_sdk::RendezvousServiceConfig {
+                url: url.clone(),
+                global_registration_enabled: false,
+            },
+        ]),
+    );
     super::rendezvous_registration_policy::register_endpoint_presence(
         &node, &url, &client, &presence,
     )
@@ -2218,8 +2222,15 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
     assert!(state.challenge_request.lock().await.is_none());
     // A global service refusing an unknown cluster triggers its ownership proof.
     state.require_enrollment.store(true, Ordering::SeqCst);
-    node.network.configured_rendezvous_services.lock().unwrap()[0].global_registration_enabled =
-        true;
+    super::replace_configured_rendezvous_services(
+        &node,
+        super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+            transport_sdk::RendezvousServiceConfig {
+                url: url.clone(),
+                global_registration_enabled: true,
+            },
+        ]),
+    );
     super::rendezvous_registration_policy::register_endpoint_presence(
         &node, &url, &client, &presence,
     )
@@ -20903,12 +20914,14 @@ async fn build_test_state(
             rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
                 "http://127.0.0.1:39080".to_string(),
             ])),
-            configured_rendezvous_services: Arc::new(std::sync::Mutex::new(vec![
-                transport_sdk::RendezvousServiceConfig {
-                    url: "http://127.0.0.1:39080/".to_string(),
-                    global_registration_enabled: false,
-                },
-            ])),
+            configured_rendezvous_services: Arc::new(std::sync::Mutex::new(
+                super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+                    transport_sdk::RendezvousServiceConfig {
+                        url: "http://127.0.0.1:39080/".to_string(),
+                        global_registration_enabled: false,
+                    },
+                ]),
+            )),
             cluster_rendezvous_services: Arc::new(std::sync::Mutex::new(Vec::new())),
             global_rendezvous_enrollments: Arc::new(Mutex::new(HashMap::new())),
             rendezvous_registration_enabled: false,
@@ -28101,7 +28114,7 @@ async fn rendezvous_service_policies_round_trip_and_survive_enrollment_reload() 
         "data_dir": root.join("node"), "bind_addr": "127.0.0.1:39080",
         "internal_bind_addr": "127.0.0.1:49080",
         "internal_tls": { "ca_cert_path": "tls/ca.pem", "cert_path": "tls/node.pem", "key_path": "tls/node.key" },
-        "rendezvous_urls": [], "rendezvous_mtls_required": true,
+        "rendezvous_urls": [], "rendezvous_mtls_required": false,
         "trust_roots": { "cluster_ca_pem": "ca" }
     })).unwrap();
     transport_sdk::NodeEnrollmentPackage {
@@ -28130,6 +28143,10 @@ async fn rendezvous_service_policies_round_trip_and_survive_enrollment_reload() 
     assert_eq!(payload["editable_services"], services);
     assert_eq!(payload["persisted"], true);
     let reloaded = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    assert!(
+        reloaded.rendezvous_mtls_required,
+        "persisted global roles must derive mTLS even when runtime setup enabled it separately"
+    );
     assert_eq!(
         serde_json::to_value(&reloaded.rendezvous_services).unwrap(),
         services
@@ -28339,12 +28356,7 @@ async fn rendezvous_replicated_policy_derives_child_bootstrap_mtls() {
     let bootstrap = super::build_issued_node_bootstrap(&state, request, None)
         .expect("replicated global services must not make node bootstrap issuance fail");
     assert!(bootstrap.rendezvous_mtls_required);
-    assert!(
-        bootstrap
-            .rendezvous_services
-            .iter()
-            .any(|service| service.global_registration_enabled)
-    );
+    assert!(bootstrap.rendezvous_services.is_empty());
     cleanup_test_state(&state).await;
 }
 
@@ -28381,4 +28393,110 @@ async fn rendezvous_new_global_role_requires_active_participation() {
     .await;
     assert_eq!(status, StatusCode::OK, "{payload}");
     cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_issued_contact_policy_remains_revocable_on_the_child() {
+    let mut issuer = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    install_global_policy_identity(&mut issuer);
+    let url = "https://global.example/".to_string();
+    *issuer.network.rendezvous_urls.lock().unwrap() = vec![url.clone()];
+    *issuer.network.cluster_rendezvous_services.lock().unwrap() =
+        vec![transport_sdk::RendezvousServiceConfig {
+            url: url.clone(),
+            global_registration_enabled: true,
+        }];
+    let request = serde_json::from_value::<super::NodeBootstrapIssueRequest>(serde_json::json!({"data_dir": issuer.managed_paths.data_dir().join("issued-child"), "internal_tls":{"ca_cert_path":"tls/ca.pem","cert_path":"tls/node.pem","key_path":"tls/node.key"}})).unwrap();
+    let bootstrap = super::build_issued_node_bootstrap(&issuer, request, None).unwrap();
+    assert!(
+        bootstrap.rendezvous_services.is_empty(),
+        "replicated policies must not be exported as local overrides"
+    );
+    assert!(bootstrap.rendezvous_urls.contains(&url));
+    assert!(bootstrap.rendezvous_mtls_required);
+    let mut child = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    child.cluster_id = bootstrap.cluster_id;
+    child.node_id = bootstrap.node_id;
+    child.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    let package_path = child
+        .managed_paths
+        .data_dir()
+        .join("inherited-enrollment.json");
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: None,
+        internal_tls_material: Some(sample_tls_material()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+    child.network.node_enrollment_path = Some(package_path.clone());
+    let config = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    *child.network.cluster_rendezvous_services.lock().unwrap() = issuer
+        .network
+        .cluster_rendezvous_services
+        .lock()
+        .unwrap()
+        .clone();
+    super::replace_configured_rendezvous_services(
+        &child,
+        super::rendezvous_registration_policy::ConfiguredServices::from_config(&config).unwrap(),
+    );
+    assert!(
+        super::rendezvous_registration_policy::current_services(&child)[0]
+            .global_registration_enabled
+    );
+    // A legacy URL-only save and restart must preserve the inherited source.
+    let app = super::build_server_apps(&child).public_app;
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/rendezvous-config",
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_urls":[url]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let reloaded = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    assert!(reloaded.rendezvous_services.is_empty());
+    super::replace_configured_rendezvous_services(
+        &child,
+        super::rendezvous_registration_policy::ConfiguredServices::from_config(&reloaded).unwrap(),
+    );
+    child.network.cluster_rendezvous_services.lock().unwrap()[0].global_registration_enabled =
+        false;
+    assert!(
+        !super::rendezvous_registration_policy::current_services(&child)[0]
+            .global_registration_enabled,
+        "revocation must override inherited URL defaults"
+    );
+    // Explicit operator policies retain their documented precedence.
+    super::replace_configured_rendezvous_services(
+        &child,
+        super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+            transport_sdk::RendezvousServiceConfig {
+                url: url.clone(),
+                global_registration_enabled: true,
+            },
+        ]),
+    );
+    assert!(
+        super::rendezvous_registration_policy::current_services(&child)[0]
+            .global_registration_enabled
+    );
+    child.network.cluster_rendezvous_services.lock().unwrap()[0].global_registration_enabled = true;
+    super::replace_configured_rendezvous_services(
+        &child,
+        super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+            transport_sdk::RendezvousServiceConfig {
+                url,
+                global_registration_enabled: false,
+            },
+        ]),
+    );
+    assert!(
+        !super::rendezvous_registration_policy::current_services(&child)[0]
+            .global_registration_enabled
+    );
+    cleanup_test_state(&child).await;
+    cleanup_test_state(&issuer).await;
 }

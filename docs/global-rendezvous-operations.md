@@ -69,8 +69,15 @@ contact configuration accepts `rendezvous_services`. Each entry contains:
 
 Node-local entries are persisted in the node enrollment package. Cluster
 contacts carry their policy in the versioned contact object and replicate with
-it. A node-local entry takes precedence when the same URL is also a cluster
-contact. The embedded managed rendezvous always remains cluster-specific.
+it. An explicit node-local policy takes precedence when the same URL is also a
+cluster contact. The embedded managed rendezvous always remains cluster-specific.
+
+Issued enrollment packages retain contact URLs as bootstrap lookup hints, but
+export only explicit local policies. URL-only hints inherit subsequent contact
+policy changes, including revocation of global registration. Legacy URL-only
+edits preserve that distinction across persistence and restart. Saving the
+operator-managed service editor writes explicit local policies. Saving a global
+role also records its required mTLS setting in the enrollment package.
 
 The URL-only API fields remain available for existing clients and bootstraps.
 Old entries default to cluster-specific. For startup URLs without an explicit
