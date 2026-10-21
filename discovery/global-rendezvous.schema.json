@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/cre4ture/berrykeep/main/discovery/global-rendezvous.schema.json",
+  "title": "BerryKeep default global rendezvous catalog",
+  "description": "Public defaults offered when creating a new cluster on its first server node.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "rendezvous_services"],
+  "properties": {
+    "$schema": {
+      "const": "https://raw.githubusercontent.com/cre4ture/berrykeep/main/discovery/global-rendezvous.schema.json"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "rendezvous_services": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "description": "An empty list intentionally advertises no default service. Array order is display order, not a failover guarantee.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "url", "global_registration_enabled"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "description": "Stable identifier, unique within the catalog; keep it when renaming or moving a service."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "pattern": "\\S",
+            "description": "Human-readable service name for the initial setup UI."
+          },
+          "url": {
+            "type": "string",
+            "minLength": 9,
+            "maxLength": 2048,
+            "format": "uri",
+            "pattern": "^https://[^/?#\\s@]+(?:/[^?#\\s]*)?$",
+            "description": "HTTPS base URL, including any required port or path prefix. Userinfo, query strings and fragments are forbidden. Consumers also validate the parsed host and port and reject duplicate canonical URLs."
+          },
+          "global_registration_enabled": {
+            "const": true,
+            "description": "Every catalog entry supports independent clusters and requires cluster self-registration."
+          }
+        }
+      }
+    }
+  }
+}
