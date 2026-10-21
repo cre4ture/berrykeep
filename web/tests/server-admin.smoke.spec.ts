@@ -594,6 +594,7 @@ test("server-admin saves global registration separately for each rendezvous serv
   // Periodic refresh must preserve both the URL and its unsaved policy.
   await page.waitForTimeout(5500);
   await expect(globalToggle).toBeChecked();
+  await page.getByRole("button", { name: "Add rendezvous service", exact: true }).click();
   const saved = page.waitForRequest((request) => request.method() === "PUT" && request.url().endsWith(apiV1("/auth/rendezvous-config")));
   await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
   expect((await saved).postDataJSON().editable_services).toEqual([
@@ -602,9 +603,12 @@ test("server-admin saves global registration separately for each rendezvous serv
   ]);
   await expect(page.getByRole("group", { name: "Operator-managed rendezvous service 1", exact: true }).getByRole("checkbox")).not.toBeChecked();
   await page.getByRole("group", { name: "Cluster rendezvous contact service 1", exact: true }).getByRole("checkbox").check();
+  await page.getByRole("button", { name: "Add cluster contact", exact: true }).click();
   const contactSaved = page.waitForResponse((response) => response.request().method() === "PUT" && response.url().endsWith(apiV1("/auth/cluster/rendezvous-contacts")));
   await page.getByRole("button", { name: "Save cluster contact list" }).click();
-  expect((await contactSaved).request().postDataJSON().rendezvous_services[0].global_registration_enabled).toBe(true);
+  const savedContacts = (await contactSaved).request().postDataJSON().rendezvous_services;
+  expect(savedContacts).toHaveLength(1);
+  expect(savedContacts[0].global_registration_enabled).toBe(true);
   await page.reload();
   await page.getByText("Control Plane", { exact: true }).click();
   await expect(page.getByRole("group", { name: "Operator-managed rendezvous service 2", exact: true }).getByRole("checkbox")).toBeChecked();

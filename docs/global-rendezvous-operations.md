@@ -84,8 +84,9 @@ material. A node holding the cluster CA signing key performs the ownership
 proof before publishing presence. Other nodes use their existing cluster
 identities after enrollment. Registration changes apply live; failures are
 reported and retried per endpoint without blocking other services or node
-startup. Successful enrollment is reused until a connection failure requires
-another attempt.
+startup. Successful cluster enrollment is reused across transient presence errors.
+Enrollment requests keep their own timeout budget, separate from presence
+requests. Restarting the node performs enrollment again.
 
 ## Registry and admission
 

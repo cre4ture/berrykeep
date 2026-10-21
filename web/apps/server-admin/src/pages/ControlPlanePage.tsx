@@ -169,7 +169,9 @@ export function ControlPlanePage() {
     setPendingAction("rendezvous-config-save");
     setError(null);
     try {
-      const editable_services = editableRendezvousServices.map((service) => ({ ...service, url: service.url.trim() }));
+      const editable_services = editableRendezvousServices
+        .map((service) => ({ ...service, url: service.url.trim() }))
+        .filter((service) => service.url.length > 0);
       const editable_urls = editable_services.map((service) => service.url);
       const payload = await updateRendezvousConfig({ editable_urls, editable_services }, adminTokenOverride);
       setRendezvousConfig(payload);
@@ -186,7 +188,9 @@ export function ControlPlanePage() {
     setPendingAction("rendezvous-contacts-save");
     setError(null);
     try {
-      const rendezvous_services = rendezvousContactServices.map((service) => ({ ...service, url: service.url.trim() }));
+      const rendezvous_services = rendezvousContactServices
+        .map((service) => ({ ...service, url: service.url.trim() }))
+        .filter((service) => service.url.length > 0);
       const rendezvous_urls = rendezvous_services.map((service) => service.url);
       const payload = await updateRendezvousContactConfiguration(
         {

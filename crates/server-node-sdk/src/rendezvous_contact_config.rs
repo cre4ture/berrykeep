@@ -22,6 +22,16 @@ pub(crate) struct RendezvousContactConfiguration {
     pub(crate) rendezvous_services: Vec<transport_sdk::RendezvousServiceConfig>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct UpdateRendezvousContactConfiguration {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    rendezvous_urls: Vec<String>,
+    #[serde(default)]
+    rendezvous_services: Option<Vec<transport_sdk::RendezvousServiceConfig>>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RendezvousContactConfigurationResponse {
     pub(crate) configuration: RendezvousContactConfiguration,
@@ -115,7 +125,7 @@ pub(crate) async fn admin_get_config(
 pub(crate) async fn admin_put_config(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(configuration): Json<RendezvousContactConfiguration>,
+    Json(request): Json<UpdateRendezvousContactConfiguration>,
 ) -> impl IntoResponse {
     let action = "auth/cluster/rendezvous-contacts/put";
     let authz = match authorize_admin_request(
@@ -124,7 +134,7 @@ pub(crate) async fn admin_put_config(
         action,
         true,
         true,
-        json!({ "rendezvous_url_count": configuration.rendezvous_urls.len() }),
+        json!({ "rendezvous_url_count": request.rendezvous_urls.len() }),
     )
     .await
     {
@@ -132,7 +142,7 @@ pub(crate) async fn admin_put_config(
         Err(status) => return status.into_response(),
     };
 
-    let configuration = match normalize_configuration(configuration) {
+    let configuration = match prepare_update(&state, request).await {
         Ok(configuration) => configuration,
         Err(err) => {
             append_admin_audit(
@@ -225,6 +235,30 @@ pub(crate) async fn admin_put_config(
         }),
     )
         .into_response()
+}
+
+async fn prepare_update(
+    state: &ServerState,
+    request: UpdateRendezvousContactConfiguration,
+) -> Result<RendezvousContactConfiguration> {
+    let urls = normalize_rendezvous_url_list(&request.rendezvous_urls)?;
+    let services = match request.rendezvous_services {
+        Some(services) => services,
+        None => load_current_configuration(state)
+            .await?
+            .configuration
+            .rendezvous_services
+            .into_iter()
+            .filter(|service| urls.contains(&service.url))
+            .collect(),
+    };
+    let configuration = normalize_configuration(RendezvousContactConfiguration {
+        schema_version: request.schema_version,
+        rendezvous_urls: urls,
+        rendezvous_services: services,
+    })?;
+    rendezvous_registration_policy::validate_services(state, &configuration.rendezvous_services)?;
+    Ok(configuration)
 }
 
 async fn load_current_configuration(

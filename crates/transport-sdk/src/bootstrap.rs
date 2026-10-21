@@ -315,11 +315,18 @@ impl NodeBootstrap {
             bail!("node bootstrap internal_tls requires internal_bind_addr");
         }
         validate_url_list("rendezvous_urls", &self.rendezvous_urls)?;
-        crate::resolve_rendezvous_services(
+        let services = crate::resolve_rendezvous_services(
             &self.rendezvous_urls,
             &self.rendezvous_services,
             false,
         )?;
+        if !self.rendezvous_mtls_required
+            && services
+                .iter()
+                .any(|service| service.global_registration_enabled)
+        {
+            bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
+        }
         validate_endpoint_list(&self.direct_endpoints)?;
         validate_trust_roots(&self.trust_roots)?;
         Ok(())
@@ -713,6 +720,13 @@ mod tests {
         bootstrap
             .validate()
             .expect("node bootstrap should validate");
+        let mut invalid = bootstrap;
+        invalid.rendezvous_mtls_required = false;
+        invalid.rendezvous_services = vec![crate::RendezvousServiceConfig {
+            url: "https://global.example/".to_string(),
+            global_registration_enabled: true,
+        }];
+        assert!(invalid.validate().unwrap_err().to_string().contains("mTLS"));
     }
 
     #[test]

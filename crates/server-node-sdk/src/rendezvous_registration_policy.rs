@@ -79,6 +79,15 @@ pub(super) fn updated_services(
             resolve_rendezvous_services(&urls, &retained, false)?
         }
     };
+    validate_services(state, &services)?;
+    let urls = build_effective_rendezvous_urls(state, &service_urls(&services))?;
+    resolve_rendezvous_services(&urls, &services, false)
+}
+
+pub(super) fn validate_services(
+    state: &ServerState,
+    services: &[RendezvousServiceConfig],
+) -> Result<()> {
     let managed_url = state
         .network
         .managed_rendezvous_public_url
@@ -97,8 +106,7 @@ pub(super) fn updated_services(
     {
         bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
     }
-    let urls = build_effective_rendezvous_urls(state, &service_urls(&services))?;
-    resolve_rendezvous_services(&urls, &services, false)
+    Ok(())
 }
 
 pub(super) async fn register_endpoint_presence(
@@ -107,52 +115,53 @@ pub(super) async fn register_endpoint_presence(
     client: &RendezvousControlClient,
     registration: &PresenceRegistration,
 ) -> Result<transport_sdk::RegisterPresenceResponse> {
-    let result = async {
-        let global = current_services(state)
-            .iter()
-            .any(|service| service.url == url && service.global_registration_enabled);
-        if global {
-            if !state.network.rendezvous_mtls_required {
-                bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
-            }
-            // Only a node holding the cluster signer can prove CA ownership.
-            // Other nodes use their existing mTLS identity after the signer enrolls the cluster.
-            if let Some(key) = state.network.internal_ca_key_pem.as_deref() {
-                let already_registered = state
+    let global = current_services(state)
+        .iter()
+        .any(|service| service.url == url && service.global_registration_enabled);
+    if global {
+        if !state.network.rendezvous_mtls_required {
+            bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
+        }
+        // Only a node holding the cluster signer can prove CA ownership.
+        if let Some(key) = state.network.internal_ca_key_pem.as_deref() {
+            let registered = state
+                .network
+                .globally_registered_rendezvous_urls
+                .lock()
+                .await
+                .contains(url);
+            if !registered {
+                let trust_state = state.clone();
+                let trust =
+                    tokio::task::spawn_blocking(move || load_live_trust_material(&trust_state))
+                        .await
+                        .context("failed loading global rendezvous trust material")??;
+                // Each enrollment request has its own dedicated timeout. It is
+                // separate from the shorter presence request budget below.
+                register_cluster_with_global_rendezvous_services(
+                    state.cluster_id,
+                    &[url.to_string()],
+                    trust.cluster_ca_pem.as_deref(),
+                    Some(key),
+                    trust.rendezvous_ca_pem.as_deref(),
+                )
+                .await?;
+                state
                     .network
                     .globally_registered_rendezvous_urls
                     .lock()
                     .await
-                    .contains(url);
-                if !already_registered {
-                    let trust = load_live_trust_material(state)?;
-                    register_cluster_with_global_rendezvous_services(
-                        state.cluster_id,
-                        &[url.to_string()],
-                        trust.cluster_ca_pem.as_deref(),
-                        Some(key),
-                        trust.rendezvous_ca_pem.as_deref(),
-                    )
-                    .await?;
-                    state
-                        .network
-                        .globally_registered_rendezvous_urls
-                        .lock()
-                        .await
-                        .insert(url.to_string());
-                }
+                    .insert(url.to_string());
             }
         }
-        client.register_presence(registration).await
     }
-    .await;
-    if result.is_err() {
-        state
-            .network
-            .globally_registered_rendezvous_urls
-            .lock()
-            .await
-            .remove(url);
-    }
-    result
+    // A transient presence error must not discard successful cluster enrollment.
+    tokio::time::timeout(
+        Duration::from_secs(RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS),
+        client.register_presence(registration),
+    )
+    .await
+    .with_context(|| {
+        format!("timed out contacting rendezvous endpoint {url} while registering presence")
+    })?
 }

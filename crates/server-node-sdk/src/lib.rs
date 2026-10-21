@@ -9435,14 +9435,11 @@ fn spawn_rendezvous_presence_heartbeat(
                 let registration = registration.clone();
                 let state = state.clone();
                 registrations.spawn(async move {
-                    let result = tokio::time::timeout(
-                        Duration::from_secs(RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS),
-                        rendezvous_registration_policy::register_endpoint_presence(
-                            &state,
-                            &url,
-                            &client,
-                            &registration,
-                        ),
+                    let result = rendezvous_registration_policy::register_endpoint_presence(
+                        &state,
+                        &url,
+                        &client,
+                        &registration,
                     )
                     .await;
                     (url, client, result)
@@ -9456,7 +9453,7 @@ fn spawn_rendezvous_presence_heartbeat(
                     continue;
                 };
                 match result {
-                    Ok(Ok(response)) => {
+                    Ok(response) => {
                         if !refresh_endpoint_bound_iroh_relay(
                             &state,
                             &url,
@@ -9491,7 +9488,7 @@ fn spawn_rendezvous_presence_heartbeat(
                             );
                         }
                     }
-                    Ok(Err(err)) => {
+                    Err(err) => {
                         all_registered = false;
                         let error_text = err.to_string();
                         let failures =
@@ -9507,31 +9504,6 @@ fn spawn_rendezvous_presence_heartbeat(
                         } else {
                             tracing::debug!(
                                 error = %err,
-                                node_id = %state.node_id,
-                                rendezvous_url = %url,
-                                consecutive_failures = failures,
-                                "failed to register rendezvous presence"
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        all_registered = false;
-                        let error_text = format!(
-                            "timed out contacting rendezvous endpoint {url} while registering presence"
-                        );
-                        let failures =
-                            record_rendezvous_registration_failure(&state, &url, &error_text).await;
-                        if should_log_rendezvous_failure(failures) {
-                            warn!(
-                                error = %error_text,
-                                node_id = %state.node_id,
-                                rendezvous_url = %url,
-                                consecutive_failures = failures,
-                                "failed to register rendezvous presence"
-                            );
-                        } else {
-                            tracing::debug!(
-                                error = %error_text,
                                 node_id = %state.node_id,
                                 rendezvous_url = %url,
                                 consecutive_failures = failures,
