@@ -134,12 +134,10 @@ pub(crate) async fn admin_put_config(
         action,
         true,
         true,
-        json!({
-            "requested_url_count": request.rendezvous_urls.len(),
-            "requested_service_count": request.rendezvous_services.as_ref().map(Vec::len),
-            "rendezvous_urls": request.rendezvous_urls,
-            "rendezvous_services": request.rendezvous_services,
-        }),
+        rendezvous_admin_audit::request_details(
+            Some(&request.rendezvous_urls),
+            request.rendezvous_services.as_deref(),
+        ),
     )
     .await
     {

@@ -171,6 +171,7 @@ mod map_dataset_import;
 mod natural_earth_import;
 mod operations;
 mod reliability_telemetry;
+mod rendezvous_admin_audit;
 mod rendezvous_contact_config;
 mod rendezvous_registration_policy;
 mod repair_execution_gate;
@@ -29251,7 +29252,10 @@ async fn update_rendezvous_config(
         action,
         true,
         true,
-        json!({ "editable_urls": request.editable_urls, "editable_services": request.editable_services }),
+        rendezvous_admin_audit::request_details(
+            request.editable_urls.as_deref(),
+            request.editable_services.as_deref(),
+        ),
     )
     .await
     {
