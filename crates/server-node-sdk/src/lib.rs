@@ -470,7 +470,8 @@ struct ServerNetworkRuntime {
     advertised_direct_endpoints: Arc<StdMutex<Vec<BootstrapEndpoint>>>,
     configured_rendezvous_services: Arc<StdMutex<Vec<transport_sdk::RendezvousServiceConfig>>>,
     cluster_rendezvous_services: Arc<StdMutex<Vec<transport_sdk::RendezvousServiceConfig>>>,
-    globally_registered_rendezvous_urls: Arc<Mutex<HashSet<String>>>,
+    global_rendezvous_enrollments:
+        Arc<Mutex<HashMap<String, rendezvous_registration_policy::GlobalEnrollmentState>>>,
     rendezvous_urls: Arc<StdMutex<Vec<String>>>,
     rendezvous_registration_enabled: bool,
     rendezvous_mtls_required: bool,
@@ -5833,11 +5834,11 @@ fn validate_global_rendezvous_registration_config(config: &ServerNodeConfig) -> 
     let internal_tls = config.internal_tls.as_ref().context(
         "global rendezvous registration requires a node client identity from internal TLS",
     )?;
-    let identity_pem = build_identity_pem_from_paths(
-        &internal_tls.cert_path,
-        &internal_tls.key_path,
-    )
-    .context(
+    validate_rendezvous_client_identity(&internal_tls.cert_path, &internal_tls.key_path)
+}
+
+fn validate_rendezvous_client_identity(cert_path: &PathBuf, key_path: &PathBuf) -> Result<()> {
+    let identity_pem = build_identity_pem_from_paths(cert_path, key_path).context(
         "global rendezvous registration requires a readable node client identity from internal TLS",
     )?;
     reqwest::Identity::from_pem(&identity_pem).context(
@@ -8068,7 +8069,7 @@ async fn run_inner(
             advertised_direct_endpoints: Arc::new(StdMutex::new(advertised_direct_endpoints)),
             configured_rendezvous_services: Arc::new(StdMutex::new(configured_rendezvous_services)),
             cluster_rendezvous_services: Arc::new(StdMutex::new(Vec::new())),
-            globally_registered_rendezvous_urls: Arc::new(Mutex::new(HashSet::new())),
+            global_rendezvous_enrollments: Arc::new(Mutex::new(HashMap::new())),
             rendezvous_urls: Arc::new(StdMutex::new(normalized_rendezvous_urls)),
             rendezvous_registration_enabled: config.rendezvous_registration_enabled,
             rendezvous_mtls_required: config.rendezvous_mtls_required,
@@ -25520,6 +25521,14 @@ fn build_issued_node_bootstrap(
     )
     .map_err(|_| StatusCode::BAD_REQUEST)?;
 
+    let rendezvous_services: Vec<_> = rendezvous_registration_policy::current_services(state)
+        .into_iter()
+        .filter(|service| rendezvous_urls.contains(&service.url))
+        .collect();
+    let rendezvous_mtls_required = state.network.rendezvous_mtls_required
+        || rendezvous_services
+            .iter()
+            .any(|service| service.global_registration_enabled);
     let bootstrap = TransportNodeBootstrap {
         version: 1,
         cluster_id: state.cluster_id,
@@ -25537,12 +25546,9 @@ fn build_issued_node_bootstrap(
         internal_bind_addr: internal_bind_addr.clone(),
         internal_url: internal_url.clone(),
         internal_tls: request.internal_tls,
-        rendezvous_services: rendezvous_registration_policy::current_services(state)
-            .into_iter()
-            .filter(|service| rendezvous_urls.contains(&service.url))
-            .collect(),
+        rendezvous_services,
         rendezvous_urls,
-        rendezvous_mtls_required: state.network.rendezvous_mtls_required,
+        rendezvous_mtls_required,
         direct_endpoints,
         relay_mode: state.network.relay_mode,
         trust_roots: bootstrap_trust_roots(state)?,
@@ -29254,7 +29260,7 @@ async fn update_rendezvous_config(
     };
 
     let configured_services =
-        match rendezvous_registration_policy::updated_services(&state, &request) {
+        match rendezvous_registration_policy::updated_services(&state, &request).await {
             Ok(urls) => urls,
             Err(err) => {
                 append_admin_audit(

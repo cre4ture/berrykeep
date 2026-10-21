@@ -134,7 +134,12 @@ pub(crate) async fn admin_put_config(
         action,
         true,
         true,
-        json!({ "rendezvous_url_count": request.rendezvous_urls.len() }),
+        json!({
+            "requested_url_count": request.rendezvous_urls.len(),
+            "requested_service_count": request.rendezvous_services.as_ref().map(Vec::len),
+            "rendezvous_urls": request.rendezvous_urls,
+            "rendezvous_services": request.rendezvous_services,
+        }),
     )
     .await
     {
@@ -222,6 +227,7 @@ pub(crate) async fn admin_put_config(
             "storage_key": RENDEZVOUS_CONTACT_CONFIGURATION_STORAGE_KEY,
             "version_id": outcome.version_id,
             "rendezvous_url_count": configuration.rendezvous_urls.len(),
+            "rendezvous_services": configuration.rendezvous_services,
         }),
     )
     .await;
@@ -241,15 +247,14 @@ async fn prepare_update(
     state: &ServerState,
     request: UpdateRendezvousContactConfiguration,
 ) -> Result<RendezvousContactConfiguration> {
+    let existing_services = load_current_rendezvous_services(state).await?;
     let urls = normalize_rendezvous_url_list(&request.rendezvous_urls)?;
     let services = match request.rendezvous_services {
         Some(services) => services,
-        None => load_current_configuration(state)
-            .await?
-            .configuration
-            .rendezvous_services
-            .into_iter()
+        None => existing_services
+            .iter()
             .filter(|service| urls.contains(&service.url))
+            .cloned()
             .collect(),
     };
     let configuration = normalize_configuration(RendezvousContactConfiguration {
@@ -257,7 +262,12 @@ async fn prepare_update(
         rendezvous_urls: urls,
         rendezvous_services: services,
     })?;
-    rendezvous_registration_policy::validate_services(state, &configuration.rendezvous_services)?;
+    rendezvous_registration_policy::validate_services(
+        state,
+        &configuration.rendezvous_services,
+        &existing_services,
+    )
+    .await?;
     Ok(configuration)
 }
 

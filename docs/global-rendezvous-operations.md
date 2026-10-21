@@ -79,14 +79,23 @@ retains its legacy meaning of enabling global registration. An explicit
 per-service setting overrides that default, including `false`; selecting a
 global service in the UI does not require setting this environment variable.
 
-Global services require HTTPS, rendezvous mTLS, and the service's trusted CA
-material. A node holding the cluster CA signing key performs the ownership
-proof before publishing presence. Other nodes use their existing cluster
-identities after enrollment. Registration changes apply live; failures are
-reported and retried per endpoint without blocking other services or node
-startup. Successful cluster enrollment is reused across transient presence errors.
-Enrollment requests keep their own timeout budget, separate from presence
-requests. Restarting the node performs enrollment again.
+Enabling a new global entry requires HTTPS, rendezvous mTLS, a readable and
+valid internal TLS client identity, and the service's trusted CA material.
+Retaining a replicated global entry does not require changing a node's legacy
+local mTLS switch. Issued node bootstraps require mTLS whenever they include a
+global service.
+
+Nodes first publish presence using their existing cluster identity. If the
+service rejects presence, a node holding the cluster CA signing key and an
+internal TLS identity can perform the ownership proof, then retry presence.
+Other nodes keep attempting ordinary presence. Changes apply live; failures
+are reported and retried per endpoint without blocking other services or node
+startup. Healthy presence refreshes a 60-second grace period against repeated
+proofs. Persistent failures after that period can recover a lost registry entry;
+failed proofs back off from 5 seconds to a maximum of 5 minutes. Enrollment
+requests keep their own timeout budget, separate from presence requests, and
+read current trust material for each proof attempt. This recovery does not
+replace an existing cluster CA: Option 1 still rejects cluster CA rotation.
 
 ## Registry and admission
 

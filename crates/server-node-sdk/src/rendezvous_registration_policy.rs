@@ -61,7 +61,7 @@ pub(super) fn editable_services(state: &ServerState) -> Vec<RendezvousServiceCon
         .collect()
 }
 
-pub(super) fn updated_services(
+pub(super) async fn updated_services(
     state: &ServerState,
     request: &UpdateRendezvousConfigRequest,
 ) -> Result<Vec<RendezvousServiceConfig>> {
@@ -79,14 +79,15 @@ pub(super) fn updated_services(
             resolve_rendezvous_services(&urls, &retained, false)?
         }
     };
-    validate_services(state, &services)?;
+    validate_services(state, &services, &editable_services(state)).await?;
     let urls = build_effective_rendezvous_urls(state, &service_urls(&services))?;
     resolve_rendezvous_services(&urls, &services, false)
 }
 
-pub(super) fn validate_services(
+pub(super) async fn validate_services(
     state: &ServerState,
     services: &[RendezvousServiceConfig],
+    existing_services: &[RendezvousServiceConfig],
 ) -> Result<()> {
     let managed_url = state
         .network
@@ -99,14 +100,82 @@ pub(super) fn validate_services(
     }) {
         bail!("the embedded rendezvous service cannot use global registration");
     }
-    if services
-        .iter()
-        .any(|service| service.global_registration_enabled)
-        && !state.network.rendezvous_mtls_required
-    {
+    // Admission checks apply when enabling a new global role. A retained
+    // cluster-wide policy must remain editable on nodes with different local settings.
+    let introduces_global = services.iter().any(|service| {
+        service.global_registration_enabled
+            && !existing_services
+                .iter()
+                .any(|existing| existing.url == service.url && existing.global_registration_enabled)
+    });
+    if !introduces_global {
+        return Ok(());
+    }
+    if !state.network.rendezvous_mtls_required {
         bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
     }
-    Ok(())
+    let tls = state.network.internal_tls_runtime.clone().context(
+        "global rendezvous registration requires a node client identity from internal TLS",
+    )?;
+    tokio::task::spawn_blocking(move || {
+        validate_rendezvous_client_identity(&tls.cert_path, &tls.key_path)
+    })
+    .await
+    .context("failed validating global rendezvous node identity")?
+}
+
+const ENROLLMENT_RECOVERY_GRACE_SECS: u64 = 60;
+
+pub(super) struct GlobalEnrollmentState {
+    pub(super) next_attempt_at: tokio::time::Instant,
+    pub(super) consecutive_failures: u32,
+}
+
+impl GlobalEnrollmentState {
+    fn healthy() -> Self {
+        Self {
+            next_attempt_at: tokio::time::Instant::now()
+                + Duration::from_secs(ENROLLMENT_RECOVERY_GRACE_SECS),
+            consecutive_failures: 0,
+        }
+    }
+
+    fn failed(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay_secs = (5_u64 << self.consecutive_failures.saturating_sub(1).min(6)).min(300);
+        self.next_attempt_at = tokio::time::Instant::now() + Duration::from_secs(delay_secs);
+    }
+}
+
+async fn publish_presence(
+    url: &str,
+    client: &RendezvousControlClient,
+    registration: &PresenceRegistration,
+) -> Result<transport_sdk::RegisterPresenceResponse> {
+    tokio::time::timeout(
+        Duration::from_secs(RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS),
+        client.register_presence(registration),
+    )
+    .await
+    .with_context(|| {
+        format!("timed out contacting rendezvous endpoint {url} while registering presence")
+    })?
+}
+
+async fn enroll_cluster(state: &ServerState, url: &str, key: &str) -> Result<()> {
+    let trust_state = state.clone();
+    let trust = tokio::task::spawn_blocking(move || load_live_trust_material(&trust_state))
+        .await
+        .context("failed loading global rendezvous trust material")??;
+    // Enrollment requests have their own timeout, separate from presence.
+    register_cluster_with_global_rendezvous_services(
+        state.cluster_id,
+        &[url.to_string()],
+        trust.cluster_ca_pem.as_deref(),
+        Some(key),
+        trust.rendezvous_ca_pem.as_deref(),
+    )
+    .await
 }
 
 pub(super) async fn register_endpoint_presence(
@@ -118,50 +187,57 @@ pub(super) async fn register_endpoint_presence(
     let global = current_services(state)
         .iter()
         .any(|service| service.url == url && service.global_registration_enabled);
-    if global {
-        if !state.network.rendezvous_mtls_required {
-            bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
-        }
-        // Only a node holding the cluster signer can prove CA ownership.
-        if let Some(key) = state.network.internal_ca_key_pem.as_deref() {
-            let registered = state
-                .network
-                .globally_registered_rendezvous_urls
-                .lock()
-                .await
-                .contains(url);
-            if !registered {
-                let trust_state = state.clone();
-                let trust =
-                    tokio::task::spawn_blocking(move || load_live_trust_material(&trust_state))
-                        .await
-                        .context("failed loading global rendezvous trust material")??;
-                // Each enrollment request has its own dedicated timeout. It is
-                // separate from the shorter presence request budget below.
-                register_cluster_with_global_rendezvous_services(
-                    state.cluster_id,
-                    &[url.to_string()],
-                    trust.cluster_ca_pem.as_deref(),
-                    Some(key),
-                    trust.rendezvous_ca_pem.as_deref(),
-                )
-                .await?;
+    // Existing cluster identities continue working regardless of the node-local
+    // legacy switch, and healthy registrations need no repeated ownership proof.
+    let presence_error = match publish_presence(url, client, registration).await {
+        Ok(response) => {
+            if global {
                 state
                     .network
-                    .globally_registered_rendezvous_urls
+                    .global_rendezvous_enrollments
                     .lock()
                     .await
-                    .insert(url.to_string());
+                    .insert(url.to_string(), GlobalEnrollmentState::healthy());
             }
+            return Ok(response);
+        }
+        Err(error) => error,
+    };
+    if !global || state.network.internal_tls_runtime.is_none() {
+        return Err(presence_error);
+    }
+    // Only a signer can recover an unknown cluster; other nodes keep attempting
+    // ordinary presence while a signer restores the shared registry entry.
+    let Some(key) = state.network.internal_ca_key_pem.as_deref() else {
+        return Err(presence_error);
+    };
+    {
+        let mut enrollments = state.network.global_rendezvous_enrollments.lock().await;
+        if enrollments
+            .get(url)
+            .is_some_and(|entry| entry.next_attempt_at > tokio::time::Instant::now())
+        {
+            return Err(presence_error);
+        }
+        // Reserve an attempt without holding the mutex across network requests.
+        enrollments
+            .entry(url.to_string())
+            .or_insert_with(GlobalEnrollmentState::healthy)
+            .next_attempt_at =
+            tokio::time::Instant::now() + Duration::from_secs(ENROLLMENT_RECOVERY_GRACE_SECS);
+    }
+    let enrollment = enroll_cluster(state, url, key).await;
+    {
+        let mut enrollments = state.network.global_rendezvous_enrollments.lock().await;
+        let entry = enrollments
+            .entry(url.to_string())
+            .or_insert_with(GlobalEnrollmentState::healthy);
+        if enrollment.is_ok() {
+            *entry = GlobalEnrollmentState::healthy();
+        } else {
+            entry.failed();
         }
     }
-    // A transient presence error must not discard successful cluster enrollment.
-    tokio::time::timeout(
-        Duration::from_secs(RENDEZVOUS_REGISTRATION_REQUEST_TIMEOUT_SECS),
-        client.register_presence(registration),
-    )
-    .await
-    .with_context(|| {
-        format!("timed out contacting rendezvous endpoint {url} while registering presence")
-    })?
+    enrollment?;
+    publish_presence(url, client, registration).await
 }
