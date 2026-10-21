@@ -1232,6 +1232,7 @@ fn install_global_policy_identity(state: &mut ServerState) {
         key_path: tls.key_path,
         metadata_path: tls.metadata_path,
     });
+    state.network.rendezvous_registration_enabled = true;
     state.network.rendezvous_mtls_required = true;
 }
 
@@ -28211,6 +28212,7 @@ async fn rendezvous_contacts_validate_global_policy_and_preserve_legacy_updates(
         StatusCode::BAD_REQUEST,
         "saving a global contact requires mTLS"
     );
+    state.network.rendezvous_registration_enabled = true;
     state.network.rendezvous_mtls_required = true;
     let app = super::build_server_apps(&state).public_app;
     let (status, _) = execute_admin_control_request(
@@ -28294,6 +28296,7 @@ async fn rendezvous_replicated_policy_preserves_legacy_edits_with_local_mtls_off
     let app = super::build_server_apps(&state).public_app;
     let (status, _) = execute_admin_control_request(&app, Method::PUT, path, Some(TEST_ADMIN_TOKEN), Some(serde_json::json!({"rendezvous_services": [{"url":"https://global.example/", "global_registration_enabled":true}]}))).await;
     assert_eq!(status, StatusCode::OK);
+    state.network.rendezvous_registration_enabled = false;
     state.network.rendezvous_mtls_required = false;
     let app = super::build_server_apps(&state).public_app;
     let (status, payload) = execute_admin_control_request(
@@ -28337,5 +28340,40 @@ async fn rendezvous_replicated_policy_derives_child_bootstrap_mtls() {
             .iter()
             .any(|service| service.global_registration_enabled)
     );
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_new_global_role_requires_active_participation() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    install_global_policy_identity(&mut state);
+    state.network.rendezvous_registration_enabled = false;
+    let app = super::build_server_apps(&state).public_app;
+    let body = serde_json::json!({"rendezvous_services": [{"url":"https://global.example/", "global_registration_enabled":true}]});
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/cluster/rendezvous-contacts",
+        Some(TEST_ADMIN_TOKEN),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a new global role must not persist a configuration that startup rejects: {payload}"
+    );
+    state.network.rendezvous_registration_enabled = true;
+    let app = super::build_server_apps(&state).public_app;
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/cluster/rendezvous-contacts",
+        Some(TEST_ADMIN_TOKEN),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
     cleanup_test_state(&state).await;
 }

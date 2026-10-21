@@ -111,6 +111,11 @@ pub(super) async fn validate_services(
     if !introduces_global {
         return Ok(());
     }
+    if !state.network.rendezvous_registration_enabled {
+        bail!(
+            "global rendezvous registration requires normal rendezvous registration to be enabled"
+        );
+    }
     if !state.network.rendezvous_mtls_required {
         bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
     }

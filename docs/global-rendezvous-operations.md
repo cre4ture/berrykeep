@@ -79,8 +79,9 @@ retains its legacy meaning of enabling global registration. An explicit
 per-service setting overrides that default, including `false`; selecting a
 global service in the UI does not require setting this environment variable.
 
-Enabling a new global entry requires HTTPS, rendezvous mTLS, a readable and
-valid internal TLS client identity, and the service's trusted CA material.
+Enabling a new global entry requires HTTPS, active rendezvous participation,
+rendezvous mTLS, a readable and valid internal TLS client identity, and the
+service's trusted CA material.
 Retaining a replicated global entry does not require changing a node's legacy
 local mTLS switch. Issued node bootstraps require mTLS whenever they include a
 global service.
