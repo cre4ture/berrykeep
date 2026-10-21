@@ -46,9 +46,10 @@ an operating service and its public HTTPS address have been confirmed.
 - `id` is a stable lowercase identifier with optional hyphen-separated parts.
   IDs must be unique within a catalog; they are not cluster IDs.
 - `name` is the service label shown during initial setup.
-- `url` is the service's absolute HTTPS base URL. A port and path prefix are
-  allowed. A host and, when supplied, a valid port are required; userinfo, query strings and
-  fragments are forbidden. Canonically equivalent URLs must not appear twice.
+- `url` is the service's absolute HTTPS origin. A port and an optional root
+  slash are allowed. Path prefixes, userinfo, query strings and fragments are
+  forbidden in v1. A host and, when supplied, a valid port are required.
+  Canonically equivalent URLs must not appear twice.
 - `global_registration_enabled` must be `true`. It maps directly to the
   corresponding per-service registration policy when the service is selected.
 
@@ -73,6 +74,11 @@ the schema form the v1 contract; format changes require a new schema version.
    service manually. Do not substitute an unverified hardcoded service host.
 4. Selected services require publicly trusted HTTPS certificates. Catalog v1
    does not distribute replacement trust roots or disable TLS verification.
+   The consumer implementation must first add public-root trust for
+   catalog-selected services to the global-registration HTTP client: the current
+   client requires an explicit service CA and disables built-in roots. Keep that
+   explicit-CA mode for manually configured private services. Merely copying a
+   catalog URL into the existing client is insufficient.
    Cluster identities and CA ownership proofs remain part of the existing
    authenticated global-registration protocol; the catalog contains no
    credentials, tokens, cluster private keys, or executable instructions.
@@ -90,3 +96,21 @@ The per-service configuration implementation and this catalog can be reviewed
 independently. Merge the catalog first, verify the raw URL returns valid JSON,
 then ship the setup consumer. No running deployment changes when this catalog
 PR is merged.
+
+## Repository validation
+
+The `Rendezvous catalog` workflow validates catalog changes on pull requests
+and pushes to `main`. It checks the JSON Schema, host and port validity, unique
+service IDs, canonical origin uniqueness, and duplicate JSON object keys. The
+same validator runs offline locally:
+
+```bash
+python3 -m pip install jsonschema==4.26.0
+python3 -m unittest discover -s scripts -p test_validate_global_rendezvous_catalog.py -v
+python3 scripts/validate_global_rendezvous_catalog.py
+```
+
+Canonical origin comparison normalizes host case, IPv6 spelling, an omitted
+HTTPS port versus port 443, a terminal DNS dot, and an optional root slash.
+The setup consumer must enforce these same checks; CI validation complements
+runtime validation rather than replacing it.
