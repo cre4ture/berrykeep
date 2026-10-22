@@ -3338,6 +3338,7 @@ pub struct ServerNodeConfig {
     pub local_status_bind_addr: Option<SocketAddr>,
     pub rendezvous_ca_cert_path: Option<PathBuf>,
     pub rendezvous_services: Vec<transport_sdk::RendezvousServiceConfig>,
+    pub rendezvous_contact_urls: Vec<String>,
     pub rendezvous_urls: Vec<String>,
     pub rendezvous_registration_enabled: bool,
     pub global_rendezvous_registration_enabled: bool,
@@ -5676,10 +5677,13 @@ fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
     )
     .into_iter()
     .collect();
-    let inherited_contacts: HashSet<_> = current_cluster_rendezvous_contact_urls(state)
-        .into_iter()
-        .filter(|url| !explicit_urls.contains(url))
-        .collect();
+    let inherited_contacts: HashSet<_> = rendezvous_registration_policy::contact_hint_urls(
+        state,
+        &current_configured_rendezvous_urls(state),
+    )
+    .into_iter()
+    .filter(|url| !explicit_urls.contains(url))
+    .collect();
     let urls = normalize_rendezvous_url_list(&current_configured_rendezvous_urls(state))
         .unwrap_or_else(|_| current_configured_rendezvous_urls(state));
     let urls: Vec<_> = urls
@@ -6546,6 +6550,7 @@ impl ServerNodeConfig {
             local_status_bind_addr: parse_local_status_bind_addr()?,
             rendezvous_ca_cert_path: None,
             rendezvous_services: bootstrap.rendezvous_services,
+            rendezvous_contact_urls: bootstrap.rendezvous_contact_urls,
             rendezvous_urls: bootstrap.rendezvous_urls,
             rendezvous_registration_enabled: rendezvous_configured,
             global_rendezvous_registration_enabled: env_flag_enabled(
@@ -6914,6 +6919,7 @@ impl ServerNodeConfig {
             rendezvous_urls,
             rendezvous_registration_enabled,
             rendezvous_services: Vec::new(),
+            rendezvous_contact_urls: Vec::new(),
             global_rendezvous_registration_enabled,
             rendezvous_mtls_required,
             managed_rendezvous: None,
@@ -25567,6 +25573,10 @@ fn build_issued_node_bootstrap(
         internal_url: internal_url.clone(),
         internal_tls: request.internal_tls,
         rendezvous_services,
+        rendezvous_contact_urls: rendezvous_registration_policy::contact_hint_urls(
+            state,
+            &rendezvous_urls,
+        ),
         rendezvous_urls,
         rendezvous_mtls_required,
         direct_endpoints,
@@ -29076,6 +29086,7 @@ fn persist_rendezvous_services_if_possible(
         package.bootstrap.rendezvous_urls =
             rendezvous_registration_policy::service_urls(services.services());
         package.bootstrap.rendezvous_services = services.explicit_services();
+        package.bootstrap.rendezvous_contact_urls = services.contact_hints();
         package.bootstrap.rendezvous_mtls_required = state.network.rendezvous_mtls_required
             || services
                 .services()

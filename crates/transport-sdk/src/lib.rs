@@ -106,7 +106,10 @@ pub use rendezvous_runtime::{
     BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayTunnelBroker,
     RelayTunnelEndpoint, RelayTunnelFrame, WakeRegistrationHandle, issue_relay_ticket,
 };
-pub use rendezvous_service::{RendezvousServiceConfig, resolve_rendezvous_services};
+pub use rendezvous_service::{
+    RendezvousServiceConfig, resolve_rendezvous_services,
+    resolve_rendezvous_services_with_contact_hints,
+};
 pub use request_auth::{
     HEADER_AUTH_NONCE, HEADER_AUTH_SIGNATURE, HEADER_AUTH_TIMESTAMP, HEADER_CLUSTER_ID,
     HEADER_CONNECTION_NAME, HEADER_CREDENTIAL_FINGERPRINT, HEADER_DEVICE_ID, HEADER_OPERATION_ID,

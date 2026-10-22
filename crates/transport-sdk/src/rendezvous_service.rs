@@ -56,6 +56,41 @@ pub fn resolve_rendezvous_services(
     Ok(resolved)
 }
 
+/// Keep cached cluster contacts outside the legacy node-wide global default.
+/// Hints classify existing targets; explicit per-service policies still win.
+pub fn resolve_rendezvous_services_with_contact_hints(
+    urls: &[String],
+    services: &[RendezvousServiceConfig],
+    contact_urls: &[String],
+    legacy_global_registration_enabled: bool,
+) -> Result<Vec<RendezvousServiceConfig>> {
+    let explicit_urls = services
+        .iter()
+        .map(|service| normalize_url(&service.url))
+        .collect::<Result<HashSet<_>>>()?;
+    let mut known_urls = urls
+        .iter()
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| normalize_url(url))
+        .collect::<Result<HashSet<_>>>()?;
+    known_urls.extend(explicit_urls.iter().cloned());
+    let mut policies = services.to_vec();
+    let mut seen_hints = HashSet::new();
+    for hint in contact_urls {
+        let url = normalize_url(hint)?;
+        if !known_urls.contains(&url) {
+            bail!("rendezvous contact hint is not a configured rendezvous URL: {url}");
+        }
+        if !explicit_urls.contains(&url) && seen_hints.insert(url.clone()) {
+            policies.push(RendezvousServiceConfig {
+                url,
+                global_registration_enabled: false,
+            });
+        }
+    }
+    resolve_rendezvous_services(urls, &policies, legacy_global_registration_enabled)
+}
+
 fn normalize_url(value: &str) -> Result<String> {
     let url = reqwest::Url::parse(value.trim()).context("invalid rendezvous service URL")?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -140,6 +175,45 @@ mod tests {
         assert!(
             resolve_rendezvous_services(&[], &[service("http://global.example", true)], false)
                 .is_err()
+        );
+    }
+    #[test]
+    fn contact_hints_do_not_inherit_the_legacy_global_default() {
+        let urls: Vec<String> = vec![
+            "https://owned.example/".into(),
+            "http://private.example/".into(),
+            "https://override.example/".into(),
+        ];
+        let hints = vec![urls[1].clone(), urls[2].clone()];
+        for global in [false, true] {
+            let resolved = resolve_rendezvous_services_with_contact_hints(
+                &urls,
+                &[service(&urls[2], global)],
+                &hints,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                resolved,
+                vec![
+                    service(&urls[0], true),
+                    service(&urls[1], false),
+                    service(&urls[2], global)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn contact_hint_metadata_cannot_introduce_an_unlisted_target() {
+        assert!(
+            resolve_rendezvous_services_with_contact_hints(
+                &["https://known.example/".into()],
+                &[],
+                &["https://unlisted.example/".into()],
+                true
+            )
+            .is_err()
         );
     }
 }

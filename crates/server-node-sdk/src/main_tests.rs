@@ -1101,6 +1101,7 @@ fn test_cluster_config_without_internal_tls(
         local_status_bind_addr: None,
         rendezvous_ca_cert_path: None,
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec![format!("http://{bind_addr}")],
         rendezvous_registration_enabled: false,
         global_rendezvous_registration_enabled: false,
@@ -1163,6 +1164,7 @@ fn install_internal_tls_for_test_config(
             key_path: "tls/internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: config.rendezvous_urls.clone(),
         rendezvous_mtls_required: config.rendezvous_mtls_required,
         direct_endpoints: Vec::new(),
@@ -9568,6 +9570,7 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
             key_path: "tls/internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: true,
         direct_endpoints: vec![
@@ -9868,6 +9871,7 @@ async fn internal_node_tls_material_uses_identity_only_sans() {
             key_path: "tls/internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: Vec::new(),
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -10685,6 +10689,7 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
             key_path: "tls/internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -10789,6 +10794,7 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
             key_path: "tls/internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["http://127.0.0.1:9".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: vec![transport_sdk::BootstrapEndpoint {
@@ -11200,6 +11206,7 @@ async fn manual_node_enrollment_renewal_forces_live_tls_reload() {
             key_path: "tls/internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -11502,6 +11509,7 @@ async fn automatic_renewal_migrates_missing_identity_uri_sans() {
             key_path: "tls/internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -11818,6 +11826,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
             key_path: "tls/internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: true,
         direct_endpoints: Vec::new(),
@@ -11902,6 +11911,7 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
             key_path: "tls/capture-internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: Vec::new(),
         rendezvous_mtls_required: true,
         direct_endpoints: Vec::new(),
@@ -12113,6 +12123,7 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
                 key_path: "tls/internal.key".to_string(),
             }),
             rendezvous_services: Vec::new(),
+            rendezvous_contact_urls: Vec::new(),
             rendezvous_urls: vec![rendezvous_url.clone()],
             rendezvous_mtls_required: false,
             direct_endpoints: Vec::new(),
@@ -12265,6 +12276,7 @@ async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metada
             key_path: "tls/internal.key".to_string(),
         }),
         rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -28429,6 +28441,10 @@ async fn rendezvous_issued_contact_policy_remains_revocable_on_the_child() {
         "replicated policies must not be exported as local overrides"
     );
     assert!(bootstrap.rendezvous_urls.contains(&url));
+    assert_eq!(
+        serde_json::to_value(&bootstrap).unwrap()["rendezvous_contact_urls"],
+        serde_json::json!([url])
+    );
     assert!(bootstrap.rendezvous_mtls_required);
     let mut child = build_test_state(1, false, MainTestBackend::Sqlite).await;
     child.cluster_id = bootstrap.cluster_id;
@@ -28491,6 +28507,13 @@ async fn rendezvous_issued_contact_policy_remains_revocable_on_the_child() {
     assert_eq!(status, StatusCode::OK, "{payload}");
     let unchanged = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
     assert!(unchanged.rendezvous_services.is_empty());
+    assert_eq!(
+        serde_json::to_value(
+            transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap()
+        )
+        .unwrap()["bootstrap"]["rendezvous_contact_urls"],
+        serde_json::json!([url])
+    );
     assert!(
         unchanged.rendezvous_urls.contains(&url),
         "bootstrap lookup hints must survive editor saves"
@@ -28619,4 +28642,48 @@ async fn rendezvous_replicated_global_contacts_require_client_identity() {
     );
     assert!(super::validate_rendezvous_client_identity_issuance(&state).is_ok());
     cleanup_test_state(&state).await;
+}
+
+#[test]
+fn rendezvous_legacy_global_default_excludes_persisted_contact_hints() {
+    let root = fresh_test_dir("rendezvous-legacy-hint-provenance");
+    let hints = vec!["http://private.example/", "https://private-tls.example/"];
+    let bootstrap: transport_sdk::NodeBootstrap = serde_json::from_value(serde_json::json!({
+        "version":1, "cluster_id":Uuid::now_v7(), "node_id":Uuid::now_v7(),
+        "data_dir":root.join("node"), "bind_addr":"127.0.0.1:39080",
+        "internal_bind_addr":"127.0.0.1:49080",
+        "internal_tls":{"ca_cert_path":"tls/ca.pem","cert_path":"tls/node.pem","key_path":"tls/node.key"},
+        "rendezvous_urls":["https://node-owned.example/", hints[0], hints[1]],
+        "rendezvous_contact_urls":hints, "rendezvous_services":[],
+        "rendezvous_mtls_required":true, "trust_roots":{"cluster_ca_pem":"ca"}
+    })).unwrap();
+    let path = root.join("enrollment.json");
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: None,
+        internal_tls_material: Some(sample_tls_material()),
+    }
+    .write_to_path(&path)
+    .unwrap();
+    let mut config = ServerNodeConfig::from_enrollment_path(&path).unwrap();
+    config.global_rendezvous_registration_enabled = true;
+    let configured =
+        super::rendezvous_registration_policy::ConfiguredServices::from_config(&config)
+            .expect("private HTTP hints must not inherit the legacy global default");
+    assert!(
+        configured
+            .services()
+            .iter()
+            .filter(|service| service.url != "https://node-owned.example/")
+            .all(|service| !service.global_registration_enabled)
+    );
+    let explicit = configured.explicit_services();
+    assert_eq!(explicit.len(), 1);
+    assert_eq!(explicit[0].url, "https://node-owned.example/");
+    assert!(explicit[0].global_registration_enabled);
+    config
+        .rendezvous_urls
+        .retain(|url| url != "https://node-owned.example/");
+    assert!(super::validate_global_rendezvous_registration_config(&config).is_ok());
+    std::fs::remove_dir_all(root).unwrap();
 }

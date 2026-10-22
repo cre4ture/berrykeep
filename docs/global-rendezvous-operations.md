@@ -73,8 +73,12 @@ it. An explicit node-local policy takes precedence when the same URL is also a
 cluster contact. The embedded managed rendezvous always remains cluster-specific.
 
 Issued enrollment packages retain contact URLs as bootstrap lookup hints, but
-export only explicit local policies. URL-only hints inherit subsequent contact
-policy changes, including revocation of global registration. Legacy URL-only
+export only explicit local policies. The optional `rendezvous_contact_urls`
+field records the hint addresses independently; `rendezvous_urls` remains the
+combined URL list for compatibility. The legacy global default applies only to
+local addresses, while explicit per-service overrides still take precedence.
+URL-only hints inherit subsequent contact policy changes, including revocation
+of global registration. Legacy URL-only
 edits preserve that distinction across persistence and restart. Saving the
 operator-managed service editor writes explicit local policies. Inherited contact
 hints appear in the effective configuration and cluster contact editor, rather

@@ -1621,6 +1621,7 @@ mod tests {
                 key_path: tls_paths.2.display().to_string(),
             }),
             rendezvous_services: Vec::new(),
+            rendezvous_contact_urls: Vec::new(),
             rendezvous_urls,
             rendezvous_mtls_required,
             direct_endpoints: Vec::new(),

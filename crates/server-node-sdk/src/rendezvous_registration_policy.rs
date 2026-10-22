@@ -1,5 +1,8 @@
 use super::*;
-use transport_sdk::{RendezvousServiceConfig, resolve_rendezvous_services};
+use transport_sdk::{
+    RendezvousServiceConfig, resolve_rendezvous_services,
+    resolve_rendezvous_services_with_contact_hints,
+};
 
 /// URL-only bootstrap hints remain fallbacks; only explicit operator policies
 /// may shadow the replicated contact object.
@@ -7,26 +10,36 @@ use transport_sdk::{RendezvousServiceConfig, resolve_rendezvous_services};
 pub(super) struct ConfiguredServices {
     services: Vec<RendezvousServiceConfig>,
     explicit_policy_urls: HashSet<String>,
+    contact_hint_urls: HashSet<String>,
 }
 
 impl ConfiguredServices {
     pub(super) fn from_config(config: &ServerNodeConfig) -> Result<Self> {
         let services = configured_services(config)?;
-        let mut explicit_policy_urls = if config.global_rendezvous_registration_enabled {
-            service_urls(&services).into_iter().collect()
-        } else {
-            config
-                .rendezvous_services
-                .iter()
-                .map(|service| canonicalize_rendezvous_url(&service.url))
-                .collect::<Result<HashSet<_>>>()?
-        };
+        let contact_hint_urls: HashSet<_> =
+            normalize_rendezvous_url_list(&config.rendezvous_contact_urls)?
+                .into_iter()
+                .collect();
+        let mut explicit_policy_urls = config
+            .rendezvous_services
+            .iter()
+            .map(|service| canonicalize_rendezvous_url(&service.url))
+            .collect::<Result<HashSet<_>>>()?;
+        if config.global_rendezvous_registration_enabled {
+            explicit_policy_urls.extend(
+                services
+                    .iter()
+                    .filter(|service| !contact_hint_urls.contains(&service.url))
+                    .map(|service| service.url.clone()),
+            );
+        }
         if let Some(managed) = &config.managed_rendezvous {
             explicit_policy_urls.insert(canonicalize_rendezvous_url(&managed.public_url)?);
         }
         Ok(Self {
             services,
             explicit_policy_urls,
+            contact_hint_urls,
         })
     }
 
@@ -35,11 +48,20 @@ impl ConfiguredServices {
         Self {
             services,
             explicit_policy_urls,
+            contact_hint_urls: HashSet::new(),
         }
     }
 
     pub(super) fn services(&self) -> &[RendezvousServiceConfig] {
         &self.services
+    }
+
+    pub(super) fn contact_hints(&self) -> Vec<String> {
+        self.services
+            .iter()
+            .filter(|service| self.contact_hint_urls.contains(&service.url))
+            .map(|service| service.url.clone())
+            .collect()
     }
 
     pub(super) fn explicit_services(&self) -> Vec<RendezvousServiceConfig> {
@@ -69,9 +91,10 @@ pub(super) fn configured_services(
             global_registration_enabled: false,
         });
     }
-    resolve_rendezvous_services(
+    resolve_rendezvous_services_with_contact_hints(
         &config.rendezvous_urls,
         &explicit,
+        &config.rendezvous_contact_urls,
         config.global_rendezvous_registration_enabled,
     )
 }
@@ -93,6 +116,28 @@ pub(super) fn explicit_configured_services(state: &ServerState) -> Vec<Rendezvou
         .lock()
         .expect("rendezvous services mutex poisoned")
         .explicit_services()
+}
+
+pub(super) fn contact_hint_urls(state: &ServerState, urls: &[String]) -> Vec<String> {
+    let configured = state
+        .network
+        .configured_rendezvous_services
+        .lock()
+        .expect("rendezvous services mutex poisoned")
+        .clone();
+    let mut hints = configured.contact_hint_urls;
+    hints.extend(current_cluster_rendezvous_contact_urls(state));
+    let owned: HashSet<_> = configured
+        .services
+        .iter()
+        .map(|service| &service.url)
+        .collect();
+    // A URL disappearing concurrently from local configuration is a conservative
+    // lookup hint, never a new target for the legacy global default.
+    urls.iter()
+        .filter(|url| hints.contains(*url) || !owned.contains(*url))
+        .cloned()
+        .collect()
 }
 
 pub(super) fn current_services(state: &ServerState) -> Vec<RendezvousServiceConfig> {
@@ -180,10 +225,18 @@ pub(super) async fn updated_services(
     validate_services(state, &services, &explicit_configured_services(state)).await?;
     // Cluster-owned contacts remain bootstrap hints even when the local editor
     // has no rows; they must not become explicit policies or disappear on save.
-    let hint_urls = combine_rendezvous_urls(
-        &service_urls(&services),
+    let cached_hints = state
+        .network
+        .configured_rendezvous_services
+        .lock()
+        .expect("rendezvous services mutex poisoned")
+        .contact_hints();
+    let contacts = combine_rendezvous_urls(
+        &cached_hints,
         &current_cluster_rendezvous_contact_urls(state),
     );
+    let hint_urls = combine_rendezvous_urls(&service_urls(&services), &contacts);
+    let contact_hint_urls: HashSet<_> = contacts.into_iter().collect();
     let urls = build_effective_rendezvous_urls(state, &hint_urls)?;
     if let Some(managed) = state.network.managed_rendezvous_public_url.as_deref() {
         explicit_policy_urls.insert(canonicalize_rendezvous_url(managed)?);
@@ -191,6 +244,7 @@ pub(super) async fn updated_services(
     Ok(ConfiguredServices {
         services: resolve_rendezvous_services(&urls, &services, false)?,
         explicit_policy_urls,
+        contact_hint_urls,
     })
 }
 
