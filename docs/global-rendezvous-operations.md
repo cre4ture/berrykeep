@@ -76,8 +76,19 @@ Issued enrollment packages retain contact URLs as bootstrap lookup hints, but
 export only explicit local policies. URL-only hints inherit subsequent contact
 policy changes, including revocation of global registration. Legacy URL-only
 edits preserve that distinction across persistence and restart. Saving the
-operator-managed service editor writes explicit local policies. Saving a global
-role also records its required mTLS setting in the enrollment package.
+operator-managed service editor writes explicit local policies. Inherited contact
+hints appear in the effective configuration and cluster contact editor, rather
+than as local service rows; saving unrelated local settings preserves inheritance.
+The persisted mTLS requirement is derived from the node's current configuration
+and its explicit global roles. Removing a global role does not disable mTLS
+that the node itself still requires.
+
+Startup compatibility: all rendezvous URLs now require an HTTP or HTTPS scheme
+and a host, including private services and legacy URL-only configuration.
+Replace `rendezvous.example:9443` with `https://rendezvous.example:9443` before
+upgrading. That malformed value previously left the node running with failed
+registration attempts; startup now rejects it with a rendezvous service URL
+validation error.
 
 The URL-only API fields remain available for existing clients and bootstraps.
 Old entries default to cluster-specific. For startup URLs without an explicit
@@ -101,6 +112,11 @@ file using `BERRYKEEP_RENDEZVOUS_CA_CERT`, or supply the bundle in the enrollmen
 package's `trust_roots.rendezvous_ca_pem`. Keep the cluster identity CA file
 separate; adding service trust roots must not change the cluster ownership CA.
 Selecting a global role does not automatically install that service's CA.
+
+Client bootstrap metadata and client certificate issuance also derive their
+mTLS requirement from active global contacts, even when the legacy node-local
+mTLS switch is off. A node without the cluster signing key rejects client
+credential issuance that it cannot complete for those services.
 
 Nodes first publish presence using their existing cluster identity. If the
 service rejects presence, a node holding the cluster CA signing key and an

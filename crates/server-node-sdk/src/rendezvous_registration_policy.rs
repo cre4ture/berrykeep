@@ -133,9 +133,17 @@ pub(super) fn current_services(state: &ServerState) -> Vec<RendezvousServiceConf
     services
 }
 
+pub(super) fn requires_mtls(state: &ServerState) -> bool {
+    state.network.rendezvous_mtls_required
+        || (state.network.rendezvous_registration_enabled
+            && current_services(state)
+                .iter()
+                .any(|service| service.global_registration_enabled))
+}
+
 pub(super) fn editable_services(state: &ServerState) -> Vec<RendezvousServiceConfig> {
     let editable_urls = current_editable_rendezvous_urls(state);
-    current_services(state)
+    current_configured_services(state)
         .into_iter()
         .filter(|service| editable_urls.contains(&service.url))
         .collect()
@@ -170,7 +178,13 @@ pub(super) async fn updated_services(
     };
     // Copying an inherited role into local configuration is a new local policy.
     validate_services(state, &services, &explicit_configured_services(state)).await?;
-    let urls = build_effective_rendezvous_urls(state, &service_urls(&services))?;
+    // Cluster-owned contacts remain bootstrap hints even when the local editor
+    // has no rows; they must not become explicit policies or disappear on save.
+    let hint_urls = combine_rendezvous_urls(
+        &service_urls(&services),
+        &current_cluster_rendezvous_contact_urls(state),
+    );
+    let urls = build_effective_rendezvous_urls(state, &hint_urls)?;
     if let Some(managed) = state.network.managed_rendezvous_public_url.as_deref() {
         explicit_policy_urls.insert(canonicalize_rendezvous_url(managed)?);
     }

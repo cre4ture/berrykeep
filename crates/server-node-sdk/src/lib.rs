@@ -2319,7 +2319,7 @@ fn text_fingerprint(value: &str) -> String {
 }
 
 fn client_transport_identity_issuance_context(state: &ServerState) -> Option<&'static str> {
-    if state.network.rendezvous_mtls_required {
+    if rendezvous_registration_policy::requires_mtls(state) {
         Some("rendezvous mTLS")
     } else if state.network.relay_mode != RelayMode::Disabled {
         Some("relay inner mTLS")
@@ -5671,8 +5671,21 @@ async fn rendezvous_registration_views(
 }
 
 fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
+    let explicit_urls: HashSet<_> = rendezvous_registration_policy::service_urls(
+        &rendezvous_registration_policy::explicit_configured_services(state),
+    )
+    .into_iter()
+    .collect();
+    let inherited_contacts: HashSet<_> = current_cluster_rendezvous_contact_urls(state)
+        .into_iter()
+        .filter(|url| !explicit_urls.contains(url))
+        .collect();
     let urls = normalize_rendezvous_url_list(&current_configured_rendezvous_urls(state))
         .unwrap_or_else(|_| current_configured_rendezvous_urls(state));
+    let urls: Vec<_> = urls
+        .into_iter()
+        .filter(|url| !inherited_contacts.contains(url))
+        .collect();
     match state
         .network
         .managed_rendezvous_public_url
@@ -25152,7 +25165,7 @@ async fn issue_client_bootstrap_impl(
         version: 1,
         cluster_id: state.cluster_id,
         rendezvous_urls,
-        rendezvous_mtls_required: state.network.rendezvous_mtls_required,
+        rendezvous_mtls_required: rendezvous_registration_policy::requires_mtls(state),
         direct_endpoints: endpoints,
         relay_mode: state.network.relay_mode,
         trust_roots: bootstrap_trust_roots(state).map_err(|status| {
@@ -29063,10 +29076,11 @@ fn persist_rendezvous_services_if_possible(
         package.bootstrap.rendezvous_urls =
             rendezvous_registration_policy::service_urls(services.services());
         package.bootstrap.rendezvous_services = services.explicit_services();
-        package.bootstrap.rendezvous_mtls_required |= services
-            .services()
-            .iter()
-            .any(|service| service.global_registration_enabled);
+        package.bootstrap.rendezvous_mtls_required = state.network.rendezvous_mtls_required
+            || services
+                .services()
+                .iter()
+                .any(|service| service.global_registration_enabled);
     })
 }
 

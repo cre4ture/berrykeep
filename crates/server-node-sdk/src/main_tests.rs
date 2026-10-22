@@ -8276,7 +8276,12 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     state.network.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
     *state.network.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.network.rendezvous_registration_enabled = true;
-    state.network.rendezvous_mtls_required = true;
+    state.network.rendezvous_mtls_required = false;
+    *state.network.cluster_rendezvous_services.lock().unwrap() =
+        vec![transport_sdk::RendezvousServiceConfig {
+            url: "https://rendezvous.example/".into(),
+            global_registration_enabled: true,
+        }];
     super::replace_advertised_direct_endpoints(
         &state,
         super::build_effective_operator_direct_endpoints(
@@ -28178,6 +28183,17 @@ async fn rendezvous_service_policies_round_trip_and_survive_enrollment_reload() 
             .rendezvous_services[0]
             .global_registration_enabled
     );
+    // Removing the final global role follows current local mTLS configuration.
+    state.network.rendezvous_mtls_required = false;
+    let app = super::build_server_apps(&state).public_app;
+    let (status, payload) = execute_admin_control_request(&app, Method::PUT, path, Some(TEST_ADMIN_TOKEN), Some(serde_json::json!({"editable_services":[{"url":"http://private.example/", "global_registration_enabled":false}]}))).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert!(
+        !ServerNodeConfig::from_enrollment_path(&package_path)
+            .unwrap()
+            .rendezvous_mtls_required,
+        "the persisted mTLS flag must not retain a removed global requirement"
+    );
     cleanup_test_state(&state).await;
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -28449,6 +28465,36 @@ async fn rendezvous_issued_contact_policy_remains_revocable_on_the_child() {
     );
     // A legacy URL-only save and restart must preserve the inherited source.
     let app = super::build_server_apps(&child).public_app;
+    let (status, settings) = execute_admin_control_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/rendezvous-config",
+        Some(TEST_ADMIN_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        settings["editable_services"].as_array().unwrap().is_empty(),
+        "contact hints must not appear as local editable policies: {settings}"
+    );
+    assert!(settings["editable_urls"].as_array().unwrap().is_empty());
+    // Echoing the complete editor unchanged must preserve inherited policies.
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/rendezvous-config",
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_services":settings["editable_services"].clone()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let unchanged = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    assert!(unchanged.rendezvous_services.is_empty());
+    assert!(
+        unchanged.rendezvous_urls.contains(&url),
+        "bootstrap lookup hints must survive editor saves"
+    );
     // Pinning an inherited role locally requires a usable local identity.
     assert!(child.network.internal_tls_runtime.is_none());
     let (status, payload) = execute_admin_control_request(
@@ -28465,6 +28511,28 @@ async fn rendezvous_issued_contact_policy_remains_revocable_on_the_child() {
             .as_str()
             .unwrap()
             .contains("client identity")
+    );
+    // An unrelated local edit must work with the legacy local mTLS switch off.
+    child.network.rendezvous_mtls_required = false;
+    let app = super::build_server_apps(&child).public_app;
+    let local_services = serde_json::json!([{"url":"http://node-private.example/", "global_registration_enabled":false}]);
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/rendezvous-config",
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_services":local_services})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["editable_services"], local_services);
+    let edited = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    assert!(edited.rendezvous_urls.contains(&url));
+    assert!(
+        edited
+            .rendezvous_services
+            .iter()
+            .all(|service| service.url != url)
     );
     let (status, payload) = execute_admin_control_request(
         &app,
@@ -28518,4 +28586,37 @@ async fn rendezvous_issued_contact_policy_remains_revocable_on_the_child() {
     );
     cleanup_test_state(&child).await;
     cleanup_test_state(&issuer).await;
+}
+
+#[tokio::test]
+async fn rendezvous_replicated_global_contacts_require_client_identity() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = false;
+    let (ca, key) = generate_test_internal_ca();
+    state.network.cluster_ca_pem = Some(ca);
+    state.network.internal_ca_key_pem = Some(key);
+    *state.network.cluster_rendezvous_services.lock().unwrap() =
+        vec![transport_sdk::RendezvousServiceConfig {
+            url: "https://global.example/".into(),
+            global_registration_enabled: true,
+        }];
+    assert_eq!(
+        super::client_transport_identity_issuance_context(&state),
+        Some("rendezvous mTLS")
+    );
+    assert!(
+        super::issue_client_rendezvous_identity_pem(&state, "client-inherited-global", None)
+            .unwrap()
+            .is_some()
+    );
+    state.network.internal_ca_key_pem = None;
+    assert!(super::validate_rendezvous_client_identity_issuance(&state).is_err());
+    state.network.rendezvous_registration_enabled = false;
+    assert_eq!(
+        super::client_transport_identity_issuance_context(&state),
+        None
+    );
+    assert!(super::validate_rendezvous_client_identity_issuance(&state).is_ok());
+    cleanup_test_state(&state).await;
 }
