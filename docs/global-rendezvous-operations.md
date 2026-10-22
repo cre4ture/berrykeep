@@ -84,9 +84,10 @@ explicit local policies. Inherited contact
 hints appear in the effective configuration and cluster contact editor, rather
 than as local service rows; saving unrelated local settings preserves inheritance.
 Hints remain available until the confirmed contact object reaches the node.
-Once it arrives, its list (including an explicitly empty list) removes obsolete
-inherited hints from runtime configuration and the enrollment package. Explicit
-local overrides remain under operator control.
+Once it arrives, its list refreshes inherited hints in runtime configuration and
+the enrollment package, including newly advertised addresses. An explicitly
+empty list removes all inherited hints. Explicit local overrides remain under
+operator control.
 The persisted mTLS requirement is derived from the node's current configuration
 and its explicit global roles. Removing a global role does not disable mTLS
 that the node itself still requires.

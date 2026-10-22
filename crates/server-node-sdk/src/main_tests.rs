@@ -28750,6 +28750,28 @@ async fn rendezvous_confirmed_contacts_reconcile_cached_bootstrap_hints() {
         url: overridden.clone(),
         global_registration_enabled: false,
     }];
+    let package_path = state
+        .managed_paths
+        .data_dir()
+        .join("contact-fallbacks.json");
+    let bootstrap = serde_json::from_value(serde_json::json!({
+        "version":1, "cluster_id":state.cluster_id, "node_id":state.node_id,
+        "data_dir":state.managed_paths.data_dir().join("persisted-node"),
+        "bind_addr":"127.0.0.1:39080", "internal_bind_addr":"127.0.0.1:49080",
+        "internal_tls":{"ca_cert_path":"tls/ca.pem","cert_path":"tls/node.pem","key_path":"tls/node.key"},
+        "rendezvous_urls":config.rendezvous_urls,
+        "rendezvous_services":config.rendezvous_services,
+        "rendezvous_contact_urls":config.rendezvous_contact_urls,
+        "trust_roots":{"cluster_ca_pem":"ca"}
+    })).unwrap();
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: None,
+        internal_tls_material: Some(sample_tls_material()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+    state.network.node_enrollment_path = Some(package_path.clone());
     super::replace_configured_rendezvous_services(
         &state,
         super::rendezvous_registration_policy::ConfiguredServices::from_config(&config).unwrap(),
@@ -28772,6 +28794,12 @@ async fn rendezvous_confirmed_contacts_reconcile_cached_bootstrap_hints() {
         assert_eq!(status, StatusCode::OK, "{payload}");
         let expected = [vec![owned.clone(), overridden.clone()], contacts.clone()].concat();
         assert_eq!(super::current_rendezvous_urls(&state), expected);
+        let saved = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+        assert_eq!(
+            saved.rendezvous_urls, expected,
+            "the replacement must survive restart before an editor save"
+        );
+        assert_eq!(saved.rendezvous_contact_urls, contacts);
         assert_eq!(
             super::rendezvous_registration_policy::service_urls(
                 &super::rendezvous_registration_policy::current_services(&state)
