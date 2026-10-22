@@ -64,6 +64,17 @@ impl ConfiguredServices {
             .collect()
     }
 
+    pub(super) fn local_service_urls(&self) -> Vec<String> {
+        self.services
+            .iter()
+            .filter(|service| {
+                !self.contact_hint_urls.contains(&service.url)
+                    || self.explicit_policy_urls.contains(&service.url)
+            })
+            .map(|service| service.url.clone())
+            .collect()
+    }
+
     pub(super) fn reconcile_contact_hints(&mut self, contacts: &[RendezvousServiceConfig]) -> bool {
         let live: HashSet<_> = contacts.iter().map(|service| &service.url).collect();
         let previous_services = self.services.clone();
@@ -251,22 +262,32 @@ pub(super) async fn updated_services(
     validate_services(state, &services, &explicit_configured_services(state)).await?;
     // Cluster-owned contacts remain bootstrap hints even when the local editor
     // has no rows; they must not become explicit policies or disappear on save.
-    let cached_hints = state
+    let configured = state
         .network
         .configured_rendezvous_services
         .lock()
         .expect("rendezvous services mutex poisoned")
-        .contact_hints();
-    let contacts = combine_rendezvous_urls(
-        &cached_hints,
-        &current_cluster_rendezvous_contact_urls(state),
-    );
-    let hint_urls = combine_rendezvous_urls(&service_urls(&services), &contacts);
-    let contact_hint_urls: HashSet<_> = contacts.into_iter().collect();
-    let urls = build_effective_rendezvous_urls(state, &hint_urls)?;
+        .clone();
+    let local_urls: HashSet<_> = configured.local_service_urls().into_iter().collect();
+    let requested_urls = service_urls(&services);
     if let Some(managed) = state.network.managed_rendezvous_public_url.as_deref() {
         explicit_policy_urls.insert(canonicalize_rendezvous_url(managed)?);
     }
+    let contacts = combine_rendezvous_urls(
+        &configured.contact_hints(),
+        &current_cluster_rendezvous_contact_urls(state),
+    );
+    let hint_urls = combine_rendezvous_urls(&requested_urls, &contacts);
+    // Sharing an address with the contact object does not transfer ownership
+    // of a retained local URL, including one from a legacy enrollment package.
+    let contact_hint_urls = contacts
+        .into_iter()
+        .filter(|url| {
+            !(explicit_policy_urls.contains(url)
+                || local_urls.contains(url) && requested_urls.contains(url))
+        })
+        .collect();
+    let urls = build_effective_rendezvous_urls(state, &hint_urls)?;
     Ok(ConfiguredServices {
         services: resolve_rendezvous_services(&urls, &services, false)?,
         explicit_policy_urls,

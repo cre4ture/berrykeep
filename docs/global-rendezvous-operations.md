@@ -88,6 +88,8 @@ Once it arrives, its list refreshes inherited hints in runtime configuration and
 the enrollment package, including newly advertised addresses. An explicitly
 empty list removes all inherited hints. Explicit local overrides remain under
 operator control.
+Node-owned URLs in older enrollment packages remain editable when the cluster
+also advertises the same address. URL-only saves retain that local ownership.
 The persisted mTLS requirement is derived from the node's current configuration
 and its explicit global roles. Removing a global role does not disable mTLS
 that the node itself still requires.

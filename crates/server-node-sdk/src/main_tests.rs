@@ -28851,7 +28851,7 @@ async fn rendezvous_confirmed_contacts_reconcile_cached_bootstrap_hints() {
         .unwrap();
     assert!(super::current_rendezvous_urls(&state).contains(&removed));
     let app = super::build_server_apps(&state).public_app;
-    for contacts in [vec![replacement.clone()], Vec::new()] {
+    for contacts in [vec![owned.clone(), replacement.clone()], Vec::new()] {
         let (status, payload) = execute_admin_control_request(
             &app,
             Method::PUT,
@@ -28861,14 +28861,23 @@ async fn rendezvous_confirmed_contacts_reconcile_cached_bootstrap_hints() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{payload}");
-        let expected = [vec![owned.clone(), overridden.clone()], contacts.clone()].concat();
+        let inherited: Vec<_> = contacts
+            .iter()
+            .filter(|url| **url != owned)
+            .cloned()
+            .collect();
+        let expected = [vec![owned.clone(), overridden.clone()], inherited.clone()].concat();
         assert_eq!(super::current_rendezvous_urls(&state), expected);
+        assert!(
+            super::current_editable_rendezvous_urls(&state).contains(&owned),
+            "a node-owned URL must stay editable when also advertised by the cluster"
+        );
         let saved = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
         assert_eq!(
             saved.rendezvous_urls, expected,
             "the replacement must survive restart before an editor save"
         );
-        assert_eq!(saved.rendezvous_contact_urls, contacts);
+        assert_eq!(saved.rendezvous_contact_urls, inherited);
         assert_eq!(
             super::rendezvous_registration_policy::service_urls(
                 &super::rendezvous_registration_policy::current_services(&state)
@@ -28885,6 +28894,13 @@ async fn rendezvous_confirmed_contacts_reconcile_cached_bootstrap_hints() {
         .await;
         assert_eq!(status, StatusCode::OK, "{payload}");
         assert_eq!(super::current_rendezvous_urls(&state), expected);
+        assert_eq!(
+            ServerNodeConfig::from_enrollment_path(&package_path)
+                .unwrap()
+                .rendezvous_contact_urls,
+            inherited,
+            "URL-only saves must preserve node ownership for overlapping contacts"
+        );
     }
     cleanup_test_state(&state).await;
 }

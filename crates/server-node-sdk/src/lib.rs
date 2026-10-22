@@ -5689,24 +5689,13 @@ async fn rendezvous_registration_views(
 }
 
 fn current_editable_rendezvous_urls(state: &ServerState) -> Vec<String> {
-    let explicit_urls: HashSet<_> = rendezvous_registration_policy::service_urls(
-        &rendezvous_registration_policy::explicit_configured_services(state),
-    )
-    .into_iter()
-    .collect();
-    let inherited_contacts: HashSet<_> = rendezvous_registration_policy::contact_hint_urls(
-        state,
-        &current_configured_rendezvous_urls(state),
-    )
-    .into_iter()
-    .filter(|url| !explicit_urls.contains(url))
-    .collect();
-    let urls = normalize_rendezvous_url_list(&current_configured_rendezvous_urls(state))
-        .unwrap_or_else(|_| current_configured_rendezvous_urls(state));
-    let urls: Vec<_> = urls
-        .into_iter()
-        .filter(|url| !inherited_contacts.contains(url))
-        .collect();
+    let urls = state
+        .network
+        .configured_rendezvous_services
+        .lock()
+        .expect("configured rendezvous services mutex poisoned")
+        .local_service_urls();
+    let urls = normalize_rendezvous_url_list(&urls).unwrap_or(urls);
     match state
         .network
         .managed_rendezvous_public_url
