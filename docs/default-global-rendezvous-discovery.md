@@ -29,16 +29,18 @@ locally rather than downloading or executing schemas.
     {
       "id": "berrykeep-default",
       "name": "BerryKeep Global Rendezvous",
-      "url": "https://rendezvous.example.com",
+      "url": "https://217.160.159.105:9443",
       "global_registration_enabled": true
     }
   ]
 }
 ```
 
-The example hostname is illustrative and must not be published as an active
-default. The initial real catalog deliberately contains an empty list until
-an operating service and its public HTTPS address have been confirmed.
+The initial catalog advertises the public Global Rendezvous service on Strato
+at `https://217.160.159.105:9443`. Its publicly trusted IP certificate and HTTPS
+health were verified on 2026-10-22 after deployment of v2.0.1. Two independent
+clusters passed signed registration, mTLS isolation, and persistent-registry
+restart checks on the same host before the public listener was activated.
 
 - `schema_version` is the integer `1`. Unsupported versions are rejected.
 - `rendezvous_services` contains zero to sixteen entries in display order.
