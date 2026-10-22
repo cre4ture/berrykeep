@@ -2395,12 +2395,19 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
         .get_mut(&url)
         .unwrap()
         .next_attempt_at = tokio::time::Instant::now();
+    let error = super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap_err();
+    let diagnostic = error.to_string();
     assert!(
-        super::rendezvous_registration_policy::register_endpoint_presence(
-            &node, &url, &client, &presence
-        )
-        .await
-        .is_err()
+        diagnostic.contains("401"),
+        "original presence failure must remain visible: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("503"),
+        "failed recovery must remain visible: {diagnostic}"
     );
     *state.challenge_request.lock().await = None;
     state.reject_proofs.store(false, Ordering::SeqCst);

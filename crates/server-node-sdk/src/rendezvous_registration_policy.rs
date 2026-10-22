@@ -457,5 +457,9 @@ pub(super) async fn register_endpoint_presence(
             entry.failed();
         }
     }
-    recovery
+    recovery.map_err(|error| {
+        let context =
+            format!("presence failed: {presence_error:#}; global recovery failed: {error:#}");
+        error.context(context)
+    })
 }

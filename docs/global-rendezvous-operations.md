@@ -148,6 +148,8 @@ only successful presence clears the failure count. Enrollment requests keep
 their own timeout budget, separate from presence requests, and
 read current trust material for each proof attempt. This recovery does not
 replace an existing cluster CA: Option 1 still rejects cluster CA rotation.
+When recovery fails, the endpoint diagnostic retains both the initial presence
+failure and the recovery failure.
 
 ## Registry and admission
 
