@@ -421,18 +421,20 @@ pub(super) async fn register_endpoint_presence(
             .next_attempt_at =
             tokio::time::Instant::now() + Duration::from_secs(ENROLLMENT_RECOVERY_GRACE_SECS);
     }
-    let enrollment = enroll_cluster(state, url, key).await;
+    let recovery = match enroll_cluster(state, url, key).await {
+        Ok(()) => publish_presence(url, client, registration).await,
+        Err(error) => Err(error),
+    };
     {
         let mut enrollments = state.network.global_rendezvous_enrollments.lock().await;
         let entry = enrollments
             .entry(url.to_string())
             .or_insert_with(GlobalEnrollmentState::healthy);
-        if enrollment.is_ok() {
+        if recovery.is_ok() {
             *entry = GlobalEnrollmentState::healthy();
         } else {
             entry.failed();
         }
     }
-    enrollment?;
-    publish_presence(url, client, registration).await
+    recovery
 }

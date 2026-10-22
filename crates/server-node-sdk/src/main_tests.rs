@@ -2437,6 +2437,75 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
             .consecutive_failures,
         0
     );
+    // A successful proof does not repair an independently rejected presence.
+    // Recovery failures must back off until presence is actually healthy.
+    for (index, delay_secs) in [5_u64, 10, 20, 40, 80, 160, 300, 300]
+        .into_iter()
+        .enumerate()
+    {
+        node.network
+            .global_rendezvous_enrollments
+            .lock()
+            .await
+            .get_mut(&url)
+            .unwrap()
+            .next_attempt_at = tokio::time::Instant::now();
+        *state.completion_request.lock().await = None;
+        assert!(
+            super::rendezvous_registration_policy::register_endpoint_presence(
+                &node,
+                &url,
+                &client,
+                &failed_presence
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            state.completion_request.lock().await.is_some(),
+            "ownership proof succeeded"
+        );
+        {
+            let entries = node.network.global_rendezvous_enrollments.lock().await;
+            let entry = entries.get(&url).unwrap();
+            assert_eq!(entry.consecutive_failures, index as u32 + 1);
+            let delay = entry
+                .next_attempt_at
+                .duration_since(tokio::time::Instant::now());
+            assert!(delay <= Duration::from_secs(delay_secs));
+            assert!(delay > Duration::from_secs(delay_secs - 1));
+        }
+        *state.challenge_request.lock().await = None;
+        assert!(
+            super::rendezvous_registration_policy::register_endpoint_presence(
+                &node,
+                &url,
+                &client,
+                &failed_presence
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            state.challenge_request.lock().await.is_none(),
+            "post-proof presence failure must respect backoff"
+        );
+    }
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        node.network
+            .global_rendezvous_enrollments
+            .lock()
+            .await
+            .get(&url)
+            .unwrap()
+            .consecutive_failures,
+        0
+    );
     *state.challenge_request.lock().await = None;
     // A regular node without the signer uses its enrolled cluster identity.
     node.network.internal_ca_key_pem = None;

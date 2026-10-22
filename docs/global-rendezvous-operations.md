@@ -134,12 +134,16 @@ credential issuance that it cannot complete for those services.
 Nodes first publish presence using their existing cluster identity. If the
 service rejects presence, a node holding the cluster CA signing key and an
 internal TLS identity can perform the ownership proof, then retry presence.
-Other nodes keep attempting ordinary presence. Changes apply live; failures
-are reported and retried per endpoint without blocking other services or node
-startup. Healthy presence refreshes a 60-second grace period against repeated
-proofs. Persistent failures after that period can recover a lost registry entry;
-failed proofs back off from 5 seconds to a maximum of 5 minutes. Enrollment
-requests keep their own timeout budget, separate from presence requests, and
+Other nodes keep attempting ordinary presence. Changes apply live; endpoint
+requests run concurrently within each heartbeat iteration. A recovering endpoint
+can extend that iteration's network wait by roughly 30 seconds (presence, two
+enrollment requests, then presence retry), delaying the next refresh for other
+endpoints. Enrollment does not block node startup. Healthy presence refreshes a
+60-second grace period against repeated proofs. Persistent failures after that
+period can recover a lost registry entry. Failed proofs and rejected presence
+after a successful proof both back off from 5 seconds to a maximum of 5 minutes;
+only successful presence clears the failure count. Enrollment requests keep
+their own timeout budget, separate from presence requests, and
 read current trust material for each proof attempt. This recovery does not
 replace an existing cluster CA: Option 1 still rejects cluster CA rotation.
 
