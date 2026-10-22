@@ -168,7 +168,8 @@ pub(super) async fn updated_services(
             )
         }
     };
-    validate_services(state, &services, &editable_services(state)).await?;
+    // Copying an inherited role into local configuration is a new local policy.
+    validate_services(state, &services, &explicit_configured_services(state)).await?;
     let urls = build_effective_rendezvous_urls(state, &service_urls(&services))?;
     if let Some(managed) = state.network.managed_rendezvous_public_url.as_deref() {
         explicit_policy_urls.insert(canonicalize_rendezvous_url(managed)?);

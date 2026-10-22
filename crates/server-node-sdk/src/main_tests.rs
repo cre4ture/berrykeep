@@ -28418,6 +28418,8 @@ async fn rendezvous_issued_contact_policy_remains_revocable_on_the_child() {
     child.cluster_id = bootstrap.cluster_id;
     child.node_id = bootstrap.node_id;
     child.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    child.network.rendezvous_registration_enabled = true;
+    child.network.rendezvous_mtls_required = true;
     let package_path = child
         .managed_paths
         .data_dir()
@@ -28447,6 +28449,23 @@ async fn rendezvous_issued_contact_policy_remains_revocable_on_the_child() {
     );
     // A legacy URL-only save and restart must preserve the inherited source.
     let app = super::build_server_apps(&child).public_app;
+    // Pinning an inherited role locally requires a usable local identity.
+    assert!(child.network.internal_tls_runtime.is_none());
+    let (status, payload) = execute_admin_control_request(
+        &app, Method::PUT, "/api/v1/auth/rendezvous-config", Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_services":[{"url": url, "global_registration_enabled":true}]})),
+    ).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "promoting an inherited role must run local admission checks: {payload}"
+    );
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("client identity")
+    );
     let (status, payload) = execute_admin_control_request(
         &app,
         Method::PUT,
