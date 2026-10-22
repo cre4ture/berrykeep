@@ -14,6 +14,7 @@ pub mod relay_tunnel;
 pub mod relay_wake;
 pub mod rendezvous;
 pub mod rendezvous_runtime;
+pub mod rendezvous_service;
 pub mod request_auth;
 pub mod session;
 pub mod transport_protocol;
@@ -104,6 +105,10 @@ pub use rendezvous::{
 pub use rendezvous_runtime::{
     BootstrapClaimBroker, BootstrapClaimRecord, PresenceRegistry, RelayTunnelBroker,
     RelayTunnelEndpoint, RelayTunnelFrame, WakeRegistrationHandle, issue_relay_ticket,
+};
+pub use rendezvous_service::{
+    RendezvousServiceConfig, resolve_rendezvous_services,
+    resolve_rendezvous_services_with_contact_hints,
 };
 pub use request_auth::{
     HEADER_AUTH_NONCE, HEADER_AUTH_SIGNATURE, HEADER_AUTH_TIMESTAMP, HEADER_CLUSTER_ID,

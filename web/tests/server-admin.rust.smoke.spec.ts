@@ -118,8 +118,9 @@ test("server-admin is served by a real server-node runtime", async ({ page }) =>
   await page.getByRole("button", { name: "Save direct node URLs" }).click();
   await expect(page.locator("pre").filter({ hasText: "node.example:18443" }).first()).toBeVisible();
   await expect(page.getByText("Rendezvous service URLs")).toBeVisible();
+  await page.getByRole("button", { name: "Add rendezvous service" }).click();
   await page
-    .getByRole("textbox", { name: "Editable operator-managed URLs" })
+    .getByRole("textbox", { name: "Operator-managed rendezvous URL 1", exact: true })
     .fill("https://rendezvous.example:9443");
   await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
   await expect(page.locator("pre").filter({ hasText: "rendezvous.example:9443" }).first()).toBeVisible();
