@@ -64,6 +64,20 @@ impl ConfiguredServices {
             .collect()
     }
 
+    pub(super) fn reconcile_contact_hints(&mut self, contacts: &[RendezvousServiceConfig]) -> bool {
+        let live: HashSet<_> = contacts.iter().map(|service| &service.url).collect();
+        let previous_service_count = self.services.len();
+        let previous_hint_count = self.contact_hint_urls.len();
+        self.services.retain(|service| {
+            !self.contact_hint_urls.contains(&service.url)
+                || self.explicit_policy_urls.contains(&service.url)
+                || live.contains(&service.url)
+        });
+        self.contact_hint_urls.retain(|url| live.contains(url));
+        previous_service_count != self.services.len()
+            || previous_hint_count != self.contact_hint_urls.len()
+    }
+
     pub(super) fn explicit_services(&self) -> Vec<RendezvousServiceConfig> {
         self.services
             .iter()

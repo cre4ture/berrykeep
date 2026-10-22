@@ -78,11 +78,15 @@ field records the hint addresses independently; `rendezvous_urls` remains the
 combined URL list for compatibility. The legacy global default applies only to
 local addresses, while explicit per-service overrides still take precedence.
 URL-only hints inherit subsequent contact policy changes, including revocation
-of global registration. Legacy URL-only
-edits preserve that distinction across persistence and restart. Saving the
-operator-managed service editor writes explicit local policies. Inherited contact
+of global registration. Legacy URL-only edits preserve that distinction across
+persistence and restart. Saving the operator-managed service editor writes
+explicit local policies. Inherited contact
 hints appear in the effective configuration and cluster contact editor, rather
 than as local service rows; saving unrelated local settings preserves inheritance.
+Hints remain available until the confirmed contact object reaches the node.
+Once it arrives, its list (including an explicitly empty list) removes obsolete
+inherited hints from runtime configuration and the enrollment package. Explicit
+local overrides remain under operator control.
 The persisted mTLS requirement is derived from the node's current configuration
 and its explicit global roles. Removing a global role does not disable mTLS
 that the node itself still requires.
@@ -93,6 +97,10 @@ Replace `rendezvous.example:9443` with `https://rendezvous.example:9443` before
 upgrading. That malformed value previously left the node running with failed
 registration attempts; startup now rejects it with a rendezvous service URL
 validation error.
+On reading an older URL-only cluster contact object, unusable entries are
+omitted with a warning so discovery and admin repair remain available. Replace
+the list through the contact editor to persist corrected values; new writes
+always require valid HTTP(S) URLs.
 
 The URL-only API fields remain available for existing clients and bootstraps.
 Old entries default to cluster-specific. For startup URLs without an explicit

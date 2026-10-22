@@ -28624,6 +28624,11 @@ async fn rendezvous_replicated_global_contacts_require_client_identity() {
             url: "https://global.example/".into(),
             global_registration_enabled: true,
         }];
+    assert!(
+        super::build_rendezvous_config_view(&state, false)
+            .await
+            .mtls_required
+    );
     assert_eq!(
         super::client_transport_identity_issuance_context(&state),
         Some("rendezvous mTLS")
@@ -28636,11 +28641,154 @@ async fn rendezvous_replicated_global_contacts_require_client_identity() {
     state.network.internal_ca_key_pem = None;
     assert!(super::validate_rendezvous_client_identity_issuance(&state).is_err());
     state.network.rendezvous_registration_enabled = false;
+    assert!(
+        !super::build_rendezvous_config_view(&state, false)
+            .await
+            .mtls_required
+    );
     assert_eq!(
         super::client_transport_identity_issuance_context(&state),
         None
     );
     assert!(super::validate_rendezvous_client_identity_issuance(&state).is_ok());
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_legacy_contacts_remain_readable_and_repairable() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    let app = super::build_server_apps(&state).public_app;
+    let admin_path = "/api/v1/auth/cluster/rendezvous-contacts";
+    for replacement in [
+        serde_json::json!({"rendezvous_services":[{"url":"https://repaired.example/", "global_registration_enabled":false}]}),
+        serde_json::json!({"rendezvous_urls":["https://repaired.example/"]}),
+    ] {
+        {
+            let mut store = lock_store(&state, "test.seed_legacy_contacts").await;
+            store
+                .put_object_versioned(
+                    super::rendezvous_contact_config::RENDEZVOUS_CONTACT_CONFIGURATION_STORAGE_KEY,
+                    Bytes::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "schema_version":1,
+                            "rendezvous_urls":["rendezvous.example:9443", "https://valid.example/"]
+                        }))
+                        .unwrap(),
+                    ),
+                    PutOptions {
+                        parent_version_ids: Vec::new(),
+                        state: VersionConsistencyState::Confirmed,
+                        inherit_preferred_parent: true,
+                        create_snapshot: true,
+                        explicit_version_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        for path in [admin_path, "/api/v1/cluster/rendezvous-contacts"] {
+            let (status, payload) = execute_admin_control_request(
+                &app,
+                Method::GET,
+                path,
+                Some(TEST_ADMIN_TOKEN),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {payload}");
+            assert_eq!(
+                payload["configuration"]["rendezvous_urls"],
+                serde_json::json!(["https://valid.example/"])
+            );
+        }
+        let (status, _) = execute_admin_control_request(
+            &app,
+            Method::PUT,
+            admin_path,
+            Some(TEST_ADMIN_TOKEN),
+            Some(serde_json::json!({"rendezvous_urls":["rendezvous.example:9443"]})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "new malformed settings must still be rejected"
+        );
+        let (status, payload) = execute_admin_control_request(
+            &app,
+            Method::PUT,
+            admin_path,
+            Some(TEST_ADMIN_TOKEN),
+            Some(replacement),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(
+            payload["configuration"]["rendezvous_urls"],
+            serde_json::json!(["https://repaired.example/"])
+        );
+    }
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_confirmed_contacts_reconcile_cached_bootstrap_hints() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    let owned = "https://owned.example/".to_string();
+    let removed = "https://removed.example/".to_string();
+    let overridden = "https://overridden.example/".to_string();
+    let replacement = "https://replacement.example/".to_string();
+    let mut config = test_cluster_config_without_internal_tls(
+        state.managed_paths.data_dir(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    config.rendezvous_urls = vec![owned.clone(), removed.clone(), overridden.clone()];
+    config.rendezvous_contact_urls = vec![removed.clone(), overridden.clone()];
+    config.rendezvous_services = vec![transport_sdk::RendezvousServiceConfig {
+        url: overridden.clone(),
+        global_registration_enabled: false,
+    }];
+    super::replace_configured_rendezvous_services(
+        &state,
+        super::rendezvous_registration_policy::ConfiguredServices::from_config(&config).unwrap(),
+    );
+    // Before the contact object has replicated, the bootstrap fallback is useful.
+    super::synchronize_cluster_rendezvous_contact_urls(&state)
+        .await
+        .unwrap();
+    assert!(super::current_rendezvous_urls(&state).contains(&removed));
+    let app = super::build_server_apps(&state).public_app;
+    for contacts in [vec![replacement.clone()], Vec::new()] {
+        let (status, payload) = execute_admin_control_request(
+            &app,
+            Method::PUT,
+            "/api/v1/auth/cluster/rendezvous-contacts",
+            Some(TEST_ADMIN_TOKEN),
+            Some(serde_json::json!({"rendezvous_urls":contacts})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let expected = [vec![owned.clone(), overridden.clone()], contacts.clone()].concat();
+        assert_eq!(super::current_rendezvous_urls(&state), expected);
+        assert_eq!(
+            super::rendezvous_registration_policy::service_urls(
+                &super::rendezvous_registration_policy::current_services(&state)
+            ),
+            expected
+        );
+        let (status, payload) = execute_admin_control_request(
+            &app,
+            Method::PUT,
+            "/api/v1/auth/rendezvous-config",
+            Some(TEST_ADMIN_TOKEN),
+            Some(serde_json::json!({"editable_urls":[owned, overridden]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(super::current_rendezvous_urls(&state), expected);
+    }
     cleanup_test_state(&state).await;
 }
 

@@ -308,7 +308,7 @@ async fn load_current_configuration(
     let configuration = serde_json::from_slice::<RendezvousContactConfiguration>(&payload)
         .context("failed parsing rendezvous contact configuration")?;
     Ok(LoadedRendezvousContactConfiguration {
-        configuration: normalize_configuration(configuration)?,
+        configuration: normalize_stored_configuration(configuration)?,
         stored: true,
         version_id,
     })
@@ -317,10 +317,43 @@ async fn load_current_configuration(
 pub(crate) async fn load_current_rendezvous_services(
     state: &ServerState,
 ) -> Result<Vec<transport_sdk::RendezvousServiceConfig>> {
-    Ok(load_current_configuration(state)
+    Ok(load_current_rendezvous_snapshot(state)
         .await?
-        .configuration
-        .rendezvous_services)
+        .unwrap_or_default())
+}
+
+/// Absence means the cluster object has not arrived; a stored empty list is an
+/// authoritative removal of all inherited contacts.
+pub(crate) async fn load_current_rendezvous_snapshot(
+    state: &ServerState,
+) -> Result<Option<Vec<transport_sdk::RendezvousServiceConfig>>> {
+    let loaded = load_current_configuration(state).await?;
+    Ok(loaded
+        .stored
+        .then_some(loaded.configuration.rendezvous_services))
+}
+
+fn normalize_stored_configuration(
+    mut configuration: RendezvousContactConfiguration,
+) -> Result<RendezvousContactConfiguration> {
+    // The old URL-only writer accepted opaque URLs such as host:port. Ignore
+    // those unusable legacy entries on read so discovery and repair remain
+    // available. All new writes and explicit service policies stay strict.
+    if configuration.rendezvous_services.is_empty() {
+        let original_count = configuration.rendezvous_urls.len();
+        configuration.rendezvous_urls.retain(|url| {
+            transport_sdk::resolve_rendezvous_services(std::slice::from_ref(url), &[], false)
+                .is_ok()
+        });
+        let rejected_count = original_count - configuration.rendezvous_urls.len();
+        if rejected_count > 0 {
+            warn!(
+                rejected_count,
+                "ignored invalid legacy rendezvous contacts; repair the cluster contact list"
+            );
+        }
+    }
+    normalize_configuration(configuration)
 }
 
 fn normalize_configuration(

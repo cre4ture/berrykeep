@@ -5203,7 +5203,18 @@ fn replace_configured_rendezvous_services(
 }
 
 async fn synchronize_cluster_rendezvous_contact_urls(state: &ServerState) -> Result<bool> {
-    let services = rendezvous_contact_config::load_current_rendezvous_services(state).await?;
+    let snapshot = rendezvous_contact_config::load_current_rendezvous_snapshot(state).await?;
+    let reconciled = snapshot.as_ref().and_then(|services| {
+        let mut configured = state
+            .network
+            .configured_rendezvous_services
+            .lock()
+            .expect("configured rendezvous services mutex poisoned");
+        configured
+            .reconcile_contact_hints(services)
+            .then(|| configured.clone())
+    });
+    let services = snapshot.unwrap_or_default();
     let cluster_contact_urls = rendezvous_registration_policy::service_urls(&services);
     let configured_urls = current_configured_rendezvous_urls(state);
     let effective_urls = combine_rendezvous_urls(&configured_urls, &cluster_contact_urls);
@@ -5222,8 +5233,14 @@ async fn synchronize_cluster_rendezvous_contact_urls(state: &ServerState) -> Res
         }
     };
 
-    if !contacts_changed {
+    if !contacts_changed && reconciled.is_none() {
         return Ok(false);
+    }
+
+    if let Some(configured) = reconciled
+        && let Err(err) = persist_rendezvous_services_if_possible(state, &configured)
+    {
+        warn!(error = %err, "failed persisting reconciled rendezvous contact hints");
     }
 
     *state
@@ -29025,7 +29042,7 @@ async fn build_rendezvous_config_view(
         registration_interval_secs: state.peer_heartbeat_config.interval_secs.max(5),
         disconnected_retry_interval_secs: RENDEZVOUS_REGISTRATION_RETRY_INTERVAL_SECS,
         endpoint_registrations: rendezvous_registration_views(state).await,
-        mtls_required: state.network.rendezvous_mtls_required,
+        mtls_required: rendezvous_registration_policy::requires_mtls(state),
         persistence_source: operator_config_persistence_source(state),
         persisted,
     }
