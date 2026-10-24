@@ -6,12 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use p256::ecdsa::signature::Signer;
-use p256::ecdsa::{Signature, SigningKey};
-use p256::pkcs8::DecodePrivateKey;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType,
+    KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType, SigningKey,
 };
 use rendezvous_server::{
     ClusterCaRegistry, GlobalClusterRegistrationConfig, RendezvousAppState, RendezvousClientCa,
@@ -37,7 +34,6 @@ const SYSTEM_TEST_TIMEOUT: Duration = Duration::from_secs(45);
 struct TestCa {
     cert_pem: String,
     issuer: Issuer<'static, KeyPair>,
-    proof_signing_key: SigningKey,
 }
 
 struct TemporaryRegistry {
@@ -229,8 +225,6 @@ async fn global_rendezvous_system_test() -> Result<()> {
 fn p256_ca(common_name: &str) -> Result<TestCa> {
     let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
         .context("failed generating P-256 test CA key")?;
-    let proof_signing_key = SigningKey::from_pkcs8_der(&key_pair.serialize_der())
-        .context("failed loading P-256 test CA proof key")?;
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params
@@ -249,7 +243,6 @@ fn p256_ca(common_name: &str) -> Result<TestCa> {
     Ok(TestCa {
         cert_pem,
         issuer: Issuer::new(params, key_pair),
-        proof_signing_key,
     })
 }
 
@@ -257,9 +250,10 @@ fn server_identity(ca: &TestCa) -> Result<RendezvousServerTlsIdentity> {
     let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
         .context("failed generating rendezvous server key")?;
     let mut params = CertificateParams::default();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "berrykeep-global-rendezvous-system-test");
+    params.distinguished_name.push(
+        DnType::CommonName,
+        "berrykeep-global-rendezvous-system-test",
+    );
     params
         .subject_alt_names
         .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
@@ -463,7 +457,11 @@ async fn register_cluster(
     let proof_message = challenge
         .canonical_proof_message_v1()
         .context("failed generating canonical P2-D proof message")?;
-    let proof_signature: Signature = cluster_ca.proof_signing_key.sign(&proof_message);
+    let proof_signature = cluster_ca
+        .issuer
+        .key()
+        .sign(&proof_message)
+        .context("failed signing P2-D registration proof")?;
     let completion = ClusterRegistrationCompleteRequest {
         protocol_version: challenge.protocol_version,
         cluster_id: challenge.cluster_id,
@@ -472,7 +470,7 @@ async fn register_cluster(
         challenge_id: challenge.challenge_id,
         challenge_nonce_b64u: challenge.challenge_nonce_b64u.clone(),
         expires_at_unix: challenge.expires_at_unix,
-        proof_signature_b64u: URL_SAFE_NO_PAD.encode(proof_signature.to_der().as_bytes()),
+        proof_signature_b64u: URL_SAFE_NO_PAD.encode(proof_signature),
     };
     completion
         .validate_at(unix_timestamp())

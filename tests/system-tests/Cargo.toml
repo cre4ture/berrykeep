@@ -10,12 +10,12 @@ authors = ["berrykeep contributors"]
 [dependencies]
 anyhow = "1"
 aws-credential-types = "1"
+# Tests use regional SigV4 endpoints and do not exercise SigV4a.
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "behavior-version-latest",
     "default-https-client",
     "http-1x",
     "rt-tokio",
-    "sigv4a",
 ] }
 aws-types = "1"
 axum = "0.8"
@@ -62,7 +62,6 @@ cli_client = { path = "../../apps/cli-client", package = "cli-client", artifact 
 berrykeep_config_app = { path = "../../apps/config-app", package = "berrykeep-config-app", artifact = "bin" }
 os_integration = { path = "../../apps/os-integration", package = "os-integration", artifact = "bin" }
 berrykeep_folder_agent = { path = "../../apps/folder-agent", package = "berrykeep-folder-agent", artifact = "bin" }
-p256 = { version = "0.13", features = ["ecdsa"] }
 rendezvous-server = { path = "../../crates/rendezvous-server" }
 rendezvous_service = { path = "../../apps/rendezvous-service", package = "rendezvous-service", artifact = "bin" }
 
