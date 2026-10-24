@@ -4,7 +4,7 @@
 
 # BerryKeep
 
-Your data. Your hardware. Your storage cluster.
+Your data. Your hardware. Your storage cluster. Autark and resource-efficient.
 
 BerryKeep is private, self-hosted storage for files and media. It turns the
 hardware you already own into a resilient storage cluster, so files, folders,
