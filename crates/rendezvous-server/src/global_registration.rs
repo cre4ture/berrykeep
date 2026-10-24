@@ -9,6 +9,8 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use base64::Engine;
 use common::ClusterId;
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature, VerifyingKey};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rustls::pki_types::pem::PemObject;
@@ -23,6 +25,7 @@ use transport_sdk::{
     ClusterRegistrationRegistryStatus, ClusterSuspendStatus,
 };
 use uuid::Uuid;
+use x509_parser::parse_x509_certificate;
 
 use crate::cluster_registry::validate_suspension_reason;
 use crate::{
@@ -428,22 +431,30 @@ fn verify_proof(ca_pem: &str, completion: &ClusterRegistrationCompleteRequest) -
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&completion.proof_signature_b64u)
         .context("failed decoding global registration proof signature")?;
-    match completion.proof_algorithm {
-        ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1 => {}
-    }
-    let certificate = rustls::pki_types::CertificateDer::from(pem_certificate_der(ca_pem)?);
-    let verifying_key = webpki::EndEntityCert::try_from(&certificate)
-        .context("failed parsing global registration CA certificate")?;
-    if verifying_key
-        .verify_signature(webpki::ring::ECDSA_P256_SHA256, &message, &signature)
-        .is_ok()
-    {
+    let signature = Signature::from_der(&signature)
+        .context("global registration proof signature is not ASN.1 ECDSA P-256")?;
+    let verifying_key = verifying_key_from_ca(ca_pem, completion.proof_algorithm)?;
+    if verifying_key.verify(&message, &signature).is_ok() {
         return Ok(());
     }
     let legacy_message = completion.legacy_proof_message_v1()?;
     verifying_key
-        .verify_signature(webpki::ring::ECDSA_P256_SHA256, &legacy_message, &signature)
+        .verify(&legacy_message, &signature)
         .context("global registration proof signature does not verify")
+}
+
+fn verifying_key_from_ca(
+    ca_pem: &str,
+    algorithm: ClusterRegistrationProofAlgorithm,
+) -> Result<VerifyingKey> {
+    match algorithm {
+        ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1 => {}
+    }
+    let certificate = pem_certificate_der(ca_pem)?;
+    let (_, parsed) = parse_x509_certificate(&certificate)
+        .context("failed parsing global registration CA certificate")?;
+    VerifyingKey::from_sec1_bytes(parsed.public_key().subject_public_key.data.as_ref())
+        .context("global registration CA does not contain a valid P-256 public key")
 }
 
 fn pem_certificate_der(ca_pem: &str) -> Result<Vec<u8>> {
@@ -733,6 +744,47 @@ mod tests {
             verify_proof(&ca.pem, &proof).is_err(),
             "cryptographically invalid ASN.1 signatures must not verify"
         );
+    }
+
+    #[tokio::test]
+    async fn registration_accepts_ca_with_compressed_p256_public_key() {
+        struct CompressedPublicKey(Vec<u8>);
+
+        impl rcgen::PublicKeyData for CompressedPublicKey {
+            fn der_bytes(&self) -> &[u8] {
+                &self.0
+            }
+
+            fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+                &rcgen::PKCS_ECDSA_P256_SHA256
+            }
+        }
+
+        let (state, mut ca, _) = global_state(10);
+        let public_key = ca.signing_key.public_key_raw();
+        assert_eq!(public_key.len(), 65);
+        let mut compressed = vec![2 | (public_key[64] & 1)];
+        compressed.extend_from_slice(&public_key[1..33]);
+        let public_key = CompressedPublicKey(compressed);
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let issuer = rcgen::Issuer::from_params(&params, &ca.signing_key);
+        ca.pem = params
+            .signed_by(&public_key, &issuer)
+            .expect("compressed P-256 CA should sign")
+            .pem();
+
+        let cluster_id = ClusterId::now_v7();
+        let challenge = issue(&state, &ca, cluster_id, "203.0.113.15").await;
+        let record = complete_registration(
+            State(state),
+            source("203.0.113.15"),
+            Json(completion(&challenge, &ca.signing_key)),
+        )
+        .await
+        .expect("valid proof from a compressed P-256 CA should register")
+        .0;
+        assert_eq!(record.cluster_id, cluster_id);
     }
 
     #[tokio::test]

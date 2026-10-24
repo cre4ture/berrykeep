@@ -20,6 +20,7 @@ iroh-relay = { version = "1.0.2", features = ["server"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = { version = "1.9", features = ["std"] }
 rand = "0.8"
+p256 = { version = "0.14", features = ["ecdsa"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
@@ -30,7 +31,6 @@ tower = { version = "0.5", features = ["util"] }
 tracing.workspace = true
 transport-sdk = { path = "../transport-sdk" }
 uuid.workspace = true
-webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 x509-parser = "0.16"
 
 [dev-dependencies]
