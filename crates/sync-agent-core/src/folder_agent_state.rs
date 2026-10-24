@@ -997,6 +997,7 @@ fn is_berrykeep_part_file_name(file_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_root;
     use std::fs;
 
     #[test]
@@ -1302,21 +1303,6 @@ mod tests {
         assert!(leftovers.is_empty());
 
         fs::remove_dir_all(root).unwrap();
-    }
-
-    fn test_root() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut root = std::env::temp_dir();
-        root.push(format!(
-            "berrykeep-folder-agent-state-test-{}-{}",
-            std::process::id(),
-            nonce
-        ));
-        fs::create_dir_all(&root).unwrap();
-        root
     }
 
     fn remove_sqlite_sidecars(path: &Path) {
