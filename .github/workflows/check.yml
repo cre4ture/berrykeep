@@ -1153,6 +1153,7 @@ jobs:
     name: Required CI
     if: ${{ always() }}
     needs:
+      - workflow-lint
       - workspace-check
       - rustfmt
       - clippy
