@@ -23,6 +23,7 @@ const PROOF_MESSAGE_DOMAIN: &[u8] = b"berrykeep.cluster-registration-proof\0";
 const LEGACY_PROOF_MESSAGE_DOMAIN: &[u8] = b"ironmesh.cluster-registration-proof\0";
 const SHA256_FINGERPRINT_HEX_LENGTH: usize = 64;
 const MAX_CA_PEM_BYTES: usize = 32 * 1024;
+const UNCOMPRESSED_P256_PUBLIC_KEY_BYTES: usize = 65;
 const MIN_CHALLENGE_NONCE_BYTES: usize = 16;
 const MAX_CHALLENGE_NONCE_BYTES: usize = 64;
 const MIN_ECDSA_P256_ASN1_SIGNATURE_BYTES: usize = 8;
@@ -34,7 +35,8 @@ const MAX_SUSPEND_REASON_BYTES: usize = 1024;
 /// BerryKeep currently creates P-256 CA keys. The proof signature uses the ASN.1 DER encoding
 /// produced and verified by the corresponding P-256 SHA-256 implementation. New algorithms
 /// require a new enum variant and explicit verifier support; APIs must not accept free-form
-/// algorithm names.
+/// algorithm names. CA public keys must use uncompressed SEC1 encoding, as required by the
+/// rendezvous service's mTLS verifier.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClusterRegistrationProofAlgorithm {
@@ -304,6 +306,14 @@ impl ClusterRegistrationProofAlgorithm {
                 {
                     bail!(
                         "cluster registration proof algorithm ecdsa_p256_sha256_asn1 requires a P-256 EC CA public key"
+                    );
+                }
+                let public_key = certificate.public_key().subject_public_key.data.as_ref();
+                if public_key.len() != UNCOMPRESSED_P256_PUBLIC_KEY_BYTES
+                    || public_key.first() != Some(&0x04)
+                {
+                    bail!(
+                        "cluster registration requires an uncompressed P-256 CA public key for mTLS"
                     );
                 }
             }

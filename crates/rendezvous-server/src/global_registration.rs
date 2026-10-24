@@ -521,9 +521,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::connect_info::ConnectInfo;
     use axum::http::{HeaderValue, Request, header};
-    use p256::ecdsa::signature::Signer;
-    use p256::pkcs8::DecodePrivateKey;
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SigningKey};
     use tower::ServiceExt;
 
     use super::*;
@@ -534,13 +532,11 @@ mod tests {
 
     struct TestCa {
         pem: String,
-        signing_key: p256::ecdsa::SigningKey,
+        signing_key: KeyPair,
     }
 
     fn test_ca() -> TestCa {
         let key_pair = KeyPair::generate().expect("test P-256 CA key should generate");
-        let signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(&key_pair.serialize_der())
-            .expect("rcgen P-256 key should decode for proof signing");
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
@@ -552,7 +548,10 @@ mod tests {
             .self_signed(&key_pair)
             .expect("test P-256 CA certificate should self-sign")
             .pem();
-        TestCa { pem, signing_key }
+        TestCa {
+            pem,
+            signing_key: key_pair,
+        }
     }
 
     fn registry_path(name: &str) -> PathBuf {
@@ -621,12 +620,12 @@ mod tests {
 
     fn completion(
         challenge: &ClusterRegistrationChallengeResponse,
-        signing_key: &p256::ecdsa::SigningKey,
+        signing_key: &KeyPair,
     ) -> ClusterRegistrationCompleteRequest {
         let message = challenge
             .canonical_proof_message_v1()
             .expect("challenge proof message should build");
-        let signature: Signature = signing_key.sign(&message);
+        let signature = signing_key.sign(&message).expect("test proof should sign");
         ClusterRegistrationCompleteRequest {
             protocol_version: challenge.protocol_version,
             cluster_id: challenge.cluster_id,
@@ -636,7 +635,7 @@ mod tests {
             challenge_nonce_b64u: challenge.challenge_nonce_b64u.clone(),
             expires_at_unix: challenge.expires_at_unix,
             proof_signature_b64u: base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(signature.to_der().as_bytes()),
+                .encode(signature),
         }
     }
 
@@ -713,6 +712,77 @@ mod tests {
         .expect("same CA registration should be idempotent")
         .0;
         assert_eq!(retry, record);
+    }
+
+    #[tokio::test]
+    async fn proof_verification_preserves_canonical_and_legacy_signature_formats() {
+        let (state, ca, _) = global_state(10);
+        let challenge = issue(&state, &ca, ClusterId::now_v7(), "203.0.113.14").await;
+        let mut proof = completion(&challenge, &ca.signing_key);
+        verify_proof(&ca.pem, &proof).expect("canonical proof should verify");
+
+        let legacy_message = proof
+            .legacy_proof_message_v1()
+            .expect("legacy proof message should build");
+        let mut signature = ca
+            .signing_key
+            .sign(&legacy_message)
+            .expect("legacy test proof should sign");
+        proof.proof_signature_b64u =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&signature);
+        verify_proof(&ca.pem, &proof).expect("legacy proof should still verify");
+
+        *signature
+            .last_mut()
+            .expect("DER signature must not be empty") ^= 1;
+        proof.proof_signature_b64u =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature);
+        proof
+            .validate()
+            .expect("tampered signature should still pass ASN.1 prevalidation");
+        assert!(
+            verify_proof(&ca.pem, &proof).is_err(),
+            "cryptographically invalid ASN.1 signatures must not verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_compressed_ca_before_issuing_challenge() {
+        struct CompressedPublicKey(Vec<u8>);
+
+        impl rcgen::PublicKeyData for CompressedPublicKey {
+            fn der_bytes(&self) -> &[u8] {
+                &self.0
+            }
+
+            fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+                &rcgen::PKCS_ECDSA_P256_SHA256
+            }
+        }
+
+        let (state, mut ca, _) = global_state(10);
+        let public_key = ca.signing_key.public_key_raw();
+        assert_eq!(public_key.len(), 65);
+        let mut compressed = vec![2 | (public_key[64] & 1)];
+        compressed.extend_from_slice(&public_key[1..33]);
+        let public_key = CompressedPublicKey(compressed);
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let issuer = rcgen::Issuer::from_params(&params, &ca.signing_key);
+        ca.pem = params
+            .signed_by(&public_key, &issuer)
+            .expect("compressed P-256 CA should sign")
+            .pem();
+
+        let error = issue_challenge(
+            State(state),
+            source("203.0.113.15"),
+            Json(challenge_request(&ca, ClusterId::now_v7())),
+        )
+        .await
+        .expect_err("CA keys unsupported by mTLS must be rejected before issuing a challenge");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("uncompressed P-256"), "{error:?}");
     }
 
     #[tokio::test]
