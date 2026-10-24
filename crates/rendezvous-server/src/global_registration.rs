@@ -713,19 +713,25 @@ mod tests {
         let legacy_message = proof
             .legacy_proof_message_v1()
             .expect("legacy proof message should build");
-        let signature = ca
+        let mut signature = ca
             .signing_key
             .sign(&legacy_message)
             .expect("legacy test proof should sign");
         proof.proof_signature_b64u =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&signature);
         verify_proof(&ca.pem, &proof).expect("legacy proof should still verify");
 
+        *signature
+            .last_mut()
+            .expect("DER signature must not be empty") ^= 1;
         proof.proof_signature_b64u =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 64]);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature);
+        proof
+            .validate()
+            .expect("tampered signature should still pass ASN.1 prevalidation");
         assert!(
             verify_proof(&ca.pem, &proof).is_err(),
-            "raw signatures must not verify as ASN.1"
+            "cryptographically invalid ASN.1 signatures must not verify"
         );
     }
 
