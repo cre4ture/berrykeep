@@ -4,6 +4,8 @@ mod folder_agent_runtime;
 mod folder_agent_startup;
 mod folder_agent_state;
 mod folder_agent_ui;
+#[cfg(test)]
+mod test_support;
 
 pub use folder_agent_conflicts::*;
 pub use folder_agent_modification_log::*;
@@ -382,8 +384,8 @@ pub fn absolute_path(root: &Path, relative_path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_root;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use sync_core::NamespaceEntry;
 
     #[test]
@@ -548,20 +550,5 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("temp root should be removed");
-    }
-
-    fn test_root() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be monotonic")
-            .as_nanos();
-        let mut root = std::env::temp_dir();
-        root.push(format!(
-            "berrykeep-sync-agent-core-test-{}-{}",
-            std::process::id(),
-            nonce
-        ));
-        fs::create_dir_all(&root).expect("temp root should be created");
-        root
     }
 }

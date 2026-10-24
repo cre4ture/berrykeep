@@ -60,6 +60,11 @@ jobs:
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$workspace_version" >> "$GITHUB_OUTPUT"
 
+      # Older immutable tags predate this validator and remain repairable.
+      - name: Validate release version metadata
+        if: ${{ hashFiles('scripts/validate_release_versions.py') != '' }}
+        run: python3 scripts/validate_release_versions.py
+
   windows-server-node-build:
     name: Windows Server Node release build
     needs: validate

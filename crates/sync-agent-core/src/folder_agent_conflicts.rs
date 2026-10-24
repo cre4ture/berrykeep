@@ -443,9 +443,8 @@ fn preserve_local_conflict_copy(
 mod tests {
     use super::*;
     use crate::PathScope;
+    use crate::test_support::test_root;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn validate_user_relative_path_input_normalizes_safe_paths() {
@@ -513,15 +512,5 @@ mod tests {
         let scope = PathScope::new(Some("cameras/vm1".to_string()));
         let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:65535");
         delete_remote_file(&client, &scope, "", None, None).unwrap();
-    }
-
-    fn test_root() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut root = std::env::temp_dir();
-        root.push(format!("berrykeep-conflicts-test-{nonce}"));
-        root
     }
 }

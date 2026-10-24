@@ -669,6 +669,7 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_root;
     use std::fs;
 
     #[test]
@@ -879,20 +880,5 @@ mod tests {
         let _ = fs::remove_file(PathBuf::from(format!("{}-wal", store.path().display())));
         let _ = fs::remove_file(PathBuf::from(format!("{}-shm", store.path().display())));
         fs::remove_dir_all(root).unwrap();
-    }
-
-    fn test_root() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut root = std::env::temp_dir();
-        root.push(format!(
-            "berrykeep-modification-log-test-{}-{}",
-            std::process::id(),
-            nonce
-        ));
-        fs::create_dir_all(&root).unwrap();
-        root
     }
 }

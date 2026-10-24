@@ -720,9 +720,9 @@ pub fn parent_directories(path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_root;
     use crate::{LocalEntryState, local_entry_state_for_path};
     use std::fs;
-    use std::path::PathBuf;
 
     #[test]
     fn startup_preserve_skips_missing_baseline_file_when_hash_matches_remote() {
@@ -1058,20 +1058,5 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(absolute, bytes).unwrap();
-    }
-
-    fn test_root() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut root = std::env::temp_dir();
-        root.push(format!(
-            "berrykeep-folder-agent-startup-test-{}-{}",
-            std::process::id(),
-            nonce
-        ));
-        fs::create_dir_all(&root).unwrap();
-        root
     }
 }
