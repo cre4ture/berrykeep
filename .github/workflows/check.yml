@@ -407,7 +407,7 @@ jobs:
   ios-build:
     name: iOS
     runs-on: macos-latest
-    needs: workspace-check
+    needs: [workspace-check, workflow-lint]
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"

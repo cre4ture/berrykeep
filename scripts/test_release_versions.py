@@ -1,6 +1,7 @@
 """Regression checks for release version consistency across Rust and Apple builds."""
 
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 
@@ -52,6 +53,25 @@ class ReleaseVersionTests(unittest.TestCase):
     def test_rejects_missing_marketing_version(self):
         self.write_versions(project=())
         with self.assertRaisesRegex(ValueError, "project.pbxproj"):
+            validate_release_versions(self.root)
+
+    def test_rejects_drift_in_an_additional_spec(self):
+        other = self.root / "apps/another-apple-app"
+        other.mkdir()
+        (other / "project.yml").write_text("MARKETING_VERSION: 2.0.0\n")
+        with self.assertRaisesRegex(ValueError, "another-apple-app/project.yml"):
+            validate_release_versions(self.root)
+
+    def test_rejects_drift_in_an_additional_project(self):
+        other = self.root / "apps/another-apple-app/Other.xcodeproj"
+        other.mkdir(parents=True)
+        (other / "project.pbxproj").write_text("MARKETING_VERSION = 2.0.0;\n")
+        with self.assertRaisesRegex(ValueError, "Other.xcodeproj/project.pbxproj"):
+            validate_release_versions(self.root)
+
+    def test_rejects_missing_apple_metadata(self):
+        shutil.rmtree(self.apple)
+        with self.assertRaisesRegex(ValueError, "no Apple version metadata found"):
             validate_release_versions(self.root)
 
 

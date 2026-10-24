@@ -11,13 +11,16 @@ import tomllib
 def validate_release_versions(root: Path) -> str:
     with (root / "Cargo.toml").open("rb") as manifest:
         version = tomllib.load(manifest)["workspace"]["package"]["version"]
-    for relative in (
-        "apps/apple-file-provider/project.yml",
-        "apps/apple-file-provider/BerryKeepAppleFileProvider.xcodeproj/project.pbxproj",
-    ):
+    metadata = sorted(root.glob("apps/*/project.yml")) + sorted(
+        root.glob("**/*.xcodeproj/project.pbxproj")
+    )
+    if not metadata:
+        raise ValueError("no Apple version metadata found")
+    for path in metadata:
+        relative = path.relative_to(root).as_posix()
         values = re.findall(
             r"^[ \t]*MARKETING_VERSION[ \t]*[:=][ \t]*(.*)$",
-            (root / relative).read_text(),
+            path.read_text(),
             re.MULTILINE,
         )
         versions = []
