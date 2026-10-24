@@ -54,15 +54,32 @@ try {
 
     $certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=BerryKeep Server Node updater test" -CertStoreLocation "Cert:\CurrentUser\My"
     try {
-        $manifestPath = Join-Path $temporaryDirectory "release-manifest.json"
-        $signaturePath = Join-Path $temporaryDirectory "release-manifest.json.p7s"
-        [System.IO.File]::WriteAllText($manifestPath, '{"schemaVersion":1,"channel":"stable"}', [System.Text.UTF8Encoding]::new($false))
-        $content = [System.IO.File]::ReadAllBytes($manifestPath)
-        $cms = [System.Security.Cryptography.Pkcs.SignedCms]::new([System.Security.Cryptography.Pkcs.ContentInfo]::new($content), $true)
-        $signer = [System.Security.Cryptography.Pkcs.CmsSigner]::new($certificate)
-        $signer.IncludeOption = [Security.Cryptography.X509Certificates.X509IncludeOption]::EndCertOnly
-        $cms.ComputeSignature($signer)
-        [System.IO.File]::WriteAllBytes($signaturePath, $cms.Encode())
+        # Exercise the real signing and manifest path with a small PE fixture.
+        $installerPath = Join-Path $temporaryDirectory "signed-installer-fixture.dll"
+        Add-Type -TypeDefinition 'public static class BerryKeepInstallerFixture { }' -OutputAssembly $installerPath -OutputType Library
+        Set-AuthenticodeSignature -FilePath $installerPath -Certificate $certificate -HashAlgorithm SHA256 | Out-Null
+        $certificatePath = Join-Path $temporaryDirectory "test-signing-certificate.pfx"
+        $certificatePassword = [Guid]::NewGuid().ToString("N")
+        $securePassword = ConvertTo-SecureString -String $certificatePassword -AsPlainText -Force
+        Export-PfxCertificate -Cert $certificate -FilePath $certificatePath -Password $securePassword | Out-Null
+        $installerUri = "https://example.invalid/berrykeep-server-node-1.2.3-windows-x64.msi"
+        & (Join-Path $installerRoot "New-ReleaseManifest.ps1") `
+            -MsiPath $installerPath `
+            -Version "1.2.3" `
+            -InstallerUri $installerUri `
+            -SigningCertificatePath $certificatePath `
+            -SigningCertificatePassword $certificatePassword `
+            -OutputDirectory $temporaryDirectory
+
+        $manifestPath = Join-Path $temporaryDirectory "berrykeep-server-node-stable.json"
+        $signaturePath = "$manifestPath.p7s"
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        if ($manifest.installer.url -ne $installerUri -or $manifest.version -ne "1.2.3") {
+            throw "Generated release manifest must preserve its installer URL and version."
+        }
+        if ($manifest.installer.sha256 -ne (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash) {
+            throw "Generated release manifest must describe the signed installer payload."
+        }
         & $updateModule {
             param($testManifestPath, $testSignaturePath, $thumbprint)
             Test-ServerNodeManifestSignature -ManifestPath $testManifestPath -SignaturePath $testSignaturePath -ExpectedThumbprint $thumbprint

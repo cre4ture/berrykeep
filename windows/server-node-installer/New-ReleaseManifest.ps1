@@ -18,6 +18,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.Security
 
 function Assert-HttpsUri {
@@ -42,7 +43,7 @@ if ($Version -notmatch '^[1-9]\d*\.\d+\.\d+$') {
 if (-not (Test-Path -LiteralPath $MsiPath -PathType Leaf)) {
     throw "MSI was not found: $MsiPath"
 }
-$installerUri = Assert-HttpsUri -Value $InstallerUri -Name "-InstallerUri"
+$parsedInstallerUri = Assert-HttpsUri -Value $InstallerUri -Name "-InstallerUri"
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
 $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
@@ -68,7 +69,7 @@ $manifest = [ordered]@{
     version = $Version
     publishedAtUtc = [DateTime]::UtcNow.ToString("o")
     installer = [ordered]@{
-        url = $installerUri.AbsoluteUri
+        url = $parsedInstallerUri.AbsoluteUri
         sha256 = (Get-FileHash -LiteralPath $MsiPath -Algorithm SHA256).Hash.ToUpperInvariant()
         authenticodeSignerThumbprint = $thumbprint
     }
