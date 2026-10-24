@@ -9,7 +9,7 @@ Your data. Your hardware. Your storage cluster. Autark and resource-efficient.
 BerryKeep is private, self-hosted storage for files and media. It turns the
 hardware you already own into a resilient storage cluster, so files, folders,
 and media stay under your control without sacrificing the convenience people
-expect from a cloud drive. Secure multi-node storage, offline-friendly sync and
+expect from a cloud drive. Never loose any data. Secure multi-node, versioned storage, offline-friendly sync and
 conflict handling, and native access paths bring the same data cleanly to the
 web, mobile, and operating-system file managers.
 
