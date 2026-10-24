@@ -10,6 +10,7 @@ import {
   registerGalleryMapContractTests
 } from "./gallery-map.contract";
 import { GalleryMapMockSession } from "./gallery-map.mock";
+import { withPausedResponse } from "./paused-response";
 import {
   filterMockStoreEntriesToPrefix,
   projectMockStoreChildrenEntries,
@@ -803,9 +804,17 @@ test("client-ui smoke flow renders and performs core operations", async ({ page 
       (element) => element.closest(".maplibregl-canvas-container") !== null
     )
   ).toBe(true);
-  await mapMarkerButton.click();
-  await expect(page.getByRole("dialog")).toBeVisible();
-  await expect(page.getByText("Loading original image")).toBeVisible();
+  await withPausedResponse(
+    page,
+    (url) =>
+      url.pathname === apiV1("/store/stream-binary") &&
+      url.searchParams.get("key") === "gallery/cat.png",
+    async () => {
+      await mapMarkerButton.click();
+      await expect(page.getByRole("dialog")).toBeVisible();
+      await expect(page.getByText("Loading original image")).toBeVisible();
+    }
+  );
   await expect(page.getByText("Loading original image")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "gallery/cat.png", exact: true })).toHaveAttribute(
     "aria-current",
@@ -3183,7 +3192,6 @@ async function installClientUiMocks(page: Page, options?: InstallClientUiMocksOp
         searchParams.get("key") === "gallery/cat.png" ||
         searchParams.get("key") === "gallery/dog.jpg"
       ) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
         await route.fulfill({
           status: 200,
           contentType: "image/png",
