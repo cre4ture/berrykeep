@@ -46,6 +46,12 @@ jobs:
         # syntax and expression validation enabled while those are addressed.
         run: '"$(go env GOPATH)/bin/actionlint" -ignore "shellcheck reported issue" .github/workflows/*.yml'
 
+      - name: Test release version metadata validation
+        run: python3 -m unittest discover -s scripts -p test_release_versions.py
+
+      - name: Validate release version metadata
+        run: python3 scripts/validate_release_versions.py
+
   workspace-check:
     name: Check
     runs-on: ubuntu-latest

@@ -22,6 +22,11 @@ Keep this file limited to stable repo-specific facts. Discover common commands f
   entries picked up the new release version.
 - Refresh `tests/system-tests/Cargo.lock` after the version bump instead of editing it by hand.
 - Verify that workspace package entries in that lockfile picked up the new release version.
+- Keep Apple `MARKETING_VERSION` aligned in
+  `apps/apple-file-provider/project.yml` and the committed
+  `BerryKeepAppleFileProvider.xcodeproj/project.pbxproj`. Run
+  `python3 scripts/validate_release_versions.py` to check all declared marketing
+  versions against the workspace before tagging. CI enforces the same check.
 
 ## Debian changelog rules
 
