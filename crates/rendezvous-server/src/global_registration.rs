@@ -747,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_accepts_ca_with_compressed_p256_public_key() {
+    async fn registration_rejects_compressed_ca_before_issuing_challenge() {
         struct CompressedPublicKey(Vec<u8>);
 
         impl rcgen::PublicKeyData for CompressedPublicKey {
@@ -774,17 +774,15 @@ mod tests {
             .expect("compressed P-256 CA should sign")
             .pem();
 
-        let cluster_id = ClusterId::now_v7();
-        let challenge = issue(&state, &ca, cluster_id, "203.0.113.15").await;
-        let record = complete_registration(
+        let error = issue_challenge(
             State(state),
             source("203.0.113.15"),
-            Json(completion(&challenge, &ca.signing_key)),
+            Json(challenge_request(&ca, ClusterId::now_v7())),
         )
         .await
-        .expect("valid proof from a compressed P-256 CA should register")
-        .0;
-        assert_eq!(record.cluster_id, cluster_id);
+        .expect_err("CA keys unsupported by mTLS must be rejected before issuing a challenge");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("uncompressed P-256"), "{error:?}");
     }
 
     #[tokio::test]
