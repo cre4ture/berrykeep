@@ -1,3 +1,16 @@
+berrykeep (2.1.0-1~repo1~ubuntu24.04.1) noble; urgency=medium
+
+  * Update cryptographic, Tokio, QUIC, DNS, and TLS dependencies for security
+    advisories and align global CA registration with mTLS key support.
+  * Expose cluster node identity and version in server administration and
+    improve gallery map rendering and merged-cluster navigation.
+  * Fix Windows MSIX configuration sharing and signed installer manifest URLs.
+  * Add optional iOS App Store/TestFlight delivery in CI and align Apple
+    marketing versions with the workspace release.
+  * Roll the workspace release to 2.1.0.
+
+ -- Ulrich Hornung <hornunguli@gmx.de>  Sat, 24 Oct 2026 12:50:28 +0200
+
 berrykeep (2.0.1-1~repo1~ubuntu24.04.1) noble; urgency=medium
 
   * Harden server storage repair and replication, including serialized Turso
