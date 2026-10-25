@@ -45,7 +45,8 @@ The protected `apt-repository` environment supplies the existing archive key:
 Publication rechecks archive metadata, executable hashes, static linkage, and
 file permissions without executing downloaded signing inputs. It signs the
 archive checksum with the pinned archive key. Private key material is removed
-after the job. Environment approval remains an independent operator step.
+after the job. Signing utilities come from protected `main`, matching the
+Windows signing jobs. Environment approval remains an independent operator step.
 
 The parent `Release` publication waits for the Linux publication to succeed.
 The Linux workflow creates only a draft when the release does not yet exist;
@@ -65,9 +66,12 @@ without rebuilding its Windows assets or moving the tag.
 gh workflow run rendezvous-release.yml --ref main -f tag=v2.1.0
 ```
 
-Pipeline utilities come from the workflow commit, while all product source and
-the Rust toolchain version come from the requested release commit. This allows
-the first publication to repair tags that predate the packaging scripts.
+Build utilities come from the workflow commit, publication utilities come from
+protected `main`, and all product source and the Rust toolchain version come
+from the requested release commit. Toolchain channels are checked against a
+single-token Rustup allowlist before becoming job outputs or action inputs.
+This allows the first publication to repair tags that predate the packaging
+scripts.
 
 ## Verify before deployment
 

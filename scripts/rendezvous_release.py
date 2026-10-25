@@ -19,6 +19,14 @@ TARGET = "x86_64-unknown-linux-musl"
 VERSION = r"[1-9][0-9]*\.[0-9]+\.[0-9]+"
 
 
+def validate_toolchain_channel(channel):
+    """Allow only a single Rustup channel token before output/action interpolation."""
+    pattern = r"(?:stable|beta|nightly)(?:-[0-9]{4}-[0-9]{2}-[0-9]{2})?|[1-9][0-9]*\.[0-9]+(?:\.[0-9]+)?"
+    if not isinstance(channel, str) or not re.fullmatch(pattern, channel):
+        raise ValueError("Unexpected Rust toolchain channel")
+    return channel
+
+
 def command(args, cwd=None):
     result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=30)
     if result.returncode:

@@ -68,13 +68,13 @@ jobs:
           import os, subprocess, sys, tomllib
           from pathlib import Path
           sys.path.insert(0, 'pipeline/scripts')
-          from rendezvous_release import validate_source
+          from rendezvous_release import validate_source, validate_toolchain_channel
           tag = os.environ.get('RELEASE_TAG') or None
           if os.environ['GITHUB_EVENT_NAME'] != 'pull_request' and tag is None:
               raise ValueError('Publication requires an explicit release tag')
           commit = subprocess.check_output(['git', '-C', 'source', 'rev-parse', 'HEAD'], text=True).strip()
           validate_source(Path('source'), commit, tag)
-          toolchain = tomllib.loads(Path('source/rust-toolchain.toml').read_text())['toolchain']['channel']
+          toolchain = validate_toolchain_channel(tomllib.loads(Path('source/rust-toolchain.toml').read_text())['toolchain']['channel'])
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'tag={tag or ""}\ncommit={commit}\ntoolchain={toolchain}\n')
           PY
@@ -166,7 +166,7 @@ jobs:
       - name: Checkout protected publication utilities
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Download verified Rendezvous artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093

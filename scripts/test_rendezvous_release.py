@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from rendezvous_release import package_release, prepare_source, verify_archive
+from rendezvous_release import package_release, prepare_source, validate_toolchain_channel, verify_archive
 from publish_rendezvous_release import publish, verify_signature
 
 
@@ -215,6 +215,24 @@ class RendezvousReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different bytes"):
                 publish("example/repo", "v2.1.0", self.commit, archive.parent, self.root, "0" * 40)
         self.assertFalse(any(args[:2] == ("release", "upload") for args in calls))
+
+
+class ToolchainChannelTests(unittest.TestCase):
+    def test_accepts_supported_single_line_rustup_channels(self):
+        for channel in ["stable", "beta", "nightly", "nightly-2026-02-17", "stable-2026-02-17", "1.90", "1.90.0"]:
+            with self.subTest(channel=channel):
+                self.assertEqual(validate_toolchain_channel(channel), channel)
+
+    def test_rejects_github_output_injection_from_multiline_toml(self):
+        malicious = 'stable\ntag=v2.1.0\ncommit=' + 'a' * 40
+        with self.assertRaisesRegex(ValueError, "toolchain"):
+            validate_toolchain_channel(malicious)
+
+    def test_rejects_shell_syntax_and_ambiguous_channel_values(self):
+        for channel in ["stable\n", "stable\r\n", "stable; id", "$(id)", "stable'", 'nightly"', "nightly --profile minimal", "../toolchain", "nightly-2026-٠٢-17", "", None, 1.90]:
+            with self.subTest(channel=channel):
+                with self.assertRaises(ValueError):
+                    validate_toolchain_channel(channel)
 
 
 class SignatureTests(unittest.TestCase):
