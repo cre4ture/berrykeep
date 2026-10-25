@@ -1,0 +1,8 @@
+# GitHub's cache-mode token restriction postdates actionlint 1.7.12 (the latest
+# stable release). The Actions service validates this key and CodeQL checks its
+# security semantics. Keep all other schema/expression checks enabled.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#controlling-cache-access-with-cache-mode
+paths:
+  .github/workflows/rendezvous-release.yml:
+    ignore:
+      - '^unexpected key "cache-mode" for "job" section\.'

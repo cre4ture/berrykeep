@@ -23,6 +23,9 @@ Builds check out the exact validated source commit with its annotated tag and
 locked dependencies. The artifact must be a fully static x86_64 ELF without a
 dynamic interpreter or shared-library dependency. The build runs `--version`
 and requires its version and revision to match the checked-out source.
+The build has platform-enforced `cache-mode: none` and uses no shared compiler
+or Cargo caches, so manually selected source cannot write the default branch's
+cache scope. See GitHub's [cache access controls](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#controlling-cache-access-with-cache-mode).
 
 Pull requests build and test unsigned development artifacts. Their metadata
 does not claim a release tag, and they cannot enter the publication job.

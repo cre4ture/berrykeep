@@ -84,11 +84,10 @@ jobs:
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # A manually requested source revision must never write main's cache scope.
+    cache-mode: none
     env:
       CARGO_INCREMENTAL: '0'
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: 'true'
-      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
     steps:
       - name: Checkout workflow utilities
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -114,15 +113,6 @@ jobs:
         with:
           toolchain: ${{ needs.validate.outputs.toolchain }}
           targets: x86_64-unknown-linux-musl
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e
-
-      - name: Cache Cargo registry
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
-        with:
-          workspaces: source -> target
-          cache-targets: false
 
       - name: Build static Rendezvous
         working-directory: source
