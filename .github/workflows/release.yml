@@ -386,9 +386,19 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  linux-rendezvous:
+    name: Linux Rendezvous release
+    needs: validate
+    uses: ./.github/workflows/rendezvous-release.yml
+    permissions:
+      contents: write
+    secrets: inherit
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+
   publish:
     name: Publish GitHub release
-    needs: [validate, windows-server-node-sign, windows-client-sign]
+    needs: [validate, windows-server-node-sign, windows-client-sign, linux-rendezvous]
     runs-on: ubuntu-latest
     permissions:
       contents: write

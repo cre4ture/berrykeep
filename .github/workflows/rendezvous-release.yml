@@ -1,0 +1,203 @@
+name: Linux Rendezvous release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing annotated stable release tag
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated vX.Y.Z tag to publish or repair
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - .github/workflows/rendezvous-release.yml
+      - .github/workflows/release.yml
+      - scripts/rendezvous_release.py
+      - scripts/publish_rendezvous_release.py
+      - scripts/test_rendezvous_release.py
+      - apps/rendezvous-service/**
+      - crates/rendezvous-server/**
+      - crates/transport-sdk/**
+      - crates/common/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Rendezvous source
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      commit: ${{ steps.source.outputs.commit }}
+      toolchain: ${{ steps.source.outputs.toolchain }}
+    steps:
+      - name: Checkout workflow utilities
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: pipeline
+
+      - name: Checkout source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          path: source
+          fetch-depth: 0
+
+      - name: Validate immutable release source or unsigned PR build
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo 'Manual publication must run from protected main.' >&2
+            exit 1
+          fi
+          git -C source fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          python3 - <<'PY'
+          import os, subprocess, sys, tomllib
+          from pathlib import Path
+          sys.path.insert(0, 'pipeline/scripts')
+          from rendezvous_release import validate_source
+          tag = os.environ.get('RELEASE_TAG') or None
+          if os.environ['GITHUB_EVENT_NAME'] != 'pull_request' and tag is None:
+              raise ValueError('Publication requires an explicit release tag')
+          commit = subprocess.check_output(['git', '-C', 'source', 'rev-parse', 'HEAD'], text=True).strip()
+          validate_source(Path('source'), commit, tag)
+          toolchain = tomllib.loads(Path('source/rust-toolchain.toml').read_text())['toolchain']['channel']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tag={tag or ""}\ncommit={commit}\ntoolchain={toolchain}\n')
+          PY
+
+  build:
+    name: Static Rendezvous (x86_64 MUSL)
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
+    steps:
+      - name: Checkout workflow utilities
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: pipeline
+
+      - name: Checkout validated source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          path: source
+          fetch-depth: 0
+
+      - name: Install static build tools
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rendezvous-target" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools binutils
+
+      - name: Install source Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: ${{ needs.validate.outputs.toolchain }}
+          targets: x86_64-unknown-linux-musl
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e
+
+      - name: Cache Cargo registry
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          workspaces: source -> target
+          cache-targets: false
+
+      - name: Build static Rendezvous
+        working-directory: source
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl -p rendezvous-service --bin berrykeep-rendezvous-service
+
+      - name: Verify and package exact source artifact
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          if [ -n "$RELEASE_TAG" ]; then tag_args=(--tag "$RELEASE_TAG"); fi
+          python3 pipeline/scripts/rendezvous_release.py package \
+            --source source --commit "$SOURCE_COMMIT" "${tag_args[@]}" \
+            --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/berrykeep-rendezvous-service" \
+            --output release-assets
+
+      - name: Upload verified Rendezvous artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-rendezvous-release
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Sign and publish Linux Rendezvous
+    needs: [validate, build]
+    if: ${{ github.event_name != 'pull_request' && needs.validate.outputs.tag != '' }}
+    runs-on: ubuntu-24.04
+    environment: apt-repository
+    permissions:
+      contents: write
+    concurrency:
+      group: rendezvous-assets-${{ needs.validate.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout protected publication utilities
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download verified Rendezvous artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-rendezvous-release
+          path: release-assets
+
+      - name: Install signature and ELF verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnupg binutils
+
+      - name: Verify provenance, sign checksums and append release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+          ARCHIVE_FINGERPRINT: ${{ vars.BERRYKEEP_APT_ARCHIVE_GPG_FINGERPRINT }}
+          ARCHIVE_PRIVATE_KEY_B64: ${{ secrets.BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64 }}
+          APT_REPO_GPG_PASSPHRASE: ${{ secrets.BERRYKEEP_APT_ARCHIVE_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          : "${ARCHIVE_FINGERPRINT:?configure BERRYKEEP_APT_ARCHIVE_GPG_FINGERPRINT}"
+          : "${ARCHIVE_PRIVATE_KEY_B64:?configure BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64}"
+          : "${APT_REPO_GPG_PASSPHRASE:?configure BERRYKEEP_APT_ARCHIVE_GPG_PASSPHRASE}"
+          export GNUPGHOME="$RUNNER_TEMP/rendezvous-release-gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          trap 'gpgconf --homedir "$GNUPGHOME" --kill gpg-agent || true; rm -rf "$GNUPGHOME"' EXIT
+          printf '%s' "$ARCHIVE_PRIVATE_KEY_B64" | base64 --decode | gpg --batch --import
+          actual_fingerprint="$(gpg --batch --with-colons --fingerprint "$ARCHIVE_FINGERPRINT" | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test "$actual_fingerprint" = "$ARCHIVE_FINGERPRINT"
+          python3 scripts/publish_rendezvous_release.py \
+            --repo "$GH_REPO" --tag "$RELEASE_TAG" --commit "$SOURCE_COMMIT" \
+            --directory release-assets --gnupg-home "$GNUPGHOME" \
+            --fingerprint "$ARCHIVE_FINGERPRINT"

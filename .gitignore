@@ -33,3 +33,4 @@ ironmesh-client-bootstrap-*.json
 ironmesh-client-bootstrap-*.json
 ironmesh-client-cli-bootstrap*.json
 web/.ironmesh-build.lock
+__pycache__/
