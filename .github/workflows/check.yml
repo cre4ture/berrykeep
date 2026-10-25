@@ -52,6 +52,12 @@ jobs:
       - name: Validate release version metadata
         run: python3 scripts/validate_release_versions.py
 
+      - name: Install release artifact test tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools binutils gnupg
+
+      - name: Test Rendezvous release provenance and signatures
+        run: python3 -m unittest discover -s scripts -p test_rendezvous_release.py
+
   workspace-check:
     name: Check
     runs-on: ubuntu-latest

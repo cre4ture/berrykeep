@@ -493,6 +493,17 @@ cargo +stable test --workspace
 - Use a small targeted fix PR for nightly lane only.
 - Revert only the offending nightly/system-test change if needed, then follow up with a proper fix.
 
+## Linux Rendezvous release publication
+
+`Release` also calls the reusable `Linux Rendezvous release` workflow and gates
+public publication on its signed static x86_64 MUSL artifact. Signing reuses the
+protected `apt-repository` environment and its pinned archive key. Pull requests
+exercise unsigned builds and packaging regression tests without publication.
+For an existing immutable tag, dispatch `rendezvous-release.yml` from `main`
+with its `tag` input to append only the Linux assets. See
+[Linux Rendezvous release artifacts](linux-rendezvous-release.md) for signing
+inputs, provenance checks, repair behavior, and deployment verification.
+
 ## Advisory security checks
 
 `cargo-audit` and `cargo-deny` are currently advisory-only for branch protection.
