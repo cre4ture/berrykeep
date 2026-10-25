@@ -392,7 +392,9 @@ jobs:
     uses: ./.github/workflows/rendezvous-release.yml
     permissions:
       contents: write
-    secrets: inherit
+    secrets:
+      BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64: ${{ secrets.BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64 }}
+      BERRYKEEP_APT_ARCHIVE_GPG_PASSPHRASE: ${{ secrets.BERRYKEEP_APT_ARCHIVE_GPG_PASSPHRASE }}
     with:
       tag: ${{ needs.validate.outputs.tag }}
 

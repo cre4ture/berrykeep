@@ -42,6 +42,11 @@ The protected `apt-repository` environment supplies the existing archive key:
 - `BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64` (secret);
 - `BERRYKEEP_APT_ARCHIVE_GPG_PASSPHRASE` (secret).
 
+The caller forwards only these two named secrets; the reusable workflow declares
+both as required. It does not inherit unrelated repository/organization secrets.
+The protected environment supplies the signing values to the publication job;
+the fingerprint remains a public variable.
+
 Publication rechecks archive metadata, executable hashes, static linkage, and
 file permissions without executing downloaded signing inputs. It signs the
 archive checksum with the pinned archive key. Private key material is removed
