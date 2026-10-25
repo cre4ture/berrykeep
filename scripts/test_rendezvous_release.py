@@ -3,6 +3,7 @@
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -28,9 +29,9 @@ class RendezvousReleaseTests(unittest.TestCase):
         cls.stale = cls.compile_fixture(root, "stale", "2.0.1", ["musl-gcc", "-static"])
 
     @staticmethod
-    def compile_fixture(root, name, version, compiler):
+    def compile_fixture(root, name, version, compiler, revision=None):
         source = root / (name + ".c")
-        message = f"berrykeep-rendezvous-service {version}\nBuild revision: v{version}"
+        message = f"berrykeep-rendezvous-service {version}\nBuild revision: {revision or 'v' + version}"
         source.write_text("#include <stdio.h>\nint main(void) { puts(" + json.dumps(message) + "); return 0; }\n")
         binary = root / name
         subprocess.run(compiler + [str(source), "-o", str(binary)], check=True)
@@ -66,6 +67,32 @@ class RendezvousReleaseTests(unittest.TestCase):
         self.assertEqual(metadata["rust_target"], "x86_64-unknown-linux-musl")
         self.assertEqual(metadata["binary_sha256"], hashlib.sha256(self.static.read_bytes()).hexdigest())
         self.assertEqual(archive.with_name(archive.name + ".sha256").read_text(), hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n")
+
+    def test_release_round_trip_with_another_tag_selected_by_git_describe(self):
+        # Git prefers the newer annotated tag even though the release tag still
+        # identifies this exact clean source commit.
+        environment = dict(os.environ, GIT_COMMITTER_DATE="2030-01-01T00:00:00Z")
+        subprocess.run(["git", "-C", str(self.repo), "tag", "-a", "latest", "-m", "Another tag"], env=environment, check=True)
+        self.assertEqual(self.git("describe", "--tags", "--always", "--dirty=-dirty", "--abbrev=12"), "latest")
+        binary = self.compile_fixture(self.root, "alias", "2.1.0", ["musl-gcc", "-static"], revision="latest")
+        metadata = verify_archive(self.package(binary=binary), "v2.1.0", self.commit)
+        self.assertEqual(metadata["build_revision"], "latest")
+        self.assertEqual(metadata["release_tag"], "v2.1.0")
+        self.assertEqual(metadata["git_commit"], self.commit)
+
+    def test_rejects_malformed_build_revision_metadata(self):
+        archive = self.package()
+        for revision in [None, "", "latest\ncommit=" + self.commit, 42]:
+            with self.subTest(revision=revision):
+                def tamper(member, data):
+                    if member.name.endswith("build-metadata.json"):
+                        body = json.loads(data)
+                        body["build_revision"] = revision
+                        data = json.dumps(body).encode()
+                    return member, data
+                self.rewrite_archive(archive, tamper)
+                with self.assertRaisesRegex(ValueError, "revision"):
+                    verify_archive(archive, "v2.1.0", self.commit)
 
     def test_prepares_an_old_release_from_a_newer_protected_main_checkout(self):
         (self.repo / "newer.txt").write_text("Newer main")

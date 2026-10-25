@@ -16,6 +16,10 @@ The archive contains the executable, an internal `SHA256SUMS`, and
 package version, build revision, target, and executable hash. The existing
 release-wide `SHA256SUMS` continues to cover the Windows assets; the Linux
 archive has its own signed checksum file.
+The build revision records the binary's actual `git describe` label. Another
+tag on the same commit may change that label without changing the release
+identity, which is checked separately using the annotated release tag, full
+commit, and package version.
 
 ## Build and signing boundary
 
@@ -54,6 +58,14 @@ file permissions without executing downloaded signing inputs. It signs the
 archive checksum with the pinned archive key. Private key material is removed
 after the job. Signing utilities come from protected `main`, matching the
 Windows signing jobs. Environment approval remains an independent operator step.
+
+Configure `apt-repository` with selected deployment branches/tags, allowing
+branch `main` and tag pattern `v[0-9]*.[0-9]*.[0-9]*`, and a required reviewer.
+Do not enable all branches. These environment policies are the external trust
+boundary: a workflow's source checks cannot constrain a ref that supplies its
+own workflow definition. Before approving, check the run's controller ref,
+requested product tag, and validated source commit. The stable-tag allowance
+supports the parent `Release` workflow; feature branches must remain excluded.
 
 The parent `Release` publication waits for the Linux publication to succeed.
 The Linux workflow creates only a draft when the release does not yet exist;

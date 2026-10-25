@@ -27,6 +27,13 @@ def validate_toolchain_channel(channel):
     return channel
 
 
+def validate_build_revision(revision):
+    """The describe label is informational; commit/tag identify release source."""
+    if not isinstance(revision, str) or not 1 <= len(revision) <= 1024 or any(not char.isprintable() or char.isspace() for char in revision):
+        raise ValueError("Unexpected build revision label")
+    return revision
+
+
 def command(args, cwd=None):
     result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=30)
     if result.returncode:
@@ -72,7 +79,7 @@ def validate_source(source, expected_commit, tag):
         raise ValueError("Release source must be clean, including untracked files")
     version = tomllib.loads((source / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     validate_release_identity(source, expected_commit, tag, version)
-    revision = git("describe", "--tags", "--always", "--dirty=-dirty", "--abbrev=12")
+    revision = validate_build_revision(git("describe", "--tags", "--always", "--dirty=-dirty", "--abbrev=12"))
     return version, revision, int(git("show", "-s", "--format=%ct", "HEAD"))
 
 
@@ -169,8 +176,9 @@ def verify_archive(archive, tag, expected_commit):
         raise ValueError("Archive source commit does not match the validated commit")
     if metadata.get("release_tag") != tag:
         raise ValueError("Archive release tag does not match the validated tag")
-    if any(metadata.get(key) != value for key, value in {"schema_version": 1, "binary": BINARY, "version": tag[1:], "build_revision": tag, "rust_target": TARGET, "source_dirty": False}.items()):
+    if any(metadata.get(key) != value for key, value in {"schema_version": 1, "binary": BINARY, "version": tag[1:], "rust_target": TARGET, "source_dirty": False}.items()):
         raise ValueError("Archive metadata does not describe the expected release")
+    validate_build_revision(metadata.get("build_revision"))
     digest = hashlib.sha256(contents[BINARY]).hexdigest()
     if metadata.get("binary_sha256") != digest or contents["SHA256SUMS"] != f"{digest}  {BINARY}\n".encode():
         raise ValueError("Archive binary hash mismatch")
