@@ -46,6 +46,8 @@ The caller forwards only these two named secrets; the reusable workflow declares
 both as required. It does not inherit unrelated repository/organization secrets.
 The protected environment supplies the signing values to the publication job;
 the fingerprint remains a public variable.
+Spaced, multiline display and lowercase fingerprints are canonicalized to the
+same full uppercase fingerprint before key lookup, comparison and signing.
 
 Publication rechecks archive metadata, executable hashes, static linkage, and
 file permissions without executing downloaded signing inputs. It signs the
@@ -66,6 +68,9 @@ After this workflow is merged, dispatch `Linux Rendezvous release` from
 protected `main` with `tag=vX.Y.Z`. Approve its `apt-repository` job after the
 build succeeds. This appends the three Linux assets to an existing release
 without rebuilding its Windows assets or moving the tag.
+Existing parent `Release` dispatches from a stable tag also remain supported:
+the controller tag must itself be annotated, match its workspace version, and
+be reachable from `main`. Arbitrary feature-branch dispatches are rejected.
 
 ```bash
 gh workflow run rendezvous-release.yml --ref main -f tag=v2.1.0

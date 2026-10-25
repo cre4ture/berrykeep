@@ -11,8 +11,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from rendezvous_release import package_release, prepare_source, validate_toolchain_channel, verify_archive
-from publish_rendezvous_release import publish, verify_signature
+from rendezvous_release import package_release, prepare_source, validate_dispatch_context, validate_toolchain_channel, verify_archive
+from publish_rendezvous_release import normalize_fingerprint, publish, verify_signature
 
 
 class RendezvousReleaseTests(unittest.TestCase):
@@ -87,6 +87,32 @@ class RendezvousReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "main"):
             prepare_source(self.repo, unmerged, "v2.1.0")
         self.assertEqual(self.git("rev-parse", "HEAD"), original)
+
+    def test_accepts_manual_publication_from_main_or_valid_release_tag(self):
+        for ref in ["refs/heads/main", "refs/tags/v2.1.0"]:
+            with self.subTest(ref=ref):
+                validate_dispatch_context(self.repo, "workflow_dispatch", ref)
+
+    def test_accepts_release_caller_tag_while_repairing_an_older_product_tag(self):
+        original = self.commit
+        (self.repo / "Cargo.toml").write_text('[workspace.package]\nversion = "2.2.0"\n')
+        self.git("add", ".")
+        self.git("commit", "-qm", "Next release")
+        self.git("tag", "-a", "v2.2.0", "-m", "Release v2.2.0")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("checkout", "--detach", original)
+        validate_dispatch_context(self.repo, "workflow_dispatch", "refs/tags/v2.2.0")
+        self.assertEqual(self.git("rev-parse", "HEAD"), original)
+
+    def test_rejects_manual_feature_branch_or_unmerged_controller_tag(self):
+        with self.assertRaisesRegex(ValueError, "main"):
+            validate_dispatch_context(self.repo, "workflow_dispatch", "refs/heads/feature")
+        (self.repo / "unmerged.txt").write_text("Unmerged")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Unmerged controller")
+        self.git("tag", "-f", "-a", "v2.1.0", "-m", "Unmerged tag")
+        with self.assertRaisesRegex(ValueError, "main"):
+            validate_dispatch_context(self.repo, "workflow_dispatch", "refs/tags/v2.1.0")
 
     def test_rejects_modified_tracked_source(self):
         (self.repo / "Cargo.toml").write_text('[workspace.package]\nversion = "2.1.0"\n# changed\n')
@@ -233,6 +259,20 @@ class ToolchainChannelTests(unittest.TestCase):
             with self.subTest(channel=channel):
                 with self.assertRaises(ValueError):
                     validate_toolchain_channel(channel)
+
+
+class FingerprintTests(unittest.TestCase):
+    def test_normalizes_spaced_lowercase_and_multiline_display_fingerprints(self):
+        expected = '5D7762BDB9A2A564D500DE702A2E3C589C188616'
+        for fingerprint in [expected, expected.lower(), ' '.join(expected[i:i+4].lower() for i in range(0,40,4)), '\n  '+expected+'\t\n']:
+            with self.subTest(fingerprint=fingerprint):
+                self.assertEqual(normalize_fingerprint(fingerprint), expected)
+
+    def test_rejects_partial_or_non_fingerprint_values(self):
+        for value in ['9C188616', '0x'+'A'*40, 'A'*39, 'G'*40, 'A'*40+'\nkey=value', '', None]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    normalize_fingerprint(value)
 
 
 class SignatureTests(unittest.TestCase):

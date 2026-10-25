@@ -17,6 +17,15 @@ def gh(*args, check=True):
     return subprocess.run(["gh", *args], text=True, capture_output=True, check=check, timeout=180)
 
 
+def normalize_fingerprint(fingerprint):
+    if not isinstance(fingerprint, str):
+        raise ValueError("Expected the full archive key fingerprint")
+    normalized = "".join(fingerprint.split()).upper()
+    if not re.fullmatch(r"[0-9A-F]{40}", normalized):
+        raise ValueError("Expected the full archive key fingerprint")
+    return normalized
+
+
 def verify_signature(signature, checksum, home, fingerprint):
     result = subprocess.run(["gpg", "--homedir", str(home), "--batch", "--status-fd", "1", "--verify", str(signature), str(checksum)], text=True, capture_output=True, timeout=30)
     if result.returncode:
@@ -45,9 +54,7 @@ def ensure_release(repo, tag):
 def publish(repo, tag, commit, directory, home, fingerprint):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise ValueError("Invalid GitHub repository")
-    fingerprint = "".join(fingerprint.split()).upper()
-    if not re.fullmatch(r"[0-9A-F]{40}", fingerprint):
-        raise ValueError("Expected the full archive key fingerprint")
+    fingerprint = normalize_fingerprint(fingerprint)
     directory, home = Path(directory).resolve(), Path(home).resolve()
     archive = directory / (artifact_name(tag[1:]) + ".tar.gz")
     verify_archive(archive, tag, commit)

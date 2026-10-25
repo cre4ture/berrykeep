@@ -50,6 +50,19 @@ def validate_release_identity(source, expected_commit, tag, version):
             raise ValueError("Release source must be reachable from origin/main")
 
 
+def validate_dispatch_context(source, event_name, ref):
+    """Keep main repairs and existing stable-tag callers, rejecting other refs."""
+    if event_name != "workflow_dispatch" or ref == "refs/heads/main":
+        return
+    if not ref.startswith("refs/tags/") or not re.fullmatch("v" + VERSION, ref[len("refs/tags/"):]):
+        raise ValueError("Manual publication requires main or a validated stable release tag")
+    tag = ref[len("refs/tags/"):]
+    git = lambda *args: command(["git", "-C", str(source), *args])
+    commit = git("rev-parse", tag + "^{commit}")
+    version = tomllib.loads(git("show", commit + ":Cargo.toml"))["workspace"]["package"]["version"]
+    validate_release_identity(source, commit, tag, version)
+
+
 def validate_source(source, expected_commit, tag):
     source = Path(source)
     git = lambda *args: command(["git", "-C", str(source), *args])

@@ -64,21 +64,18 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/main ]; then
-            echo 'Manual publication must run from protected main.' >&2
-            exit 1
-          fi
           git -C source fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           python3 - <<'PY'
           import os, subprocess, sys, tomllib
           from pathlib import Path
           sys.path.insert(0, 'pipeline/scripts')
-          from rendezvous_release import validate_source, validate_toolchain_channel
+          from rendezvous_release import validate_dispatch_context, validate_source, validate_toolchain_channel
           tag = os.environ.get('RELEASE_TAG') or None
           if os.environ['GITHUB_EVENT_NAME'] != 'pull_request' and tag is None:
               raise ValueError('Publication requires an explicit release tag')
           commit = subprocess.check_output(['git', '-C', 'source', 'rev-parse', 'HEAD'], text=True).strip()
           validate_source(Path('source'), commit, tag)
+          validate_dispatch_context(Path('source'), os.environ['GITHUB_EVENT_NAME'], os.environ['GITHUB_REF'])
           toolchain = validate_toolchain_channel(tomllib.loads(Path('source/rust-toolchain.toml').read_text())['toolchain']['channel'])
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'tag={tag or ""}\ncommit={commit}\ntoolchain={toolchain}\n')
@@ -198,12 +195,16 @@ jobs:
           : "${ARCHIVE_FINGERPRINT:?configure BERRYKEEP_APT_ARCHIVE_GPG_FINGERPRINT}"
           : "${ARCHIVE_PRIVATE_KEY_B64:?configure BERRYKEEP_APT_ARCHIVE_GPG_PRIVATE_KEY_B64}"
           : "${APT_REPO_GPG_PASSPHRASE:?configure BERRYKEEP_APT_ARCHIVE_GPG_PASSPHRASE}"
+          normalize_fingerprint() {
+            PYTHONPATH=scripts python3 -c 'import sys; from publish_rendezvous_release import normalize_fingerprint; print(normalize_fingerprint(sys.stdin.read()))'
+          }
+          ARCHIVE_FINGERPRINT="$(printf '%s' "$ARCHIVE_FINGERPRINT" | normalize_fingerprint)"
           export GNUPGHOME="$RUNNER_TEMP/rendezvous-release-gnupg"
           install -d -m 700 "$GNUPGHOME"
           trap 'gpgconf --homedir "$GNUPGHOME" --kill gpg-agent || true; rm -rf "$GNUPGHOME"' EXIT
           printf '%s' "$ARCHIVE_PRIVATE_KEY_B64" | base64 --decode | gpg --batch --import
           actual_fingerprint="$(gpg --batch --with-colons --fingerprint "$ARCHIVE_FINGERPRINT" | awk -F: '$1 == "fpr" { print $10; exit }')"
-          test "$actual_fingerprint" = "$ARCHIVE_FINGERPRINT"
+          test "$(printf '%s' "$actual_fingerprint" | normalize_fingerprint)" = "$ARCHIVE_FINGERPRINT"
           python3 scripts/publish_rendezvous_release.py \
             --repo "$GH_REPO" --tag "$RELEASE_TAG" --commit "$SOURCE_COMMIT" \
             --directory release-assets --gnupg-home "$GNUPGHOME" \
