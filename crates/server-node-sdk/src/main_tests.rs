@@ -24,7 +24,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::fs;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
@@ -1100,6 +1100,8 @@ fn test_cluster_config_without_internal_tls(
         internal_ca_key_path: None,
         local_status_bind_addr: None,
         rendezvous_ca_cert_path: None,
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec![format!("http://{bind_addr}")],
         rendezvous_registration_enabled: false,
         global_rendezvous_registration_enabled: false,
@@ -1161,6 +1163,8 @@ fn install_internal_tls_for_test_config(
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: config.rendezvous_urls.clone(),
         rendezvous_mtls_required: config.rendezvous_mtls_required,
         direct_endpoints: Vec::new(),
@@ -1202,6 +1206,36 @@ fn install_internal_tls_for_test_config(
         key_path,
         metadata_path: Some(metadata_path),
     });
+}
+
+fn install_global_policy_identity(state: &mut ServerState) {
+    if state.network.cluster_ca_pem.is_none() {
+        let (ca, key) = generate_test_internal_ca();
+        state.network.cluster_ca_pem = Some(ca);
+        state.network.internal_ca_key_pem = Some(key);
+    }
+    let mut config = test_cluster_config_without_internal_tls(
+        state.managed_paths.data_dir().join("policy-identity"),
+        free_bind_addr(),
+    );
+    config.cluster_id = state.cluster_id;
+    config.node_id = state.node_id;
+    install_internal_tls_for_test_config(state, &mut config, free_bind_addr());
+    let tls = config.internal_tls.unwrap();
+    state.network.internal_tls_runtime = Some(super::InternalTlsRuntime {
+        config: super::build_internal_mtls_rustls_config(
+            &tls.ca_cert_path,
+            &tls.cert_path,
+            &tls.key_path,
+        )
+        .unwrap(),
+        ca_cert_path: tls.ca_cert_path,
+        cert_path: tls.cert_path,
+        key_path: tls.key_path,
+        metadata_path: tls.metadata_path,
+    });
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
 }
 
 fn test_node_reachability(
@@ -1823,6 +1857,9 @@ fn build_optional_client_auth_rustls_config(
 
 #[derive(Clone)]
 struct GlobalRendezvousRegistrationCaptureState {
+    challenge_delay_ms: Arc<AtomicU64>,
+    require_enrollment: Arc<AtomicBool>,
+    reject_proofs: Arc<AtomicBool>,
     challenge: transport_sdk::ClusterRegistrationChallengeResponse,
     challenge_request: Arc<Mutex<Option<transport_sdk::ClusterRegistrationChallengeRequest>>>,
     completion_request: Arc<Mutex<Option<transport_sdk::ClusterRegistrationCompleteRequest>>>,
@@ -1840,6 +1877,10 @@ async fn capture_global_rendezvous_registration_challenge(
     Json(request): Json<transport_sdk::ClusterRegistrationChallengeRequest>,
 ) -> Json<transport_sdk::ClusterRegistrationChallengeResponse> {
     *state.challenge_request.lock().await = Some(request);
+    tokio::time::sleep(Duration::from_millis(
+        state.challenge_delay_ms.load(Ordering::SeqCst),
+    ))
+    .await;
     Json(state.challenge)
 }
 
@@ -1847,6 +1888,9 @@ async fn capture_global_rendezvous_registration_completion(
     State(state): State<GlobalRendezvousRegistrationCaptureState>,
     Json(request): Json<transport_sdk::ClusterRegistrationCompleteRequest>,
 ) -> axum::response::Response {
+    if state.reject_proofs.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     *state.completion_request.lock().await = Some(request.clone());
     match state.completion_response {
         GlobalRendezvousRegistrationCompletionResponse::Record => {
@@ -1880,6 +1924,34 @@ fn spawn_global_rendezvous_registration_capture_server(
         .route(
             "/global/cluster-registration/complete",
             post(capture_global_rendezvous_registration_completion),
+        )
+        .route(
+            "/control/presence/register",
+            post(
+                |State(state): State<GlobalRendezvousRegistrationCaptureState>,
+                 Json(registration): Json<transport_sdk::PresenceRegistration>| async move {
+                    if registration.hostname.as_deref() == Some("fail-presence") {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    if state.require_enrollment.load(Ordering::SeqCst)
+                        && state.completion_request.lock().await.is_none()
+                    {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Json(transport_sdk::RegisterPresenceResponse {
+                        accepted: true,
+                        software_version: None,
+                        iroh_relay: None,
+                        updated_at_unix: super::unix_ts(),
+                        entry: transport_sdk::PresenceEntry {
+                            registration,
+                            updated_at_unix: super::unix_ts(),
+                            observed_source_addr: None,
+                        },
+                    })
+                    .into_response()
+                },
+            ),
         )
         .with_state(state);
     let tls_config =
@@ -2074,6 +2146,11 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
     let (cluster_ca_pem, cluster_ca_key_pem) = generate_test_internal_ca();
     let (service_ca_pem, _, service_cert_pem, service_key_pem) =
         generate_test_https_ca_and_server_material(bind_addr, "global-rendezvous");
+    // Mixed private/global configurations use a shared CA bundle. The service
+    // CA is deliberately second so both presence and enrollment must trust
+    // certificates beyond the first PEM block.
+    let (other_service_ca_pem, _) = generate_test_internal_ca();
+    let service_trust_bundle = format!("{other_service_ca_pem}\n{service_ca_pem}");
     let client_ca_cert_path = root.join("cluster-ca.pem");
     let service_cert_path = root.join("service.pem");
     let service_key_path = root.join("service.key");
@@ -2090,9 +2167,12 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
         proof_algorithm: transport_sdk::ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1,
         challenge_id: Uuid::now_v7(),
         challenge_nonce_b64u: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 16]),
-        expires_at_unix: super::unix_ts() + 60,
+        expires_at_unix: super::unix_ts() + 300,
     };
     let state = GlobalRendezvousRegistrationCaptureState {
+        challenge_delay_ms: Arc::new(AtomicU64::new(6000)),
+        require_enrollment: Arc::new(AtomicBool::new(false)),
+        reject_proofs: Arc::new(AtomicBool::new(false)),
         challenge: challenge.clone(),
         challenge_request: Arc::new(Mutex::new(None)),
         completion_request: Arc::new(Mutex::new(None)),
@@ -2108,12 +2188,53 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
         captured_client_certificate.clone(),
     );
 
-    super::register_cluster_with_global_rendezvous_services(
-        cluster_id,
-        &[format!("https://{bind_addr}")],
-        Some(&cluster_ca_pem),
-        Some(&cluster_ca_key_pem),
-        Some(&service_ca_pem),
+    let mut node = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    node.cluster_id = cluster_id;
+    node.network.cluster_ca_pem = Some(cluster_ca_pem.clone());
+    node.network.internal_ca_key_pem = Some(cluster_ca_key_pem.clone());
+    node.network.rendezvous_ca_pem = Some(service_trust_bundle.clone());
+    install_global_policy_identity(&mut node);
+    let url = format!("https://{bind_addr}/");
+    let client = transport_sdk::RendezvousControlClient::new(
+        transport_sdk::RendezvousClientConfig {
+            cluster_id,
+            rendezvous_urls: vec![url.clone()],
+            heartbeat_interval_secs: 30,
+        },
+        Some(&service_trust_bundle),
+        None,
+    )
+    .unwrap();
+    let presence = super::build_rendezvous_presence_registration(&node, None);
+    // A service without the flag receives ordinary presence only.
+    super::replace_configured_rendezvous_services(
+        &node,
+        super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+            transport_sdk::RendezvousServiceConfig {
+                url: url.clone(),
+                global_registration_enabled: false,
+            },
+        ]),
+    );
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert!(state.challenge_request.lock().await.is_none());
+    // A global service refusing an unknown cluster triggers its ownership proof.
+    state.require_enrollment.store(true, Ordering::SeqCst);
+    super::replace_configured_rendezvous_services(
+        &node,
+        super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+            transport_sdk::RendezvousServiceConfig {
+                url: url.clone(),
+                global_registration_enabled: true,
+            },
+        ]),
+    );
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
     )
     .await
     .unwrap();
@@ -2173,6 +2294,240 @@ async fn global_rendezvous_registration_signs_canonical_proof_without_client_ide
         "initial global registration must not send a rendezvous client identity"
     );
 
+    // Successful enrollment is reused on subsequent heartbeats.
+    *state.challenge_request.lock().await = None;
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert!(state.challenge_request.lock().await.is_none());
+    let mut failed_presence = presence.clone();
+    failed_presence.hostname = Some("fail-presence".to_string());
+    assert!(
+        super::rendezvous_registration_policy::register_endpoint_presence(
+            &node,
+            &url,
+            &client,
+            &failed_presence
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        node.network
+            .global_rendezvous_enrollments
+            .lock()
+            .await
+            .contains_key(&url),
+        "a transient presence error must retain successful cluster enrollment"
+    );
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert!(state.challenge_request.lock().await.is_none());
+    // The full heartbeat must allow the separate 10s enrollment request budget.
+    node.network
+        .global_rendezvous_enrollments
+        .lock()
+        .await
+        .clear();
+    *state.completion_request.lock().await = None;
+    node.network.rendezvous_registration_enabled = true;
+    *node.network.rendezvous_urls.lock().unwrap() = vec![url.clone()];
+    node.network
+        .outbound_clients
+        .write()
+        .await
+        .rendezvous_controls = vec![super::RendezvousEndpointClient {
+        url: url.clone(),
+        control: client.clone(),
+    }];
+    let heartbeat = super::spawn_rendezvous_presence_heartbeat(node.clone(), 30);
+    wait_for_condition(
+        "enrollment exceeding the presence timeout completes",
+        Duration::from_secs(15),
+        || {
+            let node = node.clone();
+            let url = url.clone();
+            let capture = state.clone();
+            async move {
+                node.network
+                    .global_rendezvous_enrollments
+                    .lock()
+                    .await
+                    .contains_key(&url)
+                    && capture.completion_request.lock().await.is_some()
+            }
+        },
+    )
+    .await;
+    heartbeat.abort();
+    let _ = heartbeat.await;
+    *state.challenge_request.lock().await = None;
+    // A lost registry is repaired after the grace period, even on a signer
+    // whose node-local legacy mTLS switch differs from the replicated policy.
+    state.challenge_delay_ms.store(0, Ordering::SeqCst);
+    *state.completion_request.lock().await = None;
+    node.network.rendezvous_mtls_required = false;
+    node.network
+        .global_rendezvous_enrollments
+        .lock()
+        .await
+        .get_mut(&url)
+        .unwrap()
+        .next_attempt_at = tokio::time::Instant::now();
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert!(state.challenge_request.lock().await.is_some());
+    // Failed proofs use backoff while ordinary presence remains available.
+    *state.completion_request.lock().await = None;
+    state.reject_proofs.store(true, Ordering::SeqCst);
+    node.network
+        .global_rendezvous_enrollments
+        .lock()
+        .await
+        .get_mut(&url)
+        .unwrap()
+        .next_attempt_at = tokio::time::Instant::now();
+    let error = super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap_err();
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("401"),
+        "original presence failure must remain visible: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("503"),
+        "failed recovery must remain visible: {diagnostic}"
+    );
+    *state.challenge_request.lock().await = None;
+    state.reject_proofs.store(false, Ordering::SeqCst);
+    assert!(
+        super::rendezvous_registration_policy::register_endpoint_presence(
+            &node, &url, &client, &presence
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        state.challenge_request.lock().await.is_none(),
+        "proof attempts must respect backoff"
+    );
+    node.network
+        .global_rendezvous_enrollments
+        .lock()
+        .await
+        .get_mut(&url)
+        .unwrap()
+        .next_attempt_at = tokio::time::Instant::now();
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        node.network
+            .global_rendezvous_enrollments
+            .lock()
+            .await
+            .get(&url)
+            .unwrap()
+            .consecutive_failures,
+        0
+    );
+    // A successful proof does not repair an independently rejected presence.
+    // Recovery failures must back off until presence is actually healthy.
+    for (index, delay_secs) in [5_u64, 10, 20, 40, 80, 160, 300, 300]
+        .into_iter()
+        .enumerate()
+    {
+        node.network
+            .global_rendezvous_enrollments
+            .lock()
+            .await
+            .get_mut(&url)
+            .unwrap()
+            .next_attempt_at = tokio::time::Instant::now();
+        *state.completion_request.lock().await = None;
+        assert!(
+            super::rendezvous_registration_policy::register_endpoint_presence(
+                &node,
+                &url,
+                &client,
+                &failed_presence
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            state.completion_request.lock().await.is_some(),
+            "ownership proof succeeded"
+        );
+        {
+            let entries = node.network.global_rendezvous_enrollments.lock().await;
+            let entry = entries.get(&url).unwrap();
+            assert_eq!(entry.consecutive_failures, index as u32 + 1);
+            let delay = entry
+                .next_attempt_at
+                .duration_since(tokio::time::Instant::now());
+            assert!(delay <= Duration::from_secs(delay_secs));
+            assert!(delay > Duration::from_secs(delay_secs - 1));
+        }
+        *state.challenge_request.lock().await = None;
+        assert!(
+            super::rendezvous_registration_policy::register_endpoint_presence(
+                &node,
+                &url,
+                &client,
+                &failed_presence
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            state.challenge_request.lock().await.is_none(),
+            "post-proof presence failure must respect backoff"
+        );
+    }
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        node.network
+            .global_rendezvous_enrollments
+            .lock()
+            .await
+            .get(&url)
+            .unwrap()
+            .consecutive_failures,
+        0
+    );
+    *state.challenge_request.lock().await = None;
+    // A regular node without the signer uses its enrolled cluster identity.
+    node.network.internal_ca_key_pem = None;
+    node.network
+        .global_rendezvous_enrollments
+        .lock()
+        .await
+        .clear();
+    super::rendezvous_registration_policy::register_endpoint_presence(
+        &node, &url, &client, &presence,
+    )
+    .await
+    .unwrap();
+    assert!(state.challenge_request.lock().await.is_none());
+    cleanup_test_state(&node).await;
     server.abort();
     let _ = server.await;
     let _ = std::fs::remove_dir_all(root);
@@ -2209,9 +2564,12 @@ async fn global_rendezvous_registration_rejects_empty_completion_response() {
         proof_algorithm: transport_sdk::ClusterRegistrationProofAlgorithm::EcdsaP256Sha256Asn1,
         challenge_id: Uuid::now_v7(),
         challenge_nonce_b64u: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 16]),
-        expires_at_unix: super::unix_ts() + 60,
+        expires_at_unix: super::unix_ts() + 300,
     };
     let state = GlobalRendezvousRegistrationCaptureState {
+        challenge_delay_ms: Arc::new(AtomicU64::new(0)),
+        require_enrollment: Arc::new(AtomicBool::new(false)),
+        reject_proofs: Arc::new(AtomicBool::new(false)),
         challenge,
         challenge_request: Arc::new(Mutex::new(None)),
         completion_request: Arc::new(Mutex::new(None)),
@@ -7996,7 +8354,12 @@ async fn issue_bootstrap_bundle_includes_rendezvous_security_metadata() {
     state.network.rendezvous_ca_pem = Some("rendezvous-ca".to_string());
     *state.network.rendezvous_urls.lock().unwrap() = vec!["https://rendezvous.example".to_string()];
     state.network.rendezvous_registration_enabled = true;
-    state.network.rendezvous_mtls_required = true;
+    state.network.rendezvous_mtls_required = false;
+    *state.network.cluster_rendezvous_services.lock().unwrap() =
+        vec![transport_sdk::RendezvousServiceConfig {
+            url: "https://rendezvous.example/".into(),
+            global_registration_enabled: true,
+        }];
     super::replace_advertised_direct_endpoints(
         &state,
         super::build_effective_operator_direct_endpoints(
@@ -9282,6 +9645,8 @@ async fn server_node_config_loads_from_node_bootstrap_file() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: true,
         direct_endpoints: vec![
@@ -9581,6 +9946,8 @@ async fn internal_node_tls_material_uses_identity_only_sans() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: Vec::new(),
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -10397,6 +10764,8 @@ async fn server_node_config_loads_from_node_enrollment_file_and_materializes_tls
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -10500,6 +10869,8 @@ async fn node_enrollment_file_can_start_cluster_node_with_public_and_internal_tl
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["http://127.0.0.1:9".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: vec![transport_sdk::BootstrapEndpoint {
@@ -10910,6 +11281,8 @@ async fn manual_node_enrollment_renewal_forces_live_tls_reload() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -11211,6 +11584,8 @@ async fn automatic_renewal_migrates_missing_identity_uri_sans() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -11526,6 +11901,8 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: true,
         direct_endpoints: Vec::new(),
@@ -11609,6 +11986,8 @@ async fn live_tls_reload_rebuilds_outbound_internal_and_rendezvous_clients() {
             cert_path: "tls/capture-internal.pem".to_string(),
             key_path: "tls/capture-internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: Vec::new(),
         rendezvous_mtls_required: true,
         direct_endpoints: Vec::new(),
@@ -11819,6 +12198,8 @@ async fn reload_live_outbound_clients_picks_up_rotated_rendezvous_trust_root() {
                 cert_path: "tls/internal.pem".to_string(),
                 key_path: "tls/internal.key".to_string(),
             }),
+            rendezvous_services: Vec::new(),
+            rendezvous_contact_urls: Vec::new(),
             rendezvous_urls: vec![rendezvous_url.clone()],
             rendezvous_mtls_required: false,
             direct_endpoints: Vec::new(),
@@ -11970,6 +12351,8 @@ async fn collect_node_certificate_status_reports_renewal_due_from_sidecar_metada
             cert_path: "tls/internal.pem".to_string(),
             key_path: "tls/internal.key".to_string(),
         }),
+        rendezvous_services: Vec::new(),
+        rendezvous_contact_urls: Vec::new(),
         rendezvous_urls: vec!["https://rendezvous.example".to_string()],
         rendezvous_mtls_required: false,
         direct_endpoints: Vec::new(),
@@ -20624,10 +21007,16 @@ async fn build_test_state(
             rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
                 "http://127.0.0.1:39080".to_string(),
             ])),
-            configured_rendezvous_urls: Arc::new(std::sync::Mutex::new(vec![
-                "http://127.0.0.1:39080".to_string(),
-            ])),
-            cluster_rendezvous_contact_urls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            configured_rendezvous_services: Arc::new(std::sync::Mutex::new(
+                super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+                    transport_sdk::RendezvousServiceConfig {
+                        url: "http://127.0.0.1:39080/".to_string(),
+                        global_registration_enabled: false,
+                    },
+                ]),
+            )),
+            cluster_rendezvous_services: Arc::new(std::sync::Mutex::new(Vec::new())),
+            global_rendezvous_enrollments: Arc::new(Mutex::new(HashMap::new())),
             rendezvous_registration_enabled: false,
             rendezvous_mtls_required: false,
             managed_rendezvous_public_url: None,
@@ -27804,4 +28193,765 @@ async fn wait_for_http_status(
         }
     })
     .await;
+}
+
+#[tokio::test]
+async fn rendezvous_service_policies_round_trip_and_survive_enrollment_reload() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    install_global_policy_identity(&mut state);
+    let root = fresh_test_dir("rendezvous-service-persistence");
+    let package_path = root.join("enrollment.json");
+    let bootstrap: transport_sdk::NodeBootstrap = serde_json::from_value(serde_json::json!({
+        "version": 1, "cluster_id": state.cluster_id, "node_id": state.node_id,
+        "data_dir": root.join("node"), "bind_addr": "127.0.0.1:39080",
+        "internal_bind_addr": "127.0.0.1:49080",
+        "internal_tls": { "ca_cert_path": "tls/ca.pem", "cert_path": "tls/node.pem", "key_path": "tls/node.key" },
+        "rendezvous_urls": [], "rendezvous_mtls_required": false,
+        "trust_roots": { "cluster_ca_pem": "ca" }
+    })).unwrap();
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: None,
+        internal_tls_material: Some(sample_tls_material()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+    state.network.node_enrollment_path = Some(package_path.clone());
+    let app = super::build_server_apps(&state).public_app;
+    let path = "/api/v1/auth/rendezvous-config";
+    let services = serde_json::json!([
+        { "url": "http://private.example/", "global_registration_enabled": false },
+        { "url": "https://global.example/", "global_registration_enabled": true }
+    ]);
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_services": services})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["editable_services"], services);
+    assert_eq!(payload["persisted"], true);
+    let reloaded = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    assert!(
+        reloaded.rendezvous_mtls_required,
+        "persisted global roles must derive mTLS even when runtime setup enabled it separately"
+    );
+    assert_eq!(
+        serde_json::to_value(&reloaded.rendezvous_services).unwrap(),
+        services
+    );
+    assert_eq!(
+        reloaded.rendezvous_urls,
+        vec!["http://private.example/", "https://global.example/"]
+    );
+    // An older API client editing URLs must retain an existing global flag.
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_urls": ["https://global.example"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["editable_services"][0]["global_registration_enabled"],
+        true
+    );
+    // Invalid global HTTP configuration must leave both runtime and disk intact.
+    let (status, _) = execute_admin_control_request(&app, Method::PUT, path, Some(TEST_ADMIN_TOKEN), Some(serde_json::json!({"editable_services": [{"url": "http://global.example", "global_registration_enabled": true}]}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        ServerNodeConfig::from_enrollment_path(&package_path)
+            .unwrap()
+            .rendezvous_services[0]
+            .global_registration_enabled
+    );
+    // Removing the final global role follows current local mTLS configuration.
+    state.network.rendezvous_mtls_required = false;
+    let app = super::build_server_apps(&state).public_app;
+    let (status, payload) = execute_admin_control_request(&app, Method::PUT, path, Some(TEST_ADMIN_TOKEN), Some(serde_json::json!({"editable_services":[{"url":"http://private.example/", "global_registration_enabled":false}]}))).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert!(
+        !ServerNodeConfig::from_enrollment_path(&package_path)
+            .unwrap()
+            .rendezvous_mtls_required,
+        "the persisted mTLS flag must not retain a removed global requirement"
+    );
+    cleanup_test_state(&state).await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn rendezvous_contact_policy_changes_apply_without_changing_urls() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    install_global_policy_identity(&mut state);
+    let app = super::build_server_apps(&state).public_app;
+    let path = "/api/v1/auth/cluster/rendezvous-contacts";
+    for global in [false, true, false] {
+        let (status, payload) = execute_admin_control_request(&app, Method::PUT, path, Some(TEST_ADMIN_TOKEN), Some(serde_json::json!({
+            "schema_version": 1,
+            "rendezvous_services": [{"url": "https://contact.example", "global_registration_enabled": global}]
+        }))).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(
+            payload["configuration"]["rendezvous_urls"],
+            serde_json::json!(["https://contact.example/"])
+        );
+        let services = super::rendezvous_registration_policy::current_services(&state);
+        assert_eq!(services.last().unwrap().global_registration_enabled, global);
+        assert_eq!(
+            super::rendezvous_contact_config::load_current_rendezvous_services(&state)
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .global_registration_enabled,
+            global
+        );
+    }
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_contacts_validate_global_policy_and_preserve_legacy_updates() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.to_string());
+    let path = "/api/v1/auth/cluster/rendezvous-contacts";
+    let body = serde_json::json!({"schema_version": 1, "rendezvous_services": [{"url": "https://global.example/", "global_registration_enabled": true}]});
+    let app = super::build_server_apps(&state).public_app;
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "saving a global contact requires mTLS"
+    );
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = true;
+    let app = super::build_server_apps(&state).public_app;
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a global flag also requires an actual client identity"
+    );
+    install_global_policy_identity(&mut state);
+    // Corrupt on-disk identity must be rejected before persisting policy.
+    let key_path = state
+        .network
+        .internal_tls_runtime
+        .as_ref()
+        .unwrap()
+        .key_path
+        .clone();
+    let key = std::fs::read(&key_path).unwrap();
+    std::fs::write(&key_path, "invalid key").unwrap();
+    let app = super::build_server_apps(&state).public_app;
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    std::fs::write(key_path, key).unwrap();
+    let (status, _) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(
+            serde_json::json!({"schema_version": 1, "rendezvous_urls": ["https://global.example"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["configuration"]["rendezvous_services"][0]["global_registration_enabled"],
+        true
+    );
+    state.network.managed_rendezvous_public_url = Some("https://global.example".into());
+    let app = super::build_server_apps(&state).public_app;
+    let (status, _) =
+        execute_admin_control_request(&app, Method::PUT, path, Some(TEST_ADMIN_TOKEN), Some(body))
+            .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the embedded service cannot use global enrollment"
+    );
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_replicated_policy_preserves_legacy_edits_with_local_mtls_off() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    install_global_policy_identity(&mut state);
+    let path = "/api/v1/auth/cluster/rendezvous-contacts";
+    let app = super::build_server_apps(&state).public_app;
+    let (status, _) = execute_admin_control_request(&app, Method::PUT, path, Some(TEST_ADMIN_TOKEN), Some(serde_json::json!({"rendezvous_services": [{"url":"https://global.example/", "global_registration_enabled":true}]}))).await;
+    assert_eq!(status, StatusCode::OK);
+    state.network.rendezvous_registration_enabled = false;
+    state.network.rendezvous_mtls_required = false;
+    let app = super::build_server_apps(&state).public_app;
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        path,
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"rendezvous_urls": ["https://global.example/"]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "retained replicated policy must not be gated by this node's local switch: {payload}"
+    );
+    assert_eq!(
+        payload["configuration"]["rendezvous_services"][0]["global_registration_enabled"],
+        true
+    );
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_replicated_policy_derives_child_bootstrap_mtls() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.rendezvous_registration_enabled = true;
+    let url = "https://global.example/".to_string();
+    *state.network.rendezvous_urls.lock().unwrap() = vec![url.clone()];
+    *state.network.cluster_rendezvous_services.lock().unwrap() =
+        vec![transport_sdk::RendezvousServiceConfig {
+            url,
+            global_registration_enabled: true,
+        }];
+    let request = serde_json::from_value::<super::NodeBootstrapIssueRequest>(serde_json::json!({"internal_tls":{"ca_cert_path":"tls/ca.pem","cert_path":"tls/node.pem","key_path":"tls/node.key"}})).unwrap();
+    let bootstrap = super::build_issued_node_bootstrap(&state, request, None)
+        .expect("replicated global services must not make node bootstrap issuance fail");
+    assert!(bootstrap.rendezvous_mtls_required);
+    assert!(bootstrap.rendezvous_services.is_empty());
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_new_global_role_requires_active_participation() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    install_global_policy_identity(&mut state);
+    state.network.rendezvous_registration_enabled = false;
+    let app = super::build_server_apps(&state).public_app;
+    let body = serde_json::json!({"rendezvous_services": [{"url":"https://global.example/", "global_registration_enabled":true}]});
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/cluster/rendezvous-contacts",
+        Some(TEST_ADMIN_TOKEN),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a new global role must not persist a configuration that startup rejects: {payload}"
+    );
+    state.network.rendezvous_registration_enabled = true;
+    let app = super::build_server_apps(&state).public_app;
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/cluster/rendezvous-contacts",
+        Some(TEST_ADMIN_TOKEN),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_issued_contact_policy_remains_revocable_on_the_child() {
+    let mut issuer = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    install_global_policy_identity(&mut issuer);
+    let url = "https://global.example/".to_string();
+    *issuer.network.rendezvous_urls.lock().unwrap() = vec![url.clone()];
+    *issuer.network.cluster_rendezvous_services.lock().unwrap() =
+        vec![transport_sdk::RendezvousServiceConfig {
+            url: url.clone(),
+            global_registration_enabled: true,
+        }];
+    let request = serde_json::from_value::<super::NodeBootstrapIssueRequest>(serde_json::json!({"data_dir": issuer.managed_paths.data_dir().join("issued-child"), "internal_tls":{"ca_cert_path":"tls/ca.pem","cert_path":"tls/node.pem","key_path":"tls/node.key"}})).unwrap();
+    let bootstrap = super::build_issued_node_bootstrap(&issuer, request, None).unwrap();
+    assert!(
+        bootstrap.rendezvous_services.is_empty(),
+        "replicated policies must not be exported as local overrides"
+    );
+    assert!(bootstrap.rendezvous_urls.contains(&url));
+    assert_eq!(
+        serde_json::to_value(&bootstrap).unwrap()["rendezvous_contact_urls"],
+        serde_json::json!([url])
+    );
+    assert!(bootstrap.rendezvous_mtls_required);
+    let mut child = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    child.cluster_id = bootstrap.cluster_id;
+    child.node_id = bootstrap.node_id;
+    child.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    child.network.rendezvous_registration_enabled = true;
+    child.network.rendezvous_mtls_required = true;
+    let package_path = child
+        .managed_paths
+        .data_dir()
+        .join("inherited-enrollment.json");
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: None,
+        internal_tls_material: Some(sample_tls_material()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+    child.network.node_enrollment_path = Some(package_path.clone());
+    let config = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    *child.network.cluster_rendezvous_services.lock().unwrap() = issuer
+        .network
+        .cluster_rendezvous_services
+        .lock()
+        .unwrap()
+        .clone();
+    super::replace_configured_rendezvous_services(
+        &child,
+        super::rendezvous_registration_policy::ConfiguredServices::from_config(&config).unwrap(),
+    );
+    assert!(
+        super::rendezvous_registration_policy::current_services(&child)[0]
+            .global_registration_enabled
+    );
+    // A legacy URL-only save and restart must preserve the inherited source.
+    let app = super::build_server_apps(&child).public_app;
+    let (status, settings) = execute_admin_control_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/rendezvous-config",
+        Some(TEST_ADMIN_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        settings["editable_services"].as_array().unwrap().is_empty(),
+        "contact hints must not appear as local editable policies: {settings}"
+    );
+    assert!(settings["editable_urls"].as_array().unwrap().is_empty());
+    // Echoing the complete editor unchanged must preserve inherited policies.
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/rendezvous-config",
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_services":settings["editable_services"].clone()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let unchanged = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    assert!(unchanged.rendezvous_services.is_empty());
+    assert_eq!(
+        serde_json::to_value(
+            transport_sdk::NodeEnrollmentPackage::from_path(&package_path).unwrap()
+        )
+        .unwrap()["bootstrap"]["rendezvous_contact_urls"],
+        serde_json::json!([url])
+    );
+    assert!(
+        unchanged.rendezvous_urls.contains(&url),
+        "bootstrap lookup hints must survive editor saves"
+    );
+    // Pinning an inherited role locally requires a usable local identity.
+    assert!(child.network.internal_tls_runtime.is_none());
+    let (status, payload) = execute_admin_control_request(
+        &app, Method::PUT, "/api/v1/auth/rendezvous-config", Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_services":[{"url": url, "global_registration_enabled":true}]})),
+    ).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "promoting an inherited role must run local admission checks: {payload}"
+    );
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("client identity")
+    );
+    // An unrelated local edit must work with the legacy local mTLS switch off.
+    child.network.rendezvous_mtls_required = false;
+    let app = super::build_server_apps(&child).public_app;
+    let local_services = serde_json::json!([{"url":"http://node-private.example/", "global_registration_enabled":false}]);
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/rendezvous-config",
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_services":local_services})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["editable_services"], local_services);
+    let edited = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    assert!(edited.rendezvous_urls.contains(&url));
+    assert!(
+        edited
+            .rendezvous_services
+            .iter()
+            .all(|service| service.url != url)
+    );
+    let (status, payload) = execute_admin_control_request(
+        &app,
+        Method::PUT,
+        "/api/v1/auth/rendezvous-config",
+        Some(TEST_ADMIN_TOKEN),
+        Some(serde_json::json!({"editable_urls":[url]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let reloaded = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+    assert!(reloaded.rendezvous_services.is_empty());
+    super::replace_configured_rendezvous_services(
+        &child,
+        super::rendezvous_registration_policy::ConfiguredServices::from_config(&reloaded).unwrap(),
+    );
+    child.network.cluster_rendezvous_services.lock().unwrap()[0].global_registration_enabled =
+        false;
+    assert!(
+        !super::rendezvous_registration_policy::current_services(&child)[0]
+            .global_registration_enabled,
+        "revocation must override inherited URL defaults"
+    );
+    // Explicit operator policies retain their documented precedence.
+    super::replace_configured_rendezvous_services(
+        &child,
+        super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+            transport_sdk::RendezvousServiceConfig {
+                url: url.clone(),
+                global_registration_enabled: true,
+            },
+        ]),
+    );
+    assert!(
+        super::rendezvous_registration_policy::current_services(&child)[0]
+            .global_registration_enabled
+    );
+    child.network.cluster_rendezvous_services.lock().unwrap()[0].global_registration_enabled = true;
+    super::replace_configured_rendezvous_services(
+        &child,
+        super::rendezvous_registration_policy::ConfiguredServices::explicit(vec![
+            transport_sdk::RendezvousServiceConfig {
+                url,
+                global_registration_enabled: false,
+            },
+        ]),
+    );
+    assert!(
+        !super::rendezvous_registration_policy::current_services(&child)[0]
+            .global_registration_enabled
+    );
+    cleanup_test_state(&child).await;
+    cleanup_test_state(&issuer).await;
+}
+
+#[tokio::test]
+async fn rendezvous_replicated_global_contacts_require_client_identity() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.network.rendezvous_registration_enabled = true;
+    state.network.rendezvous_mtls_required = false;
+    let (ca, key) = generate_test_internal_ca();
+    state.network.cluster_ca_pem = Some(ca);
+    state.network.internal_ca_key_pem = Some(key);
+    *state.network.cluster_rendezvous_services.lock().unwrap() =
+        vec![transport_sdk::RendezvousServiceConfig {
+            url: "https://global.example/".into(),
+            global_registration_enabled: true,
+        }];
+    assert!(
+        super::build_rendezvous_config_view(&state, false)
+            .await
+            .mtls_required
+    );
+    assert_eq!(
+        super::client_transport_identity_issuance_context(&state),
+        Some("rendezvous mTLS")
+    );
+    assert!(
+        super::issue_client_rendezvous_identity_pem(&state, "client-inherited-global", None)
+            .unwrap()
+            .is_some()
+    );
+    state.network.internal_ca_key_pem = None;
+    assert!(super::validate_rendezvous_client_identity_issuance(&state).is_err());
+    state.network.rendezvous_registration_enabled = false;
+    assert!(
+        !super::build_rendezvous_config_view(&state, false)
+            .await
+            .mtls_required
+    );
+    assert_eq!(
+        super::client_transport_identity_issuance_context(&state),
+        None
+    );
+    assert!(super::validate_rendezvous_client_identity_issuance(&state).is_ok());
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_legacy_contacts_remain_readable_and_repairable() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    let app = super::build_server_apps(&state).public_app;
+    let admin_path = "/api/v1/auth/cluster/rendezvous-contacts";
+    for replacement in [
+        serde_json::json!({"rendezvous_services":[{"url":"https://repaired.example/", "global_registration_enabled":false}]}),
+        serde_json::json!({"rendezvous_urls":["https://repaired.example/"]}),
+    ] {
+        {
+            let mut store = lock_store(&state, "test.seed_legacy_contacts").await;
+            store
+                .put_object_versioned(
+                    super::rendezvous_contact_config::RENDEZVOUS_CONTACT_CONFIGURATION_STORAGE_KEY,
+                    Bytes::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "schema_version":1,
+                            "rendezvous_urls":["rendezvous.example:9443", "https://valid.example/"]
+                        }))
+                        .unwrap(),
+                    ),
+                    PutOptions {
+                        parent_version_ids: Vec::new(),
+                        state: VersionConsistencyState::Confirmed,
+                        inherit_preferred_parent: true,
+                        create_snapshot: true,
+                        explicit_version_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        for path in [admin_path, "/api/v1/cluster/rendezvous-contacts"] {
+            let (status, payload) = execute_admin_control_request(
+                &app,
+                Method::GET,
+                path,
+                Some(TEST_ADMIN_TOKEN),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {payload}");
+            assert_eq!(
+                payload["configuration"]["rendezvous_urls"],
+                serde_json::json!(["https://valid.example/"])
+            );
+        }
+        let (status, _) = execute_admin_control_request(
+            &app,
+            Method::PUT,
+            admin_path,
+            Some(TEST_ADMIN_TOKEN),
+            Some(serde_json::json!({"rendezvous_urls":["rendezvous.example:9443"]})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "new malformed settings must still be rejected"
+        );
+        let (status, payload) = execute_admin_control_request(
+            &app,
+            Method::PUT,
+            admin_path,
+            Some(TEST_ADMIN_TOKEN),
+            Some(replacement),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(
+            payload["configuration"]["rendezvous_urls"],
+            serde_json::json!(["https://repaired.example/"])
+        );
+    }
+    cleanup_test_state(&state).await;
+}
+
+#[tokio::test]
+async fn rendezvous_confirmed_contacts_reconcile_cached_bootstrap_hints() {
+    let mut state = build_test_state(1, false, MainTestBackend::Sqlite).await;
+    state.access.admin_control.admin_token = Some(TEST_ADMIN_TOKEN.into());
+    let owned = "https://owned.example/".to_string();
+    let removed = "https://removed.example/".to_string();
+    let overridden = "https://overridden.example/".to_string();
+    let replacement = "https://replacement.example/".to_string();
+    let mut config = test_cluster_config_without_internal_tls(
+        state.managed_paths.data_dir(),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    config.rendezvous_urls = vec![owned.clone(), removed.clone(), overridden.clone()];
+    config.rendezvous_contact_urls = vec![removed.clone(), overridden.clone()];
+    config.rendezvous_services = vec![transport_sdk::RendezvousServiceConfig {
+        url: overridden.clone(),
+        global_registration_enabled: false,
+    }];
+    let package_path = state
+        .managed_paths
+        .data_dir()
+        .join("contact-fallbacks.json");
+    let bootstrap = serde_json::from_value(serde_json::json!({
+        "version":1, "cluster_id":state.cluster_id, "node_id":state.node_id,
+        "data_dir":state.managed_paths.data_dir().join("persisted-node"),
+        "bind_addr":"127.0.0.1:39080", "internal_bind_addr":"127.0.0.1:49080",
+        "internal_tls":{"ca_cert_path":"tls/ca.pem","cert_path":"tls/node.pem","key_path":"tls/node.key"},
+        "rendezvous_urls":config.rendezvous_urls,
+        "rendezvous_services":config.rendezvous_services,
+        "rendezvous_contact_urls":config.rendezvous_contact_urls,
+        "trust_roots":{"cluster_ca_pem":"ca"}
+    })).unwrap();
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: None,
+        internal_tls_material: Some(sample_tls_material()),
+    }
+    .write_to_path(&package_path)
+    .unwrap();
+    state.network.node_enrollment_path = Some(package_path.clone());
+    super::replace_configured_rendezvous_services(
+        &state,
+        super::rendezvous_registration_policy::ConfiguredServices::from_config(&config).unwrap(),
+    );
+    // Before the contact object has replicated, the bootstrap fallback is useful.
+    super::synchronize_cluster_rendezvous_contact_urls(&state)
+        .await
+        .unwrap();
+    assert!(super::current_rendezvous_urls(&state).contains(&removed));
+    let app = super::build_server_apps(&state).public_app;
+    for contacts in [vec![owned.clone(), replacement.clone()], Vec::new()] {
+        let (status, payload) = execute_admin_control_request(
+            &app,
+            Method::PUT,
+            "/api/v1/auth/cluster/rendezvous-contacts",
+            Some(TEST_ADMIN_TOKEN),
+            Some(serde_json::json!({"rendezvous_urls":contacts})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let inherited: Vec<_> = contacts
+            .iter()
+            .filter(|url| **url != owned)
+            .cloned()
+            .collect();
+        let expected = [vec![owned.clone(), overridden.clone()], inherited.clone()].concat();
+        assert_eq!(super::current_rendezvous_urls(&state), expected);
+        assert!(
+            super::current_editable_rendezvous_urls(&state).contains(&owned),
+            "a node-owned URL must stay editable when also advertised by the cluster"
+        );
+        let saved = ServerNodeConfig::from_enrollment_path(&package_path).unwrap();
+        assert_eq!(
+            saved.rendezvous_urls, expected,
+            "the replacement must survive restart before an editor save"
+        );
+        assert_eq!(saved.rendezvous_contact_urls, inherited);
+        assert_eq!(
+            super::rendezvous_registration_policy::service_urls(
+                &super::rendezvous_registration_policy::current_services(&state)
+            ),
+            expected
+        );
+        let (status, payload) = execute_admin_control_request(
+            &app,
+            Method::PUT,
+            "/api/v1/auth/rendezvous-config",
+            Some(TEST_ADMIN_TOKEN),
+            Some(serde_json::json!({"editable_urls":[owned, overridden]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(super::current_rendezvous_urls(&state), expected);
+        assert_eq!(
+            ServerNodeConfig::from_enrollment_path(&package_path)
+                .unwrap()
+                .rendezvous_contact_urls,
+            inherited,
+            "URL-only saves must preserve node ownership for overlapping contacts"
+        );
+    }
+    cleanup_test_state(&state).await;
+}
+
+#[test]
+fn rendezvous_legacy_global_default_excludes_persisted_contact_hints() {
+    let root = fresh_test_dir("rendezvous-legacy-hint-provenance");
+    let hints = vec!["http://private.example/", "https://private-tls.example/"];
+    let bootstrap: transport_sdk::NodeBootstrap = serde_json::from_value(serde_json::json!({
+        "version":1, "cluster_id":Uuid::now_v7(), "node_id":Uuid::now_v7(),
+        "data_dir":root.join("node"), "bind_addr":"127.0.0.1:39080",
+        "internal_bind_addr":"127.0.0.1:49080",
+        "internal_tls":{"ca_cert_path":"tls/ca.pem","cert_path":"tls/node.pem","key_path":"tls/node.key"},
+        "rendezvous_urls":["https://node-owned.example/", hints[0], hints[1]],
+        "rendezvous_contact_urls":hints, "rendezvous_services":[],
+        "rendezvous_mtls_required":true, "trust_roots":{"cluster_ca_pem":"ca"}
+    })).unwrap();
+    let path = root.join("enrollment.json");
+    transport_sdk::NodeEnrollmentPackage {
+        bootstrap,
+        public_tls_material: None,
+        internal_tls_material: Some(sample_tls_material()),
+    }
+    .write_to_path(&path)
+    .unwrap();
+    let mut config = ServerNodeConfig::from_enrollment_path(&path).unwrap();
+    config.global_rendezvous_registration_enabled = true;
+    let configured =
+        super::rendezvous_registration_policy::ConfiguredServices::from_config(&config)
+            .expect("private HTTP hints must not inherit the legacy global default");
+    assert!(
+        configured
+            .services()
+            .iter()
+            .filter(|service| service.url != "https://node-owned.example/")
+            .all(|service| !service.global_registration_enabled)
+    );
+    let explicit = configured.explicit_services();
+    assert_eq!(explicit.len(), 1);
+    assert_eq!(explicit[0].url, "https://node-owned.example/");
+    assert!(explicit[0].global_registration_enabled);
+    config
+        .rendezvous_urls
+        .retain(|url| url != "https://node-owned.example/");
+    assert!(super::validate_global_rendezvous_registration_config(&config).is_ok());
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
-import type { GalleryMapConfiguration, HostDependencyCheck } from "@berrykeep/api";
+import type { GalleryMapConfiguration, HostDependencyCheck, RendezvousServiceConfig } from "@berrykeep/api";
 import { expect, test, type Page, type Route } from "@playwright/test";
 import {
   createInitialOverviewGalleryEntries,
@@ -448,15 +448,15 @@ test("server-admin runtime smoke flow renders and navigates", async ({ page }) =
   await page.getByRole("button", { name: "Save direct node URLs" }).click();
   await expect(page.locator("pre").filter({ hasText: "edge-b.local:18443" }).first()).toBeVisible();
   await expect(page.getByText("https://embedded-rendezvous.local:9443", { exact: true })).toBeVisible();
-  await page
-    .getByRole("textbox", { name: "Editable operator-managed URLs" })
-    .fill("https://rendezvous-a.local:9443\nhttps://rendezvous-b.local:9443");
+  await page.getByRole("textbox", { name: "Operator-managed rendezvous URL 1", exact: true }).fill("https://rendezvous-a.local:9443");
+  await page.getByRole("button", { name: "Add rendezvous service", exact: true }).click();
+  await page.getByRole("textbox", { name: "Operator-managed rendezvous URL 2", exact: true }).fill("https://rendezvous-b.local:9443");
   await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
   await expect(page.locator("pre").filter({ hasText: "rendezvous-b.local:9443" }).first()).toBeVisible();
   await expect(page.getByText("Cluster rendezvous contact list")).toBeVisible();
-  await page
-    .getByRole("textbox", { name: "Rendezvous contact URLs" })
-    .fill("https://home-router.example:19080\nhttps://relay.example:19080");
+  await page.getByRole("textbox", { name: "Cluster rendezvous contact URL 1", exact: true }).fill("https://home-router.example:19080");
+  await page.getByRole("button", { name: "Add cluster contact", exact: true }).click();
+  await page.getByRole("textbox", { name: "Cluster rendezvous contact URL 2", exact: true }).fill("https://relay.example:19080");
   await page.getByRole("button", { name: "Save cluster contact list" }).click();
   await expect(page.locator("pre").filter({ hasText: "home-router.example:19080" }).first()).toBeVisible();
 
@@ -567,8 +567,10 @@ test("server-admin preserves control-plane drafts while the initial configuratio
   await directEndpointsConfigRequestStarted;
   const publicUrls = page.getByRole("textbox", { name: "Additional public API URLs" });
   const peerUrls = page.getByRole("textbox", { name: "Additional peer API URLs" });
-  const rendezvousUrls = page.getByRole("textbox", { name: "Editable operator-managed URLs" });
-  const contactUrls = page.getByRole("textbox", { name: "Rendezvous contact URLs" });
+  await page.getByRole("button", { name: "Add rendezvous service", exact: true }).click();
+  await page.getByRole("button", { name: "Add cluster contact", exact: true }).click();
+  const rendezvousUrls = page.getByRole("textbox", { name: "Operator-managed rendezvous URL 1", exact: true });
+  const contactUrls = page.getByRole("textbox", { name: "Cluster rendezvous contact URL 1", exact: true });
   await publicUrls.fill("https://draft.example:8443");
   await peerUrls.fill("https://draft.example:18443");
   await rendezvousUrls.fill("https://draft-rendezvous.example:9443");
@@ -580,6 +582,45 @@ test("server-admin preserves control-plane drafts while the initial configuratio
   await expect(peerUrls).toHaveValue("https://draft.example:18443");
   await expect(rendezvousUrls).toHaveValue("https://draft-rendezvous.example:9443");
   await expect(contactUrls).toHaveValue("https://draft-contact.example:19080");
+});
+
+test("server-admin saves global registration separately for each rendezvous service", async ({ page }) => {
+  await installServerAdminMocks(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Unlock server-admin" }).click();
+  await page.getByLabel("Admin password").fill("hunter2-harder");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByText("signed in", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByText("Control Plane", { exact: true }).click();
+  await expect(page.getByLabel("Operator-managed rendezvous URL 1", { exact: true })).toHaveValue("https://rendezvous-a.local:9443");
+  await page.getByRole("button", { name: "Add rendezvous service", exact: true }).click();
+  await page.getByLabel("Operator-managed rendezvous URL 2", { exact: true }).fill("https://global.example");
+  const globalToggle = page.getByRole("group", { name: "Operator-managed rendezvous service 2", exact: true }).getByRole("checkbox");
+  await globalToggle.check();
+  // Periodic refresh must preserve both the URL and its unsaved policy.
+  await page.waitForTimeout(5500);
+  await expect(globalToggle).toBeChecked();
+  await page.getByRole("button", { name: "Add rendezvous service", exact: true }).click();
+  const saved = page.waitForRequest((request) => request.method() === "PUT" && request.url().endsWith(apiV1("/auth/rendezvous-config")));
+  await page.getByRole("button", { name: "Save rendezvous URLs" }).click();
+  expect((await saved).postDataJSON().editable_services).toEqual([
+    { url: "https://rendezvous-a.local:9443", global_registration_enabled: false },
+    { url: "https://global.example", global_registration_enabled: true }
+  ]);
+  await expect(page.getByRole("group", { name: "Operator-managed rendezvous service 1", exact: true }).getByRole("checkbox")).not.toBeChecked();
+  await page.getByRole("group", { name: "Cluster rendezvous contact service 1", exact: true }).getByRole("checkbox").check();
+  await page.getByRole("button", { name: "Add cluster contact", exact: true }).click();
+  const contactSaved = page.waitForResponse((response) => response.request().method() === "PUT" && response.url().endsWith(apiV1("/auth/cluster/rendezvous-contacts")));
+  await page.getByRole("button", { name: "Save cluster contact list" }).click();
+  const savedContacts = (await contactSaved).request().postDataJSON().rendezvous_services;
+  expect(savedContacts).toHaveLength(1);
+  expect(savedContacts[0].global_registration_enabled).toBe(true);
+  await page.reload();
+  await page.getByText("Control Plane", { exact: true }).click();
+  await expect(page.getByRole("group", { name: "Operator-managed rendezvous service 2", exact: true }).getByRole("checkbox")).toBeChecked();
+  await expect(page.getByRole("group", { name: "Cluster rendezvous contact service 1", exact: true }).getByRole("checkbox")).toBeChecked();
+  await page.screenshot({ path: "test-results/rendezvous-per-service.png", fullPage: true });
 });
 
 test("server-admin mobile drawer is available only when its navigation is available", async ({ page }) => {
@@ -2151,6 +2192,7 @@ async function installServerAdminMocks(
     persisted: true
   };
   let rendezvousConfig = {
+    editable_services: undefined as RendezvousServiceConfig[] | undefined,
     effective_urls: ["https://embedded-rendezvous.local:9443", "https://rendezvous-a.local:9443"],
     editable_urls: ["https://rendezvous-a.local:9443"],
     managed_embedded_url: "https://embedded-rendezvous.local:9443",
@@ -2184,6 +2226,7 @@ async function installServerAdminMocks(
   let rendezvousContactConfiguration = {
     configuration: {
       schema_version: 1,
+      rendezvous_services: undefined as RendezvousServiceConfig[] | undefined,
       rendezvous_urls: ["https://rendezvous-a.local:9443/"]
     },
     stored: true,
@@ -3555,13 +3598,14 @@ async function installServerAdminMocks(
     }
 
     if (pathname === apiV1("/auth/rendezvous-config") && method === "PUT") {
-      const body = route.request().postDataJSON() as { editable_urls?: string[] };
+      const body = route.request().postDataJSON() as { editable_urls?: string[]; editable_services?: RendezvousServiceConfig[] };
       rendezvousConfig = {
         ...rendezvousConfig,
-        editable_urls: body.editable_urls ?? [],
+        editable_services: body.editable_services,
+        editable_urls: body.editable_services?.map((service) => service.url) ?? body.editable_urls ?? [],
         effective_urls: [
           "https://embedded-rendezvous.local:9443",
-          ...(body.editable_urls ?? [])
+          ...(body.editable_services?.map((service) => service.url) ?? body.editable_urls ?? [])
         ]
       };
       return json(route, rendezvousConfig);
@@ -3579,10 +3623,12 @@ async function installServerAdminMocks(
       const body = route.request().postDataJSON() as {
         schema_version?: number;
         rendezvous_urls?: string[];
+        rendezvous_services?: RendezvousServiceConfig[];
       };
       rendezvousContactConfiguration = {
         configuration: {
           schema_version: body.schema_version ?? 1,
+          rendezvous_services: body.rendezvous_services,
           rendezvous_urls: body.rendezvous_urls ?? []
         },
         stored: true,
