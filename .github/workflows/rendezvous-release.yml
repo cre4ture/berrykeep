@@ -95,12 +95,24 @@ jobs:
           ref: ${{ github.sha }}
           path: pipeline
 
-      - name: Checkout validated source commit
+      - name: Checkout trusted source history
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.validate.outputs.commit }}
+          ref: ${{ github.event.repository.default_branch }}
           path: source
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select approved source before executing build code
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          if [ -n "$RELEASE_TAG" ]; then tag_args=(--tag "$RELEASE_TAG"); fi
+          python3 pipeline/scripts/rendezvous_release.py prepare \
+            --source source --commit "$SOURCE_COMMIT" "${tag_args[@]}"
 
       - name: Install static build tools
         run: |

@@ -26,14 +26,8 @@ def command(args, cwd=None):
     return result.stdout.strip()
 
 
-def validate_source(source, expected_commit, tag):
-    source = Path(source)
+def validate_release_identity(source, expected_commit, tag, version):
     git = lambda *args: command(["git", "-C", str(source), *args])
-    if not re.fullmatch(r"[0-9a-f]{40}", expected_commit) or git("rev-parse", "HEAD") != expected_commit:
-        raise ValueError("Source commit does not match the validated commit")
-    if git("status", "--porcelain", "--untracked-files=normal"):
-        raise ValueError("Release source must be clean, including untracked files")
-    version = tomllib.loads((source / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     if not re.fullmatch(VERSION, version):
         raise ValueError("Workspace version must be a stable version")
     if tag is not None:
@@ -46,8 +40,38 @@ def validate_source(source, expected_commit, tag):
         reachable = subprocess.run(["git", "-C", str(source), "merge-base", "--is-ancestor", expected_commit, "refs/remotes/origin/main"], capture_output=True)
         if reachable.returncode:
             raise ValueError("Release source must be reachable from origin/main")
+
+
+def validate_source(source, expected_commit, tag):
+    source = Path(source)
+    git = lambda *args: command(["git", "-C", str(source), *args])
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_commit) or git("rev-parse", "HEAD") != expected_commit:
+        raise ValueError("Source commit does not match the validated commit")
+    if git("status", "--porcelain", "--untracked-files=normal"):
+        raise ValueError("Release source must be clean, including untracked files")
+    version = tomllib.loads((source / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+    validate_release_identity(source, expected_commit, tag, version)
     revision = git("describe", "--tags", "--always", "--dirty=-dirty", "--abbrev=12")
     return version, revision, int(git("show", "-s", "--format=%ct", "HEAD"))
+
+
+def prepare_source(source, expected_commit, tag=None):
+    """Resolve only approved source from a trusted initial checkout before building."""
+    source = Path(source)
+    git = lambda *args: command(["git", "-C", str(source), *args])
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        raise ValueError("Expected an immutable source commit")
+    if git("status", "--porcelain", "--untracked-files=normal"):
+        raise ValueError("Initial source checkout must be clean")
+    available = subprocess.run(["git", "-C", str(source), "cat-file", "-e", expected_commit], capture_output=True)
+    if available.returncode:
+        git("fetch", "--no-tags", "origin", expected_commit)
+    if git("cat-file", "-t", expected_commit) != "commit":
+        raise ValueError("Expected a source commit object")
+    version = tomllib.loads(git("show", expected_commit + ":Cargo.toml"))["workspace"]["package"]["version"]
+    validate_release_identity(source, expected_commit, tag, version)
+    git("checkout", "--detach", expected_commit)
+    return validate_source(source, expected_commit, tag)
 
 
 def validate_static_elf(data):
@@ -136,6 +160,10 @@ def verify_archive(archive, tag, expected_commit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    prepare = commands.add_parser("prepare")
+    prepare.add_argument("--source", type=Path, required=True)
+    prepare.add_argument("--commit", required=True)
+    prepare.add_argument("--tag")
     package = commands.add_parser("package")
     package.add_argument("--source", type=Path, required=True)
     package.add_argument("--binary", type=Path, required=True)
@@ -147,7 +175,9 @@ def main():
     verify.add_argument("--tag", required=True)
     verify.add_argument("--commit", required=True)
     args = parser.parse_args()
-    if args.command == "package":
+    if args.command == "prepare":
+        prepare_source(args.source, args.commit, args.tag)
+    elif args.command == "package":
         print(package_release(args.source, args.binary, args.output, args.commit, args.tag))
     else:
         print(json.dumps(verify_archive(args.archive, args.tag, args.commit)))

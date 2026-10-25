@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from rendezvous_release import package_release, verify_archive
+from rendezvous_release import package_release, prepare_source, verify_archive
 from publish_rendezvous_release import publish, verify_signature
 
 
@@ -66,6 +66,27 @@ class RendezvousReleaseTests(unittest.TestCase):
         self.assertEqual(metadata["rust_target"], "x86_64-unknown-linux-musl")
         self.assertEqual(metadata["binary_sha256"], hashlib.sha256(self.static.read_bytes()).hexdigest())
         self.assertEqual(archive.with_name(archive.name + ".sha256").read_text(), hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n")
+
+    def test_prepares_an_old_release_from_a_newer_protected_main_checkout(self):
+        (self.repo / "newer.txt").write_text("Newer main")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Newer main")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        prepare_source(self.repo, self.commit, "v2.1.0")
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.commit)
+        self.assertFalse((self.repo / "newer.txt").exists())
+
+    def test_refuses_unmerged_release_before_changing_checkout(self):
+        original = self.commit
+        (self.repo / "unmerged.txt").write_text("Unmerged")
+        self.git("add", ".")
+        self.git("commit", "-qm", "Unmerged source")
+        unmerged = self.git("rev-parse", "HEAD")
+        self.git("tag", "-f", "-a", "v2.1.0", "-m", "Unmerged tag")
+        self.git("checkout", "--detach", original)
+        with self.assertRaisesRegex(ValueError, "main"):
+            prepare_source(self.repo, unmerged, "v2.1.0")
+        self.assertEqual(self.git("rev-parse", "HEAD"), original)
 
     def test_rejects_modified_tracked_source(self):
         (self.repo / "Cargo.toml").write_text('[workspace.package]\nversion = "2.1.0"\n# changed\n')
