@@ -766,6 +766,10 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
                     // Preserve the former bounded foreground refresh here;
                     // route discovery still remains advisory and fail-open.
                     initial_discovery_timeout: Duration::from_secs(2),
+                    // CLI commands can finish before background work is
+                    // drained, so retain the old startup guarantee that an
+                    // updated contact list reaches the bootstrap file.
+                    foreground_contact_list_refresh: true,
                     connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
                         "bootstrap_file",
                         move |bootstrap| bootstrap.write_to_path(&persistence_path),

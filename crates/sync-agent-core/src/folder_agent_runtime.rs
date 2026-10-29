@@ -860,8 +860,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let configured_client = configured_client(options)?;
     let identity_persistence_failure = configured_client.identity_persistence_failure.clone();
     let identity_persistence_callback = configured_client.identity_persistence_callback;
+    let managed_client = configured_client.managed_client.clone();
     propagate_identity_persistence_failure(identity_persistence_failure.as_ref())?;
-    if configured_client.managed_client.is_some() {
+    if managed_client.is_some() {
         tracing::info!("using shared Rendezvous-managed client routes for folder sync");
     }
     let client = configured_client.client.clone();
@@ -1270,6 +1271,9 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     while running.load(Ordering::SeqCst) {
         retry_pending_identity_persistence(
             identity_persistence_failure.as_ref(),
+            managed_client
+                .as_ref()
+                .and_then(ManagedBerryKeepClient::current_identity),
             identity_persistence_callback,
         );
         if !drain_runtime_events(
@@ -1713,6 +1717,7 @@ struct ConfiguredFolderAgentClient {
 #[derive(Clone, Default)]
 struct FolderAgentIdentityPersistenceFailure {
     state: Arc<Mutex<FolderAgentIdentityPersistenceState>>,
+    persistence_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -1777,7 +1782,11 @@ impl FolderAgentIdentityPersistenceFailure {
         }
     }
 
-    fn retry_pending(&self, persist_client_identity: FolderAgentClientIdentityPersistence) {
+    fn retry_pending(
+        &self,
+        current_identity: Option<ClientIdentityMaterial>,
+        persist_client_identity: FolderAgentClientIdentityPersistence,
+    ) {
         let now = Instant::now();
         let pending_identity = {
             let mut state = self
@@ -1795,11 +1804,22 @@ impl FolderAgentIdentityPersistenceFailure {
             state.last_retry_attempt = Some(now);
             state.pending_identity.take()
         };
-        let Some(identity) = pending_identity else {
+        let Some(pending_identity) = pending_identity else {
             return;
         };
+        // A later renewal can have persisted successfully while an older
+        // failure remains queued during the retry throttle. Always replay the
+        // managed controller's current identity when it is available.
+        let identity = current_identity.unwrap_or(pending_identity);
 
-        if let Err(error) = persist_client_identity(&identity) {
+        let result = {
+            let _persistence_guard = self
+                .persistence_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            persist_client_identity(&identity)
+        };
+        if let Err(error) = result {
             tracing::warn!(
                 error = %format!("{error:#}"),
                 device_id = %identity.device_id,
@@ -1821,6 +1841,18 @@ impl FolderAgentIdentityPersistenceFailure {
             );
         }
     }
+
+    fn persist(
+        &self,
+        persist_client_identity: FolderAgentClientIdentityPersistence,
+        identity: &ClientIdentityMaterial,
+    ) -> Result<()> {
+        let _persistence_guard = self
+            .persistence_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        persist_client_identity(identity)
+    }
 }
 
 fn propagate_identity_persistence_failure(
@@ -1834,10 +1866,11 @@ fn propagate_identity_persistence_failure(
 
 fn retry_pending_identity_persistence(
     failure: Option<&FolderAgentIdentityPersistenceFailure>,
+    current_identity: Option<ClientIdentityMaterial>,
     persist_client_identity: Option<FolderAgentClientIdentityPersistence>,
 ) {
     if let (Some(failure), Some(persist_client_identity)) = (failure, persist_client_identity) {
-        failure.retry_pending(persist_client_identity);
+        failure.retry_pending(current_identity, persist_client_identity);
     }
 }
 
@@ -1848,7 +1881,8 @@ fn persist_folder_agent_identity(
 ) -> Result<()> {
     record_folder_agent_persistence_result(
         persistence_failure,
-        persist_client_identity(identity)
+        persistence_failure
+            .persist(persist_client_identity, identity)
             .context("failed to persist renewed folder sync client identity"),
         identity,
     )
@@ -3475,6 +3509,7 @@ mod tests {
     use anyhow::{Result, bail};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum BackendOperation {
@@ -3750,7 +3785,7 @@ mod tests {
         )
         .expect_err("the managed callback should still report its persistence error");
 
-        failure.retry_pending(persistence_must_not_run);
+        failure.retry_pending(None, persistence_must_not_run);
         assert_eq!(
             failure
                 .state
@@ -3759,6 +3794,56 @@ mod tests {
                 .pending_identity
                 .as_ref(),
             Some(&identity)
+        );
+    }
+
+    #[test]
+    fn identity_persistence_retry_prefers_the_current_managed_identity() {
+        static RETRIED_IDENTITIES: OnceLock<Mutex<Vec<ClientIdentityMaterial>>> = OnceLock::new();
+
+        fn capture_persisted_identity(identity: &ClientIdentityMaterial) -> Result<()> {
+            RETRIED_IDENTITIES
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .expect("retried identities lock should not be poisoned")
+                .push(identity.clone());
+            Ok(())
+        }
+
+        let retried_identities = RETRIED_IDENTITIES.get_or_init(|| Mutex::new(Vec::new()));
+        retried_identities
+            .lock()
+            .expect("retried identities lock should not be poisoned")
+            .clear();
+
+        let failure = FolderAgentIdentityPersistenceFailure::default();
+        let stale_identity =
+            ClientIdentityMaterial::generate(common::ClusterId::now_v7(), None, None)
+                .expect("stale test identity should generate");
+        let current_identity =
+            ClientIdentityMaterial::generate(stale_identity.cluster_id, None, None)
+                .expect("current test identity should generate");
+        failure.complete_startup();
+        record_folder_agent_persistence_result(
+            &failure,
+            Err(anyhow::anyhow!("identity file temporarily locked")),
+            &stale_identity,
+        )
+        .expect_err("the managed callback should still report its persistence error");
+        failure
+            .state
+            .lock()
+            .expect("persistence state lock should not be poisoned")
+            .last_retry_attempt =
+            Some(Instant::now() - IDENTITY_PERSISTENCE_RETRY_INTERVAL - Duration::from_secs(1));
+
+        failure.retry_pending(Some(current_identity.clone()), capture_persisted_identity);
+        assert_eq!(
+            retried_identities
+                .lock()
+                .expect("retried identities lock should not be poisoned")
+                .as_slice(),
+            [current_identity]
         );
     }
 

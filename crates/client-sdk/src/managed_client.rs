@@ -125,6 +125,10 @@ pub struct ManagedClientOptions {
     pub connection_bootstrap_persistence: Option<ManagedBootstrapPersistence>,
     /// Optional durable storage for renewed Rendezvous client identities.
     pub client_identity_persistence: Option<ManagedClientIdentityPersistence>,
+    /// Waits for the direct-API contact-list refresh during the bounded startup
+    /// window. Short-lived callers can opt in when they need an updated
+    /// bootstrap persisted before their runtime exits.
+    pub foreground_contact_list_refresh: bool,
 }
 
 impl Default for ManagedClientOptions {
@@ -140,6 +144,7 @@ impl Default for ManagedClientOptions {
             route_maintenance_policy: ClientRouteMaintenancePolicy::default(),
             connection_bootstrap_persistence: None,
             client_identity_persistence: None,
+            foreground_contact_list_refresh: false,
         }
     }
 }
@@ -694,10 +699,24 @@ impl ManagedBerryKeepClient {
 
         // This authenticated direct-API request can repair a stale Rendezvous
         // list even when every currently known Rendezvous endpoint has gone
-        // away. Keep it independent from candidate discovery so it neither
-        // waits for a slow control-plane response nor gets skipped when
-        // discovery fails.
-        self.schedule_cluster_rendezvous_contact_list_refresh(reason);
+        // away. Long-lived clients keep it independent from candidate discovery
+        // so it neither waits for a slow control-plane response nor gets
+        // skipped when discovery fails. Short-lived callers can opt in to
+        // foreground persistence during their bounded startup window.
+        if self.controller.options.foreground_contact_list_refresh
+            && matches!(reason, RouteRefreshReason::Startup)
+        {
+            if let Err(error) = self.refresh_cluster_rendezvous_contact_list().await {
+                tracing::warn!(
+                    event = "rendezvous_contact_list_refresh_failed",
+                    refresh_reason = reason.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed refreshing authenticated cluster-managed Rendezvous contacts"
+                );
+            }
+        } else {
+            self.schedule_cluster_rendezvous_contact_list_refresh(reason);
+        }
 
         let (updates_sender, mut updates_receiver) = mpsc::unbounded_channel();
         let bootstrap = self
@@ -1338,6 +1357,7 @@ mod tests {
 
         assert_eq!(options.initial_discovery_timeout, Duration::ZERO);
         assert_eq!(options.discovery_ttl, Duration::from_secs(2 * 60));
+        assert!(!options.foreground_contact_list_refresh);
     }
 
     #[test]

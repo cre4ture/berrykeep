@@ -173,12 +173,23 @@ impl ClientIdentityMaterial {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
-        }
-        fs::write(path, self.to_json_pretty()?)
-            .with_context(|| format!("failed to write client identity {}", path.display()))
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        let temporary_path = parent.join(format!(".client-identity-{}.tmp", Uuid::now_v7()));
+        fs::write(&temporary_path, self.to_json_pretty()?).with_context(|| {
+            format!(
+                "failed to write temporary client identity {}",
+                temporary_path.display()
+            )
+        })?;
+        fs::rename(&temporary_path, path).with_context(|| {
+            format!(
+                "failed to atomically replace client identity {} with {}",
+                path.display(),
+                temporary_path.display()
+            )
+        })
     }
 
     pub fn validate(&self) -> Result<()> {
