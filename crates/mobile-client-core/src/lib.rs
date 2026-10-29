@@ -751,7 +751,12 @@ impl MobileClient {
                     .unwrap_or(original_identity.clone());
                 (managed.client(), Some(managed), Some(current_identity))
             }
-            None => (bootstrap.build_client()?, None, None),
+            None => {
+                let managed = self.runtime.block_on(
+                    bootstrap.build_managed_client(None, self.options.managed_client.clone()),
+                )?;
+                (managed.client(), Some(managed), None)
+            }
         };
 
         let client_node = ClientNode::with_client_cache_limits(
@@ -1307,9 +1312,7 @@ mod tests {
         .expect("identity configuration should parse")
     }
 
-    fn configuration_with_unreachable_routes(
-        identity: &ClientIdentityMaterial,
-    ) -> MobileClientConfiguration {
+    fn configuration_with_unreachable_routes() -> MobileClientConfiguration {
         MobileClientConfiguration::new(
             r#"{
                 "version": 1,
@@ -1329,11 +1332,7 @@ mod tests {
                 "trust_roots": {}
             }"#,
             None::<&str>,
-            Some(
-                identity
-                    .to_json_pretty()
-                    .expect("identity should serialize"),
-            ),
+            None::<&str>,
         )
         .expect("identity configuration should parse")
     }
@@ -1522,15 +1521,10 @@ mod tests {
     }
 
     #[test]
-    fn web_ui_starts_while_all_initial_routes_are_unreachable() {
-        let cluster_id = "019d04a8-3099-75bc-8ff5-f5bd9a78bb83"
-            .parse()
-            .expect("cluster id should parse");
-        let identity = ClientIdentityMaterial::generate(cluster_id, None, None)
-            .expect("identity should generate");
+    fn web_ui_starts_for_anonymous_unreachable_initial_routes() {
         let client = client();
 
-        let configuration = configuration_with_unreachable_routes(&identity);
+        let configuration = configuration_with_unreachable_routes();
         let started = client.start_web_ui(configuration.clone(), MobileWebUiSurface::WebUi);
 
         assert_eq!(started.disposition, MobileWebUiCommandDisposition::Applied);
