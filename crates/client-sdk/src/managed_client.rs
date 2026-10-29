@@ -63,8 +63,9 @@ impl std::fmt::Debug for ManagedBootstrapPersistence {
 }
 
 /// Optional durable storage for a renewed Rendezvous client identity. The
-/// callback runs when a managed refresh accepts a newer identity, including
-/// refreshes scheduled after the client has been returned to its caller.
+/// callback runs on Tokio's blocking executor when a managed refresh accepts
+/// a newer identity, including refreshes scheduled after the client has been
+/// returned to its caller.
 #[derive(Clone)]
 pub struct ManagedClientIdentityPersistence {
     source: &'static str,
@@ -503,7 +504,7 @@ impl ManagedBerryKeepClient {
             .clone()
     }
 
-    fn record_identity_update(&self, identity: ClientIdentityMaterial) {
+    async fn record_identity_update(&self, identity: ClientIdentityMaterial) {
         *self
             .controller
             .identity
@@ -515,23 +516,36 @@ impl ManagedBerryKeepClient {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
 
-        let Some(persistence) = self.controller.options.client_identity_persistence.as_ref() else {
+        let Some(persistence) = self.controller.options.client_identity_persistence.clone() else {
             return;
         };
-        if let Err(error) = persistence.persist(&identity) {
-            tracing::warn!(
-                event = "rendezvous_client_identity_persistence_failed",
-                persistence_source = persistence.source(),
-                error = %error,
-                "failed persisting renewed Rendezvous client identity"
-            );
-        } else {
-            tracing::info!(
-                event = "rendezvous_client_identity_persisted",
-                persistence_source = persistence.source(),
-                device_id = %identity.device_id,
-                "persisted renewed Rendezvous client identity"
-            );
+        let source = persistence.source();
+        let identity_to_persist = identity.clone();
+        match tokio::task::spawn_blocking(move || persistence.persist(&identity_to_persist)).await {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    event = "rendezvous_client_identity_persisted",
+                    persistence_source = source,
+                    device_id = %identity.device_id,
+                    "persisted renewed Rendezvous client identity"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    event = "rendezvous_client_identity_persistence_failed",
+                    persistence_source = source,
+                    error = %error,
+                    "failed persisting renewed Rendezvous client identity"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "rendezvous_client_identity_persistence_task_failed",
+                    persistence_source = source,
+                    error = %error,
+                    "renewed Rendezvous client identity persistence task failed"
+                );
+            }
         }
     }
 
@@ -621,7 +635,8 @@ impl ManagedBerryKeepClient {
                                     "renewed identity must be present after a successful renewal",
                                 )
                                 .clone(),
-                        );
+                        )
+                        .await;
                     }
                     identity_updated
                 }
@@ -1520,8 +1535,8 @@ mod tests {
         let _ = candidate_server.await;
     }
 
-    #[test]
-    fn managed_client_persists_identity_updates_after_construction() {
+    #[tokio::test]
+    async fn managed_client_persists_identity_updates_after_construction() {
         let cluster_id = Uuid::now_v7();
         let persisted = Arc::new(Mutex::new(Vec::<ClientIdentityMaterial>::new()));
         let persisted_updates = Arc::clone(&persisted);
@@ -1564,12 +1579,15 @@ mod tests {
             ..ManagedClientOptions::default()
         };
         let managed = bootstrap
-            .build_managed_client_blocking(Some(identity.clone()), options)
+            .build_managed_client(Some(identity.clone()), options)
+            .await
             .expect("managed client should build without an initial route connection");
         let mut renewed_identity = identity;
         renewed_identity.rendezvous_client_identity_pem = Some("renewed-identity".to_string());
 
-        managed.record_identity_update(renewed_identity.clone());
+        managed
+            .record_identity_update(renewed_identity.clone())
+            .await;
 
         assert_eq!(managed.current_identity(), Some(renewed_identity.clone()));
         assert_eq!(
