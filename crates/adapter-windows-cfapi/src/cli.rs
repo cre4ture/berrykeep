@@ -343,6 +343,16 @@ pub fn cli_main() -> anyhow::Result<()> {
     }
 }
 
+fn select_identity_persistence_destination(
+    explicit_path: Option<PathBuf>,
+    discovered_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    // An explicit destination stays authoritative even before it exists;
+    // otherwise a populated AppData fallback would prevent renewed
+    // credentials from ever reaching the operator-selected file.
+    explicit_path.or(discovered_path)
+}
+
 fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
     let ServeArgs {
         sync_root_id,
@@ -438,13 +448,16 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         if let Some(identity) = client_identity.as_ref() {
             tracing::info!("using enrolled client identity for {}", identity.device_id);
         }
-        let persisted_identity_path = inspect_persisted_client_identity_paths(
+        let selected_identity_path = inspect_persisted_client_identity_paths(
             &registration.root_path,
             bootstrap_file.as_deref(),
             client_identity_file.as_deref(),
         )
-        .selected_path
-        .or(client_identity_file.clone());
+        .selected_path;
+        let persisted_identity_path = select_identity_persistence_destination(
+            client_identity_file.clone(),
+            selected_identity_path,
+        );
         let identity_root_path = registration.root_path.clone();
         let mut managed_client_options = ManagedClientOptions::default();
         if client_identity.is_some() {
@@ -1123,5 +1136,16 @@ fn serve_accepts_legacy_server_ca_cert_alias() {
     assert_eq!(
         args.server_ca_pem_file,
         Some(PathBuf::from(r"C:\demo\server-ca.pem"))
+    );
+}
+
+#[test]
+fn explicit_identity_persistence_destination_overrides_discovered_fallback() {
+    let explicit_path = PathBuf::from(r"C:\config\client-identity.json");
+    let discovered_path = PathBuf::from(r"C:\Users\Example\AppData\Local\BerryKeep\identity.json");
+
+    assert_eq!(
+        select_identity_persistence_destination(Some(explicit_path.clone()), Some(discovered_path),),
+        Some(explicit_path)
     );
 }

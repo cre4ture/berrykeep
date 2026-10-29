@@ -305,9 +305,10 @@ impl RouteMembershipChanges {
 impl ConnectionBootstrap {
     /// Builds a stable client handle from static bootstrap routes, then starts
     /// a fail-open Rendezvous refresh. Enrolled clients can adopt discovered
-    /// Direct QUIC routes; anonymous clients continue to use only direct HTTPS
-    /// routes. By default, discovery and route validation run after the handle
-    /// is returned; callers can opt into a bounded foreground wait.
+    /// Direct QUIC routes; anonymous clients perform only static-route
+    /// maintenance and never issue unauthenticated Rendezvous discovery.
+    /// By default, discovery and route validation run after the handle is
+    /// returned; callers can opt into a bounded foreground wait.
     pub async fn build_managed_client(
         &self,
         identity: Option<ClientIdentityMaterial>,
@@ -675,9 +676,18 @@ impl ManagedBerryKeepClient {
             false
         };
 
-        if identity.is_some()
-            && let Err(error) = self.refresh_cluster_rendezvous_contact_list().await
-        {
+        if identity.is_none() {
+            return self.finish_route_refresh(
+                telemetry,
+                RouteRefreshOutcome {
+                    discovery_used: false,
+                    identity_updated: false,
+                    ..RouteRefreshOutcome::default()
+                },
+            );
+        }
+
+        if let Err(error) = self.refresh_cluster_rendezvous_contact_list().await {
             // This is intentionally advisory: a client with a valid immutable
             // bootstrap must remain usable while the replicated configuration
             // has not reached its current node yet.
@@ -1074,10 +1084,26 @@ impl ManagedBerryKeepClient {
     }
 
     fn start_periodic_refresh(&self) {
-        // The startup refresh can learn cluster-managed Rendezvous contacts.
-        // Start the cadence before that asynchronous pass completes so a
-        // bootstrap with no initially effective URLs is rechecked after the
-        // contact list has been adopted.
+        let has_identity = self
+            .controller
+            .identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        let has_rendezvous_urls = !self
+            .controller
+            .bootstrap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .effective_rendezvous_urls()
+            .unwrap_or_default()
+            .is_empty();
+        // An enrolled client can learn cluster-managed contacts during its
+        // asynchronous startup refresh. Anonymous clients cannot; only keep
+        // their cadence when the bootstrap already has Rendezvous URLs.
+        if !has_identity && !has_rendezvous_urls {
+            return;
+        }
         self.controller.clone().start_periodic_refresh();
     }
 }
@@ -1375,59 +1401,105 @@ mod tests {
             ClientConnectionDiagnosticImpact::UserFacing
         );
         assert!(
-            managed
+            !managed
                 .controller
                 .periodic_refresh_started
                 .load(Ordering::Acquire),
-            "a bootstrap can learn Rendezvous URLs asynchronously, so periodic refresh must start even before one is present"
+            "anonymous clients without Rendezvous URLs should not run an empty periodic refresh"
         );
     }
 
+    #[tokio::test]
+    async fn anonymous_managed_client_maintains_static_routes_without_rendezvous_discovery() {
+        let cluster_id = Uuid::now_v7();
+        let discovery_requests = Arc::new(AtomicUsize::new(0));
+        let discovery_requests_handler = Arc::clone(&discovery_requests);
+        let router = Router::new().route(
+            "/control/discovery",
+            get(move || {
+                let discovery_requests = Arc::clone(&discovery_requests_handler);
+                async move {
+                    discovery_requests.fetch_add(1, Ordering::SeqCst);
+                    Json(DiscoveryResponse {
+                        rendezvous_peers: Vec::new(),
+                        node_candidates: None,
+                        node_relay_capable: false,
+                        node_hostname: None,
+                        node_connection_priority: 0,
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("discovery listener should bind");
+        let rendezvous_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("discovery listener should expose its address")
+        );
+        let discovery_server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("discovery test server should run");
+        });
+        let bootstrap = ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: vec![rendezvous_url.clone()],
+            rendezvous_contact_list: None,
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: rendezvous_url,
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: None,
+                node_hostname: None,
+            }],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+            node_priority_overrides: BTreeMap::new(),
+        };
+        let managed = bootstrap
+            .build_managed_client(
+                None,
+                ManagedClientOptions {
+                    initial_discovery_timeout: Duration::ZERO,
+                    discovery_ttl: Duration::from_secs(60),
+                    ..ManagedClientOptions::default()
+                },
+            )
+            .await
+            .expect("anonymous managed client should retain its static route");
+
+        let outcome = managed.notify_network_changed_async().await;
+
+        assert!(!outcome.discovery_used);
+        assert!(outcome.discovery_error.is_none());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            discovery_requests.load(Ordering::SeqCst),
+            0,
+            "anonymous managed lifecycle refreshes must not call Rendezvous discovery"
+        );
+
+        discovery_server.abort();
+        let _ = discovery_server.await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn managed_client_adopts_a_usable_candidate_before_other_nodes_finish_discovery() {
+    async fn dynamic_discovery_exposes_a_usable_candidate_before_other_nodes_finish() {
         let cluster_id = Uuid::now_v7();
         let fast_node_id = NodeId::new_v4();
         let stalled_node_id = NodeId::new_v4();
-        let candidate_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("candidate listener should bind");
-        let candidate_addr = candidate_listener
-            .local_addr()
-            .expect("candidate listener should expose its address");
-        let candidate_probe_count = Arc::new(AtomicUsize::new(0));
-        let candidate_route_probe_count = Arc::clone(&candidate_probe_count);
-        let candidate_health_probe_count = Arc::clone(&candidate_probe_count);
-        let candidate_server = tokio::spawn(async move {
-            axum::serve(
-                candidate_listener,
-                Router::new()
-                    .route(
-                        "/api/v1/diagnostics/latency",
-                        get(move || {
-                            let candidate_route_probe_count =
-                                Arc::clone(&candidate_route_probe_count);
-                            async move {
-                                candidate_route_probe_count.fetch_add(1, Ordering::SeqCst);
-                                "ok"
-                            }
-                        }),
-                    )
-                    .route(
-                        "/api/v1/health",
-                        get(move || {
-                            let candidate_health_probe_count =
-                                Arc::clone(&candidate_health_probe_count);
-                            async move {
-                                candidate_health_probe_count.fetch_add(1, Ordering::SeqCst);
-                                "ok"
-                            }
-                        }),
-                    ),
-            )
-            .await
-            .expect("candidate test server should run");
-        });
-        let candidate_url = format!("http://{candidate_addr}");
+        let candidate_url = "http://127.0.0.1:47000".to_string();
         let fast_node_label = fast_node_id.to_string();
         let discovery_candidate_url = candidate_url.clone();
         let discovery_router = Router::new()
@@ -1510,45 +1582,34 @@ mod tests {
             device_id: None,
             node_priority_overrides: BTreeMap::new(),
         };
-        let managed = bootstrap
-            .build_managed_client(
-                None,
-                ManagedClientOptions {
-                    initial_discovery_timeout: Duration::ZERO,
-                    discovery_ttl: Duration::from_secs(60),
-                    ..ManagedClientOptions::default()
-                },
-            )
+        let (targets_sender, mut targets_receiver) = mpsc::unbounded_channel();
+        let discovery_task = tokio::spawn(async move {
+            bootstrap
+                .refresh_dynamic_targets_with_updates(None, move |targets| {
+                    targets_sender
+                        .send(targets)
+                        .map_err(|_| anyhow!("partial discovery receiver closed"))
+                })
+                .await
+        });
+
+        let partial_targets = tokio::time::timeout(Duration::from_secs(1), targets_receiver.recv())
             .await
-            .expect("managed client should start from its static routes");
-        let refresh_client = managed.clone();
-        let refresh_task =
-            tokio::spawn(async move { refresh_client.notify_network_changed_async().await });
+            .expect("the usable candidate should be exposed before the stalled node completes")
+            .expect("partial discovery sender should remain available");
+        assert!(partial_targets.iter().any(|target| {
+            target.path_kind == TransportPathKind::DirectHttps
+                && target.target_node_id == Some(fast_node_id)
+                && target
+                    .direct_candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.endpoint == candidate_url)
+        }));
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let has_fast_candidate_route =
-                    managed.route_snapshot().endpoints.iter().any(|endpoint| {
-                        endpoint.path_kind == TransportPathKind::DirectHttps
-                            && endpoint.target_node_id == Some(fast_node_id)
-                            && endpoint.locator == candidate_url
-                            && candidate_probe_count.load(Ordering::SeqCst) > 0
-                    });
-                if has_fast_candidate_route {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the usable candidate should be adopted before the stalled node completes");
-
-        refresh_task.abort();
-        let _ = refresh_task.await;
+        discovery_task.abort();
+        let _ = discovery_task.await;
         discovery_server.abort();
         let _ = discovery_server.await;
-        candidate_server.abort();
-        let _ = candidate_server.await;
     }
 
     #[tokio::test]
@@ -1604,6 +1665,14 @@ mod tests {
         managed
             .record_identity_update(renewed_identity.clone())
             .await;
+
+        assert!(
+            managed
+                .controller
+                .periodic_refresh_started
+                .load(Ordering::Acquire),
+            "an enrolled client can learn cluster-managed contacts after deferred startup"
+        );
 
         assert_eq!(managed.current_identity(), Some(renewed_identity.clone()));
         assert_eq!(
