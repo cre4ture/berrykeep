@@ -16,7 +16,8 @@ use std::time::Duration;
 use crate::adapter::{CfapiAction, CfapiActionPlan, WindowsCfapiAdapter};
 use crate::auth::{
     ClientEnrollmentOptions, inspect_persisted_client_identity_paths,
-    persist_local_appdata_client_identity, resolve_or_enroll_client_identity,
+    persist_local_appdata_client_identity, persist_renewed_client_identity,
+    resolve_or_enroll_client_identity,
 };
 use crate::cfapi::{cf_get_placeholder_standard_info, cf_hydrate_placeholder, cf_set_pin_state};
 use crate::connection_config::{
@@ -442,16 +443,18 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             bootstrap_file.as_deref(),
             client_identity_file.as_deref(),
         )
-        .selected_path;
+        .selected_path
+        .or(client_identity_file.clone());
         let identity_root_path = registration.root_path.clone();
         let mut managed_client_options = ManagedClientOptions::default();
         if client_identity.is_some() {
             managed_client_options.client_identity_persistence = Some(
                 ManagedClientIdentityPersistence::new("windows_cfapi", move |identity| {
-                    if let Some(path) = persisted_identity_path.as_deref() {
-                        identity.write_to_path(path)?;
-                    }
-                    persist_local_appdata_client_identity(&identity_root_path, identity)
+                    persist_renewed_client_identity(
+                        &identity_root_path,
+                        persisted_identity_path.as_deref(),
+                        identity,
+                    )
                 }),
             );
         }
@@ -465,8 +468,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             );
         }
         let managed_client = connection
-            .bootstrap
-            .build_managed_client_blocking(client_identity.clone(), managed_client_options)?;
+            .build_managed_client_with_options(client_identity.as_ref(), managed_client_options)?;
         let client = managed_client.client();
         if let Some(publisher) = status_publisher.as_ref() {
             remote_status_thread = Some(spawn_remote_status_thread(
