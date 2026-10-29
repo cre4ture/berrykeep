@@ -687,18 +687,6 @@ impl ManagedBerryKeepClient {
             );
         }
 
-        if let Err(error) = self.refresh_cluster_rendezvous_contact_list().await {
-            // This is intentionally advisory: a client with a valid immutable
-            // bootstrap must remain usable while the replicated configuration
-            // has not reached its current node yet.
-            tracing::warn!(
-                event = "rendezvous_contact_list_refresh_failed",
-                refresh_reason = telemetry.reason.as_str(),
-                error = %format!("{error:#}"),
-                "failed refreshing authenticated cluster-managed rendezvous contacts"
-            );
-        }
-
         let (updates_sender, mut updates_receiver) = mpsc::unbounded_channel();
         let bootstrap = self
             .controller
@@ -822,6 +810,19 @@ impl ManagedBerryKeepClient {
             }
         };
         changes.record(membership);
+        if let Err(error) = self.refresh_cluster_rendezvous_contact_list().await {
+            // This is intentionally advisory: a client with a valid immutable
+            // bootstrap must remain usable while the replicated configuration
+            // has not reached its current node yet. Run it after dynamic route
+            // adoption so an unavailable control-plane endpoint cannot delay
+            // a usable partial discovery result.
+            tracing::warn!(
+                event = "rendezvous_contact_list_refresh_failed",
+                refresh_reason = telemetry.reason.as_str(),
+                error = %format!("{error:#}"),
+                "failed refreshing authenticated cluster-managed rendezvous contacts"
+            );
+        }
         *self
             .controller
             .last_success
@@ -1505,35 +1506,12 @@ mod tests {
         let candidate_addr = candidate_listener
             .local_addr()
             .expect("candidate listener should expose its address");
-        let candidate_probe_count = Arc::new(AtomicUsize::new(0));
-        let candidate_route_probe_count = Arc::clone(&candidate_probe_count);
-        let candidate_health_probe_count = Arc::clone(&candidate_probe_count);
         let candidate_server = tokio::spawn(async move {
             axum::serve(
                 candidate_listener,
                 Router::new()
-                    .route(
-                        "/api/v1/diagnostics/latency",
-                        get(move || {
-                            let candidate_route_probe_count =
-                                Arc::clone(&candidate_route_probe_count);
-                            async move {
-                                candidate_route_probe_count.fetch_add(1, Ordering::SeqCst);
-                                "ok"
-                            }
-                        }),
-                    )
-                    .route(
-                        "/api/v1/health",
-                        get(move || {
-                            let candidate_health_probe_count =
-                                Arc::clone(&candidate_health_probe_count);
-                            async move {
-                                candidate_health_probe_count.fetch_add(1, Ordering::SeqCst);
-                                "ok"
-                            }
-                        }),
-                    ),
+                    .route("/api/v1/diagnostics/latency", get(|| async { "ok" }))
+                    .route("/api/v1/health", get(|| async { "ok" })),
             )
             .await
             .expect("candidate test server should run");
@@ -1541,13 +1519,17 @@ mod tests {
         let candidate_url = format!("http://{candidate_addr}");
         let fast_node_label = fast_node_id.to_string();
         let discovery_candidate_url = candidate_url.clone();
+        let discovery_request_count = Arc::new(AtomicUsize::new(0));
+        let discovery_request_counter = Arc::clone(&discovery_request_count);
         let discovery_router = Router::new()
             .route(
                 "/control/discovery",
                 get(move |Query(query): Query<TestDiscoveryQuery>| {
                     let fast_node_label = fast_node_label.clone();
                     let candidate_url = discovery_candidate_url.clone();
+                    let discovery_request_counter = Arc::clone(&discovery_request_counter);
                     async move {
+                        discovery_request_counter.fetch_add(1, Ordering::SeqCst);
                         if query.node_id.as_deref() == Some(fast_node_label.as_str()) {
                             return Json(DiscoveryResponse {
                                 rendezvous_peers: Vec::new(),
@@ -1621,9 +1603,12 @@ mod tests {
             device_id: None,
             node_priority_overrides: BTreeMap::new(),
         };
+        let mut identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("test identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
         let managed = bootstrap
             .build_managed_client(
-                None,
+                Some(identity),
                 ManagedClientOptions {
                     initial_discovery_timeout: Duration::ZERO,
                     discovery_ttl: Duration::from_secs(60),
@@ -1632,55 +1617,35 @@ mod tests {
             )
             .await
             .expect("managed client should start from its static routes");
-        let (targets_sender, mut targets_receiver) = mpsc::unbounded_channel();
-        let discovery_task = tokio::spawn(async move {
-            bootstrap
-                .refresh_dynamic_targets_with_updates(None, move |targets| {
-                    targets_sender
-                        .send(targets)
-                        .map_err(|_| anyhow!("partial discovery receiver closed"))
-                })
-                .await
-        });
+        let refresh_client = managed.clone();
+        let refresh_task =
+            tokio::spawn(async move { refresh_client.notify_network_changed_async().await });
 
-        let partial_targets = tokio::time::timeout(Duration::from_secs(1), targets_receiver.recv())
-            .await
-            .expect("the usable candidate should be exposed before the stalled node completes")
-            .expect("partial discovery sender should remain available");
-        assert!(partial_targets.iter().any(|target| {
-            target.path_kind == TransportPathKind::DirectHttps
-                && target.target_node_id == Some(fast_node_id)
-                && target
-                    .direct_candidate
-                    .as_ref()
-                    .is_some_and(|candidate| candidate.endpoint == candidate_url)
-        }));
-        managed
-            .adopt_discovered_targets(partial_targets, None)
-            .await
-            .expect("managed client should adopt partial discovery targets");
-        managed.client.spawn_due_connection_route_refresh();
-
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let candidate_adoption = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let has_fast_candidate_route =
                     managed.route_snapshot().endpoints.iter().any(|endpoint| {
                         endpoint.path_kind == TransportPathKind::DirectHttps
                             && endpoint.target_node_id == Some(fast_node_id)
                             && endpoint.locator == candidate_url
-                            && candidate_probe_count.load(Ordering::SeqCst) > 0
                     });
-                if has_fast_candidate_route {
+                if has_fast_candidate_route && discovery_request_count.load(Ordering::SeqCst) >= 2 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("the managed client should probe the usable candidate before the stalled node completes");
+        .await;
+        if candidate_adoption.is_err() {
+            panic!(
+                "the managed client should adopt the usable candidate before the stalled node completes; routes={:?}; discovery_request_count={}",
+                managed.route_snapshot(),
+                discovery_request_count.load(Ordering::SeqCst)
+            );
+        }
 
-        discovery_task.abort();
-        let _ = discovery_task.await;
+        refresh_task.abort();
+        let _ = refresh_task.await;
         discovery_server.abort();
         let _ = discovery_server.await;
         candidate_server.abort();

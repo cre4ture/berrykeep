@@ -1189,7 +1189,14 @@ impl MobileClient {
             authorization: authorization.token().to_string(),
         };
 
-        let client_identity = client_session.client_identity();
+        // A reused transport session can retain an earlier renewable
+        // credential for the same keypair. Prefer the platform's current
+        // configuration for request signing, falling back to a renewal the
+        // managed session learned itself.
+        let client_identity = configuration
+            .client_identity()
+            .cloned()
+            .or_else(|| client_session.client_identity());
         let mut web_ui_client = client_session.client(self.options.web_ui_connection_name.clone());
         if let Some(identity) = client_identity.clone() {
             // The affine transport router can stay shared, but request signing
@@ -1200,7 +1207,7 @@ impl MobileClient {
             .with_service_name(self.options.web_ui_service_name.clone())
             .with_connection_bootstrap(configuration.effective_bootstrap().clone())
             .with_embedded_session_authorization(authorization.clone());
-        if let Some(identity) = client_identity {
+        if let Some(identity) = client_identity.clone() {
             web_ui_config = web_ui_config.with_client_identity(identity);
         }
         if let Some(persistence) = self.options.web_ui_bootstrap_persistence.clone() {
@@ -1227,7 +1234,7 @@ impl MobileClient {
             request_id,
             affinity: client_session.affinity().clone(),
             bootstrap_identity: configuration.effective_bootstrap_identity().to_string(),
-            client_identity: configuration.client_identity().cloned(),
+            client_identity,
             authorization,
             session,
             task,

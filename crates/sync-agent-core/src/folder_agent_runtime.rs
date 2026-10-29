@@ -1720,7 +1720,10 @@ struct FolderAgentIdentityPersistenceState {
     startup_complete: bool,
     startup_failure: Option<(String, ClientIdentityMaterial)>,
     pending_identity: Option<ClientIdentityMaterial>,
+    last_retry_attempt: Option<Instant>,
 }
+
+const IDENTITY_PERSISTENCE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 impl FolderAgentIdentityPersistenceFailure {
     fn record(&self, error: &anyhow::Error, identity: &ClientIdentityMaterial) {
@@ -1735,6 +1738,7 @@ impl FolderAgentIdentityPersistenceFailure {
                 "failed persisting renewed folder sync client identity; will retry"
             );
             state.pending_identity = Some(identity.clone());
+            state.last_retry_attempt = Some(Instant::now());
             return;
         }
 
@@ -1769,16 +1773,28 @@ impl FolderAgentIdentityPersistenceFailure {
                 "startup identity persistence completed too late to fail initialization; will retry"
             );
             state.pending_identity = Some(identity);
+            state.last_retry_attempt = Some(Instant::now());
         }
     }
 
     fn retry_pending(&self, persist_client_identity: FolderAgentClientIdentityPersistence) {
-        let pending_identity = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pending_identity
-            .take();
+        let now = Instant::now();
+        let pending_identity = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.pending_identity.is_none()
+                || state.last_retry_attempt.is_some_and(|last_attempt| {
+                    now.saturating_duration_since(last_attempt)
+                        < IDENTITY_PERSISTENCE_RETRY_INTERVAL
+                })
+            {
+                return;
+            }
+            state.last_retry_attempt = Some(now);
+            state.pending_identity.take()
+        };
         let Some(identity) = pending_identity else {
             return;
         };
@@ -1789,10 +1805,15 @@ impl FolderAgentIdentityPersistenceFailure {
                 device_id = %identity.device_id,
                 "retrying renewed folder sync client identity persistence later"
             );
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .pending_identity = Some(identity);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A callback may have recorded a newer renewed identity while
+            // this attempt was in flight. Preserve that newer value.
+            if state.pending_identity.is_none() {
+                state.pending_identity = Some(identity);
+            }
         } else {
             tracing::info!(
                 device_id = %identity.device_id,
@@ -3701,6 +3722,35 @@ mod tests {
 
         propagate_identity_persistence_failure(Some(&failure))
             .expect("a steady-state persistence failure must not stop the folder agent");
+        assert_eq!(
+            failure
+                .state
+                .lock()
+                .expect("persistence state lock should not be poisoned")
+                .pending_identity
+                .as_ref(),
+            Some(&identity)
+        );
+    }
+
+    #[test]
+    fn steady_state_identity_persistence_retry_is_throttled() {
+        fn persistence_must_not_run(_: &ClientIdentityMaterial) -> Result<()> {
+            panic!("a fresh persistence failure must wait before retrying")
+        }
+
+        let failure = FolderAgentIdentityPersistenceFailure::default();
+        let identity = ClientIdentityMaterial::generate(common::ClusterId::now_v7(), None, None)
+            .expect("test identity should generate");
+        failure.complete_startup();
+        record_folder_agent_persistence_result(
+            &failure,
+            Err(anyhow::anyhow!("identity file temporarily locked")),
+            &identity,
+        )
+        .expect_err("the managed callback should still report its persistence error");
+
+        failure.retry_pending(persistence_must_not_run);
         assert_eq!(
             failure
                 .state
