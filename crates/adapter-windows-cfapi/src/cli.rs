@@ -420,7 +420,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let refresh_interval = Duration::from_millis(remote_refresh_interval_ms.max(250));
         let refresh_poller =
             RemoteSnapshotPoller::server_notifications(Duration::from_secs(25), refresh_interval);
-        let mut client_identity = resolve_or_enroll_client_identity(
+        let client_identity = resolve_or_enroll_client_identity(
             connection.enrollment_base_url.as_ref(),
             &registration.root_path,
             bootstrap_file.as_deref(),
@@ -458,9 +458,6 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let managed_client = connection
             .bootstrap
             .build_managed_client_blocking(client_identity.clone(), managed_client_options)?;
-        if let Some(updated_identity) = managed_client.take_identity_update() {
-            client_identity = Some(updated_identity);
-        }
         let client = managed_client.client();
         if let Some(publisher) = status_publisher.as_ref() {
             remote_status_thread = Some(spawn_remote_status_thread(
