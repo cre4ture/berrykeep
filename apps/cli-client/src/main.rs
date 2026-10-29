@@ -759,19 +759,21 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
         let client_holder = match client_identity.as_ref() {
             Some(identity) => {
                 let persistence_path = bootstrap_path.to_path_buf();
+                let identity_persistence_path = client_identity_path.clone();
                 let options = ManagedClientOptions {
                     connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
                         "bootstrap_file",
                         move |bootstrap| bootstrap.write_to_path(&persistence_path),
                     )),
-                    client_identity_persistence: client_identity_path.clone().map(|path| {
-                        ManagedClientIdentityPersistence::new(
-                            "client_identity_file",
-                            move |identity| {
-                                persist_renewed_client_identity(Some(path.as_path()), identity)
-                            },
-                        )
-                    }),
+                    client_identity_persistence: Some(ManagedClientIdentityPersistence::new(
+                        "client_identity_file",
+                        move |identity| {
+                            persist_renewed_client_identity(
+                                identity_persistence_path.as_deref(),
+                                identity,
+                            )
+                        },
+                    )),
                     ..ManagedClientOptions::default()
                 };
                 let (managed, runtime) =
@@ -2045,6 +2047,21 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&test_dir).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn renewed_rendezvous_identity_requires_a_configured_file() {
+        let identity = ClientIdentityMaterial::generate(uuid::Uuid::now_v7(), None, None)
+            .expect("test identity should generate");
+
+        let error = persist_renewed_client_identity(None, &identity)
+            .expect_err("missing identity file should be reported");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no configured identity file to persist")
+        );
     }
 
     #[test]
