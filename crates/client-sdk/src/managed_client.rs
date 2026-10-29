@@ -1043,17 +1043,10 @@ impl ManagedBerryKeepClient {
     }
 
     fn start_periodic_refresh(&self) {
-        if self
-            .controller
-            .bootstrap
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .effective_rendezvous_urls()
-            .unwrap_or_default()
-            .is_empty()
-        {
-            return;
-        }
+        // The startup refresh can learn cluster-managed Rendezvous contacts.
+        // Start the cadence before that asynchronous pass completes so a
+        // bootstrap with no initially effective URLs is rechecked after the
+        // contact list has been adopted.
         self.controller.clone().start_periodic_refresh();
     }
 }
@@ -1349,6 +1342,13 @@ mod tests {
         assert_eq!(
             managed.client().connection_diagnostic_impact(),
             ClientConnectionDiagnosticImpact::UserFacing
+        );
+        assert!(
+            managed
+                .controller
+                .periodic_refresh_started
+                .load(Ordering::Acquire),
+            "a bootstrap can learn Rendezvous URLs asynchronously, so periodic refresh must start even before one is present"
         );
     }
 
