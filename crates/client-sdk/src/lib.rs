@@ -60,8 +60,8 @@ pub use latency_probe::{
     TitleLatencyProbeState, TitleLatencyProbeStatus, compare_direct_and_relay_latency,
 };
 pub use managed_client::{
-    ManagedBerryKeepClient, ManagedBootstrapPersistence, ManagedClientOptions, RouteDiscoveryError,
-    RouteRefreshOutcome, RouteRefreshReason,
+    ManagedBerryKeepClient, ManagedBootstrapPersistence, ManagedClientIdentityPersistence,
+    ManagedClientOptions, RouteDiscoveryError, RouteRefreshOutcome, RouteRefreshReason,
 };
 pub use remote_sync::{
     RemoteObjectChange, RemoteSnapshotFetchProgress, RemoteSnapshotFetcher, RemoteSnapshotPoller,

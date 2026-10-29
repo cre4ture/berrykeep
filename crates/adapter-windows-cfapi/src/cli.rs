@@ -1,7 +1,10 @@
 #![cfg(windows)]
 
 use clap::{Parser, Subcommand};
-use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
+use client_sdk::{
+    ManagedClientIdentityPersistence, ManagedClientOptions, RemoteSnapshotFetcher,
+    RemoteSnapshotPoller, RemoteSnapshotScope,
+};
 use desktop_status::default_remote_status_poll_interval_ms;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -12,8 +15,8 @@ use std::time::Duration;
 
 use crate::adapter::{CfapiAction, CfapiActionPlan, WindowsCfapiAdapter};
 use crate::auth::{
-    ClientEnrollmentOptions, persist_local_appdata_client_identity,
-    resolve_or_enroll_client_identity,
+    ClientEnrollmentOptions, inspect_persisted_client_identity_paths,
+    persist_local_appdata_client_identity, resolve_or_enroll_client_identity,
 };
 use crate::cfapi::{cf_get_placeholder_standard_info, cf_hydrate_placeholder, cf_set_pin_state};
 use crate::connection_config::{
@@ -434,7 +437,27 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         if let Some(identity) = client_identity.as_ref() {
             tracing::info!("using enrolled client identity for {}", identity.device_id);
         }
-        let managed_client = connection.build_managed_client(client_identity.as_ref())?;
+        let persisted_identity_path = inspect_persisted_client_identity_paths(
+            &registration.root_path,
+            bootstrap_file.as_deref(),
+            client_identity_file.as_deref(),
+        )
+        .selected_path;
+        let identity_root_path = registration.root_path.clone();
+        let mut managed_client_options = ManagedClientOptions::default();
+        if client_identity.is_some() {
+            managed_client_options.client_identity_persistence = Some(
+                ManagedClientIdentityPersistence::new("windows_cfapi", move |identity| {
+                    if let Some(path) = persisted_identity_path.as_deref() {
+                        identity.write_to_path(path)?;
+                    }
+                    persist_local_appdata_client_identity(&identity_root_path, identity)
+                }),
+            );
+        }
+        let managed_client = connection
+            .bootstrap
+            .build_managed_client_blocking(client_identity.clone(), managed_client_options)?;
         if let Some(updated_identity) = managed_client.take_identity_update() {
             client_identity = Some(updated_identity);
         }

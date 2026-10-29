@@ -7,8 +7,8 @@
 use anyhow::{Context, Result};
 use client_sdk::{
     BerryKeepClient, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ManagedBerryKeepClient, ManagedClientOptions, TitleLatencyMonitor, TitleLatencyProbeConfig,
-    TitleLatencyProbeStatus,
+    ManagedBerryKeepClient, ManagedClientIdentityPersistence, ManagedClientOptions,
+    TitleLatencyMonitor, TitleLatencyProbeConfig, TitleLatencyProbeStatus,
 };
 use common::logging::LogBuffer;
 use serde::{Deserialize, Serialize};
@@ -292,7 +292,11 @@ impl MobileClientSession {
     }
 
     pub fn client_identity(&self) -> Option<ClientIdentityMaterial> {
-        self.inner.client_identity.clone()
+        self.inner
+            .managed_client
+            .as_ref()
+            .and_then(ManagedBerryKeepClient::current_identity)
+            .or_else(|| self.inner.client_identity.clone())
     }
 
     pub fn take_client_identity_update(&self) -> Option<ClientIdentityMaterial> {
@@ -722,33 +726,33 @@ impl MobileClient {
         configuration: MobileClientConfiguration,
     ) -> Result<MobileClientSession> {
         let bootstrap = configuration.effective_bootstrap().clone();
-        let (client, managed_client, client_identity) =
-            match configuration.client_identity().cloned() {
-                Some(identity) => {
-                    let original_identity = identity.clone();
-                    let managed =
-                        self.runtime
-                            .block_on(bootstrap.build_managed_client_with_identity(
-                                identity,
-                                self.options.managed_client.clone(),
-                            ))?;
-                    let current_identity = managed
-                        .latest_identity_update()
-                        .unwrap_or(original_identity.clone());
-                    if current_identity != original_identity
-                        && let Some(persistence) = self.options.identity_persistence.as_ref()
-                        && let Err(error) = (persistence.persist)(&current_identity)
-                    {
-                        tracing::warn!(
-                            source = persistence.source,
-                            error = %error,
-                            "failed to persist renewed mobile client identity"
-                        );
-                    }
-                    (managed.client(), Some(managed), Some(current_identity))
+        let (client, managed_client, client_identity) = match configuration
+            .client_identity()
+            .cloned()
+        {
+            Some(identity) => {
+                let original_identity = identity.clone();
+                let mut managed_client_options = self.options.managed_client.clone();
+                if managed_client_options.client_identity_persistence.is_none()
+                    && let Some(persistence) = self.options.identity_persistence.as_ref()
+                {
+                    let persistence = persistence.clone();
+                    managed_client_options.client_identity_persistence =
+                        Some(ManagedClientIdentityPersistence::new(
+                            persistence.source,
+                            move |identity| (persistence.persist)(identity),
+                        ));
                 }
-                None => (bootstrap.build_client()?, None, None),
-            };
+                let managed = self.runtime.block_on(
+                    bootstrap.build_managed_client_with_identity(identity, managed_client_options),
+                )?;
+                let current_identity = managed
+                    .current_identity()
+                    .unwrap_or(original_identity.clone());
+                (managed.client(), Some(managed), Some(current_identity))
+            }
+            None => (bootstrap.build_client()?, None, None),
+        };
 
         let client_node = ClientNode::with_client_cache_limits(
             client.clone(),
@@ -1176,7 +1180,7 @@ impl MobileClient {
             authorization: authorization.token().to_string(),
         };
 
-        let client_identity = configuration.client_identity().cloned();
+        let client_identity = client_session.client_identity();
         let mut web_ui_client = client_session.client(self.options.web_ui_connection_name.clone());
         if let Some(identity) = client_identity.clone() {
             // The affine transport router can stay shared, but request signing

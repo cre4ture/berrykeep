@@ -22,6 +22,7 @@ const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const MIN_PERIODIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 type PersistConnectionBootstrapFn = dyn Fn(&ConnectionBootstrap) -> Result<()> + Send + Sync;
+type PersistClientIdentityFn = dyn Fn(&ClientIdentityMaterial) -> Result<()> + Send + Sync;
 
 /// Optional durable storage for contact-list updates learned by a managed
 /// client. The callback is invoked only after an authenticated cluster API
@@ -61,6 +62,44 @@ impl std::fmt::Debug for ManagedBootstrapPersistence {
     }
 }
 
+/// Optional durable storage for a renewed Rendezvous client identity. The
+/// callback runs when a managed refresh accepts a newer identity, including
+/// refreshes scheduled after the client has been returned to its caller.
+#[derive(Clone)]
+pub struct ManagedClientIdentityPersistence {
+    source: &'static str,
+    persist: Arc<PersistClientIdentityFn>,
+}
+
+impl ManagedClientIdentityPersistence {
+    pub fn new<F>(source: &'static str, persist: F) -> Self
+    where
+        F: Fn(&ClientIdentityMaterial) -> Result<()> + Send + Sync + 'static,
+    {
+        Self {
+            source,
+            persist: Arc::new(persist),
+        }
+    }
+
+    fn persist(&self, identity: &ClientIdentityMaterial) -> Result<()> {
+        (self.persist)(identity)
+    }
+
+    fn source(&self) -> &'static str {
+        self.source
+    }
+}
+
+impl std::fmt::Debug for ManagedClientIdentityPersistence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedClientIdentityPersistence")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Policy for shared, Rendezvous-managed client routes.
 #[derive(Debug, Clone)]
 pub struct ManagedClientOptions {
@@ -83,6 +122,8 @@ pub struct ManagedClientOptions {
     /// Optional durable storage for authenticated cluster-managed Rendezvous
     /// contact-list updates.
     pub connection_bootstrap_persistence: Option<ManagedBootstrapPersistence>,
+    /// Optional durable storage for renewed Rendezvous client identities.
+    pub client_identity_persistence: Option<ManagedClientIdentityPersistence>,
 }
 
 impl Default for ManagedClientOptions {
@@ -97,6 +138,7 @@ impl Default for ManagedClientOptions {
             refresh_on_transport_failure: true,
             route_maintenance_policy: ClientRouteMaintenancePolicy::default(),
             connection_bootstrap_persistence: None,
+            client_identity_persistence: None,
         }
     }
 }
@@ -450,6 +492,49 @@ impl ManagedBerryKeepClient {
             .clone()
     }
 
+    /// Reads the identity currently used for managed route refreshes. Unlike
+    /// [`Self::latest_identity_update`], this also returns the original
+    /// identity before a renewal occurs.
+    pub fn current_identity(&self) -> Option<ClientIdentityMaterial> {
+        self.controller
+            .identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn record_identity_update(&self, identity: ClientIdentityMaterial) {
+        *self
+            .controller
+            .identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
+        *self
+            .controller
+            .pending_identity_update
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
+
+        let Some(persistence) = self.controller.options.client_identity_persistence.as_ref() else {
+            return;
+        };
+        if let Err(error) = persistence.persist(&identity) {
+            tracing::warn!(
+                event = "rendezvous_client_identity_persistence_failed",
+                persistence_source = persistence.source(),
+                error = %error,
+                "failed persisting renewed Rendezvous client identity"
+            );
+        } else {
+            tracing::info!(
+                event = "rendezvous_client_identity_persisted",
+                persistence_source = persistence.source(),
+                device_id = %identity.device_id,
+                "persisted renewed Rendezvous client identity"
+            );
+        }
+    }
+
     /// Returns and clears an authenticated cluster-managed Rendezvous contact
     /// list update. Platform owners without a Rust-side persistence callback
     /// can persist this bootstrap with their own secure/preferences storage.
@@ -529,16 +614,14 @@ impl ManagedBerryKeepClient {
                     let identity_updated = updated && renewed_identity != original_identity;
                     identity = Some(renewed_identity);
                     if identity_updated {
-                        *self
-                            .controller
-                            .identity
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = identity.clone();
-                        *self
-                            .controller
-                            .pending_identity_update
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = identity.clone();
+                        self.record_identity_update(
+                            identity
+                                .as_ref()
+                                .expect(
+                                    "renewed identity must be present after a successful renewal",
+                                )
+                                .clone(),
+                        );
                     }
                     identity_updated
                 }
@@ -1435,6 +1518,73 @@ mod tests {
         let _ = discovery_server.await;
         candidate_server.abort();
         let _ = candidate_server.await;
+    }
+
+    #[test]
+    fn managed_client_persists_identity_updates_after_construction() {
+        let cluster_id = Uuid::now_v7();
+        let persisted = Arc::new(Mutex::new(Vec::<ClientIdentityMaterial>::new()));
+        let persisted_updates = Arc::clone(&persisted);
+        let bootstrap = ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: Vec::new(),
+            rendezvous_contact_list: None,
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "http://127.0.0.1:9".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: None,
+                node_hostname: None,
+            }],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+            node_priority_overrides: BTreeMap::new(),
+        };
+        let identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("test identity should generate");
+        let options = ManagedClientOptions {
+            client_identity_persistence: Some(ManagedClientIdentityPersistence::new(
+                "test",
+                move |identity| {
+                    persisted_updates
+                        .lock()
+                        .expect("persisted updates lock should not be poisoned")
+                        .push(identity.clone());
+                    Ok(())
+                },
+            )),
+            ..ManagedClientOptions::default()
+        };
+        let managed = bootstrap
+            .build_managed_client_blocking(Some(identity.clone()), options)
+            .expect("managed client should build without an initial route connection");
+        let mut renewed_identity = identity;
+        renewed_identity.rendezvous_client_identity_pem = Some("renewed-identity".to_string());
+
+        managed.record_identity_update(renewed_identity.clone());
+
+        assert_eq!(managed.current_identity(), Some(renewed_identity.clone()));
+        assert_eq!(
+            managed
+                .take_identity_update()
+                .expect("renewed identity should remain available to FFI callers"),
+            renewed_identity
+        );
+        assert_eq!(
+            persisted
+                .lock()
+                .expect("persisted updates lock should not be poisoned")
+                .as_slice(),
+            [renewed_identity]
+        );
     }
 
     #[test]

@@ -10,7 +10,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{
     BerryKeepClient, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
     ConnectionBootstrapDiagnosticTargets, LatencyProbeComparison, LatencyProbeConfig,
-    LatencyProbeResult, ManagedBerryKeepClient, ManagedBootstrapPersistence, ManagedClientOptions,
+    LatencyProbeResult, ManagedBerryKeepClient, ManagedBootstrapPersistence,
+    ManagedClientIdentityPersistence, ManagedClientOptions,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     enroll_connection_input_blocking, normalize_server_base_url,
@@ -763,26 +764,18 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
                         "bootstrap_file",
                         move |bootstrap| bootstrap.write_to_path(&persistence_path),
                     )),
+                    client_identity_persistence: client_identity_path.clone().map(|path| {
+                        ManagedClientIdentityPersistence::new(
+                            "client_identity_file",
+                            move |identity| {
+                                persist_renewed_client_identity(Some(path.as_path()), identity)
+                            },
+                        )
+                    }),
                     ..ManagedClientOptions::default()
                 };
                 let (managed, runtime) =
                     build_managed_cli_client(bootstrap, identity.clone(), options)?;
-                if let Some(renewed_identity) = managed.take_identity_update() {
-                    match persist_renewed_client_identity(
-                        client_identity_path.as_deref(),
-                        &renewed_identity,
-                    ) {
-                        Ok(()) => info!(
-                            client_identity_file = path_for_log(client_identity_path.as_deref()),
-                            "persisted renewed rendezvous client identity"
-                        ),
-                        Err(error) => warn!(
-                            error = %error,
-                            client_identity_file = path_for_log(client_identity_path.as_deref()),
-                            "renewed rendezvous client identity could not be persisted; continuing with the in-memory identity"
-                        ),
-                    }
-                }
                 CliClientHolder::managed(managed, runtime)
             }
             None => CliClientHolder::unmanaged(bootstrap.build_client()?),

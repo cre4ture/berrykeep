@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use client_sdk::remote_sync::RemoteSnapshotFetchProgress;
 use client_sdk::{
     BerryKeepClient, ClientConnectionDiagnostics, ClientIdentityMaterial, ConnectionBootstrap,
-    ManagedBerryKeepClient, ManagedClientOptions, RemoteSnapshotFetcher, RemoteSnapshotPoller,
-    RemoteSnapshotScope, RemoteSnapshotUpdate,
+    ManagedBerryKeepClient, ManagedClientIdentityPersistence, ManagedClientOptions,
+    RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope, RemoteSnapshotUpdate,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -1716,16 +1716,19 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFo
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
 
-        let managed_client = bootstrap.build_managed_client_blocking(
-            client_identity,
-            options.managed_client_options.clone(),
-        )?;
-        if let Some(identity) = managed_client.latest_identity_update()
+        let mut managed_client_options = options.managed_client_options.clone();
+        if managed_client_options.client_identity_persistence.is_none()
             && let Some(persist_client_identity) = options.persist_client_identity
         {
-            persist_client_identity(&identity)
-                .context("failed to persist renewed folder sync client identity")?;
+            managed_client_options.client_identity_persistence = Some(
+                ManagedClientIdentityPersistence::new("folder_agent", move |identity| {
+                    persist_client_identity(identity)
+                        .context("failed to persist renewed folder sync client identity")
+                }),
+            );
         }
+        let managed_client =
+            bootstrap.build_managed_client_blocking(client_identity, managed_client_options)?;
         let client = managed_client.client();
         let client = match options.connection_name.as_deref() {
             Some(connection_name) => client.with_connection_name(connection_name),
