@@ -64,7 +64,8 @@ impl std::fmt::Debug for ManagedBootstrapPersistence {
 /// Policy for shared, Rendezvous-managed client routes.
 #[derive(Debug, Clone)]
 pub struct ManagedClientOptions {
-    /// Maximum foreground wait for the first advisory discovery pass.
+    /// Maximum foreground wait for the first advisory discovery pass. A zero
+    /// duration schedules discovery after the static client is returned.
     pub initial_discovery_timeout: Duration,
     /// Low-priority fallback cadence for discovery. Foreground, network-change,
     /// and relay-connected events refresh immediately; this interval only keeps
@@ -87,7 +88,10 @@ pub struct ManagedClientOptions {
 impl Default for ManagedClientOptions {
     fn default() -> Self {
         Self {
-            initial_discovery_timeout: Duration::from_secs(2),
+            // Constructing a managed client must not depend on a reachable
+            // transport route. Route validation and discovery are maintained
+            // asynchronously after the caller receives its static client.
+            initial_discovery_timeout: Duration::ZERO,
             discovery_ttl: Duration::from_secs(2 * 60),
             route_retirement_grace: Duration::from_secs(10 * 60),
             refresh_on_transport_failure: true,
@@ -256,10 +260,11 @@ impl RouteMembershipChanges {
 }
 
 impl ConnectionBootstrap {
-    /// Builds a stable client handle from static bootstrap routes, then performs
-    /// a bounded, fail-open Rendezvous refresh. Enrolled clients can adopt
-    /// discovered Direct QUIC routes; anonymous clients continue to use only
-    /// direct HTTPS routes.
+    /// Builds a stable client handle from static bootstrap routes, then starts
+    /// a fail-open Rendezvous refresh. Enrolled clients can adopt discovered
+    /// Direct QUIC routes; anonymous clients continue to use only direct HTTPS
+    /// routes. By default, discovery and route validation run after the handle
+    /// is returned; callers can opt into a bounded foreground wait.
     pub async fn build_managed_client(
         &self,
         identity: Option<ClientIdentityMaterial>,
@@ -276,12 +281,13 @@ impl ConnectionBootstrap {
                 );
             }
         }
-        let client = self
-            .build_client_with_optional_identity(identity.as_ref())?
-            .with_route_maintenance_policy(options.route_maintenance_policy)
-            .with_connection_diagnostic_impact(
-                ClientConnectionDiagnosticImpact::BackgroundMaintenance,
-            );
+        let planned_targets = self.planned_targets()?;
+        let client = build_unprobed_client_with_optional_identity_from_planned_targets(
+            &planned_targets,
+            identity.as_ref(),
+        )?
+        .with_route_maintenance_policy(options.route_maintenance_policy)
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::BackgroundMaintenance);
         let controller = Arc::new(ManagedRouteController {
             client: client.clone(),
             bootstrap: Mutex::new(self.clone()),
@@ -331,27 +337,34 @@ impl ConnectionBootstrap {
                 controller.schedule_refresh(RouteRefreshReason::RelayConnected);
             })));
 
-        let initial_refresh = managed.clone();
-        if tokio::time::timeout(options.initial_discovery_timeout, async move {
-            initial_refresh
-                .refresh_routes(RouteRefreshReason::Startup)
-                .await
-        })
-        .await
-        .is_err()
-        {
-            // The caller already has a usable static client. Continue discovery
-            // opportunistically instead of extending foreground startup.
+        if options.initial_discovery_timeout.is_zero() {
+            // Discovery and route validation deliberately follow construction
+            // so local callers, including the embedded Web UI, remain
+            // available even while every remote route is unavailable.
             managed.schedule_refresh(RouteRefreshReason::Startup);
+        } else {
+            let initial_refresh = managed.clone();
+            if tokio::time::timeout(options.initial_discovery_timeout, async move {
+                initial_refresh
+                    .refresh_routes(RouteRefreshReason::Startup)
+                    .await
+            })
+            .await
+            .is_err()
+            {
+                // The caller already has a static client. Continue discovery
+                // opportunistically instead of extending foreground startup.
+                managed.schedule_refresh(RouteRefreshReason::Startup);
+            }
         }
         managed.start_periodic_refresh();
 
         Ok(managed)
     }
 
-    /// Builds a stable client handle from static bootstrap routes, then performs a
-    /// bounded, fail-open Rendezvous refresh. A failed or slow discovery response
-    /// never invalidates the static direct HTTPS or relay routes.
+    /// Builds a stable client handle from static bootstrap routes, then starts a
+    /// fail-open Rendezvous refresh. A failed or slow discovery response never
+    /// invalidates the static direct HTTPS or relay routes.
     pub async fn build_managed_client_with_identity(
         &self,
         identity: ClientIdentityMaterial,
@@ -1154,16 +1167,17 @@ mod tests {
 
     #[test]
     fn default_discovery_fallback_runs_every_two_minutes() {
-        assert_eq!(
-            ManagedClientOptions::default().discovery_ttl,
-            Duration::from_secs(2 * 60)
-        );
+        let options = ManagedClientOptions::default();
+
+        assert_eq!(options.initial_discovery_timeout, Duration::ZERO);
+        assert_eq!(options.discovery_ttl, Duration::from_secs(2 * 60));
     }
 
     #[test]
     fn mobile_background_options_bound_route_maintenance() {
         let options = ManagedClientOptions::mobile_background();
 
+        assert_eq!(options.initial_discovery_timeout, Duration::ZERO);
         assert_eq!(options.discovery_ttl, Duration::from_secs(15 * 60));
         assert_eq!(options.route_retirement_grace, options.discovery_ttl * 5);
         assert_eq!(
@@ -1198,19 +1212,27 @@ mod tests {
     }
 
     #[test]
-    fn blocking_managed_client_keeps_anonymous_bootstrap_on_shared_routes() {
+    fn blocking_managed_client_starts_with_multiple_unreachable_static_routes() {
         let bootstrap = ConnectionBootstrap {
             version: 1,
             cluster_id: Uuid::now_v7(),
             rendezvous_urls: Vec::new(),
             rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
-            direct_endpoints: vec![BootstrapEndpoint {
-                url: "http://127.0.0.1:9".to_string(),
-                usage: Some(BootstrapEndpointUse::PublicApi),
-                node_id: None,
-                node_hostname: None,
-            }],
+            direct_endpoints: vec![
+                BootstrapEndpoint {
+                    url: "http://127.0.0.1:9".to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: None,
+                    node_hostname: None,
+                },
+                BootstrapEndpoint {
+                    url: "http://127.0.0.1:10".to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: None,
+                    node_hostname: None,
+                },
+            ],
             relay_mode: RelayMode::Disabled,
             trust_roots: BootstrapTrustRoots {
                 cluster_ca_pem: None,
@@ -1222,20 +1244,20 @@ mod tests {
             device_id: None,
             node_priority_overrides: BTreeMap::new(),
         };
-        let options = ManagedClientOptions {
-            initial_discovery_timeout: Duration::ZERO,
-            ..ManagedClientOptions::default()
-        };
-
         let managed = bootstrap
-            .build_managed_client_blocking(None, options)
-            .expect("anonymous bootstrap should retain its direct HTTPS fallback");
+            .build_managed_client_blocking(None, ManagedClientOptions::default())
+            .expect("managed client should retain unreachable static routes");
 
-        assert_eq!(managed.route_snapshot().endpoints.len(), 1);
+        assert_eq!(managed.route_snapshot().endpoints.len(), 2);
         assert!(
             managed.route_snapshot().endpoints[0]
                 .locator
                 .starts_with("http://127.0.0.1:9")
+        );
+        assert!(
+            managed.route_snapshot().endpoints[1]
+                .locator
+                .starts_with("http://127.0.0.1:10")
         );
         assert_eq!(
             managed.client.connection_diagnostic_impact(),

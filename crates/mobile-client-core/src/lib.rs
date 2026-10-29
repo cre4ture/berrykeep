@@ -1303,6 +1303,37 @@ mod tests {
         .expect("identity configuration should parse")
     }
 
+    fn configuration_with_unreachable_routes(
+        identity: &ClientIdentityMaterial,
+    ) -> MobileClientConfiguration {
+        MobileClientConfiguration::new(
+            r#"{
+                "version": 1,
+                "cluster_id": "019d04a8-3099-75bc-8ff5-f5bd9a78bb83",
+                "rendezvous_urls": [],
+                "direct_endpoints": [
+                    {
+                        "url": "http://127.0.0.1:9",
+                        "usage": "public_api"
+                    },
+                    {
+                        "url": "http://127.0.0.1:10",
+                        "usage": "public_api"
+                    }
+                ],
+                "relay_mode": "disabled",
+                "trust_roots": {}
+            }"#,
+            None::<&str>,
+            Some(
+                identity
+                    .to_json_pretty()
+                    .expect("identity should serialize"),
+            ),
+        )
+        .expect("identity configuration should parse")
+    }
+
     fn client() -> Arc<MobileClient> {
         Arc::new(
             MobileClient::new(MobileClientOptions::new("test"))
@@ -1453,6 +1484,10 @@ mod tests {
 
         assert_eq!(options.managed_client.discovery_ttl, expected.discovery_ttl);
         assert_eq!(
+            options.managed_client.initial_discovery_timeout,
+            Duration::ZERO
+        );
+        assert_eq!(
             options.managed_client.route_retirement_grace,
             expected.route_retirement_grace
         );
@@ -1480,6 +1515,34 @@ mod tests {
         let debug = format!("{result:?}");
         assert!(!debug.contains(authorization));
         assert!(debug.contains("authorization: \"<redacted>\""));
+    }
+
+    #[test]
+    fn web_ui_starts_while_all_initial_routes_are_unreachable() {
+        let cluster_id = "019d04a8-3099-75bc-8ff5-f5bd9a78bb83"
+            .parse()
+            .expect("cluster id should parse");
+        let identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("identity should generate");
+        let client = client();
+
+        let configuration = configuration_with_unreachable_routes(&identity);
+        let started = client.start_web_ui(configuration.clone(), MobileWebUiSurface::WebUi);
+
+        assert_eq!(started.disposition, MobileWebUiCommandDisposition::Applied);
+        assert_eq!(started.state.phase, MobileWebUiPhase::Running);
+        assert!(started.state.session.is_some());
+        assert_eq!(
+            client
+                .connect(configuration)
+                .expect("the Web UI session should stay reusable")
+                .base_client()
+                .connection_route_snapshot()
+                .endpoints
+                .len(),
+            2
+        );
+        assert_eq!(client.abort_web_ui().state.phase, MobileWebUiPhase::Idle);
     }
 
     #[test]
