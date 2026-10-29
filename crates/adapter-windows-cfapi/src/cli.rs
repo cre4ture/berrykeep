@@ -455,6 +455,15 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                 }),
             );
         }
+        if let Some(identity) = client_identity.as_ref()
+            && let Err(err) =
+                persist_local_appdata_client_identity(&registration.root_path, identity)
+        {
+            tracing::warn!(
+                "failed to persist client identity into local app data for {}: {err:#}",
+                registration.root_path.display()
+            );
+        }
         let managed_client = connection
             .bootstrap
             .build_managed_client_blocking(client_identity.clone(), managed_client_options)?;
@@ -499,16 +508,6 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                 registration.root_path.display()
             );
         }
-        if let Some(identity) = client_identity.as_ref()
-            && let Err(err) =
-                persist_local_appdata_client_identity(&registration.root_path, identity)
-        {
-            tracing::warn!(
-                "failed to persist client identity into local app data for {}: {err:#}",
-                registration.root_path.display()
-            );
-        }
-
         let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
         let fetcher = RemoteSnapshotFetcher::new(
             client.clone().with_connection_name(windows_connection_name(
