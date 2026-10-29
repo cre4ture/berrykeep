@@ -1495,11 +1495,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dynamic_discovery_exposes_a_usable_candidate_before_other_nodes_finish() {
+    async fn managed_client_adopts_a_usable_candidate_before_other_nodes_finish_discovery() {
         let cluster_id = Uuid::now_v7();
         let fast_node_id = NodeId::new_v4();
         let stalled_node_id = NodeId::new_v4();
-        let candidate_url = "http://127.0.0.1:47000".to_string();
+        let candidate_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("candidate listener should bind");
+        let candidate_addr = candidate_listener
+            .local_addr()
+            .expect("candidate listener should expose its address");
+        let candidate_probe_count = Arc::new(AtomicUsize::new(0));
+        let candidate_route_probe_count = Arc::clone(&candidate_probe_count);
+        let candidate_health_probe_count = Arc::clone(&candidate_probe_count);
+        let candidate_server = tokio::spawn(async move {
+            axum::serve(
+                candidate_listener,
+                Router::new()
+                    .route(
+                        "/api/v1/diagnostics/latency",
+                        get(move || {
+                            let candidate_route_probe_count =
+                                Arc::clone(&candidate_route_probe_count);
+                            async move {
+                                candidate_route_probe_count.fetch_add(1, Ordering::SeqCst);
+                                "ok"
+                            }
+                        }),
+                    )
+                    .route(
+                        "/api/v1/health",
+                        get(move || {
+                            let candidate_health_probe_count =
+                                Arc::clone(&candidate_health_probe_count);
+                            async move {
+                                candidate_health_probe_count.fetch_add(1, Ordering::SeqCst);
+                                "ok"
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .expect("candidate test server should run");
+        });
+        let candidate_url = format!("http://{candidate_addr}");
         let fast_node_label = fast_node_id.to_string();
         let discovery_candidate_url = candidate_url.clone();
         let discovery_router = Router::new()
@@ -1582,6 +1621,17 @@ mod tests {
             device_id: None,
             node_priority_overrides: BTreeMap::new(),
         };
+        let managed = bootstrap
+            .build_managed_client(
+                None,
+                ManagedClientOptions {
+                    initial_discovery_timeout: Duration::ZERO,
+                    discovery_ttl: Duration::from_secs(60),
+                    ..ManagedClientOptions::default()
+                },
+            )
+            .await
+            .expect("managed client should start from its static routes");
         let (targets_sender, mut targets_receiver) = mpsc::unbounded_channel();
         let discovery_task = tokio::spawn(async move {
             bootstrap
@@ -1605,11 +1655,36 @@ mod tests {
                     .as_ref()
                     .is_some_and(|candidate| candidate.endpoint == candidate_url)
         }));
+        managed
+            .adopt_discovered_targets(partial_targets, None)
+            .await
+            .expect("managed client should adopt partial discovery targets");
+        managed.client.spawn_due_connection_route_refresh();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let has_fast_candidate_route =
+                    managed.route_snapshot().endpoints.iter().any(|endpoint| {
+                        endpoint.path_kind == TransportPathKind::DirectHttps
+                            && endpoint.target_node_id == Some(fast_node_id)
+                            && endpoint.locator == candidate_url
+                            && candidate_probe_count.load(Ordering::SeqCst) > 0
+                    });
+                if has_fast_candidate_route {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the managed client should probe the usable candidate before the stalled node completes");
 
         discovery_task.abort();
         let _ = discovery_task.await;
         discovery_server.abort();
         let _ = discovery_server.await;
+        candidate_server.abort();
+        let _ = candidate_server.await;
     }
 
     #[tokio::test]

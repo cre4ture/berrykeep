@@ -96,9 +96,10 @@ pub struct FolderAgentRuntimeOptions {
     pub server_ca_pem: Option<String>,
     pub client_identity_json: Option<String>,
     /// Persists renewed identities for a managed client constructed by this
-    /// runtime. Persistence failures stop a runtime-owned folder agent. A
-    /// supplied [`FolderAgentSharedClient`] owns its own identity lifecycle
-    /// and persistence callback.
+    /// runtime. Failures during startup stop a runtime-owned folder agent;
+    /// later renewal persistence failures are logged and retried without
+    /// interrupting an active sync. A supplied [`FolderAgentSharedClient`]
+    /// owns its own identity lifecycle and persistence callback.
     pub persist_client_identity: Option<FolderAgentClientIdentityPersistence>,
     pub managed_client_options: ManagedClientOptions,
     /// Reuses a client owned by the embedding process instead of constructing
@@ -858,6 +859,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
 
     let configured_client = configured_client(options)?;
     let identity_persistence_failure = configured_client.identity_persistence_failure.clone();
+    let identity_persistence_callback = configured_client.identity_persistence_callback;
     propagate_identity_persistence_failure(identity_persistence_failure.as_ref())?;
     if configured_client.managed_client.is_some() {
         tracing::info!("using shared Rendezvous-managed client routes for folder sync");
@@ -1173,6 +1175,10 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
         return Ok(());
     }
 
+    if let Some(failure) = identity_persistence_failure.as_ref() {
+        failure.complete_startup();
+    }
+
     let (runtime_event_tx, runtime_event_rx) = mpsc::channel::<FolderAgentRuntimeEvent>();
     let wake_runtime: FolderAgentWakeCallback = Arc::new({
         let runtime_event_tx = runtime_event_tx.clone();
@@ -1262,7 +1268,10 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let mut pending_remote_updates = Vec::new();
 
     while running.load(Ordering::SeqCst) {
-        propagate_identity_persistence_failure(identity_persistence_failure.as_ref())?;
+        retry_pending_identity_persistence(
+            identity_persistence_failure.as_ref(),
+            identity_persistence_callback,
+        );
         if !drain_runtime_events(
             &runtime_event_rx,
             &mut pending_remote_updates,
@@ -1694,36 +1703,102 @@ struct ConfiguredFolderAgentClient {
     client: BerryKeepClient,
     managed_client: Option<ManagedBerryKeepClient>,
     identity_persistence_failure: Option<FolderAgentIdentityPersistenceFailure>,
+    identity_persistence_callback: Option<FolderAgentClientIdentityPersistence>,
 }
 
 /// Bridges a background managed-client persistence callback back to the
-/// folder agent's existing fail-closed runtime result.
+/// folder agent. Startup persistence keeps the legacy fail-closed contract;
+/// after the initial sync, renewal writes are retried without stopping the
+/// sync loop.
 #[derive(Clone, Default)]
 struct FolderAgentIdentityPersistenceFailure {
-    message: Arc<Mutex<Option<String>>>,
+    state: Arc<Mutex<FolderAgentIdentityPersistenceState>>,
+}
+
+#[derive(Default)]
+struct FolderAgentIdentityPersistenceState {
+    startup_complete: bool,
+    startup_failure: Option<(String, ClientIdentityMaterial)>,
+    pending_identity: Option<ClientIdentityMaterial>,
 }
 
 impl FolderAgentIdentityPersistenceFailure {
-    fn record(&self, error: &anyhow::Error) {
-        let mut message = self
-            .message
+    fn record(&self, error: &anyhow::Error, identity: &ClientIdentityMaterial) {
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if message.is_none() {
-            *message = Some(format!("{error:#}"));
+        if state.startup_complete {
+            tracing::warn!(
+                error = %error,
+                device_id = %identity.device_id,
+                "failed persisting renewed folder sync client identity; will retry"
+            );
+            state.pending_identity = Some(identity.clone());
+            return;
+        }
+
+        if state.startup_failure.is_none() {
+            state.startup_failure = Some((format!("{error:#}"), identity.clone()));
         }
     }
 
     fn propagate(&self) -> Result<()> {
-        let message = self
-            .message
+        let failure = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .startup_failure
             .take();
-        if let Some(message) = message {
+        if let Some((message, _)) = failure {
             bail!("{message}");
         }
         Ok(())
+    }
+
+    fn complete_startup(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.startup_complete = true;
+        if let Some((error, identity)) = state.startup_failure.take() {
+            tracing::warn!(
+                error,
+                device_id = %identity.device_id,
+                "startup identity persistence completed too late to fail initialization; will retry"
+            );
+            state.pending_identity = Some(identity);
+        }
+    }
+
+    fn retry_pending(&self, persist_client_identity: FolderAgentClientIdentityPersistence) {
+        let pending_identity = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending_identity
+            .take();
+        let Some(identity) = pending_identity else {
+            return;
+        };
+
+        if let Err(error) = persist_client_identity(&identity) {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                device_id = %identity.device_id,
+                "retrying renewed folder sync client identity persistence later"
+            );
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pending_identity = Some(identity);
+        } else {
+            tracing::info!(
+                device_id = %identity.device_id,
+                "persisted renewed folder sync client identity on retry"
+            );
+        }
     }
 }
 
@@ -1736,6 +1811,15 @@ fn propagate_identity_persistence_failure(
     Ok(())
 }
 
+fn retry_pending_identity_persistence(
+    failure: Option<&FolderAgentIdentityPersistenceFailure>,
+    persist_client_identity: Option<FolderAgentClientIdentityPersistence>,
+) {
+    if let (Some(failure), Some(persist_client_identity)) = (failure, persist_client_identity) {
+        failure.retry_pending(persist_client_identity);
+    }
+}
+
 fn persist_folder_agent_identity(
     persist_client_identity: FolderAgentClientIdentityPersistence,
     persistence_failure: &FolderAgentIdentityPersistenceFailure,
@@ -1745,17 +1829,19 @@ fn persist_folder_agent_identity(
         persistence_failure,
         persist_client_identity(identity)
             .context("failed to persist renewed folder sync client identity"),
+        identity,
     )
 }
 
 fn record_folder_agent_persistence_result(
     persistence_failure: &FolderAgentIdentityPersistenceFailure,
     result: Result<()>,
+    identity: &ClientIdentityMaterial,
 ) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            persistence_failure.record(&error);
+            persistence_failure.record(&error, identity);
             Err(error)
         }
     }
@@ -1772,6 +1858,7 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFo
             client,
             managed_client: shared_client.managed_client(),
             identity_persistence_failure: None,
+            identity_persistence_callback: None,
         });
     }
 
@@ -1794,6 +1881,7 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFo
 
         let mut managed_client_options = options.managed_client_options.clone();
         let mut identity_persistence_failure = None;
+        let mut identity_persistence_callback = None;
         if managed_client_options.client_identity_persistence.is_none()
             && let Some(persist_client_identity) = options.persist_client_identity
         {
@@ -1815,6 +1903,7 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFo
                 managed_client_options.initial_discovery_timeout = Duration::from_secs(2);
             }
             identity_persistence_failure = Some(failure);
+            identity_persistence_callback = Some(persist_client_identity);
         }
         let managed_client =
             bootstrap.build_managed_client_blocking(client_identity, managed_client_options)?;
@@ -1827,6 +1916,7 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFo
             client,
             managed_client: Some(managed_client),
             identity_persistence_failure,
+            identity_persistence_callback,
         });
     }
 
@@ -1844,6 +1934,7 @@ fn configured_client(options: &FolderAgentRuntimeOptions) -> Result<ConfiguredFo
         client,
         managed_client: None,
         identity_persistence_failure: None,
+        identity_persistence_callback: None,
     })
 }
 
@@ -3579,17 +3670,46 @@ mod tests {
     }
 
     #[test]
-    fn runtime_owned_identity_persistence_failure_stops_folder_agent() {
+    fn startup_identity_persistence_failure_stops_folder_agent() {
         let failure = FolderAgentIdentityPersistenceFailure::default();
+        let identity = ClientIdentityMaterial::generate(common::ClusterId::now_v7(), None, None)
+            .expect("test identity should generate");
         record_folder_agent_persistence_result(
             &failure,
             Err(anyhow::anyhow!("identity store is read-only")),
+            &identity,
         )
         .expect_err("the persistence callback should fail");
 
         let error = propagate_identity_persistence_failure(Some(&failure))
-            .expect_err("a runtime-owned folder agent must stop after persistence failure");
+            .expect_err("a startup persistence failure must stop the folder agent");
         assert!(error.to_string().contains("identity store is read-only"));
+    }
+
+    #[test]
+    fn steady_state_identity_persistence_failure_is_retained_for_retry() {
+        let failure = FolderAgentIdentityPersistenceFailure::default();
+        let identity = ClientIdentityMaterial::generate(common::ClusterId::now_v7(), None, None)
+            .expect("test identity should generate");
+        failure.complete_startup();
+        record_folder_agent_persistence_result(
+            &failure,
+            Err(anyhow::anyhow!("identity file temporarily locked")),
+            &identity,
+        )
+        .expect_err("the managed callback should still report its persistence error");
+
+        propagate_identity_persistence_failure(Some(&failure))
+            .expect("a steady-state persistence failure must not stop the folder agent");
+        assert_eq!(
+            failure
+                .state
+                .lock()
+                .expect("persistence state lock should not be poisoned")
+                .pending_identity
+                .as_ref(),
+            Some(&identity)
+        );
     }
 
     #[test]
