@@ -167,6 +167,7 @@ pub enum RouteRefreshReason {
     TransportFailure,
     RelayConnected,
     Foregrounded,
+    ContactListUpdated,
     ExplicitDiagnosticRequest,
 }
 
@@ -174,7 +175,10 @@ impl RouteRefreshReason {
     const fn is_event_driven(self) -> bool {
         matches!(
             self,
-            Self::NetworkChanged | Self::RelayConnected | Self::Foregrounded
+            Self::NetworkChanged
+                | Self::RelayConnected
+                | Self::Foregrounded
+                | Self::ContactListUpdated
         )
     }
 
@@ -186,6 +190,7 @@ impl RouteRefreshReason {
             Self::TransportFailure => "transport_failure",
             Self::RelayConnected => "relay_connected",
             Self::Foregrounded => "foregrounded",
+            Self::ContactListUpdated => "contact_list_updated",
             Self::ExplicitDiagnosticRequest => "explicit_diagnostic_request",
         }
     }
@@ -859,7 +864,7 @@ impl ManagedBerryKeepClient {
         Ok(membership)
     }
 
-    async fn refresh_cluster_rendezvous_contact_list(&self) -> Result<()> {
+    async fn refresh_cluster_rendezvous_contact_list(&self) -> Result<bool> {
         let response = self
             .client
             .get_json_path("/cluster/rendezvous-contacts")
@@ -875,16 +880,26 @@ impl ManagedBerryKeepClient {
     fn schedule_cluster_rendezvous_contact_list_refresh(&self, reason: RouteRefreshReason) {
         let managed = self.clone();
         let task = async move {
-            if let Err(error) = managed.refresh_cluster_rendezvous_contact_list().await {
-                // This is intentionally advisory: a client with a valid immutable
-                // bootstrap must remain usable while the replicated configuration
-                // has not reached its current node yet.
-                tracing::warn!(
-                    event = "rendezvous_contact_list_refresh_failed",
-                    refresh_reason = reason.as_str(),
-                    error = %format!("{error:#}"),
-                    "failed refreshing authenticated cluster-managed rendezvous contacts"
-                );
+            match managed.refresh_cluster_rendezvous_contact_list().await {
+                Ok(true) => {
+                    // The just-updated bootstrap may replace every Rendezvous
+                    // endpoint. Schedule a distinct event-driven pass so it
+                    // waits for the current refresh lock, then discovers using
+                    // the repaired contact list without waiting for the TTL.
+                    managed.schedule_refresh(RouteRefreshReason::ContactListUpdated);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // This is intentionally advisory: a client with a valid immutable
+                    // bootstrap must remain usable while the replicated configuration
+                    // has not reached its current node yet.
+                    tracing::warn!(
+                        event = "rendezvous_contact_list_refresh_failed",
+                        refresh_reason = reason.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed refreshing authenticated cluster-managed rendezvous contacts"
+                    );
+                }
             }
         };
         if !self.controller.spawn_refresh_task(task) {
@@ -899,12 +914,12 @@ impl ManagedBerryKeepClient {
     async fn apply_cluster_rendezvous_contact_response(
         &self,
         response: RendezvousContactConfigurationResponse,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // A missing config object is not an update. In particular, do not wipe
         // a previously persisted contact list merely because this node has not
         // received the object's metadata yet.
         if !response.stored {
-            return Ok(());
+            return Ok(false);
         }
         let version_id = response
             .version_id
@@ -921,7 +936,7 @@ impl ManagedBerryKeepClient {
                 version_id,
                 response.configuration.rendezvous_urls,
             )? {
-                return Ok(());
+                return Ok(false);
             }
             bootstrap.clone()
         };
@@ -973,7 +988,7 @@ impl ManagedBerryKeepClient {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn reconcile_target_set(
@@ -1757,32 +1772,44 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("contact-list listener should expose its address");
+        let endpoint = format!("http://{address}");
+        let discovery_requests = Arc::new(AtomicUsize::new(0));
+        let discovery_request_counter = Arc::clone(&discovery_requests);
+        let replacement_endpoint = endpoint.clone();
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
                 Router::new()
                     .route(
                         "/control/discovery",
-                        get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "retired rendezvous") }),
+                        get(move || {
+                            let discovery_request_counter = Arc::clone(&discovery_request_counter);
+                            async move {
+                                discovery_request_counter.fetch_add(1, Ordering::SeqCst);
+                                (StatusCode::SERVICE_UNAVAILABLE, "retired rendezvous")
+                            }
+                        }),
                     )
                     .route(
                         "/api/v1/cluster/rendezvous-contacts",
-                        get(|| async {
-                            Json(serde_json::json!({
-                                "configuration": {
-                                    "schema_version": 1,
-                                    "rendezvous_urls": ["https://replacement.example:19080"],
-                                },
-                                "stored": true,
-                                "version_id": "019d-contact-list-version",
-                            }))
+                        get(move || {
+                            let replacement_endpoint = replacement_endpoint.clone();
+                            async move {
+                                Json(serde_json::json!({
+                                    "configuration": {
+                                        "schema_version": 1,
+                                        "rendezvous_urls": [replacement_endpoint],
+                                    },
+                                    "stored": true,
+                                    "version_id": "019d-contact-list-version",
+                                }))
+                            }
                         }),
                     ),
             )
             .await
             .expect("contact-list test server should run");
         });
-        let endpoint = format!("http://{address}");
         let bootstrap = ConnectionBootstrap {
             version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
             cluster_id,
@@ -1790,7 +1817,7 @@ mod tests {
             rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
             direct_endpoints: vec![BootstrapEndpoint {
-                url: endpoint,
+                url: endpoint.clone(),
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: None,
                 node_hostname: None,
@@ -1841,14 +1868,16 @@ mod tests {
         assert!(outcome.discovery_error.is_some());
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if managed.latest_connection_bootstrap_update().is_some() {
+                if managed.latest_connection_bootstrap_update().is_some()
+                    && discovery_requests.load(Ordering::SeqCst) >= 2
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("contact refresh should survive the failed discovery pass");
+        .expect("contact refresh should survive failure and trigger follow-up discovery");
         assert_eq!(
             managed
                 .take_connection_bootstrap_update()
@@ -1856,7 +1885,7 @@ mod tests {
                 .rendezvous_contact_list
                 .expect("replacement contacts should be present")
                 .rendezvous_urls,
-            vec!["https://replacement.example:19080/".to_string()]
+            vec![format!("{endpoint}/")]
         );
 
         server.abort();
