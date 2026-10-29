@@ -25,8 +25,8 @@ type PersistConnectionBootstrapFn = dyn Fn(&ConnectionBootstrap) -> Result<()> +
 type PersistClientIdentityFn = dyn Fn(&ClientIdentityMaterial) -> Result<()> + Send + Sync;
 
 /// Optional durable storage for contact-list updates learned by a managed
-/// client. The callback is invoked only after an authenticated cluster API
-/// response changes the cached `version_id`.
+/// client. The callback runs on Tokio's blocking executor only after an
+/// authenticated cluster API response changes the cached `version_id`.
 #[derive(Clone)]
 pub struct ManagedBootstrapPersistence {
     source: &'static str,
@@ -864,9 +864,10 @@ impl ManagedBerryKeepClient {
             .context("failed parsing cluster rendezvous contacts")?;
 
         self.apply_cluster_rendezvous_contact_response(response)
+            .await
     }
 
-    fn apply_cluster_rendezvous_contact_response(
+    async fn apply_cluster_rendezvous_contact_response(
         &self,
         response: RendezvousContactConfigurationResponse,
     ) -> Result<()> {
@@ -906,25 +907,40 @@ impl ManagedBerryKeepClient {
             .controller
             .options
             .connection_bootstrap_persistence
-            .as_ref()
+            .clone()
         {
-            if let Err(error) = persistence.persist(&updated_bootstrap) {
-                tracing::warn!(
-                    event = "rendezvous_contact_list_persistence_failed",
-                    persistence_source = persistence.source(),
-                    error = %error,
-                    "failed persisting authenticated cluster-managed rendezvous contacts"
-                );
-            } else {
-                tracing::info!(
-                    event = "rendezvous_contact_list_persisted",
-                    persistence_source = persistence.source(),
-                    version_id = ?updated_bootstrap
-                        .rendezvous_contact_list
-                        .as_ref()
-                        .map(|contacts| contacts.version_id.as_str()),
-                    "persisted authenticated cluster-managed rendezvous contacts"
-                );
+            let source = persistence.source();
+            let bootstrap_to_persist = updated_bootstrap.clone();
+            match tokio::task::spawn_blocking(move || persistence.persist(&bootstrap_to_persist))
+                .await
+            {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        event = "rendezvous_contact_list_persisted",
+                        persistence_source = source,
+                        version_id = ?updated_bootstrap
+                            .rendezvous_contact_list
+                            .as_ref()
+                            .map(|contacts| contacts.version_id.as_str()),
+                        "persisted authenticated cluster-managed rendezvous contacts"
+                    );
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        event = "rendezvous_contact_list_persistence_failed",
+                        persistence_source = source,
+                        error = %error,
+                        "failed persisting authenticated cluster-managed rendezvous contacts"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "rendezvous_contact_list_persistence_task_failed",
+                        persistence_source = source,
+                        error = %error,
+                        "cluster-managed Rendezvous contact persistence task failed"
+                    );
+                }
             }
         }
 
@@ -1605,8 +1621,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn managed_client_persists_cluster_rendezvous_contacts() {
+    #[tokio::test]
+    async fn managed_client_persists_cluster_rendezvous_contacts() {
         let cluster_id = Uuid::now_v7();
         let persisted = Arc::new(Mutex::new(Vec::<ConnectionBootstrap>::new()));
         let persisted_updates = Arc::clone(&persisted);
@@ -1678,6 +1694,7 @@ mod tests {
                 stored: true,
                 version_id: Some("019d-contact-list-version".to_string()),
             })
+            .await
             .expect("cluster contact response should be persisted");
         let updated = managed
             .take_connection_bootstrap_update()
