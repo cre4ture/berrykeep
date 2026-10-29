@@ -22,7 +22,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use tracing_subscriber::filter::Directive;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -761,6 +761,11 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
                 let persistence_path = bootstrap_path.to_path_buf();
                 let identity_persistence_path = client_identity_path.clone();
                 let options = ManagedClientOptions {
+                    // Command invocations commonly finish before a detached
+                    // startup refresh can renew and persist credentials.
+                    // Preserve the former bounded foreground refresh here;
+                    // route discovery still remains advisory and fail-open.
+                    initial_discovery_timeout: Duration::from_secs(2),
                     connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
                         "bootstrap_file",
                         move |bootstrap| bootstrap.write_to_path(&persistence_path),

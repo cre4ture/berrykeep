@@ -752,9 +752,13 @@ impl MobileClient {
                 (managed.client(), Some(managed), Some(current_identity))
             }
             None => {
-                let managed = self.runtime.block_on(
+                // Anonymous sessions retain the managed lifecycle so static
+                // routes can be refreshed after connectivity returns. Keep
+                // the recursive managed construction future boxed just like
+                // the authenticated FFI path above.
+                let managed = self.runtime.block_on(Box::pin(
                     bootstrap.build_managed_client(None, self.options.managed_client.clone()),
-                )?;
+                ))?;
                 (managed.client(), Some(managed), None)
             }
         };
