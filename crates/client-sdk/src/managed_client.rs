@@ -687,6 +687,13 @@ impl ManagedBerryKeepClient {
             );
         }
 
+        // This authenticated direct-API request can repair a stale Rendezvous
+        // list even when every currently known Rendezvous endpoint has gone
+        // away. Keep it independent from candidate discovery so it neither
+        // waits for a slow control-plane response nor gets skipped when
+        // discovery fails.
+        self.schedule_cluster_rendezvous_contact_list_refresh(reason);
+
         let (updates_sender, mut updates_receiver) = mpsc::unbounded_channel();
         let bootstrap = self
             .controller
@@ -810,19 +817,6 @@ impl ManagedBerryKeepClient {
             }
         };
         changes.record(membership);
-        if let Err(error) = self.refresh_cluster_rendezvous_contact_list().await {
-            // This is intentionally advisory: a client with a valid immutable
-            // bootstrap must remain usable while the replicated configuration
-            // has not reached its current node yet. Run it after dynamic route
-            // adoption so an unavailable control-plane endpoint cannot delay
-            // a usable partial discovery result.
-            tracing::warn!(
-                event = "rendezvous_contact_list_refresh_failed",
-                refresh_reason = telemetry.reason.as_str(),
-                error = %format!("{error:#}"),
-                "failed refreshing authenticated cluster-managed rendezvous contacts"
-            );
-        }
         *self
             .controller
             .last_success
@@ -876,6 +870,30 @@ impl ManagedBerryKeepClient {
 
         self.apply_cluster_rendezvous_contact_response(response)
             .await
+    }
+
+    fn schedule_cluster_rendezvous_contact_list_refresh(&self, reason: RouteRefreshReason) {
+        let managed = self.clone();
+        let task = async move {
+            if let Err(error) = managed.refresh_cluster_rendezvous_contact_list().await {
+                // This is intentionally advisory: a client with a valid immutable
+                // bootstrap must remain usable while the replicated configuration
+                // has not reached its current node yet.
+                tracing::warn!(
+                    event = "rendezvous_contact_list_refresh_failed",
+                    refresh_reason = reason.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed refreshing authenticated cluster-managed rendezvous contacts"
+                );
+            }
+        };
+        if !self.controller.spawn_refresh_task(task) {
+            tracing::warn!(
+                event = "rendezvous_contact_list_refresh_not_scheduled",
+                refresh_reason = reason.as_str(),
+                "could not schedule authenticated cluster-managed Rendezvous contact refresh"
+            );
+        }
     }
 
     async fn apply_cluster_rendezvous_contact_response(
@@ -1281,7 +1299,7 @@ fn blocking_managed_client_runtime() -> Arc<Runtime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::Query, routing::get};
+    use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
     use common::NodeId;
     use serde::Deserialize;
     use std::sync::{
@@ -1728,6 +1746,121 @@ mod tests {
                 .as_slice(),
             [renewed_identity]
         );
+    }
+
+    #[tokio::test]
+    async fn managed_client_refreshes_contacts_when_discovery_fails() {
+        let cluster_id = Uuid::now_v7();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("contact-list listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("contact-list listener should expose its address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/control/discovery",
+                        get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "retired rendezvous") }),
+                    )
+                    .route(
+                        "/api/v1/cluster/rendezvous-contacts",
+                        get(|| async {
+                            Json(serde_json::json!({
+                                "configuration": {
+                                    "schema_version": 1,
+                                    "rendezvous_urls": ["https://replacement.example:19080"],
+                                },
+                                "stored": true,
+                                "version_id": "019d-contact-list-version",
+                            }))
+                        }),
+                    ),
+            )
+            .await
+            .expect("contact-list test server should run");
+        });
+        let endpoint = format!("http://{address}");
+        let bootstrap = ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: vec![endpoint.clone()],
+            rendezvous_contact_list: None,
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: endpoint,
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: None,
+                node_hostname: None,
+            }],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+            node_priority_overrides: BTreeMap::new(),
+        };
+        let client = build_unprobed_client_with_optional_identity_from_planned_targets(
+            &bootstrap
+                .planned_targets()
+                .expect("test bootstrap should plan direct route"),
+            None,
+        )
+        .expect("test client should build");
+        let mut identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("test identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let managed = ManagedBerryKeepClient {
+            client: client.clone(),
+            controller: Arc::new(ManagedRouteController {
+                client,
+                bootstrap: Mutex::new(bootstrap),
+                identity: Mutex::new(Some(identity)),
+                options: ManagedClientOptions::default(),
+                refresh_lock: AsyncMutex::new(()),
+                routes: Mutex::new(ManagedRouteState::default()),
+                last_attempt: Mutex::new(None),
+                last_success: Mutex::new(None),
+                last_outcome: Mutex::new(RouteRefreshOutcome::default()),
+                pending_identity_update: Mutex::new(None),
+                pending_connection_bootstrap_update: Mutex::new(None),
+                periodic_refresh_started: AtomicBool::new(false),
+                runtime_guard: Mutex::new(None),
+            }),
+        };
+
+        let outcome = managed
+            .refresh_routes(RouteRefreshReason::NetworkChanged)
+            .await;
+        assert!(outcome.discovery_error.is_some());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if managed.latest_connection_bootstrap_update().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("contact refresh should survive the failed discovery pass");
+        assert_eq!(
+            managed
+                .take_connection_bootstrap_update()
+                .expect("replacement contacts should be retained")
+                .rendezvous_contact_list
+                .expect("replacement contacts should be present")
+                .rendezvous_urls,
+            vec!["https://replacement.example:19080/".to_string()]
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
