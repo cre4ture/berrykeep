@@ -86,11 +86,17 @@ Instead it should:
 
 1. build all syntactically valid endpoint transports,
 2. combine them into one `BerryKeepClient`,
-3. run a focused connection-quality probe across all built endpoints,
-4. choose the best successful endpoint as the initial active route,
-5. return an error only if no endpoint can be built or no endpoint can complete the startup probe.
+3. return the unprobed route set immediately when at least one endpoint can be built,
+4. schedule focused connection-quality probes and discovery after construction,
+5. return an error only if no endpoint can be built.
 
-The startup probe should be cheap and safe:
+Managed clients therefore begin with unknown route quality and use bootstrap
+rank to break the initial score tie. The first request can fail over from an
+unreachable higher-ranked route; successful requests and scheduled probes then
+update normal runtime scoring. Short-lived callers may opt into a bounded
+foreground refresh when they need its side effects before their runtime exits.
+
+The initial route-validation probe should be cheap and safe:
 
 - direct unsigned clients: `/api/v1/health`,
 - signed direct or relay clients: `/api/v1/diagnostics/latency` with a minimal sample config.

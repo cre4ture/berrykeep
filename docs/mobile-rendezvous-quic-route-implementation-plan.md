@@ -213,17 +213,25 @@ runtime.
 1. Validate bootstrap and identity, including cluster binding.
 2. Build a router from static targets so direct HTTPS and relay fallback exist
    before discovery completes.
-3. Start a bounded initial discovery attempt. A foreground caller may wait up
-   to `initial_discovery_timeout`; otherwise the static client is returned and
-   discovery continues only while the runtime is active.
+3. Return the static client, then schedule initial discovery and route
+   validation. A caller that needs a bounded foreground attempt (for example,
+   a short-lived CLI that must persist a renewed identity) may set a non-zero
+   `initial_discovery_timeout`; discovery otherwise continues only while the
+   runtime is active.
 4. Reconcile successful discovery into the router and run focused background
    quality probes.
 5. If discovery fails, retain the static routes, record the structured error,
    and retry only according to the refresh policy.
 
-The default initial timeout should be short and configurable (for example,
-one to two seconds). It must not turn ordinary app startup into an unbounded
-network wait.
+The default `initial_discovery_timeout` is zero: ordinary app startup must not
+depend on a reachable remote route. A non-zero timeout is an explicit,
+bounded opt-in for callers whose one-shot work needs the first refresh to
+finish before their runtime exits.
+
+Before the first maintenance result, static routes have the shared unknown
+latency score and are ordered by `bootstrap_rank`. A first request can therefore
+pay a transport timeout on an unreachable higher-ranked route before failover;
+runtime route health and quality scoring take over after that attempt.
 
 ### 5.2 Discovery and validation rules
 
@@ -295,7 +303,7 @@ Required triggers:
 
 | Trigger | Expected behavior |
 | --- | --- |
-| Client startup | One bounded initial discovery attempt. |
+| Client startup | Schedule initial discovery and route validation after static client construction; callers may explicitly opt into a bounded foreground wait. |
 | Discovery TTL expired | Best-effort refresh before or alongside the next foreground operation. |
 | Transport circuit opens / all routes fail | Coalesced refresh before final fallback failure. |
 | Explicit diagnostics action | Immediate refresh and an observable outcome. |

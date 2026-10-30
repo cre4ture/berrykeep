@@ -1,7 +1,10 @@
 #![cfg(windows)]
 
 use clap::{Parser, Subcommand};
-use client_sdk::{RemoteSnapshotFetcher, RemoteSnapshotPoller, RemoteSnapshotScope};
+use client_sdk::{
+    ManagedClientIdentityPersistence, ManagedClientOptions, RemoteSnapshotFetcher,
+    RemoteSnapshotPoller, RemoteSnapshotScope,
+};
 use desktop_status::default_remote_status_poll_interval_ms;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -12,7 +15,8 @@ use std::time::Duration;
 
 use crate::adapter::{CfapiAction, CfapiActionPlan, WindowsCfapiAdapter};
 use crate::auth::{
-    ClientEnrollmentOptions, persist_local_appdata_client_identity,
+    ClientEnrollmentOptions, inspect_persisted_client_identity_paths,
+    persist_local_appdata_client_identity, persist_renewed_client_identity,
     resolve_or_enroll_client_identity,
 };
 use crate::cfapi::{cf_get_placeholder_standard_info, cf_hydrate_placeholder, cf_set_pin_state};
@@ -339,6 +343,16 @@ pub fn cli_main() -> anyhow::Result<()> {
     }
 }
 
+fn select_identity_persistence_destination(
+    explicit_path: Option<PathBuf>,
+    discovered_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    // An explicit destination stays authoritative even before it exists;
+    // otherwise a populated AppData fallback would prevent renewed
+    // credentials from ever reaching the operator-selected file.
+    explicit_path.or(discovered_path)
+}
+
 fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
     let ServeArgs {
         sync_root_id,
@@ -417,7 +431,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let refresh_interval = Duration::from_millis(remote_refresh_interval_ms.max(250));
         let refresh_poller =
             RemoteSnapshotPoller::server_notifications(Duration::from_secs(25), refresh_interval);
-        let mut client_identity = resolve_or_enroll_client_identity(
+        let client_identity = resolve_or_enroll_client_identity(
             connection.enrollment_base_url.as_ref(),
             &registration.root_path,
             bootstrap_file.as_deref(),
@@ -434,10 +448,40 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         if let Some(identity) = client_identity.as_ref() {
             tracing::info!("using enrolled client identity for {}", identity.device_id);
         }
-        let managed_client = connection.build_managed_client(client_identity.as_ref())?;
-        if let Some(updated_identity) = managed_client.take_identity_update() {
-            client_identity = Some(updated_identity);
+        let selected_identity_path = inspect_persisted_client_identity_paths(
+            &registration.root_path,
+            bootstrap_file.as_deref(),
+            client_identity_file.as_deref(),
+        )
+        .selected_path;
+        let persisted_identity_path = select_identity_persistence_destination(
+            client_identity_file.clone(),
+            selected_identity_path,
+        );
+        let identity_root_path = registration.root_path.clone();
+        let mut managed_client_options = ManagedClientOptions::default();
+        if client_identity.is_some() {
+            managed_client_options.client_identity_persistence = Some(
+                ManagedClientIdentityPersistence::new("windows_cfapi", move |identity| {
+                    persist_renewed_client_identity(
+                        &identity_root_path,
+                        persisted_identity_path.as_deref(),
+                        identity,
+                    )
+                }),
+            );
         }
+        if let Some(identity) = client_identity.as_ref()
+            && let Err(err) =
+                persist_local_appdata_client_identity(&registration.root_path, identity)
+        {
+            tracing::warn!(
+                "failed to persist client identity into local app data for {}: {err:#}",
+                registration.root_path.display()
+            );
+        }
+        let managed_client = connection
+            .build_managed_client_with_options(client_identity.as_ref(), managed_client_options)?;
         let client = managed_client.client();
         if let Some(publisher) = status_publisher.as_ref() {
             remote_status_thread = Some(spawn_remote_status_thread(
@@ -479,16 +523,6 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                 registration.root_path.display()
             );
         }
-        if let Some(identity) = client_identity.as_ref()
-            && let Err(err) =
-                persist_local_appdata_client_identity(&registration.root_path, identity)
-        {
-            tracing::warn!(
-                "failed to persist client identity into local app data for {}: {err:#}",
-                registration.root_path.display()
-            );
-        }
-
         let adapter = WindowsCfapiAdapter::new(registration.display_name.clone());
         let fetcher = RemoteSnapshotFetcher::new(
             client.clone().with_connection_name(windows_connection_name(
@@ -1102,5 +1136,16 @@ fn serve_accepts_legacy_server_ca_cert_alias() {
     assert_eq!(
         args.server_ca_pem_file,
         Some(PathBuf::from(r"C:\demo\server-ca.pem"))
+    );
+}
+
+#[test]
+fn explicit_identity_persistence_destination_overrides_discovered_fallback() {
+    let explicit_path = PathBuf::from(r"C:\config\client-identity.json");
+    let discovered_path = PathBuf::from(r"C:\Users\Example\AppData\Local\BerryKeep\identity.json");
+
+    assert_eq!(
+        select_identity_persistence_destination(Some(explicit_path.clone()), Some(discovered_path),),
+        Some(explicit_path)
     );
 }
