@@ -9,11 +9,19 @@ Keep the final release commit atomic: product and CI fixes land first; the relea
 
 Read [references/berrykeep-release-facts.md](references/berrykeep-release-facts.md) for stable repository-specific facts. Derive mutable conventions from the current repository and recent release history.
 
+Read [the release automation reference](../../../docs/release-and-rollout.md)
+for the current platform matrix, tag side effects, and remaining manual work.
+Recheck its dated observations against current workflows and GitHub state.
+
 ## 1. Resolve the release base
 
 - Identify the branch that will actually receive the release commit.
 - Do not release from a stale feature branch or an already merged/closed PR branch. Switch to a clean, up-to-date worktree at the real release target when needed.
 - Refresh remote state before release edits.
+- If the request includes a later cluster rollout, retain the currently
+  installed packages and secure configuration backups before publishing the
+  tag: APT publication prunes superseded Server Node packages. Use the shared
+  rollout reference; a release-only request does not select deployment hosts.
 
 ## 2. Pass the release gate
 
@@ -28,10 +36,23 @@ Read [references/berrykeep-release-facts.md](references/berrykeep-release-facts.
 - Update `[workspace.package].version` in the root `Cargo.toml`.
 - Refresh the root `Cargo.lock` and `tests/system-tests/Cargo.lock` with Cargo; do not hand-edit lockfiles.
 - Update `debian/changelog`, preserving the current package metadata and Debian revision style, with a concise summary since the previous release tag.
+- For requested iOS deliverables, reconcile `MARKETING_VERSION` in the Apple
+  project specification and generated Xcode project. Cargo version changes do
+  not update it; tag CI overrides only the build number. Check the archived
+  marketing version against the requested release.
 - Stage only release files and follow the current release commit/tag convention discovered from recent history.
+- Deliver the metadata change through the repository's PR workflow. Tag the
+  final integrated commit on the release target, not the pre-squash PR head.
 
 ## 4. Tag, push, and hand off publication
 
-- Create the annotated `vX.Y.Z` tag, push the release commit and tag, and confirm the tag points to the intended commit.
-- Verify GitHub Actions on the pushed release commit.
-- Then use [../release-publish/SKILL.md](../release-publish/SKILL.md) to verify the signed release publication before declaring the release complete.
+- Refresh remote state again and verify CI on the exact integrated release
+  commit and target branch before creating/pushing the annotated `vX.Y.Z` tag.
+  The APT tag validator requires that commit to be reachable from `main`.
+- A stable tag starts both Windows GitHub publication and signed Linux APT
+  publication, independently, plus tag CI/mobile artifact builds. Inspect
+  protected-environment requirements before pushing; APT may publish before
+  the GitHub Release is public.
+- Use [../release-publish/SKILL.md](../release-publish/SKILL.md) to verify both
+  publication paths and requested mobile artifacts. Cluster installation is
+  a separate [production deployment](../production-deploy/SKILL.md).

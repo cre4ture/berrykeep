@@ -1,4 +1,4 @@
 interface:
   display_name: "Production Deploy"
-  short_description: "Deploy a released artifact safely"
+  short_description: "Roll out verified release assets and APT packages"
   default_prompt: "Use $production-deploy to deploy a released BerryKeep artifact."

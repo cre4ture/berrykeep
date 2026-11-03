@@ -9,6 +9,10 @@ Keep this file limited to stable repo-specific facts. Discover common commands f
   by root CI commands that use `--locked`.
 - `tests/system-tests` is excluded from the main workspace and carries its own `Cargo.lock`.
 - `debian/changelog` must gain a new top entry for each release.
+- Apple marketing versions are separate from Cargo:
+  `apps/apple-file-provider/project.yml` owns `MARKETING_VERSION`, also present
+  in the committed generated Xcode project. Follow that directory's README for
+  project generation and verify requested iOS release versions explicitly.
 
 ## CI expectations
 

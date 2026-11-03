@@ -1,4 +1,4 @@
 interface:
   display_name: "Release Publish"
-  short_description: "Publish signed GitHub release assets"
+  short_description: "Verify signed Windows and Linux publication"
   default_prompt: "Use $release-publish to publish a signed BerryKeep release."

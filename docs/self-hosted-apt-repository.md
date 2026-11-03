@@ -10,7 +10,7 @@ The primary BerryKeep repository URL is:
 https://creax.de/apt/berrykeep
 ```
 
-The former `https://creax.de/apt/berrykeep` location is retained as a signed
+The former `https://creax.de/apt/ironmesh` location is retained as a signed
 compatibility mirror. Existing clients can keep using it, but new
 installations should use the BerryKeep URL.
 
@@ -134,7 +134,7 @@ package increments the legacy repository revision, so it supersedes an
 otherwise identical `~repo1~ubuntu…` package in APT's version comparison.
 
 When a server-only matrix refreshes an already-published suite, the matrix
-discovers and publishes the matching `berrykeep-server-node` transition package
+discovers and publishes the matching `ironmesh-server-node` transition package
 beside each `berrykeep-server-node` input. Its existing client, rendezvous, and
 map-tools `.deb` files are retained from both the legacy shared pool and the
 previous BerryKeep suite pool, then copied into the new BerryKeep suite pool
@@ -168,14 +168,14 @@ same signed repository to both locations:
 APT_REPO_SIGN_KEY=5D7762BDB9A2A564D500DE702A2E3C589C188616 \
   ./scripts/build-apt-repository.sh \
     --server-node-matrix server-node-debian-matrix.txt \
-    --import-remote creature@creax.de:/home/creature/html/apt/berrykeep
+    --import-remote creature@creax.de:/home/creature/html/apt/ironmesh
 
 ./scripts/deploy-apt-repository.sh \
   --server-node-matrix server-node-debian-matrix.txt
 ./scripts/deploy-apt-repository.sh \
   --server-node-matrix server-node-debian-matrix.txt \
-  --remote-dir /home/creature/html/apt/berrykeep \
-  --url https://creax.de/apt/berrykeep
+  --remote-dir /home/creature/html/apt/ironmesh \
+  --url https://creax.de/apt/ironmesh
 ```
 
 ## CI build, signing, and deployment
@@ -212,9 +212,9 @@ Add these environment variables:
 - `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE`: SSH target of the legacy
   mirror, normally `creature@creax.de`.
 - `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_REMOTE_DIR`: legacy mirror directory,
-  `/home/creature/html/apt/berrykeep`.
+  `/home/creature/html/apt/ironmesh`.
 - `BERRYKEEP_APT_COMPATIBILITY_REPOSITORY_URL`: legacy mirror URL,
-  `https://creax.de/apt/berrykeep`.
+  `https://creax.de/apt/ironmesh`.
 
 The publish job imports the private key into a fresh temporary keyring,
 confirms its fingerprint, imports the primary archive, and deploys identical
@@ -240,9 +240,9 @@ curl -fsSL https://creax.de/apt/berrykeep/dists/focal/main/binary-arm64/Packages
   | gzip -dc \
   | grep '^Package: '
 
-# Existing BerryKeep clients continue to receive the same signed metadata.
+# Existing IronMesh clients continue to receive the same signed metadata.
 cmp <(curl -fsSL https://creax.de/apt/berrykeep/dists/noble/InRelease) \
-  <(curl -fsSL https://creax.de/apt/berrykeep/dists/noble/InRelease)
+  <(curl -fsSL https://creax.de/apt/ironmesh/dists/noble/InRelease)
 ```
 
 ## Client setup
@@ -256,7 +256,7 @@ curl -fsSL https://creax.de/apt/berrykeep/berrykeep-archive-keyring.asc \
 
 Add exactly one apt source, matching the distribution suite and architecture of
 the host. New installations use `berrykeep.list`; existing clients can retain
-their `berrykeep.list` source because the legacy URL is a compatibility mirror:
+their `ironmesh.list` source because the legacy URL is a compatibility mirror:
 
 ```bash
 # Ubuntu 20.04 ARM64
@@ -276,24 +276,33 @@ echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/berrykeep-archive-keyring.gp
   | sudo tee /etc/apt/sources.list.d/berrykeep.list
 ```
 
-Install or update packages through apt:
+Install or update the Server Node through apt:
 
 ```bash
 sudo apt update
-sudo apt install berrykeep-client
+sudo apt install berrykeep-server-node
 ```
 
-Headless targets install only `berrykeep-server-node`. The desktop package set
-can additionally install `berrykeep-rendezvous-service`; add
-`berrykeep-server-node-map-tools` when the optional Natural Earth imports are
-needed.
+The automated release matrix publishes the Server Node and its transition
+packages. The full desktop package set (`berrykeep-client` and
+`berrykeep-rendezvous-service`) needs separate publication; check its actual
+APT candidate before trying to install it. Retained legacy client/rendezvous
+packages can be older than the Server Node. Add `berrykeep-server-node-map-tools`
+when the optional Natural Earth imports are needed and that package is available
+for the host's suite/architecture.
 
 ## Publishing updates
 
-For a new release, bump `[workspace.package].version` in `Cargo.toml`, build the
-local `.deb` packages, rebuild the repository metadata, and deploy again. The
-packaging helpers update the upstream portion of `debian/changelog`
-automatically while preserving the existing Debian revision suffix:
+For a stable Server Node release, follow the
+[release preparation procedure](release-and-rollout.md#release-preparation-and-verification).
+The annotated tag automatically builds, signs, and publishes the five-target
+Server Node matrix through the protected `apt-repository` environment. Approve
+the environment job and verify publication; a local rebuild is not required.
+
+The commands below are a separate manual path for explicitly requested full
+package publication or repair. The packaging helpers update the upstream
+portion of `debian/changelog` automatically while preserving its Debian
+revision suffix:
 
 ```bash
 ./scripts/build-local-debs.sh -- -jauto
