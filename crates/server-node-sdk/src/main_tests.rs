@@ -27599,11 +27599,11 @@ async fn local_node_connection_priority_updates_presence_labels() {
     cleanup_test_state(&state).await;
 }
 
-pub(super) async fn build_natural_earth_test_state() -> ServerState {
+pub(super) async fn build_sqlite_test_state() -> ServerState {
     build_test_state(1, false, MainTestBackend::Sqlite).await
 }
 
-pub(super) async fn cleanup_natural_earth_test_state(state: &ServerState) {
+pub(super) async fn cleanup_sqlite_test_state(state: &ServerState) {
     cleanup_test_state(state).await;
 }
 
