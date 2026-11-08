@@ -25,9 +25,9 @@ use desktop_client_config::{
     ManagedInstanceStore, OS_INTEGRATION_MANAGEMENT_SUPPORTED, OsIntegrationInstance,
     PLATFORM_KIND, STARTUP_INTEGRATION_LABEL, STARTUP_INTEGRATION_NOTE, STARTUP_INTEGRATION_VALUE,
     ServiceRuntimeStatus, StopOutcome, default_instance_store_path, default_launch_report_path,
-    default_service_log_dir, generate_instance_id, launch_client_cli_instance,
-    launch_enabled_instances, launch_folder_agent_instance, launch_os_integration_instance,
-    launch_report_with_updated_outcome, load_last_launch_report,
+    default_service_log_dir, default_service_log_file_path, generate_instance_id,
+    launch_client_cli_instance, launch_enabled_instances, launch_folder_agent_instance,
+    launch_os_integration_instance, launch_report_with_updated_outcome, load_last_launch_report,
     migrate_legacy_virtualized_windows_state, package_root_from_current_exe, save_launch_report,
     service_desktop_status_file_path, service_runtime_statuses, stop_service_from_report,
 };
@@ -39,6 +39,7 @@ use desktop_status::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -564,6 +565,8 @@ impl UpsertClientCliInstanceRequest {
 struct ApiError {
     status: StatusCode,
     message: String,
+    code: Option<&'static str>,
+    path_preparation: Option<Box<ServicePathPreparationFailure>>,
 }
 
 impl ApiError {
@@ -571,6 +574,8 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            code: None,
+            path_preparation: None,
         }
     }
 
@@ -578,14 +583,42 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: error.to_string(),
+            code: None,
+            path_preparation: None,
+        }
+    }
+
+    fn service_path_preparation(failure: ServicePathPreparationFailure) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: service_path_preparation_message(&failure),
+            code: Some("service_path_preparation_failed"),
+            path_preparation: Some(Box::new(failure)),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(json!({
+                "error": self.message,
+                "code": self.code,
+                "path_preparation": self.path_preparation,
+            })),
+        )
+            .into_response()
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ServicePathPreparationFailure {
+    service_kind: String,
+    service_id: String,
+    location: &'static str,
+    path: PathBuf,
+    reason: String,
 }
 
 #[tokio::main]
@@ -624,7 +657,8 @@ async fn main() -> Result<()> {
             ManagedIdentitySelection::EnabledLaunch,
         )
         .await;
-        let report = launch_enabled_instances(&store, state.paths.package_root());
+        let report =
+            launch_enabled_instances_with_path_preparation(&store, state.paths.package_root());
         save_launch_report(state.paths.launch_report_path(), &report)
             .context("failed saving launch report before config app startup")?;
     }
@@ -1552,6 +1586,8 @@ async fn start_service_instance(
         }));
     }
 
+    prepare_configured_service_paths(&store, kind, &id, &default_service_log_dir())
+        .map_err(ApiError::service_path_preparation)?;
     reconcile_managed_identities_for_selection(
         &state,
         &store,
@@ -1607,6 +1643,8 @@ async fn restart_service_instance(
     let launch = if stop.was_running && !stop.stopped {
         None
     } else {
+        prepare_configured_service_paths(&store, kind, &id, &default_service_log_dir())
+            .map_err(ApiError::service_path_preparation)?;
         reconcile_managed_identities_for_selection(
             &state,
             &store,
@@ -1640,7 +1678,7 @@ async fn launch_enabled_now(State(state): State<AppState>) -> Result<Json<Launch
         ManagedIdentitySelection::EnabledLaunch,
     )
     .await;
-    let report = launch_enabled_instances(&store, state.paths.package_root());
+    let report = launch_enabled_instances_with_path_preparation(&store, state.paths.package_root());
     save_launch_report(state.paths.launch_report_path(), &report).map_err(ApiError::internal)?;
     Ok(Json(report))
 }
@@ -1869,6 +1907,210 @@ fn ensure_service_instance_exists(
             "{kind} instance '{id}' was not found"
         )))
     }
+}
+
+/// Creates the directories that a managed service is allowed to write to before it is spawned.
+///
+/// Configuration inputs such as bootstrap, certificate, and client-identity files are
+/// deliberately excluded: those are read-only inputs and creating their parents would mask a
+/// misconfigured or missing input file.
+fn prepare_configured_service_paths(
+    store: &ManagedInstanceStore,
+    kind: &str,
+    id: &str,
+    service_log_dir: &Path,
+) -> Result<(), ServicePathPreparationFailure> {
+    prepare_service_directory(kind, id, "service log directory", service_log_dir)?;
+
+    match kind {
+        "client-cli" => Ok(()),
+        "folder-agent" => {
+            let instance = store
+                .folder_agent_instances
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .expect("service instance existence should be checked before path preparation");
+            prepare_service_directory(
+                kind,
+                id,
+                "folder-agent root directory",
+                Path::new(&instance.root_dir),
+            )?;
+            if let Some(state_root_dir) = instance.state_root_dir.as_deref() {
+                prepare_service_directory(
+                    kind,
+                    id,
+                    "folder-agent state directory",
+                    Path::new(state_root_dir),
+                )?;
+            }
+            #[cfg(target_os = "linux")]
+            prepare_linux_service_status_parent(kind, id)?;
+            Ok(())
+        }
+        "os-integration" => {
+            let instance = store
+                .os_integration_instances
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .expect("service instance existence should be checked before path preparation");
+            prepare_service_directory(
+                kind,
+                id,
+                "OS integration root directory",
+                Path::new(&instance.root_path),
+            )?;
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(client_edge_state_dir) = instance.client_edge_state_dir.as_deref() {
+                    prepare_service_directory(
+                        kind,
+                        id,
+                        "OS integration client state directory",
+                        Path::new(client_edge_state_dir),
+                    )?;
+                }
+                prepare_linux_service_status_parent(kind, id)?;
+            }
+            Ok(())
+        }
+        _ => unreachable!("service kind should be normalized before path preparation"),
+    }
+}
+
+fn launch_enabled_instances_with_path_preparation(
+    store: &ManagedInstanceStore,
+    package_root: &Path,
+) -> LaunchReport {
+    let service_log_dir = default_service_log_dir();
+    let mut launchable_store = store.clone();
+    let mut path_preparation_outcomes = Vec::new();
+
+    let enabled_services = enabled_service_instances(store);
+    for (kind, id, label) in enabled_services {
+        if let Err(failure) = prepare_configured_service_paths(store, kind, &id, &service_log_dir) {
+            disable_service_instance(&mut launchable_store, kind, &id);
+            path_preparation_outcomes.push(path_preparation_launch_outcome(failure, label));
+        }
+    }
+
+    let mut report = launch_enabled_instances(&launchable_store, package_root);
+    report.outcomes.extend(path_preparation_outcomes);
+    report.total_enabled = report.outcomes.len();
+    report
+}
+
+fn enabled_service_instances(store: &ManagedInstanceStore) -> Vec<(&'static str, String, String)> {
+    let mut services = Vec::new();
+    for instance in &store.client_cli_instances {
+        if instance.enabled {
+            services.push(("client-cli", instance.id.clone(), instance.label.clone()));
+        }
+    }
+    for instance in &store.os_integration_instances {
+        if instance.enabled {
+            services.push((
+                "os-integration",
+                instance.id.clone(),
+                instance.label.clone(),
+            ));
+        }
+    }
+    for instance in &store.folder_agent_instances {
+        if instance.enabled {
+            services.push(("folder-agent", instance.id.clone(), instance.label.clone()));
+        }
+    }
+    services
+}
+
+fn disable_service_instance(store: &mut ManagedInstanceStore, kind: &str, id: &str) {
+    match kind {
+        "client-cli" => {
+            if let Some(instance) = store
+                .client_cli_instances
+                .iter_mut()
+                .find(|instance| instance.id == id)
+            {
+                instance.enabled = false;
+            }
+        }
+        "os-integration" => {
+            if let Some(instance) = store
+                .os_integration_instances
+                .iter_mut()
+                .find(|instance| instance.id == id)
+            {
+                instance.enabled = false;
+            }
+        }
+        "folder-agent" => {
+            if let Some(instance) = store
+                .folder_agent_instances
+                .iter_mut()
+                .find(|instance| instance.id == id)
+            {
+                instance.enabled = false;
+            }
+        }
+        _ => unreachable!("service kind should be normalized before disabling an instance"),
+    }
+}
+
+fn path_preparation_launch_outcome(
+    failure: ServicePathPreparationFailure,
+    label: String,
+) -> LaunchOutcome {
+    LaunchOutcome {
+        instance_kind: failure.service_kind.clone(),
+        id: failure.service_id.clone(),
+        label,
+        executable: String::new(),
+        command_line: Vec::new(),
+        log_file: Some(
+            default_service_log_file_path(&failure.service_kind, &failure.service_id)
+                .display()
+                .to_string(),
+        ),
+        pid: None,
+        error: Some(service_path_preparation_message(&failure)),
+    }
+}
+
+fn service_path_preparation_message(failure: &ServicePathPreparationFailure) -> String {
+    format!(
+        "failed preparing {} at {}: {}",
+        failure.location,
+        failure.path.display(),
+        failure.reason
+    )
+}
+
+fn prepare_service_directory(
+    service_kind: &str,
+    service_id: &str,
+    location: &'static str,
+    path: &Path,
+) -> Result<(), ServicePathPreparationFailure> {
+    fs::create_dir_all(path).map_err(|error| ServicePathPreparationFailure {
+        service_kind: service_kind.to_string(),
+        service_id: service_id.to_string(),
+        location,
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_service_status_parent(
+    service_kind: &str,
+    service_id: &str,
+) -> Result<(), ServicePathPreparationFailure> {
+    let status_file = service_desktop_status_file_path(service_kind, service_id);
+    let parent = status_file
+        .parent()
+        .expect("desktop status file should have a parent");
+    prepare_service_directory(service_kind, service_id, "desktop status directory", parent)
 }
 
 fn launch_configured_service(
@@ -3415,7 +3657,10 @@ async function fetchJson(url, options) {
   const response = await fetch(url, options);
   const payload = await response.json();
   if (!response.ok) {
-    throw new Error(payload.error || JSON.stringify(payload));
+    const error = new Error(payload.error || JSON.stringify(payload));
+    error.code = payload.code || null;
+    error.pathPreparation = payload.path_preparation || null;
+    throw error;
   }
   return payload;
 }
@@ -3970,18 +4215,27 @@ window.deleteFolderInstance = async function(encodedId) {
 
 window.controlService = async function(serviceKind, encodedId, action) {
   const id = decodeURIComponent(encodedId);
-  const response = await fetchJson(
-    `/api/services/${encodeURIComponent(serviceKind)}/${encodeURIComponent(id)}/${action}`,
-    { method: 'POST' }
-  );
-  renderConfig(response.config);
-  showStatus({
-    action,
-    service: serviceKind,
-    id,
-    launch: response.launch || null,
-    stop: response.stop || null,
-  });
+  try {
+    const response = await fetchJson(
+      `/api/services/${encodeURIComponent(serviceKind)}/${encodeURIComponent(id)}/${action}`,
+      { method: 'POST' }
+    );
+    renderConfig(response.config);
+    showStatus({
+      action,
+      service: serviceKind,
+      id,
+      launch: response.launch || null,
+      stop: response.stop || null,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showStatus({
+      error: message,
+      code: error?.code || null,
+      path_preparation: error?.pathPreparation || null,
+    });
+  }
 };
 
 async function submitIdentityForm(event) {
@@ -4239,6 +4493,96 @@ mod tests {
         assert!(APP_JS.contains("function formatHeaderVersion"));
         assert!(APP_JS.contains("document.title = `${desktopConfigTitle}"));
         assert!(APP_FAVICON.contains("connected grape cluster with a green leaf"));
+    }
+
+    #[test]
+    fn service_path_preparation_creates_all_configured_writable_directories() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "berrykeep-config-app-path-preparation-{}-{}",
+            std::process::id(),
+            unix_ts_ms()
+        ));
+        let log_dir = temp_dir.join("logs");
+        let root_dir = temp_dir.join("sync").join("root");
+        let state_root_dir = temp_dir.join("state").join("folder-agent");
+        prepare_service_directory(
+            "folder-agent",
+            "folder-1",
+            "service log directory",
+            &log_dir,
+        )
+        .expect("service log directory should be created");
+        prepare_service_directory(
+            "folder-agent",
+            "folder-1",
+            "folder-agent root directory",
+            &root_dir,
+        )
+        .expect("folder root directory should be created");
+        prepare_service_directory(
+            "folder-agent",
+            "folder-1",
+            "folder-agent state directory",
+            &state_root_dir,
+        )
+        .expect("folder state directory should be created");
+
+        assert!(log_dir.is_dir());
+        assert!(root_dir.is_dir());
+        assert!(state_root_dir.is_dir());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn service_path_preparation_failure_has_a_machine_readable_response_node() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "berrykeep-config-app-path-preparation-failure-{}-{}",
+            std::process::id(),
+            unix_ts_ms()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("temporary directory should be created");
+        let log_path_that_is_a_file = temp_dir.join("service-log-directory");
+        std::fs::write(&log_path_that_is_a_file, "not a directory")
+            .expect("log path blocker should be written");
+
+        let failure = prepare_configured_service_paths(
+            &ManagedInstanceStore::default(),
+            "client-cli",
+            "client-1",
+            &log_path_that_is_a_file,
+        )
+        .expect_err("a file cannot be prepared as a service log directory");
+        let response = ApiError::service_path_preparation(failure).into_response();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("failure response should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("failure response should be JSON");
+        assert_eq!(
+            payload.get("code").and_then(serde_json::Value::as_str),
+            Some("service_path_preparation_failed")
+        );
+        assert_eq!(
+            payload
+                .pointer("/path_preparation/service_kind")
+                .and_then(serde_json::Value::as_str),
+            Some("client-cli")
+        );
+        assert_eq!(
+            payload
+                .pointer("/path_preparation/location")
+                .and_then(serde_json::Value::as_str),
+            Some("service log directory")
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn embedded_ui_preserves_service_path_preparation_failure_details() {
+        assert!(APP_JS.contains("error.code = payload.code || null"));
+        assert!(APP_JS.contains("path_preparation: error?.pathPreparation || null"));
     }
 
     fn test_app_state() -> AppState {
