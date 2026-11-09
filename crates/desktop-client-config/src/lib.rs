@@ -1140,9 +1140,9 @@ fn fill_client_web_readiness(statuses: &mut [ServiceRuntimeStatus]) {
         });
         let address = client_web_probe_address(bind);
         status.web_ui_bind = address.map(|address| address.to_string());
-        status.web_ui_ready = Some(address.is_some_and(|address| {
+        status.web_ui_ready = address.map(|address| {
             TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
-        }));
+        });
     }
 }
 
@@ -2417,6 +2417,10 @@ mod tests {
         fill_client_web_readiness(&mut statuses);
         assert_eq!(statuses[0].web_ui_ready, Some(true));
         assert_eq!(statuses[0].web_ui_bind.as_deref(), Some(bind.as_str()));
+        statuses[0].last_launch.as_mut().unwrap().command_line[2] = "invalid-address".to_string();
+        fill_client_web_readiness(&mut statuses);
+        assert_eq!(statuses[0].web_ui_ready, None);
+        assert_eq!(statuses[0].web_ui_bind, None);
         // Readiness follows the launched command, even if a later store edit changes bind.
         statuses[0] = service_runtime_status("client-cli", "web-client", None);
         fill_client_web_readiness(&mut statuses);
