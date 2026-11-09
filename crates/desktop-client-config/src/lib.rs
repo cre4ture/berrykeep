@@ -119,7 +119,7 @@ impl ManagedInstanceStore {
         store.version = MANAGED_INSTANCE_STORE_VERSION;
         let payload = serde_json::to_vec_pretty(&store)
             .context("failed serializing managed instance store")?;
-        fs::write(path, payload)
+        write_atomic(path, &payload)
             .with_context(|| format!("failed writing managed instance store {}", path.display()))
     }
 
@@ -879,7 +879,7 @@ pub fn save_launch_report(path: &Path, report: &LaunchReport) -> Result<()> {
     let mut report = report.clone();
     report.version = LAUNCH_REPORT_VERSION;
     let payload = serde_json::to_vec_pretty(&report).context("failed serializing launch report")?;
-    fs::write(path, payload)
+    write_atomic(path, &payload)
         .with_context(|| format!("failed writing launch report {}", path.display()))
 }
 
@@ -1734,6 +1734,21 @@ fn push_optional_usize(args: &mut Vec<String>, flag: &str, value: Option<usize>)
     args.push(value.to_string());
 }
 
+fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed staging configuration in {}", parent.display()))?;
+    staged.write_all(payload)?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist(path)
+        .with_context(|| format!("failed replacing configuration {}", path.display()))?;
+    Ok(())
+}
+
 fn ensure_parent_dir(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -2152,6 +2167,50 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should create");
         dir.join("state.json")
+    }
+
+    #[test]
+    fn configuration_saves_preserve_open_reader_snapshots() {
+        fn verify(path: &Path, save: impl Fn() -> Result<()>) {
+            use std::io::Read;
+            let original = b"{\"snapshot\":\"original\"}";
+            fs::write(path, original).unwrap();
+            let mut reader = fs::File::open(path).unwrap();
+            let saved = save();
+            let mut observed = Vec::new();
+            reader.read_to_end(&mut observed).unwrap();
+            assert_eq!(
+                observed, original,
+                "an open reader must retain its complete snapshot"
+            );
+            drop(reader);
+            // Windows may refuse replacement while a reader holds the target.
+            // The previous snapshot must survive that failure, and a retry after
+            // the reader closes must still be able to replace the file.
+            #[cfg(not(windows))]
+            saved.unwrap();
+            #[cfg(windows)]
+            let _ = saved;
+            save().unwrap();
+        }
+        let store_path = temp_path("atomic-store");
+        verify(&store_path, || {
+            ManagedInstanceStore::default().save(&store_path)
+        });
+        ManagedInstanceStore::load_or_default(&store_path).unwrap();
+        let report_path = temp_path("atomic-report");
+        let report = LaunchReport {
+            version: LAUNCH_REPORT_VERSION,
+            launched_at_unix_ms: 1,
+            package_root: "test-package".to_string(),
+            total_enabled: 0,
+            outcomes: vec![],
+        };
+        verify(&report_path, || save_launch_report(&report_path, &report));
+        assert_eq!(load_last_launch_report(&report_path).unwrap(), Some(report));
+        for path in [store_path, report_path] {
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]
