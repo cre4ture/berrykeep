@@ -719,6 +719,8 @@ pub struct ServiceRuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_ui_ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_ui_bind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_launch: Option<LaunchOutcome>,
@@ -1120,21 +1122,28 @@ pub fn service_runtime_statuses_with_web_readiness(
     report: Option<&LaunchReport>,
 ) -> Vec<ServiceRuntimeStatus> {
     let mut statuses = service_runtime_statuses(store, report);
-    for instance in &store.client_cli_instances {
-        if let Some(status) = statuses.iter_mut().find(|status| {
-            status.instance_kind == "client-cli" && status.id == instance.id && status.running
-        }) {
-            status.web_ui_ready = Some(client_web_port_is_listening(instance));
-        }
-    }
+    fill_client_web_readiness(&mut statuses);
     statuses
 }
 
-fn client_web_port_is_listening(instance: &ClientCliInstance) -> bool {
-    let Some(address) = client_web_probe_address(instance.bind.as_deref()) else {
-        return false;
-    };
-    TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+fn fill_client_web_readiness(statuses: &mut [ServiceRuntimeStatus]) {
+    for status in statuses {
+        if status.instance_kind != "client-cli" || !status.running {
+            continue;
+        }
+        let bind = status.last_launch.as_ref().and_then(|launch| {
+            launch
+                .command_line
+                .windows(2)
+                .find(|args| args[0] == "--bind")
+                .map(|args| args[1].as_str())
+        });
+        let address = client_web_probe_address(bind);
+        status.web_ui_bind = address.map(|address| address.to_string());
+        status.web_ui_ready = Some(address.is_some_and(|address| {
+            TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+        }));
+    }
 }
 
 fn client_web_probe_address(bind: Option<&str>) -> Option<SocketAddr> {
@@ -1205,7 +1214,7 @@ pub fn stop_service_from_report(
         };
     };
 
-    if !process_is_running(pid) {
+    if !launched_process_is_running(outcome) {
         return StopOutcome {
             instance_kind: instance_kind.to_string(),
             id: id.to_string(),
@@ -1216,9 +1225,9 @@ pub fn stop_service_from_report(
         };
     }
 
-    match terminate_process(pid) {
+    match terminate_process(outcome) {
         Ok(()) => {
-            let stopped = wait_for_process_exit(pid, Duration::from_secs(2));
+            let stopped = wait_for_process_exit(outcome, Duration::from_secs(2));
             StopOutcome {
                 instance_kind: instance_kind.to_string(),
                 id: id.to_string(),
@@ -1249,8 +1258,8 @@ fn service_runtime_status(
     last_launch: Option<&LaunchOutcome>,
 ) -> ServiceRuntimeStatus {
     let running_pid = last_launch
-        .and_then(|outcome| outcome.pid)
-        .filter(|pid| process_is_running(*pid));
+        .filter(|outcome| launched_process_is_running(outcome))
+        .and_then(|outcome| outcome.pid);
     let log_file = last_launch
         .and_then(|outcome| outcome.log_file.clone())
         .or_else(|| {
@@ -1266,6 +1275,7 @@ fn service_runtime_status(
         log_file,
         running: running_pid.is_some(),
         web_ui_ready: None,
+        web_ui_bind: None,
         pid: running_pid,
         last_launch: last_launch.cloned(),
     }
@@ -1283,15 +1293,55 @@ fn last_launch_outcome<'a>(
         .find(|outcome| outcome.instance_kind == instance_kind && outcome.id == id)
 }
 
-fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+fn wait_for_process_exit(outcome: &LaunchOutcome, timeout: Duration) -> bool {
     let started_at = std::time::Instant::now();
     while started_at.elapsed() < timeout {
-        if !process_is_running(pid) {
+        if !launched_process_is_running(outcome) {
             return true;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    !process_is_running(pid)
+    !launched_process_is_running(outcome)
+}
+
+fn launched_process_is_running(outcome: &LaunchOutcome) -> bool {
+    let Some(pid) = outcome.pid else {
+        return false;
+    };
+    let mut system = sysinfo::System::new();
+    let pid = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system
+        .process(pid)
+        .is_some_and(|process| process_matches_launch(process, outcome))
+}
+
+fn process_matches_launch(process: &sysinfo::Process, outcome: &LaunchOutcome) -> bool {
+    let expected = Path::new(&outcome.executable);
+    let matches_path = |path: &Path| {
+        #[cfg(windows)]
+        {
+            path.to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .eq_ignore_ascii_case(expected.to_string_lossy().trim_start_matches(r"\\?\"))
+        }
+        #[cfg(not(windows))]
+        {
+            path == expected
+        }
+    };
+    let executable_matches = process.exe().is_some_and(matches_path)
+        || process
+            .cmd()
+            .first()
+            .is_some_and(|arg| matches_path(Path::new(arg)));
+    executable_matches
+        && process
+            .cmd()
+            .iter()
+            .skip(1)
+            .map(|arg| arg.as_os_str())
+            .eq(outcome.command_line.iter().map(std::ffi::OsStr::new))
 }
 
 fn process_is_running(pid: u32) -> bool {
@@ -1301,13 +1351,19 @@ fn process_is_running(pid: u32) -> bool {
     system.process(pids[0]).is_some()
 }
 
-fn terminate_process(pid: u32) -> Result<()> {
+fn terminate_process(outcome: &LaunchOutcome) -> Result<()> {
+    let pid = outcome
+        .pid
+        .context("cannot stop a service without its process ID")?;
     let mut system = sysinfo::System::new();
     let pids = [sysinfo::Pid::from_u32(pid)];
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
     let Some(process) = system.process(pids[0]) else {
         return Ok(());
     };
+    if !process_matches_launch(process, outcome) {
+        return Ok(());
+    }
     if process.kill() {
         Ok(())
     } else {
@@ -2247,58 +2303,24 @@ mod tests {
     fn client_service_reports_starting_until_its_web_port_is_listening() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap().to_string();
-        let mut store = ManagedInstanceStore {
-            client_cli_instances: vec![ClientCliInstance {
-                id: "web-client".to_string(),
-                label: "Web client".to_string(),
-                enabled: true,
-                // Port zero cannot have a listener; keep the positive-case listener reserved.
-                bind: Some("127.0.0.1:0".to_string()),
-                server_base_url: None,
-                bootstrap_file: None,
-                server_ca_pem_file: None,
-                client_identity_id: None,
-                client_identity_file: None,
-            }],
-            ..ManagedInstanceStore::default()
-        };
-        let mut report = LaunchReport {
-            version: LAUNCH_REPORT_VERSION,
-            launched_at_unix_ms: 1,
-            package_root: "/test".to_string(),
-            total_enabled: 1,
-            outcomes: vec![LaunchOutcome {
-                instance_kind: "client-cli".to_string(),
-                id: "web-client".to_string(),
-                label: "Web client".to_string(),
-                executable: "client".to_string(),
-                command_line: Vec::new(),
-                log_file: None,
-                pid: Some(std::process::id()),
-                error: None,
-            }],
-        };
-        let status = serde_json::to_value(
-            &service_runtime_statuses_with_web_readiness(&store, Some(&report))[0],
-        )
+        let mut statuses: Vec<ServiceRuntimeStatus> = serde_json::from_value(serde_json::json!([{
+            "instance_kind":"client-cli", "id":"web-client", "running":true,
+            "last_launch": {"instance_kind":"client-cli", "id":"web-client", "label":"Client",
+                "executable":"client", "command_line":["serve-web", "--bind", "127.0.0.1:0"],
+                "pid":null, "error":null}
+        }]))
         .unwrap();
-        assert_eq!(status["running"], true);
-        assert_eq!(status["web_ui_ready"], false);
-
-        store.client_cli_instances[0].bind = Some(bind);
-        let status = serde_json::to_value(
-            &service_runtime_statuses_with_web_readiness(&store, Some(&report))[0],
-        )
-        .unwrap();
-        assert_eq!(status["web_ui_ready"], true);
-
-        report.outcomes[0].pid = None;
-        let status = serde_json::to_value(
-            &service_runtime_statuses_with_web_readiness(&store, Some(&report))[0],
-        )
-        .unwrap();
-        assert_eq!(status["running"], false);
-        assert!(status.get("web_ui_ready").is_none());
+        fill_client_web_readiness(&mut statuses);
+        assert_eq!(statuses[0].web_ui_ready, Some(false));
+        statuses[0].last_launch.as_mut().unwrap().command_line[2] = bind.clone();
+        fill_client_web_readiness(&mut statuses);
+        assert_eq!(statuses[0].web_ui_ready, Some(true));
+        assert_eq!(statuses[0].web_ui_bind.as_deref(), Some(bind.as_str()));
+        // Readiness follows the launched command, even if a later store edit changes bind.
+        statuses[0] = service_runtime_status("client-cli", "web-client", None);
+        fill_client_web_readiness(&mut statuses);
+        assert!(!statuses[0].running);
+        assert_eq!(statuses[0].web_ui_ready, None);
     }
 
     #[test]
@@ -2335,7 +2357,7 @@ mod tests {
                     .expect("current exe should resolve")
                     .display()
                     .to_string(),
-                command_line: Vec::new(),
+                command_line: std::env::args().skip(1).collect(),
                 log_file: None,
                 pid: Some(std::process::id()),
                 error: None,
@@ -2356,6 +2378,25 @@ mod tests {
         assert!(statuses[0].running);
         assert_eq!(statuses[0].pid, Some(std::process::id()));
         assert!(statuses[0].last_launch.is_some());
+    }
+
+    #[test]
+    fn a_recycled_pid_is_neither_reused_nor_stopped() {
+        let outcome = LaunchOutcome {
+            instance_kind: "client-cli".to_string(),
+            id: "old".to_string(),
+            label: "Old".to_string(),
+            executable: "/a/different/executable".to_string(),
+            command_line: Vec::new(),
+            log_file: None,
+            pid: Some(std::process::id()),
+            error: None,
+        };
+        assert!(!service_runtime_status("client-cli", "old", Some(&outcome)).running);
+        let report = launch_report_with_updated_outcome(None, Path::new("/test"), outcome);
+        let stop = stop_service_from_report(Some(&report), "client-cli", "old");
+        assert!(!stop.was_running);
+        assert!(!stop.stopped);
     }
 
     #[test]

@@ -286,7 +286,7 @@ Why the version bump matters:
 ### Managed client startup status
 
 The config app shows **Starting** while a client service process is alive but
-its configured local web port has not opened yet. Connection discovery can
+its launched local web port has not opened yet. Connection discovery can
 take time when bootstrap endpoints are unreachable. Service cards refresh
 automatically every two seconds without resetting unsaved configuration edits.
 The web UI link becomes available once its port is listening; a process that
@@ -298,6 +298,10 @@ updates, including across config-app processes using the same report path.
 Overlapping actions return HTTP 409 with `code: "service_action_in_progress"`.
 "Run Enabled Services" reuses already live processes, including clients still
 starting, instead of replacing their recorded PID.
+Configuration edits use a separate, short write lock, so slow service startup
+does not block saving unrelated profiles. Recorded processes are reused or
+stopped only when their executable and command arguments still match the
+launch report, preventing unrelated recycled PIDs from being mistaken for services.
 
 The prototype DLL now writes a simple log file to:
 

@@ -1411,9 +1411,9 @@ async fn upsert_client_identity(
         None
     };
 
-    // Enrollment may wait on the network. Only the local commit and reconciliation
-    // need the service-action lock, and the store must be reloaded after that wait.
-    let _action = service_action::acquire(&state.paths)?;
+    // Enrollment may wait on the network. Only the local commit needs the store-write
+    // lock, and the store must be reloaded after that wait.
+    let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let enrollment = if let Some(prepared) = prepared {
@@ -1446,14 +1446,22 @@ async fn upsert_client_identity(
     store
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
-    reconcile_managed_identities_for_selection(
-        &state,
-        &store,
-        ManagedIdentitySelection::Identity {
-            id: managed_identity_id.as_str(),
-        },
-    )
-    .await;
+    drop(store_write);
+    match service_action::acquire(&state.paths) {
+        Ok(_action) => {
+            reconcile_managed_identities_for_selection(
+                &state,
+                &store,
+                ManagedIdentitySelection::Identity {
+                    id: managed_identity_id.as_str(),
+                },
+            )
+            .await
+        }
+        // The identity was committed successfully; an ongoing launch owns its own reconciliation.
+        Err(error) if error.code == Some("service_action_in_progress") => {}
+        Err(error) => return Err(error),
+    }
     Ok(Json(UpsertClientIdentityResponse {
         config: load_config_response(&state)
             .await
@@ -1476,7 +1484,7 @@ async fn upsert_client_cli_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertClientCliInstanceRequest>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let _action = service_action::acquire(&state.paths)?;
+    let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let instance = request.into_instance(&store)?;
@@ -1484,6 +1492,7 @@ async fn upsert_client_cli_instance(
     store
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
+    drop(store_write);
     Ok(Json(
         load_config_response(&state)
             .await
@@ -1495,7 +1504,7 @@ async fn upsert_os_integration_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertOsIntegrationInstanceRequest>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let _action = service_action::acquire(&state.paths)?;
+    let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let existing = request
@@ -1514,6 +1523,7 @@ async fn upsert_os_integration_instance(
     store
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
+    drop(store_write);
     Ok(Json(
         load_config_response(&state)
             .await
@@ -1525,7 +1535,7 @@ async fn upsert_folder_agent_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertFolderAgentInstanceRequest>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let _action = service_action::acquire(&state.paths)?;
+    let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let existing = request
@@ -1544,6 +1554,7 @@ async fn upsert_folder_agent_instance(
     store
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
+    drop(store_write);
     Ok(Json(
         load_config_response(&state)
             .await
@@ -1555,7 +1566,7 @@ async fn delete_os_integration_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let _action = service_action::acquire(&state.paths)?;
+    let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_os_integration(&id) {
@@ -1567,6 +1578,7 @@ async fn delete_os_integration_instance(
     store
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
+    drop(store_write);
     Ok(Json(
         load_config_response(&state)
             .await
@@ -1578,7 +1590,7 @@ async fn delete_client_cli_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let _action = service_action::acquire(&state.paths)?;
+    let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_client_cli(&id) {
@@ -1590,6 +1602,7 @@ async fn delete_client_cli_instance(
     store
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
+    drop(store_write);
     Ok(Json(
         load_config_response(&state)
             .await
@@ -1601,7 +1614,7 @@ async fn delete_folder_agent_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let _action = service_action::acquire(&state.paths)?;
+    let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_folder_agent(&id) {
@@ -1613,6 +1626,7 @@ async fn delete_folder_agent_instance(
     store
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
+    drop(store_write);
     Ok(Json(
         load_config_response(&state)
             .await
@@ -1624,7 +1638,7 @@ async fn delete_client_identity(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
-    let _action = service_action::acquire(&state.paths)?;
+    let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_client_identity(&id) {
@@ -1636,6 +1650,7 @@ async fn delete_client_identity(
     store
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
+    drop(store_write);
     Ok(Json(
         load_config_response(&state)
             .await
@@ -4021,7 +4036,7 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
         ]
     : kind === 'client'
       ? [
-          ['Bind Address', instance.bind || '127.0.0.1:8081'],
+          ['Bind Address', runtime?.web_ui_bind || instance.bind || '127.0.0.1:8081'],
           ['Connection Source', instance.bootstrap_file || instance.server_base_url || 'Starts disconnected'],
           ['Client Identity', identityLabelForProfile(instance)],
         ]
@@ -4662,6 +4677,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrelated_configuration_can_be_saved_during_a_service_action() {
+        let temp_dir = std::env::temp_dir().join(generate_instance_id("config-store-lock"));
+        let mut state = test_app_state();
+        state.paths = ManagedPaths::new(
+            temp_dir.join("instances.json"),
+            temp_dir.join("report.json"),
+            temp_dir.join("package"),
+        );
+        let action = service_action::acquire(&state.paths).unwrap();
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/client-cli-instances")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"id":"other","label":"Other service","enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let store =
+            ManagedInstanceStore::load_or_default(state.paths.instance_store_path()).unwrap();
+        assert_eq!(store.client_cli_instances[0].id, "other");
+        drop(action);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn initial_launch_preserves_store_errors_but_allows_an_existing_action() {
         let temp_dir = std::env::temp_dir().join(generate_instance_id("config-initial-error"));
         fs::create_dir_all(&temp_dir).unwrap();
@@ -4703,7 +4749,7 @@ mod tests {
         store.save(state.paths.instance_store_path()).unwrap();
         let outcome: LaunchOutcome = serde_json::from_value(json!({
             "instance_kind": "client-cli", "id": "client-a", "label": "Client",
-            "executable": "client", "command_line": [], "pid": std::process::id(), "error": null,
+            "executable": std::env::current_exe().unwrap(), "command_line": std::env::args().skip(1).collect::<Vec<_>>(), "pid": std::process::id(), "error": null,
         }))
         .unwrap();
         let report = launch_report_with_updated_outcome(None, state.paths.package_root(), outcome);
@@ -4774,7 +4820,7 @@ mod tests {
         };
         let outcome: LaunchOutcome = serde_json::from_value(json!({
             "instance_kind": "client-cli", "id": "client-a", "label": "Client",
-            "executable": "client", "command_line": [], "pid": std::process::id(), "error": null,
+            "executable": std::env::current_exe().unwrap(), "command_line": std::env::args().skip(1).collect::<Vec<_>>(), "pid": std::process::id(), "error": null,
         }))
         .unwrap();
         let previous =

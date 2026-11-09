@@ -96,3 +96,11 @@ test('a process that exits during startup is no longer shown as Starting', async
   assert.doesNotMatch(elements.get('client-instance-list').innerHTML, /Starting/);
   assert.doesNotMatch(elements.get('client-instance-list').innerHTML, /disabled>Start/);
 });
+
+test('editing the configured bind does not move the running service link', () => {
+  const { context, elements, fixture } = app([{ instance_kind: 'client-cli', id: 'client-a', running: true, web_ui_ready: true, web_ui_bind: '127.0.0.1:8081' }]);
+  fixture.store.client_cli_instances[0].bind = '127.0.0.1:9100';
+  vm.runInContext('renderConfig(fixture)', context);
+  assert.match(elements.get('client-instance-list').innerHTML, /href="http:\/\/127.0.0.1:8081/);
+  assert.doesNotMatch(elements.get('client-instance-list').innerHTML, /href="http:\/\/127.0.0.1:9100/);
+});

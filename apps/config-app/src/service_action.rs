@@ -11,6 +11,29 @@ pub(super) fn acquire(paths: &ManagedPaths) -> Result<File, ApiError> {
     let path = paths
         .launch_report_path()
         .with_extension("service-action.lock");
+    acquire_lock(
+        &path,
+        "service_action_in_progress",
+        "Another service action is in progress. Wait for it to finish before trying again.",
+    )
+}
+
+pub(super) fn acquire_store(paths: &ManagedPaths) -> Result<File, ApiError> {
+    let path = paths
+        .instance_store_path()
+        .with_extension("store-write.lock");
+    acquire_lock(
+        &path,
+        "configuration_update_in_progress",
+        "Another configuration update is in progress. Please retry.",
+    )
+}
+
+fn acquire_lock(
+    path: &std::path::Path,
+    code: &'static str,
+    message: &'static str,
+) -> Result<File, ApiError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| {
@@ -26,17 +49,15 @@ pub(super) fn acquire(paths: &ManagedPaths) -> Result<File, ApiError> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("failed opening service action lock {}", path.display()))
         .map_err(ApiError::internal)?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(ApiError {
             status: axum::http::StatusCode::CONFLICT,
-            message:
-                "Another service action is in progress. Wait for it to finish before trying again."
-                    .to_string(),
-            code: Some("service_action_in_progress"),
+            message: message.to_string(),
+            code: Some(code),
             path_preparation: None,
         }),
         Err(TryLockError::Error(error)) => {
