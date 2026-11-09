@@ -1344,6 +1344,7 @@ fn process_matches_launch(process: &sysinfo::Process, outcome: &LaunchOutcome) -
             .eq(outcome.command_line.iter().map(std::ffi::OsStr::new))
 }
 
+#[cfg(any(windows, test))]
 fn process_is_running(pid: u32) -> bool {
     let mut system = sysinfo::System::new();
     let pids = [sysinfo::Pid::from_u32(pid)];
