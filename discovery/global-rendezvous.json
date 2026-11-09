@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cre4ture/berrykeep/main/discovery/global-rendezvous.schema.json",
+  "schema_version": 1,
+  "rendezvous_services": [
+    {
+      "id": "berrykeep-default",
+      "name": "BerryKeep Global Rendezvous",
+      "url": "https://217.160.159.105:9443",
+      "global_registration_enabled": true
+    }
+  ]
+}
