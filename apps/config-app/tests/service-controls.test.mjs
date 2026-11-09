@@ -6,6 +6,15 @@ import vm from 'node:vm';
 const rust = readFileSync(new URL('../src/main.rs', import.meta.url), 'utf8');
 const script = rust.split('const APP_JS: &str = r###"')[1].split('"###;')[0];
 
+test('identity save explains when applying the saved identity is deferred', async () => {
+  const { context, elements, fixture } = app();
+  context.fetch = async () => ({ ok: true, json: async () => ({ config: fixture, reconciliation_deferred: true }) });
+  await vm.runInContext('submitIdentityForm({ preventDefault() {} })', context);
+  assert.match(elements.get('identity-form-status').textContent, /saved/i);
+  assert.match(elements.get('identity-form-status').textContent, /restart affected services/i);
+  assert.equal(elements.get('identity-form-status').dataset.state, 'warning');
+});
+
 function app(statuses = []) {
   const elements = new Map();
   const fixture = {

@@ -317,6 +317,7 @@ impl UpsertClientIdentityRequest {
 #[derive(Debug, Serialize)]
 struct UpsertClientIdentityResponse {
     config: ConfigResponse,
+    reconciliation_deferred: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     enrollment: Option<ClientIdentityEnrollmentReport>,
 }
@@ -1454,7 +1455,7 @@ async fn upsert_client_identity(
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     drop(store_write);
-    match service_action::acquire(&state.paths) {
+    let reconciliation_deferred = match service_action::acquire(&state.paths) {
         Ok(_action) => {
             reconcile_managed_identities_for_selection(
                 &state,
@@ -1463,17 +1464,20 @@ async fn upsert_client_identity(
                     id: managed_identity_id.as_str(),
                 },
             )
-            .await
+            .await;
+            false
         }
-        // The identity was committed successfully; an ongoing launch owns its own reconciliation.
-        Err(error) if error.code == Some("service_action_in_progress") => {}
+        // Saving succeeded, but a different action may not reconcile this identity.
+        // Report that distinction so the caller can apply it after the action finishes.
+        Err(error) if error.code == Some("service_action_in_progress") => true,
         Err(error) => return Err(error),
-    }
+    };
     Ok(Json(UpsertClientIdentityResponse {
         config: load_config_response(&state)
             .await
             .map_err(ApiError::internal)?,
         enrollment,
+        reconciliation_deferred,
     }))
 }
 
@@ -3609,7 +3613,8 @@ dd {
   line-height: 1.45;
 }
 
-.form-feedback[data-state="pending"] {
+.form-feedback[data-state="pending"],
+.form-feedback[data-state="warning"] {
   color: var(--form-feedback-pending);
 }
 
@@ -4512,9 +4517,12 @@ async function submitIdentityForm(event) {
     submitButton.textContent = 'Save Client Identity';
   }
 
-  const status = response.enrollment ? 'Client identity enrolled and saved.' : 'Client identity saved.';
-  showIdentityFormStatus(status, 'success');
-  showStatus(response.enrollment ? response.enrollment : status);
+  const saved = response.enrollment ? 'Client identity enrolled and saved.' : 'Client identity saved.';
+  const status = response.reconciliation_deferred
+    ? `${saved} Another service action prevented applying it to running services. Restart affected services after that action finishes.`
+    : saved;
+  showIdentityFormStatus(status, response.reconciliation_deferred ? 'warning' : 'success');
+  showStatus(response.reconciliation_deferred ? { message: status, reconciliation_deferred: true } : (response.enrollment || status));
 }
 
 async function submitClientForm(event) {
@@ -4743,6 +4751,43 @@ mod tests {
             .unwrap();
         // Invalid enrollment input must reach preparation, even while another service action runs.
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        drop(action);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_save_reports_when_reconciliation_is_deferred() {
+        let temp_dir = std::env::temp_dir().join(generate_instance_id("identity-deferred"));
+        let mut state = test_app_state();
+        state.paths = ManagedPaths::new(
+            temp_dir.join("instances.json"),
+            temp_dir.join("report.json"),
+            temp_dir.join("package"),
+        );
+        let identity = sample_identity(
+            "identity-a",
+            temp_dir.join("identity.json").to_str().unwrap(),
+        );
+        let mut store = ManagedInstanceStore::default();
+        store.upsert_client_identity(identity);
+        store.save(state.paths.instance_store_path()).unwrap();
+        let action = service_action::acquire(&state.paths).unwrap();
+        let Json(response) = upsert_client_identity(
+            State(state.clone()),
+            Json(UpsertClientIdentityRequest {
+                id: Some("identity-a".to_string()),
+                bootstrap_content: String::new(),
+                enroll: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response["reconciliation_deferred"], true);
+        assert_eq!(
+            response["config"]["store"]["client_identities"][0]["id"],
+            "identity-a"
+        );
         drop(action);
         fs::remove_dir_all(temp_dir).unwrap();
     }
