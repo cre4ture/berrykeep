@@ -1730,13 +1730,7 @@ async fn start_service_instance(
     )
     .await;
     let launch = launch_configured_service(&store, kind, &id, state.paths.package_root())?;
-    let updated_report = launch_report_with_updated_outcome(
-        existing_report,
-        state.paths.package_root(),
-        launch.clone(),
-    );
-    save_launch_report(state.paths.launch_report_path(), &updated_report)
-        .map_err(ApiError::internal)?;
+    persist_service_launch_outcome(&state.paths, launch.clone())?;
 
     Ok(Json(ServiceActionResponse {
         config: load_config_response(&state)
@@ -1745,6 +1739,17 @@ async fn start_service_instance(
         launch: Some(launch),
         stop: None,
     }))
+}
+
+fn persist_service_launch_outcome(
+    paths: &ManagedPaths,
+    launch: LaunchOutcome,
+) -> Result<(), ApiError> {
+    // Reconciliation may have restarted other services and saved their new PIDs.
+    // Merge only after it completes, while the caller still holds the action lock.
+    let latest = load_last_launch_report(paths.launch_report_path()).map_err(ApiError::internal)?;
+    let report = launch_report_with_updated_outcome(latest, paths.package_root(), launch);
+    save_launch_report(paths.launch_report_path(), &report).map_err(ApiError::internal)
 }
 
 async fn stop_service_instance(
@@ -1793,13 +1798,7 @@ async fn restart_service_instance(
         )
         .await;
         let launch = launch_configured_service(&store, kind, &id, state.paths.package_root())?;
-        let updated_report = launch_report_with_updated_outcome(
-            existing_report,
-            state.paths.package_root(),
-            launch.clone(),
-        );
-        save_launch_report(state.paths.launch_report_path(), &updated_report)
-            .map_err(ApiError::internal)?;
+        persist_service_launch_outcome(&state.paths, launch.clone())?;
         Some(launch)
     };
 
@@ -4845,6 +4844,31 @@ mod tests {
         // A second config app may serve its UI while the first holds the launch transaction.
         launch_initial_enabled_services(&state).await.unwrap();
         drop(action);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recording_a_service_launch_preserves_reconciled_service_pids() {
+        let temp_dir = std::env::temp_dir().join(generate_instance_id("reconciled-report"));
+        let paths = ManagedPaths::new(
+            temp_dir.join("instances.json"),
+            temp_dir.join("report.json"),
+            temp_dir.join("package"),
+        );
+        let renewed: LaunchOutcome = serde_json::from_value(json!({
+            "instance_kind":"client-cli", "id":"dependent-b", "label":"B", "executable":"client", "command_line":[], "pid":222, "error":null,
+        })).unwrap();
+        let report =
+            launch_report_with_updated_outcome(None, paths.package_root(), renewed.clone());
+        save_launch_report(paths.launch_report_path(), &report).unwrap();
+        let started: LaunchOutcome = serde_json::from_value(json!({
+            "instance_kind":"client-cli", "id":"started-a", "label":"A", "executable":"client", "command_line":[], "pid":333, "error":null,
+        })).unwrap();
+        persist_service_launch_outcome(&paths, started.clone()).unwrap();
+        let recorded = load_last_launch_report(paths.launch_report_path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.outcomes, vec![renewed, started]);
         fs::remove_dir_all(temp_dir).unwrap();
     }
 
