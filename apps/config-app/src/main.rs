@@ -2187,6 +2187,17 @@ fn launch_enabled_instances_with_path_preparation(
     let mut report = launch_enabled_instances(&launchable_store, package_root);
     report.outcomes.extend(path_preparation_outcomes);
     report.total_enabled = report.outcomes.len();
+    for outcome in running_services
+        .into_iter()
+        .filter(|status| status.running)
+        .filter_map(|status| status.last_launch)
+    {
+        if !report.outcomes.iter().any(|recorded| {
+            recorded.instance_kind == outcome.instance_kind && recorded.id == outcome.id
+        }) {
+            report.outcomes.push(outcome);
+        }
+    }
     report
 }
 
@@ -4973,6 +4984,14 @@ mod tests {
         assert_eq!(report.outcomes, vec![outcome]);
         assert_eq!(report.total_enabled, 1);
         assert!(store.client_cli_instances[0].enabled);
+        let mut disabled_store = store;
+        disabled_store.client_cli_instances[0].enabled = false;
+        let report = launch_enabled_instances_with_path_preparation(
+            &disabled_store,
+            Path::new("/test"),
+            Some(&previous),
+        );
+        assert_eq!(report.outcomes, previous.outcomes);
     }
 
     #[tokio::test]
