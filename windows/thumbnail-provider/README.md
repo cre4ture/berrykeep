@@ -302,6 +302,11 @@ Configuration edits use a separate, short write lock, so slow service startup
 does not block saving unrelated profiles. Recorded processes are reused or
 stopped only when their executable and command arguments still match the
 launch report, preventing unrelated recycled PIDs from being mistaken for services.
+Identity updates reject concurrent changes with HTTP 409 and
+`code: "client_identity_changed"`. If remote enrollment already completed,
+the code is `client_identity_changed_after_enrollment`: no local credentials
+are overwritten, but a single-use bootstrap or pairing token may have been
+consumed, so obtain a new token before enrolling again.
 
 The prototype DLL now writes a simple log file to:
 

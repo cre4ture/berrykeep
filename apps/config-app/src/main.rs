@@ -1417,7 +1417,12 @@ async fn upsert_client_identity(
     let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
-    validate_identity_revision(&store, &identity.id, expected_identity.as_ref())?;
+    validate_identity_revision(
+        &store,
+        &identity.id,
+        expected_identity.as_ref(),
+        prepared.is_some(),
+    )?;
     let enrollment = if let Some(prepared) = prepared {
         prepared
             .material
@@ -1476,14 +1481,26 @@ fn validate_identity_revision(
     store: &ManagedInstanceStore,
     id: &str,
     expected: Option<&ClientIdentityConfig>,
+    enrollment_completed: bool,
 ) -> Result<(), ApiError> {
     if store.client_identity(id) == expected {
         return Ok(());
     }
+    let (code, message) = if enrollment_completed {
+        (
+            "client_identity_changed_after_enrollment",
+            "Enrollment succeeded remotely, but this client identity changed before the result could be saved locally. A single-use bootstrap or pairing token may already be consumed; obtain a new token and reload the configuration before enrolling again.",
+        )
+    } else {
+        (
+            "client_identity_changed",
+            "This client identity changed while the update was being prepared. Reload the configuration before retrying.",
+        )
+    };
     Err(ApiError {
         status: StatusCode::CONFLICT,
-        message: "This client identity changed while enrollment was being prepared. Reload the configuration before retrying.".to_string(),
-        code: Some("client_identity_changed"),
+        message: message.to_string(),
+        code: Some(code),
         path_preparation: None,
     })
 }
@@ -4668,26 +4685,39 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn enrollment_conflict_reports_the_completed_remote_enrollment() {
+        let identity = sample_identity("identity-a", "/test/identity.json");
+        let store = ManagedInstanceStore::default();
+        let error =
+            validate_identity_revision(&store, &identity.id, Some(&identity), true).unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, Some("client_identity_changed_after_enrollment"));
+        assert!(error.message.contains("single-use"));
+        assert!(error.message.contains("new token"));
+    }
+
+    #[test]
     fn identity_commit_rejects_concurrent_edits_deletions_and_insertions() {
         let identity = sample_identity("identity-a", "/test/identity.json");
         let mut store = ManagedInstanceStore {
             client_identities: vec![identity.clone()],
             ..ManagedInstanceStore::default()
         };
-        validate_identity_revision(&store, &identity.id, Some(&identity)).unwrap();
+        validate_identity_revision(&store, &identity.id, Some(&identity), false).unwrap();
         store.client_identities[0].label = "Concurrent edit".to_string();
-        let error = validate_identity_revision(&store, &identity.id, Some(&identity)).unwrap_err();
+        let error =
+            validate_identity_revision(&store, &identity.id, Some(&identity), false).unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(error.code, Some("client_identity_changed"));
         store.client_identities.clear();
-        assert!(validate_identity_revision(&store, &identity.id, Some(&identity)).is_err());
-        validate_identity_revision(&store, &identity.id, None).unwrap();
+        assert!(validate_identity_revision(&store, &identity.id, Some(&identity), false).is_err());
+        validate_identity_revision(&store, &identity.id, None, false).unwrap();
         store.client_identities.push(identity.clone());
-        assert!(validate_identity_revision(&store, &identity.id, None).is_err());
+        assert!(validate_identity_revision(&store, &identity.id, None, false).is_err());
         store
             .client_identities
             .push(sample_identity("unrelated", "/test/other.json"));
-        validate_identity_revision(&store, &identity.id, Some(&identity)).unwrap();
+        validate_identity_revision(&store, &identity.id, Some(&identity), false).unwrap();
     }
 
     #[tokio::test]
