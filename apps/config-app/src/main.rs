@@ -2906,25 +2906,14 @@ fn resolve_client_identity<'a>(
 
 fn write_managed_text_file(path: &str, content: &str) -> Result<(), ApiError> {
     let path = Path::new(path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            ApiError::internal(anyhow::anyhow!(
-                "failed creating managed client identity directory {}: {error}",
-                parent.display()
-            ))
-        })?;
-    }
     let payload = if content.ends_with('\n') {
         content.to_string()
     } else {
         format!("{content}\n")
     };
-    std::fs::write(path, payload).map_err(|error| {
-        ApiError::internal(anyhow::anyhow!(
-            "failed writing managed bootstrap file {}: {error}",
-            path.display()
-        ))
-    })
+    common::atomic_file::write(path, payload.as_bytes())
+        .with_context(|| format!("failed writing managed bootstrap file {}", path.display()))
+        .map_err(ApiError::internal)
 }
 
 #[cfg(windows)]
@@ -4701,6 +4690,27 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    #[test]
+    fn atomic_bootstrap_write_preserves_an_open_reader_snapshot() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(generate_instance_id("atomic-bootstrap"));
+        let path = dir.join("bootstrap.json");
+        write_managed_text_file(path.to_str().unwrap(), "original").unwrap();
+        let mut reader = fs::File::open(&path).unwrap();
+        let saved = write_managed_text_file(path.to_str().unwrap(), "replacement");
+        let mut snapshot = String::new();
+        reader.read_to_string(&mut snapshot).unwrap();
+        assert_eq!(snapshot, "original\n");
+        drop(reader);
+        #[cfg(not(windows))]
+        saved.unwrap();
+        #[cfg(windows)]
+        let _ = saved;
+        write_managed_text_file(path.to_str().unwrap(), "replacement").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn enrollment_conflict_reports_the_completed_remote_enrollment() {

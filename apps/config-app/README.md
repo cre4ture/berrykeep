@@ -14,11 +14,14 @@ exclusive lock across process checks, identity preparation, and launch-report
 updates, including across config-app processes using the same report path.
 Overlapping actions return HTTP 409 with `code: "service_action_in_progress"`.
 "Run Enabled Services" reuses already live processes, including clients still
-starting, instead of replacing their recorded PID.
+starting, instead of replacing their recorded PID. Disabled services that are
+still running remain tracked when enabled services are launched.
 
 Configuration edits use a separate, short write lock, so slow service startup
 does not block saving unrelated profiles. Configuration and launch-report
 saves atomically replace the previous file, so readers see complete snapshots.
+Bootstrap and client identity files use the same writer. Temporary Windows
+sharing conflicts receive a short, bounded retry before an error is returned.
 Recorded processes are reused or stopped only when their executable and
 command arguments still match the launch report, preventing unrelated recycled
 PIDs from being mistaken for services.

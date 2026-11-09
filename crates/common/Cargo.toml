@@ -5,11 +5,15 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+atomic-file = ["dep:tempfile"]
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
+tempfile = { version = "3", optional = true }
 time = { version = "0.3", features = ["formatting"] }
 tokio.workspace = true
 tracing.workspace = true

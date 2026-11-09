@@ -1133,6 +1133,7 @@ dependencies = [
  "blake3",
  "quick-xml",
  "serde",
+ "tempfile",
  "time",
  "tokio",
  "tracing",
@@ -1591,6 +1592,7 @@ name = "desktop-client-config"
 version = "2.1.0"
 dependencies = [
  "anyhow",
+ "common",
  "git-version",
  "serde",
  "serde_json",

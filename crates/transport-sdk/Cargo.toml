@@ -9,7 +9,7 @@ authors.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 base64 = "0.22"
-common = { path = "../common" }
+common = { path = "../common", features = ["atomic-file"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 futures-util = "0.3"
 iroh = "1.0.2"
