@@ -1,5 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod service_action;
+
 #[cfg(windows)]
 mod windows_tray;
 
@@ -648,19 +650,14 @@ async fn main() -> Result<()> {
         },
     };
 
-    if (cli.background || cli.launch_enabled_on_start) && !cli.skip_initial_service_launch {
-        let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
-            .context("failed loading managed instances before launch")?;
-        reconcile_managed_identities_for_selection(
-            &state,
-            &store,
-            ManagedIdentitySelection::EnabledLaunch,
-        )
-        .await;
-        let report =
-            launch_enabled_instances_with_path_preparation(&store, state.paths.package_root());
-        save_launch_report(state.paths.launch_report_path(), &report)
-            .context("failed saving launch report before config app startup")?;
+    if (cli.background || cli.launch_enabled_on_start)
+        && !cli.skip_initial_service_launch
+        && let Err(error) = launch_enabled_services(&state).await
+    {
+        eprintln!(
+            "config-app: enabled service launch failed: {}",
+            error.message
+        );
     }
 
     let app = build_router(state.clone());
@@ -735,6 +732,7 @@ fn build_router(state: AppState) -> Router {
         .route("/app.css", get(app_css))
         .route("/app.js", get(app_js))
         .route("/api/config", get(get_config))
+        .route("/api/service-statuses", get(get_service_statuses))
         .route("/api/client-identities", post(upsert_client_identity))
         .route(
             "/api/client-cli-instances",
@@ -1086,6 +1084,17 @@ fn merged_service_status(
     }
 
     if running {
+        if runtime.is_some_and(|status| status.web_ui_ready == Some(false)) {
+            return desktop_service_status(
+                instance_kind,
+                id,
+                label,
+                "starting",
+                "Starting web UI",
+                "The client process is alive; waiting for its local web port to open",
+                "view-refresh-symbolic",
+            );
+        }
         return desktop_service_status(
             instance_kind,
             id,
@@ -1354,10 +1363,21 @@ async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse
     Ok(Json(payload))
 }
 
+async fn get_service_statuses(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ServiceRuntimeStatus>>, ApiError> {
+    let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
+        .map_err(ApiError::internal)?;
+    let report =
+        load_last_launch_report(state.paths.launch_report_path()).map_err(ApiError::internal)?;
+    Ok(Json(service_runtime_statuses(&store, report.as_ref())))
+}
+
 async fn upsert_client_identity(
     State(state): State<AppState>,
     Json(request): Json<UpsertClientIdentityRequest>,
 ) -> Result<Json<UpsertClientIdentityResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let existing = request
@@ -1419,6 +1439,7 @@ async fn upsert_client_cli_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertClientCliInstanceRequest>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let instance = request.into_instance(&store)?;
@@ -1435,6 +1456,7 @@ async fn upsert_os_integration_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertOsIntegrationInstanceRequest>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let existing = request
@@ -1462,6 +1484,7 @@ async fn upsert_folder_agent_instance(
     State(state): State<AppState>,
     Json(request): Json<UpsertFolderAgentInstanceRequest>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let existing = request
@@ -1489,6 +1512,7 @@ async fn delete_os_integration_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_os_integration(&id) {
@@ -1509,6 +1533,7 @@ async fn delete_client_cli_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_client_cli(&id) {
@@ -1529,6 +1554,7 @@ async fn delete_folder_agent_instance(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_folder_agent(&id) {
@@ -1549,6 +1575,7 @@ async fn delete_client_identity(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<ConfigResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     if !store.remove_client_identity(&id) {
@@ -1569,6 +1596,7 @@ async fn start_service_instance(
     AxumPath((kind, id)): AxumPath<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let kind = normalize_service_kind(&kind)?;
     let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
@@ -1614,6 +1642,7 @@ async fn stop_service_instance(
     AxumPath((kind, id)): AxumPath<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let kind = normalize_service_kind(&kind)?;
     let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
@@ -1633,6 +1662,7 @@ async fn restart_service_instance(
     AxumPath((kind, id)): AxumPath<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let kind = normalize_service_kind(&kind)?;
     let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
@@ -1670,17 +1700,28 @@ async fn restart_service_instance(
 }
 
 async fn launch_enabled_now(State(state): State<AppState>) -> Result<Json<LaunchReport>, ApiError> {
+    Ok(Json(launch_enabled_services(&state).await?))
+}
+
+async fn launch_enabled_services(state: &AppState) -> Result<LaunchReport, ApiError> {
+    let _action = service_action::acquire(&state.paths)?;
     let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     reconcile_managed_identities_for_selection(
-        &state,
+        state,
         &store,
         ManagedIdentitySelection::EnabledLaunch,
     )
     .await;
-    let report = launch_enabled_instances_with_path_preparation(&store, state.paths.package_root());
+    let previous =
+        load_last_launch_report(state.paths.launch_report_path()).map_err(ApiError::internal)?;
+    let report = launch_enabled_instances_with_path_preparation(
+        &store,
+        state.paths.package_root(),
+        previous.as_ref(),
+    );
     save_launch_report(state.paths.launch_report_path(), &report).map_err(ApiError::internal)?;
-    Ok(Json(report))
+    Ok(report)
 }
 
 async fn shutdown_app(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1981,13 +2022,25 @@ fn prepare_configured_service_paths(
 fn launch_enabled_instances_with_path_preparation(
     store: &ManagedInstanceStore,
     package_root: &Path,
+    previous: Option<&LaunchReport>,
 ) -> LaunchReport {
     let service_log_dir = default_service_log_dir();
     let mut launchable_store = store.clone();
     let mut path_preparation_outcomes = Vec::new();
+    let running_services = service_runtime_statuses(store, previous);
 
     let enabled_services = enabled_service_instances(store);
     for (kind, id, label) in enabled_services {
+        if let Some(status) = running_services
+            .iter()
+            .find(|status| status.instance_kind == kind && status.id == id && status.running)
+        {
+            disable_service_instance(&mut launchable_store, kind, &id);
+            if let Some(outcome) = &status.last_launch {
+                path_preparation_outcomes.push(outcome.clone());
+            }
+            continue;
+        }
         if let Err(failure) = prepare_configured_service_paths(store, kind, &id, &service_log_dir) {
             disable_service_instance(&mut launchable_store, kind, &id);
             path_preparation_outcomes.push(path_preparation_launch_outcome(failure, label));
@@ -3612,6 +3665,8 @@ pre {
 
 const APP_JS: &str = r###"
 let currentConfig = null;
+const pendingServiceActions = new Map();
+let serviceStatusGeneration = 0;
 const colorSchemeStorageKey = 'berrykeep-color-scheme';
 
 function getPreferredColorScheme() {
@@ -3744,6 +3799,9 @@ function runtimeLabel(status) {
   if (!status?.running) {
     return 'Stopped';
   }
+  if (status.web_ui_ready === false) {
+    return status.pid ? `Starting · PID ${status.pid}` : 'Starting';
+  }
   return status.pid ? `Running · PID ${status.pid}` : 'Running';
 }
 
@@ -3857,6 +3915,13 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
       : 'folder-agent';
   const runtime = serviceStatusFor(serviceKind, instance.id);
   const running = !!runtime?.running;
+  const pendingAction = pendingServiceActions.get(`${serviceKind}:${instance.id}`);
+  const busy = !!pendingAction;
+  const ready = running && runtime?.web_ui_ready !== false;
+  const statusLabel = pendingAction === 'stop' ? 'Stopping...'
+    : pendingAction === 'restart' ? 'Restarting...'
+    : pendingAction === 'start' ? 'Starting...'
+    : runtimeLabel(runtime);
   const encodedId = encodeURIComponent(instance.id);
   const logFile = runtime?.log_file || runtime?.last_launch?.log_file || '';
   const details = kind === 'os'
@@ -3901,19 +3966,19 @@ function renderInstanceCard(instance, kind, onEdit, onDelete) {
           <strong>${escapeHtml(instance.label)}</strong>
           <div class="instance-meta">
             <span>${instance.enabled ? 'Enabled' : 'Disabled'}</span>
-            <span class="runtime-pill" data-running="${running ? 'true' : 'false'}">${escapeHtml(runtimeLabel(runtime))}</span>
+            <span class="runtime-pill" data-running="${running ? 'true' : 'false'}">${escapeHtml(statusLabel)}</span>
           </div>
         </div>
         <div class="actions">
-          <button type="button" class="secondary" onclick="controlService('${serviceKind}', '${encodedId}', 'start')" ${running ? 'disabled' : ''}>Start</button>
-          <button type="button" class="secondary" onclick="controlService('${serviceKind}', '${encodedId}', 'stop')" ${running ? '' : 'disabled'}>Stop</button>
-          <button type="button" class="secondary" onclick="controlService('${serviceKind}', '${encodedId}', 'restart')">Restart</button>
+          <button type="button" class="secondary" onclick="controlService('${serviceKind}', '${encodedId}', 'start')" ${running || busy ? 'disabled' : ''}>Start</button>
+          <button type="button" class="secondary" onclick="controlService('${serviceKind}', '${encodedId}', 'stop')" ${running && !busy ? '' : 'disabled'}>Stop</button>
+          <button type="button" class="secondary" onclick="controlService('${serviceKind}', '${encodedId}', 'restart')" ${busy ? 'disabled' : ''}>Restart</button>
           <button type="button" class="secondary" onclick="${onEdit}('${encodedId}')">Edit</button>
           <button type="button" class="secondary" onclick="${onDelete}('${encodedId}')">Delete</button>
         </div>
       </div>
       <dl class="instance-meta">
-        ${details.map(([label, value]) => `<div><strong>${escapeHtml(label)}:</strong> ${renderInstanceDetailValue(kind, label, value, running)}</div>`).join('')}
+        ${details.map(([label, value]) => `<div><strong>${escapeHtml(label)}:</strong> ${renderInstanceDetailValue(kind, label, value, ready)}</div>`).join('')}
       </dl>
     </article>
   `;
@@ -4010,6 +4075,12 @@ function renderConfig(config) {
     ? config.store.client_identities.map(renderClientIdentityCard).join('')
     : '<p class="empty">No client identities configured yet.</p>';
 
+  renderServiceInstances();
+}
+
+function renderServiceInstances() {
+  if (!currentConfig) return;
+  const config = currentConfig;
   const clientTarget = document.getElementById('client-instance-list');
   clientTarget.innerHTML = config.store.client_cli_instances.length
     ? config.store.client_cli_instances.map((instance) => renderInstanceCard(instance, 'client', 'editClientServiceInstance', 'deleteClientServiceInstance')).join('')
@@ -4039,6 +4110,25 @@ async function refreshConfig() {
   const payload = await fetchJson('/api/config');
   renderConfig(payload);
   showStatus('Loaded configuration store.');
+}
+
+async function refreshServiceStatuses() {
+  const generation = serviceStatusGeneration;
+  const statuses = await fetchJson('/api/service-statuses');
+  if (currentConfig && generation === serviceStatusGeneration) {
+    currentConfig.service_statuses = statuses;
+    renderServiceInstances();
+  }
+}
+
+async function pollServiceStatuses() {
+  try {
+    await refreshServiceStatuses();
+  } catch {
+    // Keep the current form and action feedback intact during a transient polling failure.
+  } finally {
+    window.setTimeout(pollServiceStatuses, 2000);
+  }
 }
 
 function clearIdentityForm() {
@@ -4215,6 +4305,12 @@ window.deleteFolderInstance = async function(encodedId) {
 
 window.controlService = async function(serviceKind, encodedId, action) {
   const id = decodeURIComponent(encodedId);
+  const key = `${serviceKind}:${id}`;
+  if (pendingServiceActions.has(key)) return;
+  pendingServiceActions.set(key, action);
+  serviceStatusGeneration++;
+  renderServiceInstances();
+  showStatus(`${action === 'stop' ? 'Stopping' : action === 'restart' ? 'Restarting' : 'Starting'} service ${id}...`);
   try {
     const response = await fetchJson(
       `/api/services/${encodeURIComponent(serviceKind)}/${encodeURIComponent(id)}/${action}`,
@@ -4235,6 +4331,10 @@ window.controlService = async function(serviceKind, encodedId, action) {
       code: error?.code || null,
       path_preparation: error?.pathPreparation || null,
     });
+  } finally {
+    pendingServiceActions.delete(key);
+    serviceStatusGeneration++;
+    renderServiceInstances();
   }
 };
 
@@ -4443,6 +4543,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   } catch (error) {
     showStatus({ error: error.message });
   }
+  window.setTimeout(pollServiceStatuses, 2000);
 });
 "###;
 
@@ -4454,6 +4555,109 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn concurrent_start_is_rejected_without_replacing_the_tracked_process() {
+        let temp_dir = std::env::temp_dir().join(generate_instance_id("config-service-action"));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let mut state = test_app_state();
+        state.paths = ManagedPaths::new(
+            temp_dir.join("instances.json"),
+            temp_dir.join("report.json"),
+            temp_dir.join("package"),
+        );
+        let store = ManagedInstanceStore {
+            client_cli_instances: vec![sample_client_cli_instance("client-a", true, None, None)],
+            ..ManagedInstanceStore::default()
+        };
+        store.save(state.paths.instance_store_path()).unwrap();
+        let outcome: LaunchOutcome = serde_json::from_value(json!({
+            "instance_kind": "client-cli", "id": "client-a", "label": "Client",
+            "executable": "client", "command_line": [], "pid": std::process::id(), "error": null,
+        }))
+        .unwrap();
+        let report = launch_report_with_updated_outcome(None, state.paths.package_root(), outcome);
+        save_launch_report(state.paths.launch_report_path(), &report).unwrap();
+        let lock = fs::File::create(
+            state
+                .paths
+                .launch_report_path()
+                .with_extension("service-action.lock"),
+        )
+        .unwrap();
+        lock.lock().unwrap();
+
+        let app = build_router(state.clone());
+        // Status reads must remain available while connection preparation is in progress.
+        let status_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/service-statuses")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let body = to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let statuses: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(statuses[0]["pid"], std::process::id());
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/services/client-cli/client-a/start")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "service_action_in_progress");
+        assert_eq!(
+            load_last_launch_report(state.paths.launch_report_path()).unwrap(),
+            Some(report.clone())
+        );
+        drop(lock);
+
+        // Retrying after the other action completes must reuse the live process.
+        let response = app.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload.get("launch").is_none());
+        assert_eq!(
+            load_last_launch_report(state.paths.launch_report_path()).unwrap(),
+            Some(report)
+        );
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn launching_enabled_services_keeps_the_live_starting_process() {
+        let store = ManagedInstanceStore {
+            client_cli_instances: vec![sample_client_cli_instance("client-a", true, None, None)],
+            ..ManagedInstanceStore::default()
+        };
+        let outcome: LaunchOutcome = serde_json::from_value(json!({
+            "instance_kind": "client-cli", "id": "client-a", "label": "Client",
+            "executable": "client", "command_line": [], "pid": std::process::id(), "error": null,
+        }))
+        .unwrap();
+        let previous =
+            launch_report_with_updated_outcome(None, Path::new("/test"), outcome.clone());
+        let report = launch_enabled_instances_with_path_preparation(
+            &store,
+            Path::new("/test"),
+            Some(&previous),
+        );
+        assert_eq!(report.outcomes, vec![outcome]);
+        assert_eq!(report.total_enabled, 1);
+        assert!(store.client_cli_instances[0].enabled);
+    }
 
     #[tokio::test]
     async fn app_favicon_route_serves_the_product_favicon() {

@@ -283,6 +283,22 @@ Why the version bump matters:
 
 ## Diagnostics
 
+### Managed client startup status
+
+The config app shows **Starting** while a client service process is alive but
+its configured local web port has not opened yet. Connection discovery can
+take time when bootstrap endpoints are unreachable. Service cards refresh
+automatically every two seconds without resetting unsaved configuration edits.
+The web UI link becomes available once its port is listening; a process that
+exits returns to **Stopped**, with its diagnostic log shown on the card.
+
+Service actions disable their controls immediately. The backend also holds an
+exclusive lock across process checks, identity preparation, and launch-report
+updates, including across config-app processes using the same report path.
+Overlapping actions return HTTP 409 with `code: "service_action_in_progress"`.
+"Run Enabled Services" reuses already live processes, including clients still
+starting, instead of replacing their recorded PID.
+
 The prototype DLL now writes a simple log file to:
 
 - `%LocalAppData%\BerryKeep\thumbnail-provider.log`

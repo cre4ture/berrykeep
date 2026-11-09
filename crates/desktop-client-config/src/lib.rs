@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -715,6 +715,9 @@ pub struct ServiceRuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
     pub running: bool,
+    /// Process liveness and web readiness are separate during connection setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_ui_ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1083,11 +1086,15 @@ pub fn service_runtime_statuses(
     let mut statuses = Vec::new();
 
     for instance in &store.client_cli_instances {
-        statuses.push(service_runtime_status(
+        let mut status = service_runtime_status(
             "client-cli",
             &instance.id,
             report.and_then(|report| last_launch_outcome(report, "client-cli", &instance.id)),
-        ));
+        );
+        status.web_ui_ready = status
+            .running
+            .then(|| client_web_port_is_listening(instance));
+        statuses.push(status);
     }
 
     for instance in &store.os_integration_instances {
@@ -1107,6 +1114,27 @@ pub fn service_runtime_statuses(
     }
 
     statuses
+}
+
+fn client_web_port_is_listening(instance: &ClientCliInstance) -> bool {
+    let Ok(mut address) = instance
+        .bind
+        .as_deref()
+        .unwrap_or("127.0.0.1:8081")
+        .trim()
+        .parse::<SocketAddr>()
+    else {
+        return false;
+    };
+    // A wildcard is a listen address, not an address to connect to.
+    if address.ip().is_unspecified() {
+        address.set_ip(if address.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    TcpStream::connect_timeout(&address, Duration::from_millis(25)).is_ok()
 }
 
 pub fn launch_report_with_updated_outcome(
@@ -1219,6 +1247,7 @@ fn service_runtime_status(
         id: id.to_string(),
         log_file,
         running: running_pid.is_some(),
+        web_ui_ready: None,
         pid: running_pid,
         last_launch: last_launch.cloned(),
     }
@@ -2177,6 +2206,58 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = path.parent().map(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn client_service_reports_starting_until_its_web_port_is_listening() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let store = ManagedInstanceStore {
+            client_cli_instances: vec![ClientCliInstance {
+                id: "web-client".to_string(),
+                label: "Web client".to_string(),
+                enabled: true,
+                bind: Some(bind.clone()),
+                server_base_url: None,
+                bootstrap_file: None,
+                server_ca_pem_file: None,
+                client_identity_id: None,
+                client_identity_file: None,
+            }],
+            ..ManagedInstanceStore::default()
+        };
+        let mut report = LaunchReport {
+            version: LAUNCH_REPORT_VERSION,
+            launched_at_unix_ms: 1,
+            package_root: "/test".to_string(),
+            total_enabled: 1,
+            outcomes: vec![LaunchOutcome {
+                instance_kind: "client-cli".to_string(),
+                id: "web-client".to_string(),
+                label: "Web client".to_string(),
+                executable: "client".to_string(),
+                command_line: Vec::new(),
+                log_file: None,
+                pid: Some(std::process::id()),
+                error: None,
+            }],
+        };
+        let status =
+            serde_json::to_value(&service_runtime_statuses(&store, Some(&report))[0]).unwrap();
+        assert_eq!(status["running"], true);
+        assert_eq!(status["web_ui_ready"], false);
+
+        let _listener = std::net::TcpListener::bind(bind).unwrap();
+        let status =
+            serde_json::to_value(&service_runtime_statuses(&store, Some(&report))[0]).unwrap();
+        assert_eq!(status["web_ui_ready"], true);
+
+        report.outcomes[0].pid = None;
+        let status =
+            serde_json::to_value(&service_runtime_statuses(&store, Some(&report))[0]).unwrap();
+        assert_eq!(status["running"], false);
+        assert!(status.get("web_ui_ready").is_none());
     }
 
     #[test]
