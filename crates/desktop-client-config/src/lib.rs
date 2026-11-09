@@ -1330,6 +1330,9 @@ fn load_process_identity(pid: sysinfo::Pid) -> sysinfo::System {
 }
 
 fn process_matches_launch(process: &sysinfo::Process, outcome: &LaunchOutcome) -> bool {
+    let Some(command_line) = process_command_line(process) else {
+        return false;
+    };
     let expected = Path::new(&outcome.executable);
     let matches_path = |path: &Path| {
         #[cfg(windows)]
@@ -1344,17 +1347,39 @@ fn process_matches_launch(process: &sysinfo::Process, outcome: &LaunchOutcome) -
         }
     };
     let executable_matches = process.exe().is_some_and(matches_path)
-        || process
-            .cmd()
+        || command_line
             .first()
             .is_some_and(|arg| matches_path(Path::new(arg)));
     executable_matches
-        && process
-            .cmd()
+        && command_line
             .iter()
             .skip(1)
             .map(|arg| arg.as_os_str())
             .eq(outcome.command_line.iter().map(std::ffi::OsStr::new))
+}
+
+fn process_command_line(process: &sysinfo::Process) -> Option<Vec<std::ffi::OsString>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        // sysinfo trims whitespace and removes empty arguments on Linux. Read
+        // the native representation so identity comparison preserves both.
+        let bytes = fs::read(format!("/proc/{}/cmdline", process.pid())).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
+        Some(
+            bytes
+                .split(|byte| *byte == 0)
+                .map(|arg| std::ffi::OsString::from_vec(arg.to_vec()))
+                .collect(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(process.cmd().to_vec())
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -2391,6 +2416,7 @@ mod tests {
             "--nocapture",
             "--",
             "",
+            " surrounding whitespace ",
             r"C:\folder with spaces\",
             r#"a "quoted" value"#,
             r"C:\trailing\\",
@@ -2411,7 +2437,7 @@ mod tests {
             id: "quoted-child".to_string(),
             label: "Quoted child".to_string(),
             executable: executable.display().to_string(),
-            command_line: args,
+            command_line: args.clone(),
             log_file: None,
             pid: Some(child.id()),
             error: None,
@@ -2420,7 +2446,10 @@ mod tests {
         while !ready_file.exists() && started.elapsed() < Duration::from_secs(5) {
             thread::sleep(Duration::from_millis(5));
         }
-        let matched = launched_process_is_running(&outcome);
+        let system = load_process_identity(sysinfo::Pid::from_u32(child.id()));
+        let process = system.process(sysinfo::Pid::from_u32(child.id()));
+        let matched = process.is_some_and(|process| process_matches_launch(process, &outcome));
+        let observed = process.map(|process| (process.exe(), process.cmd()));
         outcome.command_line.push("different-arguments".to_string());
         let mismatched = launched_process_is_running(&outcome);
         child.kill().unwrap();
@@ -2431,7 +2460,7 @@ mod tests {
         );
         assert!(
             matched,
-            "process identity must preserve empty arguments, quotes, spaces, and trailing backslashes"
+            "process identity must preserve empty arguments, quotes, spaces, and trailing backslashes: {observed:?}; expected: {args:?}"
         );
         assert!(
             !mismatched,
