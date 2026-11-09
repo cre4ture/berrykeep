@@ -1403,6 +1403,7 @@ async fn upsert_client_identity(
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .and_then(|id| store.client_identity(id));
+    let expected_identity = existing.cloned();
     let (mut identity, bootstrap_content, enroll) =
         request.into_identity(existing, state.paths.instance_store_path())?;
     let prepared = if enroll {
@@ -1416,6 +1417,7 @@ async fn upsert_client_identity(
     let store_write = service_action::acquire_store(&state.paths)?;
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
+    validate_identity_revision(&store, &identity.id, expected_identity.as_ref())?;
     let enrollment = if let Some(prepared) = prepared {
         prepared
             .material
@@ -1468,6 +1470,22 @@ async fn upsert_client_identity(
             .map_err(ApiError::internal)?,
         enrollment,
     }))
+}
+
+fn validate_identity_revision(
+    store: &ManagedInstanceStore,
+    id: &str,
+    expected: Option<&ClientIdentityConfig>,
+) -> Result<(), ApiError> {
+    if store.client_identity(id) == expected {
+        return Ok(());
+    }
+    Err(ApiError {
+        status: StatusCode::CONFLICT,
+        message: "This client identity changed while enrollment was being prepared. Reload the configuration before retrying.".to_string(),
+        code: Some("client_identity_changed"),
+        path_preparation: None,
+    })
 }
 
 fn persisted_bootstrap_content<'a>(
@@ -4648,6 +4666,29 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    #[test]
+    fn identity_commit_rejects_concurrent_edits_deletions_and_insertions() {
+        let identity = sample_identity("identity-a", "/test/identity.json");
+        let mut store = ManagedInstanceStore {
+            client_identities: vec![identity.clone()],
+            ..ManagedInstanceStore::default()
+        };
+        validate_identity_revision(&store, &identity.id, Some(&identity)).unwrap();
+        store.client_identities[0].label = "Concurrent edit".to_string();
+        let error = validate_identity_revision(&store, &identity.id, Some(&identity)).unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, Some("client_identity_changed"));
+        store.client_identities.clear();
+        assert!(validate_identity_revision(&store, &identity.id, Some(&identity)).is_err());
+        validate_identity_revision(&store, &identity.id, None).unwrap();
+        store.client_identities.push(identity.clone());
+        assert!(validate_identity_revision(&store, &identity.id, None).is_err());
+        store
+            .client_identities
+            .push(sample_identity("unrelated", "/test/other.json"));
+        validate_identity_revision(&store, &identity.id, Some(&identity)).unwrap();
+    }
 
     #[tokio::test]
     async fn enrollment_preparation_does_not_acquire_the_service_action_lock() {

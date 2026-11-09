@@ -249,7 +249,7 @@ impl ManagedInstanceStore {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientIdentityConfig {
     pub id: String,
     pub label: String,
