@@ -1,6 +1,12 @@
 use std::fs;
 use std::path::Path;
 
+#[cfg(unix)]
+use std::io::Write;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use anyhow::{Context, Result, bail};
 use common::{ClusterId, DeviceId};
 use ed25519_dalek::SigningKey;
@@ -173,12 +179,36 @@ impl ClientIdentityMaterial {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        let temporary_path = parent.join(format!(".client-identity-{}.tmp", Uuid::now_v7()));
+        let result = (|| {
+            write_private_temporary_file(&temporary_path, &self.to_json_pretty()?).with_context(
+                || {
+                    format!(
+                        "failed to write temporary client identity {}",
+                        temporary_path.display()
+                    )
+                },
+            )?;
+            preserve_existing_permissions(&temporary_path, path)?;
+            fs::rename(&temporary_path, path).with_context(|| {
+                format!(
+                    "failed to atomically replace client identity {} with {}",
+                    path.display(),
+                    temporary_path.display()
+                )
+            })
+        })();
+
+        if result.is_err() {
+            // The temporary file contains the private key, so never leave it behind for a
+            // retry or a later directory scan when the replacement cannot be completed.
+            let _ = fs::remove_file(&temporary_path);
         }
-        fs::write(path, self.to_json_pretty()?)
-            .with_context(|| format!("failed to write client identity {}", path.display()))
+
+        result
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -220,10 +250,63 @@ impl ClientIdentityMaterial {
     }
 }
 
+#[cfg(unix)]
+fn write_private_temporary_file(path: &Path, content: &str) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(content.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private_temporary_file(path: &Path, content: &str) -> std::io::Result<()> {
+    fs::write(path, content)
+}
+
+fn preserve_existing_permissions(temporary_path: &Path, path: &Path) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            fs::set_permissions(temporary_path, metadata.permissions()).with_context(|| {
+                format!(
+                    "failed to preserve permissions from client identity {} onto {}",
+                    path.display(),
+                    temporary_path.display()
+                )
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect existing client identity {} before replacement",
+                path.display()
+            )
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_identity() -> ClientIdentityMaterial {
+        ClientIdentityMaterial::generate(
+            "019d02eb-ab39-7220-911a-c0eafcb38249"
+                .parse()
+                .expect("test cluster id should parse"),
+            None,
+            Some("test identity".to_string()),
+        )
+        .expect("test identity should generate")
+    }
+
+    fn temporary_test_directory(name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!("berrykeep-{name}-{}", Uuid::now_v7()));
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        directory
+    }
 
     #[test]
     fn client_enrollment_request_serializes_device_label_and_accepts_legacy_label() {
@@ -295,5 +378,62 @@ mod tests {
         .expect("legacy issued identity should deserialize");
 
         assert_eq!(legacy.label.as_deref(), Some("Desktop"));
+    }
+
+    #[test]
+    fn identity_write_removes_temporary_file_when_replacement_fails() {
+        let directory = temporary_test_directory("identity-write-cleanup");
+        let destination = directory.join("identity-destination");
+        fs::create_dir(&destination).expect("destination directory should be created");
+
+        let error = test_identity()
+            .write_to_path(&destination)
+            .expect_err("replacing a directory must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to atomically replace client identity"),
+            "unexpected error: {error:#}"
+        );
+        let temporary_files = fs::read_dir(&directory)
+            .expect("test directory should be readable")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".client-identity-")
+            })
+            .count();
+        assert_eq!(temporary_files, 0, "temporary identities must be removed");
+
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_write_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temporary_test_directory("identity-write-permissions");
+        let destination = directory.join("identity.json");
+        fs::write(&destination, "old identity").expect("old identity should be written");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o640))
+            .expect("old identity permissions should be set");
+
+        test_identity()
+            .write_to_path(&destination)
+            .expect("identity should be atomically replaced");
+
+        assert_eq!(
+            fs::metadata(&destination)
+                .expect("identity metadata should be readable")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+
+        fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 }

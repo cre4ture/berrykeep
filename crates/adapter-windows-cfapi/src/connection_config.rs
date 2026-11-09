@@ -171,10 +171,18 @@ impl ResolvedConnectionConfig {
         &self,
         client_identity: Option<&ClientIdentityMaterial>,
     ) -> Result<ManagedBerryKeepClient> {
-        self.bootstrap.build_managed_client_blocking(
-            client_identity.cloned(),
-            ManagedClientOptions::default(),
-        )
+        self.build_managed_client_with_options(client_identity, ManagedClientOptions::default())
+    }
+
+    /// Builds a managed client through the shared Windows connection-config
+    /// path with caller-owned persistence and refresh policy.
+    pub fn build_managed_client_with_options(
+        &self,
+        client_identity: Option<&ClientIdentityMaterial>,
+        options: ManagedClientOptions,
+    ) -> Result<ManagedBerryKeepClient> {
+        self.bootstrap
+            .build_managed_client_blocking(client_identity.cloned(), options)
     }
 }
 

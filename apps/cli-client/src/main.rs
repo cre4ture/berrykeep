@@ -10,7 +10,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use client_sdk::{
     BerryKeepClient, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
     ConnectionBootstrapDiagnosticTargets, LatencyProbeComparison, LatencyProbeConfig,
-    LatencyProbeResult, ManagedBerryKeepClient, ManagedBootstrapPersistence, ManagedClientOptions,
+    LatencyProbeResult, ManagedBerryKeepClient, ManagedBootstrapPersistence,
+    ManagedClientIdentityPersistence, ManagedClientOptions,
     build_client_with_optional_identity_from_planned_target, build_http_client_from_pem,
     build_http_client_with_identity_from_pem, compare_direct_and_relay_latency,
     enroll_connection_input_blocking, normalize_server_base_url,
@@ -21,7 +22,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use tracing_subscriber::filter::Directive;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -758,31 +759,34 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
         let client_holder = match client_identity.as_ref() {
             Some(identity) => {
                 let persistence_path = bootstrap_path.to_path_buf();
+                let identity_persistence_path = client_identity_path.clone();
                 let options = ManagedClientOptions {
+                    // Command invocations commonly finish before a detached
+                    // startup refresh can renew and persist credentials.
+                    // Preserve the former bounded foreground refresh here;
+                    // route discovery still remains advisory and fail-open.
+                    initial_discovery_timeout: Duration::from_secs(2),
+                    // CLI commands can finish before background work is
+                    // drained, so retain the old startup guarantee that an
+                    // updated contact list reaches the bootstrap file.
+                    foreground_contact_list_refresh: true,
                     connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
                         "bootstrap_file",
                         move |bootstrap| bootstrap.write_to_path(&persistence_path),
+                    )),
+                    client_identity_persistence: Some(ManagedClientIdentityPersistence::new(
+                        "client_identity_file",
+                        move |identity| {
+                            persist_renewed_client_identity(
+                                identity_persistence_path.as_deref(),
+                                identity,
+                            )
+                        },
                     )),
                     ..ManagedClientOptions::default()
                 };
                 let (managed, runtime) =
                     build_managed_cli_client(bootstrap, identity.clone(), options)?;
-                if let Some(renewed_identity) = managed.take_identity_update() {
-                    match persist_renewed_client_identity(
-                        client_identity_path.as_deref(),
-                        &renewed_identity,
-                    ) {
-                        Ok(()) => info!(
-                            client_identity_file = path_for_log(client_identity_path.as_deref()),
-                            "persisted renewed rendezvous client identity"
-                        ),
-                        Err(error) => warn!(
-                            error = %error,
-                            client_identity_file = path_for_log(client_identity_path.as_deref()),
-                            "renewed rendezvous client identity could not be persisted; continuing with the in-memory identity"
-                        ),
-                    }
-                }
                 CliClientHolder::managed(managed, runtime)
             }
             None => CliClientHolder::unmanaged(bootstrap.build_client()?),
@@ -2052,6 +2056,21 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&test_dir).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn renewed_rendezvous_identity_requires_a_configured_file() {
+        let identity = ClientIdentityMaterial::generate(uuid::Uuid::now_v7(), None, None)
+            .expect("test identity should generate");
+
+        let error = persist_renewed_client_identity(None, &identity)
+            .expect_err("missing identity file should be reported");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no configured identity file to persist")
+        );
     }
 
     #[test]

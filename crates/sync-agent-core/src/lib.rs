@@ -23,7 +23,7 @@ use client_sdk::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 use sync_core::{EntryKind, SyncSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,8 +84,17 @@ pub fn build_configured_client(
         if let Some(server_ca_pem) = server_ca_pem.as_ref() {
             bootstrap.trust_roots.public_api_ca_pem = Some(server_ca_pem.clone());
         }
-        let managed_client = bootstrap
-            .build_managed_client_blocking(client_identity, ManagedClientOptions::default())?;
+        // This legacy helper returns only `BerryKeepClient`, so it cannot
+        // retain the managed controller after construction. Preserve the
+        // former bounded startup refresh for callers that use this detached
+        // client shape.
+        let managed_client = bootstrap.build_managed_client_blocking(
+            client_identity,
+            ManagedClientOptions {
+                initial_discovery_timeout: Duration::from_secs(2),
+                ..ManagedClientOptions::default()
+            },
+        )?;
         return Ok(managed_client.client());
     }
 

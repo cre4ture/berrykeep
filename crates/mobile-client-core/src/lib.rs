@@ -7,8 +7,8 @@
 use anyhow::{Context, Result};
 use client_sdk::{
     BerryKeepClient, ClientIdentityMaterial, ClientNode, ConnectionBootstrap,
-    ManagedBerryKeepClient, ManagedClientOptions, TitleLatencyMonitor, TitleLatencyProbeConfig,
-    TitleLatencyProbeStatus,
+    ManagedBerryKeepClient, ManagedClientIdentityPersistence, ManagedClientOptions,
+    TitleLatencyMonitor, TitleLatencyProbeConfig, TitleLatencyProbeStatus,
 };
 use common::logging::LogBuffer;
 use serde::{Deserialize, Serialize};
@@ -292,7 +292,11 @@ impl MobileClientSession {
     }
 
     pub fn client_identity(&self) -> Option<ClientIdentityMaterial> {
-        self.inner.client_identity.clone()
+        self.inner
+            .managed_client
+            .as_ref()
+            .and_then(ManagedBerryKeepClient::current_identity)
+            .or_else(|| self.inner.client_identity.clone())
     }
 
     pub fn take_client_identity_update(&self) -> Option<ClientIdentityMaterial> {
@@ -722,33 +726,42 @@ impl MobileClient {
         configuration: MobileClientConfiguration,
     ) -> Result<MobileClientSession> {
         let bootstrap = configuration.effective_bootstrap().clone();
-        let (client, managed_client, client_identity) =
-            match configuration.client_identity().cloned() {
-                Some(identity) => {
-                    let original_identity = identity.clone();
-                    let managed =
-                        self.runtime
-                            .block_on(bootstrap.build_managed_client_with_identity(
-                                identity,
-                                self.options.managed_client.clone(),
-                            ))?;
-                    let current_identity = managed
-                        .latest_identity_update()
-                        .unwrap_or(original_identity.clone());
-                    if current_identity != original_identity
-                        && let Some(persistence) = self.options.identity_persistence.as_ref()
-                        && let Err(error) = (persistence.persist)(&current_identity)
-                    {
-                        tracing::warn!(
-                            source = persistence.source,
-                            error = %error,
-                            "failed to persist renewed mobile client identity"
-                        );
-                    }
-                    (managed.client(), Some(managed), Some(current_identity))
+        let (client, managed_client, client_identity) = match configuration
+            .client_identity()
+            .cloned()
+        {
+            Some(identity) => {
+                let original_identity = identity.clone();
+                let mut managed_client_options = self.options.managed_client.clone();
+                if managed_client_options.client_identity_persistence.is_none()
+                    && let Some(persistence) = self.options.identity_persistence.as_ref()
+                {
+                    let persistence = persistence.clone();
+                    managed_client_options.client_identity_persistence =
+                        Some(ManagedClientIdentityPersistence::new(
+                            persistence.source,
+                            move |identity| (persistence.persist)(identity),
+                        ));
                 }
-                None => (bootstrap.build_client()?, None, None),
-            };
+                let managed = self.runtime.block_on(
+                    bootstrap.build_managed_client_with_identity(identity, managed_client_options),
+                )?;
+                let current_identity = managed
+                    .current_identity()
+                    .unwrap_or(original_identity.clone());
+                (managed.client(), Some(managed), Some(current_identity))
+            }
+            None => {
+                // Anonymous sessions retain the managed lifecycle so static
+                // routes can be refreshed after connectivity returns. Keep
+                // the recursive managed construction future boxed just like
+                // the authenticated FFI path above.
+                let managed = self.runtime.block_on(Box::pin(
+                    bootstrap.build_managed_client(None, self.options.managed_client.clone()),
+                ))?;
+                (managed.client(), Some(managed), None)
+            }
+        };
 
         let client_node = ClientNode::with_client_cache_limits(
             client.clone(),
@@ -1176,7 +1189,14 @@ impl MobileClient {
             authorization: authorization.token().to_string(),
         };
 
-        let client_identity = configuration.client_identity().cloned();
+        // A reused transport session can retain an earlier renewable
+        // credential for the same keypair. Prefer the platform's current
+        // configuration for request signing, falling back to a renewal the
+        // managed session learned itself.
+        let client_identity = configuration
+            .client_identity()
+            .cloned()
+            .or_else(|| client_session.client_identity());
         let mut web_ui_client = client_session.client(self.options.web_ui_connection_name.clone());
         if let Some(identity) = client_identity.clone() {
             // The affine transport router can stay shared, but request signing
@@ -1187,7 +1207,7 @@ impl MobileClient {
             .with_service_name(self.options.web_ui_service_name.clone())
             .with_connection_bootstrap(configuration.effective_bootstrap().clone())
             .with_embedded_session_authorization(authorization.clone());
-        if let Some(identity) = client_identity {
+        if let Some(identity) = client_identity.clone() {
             web_ui_config = web_ui_config.with_client_identity(identity);
         }
         if let Some(persistence) = self.options.web_ui_bootstrap_persistence.clone() {
@@ -1214,7 +1234,7 @@ impl MobileClient {
             request_id,
             affinity: client_session.affinity().clone(),
             bootstrap_identity: configuration.effective_bootstrap_identity().to_string(),
-            client_identity: configuration.client_identity().cloned(),
+            client_identity,
             authorization,
             session,
             task,
@@ -1299,6 +1319,31 @@ mod tests {
                     .to_json_pretty()
                     .expect("test identity should serialize"),
             ),
+        )
+        .expect("identity configuration should parse")
+    }
+
+    fn configuration_with_unreachable_routes() -> MobileClientConfiguration {
+        MobileClientConfiguration::new(
+            r#"{
+                "version": 1,
+                "cluster_id": "019d04a8-3099-75bc-8ff5-f5bd9a78bb83",
+                "rendezvous_urls": [],
+                "direct_endpoints": [
+                    {
+                        "url": "http://127.0.0.1:9",
+                        "usage": "public_api"
+                    },
+                    {
+                        "url": "http://127.0.0.1:10",
+                        "usage": "public_api"
+                    }
+                ],
+                "relay_mode": "disabled",
+                "trust_roots": {}
+            }"#,
+            None::<&str>,
+            None::<&str>,
         )
         .expect("identity configuration should parse")
     }
@@ -1453,6 +1498,10 @@ mod tests {
 
         assert_eq!(options.managed_client.discovery_ttl, expected.discovery_ttl);
         assert_eq!(
+            options.managed_client.initial_discovery_timeout,
+            Duration::ZERO
+        );
+        assert_eq!(
             options.managed_client.route_retirement_grace,
             expected.route_retirement_grace
         );
@@ -1480,6 +1529,29 @@ mod tests {
         let debug = format!("{result:?}");
         assert!(!debug.contains(authorization));
         assert!(debug.contains("authorization: \"<redacted>\""));
+    }
+
+    #[test]
+    fn web_ui_starts_for_anonymous_unreachable_initial_routes() {
+        let client = client();
+
+        let configuration = configuration_with_unreachable_routes();
+        let started = client.start_web_ui(configuration.clone(), MobileWebUiSurface::WebUi);
+
+        assert_eq!(started.disposition, MobileWebUiCommandDisposition::Applied);
+        assert_eq!(started.state.phase, MobileWebUiPhase::Running);
+        assert!(started.state.session.is_some());
+        assert_eq!(
+            client
+                .connect(configuration)
+                .expect("the Web UI session should stay reusable")
+                .base_client()
+                .connection_route_snapshot()
+                .endpoints
+                .len(),
+            2
+        );
+        assert_eq!(client.abort_web_ui().state.phase, MobileWebUiPhase::Idle);
     }
 
     #[test]

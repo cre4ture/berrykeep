@@ -195,6 +195,36 @@ pub fn persist_local_appdata_client_identity(
     )
 }
 
+/// Persists a renewed identity to its selected source (when one exists) and
+/// the local AppData fallback. The helper validates the identity for every
+/// write and avoids rewriting the same AppData file twice.
+pub fn persist_renewed_client_identity(
+    sync_root_path: &Path,
+    selected_path: Option<&Path>,
+    identity: &ClientIdentityMaterial,
+) -> Result<()> {
+    let local_appdata_path = local_appdata_client_identity_path(sync_root_path);
+    if selected_path == Some(local_appdata_path.as_path()) {
+        return persist_client_identity(&local_appdata_path, identity);
+    }
+
+    let selected_error =
+        selected_path.and_then(|path| persist_client_identity(path, identity).err());
+    let local_appdata_error = persist_client_identity(&local_appdata_path, identity).err();
+    match (selected_error, local_appdata_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(error.context(
+            "failed persisting renewed identity to its selected source; local AppData fallback succeeded",
+        )),
+        (None, Some(error)) => Err(error.context(
+            "failed persisting renewed identity to the local AppData fallback",
+        )),
+        (Some(selected_error), Some(local_appdata_error)) => Err(anyhow::anyhow!(
+            "failed persisting renewed identity to its selected source: {selected_error:#}; failed persisting local AppData fallback: {local_appdata_error:#}",
+        )),
+    }
+}
+
 fn candidate_client_identity_paths(
     sync_root_path: &Path,
     bootstrap_file: Option<&Path>,
@@ -302,6 +332,73 @@ mod tests {
         assert_eq!(reloaded, identity);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn renewed_identity_persists_selected_and_local_appdata_paths() {
+        let sync_root =
+            std::env::temp_dir().join(format!("berrykeep-renewed-identity-{}", Uuid::now_v7()));
+        let selected_path = sync_root.join("configured-client-identity.json");
+        std::fs::create_dir_all(&sync_root).expect("sync root should exist");
+        let mut identity = ClientIdentityMaterial::generate(
+            Uuid::now_v7(),
+            None,
+            Some("renewed-identity-test".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+
+        persist_renewed_client_identity(&sync_root, Some(&selected_path), &identity)
+            .expect("renewed identity should persist");
+
+        assert_eq!(
+            load_client_identity(&selected_path).expect("selected identity should reload"),
+            identity
+        );
+        let local_appdata_path = local_appdata_client_identity_path(&sync_root);
+        assert_eq!(
+            load_client_identity(&local_appdata_path)
+                .expect("local appdata identity should reload"),
+            identity
+        );
+
+        let _ = std::fs::remove_file(selected_path);
+        if let Some(parent) = local_appdata_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        let _ = std::fs::remove_dir_all(sync_root);
+    }
+
+    #[test]
+    fn renewed_identity_persists_local_appdata_after_selected_path_failure() {
+        let sync_root = std::env::temp_dir().join(format!(
+            "berrykeep-renewed-identity-fallback-{}",
+            Uuid::now_v7()
+        ));
+        let selected_path = sync_root.join("selected-identity-directory");
+        std::fs::create_dir_all(&selected_path).expect("selected path should be a directory");
+        let mut identity = ClientIdentityMaterial::generate(
+            Uuid::now_v7(),
+            None,
+            Some("renewed-identity-fallback-test".to_string()),
+        )
+        .expect("identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+
+        persist_renewed_client_identity(&sync_root, Some(&selected_path), &identity)
+            .expect_err("selected identity write should fail");
+
+        let local_appdata_path = local_appdata_client_identity_path(&sync_root);
+        assert_eq!(
+            load_client_identity(&local_appdata_path)
+                .expect("local appdata identity should persist after selected-path failure"),
+            identity
+        );
+
+        if let Some(parent) = local_appdata_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+        let _ = std::fs::remove_dir_all(sync_root);
     }
 
     #[test]

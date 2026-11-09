@@ -22,10 +22,11 @@ const REFRESH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const MIN_PERIODIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 type PersistConnectionBootstrapFn = dyn Fn(&ConnectionBootstrap) -> Result<()> + Send + Sync;
+type PersistClientIdentityFn = dyn Fn(&ClientIdentityMaterial) -> Result<()> + Send + Sync;
 
 /// Optional durable storage for contact-list updates learned by a managed
-/// client. The callback is invoked only after an authenticated cluster API
-/// response changes the cached `version_id`.
+/// client. The callback runs on Tokio's blocking executor only after an
+/// authenticated cluster API response changes the cached `version_id`.
 #[derive(Clone)]
 pub struct ManagedBootstrapPersistence {
     source: &'static str,
@@ -61,10 +62,50 @@ impl std::fmt::Debug for ManagedBootstrapPersistence {
     }
 }
 
+/// Optional durable storage for a renewed Rendezvous client identity. The
+/// callback runs on Tokio's blocking executor when a managed refresh accepts
+/// a newer identity, including refreshes scheduled after the client has been
+/// returned to its caller.
+#[derive(Clone)]
+pub struct ManagedClientIdentityPersistence {
+    source: &'static str,
+    persist: Arc<PersistClientIdentityFn>,
+}
+
+impl ManagedClientIdentityPersistence {
+    pub fn new<F>(source: &'static str, persist: F) -> Self
+    where
+        F: Fn(&ClientIdentityMaterial) -> Result<()> + Send + Sync + 'static,
+    {
+        Self {
+            source,
+            persist: Arc::new(persist),
+        }
+    }
+
+    fn persist(&self, identity: &ClientIdentityMaterial) -> Result<()> {
+        (self.persist)(identity)
+    }
+
+    fn source(&self) -> &'static str {
+        self.source
+    }
+}
+
+impl std::fmt::Debug for ManagedClientIdentityPersistence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedClientIdentityPersistence")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Policy for shared, Rendezvous-managed client routes.
 #[derive(Debug, Clone)]
 pub struct ManagedClientOptions {
-    /// Maximum foreground wait for the first advisory discovery pass.
+    /// Maximum foreground wait for the first advisory discovery pass. A zero
+    /// duration schedules discovery after the static client is returned.
     pub initial_discovery_timeout: Duration,
     /// Low-priority fallback cadence for discovery. Foreground, network-change,
     /// and relay-connected events refresh immediately; this interval only keeps
@@ -82,17 +123,28 @@ pub struct ManagedClientOptions {
     /// Optional durable storage for authenticated cluster-managed Rendezvous
     /// contact-list updates.
     pub connection_bootstrap_persistence: Option<ManagedBootstrapPersistence>,
+    /// Optional durable storage for renewed Rendezvous client identities.
+    pub client_identity_persistence: Option<ManagedClientIdentityPersistence>,
+    /// Waits for the direct-API contact-list refresh during the bounded startup
+    /// window. Short-lived callers can opt in when they need an updated
+    /// bootstrap persisted before their runtime exits.
+    pub foreground_contact_list_refresh: bool,
 }
 
 impl Default for ManagedClientOptions {
     fn default() -> Self {
         Self {
-            initial_discovery_timeout: Duration::from_secs(2),
+            // Constructing a managed client must not depend on a reachable
+            // transport route. Route validation and discovery are maintained
+            // asynchronously after the caller receives its static client.
+            initial_discovery_timeout: Duration::ZERO,
             discovery_ttl: Duration::from_secs(2 * 60),
             route_retirement_grace: Duration::from_secs(10 * 60),
             refresh_on_transport_failure: true,
             route_maintenance_policy: ClientRouteMaintenancePolicy::default(),
             connection_bootstrap_persistence: None,
+            client_identity_persistence: None,
+            foreground_contact_list_refresh: false,
         }
     }
 }
@@ -120,6 +172,7 @@ pub enum RouteRefreshReason {
     TransportFailure,
     RelayConnected,
     Foregrounded,
+    ContactListUpdated,
     ExplicitDiagnosticRequest,
 }
 
@@ -127,7 +180,10 @@ impl RouteRefreshReason {
     const fn is_event_driven(self) -> bool {
         matches!(
             self,
-            Self::NetworkChanged | Self::RelayConnected | Self::Foregrounded
+            Self::NetworkChanged
+                | Self::RelayConnected
+                | Self::Foregrounded
+                | Self::ContactListUpdated
         )
     }
 
@@ -139,6 +195,7 @@ impl RouteRefreshReason {
             Self::TransportFailure => "transport_failure",
             Self::RelayConnected => "relay_connected",
             Self::Foregrounded => "foregrounded",
+            Self::ContactListUpdated => "contact_list_updated",
             Self::ExplicitDiagnosticRequest => "explicit_diagnostic_request",
         }
     }
@@ -256,10 +313,12 @@ impl RouteMembershipChanges {
 }
 
 impl ConnectionBootstrap {
-    /// Builds a stable client handle from static bootstrap routes, then performs
-    /// a bounded, fail-open Rendezvous refresh. Enrolled clients can adopt
-    /// discovered Direct QUIC routes; anonymous clients continue to use only
-    /// direct HTTPS routes.
+    /// Builds a stable client handle from static bootstrap routes, then starts
+    /// a fail-open Rendezvous refresh. Enrolled clients can adopt discovered
+    /// Direct QUIC routes; anonymous clients perform only static-route
+    /// maintenance and never issue unauthenticated Rendezvous discovery.
+    /// By default, discovery and route validation run after the handle is
+    /// returned; callers can opt into a bounded foreground wait.
     pub async fn build_managed_client(
         &self,
         identity: Option<ClientIdentityMaterial>,
@@ -276,12 +335,13 @@ impl ConnectionBootstrap {
                 );
             }
         }
-        let client = self
-            .build_client_with_optional_identity(identity.as_ref())?
-            .with_route_maintenance_policy(options.route_maintenance_policy)
-            .with_connection_diagnostic_impact(
-                ClientConnectionDiagnosticImpact::BackgroundMaintenance,
-            );
+        let planned_targets = self.planned_targets()?;
+        let client = build_unprobed_client_with_optional_identity_from_planned_targets(
+            &planned_targets,
+            identity.as_ref(),
+        )?
+        .with_route_maintenance_policy(options.route_maintenance_policy)
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::BackgroundMaintenance);
         let controller = Arc::new(ManagedRouteController {
             client: client.clone(),
             bootstrap: Mutex::new(self.clone()),
@@ -331,27 +391,34 @@ impl ConnectionBootstrap {
                 controller.schedule_refresh(RouteRefreshReason::RelayConnected);
             })));
 
-        let initial_refresh = managed.clone();
-        if tokio::time::timeout(options.initial_discovery_timeout, async move {
-            initial_refresh
-                .refresh_routes(RouteRefreshReason::Startup)
-                .await
-        })
-        .await
-        .is_err()
-        {
-            // The caller already has a usable static client. Continue discovery
-            // opportunistically instead of extending foreground startup.
+        if options.initial_discovery_timeout.is_zero() {
+            // Discovery and route validation deliberately follow construction
+            // so local callers, including the embedded Web UI, remain
+            // available even while every remote route is unavailable.
             managed.schedule_refresh(RouteRefreshReason::Startup);
+        } else {
+            let initial_refresh = managed.clone();
+            if tokio::time::timeout(options.initial_discovery_timeout, async move {
+                initial_refresh
+                    .refresh_routes(RouteRefreshReason::Startup)
+                    .await
+            })
+            .await
+            .is_err()
+            {
+                // The caller already has a static client. Continue discovery
+                // opportunistically instead of extending foreground startup.
+                managed.schedule_refresh(RouteRefreshReason::Startup);
+            }
         }
         managed.start_periodic_refresh();
 
         Ok(managed)
     }
 
-    /// Builds a stable client handle from static bootstrap routes, then performs a
-    /// bounded, fail-open Rendezvous refresh. A failed or slow discovery response
-    /// never invalidates the static direct HTTPS or relay routes.
+    /// Builds a stable client handle from static bootstrap routes, then starts a
+    /// fail-open Rendezvous refresh. A failed or slow discovery response never
+    /// invalidates the static direct HTTPS or relay routes.
     pub async fn build_managed_client_with_identity(
         &self,
         identity: ClientIdentityMaterial,
@@ -437,6 +504,62 @@ impl ManagedBerryKeepClient {
             .clone()
     }
 
+    /// Reads the identity currently used for managed route refreshes. Unlike
+    /// [`Self::latest_identity_update`], this also returns the original
+    /// identity before a renewal occurs.
+    pub fn current_identity(&self) -> Option<ClientIdentityMaterial> {
+        self.controller
+            .identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn record_identity_update(&self, identity: ClientIdentityMaterial) {
+        *self
+            .controller
+            .identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
+        *self
+            .controller
+            .pending_identity_update
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
+
+        let Some(persistence) = self.controller.options.client_identity_persistence.clone() else {
+            return;
+        };
+        let source = persistence.source();
+        let identity_to_persist = identity.clone();
+        match tokio::task::spawn_blocking(move || persistence.persist(&identity_to_persist)).await {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    event = "rendezvous_client_identity_persisted",
+                    persistence_source = source,
+                    device_id = %identity.device_id,
+                    "persisted renewed Rendezvous client identity"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    event = "rendezvous_client_identity_persistence_failed",
+                    persistence_source = source,
+                    error = %error,
+                    "failed persisting renewed Rendezvous client identity"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "rendezvous_client_identity_persistence_task_failed",
+                    persistence_source = source,
+                    error = %error,
+                    "renewed Rendezvous client identity persistence task failed"
+                );
+            }
+        }
+    }
+
     /// Returns and clears an authenticated cluster-managed Rendezvous contact
     /// list update. Platform owners without a Rust-side persistence callback
     /// can persist this bootstrap with their own secure/preferences storage.
@@ -516,16 +639,15 @@ impl ManagedBerryKeepClient {
                     let identity_updated = updated && renewed_identity != original_identity;
                     identity = Some(renewed_identity);
                     if identity_updated {
-                        *self
-                            .controller
-                            .identity
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = identity.clone();
-                        *self
-                            .controller
-                            .pending_identity_update
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = identity.clone();
+                        self.record_identity_update(
+                            identity
+                                .as_ref()
+                                .expect(
+                                    "renewed identity must be present after a successful renewal",
+                                )
+                                .clone(),
+                        )
+                        .await;
                     }
                     identity_updated
                 }
@@ -564,18 +686,36 @@ impl ManagedBerryKeepClient {
             false
         };
 
-        if identity.is_some()
-            && let Err(error) = self.refresh_cluster_rendezvous_contact_list().await
-        {
-            // This is intentionally advisory: a client with a valid immutable
-            // bootstrap must remain usable while the replicated configuration
-            // has not reached its current node yet.
-            tracing::warn!(
-                event = "rendezvous_contact_list_refresh_failed",
-                refresh_reason = telemetry.reason.as_str(),
-                error = %format!("{error:#}"),
-                "failed refreshing authenticated cluster-managed rendezvous contacts"
+        if identity.is_none() {
+            return self.finish_route_refresh(
+                telemetry,
+                RouteRefreshOutcome {
+                    discovery_used: false,
+                    identity_updated: false,
+                    ..RouteRefreshOutcome::default()
+                },
             );
+        }
+
+        // This authenticated direct-API request can repair a stale Rendezvous
+        // list even when every currently known Rendezvous endpoint has gone
+        // away. Long-lived clients keep it independent from candidate discovery
+        // so it neither waits for a slow control-plane response nor gets
+        // skipped when discovery fails. Short-lived callers can opt in to
+        // foreground persistence during their bounded startup window.
+        if self.controller.options.foreground_contact_list_refresh
+            && matches!(reason, RouteRefreshReason::Startup)
+        {
+            if let Err(error) = self.refresh_cluster_rendezvous_contact_list().await {
+                tracing::warn!(
+                    event = "rendezvous_contact_list_refresh_failed",
+                    refresh_reason = reason.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed refreshing authenticated cluster-managed Rendezvous contacts"
+                );
+            }
+        } else {
+            self.schedule_cluster_rendezvous_contact_list_refresh(reason);
         }
 
         let (updates_sender, mut updates_receiver) = mpsc::unbounded_channel();
@@ -743,7 +883,7 @@ impl ManagedBerryKeepClient {
         Ok(membership)
     }
 
-    async fn refresh_cluster_rendezvous_contact_list(&self) -> Result<()> {
+    async fn refresh_cluster_rendezvous_contact_list(&self) -> Result<bool> {
         let response = self
             .client
             .get_json_path("/cluster/rendezvous-contacts")
@@ -753,17 +893,52 @@ impl ManagedBerryKeepClient {
             .context("failed parsing cluster rendezvous contacts")?;
 
         self.apply_cluster_rendezvous_contact_response(response)
+            .await
     }
 
-    fn apply_cluster_rendezvous_contact_response(
+    fn schedule_cluster_rendezvous_contact_list_refresh(&self, reason: RouteRefreshReason) {
+        let managed = self.clone();
+        let task = async move {
+            match managed.refresh_cluster_rendezvous_contact_list().await {
+                Ok(true) => {
+                    // The just-updated bootstrap may replace every Rendezvous
+                    // endpoint. Schedule a distinct event-driven pass so it
+                    // waits for the current refresh lock, then discovers using
+                    // the repaired contact list without waiting for the TTL.
+                    managed.schedule_refresh(RouteRefreshReason::ContactListUpdated);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // This is intentionally advisory: a client with a valid immutable
+                    // bootstrap must remain usable while the replicated configuration
+                    // has not reached its current node yet.
+                    tracing::warn!(
+                        event = "rendezvous_contact_list_refresh_failed",
+                        refresh_reason = reason.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed refreshing authenticated cluster-managed rendezvous contacts"
+                    );
+                }
+            }
+        };
+        if !self.controller.spawn_refresh_task(task) {
+            tracing::warn!(
+                event = "rendezvous_contact_list_refresh_not_scheduled",
+                refresh_reason = reason.as_str(),
+                "could not schedule authenticated cluster-managed Rendezvous contact refresh"
+            );
+        }
+    }
+
+    async fn apply_cluster_rendezvous_contact_response(
         &self,
         response: RendezvousContactConfigurationResponse,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // A missing config object is not an update. In particular, do not wipe
         // a previously persisted contact list merely because this node has not
         // received the object's metadata yet.
         if !response.stored {
-            return Ok(());
+            return Ok(false);
         }
         let version_id = response
             .version_id
@@ -780,7 +955,7 @@ impl ManagedBerryKeepClient {
                 version_id,
                 response.configuration.rendezvous_urls,
             )? {
-                return Ok(());
+                return Ok(false);
             }
             bootstrap.clone()
         };
@@ -795,29 +970,44 @@ impl ManagedBerryKeepClient {
             .controller
             .options
             .connection_bootstrap_persistence
-            .as_ref()
+            .clone()
         {
-            if let Err(error) = persistence.persist(&updated_bootstrap) {
-                tracing::warn!(
-                    event = "rendezvous_contact_list_persistence_failed",
-                    persistence_source = persistence.source(),
-                    error = %error,
-                    "failed persisting authenticated cluster-managed rendezvous contacts"
-                );
-            } else {
-                tracing::info!(
-                    event = "rendezvous_contact_list_persisted",
-                    persistence_source = persistence.source(),
-                    version_id = ?updated_bootstrap
-                        .rendezvous_contact_list
-                        .as_ref()
-                        .map(|contacts| contacts.version_id.as_str()),
-                    "persisted authenticated cluster-managed rendezvous contacts"
-                );
+            let source = persistence.source();
+            let bootstrap_to_persist = updated_bootstrap.clone();
+            match tokio::task::spawn_blocking(move || persistence.persist(&bootstrap_to_persist))
+                .await
+            {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        event = "rendezvous_contact_list_persisted",
+                        persistence_source = source,
+                        version_id = ?updated_bootstrap
+                            .rendezvous_contact_list
+                            .as_ref()
+                            .map(|contacts| contacts.version_id.as_str()),
+                        "persisted authenticated cluster-managed rendezvous contacts"
+                    );
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        event = "rendezvous_contact_list_persistence_failed",
+                        persistence_source = source,
+                        error = %error,
+                        "failed persisting authenticated cluster-managed rendezvous contacts"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "rendezvous_contact_list_persistence_task_failed",
+                        persistence_source = source,
+                        error = %error,
+                        "cluster-managed Rendezvous contact persistence task failed"
+                    );
+                }
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn reconcile_target_set(
@@ -947,15 +1137,24 @@ impl ManagedBerryKeepClient {
     }
 
     fn start_periodic_refresh(&self) {
-        if self
+        let has_identity = self
+            .controller
+            .identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        let has_rendezvous_urls = !self
             .controller
             .bootstrap
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .effective_rendezvous_urls()
             .unwrap_or_default()
-            .is_empty()
-        {
+            .is_empty();
+        // An enrolled client can learn cluster-managed contacts during its
+        // asynchronous startup refresh. Anonymous clients cannot; only keep
+        // their cadence when the bootstrap already has Rendezvous URLs.
+        if !has_identity && !has_rendezvous_urls {
             return;
         }
         self.controller.clone().start_periodic_refresh();
@@ -1134,7 +1333,7 @@ fn blocking_managed_client_runtime() -> Arc<Runtime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::Query, routing::get};
+    use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
     use common::NodeId;
     use serde::Deserialize;
     use std::sync::{
@@ -1154,16 +1353,18 @@ mod tests {
 
     #[test]
     fn default_discovery_fallback_runs_every_two_minutes() {
-        assert_eq!(
-            ManagedClientOptions::default().discovery_ttl,
-            Duration::from_secs(2 * 60)
-        );
+        let options = ManagedClientOptions::default();
+
+        assert_eq!(options.initial_discovery_timeout, Duration::ZERO);
+        assert_eq!(options.discovery_ttl, Duration::from_secs(2 * 60));
+        assert!(!options.foreground_contact_list_refresh);
     }
 
     #[test]
     fn mobile_background_options_bound_route_maintenance() {
         let options = ManagedClientOptions::mobile_background();
 
+        assert_eq!(options.initial_discovery_timeout, Duration::ZERO);
         assert_eq!(options.discovery_ttl, Duration::from_secs(15 * 60));
         assert_eq!(options.route_retirement_grace, options.discovery_ttl * 5);
         assert_eq!(
@@ -1198,15 +1399,113 @@ mod tests {
     }
 
     #[test]
-    fn blocking_managed_client_keeps_anonymous_bootstrap_on_shared_routes() {
+    fn blocking_managed_client_starts_with_multiple_unreachable_static_routes() {
         let bootstrap = ConnectionBootstrap {
             version: 1,
             cluster_id: Uuid::now_v7(),
             rendezvous_urls: Vec::new(),
             rendezvous_contact_list: None,
             rendezvous_mtls_required: false,
+            direct_endpoints: vec![
+                BootstrapEndpoint {
+                    url: "http://127.0.0.1:9".to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: None,
+                    node_hostname: None,
+                },
+                BootstrapEndpoint {
+                    url: "http://127.0.0.1:10".to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: None,
+                    node_hostname: None,
+                },
+            ],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+            node_priority_overrides: BTreeMap::new(),
+        };
+        let managed = bootstrap
+            .build_managed_client_blocking(None, ManagedClientOptions::default())
+            .expect("managed client should retain unreachable static routes");
+
+        assert_eq!(managed.route_snapshot().endpoints.len(), 2);
+        assert!(
+            managed.route_snapshot().endpoints[0]
+                .locator
+                .starts_with("http://127.0.0.1:9")
+        );
+        assert!(
+            managed.route_snapshot().endpoints[1]
+                .locator
+                .starts_with("http://127.0.0.1:10")
+        );
+        assert_eq!(
+            managed.client.connection_diagnostic_impact(),
+            ClientConnectionDiagnosticImpact::BackgroundMaintenance
+        );
+        assert_eq!(
+            managed.client().connection_diagnostic_impact(),
+            ClientConnectionDiagnosticImpact::UserFacing
+        );
+        assert!(
+            !managed
+                .controller
+                .periodic_refresh_started
+                .load(Ordering::Acquire),
+            "anonymous clients without Rendezvous URLs should not run an empty periodic refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_managed_client_maintains_static_routes_without_rendezvous_discovery() {
+        let cluster_id = Uuid::now_v7();
+        let discovery_requests = Arc::new(AtomicUsize::new(0));
+        let discovery_requests_handler = Arc::clone(&discovery_requests);
+        let router = Router::new().route(
+            "/control/discovery",
+            get(move || {
+                let discovery_requests = Arc::clone(&discovery_requests_handler);
+                async move {
+                    discovery_requests.fetch_add(1, Ordering::SeqCst);
+                    Json(DiscoveryResponse {
+                        rendezvous_peers: Vec::new(),
+                        node_candidates: None,
+                        node_relay_capable: false,
+                        node_hostname: None,
+                        node_connection_priority: 0,
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("discovery listener should bind");
+        let rendezvous_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("discovery listener should expose its address")
+        );
+        let discovery_server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("discovery test server should run");
+        });
+        let bootstrap = ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: vec![rendezvous_url.clone()],
+            rendezvous_contact_list: None,
+            rendezvous_mtls_required: false,
             direct_endpoints: vec![BootstrapEndpoint {
-                url: "http://127.0.0.1:9".to_string(),
+                url: rendezvous_url,
                 usage: Some(BootstrapEndpointUse::PublicApi),
                 node_id: None,
                 node_hostname: None,
@@ -1222,29 +1521,31 @@ mod tests {
             device_id: None,
             node_priority_overrides: BTreeMap::new(),
         };
-        let options = ManagedClientOptions {
-            initial_discovery_timeout: Duration::ZERO,
-            ..ManagedClientOptions::default()
-        };
-
         let managed = bootstrap
-            .build_managed_client_blocking(None, options)
-            .expect("anonymous bootstrap should retain its direct HTTPS fallback");
+            .build_managed_client(
+                None,
+                ManagedClientOptions {
+                    initial_discovery_timeout: Duration::ZERO,
+                    discovery_ttl: Duration::from_secs(60),
+                    ..ManagedClientOptions::default()
+                },
+            )
+            .await
+            .expect("anonymous managed client should retain its static route");
 
-        assert_eq!(managed.route_snapshot().endpoints.len(), 1);
-        assert!(
-            managed.route_snapshot().endpoints[0]
-                .locator
-                .starts_with("http://127.0.0.1:9")
-        );
+        let outcome = managed.notify_network_changed_async().await;
+
+        assert!(!outcome.discovery_used);
+        assert!(outcome.discovery_error.is_none());
+        tokio::time::sleep(Duration::from_millis(25)).await;
         assert_eq!(
-            managed.client.connection_diagnostic_impact(),
-            ClientConnectionDiagnosticImpact::BackgroundMaintenance
+            discovery_requests.load(Ordering::SeqCst),
+            0,
+            "anonymous managed lifecycle refreshes must not call Rendezvous discovery"
         );
-        assert_eq!(
-            managed.client().connection_diagnostic_impact(),
-            ClientConnectionDiagnosticImpact::UserFacing
-        );
+
+        discovery_server.abort();
+        let _ = discovery_server.await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1258,35 +1559,12 @@ mod tests {
         let candidate_addr = candidate_listener
             .local_addr()
             .expect("candidate listener should expose its address");
-        let candidate_probe_count = Arc::new(AtomicUsize::new(0));
-        let candidate_route_probe_count = Arc::clone(&candidate_probe_count);
-        let candidate_health_probe_count = Arc::clone(&candidate_probe_count);
         let candidate_server = tokio::spawn(async move {
             axum::serve(
                 candidate_listener,
                 Router::new()
-                    .route(
-                        "/api/v1/diagnostics/latency",
-                        get(move || {
-                            let candidate_route_probe_count =
-                                Arc::clone(&candidate_route_probe_count);
-                            async move {
-                                candidate_route_probe_count.fetch_add(1, Ordering::SeqCst);
-                                "ok"
-                            }
-                        }),
-                    )
-                    .route(
-                        "/api/v1/health",
-                        get(move || {
-                            let candidate_health_probe_count =
-                                Arc::clone(&candidate_health_probe_count);
-                            async move {
-                                candidate_health_probe_count.fetch_add(1, Ordering::SeqCst);
-                                "ok"
-                            }
-                        }),
-                    ),
+                    .route("/api/v1/diagnostics/latency", get(|| async { "ok" }))
+                    .route("/api/v1/health", get(|| async { "ok" })),
             )
             .await
             .expect("candidate test server should run");
@@ -1294,13 +1572,17 @@ mod tests {
         let candidate_url = format!("http://{candidate_addr}");
         let fast_node_label = fast_node_id.to_string();
         let discovery_candidate_url = candidate_url.clone();
+        let discovery_request_count = Arc::new(AtomicUsize::new(0));
+        let discovery_request_counter = Arc::clone(&discovery_request_count);
         let discovery_router = Router::new()
             .route(
                 "/control/discovery",
                 get(move |Query(query): Query<TestDiscoveryQuery>| {
                     let fast_node_label = fast_node_label.clone();
                     let candidate_url = discovery_candidate_url.clone();
+                    let discovery_request_counter = Arc::clone(&discovery_request_counter);
                     async move {
+                        discovery_request_counter.fetch_add(1, Ordering::SeqCst);
                         if query.node_id.as_deref() == Some(fast_node_label.as_str()) {
                             return Json(DiscoveryResponse {
                                 rendezvous_peers: Vec::new(),
@@ -1374,9 +1656,12 @@ mod tests {
             device_id: None,
             node_priority_overrides: BTreeMap::new(),
         };
+        let mut identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("test identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
         let managed = bootstrap
             .build_managed_client(
-                None,
+                Some(identity),
                 ManagedClientOptions {
                     initial_discovery_timeout: Duration::ZERO,
                     discovery_ttl: Duration::from_secs(60),
@@ -1389,23 +1674,28 @@ mod tests {
         let refresh_task =
             tokio::spawn(async move { refresh_client.notify_network_changed_async().await });
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let candidate_adoption = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let has_fast_candidate_route =
                     managed.route_snapshot().endpoints.iter().any(|endpoint| {
                         endpoint.path_kind == TransportPathKind::DirectHttps
                             && endpoint.target_node_id == Some(fast_node_id)
                             && endpoint.locator == candidate_url
-                            && candidate_probe_count.load(Ordering::SeqCst) > 0
                     });
-                if has_fast_candidate_route {
+                if has_fast_candidate_route && discovery_request_count.load(Ordering::SeqCst) >= 2 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("the usable candidate should be adopted before the stalled node completes");
+        .await;
+        if candidate_adoption.is_err() {
+            panic!(
+                "the managed client should adopt the usable candidate before the stalled node completes; routes={:?}; discovery_request_count={}",
+                managed.route_snapshot(),
+                discovery_request_count.load(Ordering::SeqCst)
+            );
+        }
 
         refresh_task.abort();
         let _ = refresh_task.await;
@@ -1415,8 +1705,215 @@ mod tests {
         let _ = candidate_server.await;
     }
 
-    #[test]
-    fn managed_client_persists_cluster_rendezvous_contacts() {
+    #[tokio::test]
+    async fn managed_client_persists_identity_updates_after_construction() {
+        let cluster_id = Uuid::now_v7();
+        let persisted = Arc::new(Mutex::new(Vec::<ClientIdentityMaterial>::new()));
+        let persisted_updates = Arc::clone(&persisted);
+        let bootstrap = ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: Vec::new(),
+            rendezvous_contact_list: None,
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: "http://127.0.0.1:9".to_string(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: None,
+                node_hostname: None,
+            }],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+            node_priority_overrides: BTreeMap::new(),
+        };
+        let identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("test identity should generate");
+        let options = ManagedClientOptions {
+            client_identity_persistence: Some(ManagedClientIdentityPersistence::new(
+                "test",
+                move |identity| {
+                    persisted_updates
+                        .lock()
+                        .expect("persisted updates lock should not be poisoned")
+                        .push(identity.clone());
+                    Ok(())
+                },
+            )),
+            ..ManagedClientOptions::default()
+        };
+        let managed = bootstrap
+            .build_managed_client(Some(identity.clone()), options)
+            .await
+            .expect("managed client should build without an initial route connection");
+        let mut renewed_identity = identity;
+        renewed_identity.rendezvous_client_identity_pem = Some("renewed-identity".to_string());
+
+        managed
+            .record_identity_update(renewed_identity.clone())
+            .await;
+
+        assert!(
+            managed
+                .controller
+                .periodic_refresh_started
+                .load(Ordering::Acquire),
+            "an enrolled client can learn cluster-managed contacts after deferred startup"
+        );
+
+        assert_eq!(managed.current_identity(), Some(renewed_identity.clone()));
+        assert_eq!(
+            managed
+                .take_identity_update()
+                .expect("renewed identity should remain available to FFI callers"),
+            renewed_identity
+        );
+        assert_eq!(
+            persisted
+                .lock()
+                .expect("persisted updates lock should not be poisoned")
+                .as_slice(),
+            [renewed_identity]
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_client_refreshes_contacts_when_discovery_fails() {
+        let cluster_id = Uuid::now_v7();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("contact-list listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("contact-list listener should expose its address");
+        let endpoint = format!("http://{address}");
+        let discovery_requests = Arc::new(AtomicUsize::new(0));
+        let discovery_request_counter = Arc::clone(&discovery_requests);
+        let replacement_endpoint = endpoint.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/control/discovery",
+                        get(move || {
+                            let discovery_request_counter = Arc::clone(&discovery_request_counter);
+                            async move {
+                                discovery_request_counter.fetch_add(1, Ordering::SeqCst);
+                                (StatusCode::SERVICE_UNAVAILABLE, "retired rendezvous")
+                            }
+                        }),
+                    )
+                    .route(
+                        "/api/v1/cluster/rendezvous-contacts",
+                        get(move || {
+                            let replacement_endpoint = replacement_endpoint.clone();
+                            async move {
+                                Json(serde_json::json!({
+                                    "configuration": {
+                                        "schema_version": 1,
+                                        "rendezvous_urls": [replacement_endpoint],
+                                    },
+                                    "stored": true,
+                                    "version_id": "019d-contact-list-version",
+                                }))
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .expect("contact-list test server should run");
+        });
+        let bootstrap = ConnectionBootstrap {
+            version: transport_sdk::CLIENT_BOOTSTRAP_VERSION,
+            cluster_id,
+            rendezvous_urls: vec![endpoint.clone()],
+            rendezvous_contact_list: None,
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![BootstrapEndpoint {
+                url: endpoint.clone(),
+                usage: Some(BootstrapEndpointUse::PublicApi),
+                node_id: None,
+                node_hostname: None,
+            }],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+            node_priority_overrides: BTreeMap::new(),
+        };
+        let client = build_unprobed_client_with_optional_identity_from_planned_targets(
+            &bootstrap
+                .planned_targets()
+                .expect("test bootstrap should plan direct route"),
+            None,
+        )
+        .expect("test client should build");
+        let mut identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("test identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+        let managed = ManagedBerryKeepClient {
+            client: client.clone(),
+            controller: Arc::new(ManagedRouteController {
+                client,
+                bootstrap: Mutex::new(bootstrap),
+                identity: Mutex::new(Some(identity)),
+                options: ManagedClientOptions::default(),
+                refresh_lock: AsyncMutex::new(()),
+                routes: Mutex::new(ManagedRouteState::default()),
+                last_attempt: Mutex::new(None),
+                last_success: Mutex::new(None),
+                last_outcome: Mutex::new(RouteRefreshOutcome::default()),
+                pending_identity_update: Mutex::new(None),
+                pending_connection_bootstrap_update: Mutex::new(None),
+                periodic_refresh_started: AtomicBool::new(false),
+                runtime_guard: Mutex::new(None),
+            }),
+        };
+
+        let outcome = managed
+            .refresh_routes(RouteRefreshReason::NetworkChanged)
+            .await;
+        assert!(outcome.discovery_error.is_some());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if managed.latest_connection_bootstrap_update().is_some()
+                    && discovery_requests.load(Ordering::SeqCst) >= 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("contact refresh should survive failure and trigger follow-up discovery");
+        assert_eq!(
+            managed
+                .take_connection_bootstrap_update()
+                .expect("replacement contacts should be retained")
+                .rendezvous_contact_list
+                .expect("replacement contacts should be present")
+                .rendezvous_urls,
+            vec![format!("{endpoint}/")]
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn managed_client_persists_cluster_rendezvous_contacts() {
         let cluster_id = Uuid::now_v7();
         let persisted = Arc::new(Mutex::new(Vec::<ConnectionBootstrap>::new()));
         let persisted_updates = Arc::clone(&persisted);
@@ -1488,6 +1985,7 @@ mod tests {
                 stored: true,
                 version_id: Some("019d-contact-list-version".to_string()),
             })
+            .await
             .expect("cluster contact response should be persisted");
         let updated = managed
             .take_connection_bootstrap_update()
