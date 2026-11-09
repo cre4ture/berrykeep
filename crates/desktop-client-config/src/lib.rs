@@ -1308,12 +1308,25 @@ fn launched_process_is_running(outcome: &LaunchOutcome) -> bool {
     let Some(pid) = outcome.pid else {
         return false;
     };
-    let mut system = sysinfo::System::new();
     let pid = sysinfo::Pid::from_u32(pid);
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    let system = load_process_identity(pid);
     system
         .process(pid)
         .is_some_and(|process| process_matches_launch(process, outcome))
+}
+
+fn load_process_identity(pid: sysinfo::Pid) -> sysinfo::System {
+    let mut system = sysinfo::System::new();
+    // The default refresh does not load command arguments on Linux. Both reuse
+    // and termination must request the metadata used by process_matches_launch.
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing()
+            .with_exe(sysinfo::UpdateKind::Always)
+            .with_cmd(sysinfo::UpdateKind::Always),
+    );
+    system
 }
 
 fn process_matches_launch(process: &sysinfo::Process, outcome: &LaunchOutcome) -> bool {
@@ -1356,10 +1369,9 @@ fn terminate_process(outcome: &LaunchOutcome) -> Result<()> {
     let pid = outcome
         .pid
         .context("cannot stop a service without its process ID")?;
-    let mut system = sysinfo::System::new();
-    let pids = [sysinfo::Pid::from_u32(pid)];
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
-    let Some(process) = system.process(pids[0]) else {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let system = load_process_identity(pid);
+    let Some(process) = system.process(pid) else {
         return Ok(());
     };
     if !process_matches_launch(process, outcome) {
@@ -2298,6 +2310,35 @@ mod tests {
             Some("[::1]:1234".parse().unwrap())
         );
         assert_eq!(client_web_probe_address(Some("invalid")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_process_identity_loads_and_validates_command_arguments() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut outcome = LaunchOutcome {
+            instance_kind: "client-cli".to_string(),
+            id: "child-identity".to_string(),
+            label: "Child identity".to_string(),
+            executable: "/bin/sleep".to_string(),
+            command_line: vec!["30".to_string()],
+            log_file: None,
+            pid: Some(child.id()),
+            error: None,
+        };
+        let matched = launched_process_is_running(&outcome);
+        outcome.command_line = vec!["60".to_string()];
+        let mismatched = launched_process_is_running(&outcome);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            matched,
+            "the launched child and its arguments must be recognized"
+        );
+        assert!(
+            !mismatched,
+            "different arguments must not match the tracked child"
+        );
     }
 
     #[test]
