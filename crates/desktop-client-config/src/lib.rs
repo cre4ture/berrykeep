@@ -2400,6 +2400,59 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn process_identity_child_fixture() {
+        if std::env::var_os("BERRYKEEP_PROCESS_IDENTITY_TEST_CHILD").is_some() {
+            use std::io::Read;
+            let _ = std::io::stdin().read(&mut [0]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_identity_preserves_empty_quoted_and_path_arguments() {
+        let executable = std::env::current_exe().unwrap();
+        let args: Vec<String> = [
+            "--exact",
+            "tests::process_identity_child_fixture",
+            "--nocapture",
+            "--",
+            "",
+            r"C:\folder with spaces\",
+            r#"a "quoted" value"#,
+            r"C:\trailing\\",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut child = Command::new(&executable)
+            .args(&args)
+            .env("BERRYKEEP_PROCESS_IDENTITY_TEST_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let outcome = LaunchOutcome {
+            instance_kind: "os-integration".to_string(),
+            id: "quoted-child".to_string(),
+            label: "Quoted child".to_string(),
+            executable: executable.display().to_string(),
+            command_line: args,
+            log_file: None,
+            pid: Some(child.id()),
+            error: None,
+        };
+        let matched = launched_process_is_running(&outcome);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            matched,
+            "Windows must preserve empty arguments, quotes, spaces, and trailing backslashes"
+        );
+    }
+
     #[test]
     fn client_service_reports_starting_until_its_web_port_is_listening() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
