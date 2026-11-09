@@ -1086,14 +1086,11 @@ pub fn service_runtime_statuses(
     let mut statuses = Vec::new();
 
     for instance in &store.client_cli_instances {
-        let mut status = service_runtime_status(
+        let status = service_runtime_status(
             "client-cli",
             &instance.id,
             report.and_then(|report| last_launch_outcome(report, "client-cli", &instance.id)),
         );
-        status.web_ui_ready = status
-            .running
-            .then(|| client_web_port_is_listening(instance));
         statuses.push(status);
     }
 
@@ -1116,16 +1113,37 @@ pub fn service_runtime_statuses(
     statuses
 }
 
+/// Blocking readiness probes are opt-in; process-control callers only need liveness.
+/// Async callers must run this on their blocking pool.
+pub fn service_runtime_statuses_with_web_readiness(
+    store: &ManagedInstanceStore,
+    report: Option<&LaunchReport>,
+) -> Vec<ServiceRuntimeStatus> {
+    let mut statuses = service_runtime_statuses(store, report);
+    for instance in &store.client_cli_instances {
+        if let Some(status) = statuses.iter_mut().find(|status| {
+            status.instance_kind == "client-cli" && status.id == instance.id && status.running
+        }) {
+            status.web_ui_ready = Some(client_web_port_is_listening(instance));
+        }
+    }
+    statuses
+}
+
 fn client_web_port_is_listening(instance: &ClientCliInstance) -> bool {
-    let Ok(mut address) = instance
-        .bind
-        .as_deref()
-        .unwrap_or("127.0.0.1:8081")
-        .trim()
-        .parse::<SocketAddr>()
-    else {
+    let Some(address) = client_web_probe_address(instance.bind.as_deref()) else {
         return false;
     };
+    TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+}
+
+fn client_web_probe_address(bind: Option<&str>) -> Option<SocketAddr> {
+    let mut address = bind
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:8081")
+        .parse::<SocketAddr>()
+        .ok()?;
     // A wildcard is a listen address, not an address to connect to.
     if address.ip().is_unspecified() {
         address.set_ip(if address.is_ipv4() {
@@ -1134,7 +1152,7 @@ fn client_web_port_is_listening(instance: &ClientCliInstance) -> bool {
             std::net::Ipv6Addr::LOCALHOST.into()
         });
     }
-    TcpStream::connect_timeout(&address, Duration::from_millis(25)).is_ok()
+    Some(address)
 }
 
 pub fn launch_report_with_updated_outcome(
@@ -2209,16 +2227,33 @@ mod tests {
     }
 
     #[test]
+    fn client_web_readiness_normalizes_blank_and_wildcard_bind_addresses() {
+        let default = "127.0.0.1:8081".parse::<SocketAddr>().unwrap();
+        for bind in [None, Some(""), Some("  ")] {
+            assert_eq!(client_web_probe_address(bind), Some(default));
+        }
+        assert_eq!(
+            client_web_probe_address(Some("0.0.0.0:1234")),
+            Some("127.0.0.1:1234".parse().unwrap())
+        );
+        assert_eq!(
+            client_web_probe_address(Some("[::]:1234")),
+            Some("[::1]:1234".parse().unwrap())
+        );
+        assert_eq!(client_web_probe_address(Some("invalid")), None);
+    }
+
+    #[test]
     fn client_service_reports_starting_until_its_web_port_is_listening() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap().to_string();
-        drop(listener);
-        let store = ManagedInstanceStore {
+        let mut store = ManagedInstanceStore {
             client_cli_instances: vec![ClientCliInstance {
                 id: "web-client".to_string(),
                 label: "Web client".to_string(),
                 enabled: true,
-                bind: Some(bind.clone()),
+                // Port zero cannot have a listener; keep the positive-case listener reserved.
+                bind: Some("127.0.0.1:0".to_string()),
                 server_base_url: None,
                 bootstrap_file: None,
                 server_ca_pem_file: None,
@@ -2243,19 +2278,25 @@ mod tests {
                 error: None,
             }],
         };
-        let status =
-            serde_json::to_value(&service_runtime_statuses(&store, Some(&report))[0]).unwrap();
+        let status = serde_json::to_value(
+            &service_runtime_statuses_with_web_readiness(&store, Some(&report))[0],
+        )
+        .unwrap();
         assert_eq!(status["running"], true);
         assert_eq!(status["web_ui_ready"], false);
 
-        let _listener = std::net::TcpListener::bind(bind).unwrap();
-        let status =
-            serde_json::to_value(&service_runtime_statuses(&store, Some(&report))[0]).unwrap();
+        store.client_cli_instances[0].bind = Some(bind);
+        let status = serde_json::to_value(
+            &service_runtime_statuses_with_web_readiness(&store, Some(&report))[0],
+        )
+        .unwrap();
         assert_eq!(status["web_ui_ready"], true);
 
         report.outcomes[0].pid = None;
-        let status =
-            serde_json::to_value(&service_runtime_statuses(&store, Some(&report))[0]).unwrap();
+        let status = serde_json::to_value(
+            &service_runtime_statuses_with_web_readiness(&store, Some(&report))[0],
+        )
+        .unwrap();
         assert_eq!(status["running"], false);
         assert!(status.get("web_ui_ready").is_none());
     }

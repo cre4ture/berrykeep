@@ -3,6 +3,8 @@
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 
+use anyhow::Context;
+
 use super::{ApiError, ManagedPaths};
 
 pub(super) fn acquire(paths: &ManagedPaths) -> Result<File, ApiError> {
@@ -10,7 +12,14 @@ pub(super) fn acquire(paths: &ManagedPaths) -> Result<File, ApiError> {
         .launch_report_path()
         .with_extension("service-action.lock");
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| ApiError::internal(error.into()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| {
+                format!(
+                    "failed creating service action directory {}",
+                    parent.display()
+                )
+            })
+            .map_err(ApiError::internal)?;
     }
     let file = OpenOptions::new()
         .create(true)
@@ -18,7 +27,8 @@ pub(super) fn acquire(paths: &ManagedPaths) -> Result<File, ApiError> {
         .read(true)
         .write(true)
         .open(&path)
-        .map_err(|error| ApiError::internal(error.into()))?;
+        .with_context(|| format!("failed opening service action lock {}", path.display()))
+        .map_err(ApiError::internal)?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(ApiError {
@@ -29,6 +39,10 @@ pub(super) fn acquire(paths: &ManagedPaths) -> Result<File, ApiError> {
             code: Some("service_action_in_progress"),
             path_preparation: None,
         }),
-        Err(TryLockError::Error(error)) => Err(ApiError::internal(error.into())),
+        Err(TryLockError::Error(error)) => {
+            Err(ApiError::internal(anyhow::Error::new(error).context(
+                format!("failed locking service actions at {}", path.display()),
+            )))
+        }
     }
 }

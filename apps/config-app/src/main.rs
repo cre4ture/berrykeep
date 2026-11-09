@@ -31,7 +31,8 @@ use desktop_client_config::{
     launch_client_cli_instance, launch_enabled_instances, launch_folder_agent_instance,
     launch_os_integration_instance, launch_report_with_updated_outcome, load_last_launch_report,
     migrate_legacy_virtualized_windows_state, package_root_from_current_exe, save_launch_report,
-    service_desktop_status_file_path, service_runtime_statuses, stop_service_from_report,
+    service_desktop_status_file_path, service_runtime_statuses,
+    service_runtime_statuses_with_web_readiness, stop_service_from_report,
 };
 use desktop_status::{
     DesktopServiceStatus, DesktopStatusDocument, GNOME_EXTENSION_UUID, StatusFacet, StatusSnapshot,
@@ -331,6 +332,11 @@ struct ClientIdentityEnrollmentReport {
     server_base_url: Option<String>,
 }
 
+struct PreparedClientEnrollment {
+    report: ClientIdentityEnrollmentReport,
+    material: ClientIdentityMaterial,
+}
+
 #[derive(Debug, Serialize)]
 struct ServiceActionResponse {
     config: ConfigResponse,
@@ -584,7 +590,7 @@ impl ApiError {
     fn internal(error: anyhow::Error) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.to_string(),
+            message: format!("{error:#}"),
             code: None,
             path_preparation: None,
         }
@@ -650,14 +656,8 @@ async fn main() -> Result<()> {
         },
     };
 
-    if (cli.background || cli.launch_enabled_on_start)
-        && !cli.skip_initial_service_launch
-        && let Err(error) = launch_enabled_services(&state).await
-    {
-        eprintln!(
-            "config-app: enabled service launch failed: {}",
-            error.message
-        );
+    if (cli.background || cli.launch_enabled_on_start) && !cli.skip_initial_service_launch {
+        launch_initial_enabled_services(&state).await?;
     }
 
     let app = build_router(state.clone());
@@ -912,9 +912,16 @@ fn resolve_desktop_status_file(cli: &Cli) -> Option<PathBuf> {
 fn spawn_desktop_status_task(state: AppState, web_ui_url: String, status_file: PathBuf) {
     tokio::spawn(async move {
         loop {
-            if let Err(error) =
-                publish_config_app_desktop_status(&state, web_ui_url.as_str(), &status_file)
-            {
+            let task_state = state.clone();
+            let task_url = web_ui_url.clone();
+            let task_file = status_file.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                publish_config_app_desktop_status(&task_state, &task_url, &task_file)
+            })
+            .await
+            .context("desktop status task failed")
+            .and_then(|result| result);
+            if let Err(error) = result {
                 eprintln!("desktop-status: failed to publish config app status: {error:#}");
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -929,7 +936,8 @@ fn publish_config_app_desktop_status(
 ) -> Result<()> {
     let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())?;
     let last_launch_report = load_last_launch_report(state.paths.launch_report_path())?;
-    let runtime_statuses = service_runtime_statuses(&store, last_launch_report.as_ref());
+    let runtime_statuses =
+        service_runtime_statuses_with_web_readiness(&store, last_launch_report.as_ref());
     let service_documents = load_service_status_documents(&runtime_statuses);
     let services = merged_service_statuses(&store, &runtime_statuses, service_documents.as_slice());
     let snapshot = StatusSnapshot {
@@ -1359,26 +1367,35 @@ async fn app_favicon() -> impl IntoResponse {
 }
 
 async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse>, ApiError> {
-    let payload = load_config_response(&state).map_err(ApiError::internal)?;
+    let payload = load_config_response(&state)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(payload))
 }
 
 async fn get_service_statuses(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ServiceRuntimeStatus>>, ApiError> {
-    let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
-        .map_err(ApiError::internal)?;
-    let report =
-        load_last_launch_report(state.paths.launch_report_path()).map_err(ApiError::internal)?;
-    Ok(Json(service_runtime_statuses(&store, report.as_ref())))
+    let statuses = tokio::task::spawn_blocking(move || -> Result<_> {
+        let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())?;
+        let report = load_last_launch_report(state.paths.launch_report_path())?;
+        Ok(service_runtime_statuses_with_web_readiness(
+            &store,
+            report.as_ref(),
+        ))
+    })
+    .await
+    .context("service readiness task failed")
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)?;
+    Ok(Json(statuses))
 }
 
 async fn upsert_client_identity(
     State(state): State<AppState>,
     Json(request): Json<UpsertClientIdentityRequest>,
 ) -> Result<Json<UpsertClientIdentityResponse>, ApiError> {
-    let _action = service_action::acquire(&state.paths)?;
-    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
+    let store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     let existing = request
         .id
@@ -1388,23 +1405,41 @@ async fn upsert_client_identity(
         .and_then(|id| store.client_identity(id));
     let (mut identity, bootstrap_content, enroll) =
         request.into_identity(existing, state.paths.instance_store_path())?;
-    let enrollment = if enroll {
-        let report = enroll_client_identity(identity.clone(), bootstrap_content.as_deref()).await?;
-        if let Some(bootstrap_content) =
-            persisted_bootstrap_content(&report, bootstrap_content.as_deref())
-        {
-            write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
-        }
-        refresh_client_identity_metadata(&mut identity);
-        identity.last_enrolled_at_unix_ms = Some(unix_ts_ms());
-        Some(report)
+    let prepared = if enroll {
+        Some(enroll_client_identity(identity.clone(), bootstrap_content.as_deref()).await?)
     } else {
-        if let Some(bootstrap_content) = bootstrap_content.as_deref() {
-            write_managed_text_file(&identity.bootstrap_file, bootstrap_content)?;
-        }
-        refresh_client_identity_metadata(&mut identity);
         None
     };
+
+    // Enrollment may wait on the network. Only the local commit and reconciliation
+    // need the service-action lock, and the store must be reloaded after that wait.
+    let _action = service_action::acquire(&state.paths)?;
+    let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())
+        .map_err(ApiError::internal)?;
+    let enrollment = if let Some(prepared) = prepared {
+        prepared
+            .material
+            .write_to_path(Path::new(&identity.client_identity_file))
+            .with_context(|| {
+                format!(
+                    "failed writing client identity {}",
+                    identity.client_identity_file
+                )
+            })
+            .map_err(ApiError::internal)?;
+        identity.last_enrolled_at_unix_ms = Some(unix_ts_ms());
+        Some(prepared.report)
+    } else {
+        None
+    };
+    let bootstrap_content = enrollment
+        .as_ref()
+        .and_then(|report| persisted_bootstrap_content(report, bootstrap_content.as_deref()))
+        .or(bootstrap_content.as_deref());
+    if let Some(content) = bootstrap_content {
+        write_managed_text_file(&identity.bootstrap_file, content)?;
+    }
+    refresh_client_identity_metadata(&mut identity);
 
     let managed_identity_id = identity.id.clone();
     store.upsert_client_identity(identity);
@@ -1420,7 +1455,9 @@ async fn upsert_client_identity(
     )
     .await;
     Ok(Json(UpsertClientIdentityResponse {
-        config: load_config_response(&state).map_err(ApiError::internal)?,
+        config: load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
         enrollment,
     }))
 }
@@ -1448,7 +1485,9 @@ async fn upsert_client_cli_instance(
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
-        load_config_response(&state).map_err(ApiError::internal)?,
+        load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
     ))
 }
 
@@ -1476,7 +1515,9 @@ async fn upsert_os_integration_instance(
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
-        load_config_response(&state).map_err(ApiError::internal)?,
+        load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
     ))
 }
 
@@ -1504,7 +1545,9 @@ async fn upsert_folder_agent_instance(
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
-        load_config_response(&state).map_err(ApiError::internal)?,
+        load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
     ))
 }
 
@@ -1525,7 +1568,9 @@ async fn delete_os_integration_instance(
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
-        load_config_response(&state).map_err(ApiError::internal)?,
+        load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
     ))
 }
 
@@ -1546,7 +1591,9 @@ async fn delete_client_cli_instance(
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
-        load_config_response(&state).map_err(ApiError::internal)?,
+        load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
     ))
 }
 
@@ -1567,7 +1614,9 @@ async fn delete_folder_agent_instance(
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
-        load_config_response(&state).map_err(ApiError::internal)?,
+        load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
     ))
 }
 
@@ -1588,7 +1637,9 @@ async fn delete_client_identity(
         .save(state.paths.instance_store_path())
         .map_err(ApiError::internal)?;
     Ok(Json(
-        load_config_response(&state).map_err(ApiError::internal)?,
+        load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
     ))
 }
 
@@ -1608,7 +1659,9 @@ async fn start_service_instance(
         .any(|status| status.instance_kind == kind && status.id == id && status.running);
     if already_running {
         return Ok(Json(ServiceActionResponse {
-            config: load_config_response(&state).map_err(ApiError::internal)?,
+            config: load_config_response(&state)
+                .await
+                .map_err(ApiError::internal)?,
             launch: None,
             stop: None,
         }));
@@ -1632,7 +1685,9 @@ async fn start_service_instance(
         .map_err(ApiError::internal)?;
 
     Ok(Json(ServiceActionResponse {
-        config: load_config_response(&state).map_err(ApiError::internal)?,
+        config: load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
         launch: Some(launch),
         stop: None,
     }))
@@ -1652,7 +1707,9 @@ async fn stop_service_instance(
     let stop = stop_service_from_report(report.as_ref(), kind, &id);
 
     Ok(Json(ServiceActionResponse {
-        config: load_config_response(&state).map_err(ApiError::internal)?,
+        config: load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
         launch: None,
         stop: Some(stop),
     }))
@@ -1693,7 +1750,9 @@ async fn restart_service_instance(
     };
 
     Ok(Json(ServiceActionResponse {
-        config: load_config_response(&state).map_err(ApiError::internal)?,
+        config: load_config_response(&state)
+            .await
+            .map_err(ApiError::internal)?,
         launch,
         stop: Some(stop),
     }))
@@ -1722,6 +1781,23 @@ async fn launch_enabled_services(state: &AppState) -> Result<LaunchReport, ApiEr
     );
     save_launch_report(state.paths.launch_report_path(), &report).map_err(ApiError::internal)?;
     Ok(report)
+}
+
+async fn launch_initial_enabled_services(state: &AppState) -> Result<()> {
+    match launch_enabled_services(state).await {
+        Ok(_) => Ok(()),
+        Err(error) if error.code == Some("service_action_in_progress") => {
+            eprintln!(
+                "config-app: initial launch already in progress: {}",
+                error.message
+            );
+            Ok(())
+        }
+        Err(error) => bail!(
+            "failed launching enabled services before config app startup: {}",
+            error.message
+        ),
+    }
 }
 
 async fn shutdown_app(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1881,11 +1957,19 @@ fn spawn_background_child_reaper(mut child: Child, process_label: String) {
     });
 }
 
-fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
+async fn load_config_response(state: &AppState) -> Result<ConfigResponse> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || load_config_response_blocking(&state))
+        .await
+        .context("config status task failed")?
+}
+
+fn load_config_response_blocking(state: &AppState) -> Result<ConfigResponse> {
     let mut store = ManagedInstanceStore::load_or_default(state.paths.instance_store_path())?;
     refresh_store_client_identity_metadata(&mut store);
     let last_launch_report = load_last_launch_report(state.paths.launch_report_path())?;
-    let service_statuses = service_runtime_statuses(&store, last_launch_report.as_ref());
+    let service_statuses =
+        service_runtime_statuses_with_web_readiness(&store, last_launch_report.as_ref());
     Ok(ConfigResponse {
         platform: PLATFORM_KIND,
         desktop_config_version: DESKTOP_CLIENT_CONFIG_VERSION,
@@ -2628,7 +2712,7 @@ fn reconcile_managed_identity_target_blocking(
 async fn enroll_client_identity(
     identity: ClientIdentityConfig,
     bootstrap_content: Option<&str>,
-) -> Result<ClientIdentityEnrollmentReport, ApiError> {
+) -> Result<PreparedClientEnrollment, ApiError> {
     let bootstrap_content = bootstrap_content.map(str::to_owned);
     tokio::task::spawn_blocking(move || {
         let bootstrap_content = bootstrap_content.map(Ok).unwrap_or_else(|| {
@@ -2648,7 +2732,7 @@ async fn enroll_client_identity(
 fn enroll_client_identity_blocking(
     identity: &ClientIdentityConfig,
     bootstrap_content: &str,
-) -> Result<ClientIdentityEnrollmentReport, ApiError> {
+) -> Result<PreparedClientEnrollment, ApiError> {
     let enrolled =
         enroll_connection_input_blocking(bootstrap_content, None, Some(identity.label.as_str()))
             .map_err(|error| {
@@ -2657,21 +2741,15 @@ fn enroll_client_identity_blocking(
     let material = enrolled.client_identity_material().map_err(|error| {
         ApiError::internal(error.context("failed building client identity material"))
     })?;
-    material
-        .write_to_path(Path::new(&identity.client_identity_file))
-        .map_err(|error| {
-            ApiError::internal(error.context(format!(
-                "failed writing client identity {}",
-                identity.client_identity_file
-            )))
-        })?;
-
-    Ok(ClientIdentityEnrollmentReport {
-        identity_file: identity.client_identity_file.clone(),
-        cluster_id: material.cluster_id.to_string(),
-        device_id: material.device_id.to_string(),
-        connection_bootstrap_json: enrolled.connection_bootstrap_json,
-        server_base_url: enrolled.server_base_url,
+    Ok(PreparedClientEnrollment {
+        report: ClientIdentityEnrollmentReport {
+            identity_file: identity.client_identity_file.clone(),
+            cluster_id: material.cluster_id.to_string(),
+            device_id: material.device_id.to_string(),
+            connection_bootstrap_json: enrolled.connection_bootstrap_json,
+            server_base_url: enrolled.server_base_url,
+        },
+        material,
     })
 }
 
@@ -4555,6 +4633,58 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn enrollment_preparation_does_not_acquire_the_service_action_lock() {
+        let temp_dir = std::env::temp_dir().join(generate_instance_id("config-enrollment-lock"));
+        let mut state = test_app_state();
+        state.paths = ManagedPaths::new(
+            temp_dir.join("instances.json"),
+            temp_dir.join("report.json"),
+            temp_dir.join("package"),
+        );
+        let action = service_action::acquire(&state.paths).unwrap();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/client-identities")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"bootstrap_content":"{}","enroll":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Invalid enrollment input must reach preparation, even while another service action runs.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        drop(action);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_launch_preserves_store_errors_but_allows_an_existing_action() {
+        let temp_dir = std::env::temp_dir().join(generate_instance_id("config-initial-error"));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let mut state = test_app_state();
+        state.paths = ManagedPaths::new(
+            temp_dir.join("instances.json"),
+            temp_dir.join("report.json"),
+            temp_dir.join("package"),
+        );
+        fs::write(state.paths.instance_store_path(), "invalid JSON").unwrap();
+        let error = launch_initial_enabled_services(&state).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("before config app startup"));
+        assert!(message.contains("failed parsing managed instance store"));
+        assert!(message.contains("instances.json"));
+        assert!(message.contains("expected"));
+
+        let action = service_action::acquire(&state.paths).unwrap();
+        // A second config app may serve its UI while the first holds the launch transaction.
+        launch_initial_enabled_services(&state).await.unwrap();
+        drop(action);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
 
     #[tokio::test]
     async fn concurrent_start_is_rejected_without_replacing_the_tracked_process() {
