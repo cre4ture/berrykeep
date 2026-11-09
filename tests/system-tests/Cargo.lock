@@ -1871,7 +1871,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
- "tempfile",
 ]
 
 [[package]]
