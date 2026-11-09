@@ -2371,48 +2371,20 @@ mod tests {
         assert_eq!(client_web_probe_address(Some("invalid")), None);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn child_process_identity_loads_and_validates_command_arguments() {
-        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let mut outcome = LaunchOutcome {
-            instance_kind: "client-cli".to_string(),
-            id: "child-identity".to_string(),
-            label: "Child identity".to_string(),
-            executable: "/bin/sleep".to_string(),
-            command_line: vec!["30".to_string()],
-            log_file: None,
-            pid: Some(child.id()),
-            error: None,
-        };
-        let matched = launched_process_is_running(&outcome);
-        outcome.command_line = vec!["60".to_string()];
-        let mismatched = launched_process_is_running(&outcome);
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(
-            matched,
-            "the launched child and its arguments must be recognized"
-        );
-        assert!(
-            !mismatched,
-            "different arguments must not match the tracked child"
-        );
-    }
-
-    #[cfg(windows)]
     #[test]
     fn process_identity_child_fixture() {
-        if std::env::var_os("BERRYKEEP_PROCESS_IDENTITY_TEST_CHILD").is_some() {
+        if let Some(ready_file) = std::env::var_os("BERRYKEEP_PROCESS_IDENTITY_TEST_CHILD") {
             use std::io::Read;
+            fs::write(ready_file, b"ready").unwrap();
             let _ = std::io::stdin().read(&mut [0]);
         }
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_process_identity_preserves_empty_quoted_and_path_arguments() {
+    fn process_identity_preserves_empty_quoted_and_path_arguments() {
         let executable = std::env::current_exe().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ready_file = temp_dir.path().join("ready");
         let args: Vec<String> = [
             "--exact",
             "tests::process_identity_child_fixture",
@@ -2428,13 +2400,13 @@ mod tests {
         .collect();
         let mut child = Command::new(&executable)
             .args(&args)
-            .env("BERRYKEEP_PROCESS_IDENTITY_TEST_CHILD", "1")
+            .env("BERRYKEEP_PROCESS_IDENTITY_TEST_CHILD", &ready_file)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let outcome = LaunchOutcome {
+        let mut outcome = LaunchOutcome {
             instance_kind: "os-integration".to_string(),
             id: "quoted-child".to_string(),
             label: "Quoted child".to_string(),
@@ -2444,12 +2416,26 @@ mod tests {
             pid: Some(child.id()),
             error: None,
         };
+        let started = std::time::Instant::now();
+        while !ready_file.exists() && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
         let matched = launched_process_is_running(&outcome);
+        outcome.command_line.push("different-arguments".to_string());
+        let mismatched = launched_process_is_running(&outcome);
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(
+            ready_file.exists(),
+            "the child must initialize before checking its identity"
+        );
+        assert!(
             matched,
-            "Windows must preserve empty arguments, quotes, spaces, and trailing backslashes"
+            "process identity must preserve empty arguments, quotes, spaces, and trailing backslashes"
+        );
+        assert!(
+            !mismatched,
+            "different arguments must not match the tracked child"
         );
     }
 
