@@ -592,17 +592,7 @@ impl ConnectionBootstrap {
         &self,
         identity: &ClientIdentityMaterial,
     ) -> Result<BerryKeepClient> {
-        self.validate()?;
-        identity.validate()?;
-        if identity.cluster_id != self.cluster_id {
-            bail!(
-                "client identity cluster_id {} does not match bootstrap cluster_id {}",
-                identity.cluster_id,
-                self.cluster_id
-            );
-        }
-
-        let planned_targets = self.planned_targets()?;
+        let planned_targets = self.planned_client_targets(Some(identity))?;
         build_http_client_with_identity_from_planned_targets(&planned_targets, identity)
     }
 
@@ -726,7 +716,28 @@ impl ConnectionBootstrap {
     }
 
     pub fn build_client(&self) -> Result<BerryKeepClient> {
+        let planned_targets = self.planned_client_targets(None)?;
+        build_http_client_from_planned_targets(&planned_targets)
+    }
+
+    /// Returns the static transport routes that can be built for an optional
+    /// client identity without performing network quality probes.
+    pub(crate) fn planned_client_targets(
+        &self,
+        identity: Option<&ClientIdentityMaterial>,
+    ) -> Result<Vec<PlannedConnectionBootstrapTarget>> {
         self.validate()?;
+        if let Some(identity) = identity {
+            identity.validate()?;
+            if identity.cluster_id != self.cluster_id {
+                bail!(
+                    "client identity cluster_id {} does not match bootstrap cluster_id {}",
+                    identity.cluster_id,
+                    self.cluster_id
+                );
+            }
+            return self.planned_targets();
+        }
 
         let planned_targets = self.planned_targets()?;
         let direct_targets = planned_targets
@@ -748,7 +759,7 @@ impl ConnectionBootstrap {
             bail!("bootstrap does not contain a reachable direct client transport target");
         }
 
-        build_http_client_from_planned_targets(&direct_targets)
+        Ok(direct_targets)
     }
 
     pub fn build_client_with_optional_identity(
