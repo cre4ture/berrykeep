@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use uuid::Uuid;
 
+#[cfg(feature = "atomic-file")]
+pub mod atomic_file;
 pub mod content_fingerprint;
 pub mod legacy_compatibility;
 pub mod logging;

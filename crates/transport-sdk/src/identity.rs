@@ -173,11 +173,7 @@ impl ClientIdentityMaterial {
     }
 
     pub fn write_to_path(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
-        }
-        fs::write(path, self.to_json_pretty()?)
+        common::atomic_file::write(path, self.to_json_pretty()?.as_bytes())
             .with_context(|| format!("failed to write client identity {}", path.display()))
     }
 
@@ -224,6 +220,36 @@ impl ClientIdentityMaterial {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn atomic_identity_write_preserves_an_open_reader_snapshot() {
+        use std::io::Read;
+        let dir =
+            std::env::temp_dir().join(format!("berrykeep-atomic-identity-{}", Uuid::now_v7()));
+        let path = dir.join("identity.json");
+        let original =
+            ClientIdentityMaterial::generate(Uuid::now_v7(), None, Some("Original".to_string()))
+                .unwrap();
+        original.write_to_path(&path).unwrap();
+        let mut reader = fs::File::open(&path).unwrap();
+        let mut updated = original.clone();
+        updated.label = Some("Updated".to_string());
+        let saved = updated.write_to_path(&path);
+        let mut snapshot = String::new();
+        reader.read_to_string(&mut snapshot).unwrap();
+        assert_eq!(
+            ClientIdentityMaterial::from_json_str(&snapshot).unwrap(),
+            original
+        );
+        drop(reader);
+        #[cfg(not(windows))]
+        saved.unwrap();
+        #[cfg(windows)]
+        let _ = saved;
+        updated.write_to_path(&path).unwrap();
+        assert_eq!(ClientIdentityMaterial::from_path(&path).unwrap(), updated);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn client_enrollment_request_serializes_device_label_and_accepts_legacy_label() {

@@ -208,6 +208,9 @@ jobs:
       - name: Run unit tests
         run: cargo test --locked --workspace
 
+      - name: Test desktop config service controls
+        run: node --test apps/config-app/tests/service-controls.test.mjs
+
   web-smoke-tests:
     name: Web (${{ matrix.suite.label }})
     runs-on: ubuntu-latest

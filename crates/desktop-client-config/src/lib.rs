@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -119,7 +119,7 @@ impl ManagedInstanceStore {
         store.version = MANAGED_INSTANCE_STORE_VERSION;
         let payload = serde_json::to_vec_pretty(&store)
             .context("failed serializing managed instance store")?;
-        fs::write(path, payload)
+        common::atomic_file::write(path, &payload)
             .with_context(|| format!("failed writing managed instance store {}", path.display()))
     }
 
@@ -249,7 +249,7 @@ impl ManagedInstanceStore {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientIdentityConfig {
     pub id: String,
     pub label: String,
@@ -715,6 +715,11 @@ pub struct ServiceRuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
     pub running: bool,
+    /// Process liveness and web readiness are separate during connection setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_ui_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_ui_bind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -874,7 +879,7 @@ pub fn save_launch_report(path: &Path, report: &LaunchReport) -> Result<()> {
     let mut report = report.clone();
     report.version = LAUNCH_REPORT_VERSION;
     let payload = serde_json::to_vec_pretty(&report).context("failed serializing launch report")?;
-    fs::write(path, payload)
+    common::atomic_file::write(path, &payload)
         .with_context(|| format!("failed writing launch report {}", path.display()))
 }
 
@@ -1083,11 +1088,12 @@ pub fn service_runtime_statuses(
     let mut statuses = Vec::new();
 
     for instance in &store.client_cli_instances {
-        statuses.push(service_runtime_status(
+        let status = service_runtime_status(
             "client-cli",
             &instance.id,
             report.and_then(|report| last_launch_outcome(report, "client-cli", &instance.id)),
-        ));
+        );
+        statuses.push(status);
     }
 
     for instance in &store.os_integration_instances {
@@ -1107,6 +1113,55 @@ pub fn service_runtime_statuses(
     }
 
     statuses
+}
+
+/// Blocking readiness probes are opt-in; process-control callers only need liveness.
+/// Async callers must run this on their blocking pool.
+pub fn service_runtime_statuses_with_web_readiness(
+    store: &ManagedInstanceStore,
+    report: Option<&LaunchReport>,
+) -> Vec<ServiceRuntimeStatus> {
+    let mut statuses = service_runtime_statuses(store, report);
+    fill_client_web_readiness(&mut statuses);
+    statuses
+}
+
+fn fill_client_web_readiness(statuses: &mut [ServiceRuntimeStatus]) {
+    for status in statuses {
+        if status.instance_kind != "client-cli" || !status.running {
+            continue;
+        }
+        let bind = status.last_launch.as_ref().and_then(|launch| {
+            launch
+                .command_line
+                .windows(2)
+                .find(|args| args[0] == "--bind")
+                .map(|args| args[1].as_str())
+        });
+        let address = client_web_probe_address(bind);
+        status.web_ui_bind = address.map(|address| address.to_string());
+        status.web_ui_ready = address.map(|address| {
+            TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+        });
+    }
+}
+
+fn client_web_probe_address(bind: Option<&str>) -> Option<SocketAddr> {
+    let mut address = bind
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:8081")
+        .parse::<SocketAddr>()
+        .ok()?;
+    // A wildcard is a listen address, not an address to connect to.
+    if address.ip().is_unspecified() {
+        address.set_ip(if address.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    Some(address)
 }
 
 pub fn launch_report_with_updated_outcome(
@@ -1159,7 +1214,7 @@ pub fn stop_service_from_report(
         };
     };
 
-    if !process_is_running(pid) {
+    if !launched_process_is_running(outcome) {
         return StopOutcome {
             instance_kind: instance_kind.to_string(),
             id: id.to_string(),
@@ -1170,9 +1225,9 @@ pub fn stop_service_from_report(
         };
     }
 
-    match terminate_process(pid) {
+    match terminate_process(outcome) {
         Ok(()) => {
-            let stopped = wait_for_process_exit(pid, Duration::from_secs(2));
+            let stopped = wait_for_process_exit(outcome, Duration::from_secs(2));
             StopOutcome {
                 instance_kind: instance_kind.to_string(),
                 id: id.to_string(),
@@ -1203,8 +1258,8 @@ fn service_runtime_status(
     last_launch: Option<&LaunchOutcome>,
 ) -> ServiceRuntimeStatus {
     let running_pid = last_launch
-        .and_then(|outcome| outcome.pid)
-        .filter(|pid| process_is_running(*pid));
+        .filter(|outcome| launched_process_is_running(outcome))
+        .and_then(|outcome| outcome.pid);
     let log_file = last_launch
         .and_then(|outcome| outcome.log_file.clone())
         .or_else(|| {
@@ -1219,6 +1274,8 @@ fn service_runtime_status(
         id: id.to_string(),
         log_file,
         running: running_pid.is_some(),
+        web_ui_ready: None,
+        web_ui_bind: None,
         pid: running_pid,
         last_launch: last_launch.cloned(),
     }
@@ -1236,17 +1293,96 @@ fn last_launch_outcome<'a>(
         .find(|outcome| outcome.instance_kind == instance_kind && outcome.id == id)
 }
 
-fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+fn wait_for_process_exit(outcome: &LaunchOutcome, timeout: Duration) -> bool {
     let started_at = std::time::Instant::now();
     while started_at.elapsed() < timeout {
-        if !process_is_running(pid) {
+        if !launched_process_is_running(outcome) {
             return true;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    !process_is_running(pid)
+    !launched_process_is_running(outcome)
 }
 
+fn launched_process_is_running(outcome: &LaunchOutcome) -> bool {
+    let Some(pid) = outcome.pid else {
+        return false;
+    };
+    let pid = sysinfo::Pid::from_u32(pid);
+    let system = load_process_identity(pid);
+    system
+        .process(pid)
+        .is_some_and(|process| process_matches_launch(process, outcome))
+}
+
+fn load_process_identity(pid: sysinfo::Pid) -> sysinfo::System {
+    let mut system = sysinfo::System::new();
+    // The default refresh does not load command arguments on Linux. Both reuse
+    // and termination must request the metadata used by process_matches_launch.
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing()
+            .with_exe(sysinfo::UpdateKind::Always)
+            .with_cmd(sysinfo::UpdateKind::Always),
+    );
+    system
+}
+
+fn process_matches_launch(process: &sysinfo::Process, outcome: &LaunchOutcome) -> bool {
+    let Some(command_line) = process_command_line(process) else {
+        return false;
+    };
+    let expected = Path::new(&outcome.executable);
+    let matches_path = |path: &Path| {
+        #[cfg(windows)]
+        {
+            path.to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .eq_ignore_ascii_case(expected.to_string_lossy().trim_start_matches(r"\\?\"))
+        }
+        #[cfg(not(windows))]
+        {
+            path == expected
+        }
+    };
+    let executable_matches = process.exe().is_some_and(matches_path)
+        || command_line
+            .first()
+            .is_some_and(|arg| matches_path(Path::new(arg)));
+    executable_matches
+        && command_line
+            .iter()
+            .skip(1)
+            .map(|arg| arg.as_os_str())
+            .eq(outcome.command_line.iter().map(std::ffi::OsStr::new))
+}
+
+fn process_command_line(process: &sysinfo::Process) -> Option<Vec<std::ffi::OsString>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        // sysinfo trims whitespace and removes empty arguments on Linux. Read
+        // the native representation so identity comparison preserves both.
+        let bytes = fs::read(format!("/proc/{}/cmdline", process.pid())).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
+        Some(
+            bytes
+                .split(|byte| *byte == 0)
+                .map(|arg| std::ffi::OsString::from_vec(arg.to_vec()))
+                .collect(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(process.cmd().to_vec())
+    }
+}
+
+#[cfg(any(windows, test))]
 fn process_is_running(pid: u32) -> bool {
     let mut system = sysinfo::System::new();
     let pids = [sysinfo::Pid::from_u32(pid)];
@@ -1254,13 +1390,18 @@ fn process_is_running(pid: u32) -> bool {
     system.process(pids[0]).is_some()
 }
 
-fn terminate_process(pid: u32) -> Result<()> {
-    let mut system = sysinfo::System::new();
-    let pids = [sysinfo::Pid::from_u32(pid)];
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
-    let Some(process) = system.process(pids[0]) else {
+fn terminate_process(outcome: &LaunchOutcome) -> Result<()> {
+    let pid = outcome
+        .pid
+        .context("cannot stop a service without its process ID")?;
+    let pid = sysinfo::Pid::from_u32(pid);
+    let system = load_process_identity(pid);
+    let Some(process) = system.process(pid) else {
         return Ok(());
     };
+    if !process_matches_launch(process, outcome) {
+        return Ok(());
+    }
     if process.kill() {
         Ok(())
     } else {
@@ -2039,6 +2180,50 @@ mod tests {
     }
 
     #[test]
+    fn configuration_saves_preserve_open_reader_snapshots() {
+        fn verify(path: &Path, save: impl Fn() -> Result<()>) {
+            use std::io::Read;
+            let original = b"{\"snapshot\":\"original\"}";
+            fs::write(path, original).unwrap();
+            let mut reader = fs::File::open(path).unwrap();
+            let saved = save();
+            let mut observed = Vec::new();
+            reader.read_to_end(&mut observed).unwrap();
+            assert_eq!(
+                observed, original,
+                "an open reader must retain its complete snapshot"
+            );
+            drop(reader);
+            // Windows may refuse replacement while a reader holds the target.
+            // The previous snapshot must survive that failure, and a retry after
+            // the reader closes must still be able to replace the file.
+            #[cfg(not(windows))]
+            saved.unwrap();
+            #[cfg(windows)]
+            let _ = saved;
+            save().unwrap();
+        }
+        let store_path = temp_path("atomic-store");
+        verify(&store_path, || {
+            ManagedInstanceStore::default().save(&store_path)
+        });
+        ManagedInstanceStore::load_or_default(&store_path).unwrap();
+        let report_path = temp_path("atomic-report");
+        let report = LaunchReport {
+            version: LAUNCH_REPORT_VERSION,
+            launched_at_unix_ms: 1,
+            package_root: "test-package".to_string(),
+            total_enabled: 0,
+            outcomes: vec![],
+        };
+        verify(&report_path, || save_launch_report(&report_path, &report));
+        assert_eq!(load_last_launch_report(&report_path).unwrap(), Some(report));
+        for path in [store_path, report_path] {
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
     fn managed_instance_store_roundtrip_persists_version() {
         let path = temp_path("instance-store-roundtrip");
         let store = ManagedInstanceStore {
@@ -2180,6 +2365,123 @@ mod tests {
     }
 
     #[test]
+    fn client_web_readiness_normalizes_blank_and_wildcard_bind_addresses() {
+        let default = "127.0.0.1:8081".parse::<SocketAddr>().unwrap();
+        for bind in [None, Some(""), Some("  ")] {
+            assert_eq!(client_web_probe_address(bind), Some(default));
+        }
+        assert_eq!(
+            client_web_probe_address(Some("0.0.0.0:1234")),
+            Some("127.0.0.1:1234".parse().unwrap())
+        );
+        assert_eq!(
+            client_web_probe_address(Some("[::]:1234")),
+            Some("[::1]:1234".parse().unwrap())
+        );
+        assert_eq!(client_web_probe_address(Some("invalid")), None);
+    }
+
+    #[test]
+    fn process_identity_child_fixture() {
+        if let Some(ready_file) = std::env::var_os("BERRYKEEP_PROCESS_IDENTITY_TEST_CHILD") {
+            use std::io::Read;
+            fs::write(ready_file, b"ready").unwrap();
+            let _ = std::io::stdin().read(&mut [0]);
+        }
+    }
+
+    #[test]
+    fn process_identity_preserves_empty_quoted_and_path_arguments() {
+        let executable = std::env::current_exe().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ready_file = temp_dir.path().join("ready");
+        let args: Vec<String> = [
+            "--exact",
+            "tests::process_identity_child_fixture",
+            "--nocapture",
+            "--",
+            "",
+            " surrounding whitespace ",
+            r"C:\folder with spaces\",
+            r#"a "quoted" value"#,
+            r"C:\trailing\\",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut child = Command::new(&executable)
+            .args(&args)
+            .env("BERRYKEEP_PROCESS_IDENTITY_TEST_CHILD", &ready_file)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut outcome = LaunchOutcome {
+            instance_kind: "os-integration".to_string(),
+            id: "quoted-child".to_string(),
+            label: "Quoted child".to_string(),
+            executable: executable.display().to_string(),
+            command_line: args.clone(),
+            log_file: None,
+            pid: Some(child.id()),
+            error: None,
+        };
+        let started = std::time::Instant::now();
+        while !ready_file.exists() && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let system = load_process_identity(sysinfo::Pid::from_u32(child.id()));
+        let process = system.process(sysinfo::Pid::from_u32(child.id()));
+        let matched = process.is_some_and(|process| process_matches_launch(process, &outcome));
+        let observed = process.map(|process| (process.exe(), process.cmd()));
+        outcome.command_line.push("different-arguments".to_string());
+        let mismatched = launched_process_is_running(&outcome);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            ready_file.exists(),
+            "the child must initialize before checking its identity"
+        );
+        assert!(
+            matched,
+            "process identity must preserve empty arguments, quotes, spaces, and trailing backslashes: {observed:?}; expected: {args:?}"
+        );
+        assert!(
+            !mismatched,
+            "different arguments must not match the tracked child"
+        );
+    }
+
+    #[test]
+    fn client_service_reports_starting_until_its_web_port_is_listening() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        let mut statuses: Vec<ServiceRuntimeStatus> = serde_json::from_value(serde_json::json!([{
+            "instance_kind":"client-cli", "id":"web-client", "running":true,
+            "last_launch": {"instance_kind":"client-cli", "id":"web-client", "label":"Client",
+                "executable":"client", "command_line":["serve-web", "--bind", "127.0.0.1:0"],
+                "pid":null, "error":null}
+        }]))
+        .unwrap();
+        fill_client_web_readiness(&mut statuses);
+        assert_eq!(statuses[0].web_ui_ready, Some(false));
+        statuses[0].last_launch.as_mut().unwrap().command_line[2] = bind.clone();
+        fill_client_web_readiness(&mut statuses);
+        assert_eq!(statuses[0].web_ui_ready, Some(true));
+        assert_eq!(statuses[0].web_ui_bind.as_deref(), Some(bind.as_str()));
+        statuses[0].last_launch.as_mut().unwrap().command_line[2] = "invalid-address".to_string();
+        fill_client_web_readiness(&mut statuses);
+        assert_eq!(statuses[0].web_ui_ready, None);
+        assert_eq!(statuses[0].web_ui_bind, None);
+        // Readiness follows the launched command, even if a later store edit changes bind.
+        statuses[0] = service_runtime_status("client-cli", "web-client", None);
+        fill_client_web_readiness(&mut statuses);
+        assert!(!statuses[0].running);
+        assert_eq!(statuses[0].web_ui_ready, None);
+    }
+
+    #[test]
     fn service_runtime_statuses_report_current_process_running() {
         let store = ManagedInstanceStore {
             folder_agent_instances: vec![FolderAgentInstance {
@@ -2213,7 +2515,7 @@ mod tests {
                     .expect("current exe should resolve")
                     .display()
                     .to_string(),
-                command_line: Vec::new(),
+                command_line: std::env::args().skip(1).collect(),
                 log_file: None,
                 pid: Some(std::process::id()),
                 error: None,
@@ -2234,6 +2536,25 @@ mod tests {
         assert!(statuses[0].running);
         assert_eq!(statuses[0].pid, Some(std::process::id()));
         assert!(statuses[0].last_launch.is_some());
+    }
+
+    #[test]
+    fn a_recycled_pid_is_neither_reused_nor_stopped() {
+        let outcome = LaunchOutcome {
+            instance_kind: "client-cli".to_string(),
+            id: "old".to_string(),
+            label: "Old".to_string(),
+            executable: "/a/different/executable".to_string(),
+            command_line: Vec::new(),
+            log_file: None,
+            pid: Some(std::process::id()),
+            error: None,
+        };
+        assert!(!service_runtime_status("client-cli", "old", Some(&outcome)).running);
+        let report = launch_report_with_updated_outcome(None, Path::new("/test"), outcome);
+        let stop = stop_service_from_report(Some(&report), "client-cli", "old");
+        assert!(!stop.was_running);
+        assert!(!stop.stopped);
     }
 
     #[test]
