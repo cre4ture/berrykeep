@@ -133,6 +133,11 @@ pub struct NodeBootstrap {
     pub internal_url: Option<String>,
     #[serde(default)]
     pub internal_tls: Option<BootstrapTlsFiles>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendezvous_services: Vec<crate::RendezvousServiceConfig>,
+    /// Cached cluster-owned lookup hints, excluded from node-local defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendezvous_contact_urls: Vec<String>,
     pub rendezvous_urls: Vec<String>,
     #[serde(default)]
     pub rendezvous_mtls_required: bool,
@@ -313,6 +318,19 @@ impl NodeBootstrap {
             bail!("node bootstrap internal_tls requires internal_bind_addr");
         }
         validate_url_list("rendezvous_urls", &self.rendezvous_urls)?;
+        let services = crate::resolve_rendezvous_services_with_contact_hints(
+            &self.rendezvous_urls,
+            &self.rendezvous_services,
+            &self.rendezvous_contact_urls,
+            false,
+        )?;
+        if !self.rendezvous_mtls_required
+            && services
+                .iter()
+                .any(|service| service.global_registration_enabled)
+        {
+            bail!("global rendezvous registration requires rendezvous mTLS to be enabled");
+        }
         validate_endpoint_list(&self.direct_endpoints)?;
         validate_trust_roots(&self.trust_roots)?;
         Ok(())
@@ -685,6 +703,8 @@ mod tests {
                 cert_path: "tls/node.pem".to_string(),
                 key_path: "tls/node.key".to_string(),
             }),
+            rendezvous_services: Vec::new(),
+            rendezvous_contact_urls: Vec::new(),
             rendezvous_urls: vec!["https://rendezvous.example".to_string()],
             rendezvous_mtls_required: true,
             direct_endpoints: vec![BootstrapEndpoint {
@@ -705,6 +725,13 @@ mod tests {
         bootstrap
             .validate()
             .expect("node bootstrap should validate");
+        let mut invalid = bootstrap;
+        invalid.rendezvous_mtls_required = false;
+        invalid.rendezvous_services = vec![crate::RendezvousServiceConfig {
+            url: "https://global.example/".to_string(),
+            global_registration_enabled: true,
+        }];
+        assert!(invalid.validate().unwrap_err().to_string().contains("mTLS"));
     }
 
     #[test]
@@ -759,6 +786,8 @@ mod tests {
                     cert_path: "tls/node.pem".to_string(),
                     key_path: "tls/node.key".to_string(),
                 }),
+                rendezvous_services: Vec::new(),
+                rendezvous_contact_urls: Vec::new(),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),
@@ -802,6 +831,8 @@ mod tests {
                     cert_path: "tls/node.pem".to_string(),
                     key_path: "tls/node.key".to_string(),
                 }),
+                rendezvous_services: Vec::new(),
+                rendezvous_contact_urls: Vec::new(),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),
@@ -845,6 +876,8 @@ mod tests {
                     cert_path: "tls/node.pem".to_string(),
                     key_path: "tls/node.key".to_string(),
                 }),
+                rendezvous_services: Vec::new(),
+                rendezvous_contact_urls: Vec::new(),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),
@@ -890,6 +923,8 @@ mod tests {
                     cert_path: "tls/node.pem".to_string(),
                     key_path: "tls/node.key".to_string(),
                 }),
+                rendezvous_services: Vec::new(),
+                rendezvous_contact_urls: Vec::new(),
                 rendezvous_urls: vec!["https://rendezvous.example".to_string()],
                 rendezvous_mtls_required: false,
                 direct_endpoints: Vec::new(),

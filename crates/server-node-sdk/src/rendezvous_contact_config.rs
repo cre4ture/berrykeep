@@ -18,6 +18,18 @@ pub(crate) struct RendezvousContactConfiguration {
     pub(crate) schema_version: u32,
     #[serde(default)]
     pub(crate) rendezvous_urls: Vec<String>,
+    #[serde(default)]
+    pub(crate) rendezvous_services: Vec<transport_sdk::RendezvousServiceConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct UpdateRendezvousContactConfiguration {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    rendezvous_urls: Vec<String>,
+    #[serde(default)]
+    rendezvous_services: Option<Vec<transport_sdk::RendezvousServiceConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +55,7 @@ fn default_configuration() -> RendezvousContactConfiguration {
     RendezvousContactConfiguration {
         schema_version: RENDEZVOUS_CONTACT_CONFIGURATION_SCHEMA_VERSION,
         rendezvous_urls: Vec::new(),
+        rendezvous_services: Vec::new(),
     }
 }
 
@@ -112,7 +125,7 @@ pub(crate) async fn admin_get_config(
 pub(crate) async fn admin_put_config(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(configuration): Json<RendezvousContactConfiguration>,
+    Json(request): Json<UpdateRendezvousContactConfiguration>,
 ) -> impl IntoResponse {
     let action = "auth/cluster/rendezvous-contacts/put";
     let authz = match authorize_admin_request(
@@ -121,7 +134,10 @@ pub(crate) async fn admin_put_config(
         action,
         true,
         true,
-        json!({ "rendezvous_url_count": configuration.rendezvous_urls.len() }),
+        rendezvous_admin_audit::request_details(
+            Some(&request.rendezvous_urls),
+            request.rendezvous_services.as_deref(),
+        ),
     )
     .await
     {
@@ -129,7 +145,7 @@ pub(crate) async fn admin_put_config(
         Err(status) => return status.into_response(),
     };
 
-    let configuration = match normalize_configuration(configuration) {
+    let configuration = match prepare_update(&state, request).await {
         Ok(configuration) => configuration,
         Err(err) => {
             append_admin_audit(
@@ -209,6 +225,7 @@ pub(crate) async fn admin_put_config(
             "storage_key": RENDEZVOUS_CONTACT_CONFIGURATION_STORAGE_KEY,
             "version_id": outcome.version_id,
             "rendezvous_url_count": configuration.rendezvous_urls.len(),
+            "rendezvous_services": configuration.rendezvous_services,
         }),
     )
     .await;
@@ -222,6 +239,34 @@ pub(crate) async fn admin_put_config(
         }),
     )
         .into_response()
+}
+
+async fn prepare_update(
+    state: &ServerState,
+    request: UpdateRendezvousContactConfiguration,
+) -> Result<RendezvousContactConfiguration> {
+    let existing_services = load_current_rendezvous_services(state).await?;
+    let urls = normalize_rendezvous_url_list(&request.rendezvous_urls)?;
+    let services = match request.rendezvous_services {
+        Some(services) => services,
+        None => existing_services
+            .iter()
+            .filter(|service| urls.contains(&service.url))
+            .cloned()
+            .collect(),
+    };
+    let configuration = normalize_configuration(RendezvousContactConfiguration {
+        schema_version: request.schema_version,
+        rendezvous_urls: urls,
+        rendezvous_services: services,
+    })?;
+    rendezvous_registration_policy::validate_services(
+        state,
+        &configuration.rendezvous_services,
+        &existing_services,
+    )
+    .await?;
+    Ok(configuration)
 }
 
 async fn load_current_configuration(
@@ -263,17 +308,52 @@ async fn load_current_configuration(
     let configuration = serde_json::from_slice::<RendezvousContactConfiguration>(&payload)
         .context("failed parsing rendezvous contact configuration")?;
     Ok(LoadedRendezvousContactConfiguration {
-        configuration: normalize_configuration(configuration)?,
+        configuration: normalize_stored_configuration(configuration)?,
         stored: true,
         version_id,
     })
 }
 
-pub(crate) async fn load_current_rendezvous_urls(state: &ServerState) -> Result<Vec<String>> {
-    Ok(load_current_configuration(state)
+pub(crate) async fn load_current_rendezvous_services(
+    state: &ServerState,
+) -> Result<Vec<transport_sdk::RendezvousServiceConfig>> {
+    Ok(load_current_rendezvous_snapshot(state)
         .await?
-        .configuration
-        .rendezvous_urls)
+        .unwrap_or_default())
+}
+
+/// Absence means the cluster object has not arrived; a stored empty list is an
+/// authoritative removal of all inherited contacts.
+pub(crate) async fn load_current_rendezvous_snapshot(
+    state: &ServerState,
+) -> Result<Option<Vec<transport_sdk::RendezvousServiceConfig>>> {
+    let loaded = load_current_configuration(state).await?;
+    Ok(loaded
+        .stored
+        .then_some(loaded.configuration.rendezvous_services))
+}
+
+fn normalize_stored_configuration(
+    mut configuration: RendezvousContactConfiguration,
+) -> Result<RendezvousContactConfiguration> {
+    // The old URL-only writer accepted opaque URLs such as host:port. Ignore
+    // those unusable legacy entries on read so discovery and repair remain
+    // available. All new writes and explicit service policies stay strict.
+    if configuration.rendezvous_services.is_empty() {
+        let original_count = configuration.rendezvous_urls.len();
+        configuration.rendezvous_urls.retain(|url| {
+            transport_sdk::resolve_rendezvous_services(std::slice::from_ref(url), &[], false)
+                .is_ok()
+        });
+        let rejected_count = original_count - configuration.rendezvous_urls.len();
+        if rejected_count > 0 {
+            warn!(
+                rejected_count,
+                "ignored invalid legacy rendezvous contacts; repair the cluster contact list"
+            );
+        }
+    }
+    normalize_configuration(configuration)
 }
 
 fn normalize_configuration(
@@ -286,13 +366,22 @@ fn normalize_configuration(
             RENDEZVOUS_CONTACT_CONFIGURATION_SCHEMA_VERSION
         );
     }
-    if configuration.rendezvous_urls.len() > MAX_RENDEZVOUS_CONTACT_URLS {
+    configuration.rendezvous_services = transport_sdk::resolve_rendezvous_services(
+        &configuration.rendezvous_urls,
+        &configuration.rendezvous_services,
+        false,
+    )?;
+    if configuration.rendezvous_services.len() > MAX_RENDEZVOUS_CONTACT_URLS {
         bail!(
             "rendezvous contact configuration supports at most {MAX_RENDEZVOUS_CONTACT_URLS} URLs"
         );
     }
 
-    configuration.rendezvous_urls = normalize_rendezvous_url_list(&configuration.rendezvous_urls)?;
+    configuration.rendezvous_urls = configuration
+        .rendezvous_services
+        .iter()
+        .map(|service| service.url.clone())
+        .collect();
     Ok(configuration)
 }
 
@@ -304,6 +393,7 @@ mod tests {
     fn normalizes_duplicate_urls_without_reordering_contacts() {
         let configuration = normalize_configuration(RendezvousContactConfiguration {
             schema_version: RENDEZVOUS_CONTACT_CONFIGURATION_SCHEMA_VERSION,
+            rendezvous_services: Vec::new(),
             rendezvous_urls: vec![
                 "https://relay.example:19080".to_string(),
                 "https://relay.example:19080".to_string(),
@@ -325,6 +415,7 @@ mod tests {
     fn rejects_unknown_schema_version() {
         let err = normalize_configuration(RendezvousContactConfiguration {
             schema_version: RENDEZVOUS_CONTACT_CONFIGURATION_SCHEMA_VERSION + 1,
+            rendezvous_services: Vec::new(),
             rendezvous_urls: Vec::new(),
         })
         .expect_err("unknown schema version must be rejected");

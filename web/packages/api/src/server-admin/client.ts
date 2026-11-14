@@ -81,6 +81,7 @@ import type {
   RendezvousContactConfiguration,
   RendezvousContactConfigurationResponse,
   RendezvousConfigView,
+  RendezvousServiceConfig,
   ReplicationPlan,
   S3AccessKeyView,
   S3BucketView,
@@ -1574,7 +1575,7 @@ export async function updateNodeConnectionPriority(
 }
 
 export async function updateRendezvousConfig(
-  request: { editable_urls: string[] },
+  request: { editable_urls: string[]; editable_services?: RendezvousServiceConfig[] },
   adminTokenOverride?: string
 ): Promise<RendezvousConfigView> {
   return fetchAdminJson<RendezvousConfigView>(apiV1("/auth/rendezvous-config"), {

@@ -1195,7 +1195,14 @@ export type NodeCertificateStatusResponse = {
   };
 };
 
+export type RendezvousServiceConfig = {
+  url: string;
+  global_registration_enabled: boolean;
+};
+
 export type RendezvousConfigView = {
+  editable_services?: RendezvousServiceConfig[];
+  effective_services?: RendezvousServiceConfig[];
   effective_urls: string[];
   editable_urls: string[];
   managed_embedded_url: string | null;
@@ -1219,6 +1226,7 @@ export type RendezvousConfigView = {
 export type RendezvousContactConfiguration = {
   schema_version: number;
   rendezvous_urls: string[];
+  rendezvous_services?: RendezvousServiceConfig[];
 };
 
 export type RendezvousContactConfigurationResponse = {

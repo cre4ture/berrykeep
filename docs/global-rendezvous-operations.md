@@ -50,6 +50,107 @@ These names are the Phase-2 contract. The service and node must not silently
 substitute alternate names or treat node opt-in as permission to bypass the
 global service gate.
 
+## Per-service registration policy
+
+The Server Admin Control Plane page stores a **Global rendezvous service**
+setting beside each operator-managed URL and each cluster contact. Enable it
+only for a service that accepts self-registration of independent clusters.
+The service-side registration gate must also be enabled.
+
+The node configuration API accepts `editable_services`, and the replicated
+contact configuration accepts `rendezvous_services`. Each entry contains:
+
+```json
+{
+  "url": "https://rendezvous.example.com/",
+  "global_registration_enabled": true
+}
+```
+
+Node-local entries are persisted in the node enrollment package. Cluster
+contacts carry their policy in the versioned contact object and replicate with
+it. An explicit node-local policy takes precedence when the same URL is also a
+cluster contact. The embedded managed rendezvous always remains cluster-specific.
+
+Issued enrollment packages retain contact URLs as bootstrap lookup hints, but
+export only explicit local policies. The optional `rendezvous_contact_urls`
+field records the hint addresses independently; `rendezvous_urls` remains the
+combined URL list for compatibility. The legacy global default applies only to
+local addresses, while explicit per-service overrides still take precedence.
+URL-only hints inherit subsequent contact policy changes, including revocation
+of global registration. Legacy URL-only edits preserve that distinction across
+persistence and restart. Saving the operator-managed service editor writes
+explicit local policies. Inherited contact
+hints appear in the effective configuration and cluster contact editor, rather
+than as local service rows; saving unrelated local settings preserves inheritance.
+Hints remain available until the confirmed contact object reaches the node.
+Once it arrives, its list refreshes inherited hints in runtime configuration and
+the enrollment package, including newly advertised addresses. An explicitly
+empty list removes all inherited hints. Explicit local overrides remain under
+operator control.
+Node-owned URLs in older enrollment packages remain editable when the cluster
+also advertises the same address. URL-only saves retain that local ownership.
+The persisted mTLS requirement is derived from the node's current configuration
+and its explicit global roles. Removing a global role does not disable mTLS
+that the node itself still requires.
+
+Startup compatibility: all rendezvous URLs now require an HTTP or HTTPS scheme
+and a host, including private services and legacy URL-only configuration.
+Replace `rendezvous.example:9443` with `https://rendezvous.example:9443` before
+upgrading. That malformed value previously left the node running with failed
+registration attempts; startup now rejects it with a rendezvous service URL
+validation error.
+On reading an older URL-only cluster contact object, unusable entries are
+omitted with a warning so discovery and admin repair remain available. Replace
+the list through the contact editor to persist corrected values; new writes
+always require valid HTTP(S) URLs.
+
+The URL-only API fields remain available for existing clients and bootstraps.
+Old entries default to cluster-specific. For startup URLs without an explicit
+per-service policy, `BERRYKEEP_GLOBAL_RENDEZVOUS_REGISTRATION_ENABLED=true`
+retains its legacy meaning of enabling global registration. An explicit
+per-service setting overrides that default, including `false`; selecting a
+global service in the UI does not require setting this environment variable.
+
+Enabling a new global entry, including a local override of an inherited global
+role, requires HTTPS, active rendezvous participation, rendezvous mTLS, a
+readable and valid internal TLS client identity, and the service's trusted CA
+material.
+Retaining a replicated global entry does not require changing a node's legacy
+local mTLS switch. Issued node bootstraps require mTLS whenever they include a
+global service.
+
+The rendezvous trust setting is node-wide and accepts a concatenated PEM CA
+bundle with the trust roots for all configured services. When private and global
+services use independent CAs, include both roots. Configure a dedicated bundle
+file using `BERRYKEEP_RENDEZVOUS_CA_CERT`, or supply the bundle in the enrollment
+package's `trust_roots.rendezvous_ca_pem`. Keep the cluster identity CA file
+separate; adding service trust roots must not change the cluster ownership CA.
+Selecting a global role does not automatically install that service's CA.
+
+Client bootstrap metadata and client certificate issuance also derive their
+mTLS requirement from active global contacts, even when the legacy node-local
+mTLS switch is off. A node without the cluster signing key rejects client
+credential issuance that it cannot complete for those services.
+
+Nodes first publish presence using their existing cluster identity. If the
+service rejects presence, a node holding the cluster CA signing key and an
+internal TLS identity can perform the ownership proof, then retry presence.
+Other nodes keep attempting ordinary presence. Changes apply live; endpoint
+requests run concurrently within each heartbeat iteration. A recovering endpoint
+can extend that iteration's network wait by roughly 30 seconds (presence, two
+enrollment requests, then presence retry), delaying the next refresh for other
+endpoints. Enrollment does not block node startup. Healthy presence refreshes a
+60-second grace period against repeated proofs. Persistent failures after that
+period can recover a lost registry entry. Failed proofs and rejected presence
+after a successful proof both back off from 5 seconds to a maximum of 5 minutes;
+only successful presence clears the failure count. Enrollment requests keep
+their own timeout budget, separate from presence requests, and
+read current trust material for each proof attempt. This recovery does not
+replace an existing cluster CA: Option 1 still rejects cluster CA rotation.
+When recovery fails, the endpoint diagnostic retains both the initial presence
+failure and the recovery failure.
+
 ## Registry and admission
 
 - [ ] Enforce exactly one active P-256 CA per `cluster_id`. The cluster SAN on
