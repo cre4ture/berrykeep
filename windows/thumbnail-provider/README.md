@@ -283,6 +283,11 @@ Why the version bump matters:
 
 ## Diagnostics
 
+For service controls and client startup diagnostics, see the
+[config app documentation](../../apps/config-app/README.md#managed-client-startup-status).
+
+### Thumbnail provider logs
+
 The prototype DLL now writes a simple log file to:
 
 - `%LocalAppData%\BerryKeep\thumbnail-provider.log`

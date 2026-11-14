@@ -265,23 +265,19 @@ impl ConnectionBootstrap {
         identity: Option<ClientIdentityMaterial>,
         options: ManagedClientOptions,
     ) -> Result<ManagedBerryKeepClient> {
-        self.validate()?;
-        if let Some(identity) = identity.as_ref() {
-            identity.validate()?;
-            if identity.cluster_id != self.cluster_id {
-                anyhow::bail!(
-                    "client identity cluster_id {} does not match bootstrap cluster_id {}",
-                    identity.cluster_id,
-                    self.cluster_id
-                );
-            }
-        }
-        let client = self
-            .build_client_with_optional_identity(identity.as_ref())?
-            .with_route_maintenance_policy(options.route_maintenance_policy)
-            .with_connection_diagnostic_impact(
-                ClientConnectionDiagnosticImpact::BackgroundMaintenance,
-            );
+        // A managed client owns route discovery and health maintenance after it
+        // has been created. Its initial static routes must therefore be
+        // constructible while every remote endpoint is offline: local surfaces
+        // such as the desktop and mobile Web UI still need to start and report
+        // that disconnected state. Startup quality probes belong to explicit
+        // foreground operations, not construction of this long-lived handle.
+        let initial_targets = self.planned_client_targets(identity.as_ref())?;
+        let client = build_unprobed_client_with_optional_identity_from_planned_targets(
+            &initial_targets,
+            identity.as_ref(),
+        )?
+        .with_route_maintenance_policy(options.route_maintenance_policy)
+        .with_connection_diagnostic_impact(ClientConnectionDiagnosticImpact::BackgroundMaintenance);
         let controller = Arc::new(ManagedRouteController {
             client: client.clone(),
             bootstrap: Mutex::new(self.clone()),
@@ -1245,6 +1241,77 @@ mod tests {
             managed.client().connection_diagnostic_impact(),
             ClientConnectionDiagnosticImpact::UserFacing
         );
+    }
+
+    #[tokio::test]
+    async fn managed_client_with_multiple_offline_routes_starts_without_quality_probes() {
+        let cluster_id = Uuid::now_v7();
+        let bootstrap = ConnectionBootstrap {
+            version: 1,
+            cluster_id,
+            rendezvous_urls: Vec::new(),
+            rendezvous_contact_list: None,
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![
+                BootstrapEndpoint {
+                    url: "http://127.0.0.1:9".to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(NodeId::new_v4()),
+                    node_hostname: None,
+                },
+                BootstrapEndpoint {
+                    url: "http://127.0.0.1:10".to_string(),
+                    usage: Some(BootstrapEndpointUse::PublicApi),
+                    node_id: Some(NodeId::new_v4()),
+                    node_hostname: None,
+                },
+            ],
+            relay_mode: RelayMode::Disabled,
+            trust_roots: BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+            node_priority_overrides: BTreeMap::new(),
+        };
+        let mut identity = ClientIdentityMaterial::generate(cluster_id, None, None)
+            .expect("test identity should generate");
+        identity.credential_pem = Some("issued-credential".to_string());
+
+        let managed = tokio::time::timeout(
+            Duration::from_millis(500),
+            bootstrap.build_managed_client_with_identity(
+                identity,
+                ManagedClientOptions {
+                    initial_discovery_timeout: Duration::ZERO,
+                    ..ManagedClientOptions::default()
+                },
+            ),
+        )
+        .await
+        .expect("managed client construction should not probe offline routes")
+        .expect("managed client should retain offline routes");
+
+        assert_eq!(managed.route_snapshot().endpoints.len(), 2);
+
+        let anonymous_managed = tokio::time::timeout(
+            Duration::from_millis(500),
+            bootstrap.build_managed_client(
+                None,
+                ManagedClientOptions {
+                    initial_discovery_timeout: Duration::ZERO,
+                    ..ManagedClientOptions::default()
+                },
+            ),
+        )
+        .await
+        .expect("anonymous managed client construction should not probe offline routes")
+        .expect("anonymous managed client should retain offline routes");
+
+        assert_eq!(anonymous_managed.route_snapshot().endpoints.len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
