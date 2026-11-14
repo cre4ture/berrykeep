@@ -988,6 +988,17 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
                 registration.prefix
             ));
         }
+
+        if let Err(error) = register_sync_root_with_explorer_shell(
+            registration,
+            &expected_shell_sync_root_id,
+            &existing.identity,
+        ) {
+            tracing::warn!(
+                "sync-root registration: failed to refresh Explorer metadata for {}: {error:#}",
+                registration.root_path.display(),
+            );
+        }
         return Ok(existing.identity);
     }
 
@@ -1008,11 +1019,7 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
         ));
     }
 
-    let display_name = U16String::from_str(&registration.display_name);
-    let provider_version = U16String::from_str(env!("CARGO_PKG_VERSION"));
-    let icon_resource = current_executable_icon_resource()?;
     let sync_root_identity = expected_identity(uuid::Uuid::now_v7());
-    let sync_root_identity_blob = sync_root_identity.encoded();
     tracing::info!(
         "sync-root registration: path={} hydration_type=Progressive hydration_policy=allow_platform_dehydration population_type=AlwaysFull allow_pinning=true cluster_id={} prefix='{}' provider_instance_id={}",
         registration.root_path.display(),
@@ -1021,21 +1028,11 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
         sync_root_identity.provider_instance_id
     );
 
-    Registration::from_sync_root_id(&expected_shell_sync_root_id)
-        .display_name(display_name.as_ref())
-        .icon(icon_resource, 0)
-        .version(provider_version.as_ref())
-        .hydration_type(HydrationType::Progressive)
-        .hydration_policy(HydrationPolicy::default().allow_platform_dehydration())
-        // The current adapter eagerly materializes the full namespace and does not
-        // implement on-demand FETCH_PLACEHOLDERS callbacks, so Explorer must treat
-        // the sync root as fully populated.
-        .population_type(PopulationType::AlwaysFull)
-        .allow_pinning()
-        .show_siblings_as_group()
-        .blob(&sync_root_identity_blob)
-        .register(&registration.root_path)
-        .map_err(|error| anyhow!("failed to register sync root with Explorer shell: {error}"))?;
+    register_sync_root_with_explorer_shell(
+        registration,
+        &expected_shell_sync_root_id,
+        &sync_root_identity,
+    )?;
 
     match load_registered_sync_root_context(&registration.root_path) {
         Ok(Some(existing)) => {
@@ -2828,6 +2825,47 @@ fn current_executable_icon_resource() -> Result<U16String> {
     Ok(U16String::from_os_str(current_executable.as_os_str()))
 }
 
+fn register_sync_root_with_explorer_shell(
+    registration: &SyncRootRegistration,
+    shell_sync_root_id: &SyncRootId,
+    sync_root_identity: &SyncRootIdentity,
+) -> Result<()> {
+    let icon_resource = current_executable_icon_resource()?;
+    write_sync_root_shell_registration(
+        registration,
+        shell_sync_root_id,
+        sync_root_identity,
+        icon_resource,
+    )
+}
+
+fn write_sync_root_shell_registration(
+    registration: &SyncRootRegistration,
+    shell_sync_root_id: &SyncRootId,
+    sync_root_identity: &SyncRootIdentity,
+    icon_resource: U16String,
+) -> Result<()> {
+    let display_name = U16String::from_str(&registration.display_name);
+    let provider_version = U16String::from_str(env!("CARGO_PKG_VERSION"));
+    let sync_root_identity_blob = sync_root_identity.encoded();
+
+    Registration::from_sync_root_id(shell_sync_root_id)
+        .display_name(display_name.as_ref())
+        .icon(icon_resource, 0)
+        .version(provider_version.as_ref())
+        .hydration_type(HydrationType::Progressive)
+        .hydration_policy(HydrationPolicy::default().allow_platform_dehydration())
+        // The current adapter eagerly materializes the full namespace and does not
+        // implement on-demand FETCH_PLACEHOLDERS callbacks, so Explorer must treat
+        // the sync root as fully populated.
+        .population_type(PopulationType::AlwaysFull)
+        .allow_pinning()
+        .show_siblings_as_group()
+        .blob(&sync_root_identity_blob)
+        .register(&registration.root_path)
+        .map_err(|error| anyhow!("failed to register sync root with Explorer shell: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2872,6 +2910,82 @@ mod tests {
 
         let registration = SyncRootRegistration::new("id", "", "C:/berrykeep", cluster_id, None);
         assert!(register_sync_root(&registration).is_err());
+    }
+
+    #[test]
+    fn registration_refreshes_an_existing_sync_root() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("berrykeep-registration-refresh-{unique}"));
+        let _guard = TestSyncRootGuard::new(sync_root.clone());
+        let registration = SyncRootRegistration::new(
+            format!("registration-refresh-{unique}"),
+            "BerryKeep Test",
+            &sync_root,
+            uuid::Uuid::new_v4(),
+            None,
+        );
+
+        let registered_identity = register_sync_root(&registration)
+            .expect("initial sync root registration should succeed");
+
+        let shell_sync_root_id =
+            build_shell_sync_root_id(&registration).expect("shell sync root id should build");
+        write_sync_root_shell_registration(
+            &registration,
+            &shell_sync_root_id,
+            &registered_identity,
+            U16String::from_str("C:\\Windows\\System32\\imageres.dll"),
+        )
+        .expect("test setup should replace the registered icon");
+        assert_eq!(
+            registered_shell_icon_resource(&shell_sync_root_id)
+                .expect("Explorer shell registration should expose the test icon"),
+            "C:\\Windows\\System32\\imageres.dll,0",
+        );
+
+        let refreshed_identity = register_sync_root(&registration)
+            .expect("existing sync root registration should refresh");
+
+        assert_eq!(refreshed_identity, registered_identity);
+        assert_eq!(
+            registered_shell_icon_resource(&shell_sync_root_id)
+                .expect("Explorer shell registration should expose the refreshed icon"),
+            format!(
+                "{},0",
+                current_executable_icon_resource()
+                    .expect("current executable icon")
+                    .to_string_lossy()
+            ),
+        );
+    }
+
+    fn registered_shell_icon_resource(shell_sync_root_id: &SyncRootId) -> Result<String> {
+        let sync_root_id = shell_sync_root_id.as_hstring().to_string_lossy();
+        let registry_key = format!(
+            r"HKLM\Software\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{sync_root_id}"
+        );
+        let output = std::process::Command::new("reg.exe")
+            .args(["query", &registry_key, "/v", "IconResource"])
+            .output()
+            .context("failed to query the Explorer sync root registration")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Explorer sync root registration query failed for {sync_root_id}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        let query_output = String::from_utf8_lossy(&output.stdout).replace('\0', "");
+        query_output
+            .lines()
+            .find_map(|line| {
+                line.split_once("REG_")
+                    .and_then(|(_, value)| value.split_once(char::is_whitespace))
+                    .map(|(_, value)| value.trim().to_string())
+            })
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("Explorer sync root registration has no IconResource value"))
     }
 
     #[test]
