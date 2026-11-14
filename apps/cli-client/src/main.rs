@@ -139,7 +139,7 @@ impl CliClientHolder {
 
 fn build_managed_cli_client(
     bootstrap: ConnectionBootstrap,
-    identity: ClientIdentityMaterial,
+    identity: Option<ClientIdentityMaterial>,
     options: ManagedClientOptions,
 ) -> Result<(ManagedBerryKeepClient, ManagedCliRuntime)> {
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
@@ -159,8 +159,7 @@ fn build_managed_cli_client(
                     return;
                 }
             };
-            match runtime.block_on(bootstrap.build_managed_client_with_identity(identity, options))
-            {
+            match runtime.block_on(bootstrap.build_managed_client(identity, options)) {
                 Ok(managed_client) => {
                     if result_tx.send(Ok(managed_client)).is_ok() {
                         runtime.block_on(async {
@@ -755,38 +754,33 @@ async fn build_authenticated_sdk_from_cli(cli: &Cli) -> Result<CliClientHolder> 
             "building authenticated client from bootstrap"
         );
         let bootstrap = load_bootstrap_from_path(bootstrap_path, server_ca_override.as_deref())?;
-        let client_holder = match client_identity.as_ref() {
-            Some(identity) => {
-                let persistence_path = bootstrap_path.to_path_buf();
-                let options = ManagedClientOptions {
-                    connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
-                        "bootstrap_file",
-                        move |bootstrap| bootstrap.write_to_path(&persistence_path),
-                    )),
-                    ..ManagedClientOptions::default()
-                };
-                let (managed, runtime) =
-                    build_managed_cli_client(bootstrap, identity.clone(), options)?;
-                if let Some(renewed_identity) = managed.take_identity_update() {
-                    match persist_renewed_client_identity(
-                        client_identity_path.as_deref(),
-                        &renewed_identity,
-                    ) {
-                        Ok(()) => info!(
-                            client_identity_file = path_for_log(client_identity_path.as_deref()),
-                            "persisted renewed rendezvous client identity"
-                        ),
-                        Err(error) => warn!(
-                            error = %error,
-                            client_identity_file = path_for_log(client_identity_path.as_deref()),
-                            "renewed rendezvous client identity could not be persisted; continuing with the in-memory identity"
-                        ),
-                    }
-                }
-                CliClientHolder::managed(managed, runtime)
-            }
-            None => CliClientHolder::unmanaged(bootstrap.build_client()?),
+        let persistence_path = bootstrap_path.to_path_buf();
+        let options = ManagedClientOptions {
+            connection_bootstrap_persistence: Some(ManagedBootstrapPersistence::new(
+                "bootstrap_file",
+                move |bootstrap| bootstrap.write_to_path(&persistence_path),
+            )),
+            ..ManagedClientOptions::default()
         };
+        let (managed, runtime) =
+            build_managed_cli_client(bootstrap, client_identity.clone(), options)?;
+        if let Some(renewed_identity) = managed.take_identity_update() {
+            match persist_renewed_client_identity(
+                client_identity_path.as_deref(),
+                &renewed_identity,
+            ) {
+                Ok(()) => info!(
+                    client_identity_file = path_for_log(client_identity_path.as_deref()),
+                    "persisted renewed rendezvous client identity"
+                ),
+                Err(error) => warn!(
+                    error = %error,
+                    client_identity_file = path_for_log(client_identity_path.as_deref()),
+                    "renewed rendezvous client identity could not be persisted; continuing with the in-memory identity"
+                ),
+            }
+        }
+        let client_holder = CliClientHolder::managed(managed, runtime);
         log_client_transport_ready("build_authenticated_sdk_from_cli", client_holder.client());
         return Ok(client_holder);
     }
@@ -1554,6 +1548,58 @@ mod tests {
         requests: Arc<Mutex<Vec<ObservedRelayGatewayRequest>>>,
         issued_ticket_count: Arc<AtomicUsize>,
         paired_session_count: Arc<AtomicUsize>,
+    }
+
+    #[test]
+    fn managed_cli_client_starts_anonymous_bootstrap_with_offline_routes() {
+        let bootstrap = ConnectionBootstrap {
+            version: 1,
+            cluster_id: uuid::Uuid::now_v7(),
+            rendezvous_urls: Vec::new(),
+            rendezvous_contact_list: None,
+            rendezvous_mtls_required: false,
+            direct_endpoints: vec![
+                transport_sdk::BootstrapEndpoint {
+                    url: "http://127.0.0.1:9".to_string(),
+                    usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+                    node_id: None,
+                    node_hostname: None,
+                },
+                transport_sdk::BootstrapEndpoint {
+                    url: "http://127.0.0.1:10".to_string(),
+                    usage: Some(transport_sdk::BootstrapEndpointUse::PublicApi),
+                    node_id: None,
+                    node_hostname: None,
+                },
+            ],
+            relay_mode: transport_sdk::RelayMode::Disabled,
+            trust_roots: transport_sdk::BootstrapTrustRoots {
+                cluster_ca_pem: None,
+                public_api_ca_pem: None,
+                rendezvous_ca_pem: None,
+            },
+            pairing_token: None,
+            device_label: None,
+            device_id: None,
+            node_priority_overrides: std::collections::BTreeMap::new(),
+        };
+
+        let started = std::time::Instant::now();
+        let (managed, _runtime) = build_managed_cli_client(
+            bootstrap,
+            None,
+            ManagedClientOptions {
+                initial_discovery_timeout: std::time::Duration::ZERO,
+                ..ManagedClientOptions::default()
+            },
+        )
+        .expect("anonymous CLI client should retain offline bootstrap routes");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "managed CLI startup should not wait for offline route probes"
+        );
+        assert_eq!(managed.route_snapshot().endpoints.len(), 2);
     }
 
     async fn gateway_target_handler(
