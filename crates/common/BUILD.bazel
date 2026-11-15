@@ -3,11 +3,13 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 # Keep Cargo.toml as the dependency source of truth while exposing this leaf
 # crate to Bazel's action graph. Downstream workspace crates can depend on this
-# target as they are migrated.
+# target as they are migrated. Enable the atomic-file feature requested by
+# transport-sdk and desktop-client-config in their Cargo manifests.
 rust_library(
     name = "common",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
+    crate_features = ["atomic-file"],
     crate_name = "common",
     crate_root = "src/lib.rs",
     edition = crate_edition(),
@@ -23,6 +25,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     crate = ":common",
+    crate_features = ["atomic-file"],
     edition = crate_edition(),
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),

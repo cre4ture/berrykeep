@@ -435,7 +435,7 @@ impl LogicalMbtilesSource {
         Connection::open_with_flags_and_vfs(
             &self.manifest_key,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            &self.vfs_name,
+            self.vfs_name.as_str(),
         )
         .with_context(|| {
             format!(
