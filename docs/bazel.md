@@ -29,11 +29,11 @@ consumes the native `client-sdk` target, extending dependency-aware
 invalidation to desktop integration code. The Linux-only
 `adapter-linux-fuse` target builds on `client-sdk`, `common`, `desktop-status`,
 and `sync-core`, so changes outside that closure no longer invalidate its
-tests. `desktop-client-config` and `stats-collector-server` are independent
-leaves whose dependencies are all supplied by Crate Universe; the former
-prepares the later `background-launcher` and `config-app` application targets,
-while the latter adds the standalone telemetry service's default-feature unit
-suite. `sync-agent-core` builds on the native `client-sdk`, `common`, and
+tests. `desktop-client-config` uses the native `common` target with its
+`atomic-file` feature enabled, preparing the later `background-launcher` and
+`config-app` application targets. `stats-collector-server` also depends on the
+native `common` target and adds the standalone telemetry service's default-feature
+unit suite. `sync-agent-core` builds on the native `client-sdk`, `common`, and
 `sync-core` graph, and tracks its embedded folder agent UI files as
 compile-time inputs. These targets avoid duplicate generated crates. Run the
 current Bazel unit suite with:
