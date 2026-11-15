@@ -951,6 +951,17 @@ impl FetchExecutionScheduler {
 }
 
 pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRootIdentity> {
+    register_sync_root_with_shell_writer(registration, register_sync_root_with_explorer_shell)
+}
+
+fn register_sync_root_with_shell_writer(
+    registration: &SyncRootRegistration,
+    mut write_shell_registration: impl FnMut(
+        &SyncRootRegistration,
+        &SyncRootId,
+        &SyncRootIdentity,
+    ) -> Result<()>,
+) -> Result<SyncRootIdentity> {
     validate_registration(registration)?;
     std::fs::create_dir_all(&registration.root_path).with_context(|| {
         format!(
@@ -989,7 +1000,7 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
             ));
         }
 
-        if let Err(error) = register_sync_root_with_explorer_shell(
+        if let Err(error) = write_shell_registration(
             registration,
             &expected_shell_sync_root_id,
             &existing.identity,
@@ -1028,7 +1039,7 @@ pub fn register_sync_root(registration: &SyncRootRegistration) -> Result<SyncRoo
         sync_root_identity.provider_instance_id
     );
 
-    register_sync_root_with_explorer_shell(
+    write_shell_registration(
         registration,
         &expected_shell_sync_root_id,
         &sync_root_identity,
@@ -2910,6 +2921,46 @@ mod tests {
 
         let registration = SyncRootRegistration::new("id", "", "C:/berrykeep", cluster_id, None);
         assert!(register_sync_root(&registration).is_err());
+    }
+
+    #[test]
+    fn registration_failure_is_fatal_only_for_a_new_sync_root() {
+        let unique = uuid::Uuid::new_v4();
+        let sync_root =
+            std::env::temp_dir().join(format!("berrykeep-registration-failure-{unique}"));
+        let _guard = TestSyncRootGuard::new(sync_root.clone());
+        let registration = SyncRootRegistration::new(
+            format!("registration-failure-{unique}"),
+            "BerryKeep Test",
+            &sync_root,
+            uuid::Uuid::new_v4(),
+            None,
+        );
+        let failed_initial_registration =
+            register_sync_root_with_shell_writer(&registration, |_, _, _| {
+                Err(anyhow!("injected shell registration failure"))
+            });
+        assert!(failed_initial_registration.is_err());
+
+        let registered_identity = register_sync_root(&registration)
+            .expect("initial sync root registration should succeed");
+        let mut refresh_attempted = false;
+        let refreshed_identity =
+            register_sync_root_with_shell_writer(&registration, |_, _, identity| {
+                refresh_attempted = true;
+                assert_eq!(identity, &registered_identity);
+                Err(anyhow!("injected shell refresh failure"))
+            })
+            .expect("shell refresh failure must not prevent existing root startup");
+        assert!(refresh_attempted);
+        assert_eq!(refreshed_identity, registered_identity);
+        assert_eq!(
+            load_registered_sync_root_context(&sync_root)
+                .expect("existing root should remain readable")
+                .expect("existing root must remain registered")
+                .identity,
+            registered_identity,
+        );
     }
 
     #[test]
