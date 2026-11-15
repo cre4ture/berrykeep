@@ -2041,7 +2041,7 @@ async fn open_sqlite_reader_connection(metadata_db_path: &Path) -> Result<TokioC
         .await
         .with_context(|| format!("failed to open {}", metadata_db_path.display()))?;
     connection
-        .call(|db| configure_read_only_metadata_db_connection(db))
+        .call(configure_read_only_metadata_db_connection)
         .await
         .map_err(map_tokio_rusqlite_error)
         .with_context(|| {

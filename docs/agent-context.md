@@ -37,8 +37,10 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
 - Quick validation: `cargo audit --file Cargo.lock`,
   `cargo audit --file tests/system-tests/Cargo.lock`, and
   `cargo deny --locked --exclude system-tests check advisories licenses sources bans`.
-- Source of truth: workspace and crate `Cargo.toml` files, both lockfiles,
-  `deny.toml`, and `.github/workflows/security.yml`.
+- Refresh the generated Bazel graph with `bazel mod tidy --lockfile_mode=update`
+  whenever workspace manifests or `Cargo.lock` change.
+- Source of truth: workspace and crate `Cargo.toml` files, both Cargo lockfiles,
+  `MODULE.bazel.lock`, `deny.toml`, and `.github/workflows/security.yml`.
 
 ## Current state (latest implemented)
 
