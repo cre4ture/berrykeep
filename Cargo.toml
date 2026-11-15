@@ -54,7 +54,7 @@ clap = { version = "4", features = ["derive", "env"] }
 git-version = "0.3.9"
 quick-xml = "0.41"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled", "fallible_uint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -65,3 +65,7 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 async-trait = "0.1"
 notify = "6"
 winres = "0.1"
+
+# Metadata and telemetry use SQL tables, not Turso full-text search.
+# Keep the allocator while excluding the unused Tantivy dependency tree.
+turso = { version = "0.6.1", default-features = false, features = ["mimalloc"] }
