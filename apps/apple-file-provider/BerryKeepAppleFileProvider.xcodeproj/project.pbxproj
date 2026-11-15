@@ -951,7 +951,7 @@
 				CODE_SIGNING_REQUIRED = NO;
 				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
-				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_IDENTITY = "";
 				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/BerryKeepIosApp-Info.plist";
@@ -1099,6 +1099,7 @@
 				CODE_SIGNING_REQUIRED = NO;
 				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
+				CODE_SIGN_IDENTITY = "";
 				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/BerryKeepIosFileProviderExtension-Info.plist";
@@ -1169,7 +1170,7 @@
 				CODE_SIGNING_REQUIRED = NO;
 				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
-				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_IDENTITY = "";
 				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/BerryKeepIosApp-Info.plist";
@@ -1273,6 +1274,7 @@
 				CODE_SIGNING_REQUIRED = NO;
 				"CODE_SIGNING_REQUIRED[sdk=iphonesimulator*]" = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/Entitlements/BerryKeepSharedAccess.entitlements;
+				CODE_SIGN_IDENTITY = "";
 				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../ios-app/include";
 				INFOPLIST_FILE = "Resources/Info/BerryKeepIosFileProviderExtension-Info.plist";

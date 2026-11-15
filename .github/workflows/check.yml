@@ -601,7 +601,6 @@ jobs:
               -derivedDataPath "$IOS_DERIVED_DATA_PATH" \
               -archivePath "$IOS_ARCHIVE_PATH" \
               CODE_SIGN_STYLE=Automatic \
-              CODE_SIGN_IDENTITY="$BERRYKEEP_IOS_SIGNING_IDENTITY" \
               CODE_SIGNING_ALLOWED=YES \
               CODE_SIGNING_REQUIRED=YES \
               CURRENT_PROJECT_VERSION="$IOS_BUILD_NUMBER" \
