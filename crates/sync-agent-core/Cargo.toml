@@ -14,7 +14,7 @@ client-sdk = { path = "../client-sdk" }
 common = { path = "../common" }
 ctrlc = { version = "3", features = ["termination"] }
 notify.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sync-core = { path = "../sync-core" }

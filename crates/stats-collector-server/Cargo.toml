@@ -31,7 +31,7 @@ tracing-subscriber.workspace = true
 # Pure-Rust, embedded SQLite-compatible engine (no C toolchain / bundled libsqlite3 needed to
 # build this crate). Same version already used by `server-node-sdk`'s optional Turso metadata
 # backend (see `crates/server-node-sdk/src/storage/turso_impl.rs`).
-turso = "0.6.0-pre.2"
+turso.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
