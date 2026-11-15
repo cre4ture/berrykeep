@@ -34,7 +34,7 @@ sync-agent-core = { path = "../../crates/sync-agent-core" }
 time = "0.3"
 tokio = { version = "1", features = ["full"] }
 transport-sdk = { path = "../../crates/transport-sdk" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled", "fallible_uint"] }
 uuid = { version = "1", features = ["v4"] }
 web-ui-backend = { path = "../../crates/web-ui-backend" }
 

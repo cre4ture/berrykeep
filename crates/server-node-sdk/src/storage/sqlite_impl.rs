@@ -111,9 +111,9 @@ impl SqliteMetadataStore {
         T: Send + 'static,
     {
         self.read_connection()
-            .call(move |db| Ok(f(db)))
+            .call(f)
             .await
-            .map_err(map_tokio_rusqlite_error)?
+            .map_err(map_tokio_rusqlite_error)
     }
 
     /// Returns the whole-scope gallery map summary for `scope`, serving a cached (possibly
@@ -160,16 +160,15 @@ impl SqliteMetadataStore {
                         let query_scope = refresh_scope.clone();
                         let result = reader
                             .call(move |db| {
-                                Ok(query_gallery_map_summary_from_db(
+                                query_gallery_map_summary_from_db(
                                     db,
                                     &query_scope,
                                     estimate,
                                     Some(&progress),
-                                ))
+                                )
                             })
                             .await
-                            .map_err(map_tokio_rusqlite_error)
-                            .and_then(|value| value);
+                            .map_err(map_tokio_rusqlite_error);
                         match result {
                             Ok(value) => cache.store(refresh_scope.clone(), value),
                             Err(error) => {
@@ -218,10 +217,7 @@ impl SqliteMetadataStore {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        self.writer
-            .call(move |db| Ok(f(db)))
-            .await
-            .map_err(map_tokio_rusqlite_error)?
+        self.writer.call(f).await.map_err(map_tokio_rusqlite_error)
     }
 
     async fn write_tx<T, F>(&self, f: F) -> Result<T>
@@ -2033,11 +2029,7 @@ async fn open_sqlite_writer_connection(metadata_db_path: &Path) -> Result<TokioC
         .await
         .with_context(|| format!("failed to open {}", metadata_db_path.display()))?;
     connection
-        .call(|db| {
-            init_metadata_db(db).map_err(|err| {
-                tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(format!("{err:#}"))))
-            })
-        })
+        .call(|db| init_metadata_db(db))
         .await
         .map_err(map_tokio_rusqlite_error)
         .with_context(|| format!("failed to initialize {}", metadata_db_path.display()))?;
@@ -2049,11 +2041,7 @@ async fn open_sqlite_reader_connection(metadata_db_path: &Path) -> Result<TokioC
         .await
         .with_context(|| format!("failed to open {}", metadata_db_path.display()))?;
     connection
-        .call(|db| {
-            configure_read_only_metadata_db_connection(db).map_err(|err| {
-                tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(format!("{err:#}"))))
-            })
-        })
+        .call(|db| configure_read_only_metadata_db_connection(db))
         .await
         .map_err(map_tokio_rusqlite_error)
         .with_context(|| {
@@ -2073,14 +2061,15 @@ fn sqlite_read_connection_count() -> usize {
         .unwrap_or(DEFAULT_SQLITE_READ_CONNECTION_COUNT)
 }
 
-fn map_tokio_rusqlite_error(error: tokio_rusqlite::Error) -> anyhow::Error {
+fn map_tokio_rusqlite_error<E: Into<anyhow::Error>>(
+    error: tokio_rusqlite::Error<E>,
+) -> anyhow::Error {
     match error {
         tokio_rusqlite::Error::ConnectionClosed => {
             anyhow!("sqlite metadata connection closed unexpectedly")
         }
         tokio_rusqlite::Error::Close((_, err)) => err.into(),
-        tokio_rusqlite::Error::Rusqlite(err) => err.into(),
-        tokio_rusqlite::Error::Other(err) => anyhow!("sqlite metadata worker error: {err}"),
+        tokio_rusqlite::Error::Error(err) => err.into(),
         _ => anyhow!("sqlite metadata worker returned an unsupported error variant"),
     }
 }
@@ -6309,6 +6298,54 @@ mod tests {
             "berrykeep-{name}-{}-{stamp}.sqlite",
             std::process::id()
         ))
+    }
+
+    #[tokio::test]
+    async fn sqlite_worker_preserves_database_errors() {
+        let connection = TokioConnection::open_in_memory().await.unwrap();
+        let error = connection
+            .call(|db| db.execute("SELECT * FROM missing_table", []))
+            .await
+            .map_err(map_tokio_rusqlite_error)
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+        assert!(error.to_string().contains("no such table: missing_table"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_worker_preserves_application_error_context() {
+        let connection = TokioConnection::open_in_memory().await.unwrap();
+        let error = connection
+            .call(|_| -> Result<()> {
+                Err(std::io::Error::other("storage unavailable"))
+                    .context("failed to initialize metadata")
+            })
+            .await
+            .map_err(map_tokio_rusqlite_error)
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(
+            format!("{error:#}"),
+            "failed to initialize metadata: storage unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_worker_reports_closed_connections() {
+        let connection = TokioConnection::open_in_memory().await.unwrap();
+        connection.clone().close().await.unwrap();
+        let error = connection
+            .call(|_| Ok::<_, rusqlite::Error>(()))
+            .await
+            .map_err(map_tokio_rusqlite_error)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "sqlite metadata connection closed unexpectedly"
+        );
     }
 
     #[test]

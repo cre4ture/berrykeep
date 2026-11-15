@@ -52,12 +52,12 @@ sha2 = "0.10"
 sqlite-vfs = "0.2.0"
 sysinfo = { version = "0.38.4", default-features = false, features = ["component", "disk", "system"] }
 tokio.workspace = true
-tokio-rusqlite = "0.6"
+tokio-rusqlite = "0.9"
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["compat"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 transport-sdk = { path = "../transport-sdk" }
-turso = { version = "0.6.0-pre.2", optional = true }
+turso = { workspace = true, optional = true }
 tower = "0.5"
 tracing.workspace = true
 tracing-subscriber.workspace = true

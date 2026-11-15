@@ -24,6 +24,22 @@ Purpose: fast bootstrap for coding sessions without replaying full tool/chat his
   - Windows CFAPI compile check lane
 - Coverage gate excludes `crates/adapter-linux-fuse/` for current MVP stage.
 
+## Rust dependency security
+
+- SQLite consumers share workspace `rusqlite` 0.42 and bundled SQLite through
+  `libsqlite3-sys` 0.40; `tokio-rusqlite` 0.9 uses the same version.
+- Turso dependencies share one workspace declaration with `mimalloc` enabled and
+  unused full-text search disabled. Metadata and telemetry use ordinary SQL tables;
+  enabling `fts` would reintroduce the Tantivy dependency tree.
+- Audit both `Cargo.lock` and `tests/system-tests/Cargo.lock`; the system-test AWS
+  SDK has its own transitive dependency graph. `deny.toml` documents the remaining
+  `paste` maintenance advisory, which has no supported upstream replacement.
+- Quick validation: `cargo audit --file Cargo.lock`,
+  `cargo audit --file tests/system-tests/Cargo.lock`, and
+  `cargo deny --locked --exclude system-tests check advisories licenses sources bans`.
+- Source of truth: workspace and crate `Cargo.toml` files, both lockfiles,
+  `deny.toml`, and `.github/workflows/security.yml`.
+
 ## Current state (latest implemented)
 
 ### Client route priority
