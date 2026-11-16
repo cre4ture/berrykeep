@@ -4,6 +4,7 @@ mod folder_agent_runtime;
 mod folder_agent_startup;
 mod folder_agent_state;
 mod folder_agent_ui;
+pub mod sync_work;
 #[cfg(test)]
 mod test_support;
 
