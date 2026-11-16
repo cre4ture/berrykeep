@@ -121,4 +121,62 @@ mod tests {
             Some(state)
         );
     }
+
+    #[test]
+    fn claims_use_due_index_and_do_not_scan_blocked_descendants() {
+        let (_, store) = store();
+        let mut jobs = vec![op("blocked", 1)];
+        for index in 0..2000 {
+            let mut child = op(&format!("blocked/{index:04}"), 1);
+            child.depends_on.push("blocked".into());
+            jobs.push(child);
+        }
+        for index in 0..100 {
+            jobs.push(op(&format!("independent/{index:04}"), 1));
+        }
+        store.enqueue("test", &jobs).unwrap();
+        assert_eq!(store.ready_count("test").unwrap(), 101);
+        let parent = store.claim_next("test", 0, 100).unwrap().unwrap();
+        assert_eq!(parent.work.key, "blocked");
+        store
+            .finish(&parent, WorkResult::Retry("offline".into()), 0)
+            .unwrap();
+        let plan = store.claim_query_plan().unwrap();
+        assert!(
+            plan.iter().any(|line| line.contains("sync_work_due")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+        for _ in 0..100 {
+            let lease = store.claim_next("test", 1, 100).unwrap().unwrap();
+            assert!(lease.work.key.starts_with("independent/"));
+            store.finish(&lease, WorkResult::Complete, 1).unwrap();
+        }
+        assert_eq!(
+            store.ready_count("test").unwrap(),
+            1,
+            "blocked children never enter the claim index"
+        );
+    }
+
+    #[test]
+    fn terminal_history_pruning_preserves_current_desired_completions() {
+        let (_, store) = store();
+        store
+            .reconcile("desired", &[op("current", 1), op("removed", 1)])
+            .unwrap();
+        while let Some(lease) = store.claim_next("desired", 0, 100).unwrap() {
+            store.finish(&lease, WorkResult::Complete, 1).unwrap();
+        }
+        store.reconcile("desired", &[op("current", 1)]).unwrap();
+        store.enqueue("intent", &[op("historical", 1)]).unwrap();
+        let lease = store.claim_next("intent", 0, 100).unwrap().unwrap();
+        store.finish(&lease, WorkResult::Complete, 1).unwrap();
+        assert_eq!(store.prune(i64::MAX / 2, 100).unwrap(), 2);
+        assert_eq!(store.status("desired").unwrap().completed, 1);
+        assert!(store.claim_next("desired", 100, 100).unwrap().is_none());
+    }
 }
