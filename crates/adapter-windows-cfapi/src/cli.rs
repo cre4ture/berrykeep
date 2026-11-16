@@ -630,10 +630,11 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let monitor_gate = refresh_gate.clone();
         let monitor_work = work.clone();
         let worker_status = status_publisher.clone();
-        std::thread::spawn(move || {
+        let work_thread = std::thread::spawn(move || {
             let mut previous_status = None;
             let mut next_scan = std::time::Instant::now();
             while monitor_running.load(Ordering::SeqCst) {
+                let epoch = monitor_work.wake_epoch();
                 if std::time::Instant::now() >= next_scan {
                     monitor_thread
                         .lock()
@@ -658,7 +659,22 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                     Err(error) => tracing::error!("CFAPI work status: {error:#}"),
                     _ => {}
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let until_scan = next_scan.saturating_duration_since(std::time::Instant::now());
+                let wait = match monitor_work.next_execution_at() {
+                    Ok(Some(deadline)) => until_scan.min(Duration::from_millis(
+                        deadline
+                            .saturating_sub(sync_agent_core::sync_work::now_ms())
+                            .max(0) as u64,
+                    )),
+                    Ok(None) => until_scan,
+                    Err(error) => {
+                        tracing::error!("CFAPI work deadline: {error:#}");
+                        until_scan
+                    }
+                };
+                if monitor_running.load(Ordering::SeqCst) {
+                    monitor_work.wait_for_work(epoch, wait);
+                }
             }
         });
 
@@ -667,9 +683,11 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
 
         {
             let r = running.clone();
+            let wake = work.clone();
             ctrlc::set_handler(move || {
                 tracing::info!("received Ctrl+C, shutting down");
                 r.store(false, Ordering::SeqCst);
+                wake.notify();
             })?;
         }
 
@@ -759,6 +777,10 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         }
 
         tracing::info!("shutting down; dropping connection and exiting");
+        work.notify();
+        if let Err(error) = work_thread.join() {
+            tracing::error!(?error, "CFAPI work thread panicked while shutting down");
+        }
         drop(connection_guard);
         Ok(())
     })();

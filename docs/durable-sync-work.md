@@ -63,7 +63,10 @@ there is no legacy scheduler switch or compatibility runtime.
 
 Remote materialization is grouped by parent into batches of at most 64 entries.
 The worker executes at most eight batches per turn, between five-second local
-topology scans. Missing previously observed paths wait for a topology scan so
+topology scans. It sleeps until the next eligible job or topology scan; scheduling
+and accepted upload receipts wake the same worker without database polling.
+External conflict controls are observed within the topology scan interval.
+Missing previously observed paths wait for a topology scan so
 background population cannot recreate an unobserved user deletion or rename.
 Partial batch success is recorded per path before acknowledgement; a failed
 first entry does not prevent independent siblings from being attempted.

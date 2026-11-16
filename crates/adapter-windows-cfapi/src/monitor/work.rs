@@ -71,9 +71,39 @@ pub(crate) struct CfapiWork {
     inventory: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
     baseline: Arc<Mutex<HashMap<String, PriorPath>>>,
     fences: Arc<Mutex<HashMap<String, RevisionFence>>>,
+    wake: Arc<(Mutex<u64>, std::sync::Condvar)>,
 }
 
 impl CfapiWork {
+    pub(crate) fn wake_epoch(&self) -> u64 {
+        *self.wake.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn notify(&self) {
+        let mut epoch = self.wake.0.lock().unwrap_or_else(|e| e.into_inner());
+        *epoch = epoch.wrapping_add(1);
+        self.wake.1.notify_all();
+    }
+
+    pub(crate) fn wait_for_work(&self, observed: u64, timeout: std::time::Duration) {
+        let epoch = self.wake.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .wake
+            .1
+            .wait_timeout_while(epoch, timeout, |epoch| *epoch == observed)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+
+    pub(crate) fn next_execution_at(&self) -> Result<Option<i64>> {
+        Ok([RECEIPT_SCOPE, MATERIALIZATION_SCOPE]
+            .into_iter()
+            .map(|scope| self.store.next_ready_at(scope))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .min())
+    }
+
     pub(super) fn pending_uploads(&self) -> Result<HashSet<String>> {
         Ok(self
             .store
@@ -128,6 +158,7 @@ impl CfapiWork {
             inventory: Arc::new(Mutex::new(inventory)),
             baseline: Arc::new(Mutex::new(baseline)),
             fences: Arc::new(Mutex::new(fences)),
+            wake: Arc::default(),
         })
     }
 
@@ -239,6 +270,7 @@ impl CfapiWork {
         self.store
             .observe_paths(BASELINE_SCOPE, &[(path.to_owned(), entry.clone())], &[])?;
         baseline.insert(path.to_owned(), entry);
+        self.notify();
         Ok(())
     }
 
@@ -468,7 +500,9 @@ impl CfapiWork {
                 intent.object_id(),
                 serde_json::to_value(intent)?,
             )],
-        )
+        )?;
+        self.notify();
+        Ok(())
     }
 
     pub(super) fn enqueue_deletes(&self, intents: &[LocalMutation]) -> Result<()> {
@@ -496,7 +530,9 @@ impl CfapiWork {
             }
             jobs.push(job);
         }
-        self.store.enqueue(LOCAL_SCOPE, &jobs)
+        self.store.enqueue(LOCAL_SCOPE, &jobs)?;
+        self.notify();
+        Ok(())
     }
 
     pub(super) fn drain_mutations(&self, uploader: &dyn Uploader) -> Result<()> {
@@ -672,7 +708,9 @@ impl CfapiWork {
         self.store.reconcile(
             MATERIALIZATION_SCOPE,
             &materialization_plan(&plan, &self.protected_paths()?)?,
-        )
+        )?;
+        self.notify();
+        Ok(())
     }
 
     pub(crate) fn drain_materialization(&self) -> Result<()> {
@@ -917,6 +955,7 @@ impl Uploader for JournaledUploader {
             serde_json::json!({"path":path,"object_id":object_id,"revision":revision,"length":length}),
         );
         self.work.store.enqueue(UPLOAD_SCOPE, &[job])?;
+        self.work.notify();
         self.work.store.rearm_completed(UPLOAD_SCOPE, path)?;
         let Some(lease) = self
             .work
@@ -950,6 +989,7 @@ impl Uploader for JournaledUploader {
                 }
             }
         })?;
+        self.work.notify();
         if !applied {
             anyhow::bail!("upload work was superseded while executing {path}");
         }
@@ -1160,6 +1200,33 @@ mod tests {
             remote_media: None,
         }
     }
+    #[test]
+    fn idle_work_wait_has_no_deadline_and_scheduling_cannot_lose_wakeup() {
+        let work = CfapiWork::new(
+            root(),
+            uuid::Uuid::nil(),
+            WorkStore::open(":memory:").unwrap(),
+            RemoteAppliedTracker::default(),
+        )
+        .unwrap();
+        assert_eq!(work.next_execution_at().unwrap(), None);
+        let epoch = work.wake_epoch();
+        work.schedule(
+            &CfapiActionPlan {
+                actions: vec![file("wake.txt")],
+            },
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let before = std::time::Instant::now();
+        work.wait_for_work(epoch, std::time::Duration::from_secs(5));
+        assert!(
+            before.elapsed() < std::time::Duration::from_secs(1),
+            "enqueue before wait must wake immediately"
+        );
+        assert!(work.next_execution_at().unwrap().is_some());
+    }
+
     #[test]
     fn large_tree_plan_is_bounded_and_parents_gate_children() {
         let mut actions = vec![CfapiAction::EnsureDirectory {
