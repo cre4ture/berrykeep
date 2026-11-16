@@ -179,4 +179,23 @@ mod tests {
         assert_eq!(store.status("desired").unwrap().completed, 1);
         assert!(store.claim_next("desired", 100, 100).unwrap().is_none());
     }
+
+    #[test]
+    fn normal_enqueue_runs_due_terminal_retention_maintenance() {
+        let (_, store) = store();
+        store.enqueue("intent", &[op("old", 1)]).unwrap();
+        let lease = store.claim_next("intent", 0, 100).unwrap().unwrap();
+        store.finish(&lease, WorkResult::Complete, 1).unwrap();
+        store.observe("scheduler-maintenance", &0_i64).unwrap();
+        store.enqueue("intent", &[op("new", 1)]).unwrap();
+        assert_eq!(store.status("intent").unwrap().completed, 0);
+        assert_eq!(store.status("intent").unwrap().pending, 1);
+        assert!(
+            store
+                .observation::<i64>("scheduler-maintenance")
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+    }
 }

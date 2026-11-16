@@ -44,6 +44,17 @@ current desired plan can be pruned while retaining active prerequisites and curr
 desired completions. Directory preconditions share one tree capture per planning
 or execution batch rather than walking the entire root for every directory.
 
+Folder queue conflicts appear in the existing conflict list and resolution API.
+An explicit keep-remote choice preserves the local file or directory before the
+queued remote operation resumes. Keep-local runs the existing folder transfer or
+delete executor for the chosen path. Editing a conflicted path alone never grants
+permission to overwrite it. Backends must implement conflict-copy preservation to
+support keep-remote; unsupported preservation fails without replacing local bytes.
+Local scans retain the previous baseline for paths blocked by remote work, avoiding
+upload/delete echoes while resolution is pending. Normal scheduling checks terminal
+retention at most once per day and retains seven days of historical terminal jobs,
+in addition to current desired completions and active prerequisites.
+
 CFAPI uses the same journal under its local application-data sync-root state,
 scoped by provider instance, connection target, and remote prefix. Startup first
 compares actual placeholders with persisted observations and records local

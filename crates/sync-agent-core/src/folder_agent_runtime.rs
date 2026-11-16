@@ -33,7 +33,7 @@ use crate::{
     try_record_modification, upload_local_file,
 };
 
-mod materialization;
+pub(crate) mod materialization;
 #[cfg(test)]
 use materialization::apply_remote_snapshot;
 
@@ -315,6 +315,14 @@ pub trait FolderAgentLocalBackend {
         Ok(())
     }
 
+    fn preserve_local_conflict(
+        &mut self,
+        _options: &FolderAgentRuntimeOptions,
+        _path: &str,
+    ) -> Result<()> {
+        anyhow::bail!("this storage backend does not support preserving a local conflict copy")
+    }
+
     fn scan_local_tree_with_progress(
         &mut self,
         options: &FolderAgentRuntimeOptions,
@@ -427,6 +435,18 @@ impl FolderAgentLocalBackend for NativeFilesystemBackend {
         conflicts: &[crate::StartupConflict],
     ) -> Result<()> {
         materialize_remote_conflict_copies(&options.root_dir, client, scope, conflicts)
+    }
+
+    fn preserve_local_conflict(
+        &mut self,
+        options: &FolderAgentRuntimeOptions,
+        path: &str,
+    ) -> Result<()> {
+        crate::folder_agent_conflicts::preserve_local_conflict_copy(
+            &options.root_dir,
+            path,
+            &absolute_path(&options.root_dir, path),
+        )
     }
 
     fn scan_local_tree_with_progress(
@@ -1079,6 +1099,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     let startup_local_sync_message =
         format!("Scanning {local_tree_label} and reconciling startup local changes");
 
+    let blocked_startup_paths = materialization::blocked_local_paths(&materialization_journal)?;
     let initial_local_sync_outcome = run_with_status_heartbeat(
         status_callback.clone(),
         BlockingStatusProgress {
@@ -1118,6 +1139,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                     base_message: startup_local_sync_message.clone(),
                     last_success_unix_ms,
                 }),
+                Some(&blocked_startup_paths),
             )
         },
     )?;
@@ -1125,9 +1147,12 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
     state_store
         .persist_local_baseline(&local_state)
         .context("failed to persist sqlite baseline after startup reconciliation")?;
+    let explicit_resolutions = materialization::resolution_paths(&materialization_journal)?;
+    startup_conflicts.retain(|conflict| !explicit_resolutions.contains(&conflict.path));
     state_store
         .persist_startup_conflicts(&startup_conflicts)
         .context("failed to persist startup conflicts")?;
+    materialization::publish_conflicts(&materialization_journal, &state_store)?;
 
     last_success_unix_ms = Some(now_unix_ms());
     let mut initial_runtime_metrics =
@@ -1439,6 +1464,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                 last_success_unix_ms,
                 None,
             );
+            let blocked_paths = materialization::blocked_local_paths(&materialization_journal)?;
             let local_sync_outcome = run_with_status_heartbeat(
                 status_callback.clone(),
                 BlockingStatusProgress {
@@ -1482,6 +1508,7 @@ fn run_folder_agent_inner<B: FolderAgentLocalBackend>(
                             base_message: local_scan_base_message.clone(),
                             last_success_unix_ms,
                         }),
+                        Some(&blocked_paths),
                     )
                 },
             )?;
@@ -2106,8 +2133,9 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
     modification_context: Option<&ModificationLogContext>,
     status_callback: Option<&FolderAgentStatusCallback>,
     local_scan_status: Option<&LocalScanStatusContext>,
+    blocked_paths: Option<&BTreeSet<String>>,
 ) -> Result<LocalSyncOutcome> {
-    let current = match local_scan_status {
+    let mut current = match local_scan_status {
         Some(progress) => scan_local_tree_with_status_progress(
             backend,
             &progress.options,
@@ -2124,6 +2152,25 @@ fn sync_local_changes<B: FolderAgentLocalBackend>(
             scan_local_tree_without_status(backend, options).context("failed to scan local root")?
         }
     };
+    if let Some(blocked) = blocked_paths {
+        let related = |path: &str| {
+            blocked.contains(path)
+                || parent_directories(path)
+                    .iter()
+                    .any(|parent| blocked.contains(parent))
+                || blocked
+                    .range(format!("{path}/")..)
+                    .next()
+                    .is_some_and(|candidate| candidate.starts_with(&format!("{path}/")))
+        };
+        current.retain(|path, _| !related(path));
+        current.extend(
+            local_state
+                .iter()
+                .filter(|(path, _)| related(path))
+                .map(|(path, state)| (path.clone(), state.clone())),
+        );
+    }
     let diff = diff_local_trees(local_state, &current);
     let mut outcome = LocalSyncOutcome {
         changed_path_count: diff.created_directories.len()
@@ -3327,6 +3374,8 @@ mod tests {
             remote_key: String,
         },
         RemoveLocalPath(String),
+        UploadFile(String),
+        PreserveLocalPath(String),
     }
 
     #[derive(Debug, Default)]
@@ -3337,6 +3386,8 @@ mod tests {
         fail_remove: bool,
         fingerprints: BTreeMap<String, String>,
         scan_count: usize,
+        allow_upload: bool,
+        backups: LocalTreeState,
     }
 
     impl RecordingBackend {
@@ -3362,6 +3413,24 @@ mod tests {
         }
 
         fn prepare(&mut self, _options: &FolderAgentRuntimeOptions) -> Result<()> {
+            Ok(())
+        }
+
+        fn preserve_local_conflict(
+            &mut self,
+            _options: &FolderAgentRuntimeOptions,
+            path: &str,
+        ) -> Result<()> {
+            self.operations
+                .push(BackendOperation::PreserveLocalPath(path.to_owned()));
+            let prefix = format!("{path}/");
+            self.backups.extend(
+                self.local_entries
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == path || candidate.starts_with(&prefix))
+                    .map(|(path, state)| (path.clone(), state.clone())),
+            );
+            remove_local_state_path_and_descendants(&mut self.local_entries, path);
             Ok(())
         }
 
@@ -3424,13 +3493,16 @@ mod tests {
 
         fn upload_local_file(
             &mut self,
-            _options: &FolderAgentRuntimeOptions,
+            options: &FolderAgentRuntimeOptions,
             _client: &BerryKeepClient,
             _scope: &PathScope,
-            _relative_path: &str,
+            relative_path: &str,
             _size_bytes: u64,
         ) -> Result<String> {
-            panic!("upload_local_file should not be called in this test");
+            assert!(self.allow_upload, "unexpected upload in this test");
+            self.operations
+                .push(BackendOperation::UploadFile(relative_path.to_owned()));
+            self.file_content_fingerprint(options, relative_path)
         }
 
         fn download_remote_file(
@@ -3447,6 +3519,7 @@ mod tests {
             if self.fail_download_for.as_deref() == Some(local_relative_path) {
                 bail!("simulated download failure");
             }
+            self.fingerprints.remove(local_relative_path);
             remove_local_state_path_and_descendants(&mut self.local_entries, local_relative_path);
             for parent in parent_directories(local_relative_path) {
                 self.local_entries.insert(
@@ -4378,6 +4451,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(deleted.deleted_remote_file_count, 1);
@@ -4562,6 +4636,207 @@ mod tests {
             "one capture for scheduling and one for execution, independent of directory count"
         );
         assert!(backend.local_entries.is_empty());
+    }
+
+    #[test]
+    fn queued_conflicts_use_explicit_existing_resolution_actions() {
+        for strategy in [
+            crate::ConflictResolutionStrategy::KeepRemote,
+            crate::ConflictResolutionStrategy::KeepLocal,
+        ] {
+            let root = crate::test_support::test_root();
+            let scope = PathScope::new(None);
+            let state = StartupStateStore::new_with_state_root(
+                &root,
+                &scope,
+                "http://127.0.0.1:1",
+                &root.join("state"),
+            );
+            let local = LocalEntryState {
+                kind: LocalEntryKind::File,
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            };
+            state
+                .upsert_baseline_entry_with_hash("a.txt", &local, Some("previous-synced"))
+                .unwrap();
+            let journal = materialization::open(&state).unwrap();
+            let mut backend = RecordingBackend {
+                allow_upload: true,
+                ..RecordingBackend::default()
+            };
+            backend.local_entries.insert("a.txt".into(), local.clone());
+            backend
+                .fingerprints
+                .insert("a.txt".into(), "edited-local".into());
+            let mut options = test_runtime_options();
+            options.run_once = false;
+            let client = BerryKeepClient::from_direct_base_url("http://127.0.0.1:1");
+            let snapshot = SyncSnapshot {
+                local: Vec::new(),
+                remote: vec![sync_core::NamespaceEntry::file(
+                    "a.txt",
+                    "r1",
+                    "fingerprint-a.txt",
+                )],
+            };
+            let mut index = RemoteTreeIndex::default();
+            let mut suppressed = BTreeMap::new();
+            apply_remote_snapshot_with_journal(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                &snapshot,
+                None,
+                None,
+                None,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                state
+                    .load_conflict("a.txt")
+                    .unwrap()
+                    .map(|conflict| conflict.reason),
+                Some("queued_remote_materialization".into()),
+                "queued conflicts must appear in the existing list/UI"
+            );
+            backend
+                .local_entries
+                .get_mut("a.txt")
+                .unwrap()
+                .modified_unix_ms = 2;
+            materialization::drain_remote_work(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                1,
+                "editing a conflicted path is not permission to overwrite it"
+            );
+            assert!(backend.operations.is_empty());
+            crate::resolve_conflict_action(
+                &root,
+                Some("http://127.0.0.1:1"),
+                None,
+                None,
+                None,
+                &scope,
+                &state,
+                "a.txt",
+                strategy,
+                false,
+            )
+            .unwrap();
+            materialization::drain_remote_work(
+                &journal,
+                &mut backend,
+                &options,
+                &client,
+                None,
+                Some(&state),
+                &scope,
+                &mut suppressed,
+                &mut index,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                journal.status("folder-materialization").unwrap().conflicts,
+                0
+            );
+            assert_eq!(journal.status("folder-materialization").unwrap().pending, 0);
+            assert!(state.load_conflict("a.txt").unwrap().is_none());
+            if matches!(strategy, crate::ConflictResolutionStrategy::KeepRemote) {
+                assert_eq!(
+                    backend
+                        .backups
+                        .get("a.txt")
+                        .map(|state| state.modified_unix_ms),
+                    Some(2)
+                );
+            }
+            match strategy {
+                crate::ConflictResolutionStrategy::KeepRemote=>assert!(backend.operations.iter().any(|operation|matches!(operation,BackendOperation::DownloadFile{local_path,..} if local_path=="a.txt"))),
+                crate::ConflictResolutionStrategy::KeepLocal=>assert_eq!(state.load_local_baseline_hashes().unwrap().get("a.txt").map(String::as_str),Some("edited-local")),
+            }
+        }
+    }
+
+    #[test]
+    fn local_scans_retain_baselines_for_unresolved_remote_work() {
+        for directory in [false, true] {
+            let mut backend = RecordingBackend::default();
+            let path = if directory { "docs" } else { "a.txt" };
+            let baseline = LocalEntryState {
+                kind: if directory {
+                    LocalEntryKind::Directory
+                } else {
+                    LocalEntryKind::File
+                },
+                size_bytes: 7,
+                modified_unix_ms: 1,
+            };
+            if !directory {
+                backend.local_entries.insert(
+                    path.into(),
+                    LocalEntryState {
+                        modified_unix_ms: 2,
+                        ..baseline.clone()
+                    },
+                );
+            }
+            let mut state = LocalTreeState::from([(path.into(), baseline.clone())]);
+            let mut index = RemoteTreeIndex::default();
+            if directory {
+                index.directories.insert(path.into());
+            } else {
+                index.files.insert(path.into());
+            }
+            let blocked = BTreeSet::from([if directory {
+                "docs/incoming.txt".into()
+            } else {
+                path.into()
+            }]);
+            let result = sync_local_changes(
+                &mut backend,
+                &test_runtime_options(),
+                &BerryKeepClient::from_direct_base_url("http://127.0.0.1:1"),
+                &mut state,
+                None,
+                &PathScope::new(None),
+                &mut index,
+                &mut BTreeMap::new(),
+                None,
+                None,
+                None,
+                None,
+                Some(&blocked),
+            )
+            .unwrap();
+            assert_eq!(result.changed_path_count, 0);
+            assert_eq!(state.get(path), Some(&baseline));
+            assert!(backend.operations.is_empty());
+        }
     }
 
     #[test]

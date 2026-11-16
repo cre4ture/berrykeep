@@ -127,6 +127,7 @@ impl WorkStore {
                 PRAGMA user_version=2;")?;
             tx.commit()?;
         }
+        connection.execute("CREATE INDEX IF NOT EXISTS sync_work_terminal ON sync_work(finished_at) WHERE state IN ('complete','cancelled')",[])?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             path: path.to_path_buf(),
@@ -136,11 +137,13 @@ impl WorkStore {
         &self.path
     }
     pub fn enqueue(&self, scope: &str, work: &[PlannedWork]) -> Result<()> {
-        self.write_plan(scope, work, false)
+        self.write_plan(scope, work, false)?;
+        self.maintain(now_ms())
     }
     /// Supply a complete authoritative plan, never a partial filesystem scan.
     pub fn reconcile(&self, scope: &str, work: &[PlannedWork]) -> Result<()> {
-        self.write_plan(scope, work, true)
+        self.write_plan(scope, work, true)?;
+        self.maintain(now_ms())
     }
     fn write_plan(&self, scope: &str, work: &[PlannedWork], replace: bool) -> Result<()> {
         let mut connection = self.lock()?;
@@ -338,6 +341,22 @@ impl WorkStore {
         tx.commit()?;
         Ok(applied)
     }
+    /// Apply an explicit user resolution to exactly the conflict they reviewed.
+    pub fn authorize_conflict(
+        &self,
+        scope: &str,
+        work: &PlannedWork,
+        payload: &Value,
+    ) -> Result<bool> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let applied=tx.execute("UPDATE sync_work SET payload=?4,state='pending',generation=generation+1,token=token+1,attempts=0,available_at=0,error=NULL WHERE scope=?1 AND key=?2 AND state='conflict' AND payload=?3",params![scope,work.key,serde_json::to_string(&work.payload)?,serde_json::to_string(payload)?])?==1;
+        if applied {
+            refresh_ready(&tx, scope, &work.key)?;
+        }
+        tx.commit()?;
+        Ok(applied)
+    }
     pub fn next_ready_at(&self, scope: &str) -> Result<Option<i64>> {
         Ok(self.lock()?.query_row(
             "SELECT min(available_at) FROM sync_work_ready WHERE scope=?1",
@@ -355,6 +374,17 @@ impl WorkStore {
             AND NOT EXISTS(SELECT 1 FROM sync_work_desired d WHERE d.scope=sync_work.scope AND d.key=sync_work.key)
             AND NOT EXISTS(SELECT 1 FROM sync_work_resources r WHERE r.scope=sync_work.scope AND r.key=sync_work.key AND r.lease_until>?2)
             AND NOT EXISTS(SELECT 1 FROM sync_work_dependencies d JOIN sync_work child ON child.scope=d.scope AND child.key=d.key WHERE d.scope=sync_work.scope AND d.dependency=sync_work.key AND child.state IN ('pending','running','conflict'))",params![now.saturating_sub(retention_ms),now])?)
+    }
+    /// Bound terminal history during normal scheduling without an idle polling task.
+    pub fn maintain(&self, now: i64) -> Result<()> {
+        let previous = self
+            .observation::<i64>("scheduler-maintenance")?
+            .unwrap_or(0);
+        if now.saturating_sub(previous) >= 24 * 60 * 60 * 1000 {
+            self.prune(now, 7 * 24 * 60 * 60 * 1000)?;
+            self.observe("scheduler-maintenance", &now)?;
+        }
+        Ok(())
     }
     pub fn status(&self, scope: &str) -> Result<WorkStatus> {
         let connection = self.lock()?;
@@ -383,6 +413,9 @@ impl WorkStore {
     }
     pub fn conflicts(&self, scope: &str) -> Result<Vec<PlannedWork>> {
         self.read_work(scope, "conflict")
+    }
+    pub fn active_resources(&self, scope: &str) -> Result<Vec<String>> {
+        Ok(self.lock()?.prepare("SELECT DISTINCT resource FROM sync_work WHERE scope=?1 AND state IN ('pending','running','conflict')")?.query_map([scope],|row|row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
     }
     fn read_work(&self, scope: &str, selection: &str) -> Result<Vec<PlannedWork>> {
         let connection = self.lock()?;

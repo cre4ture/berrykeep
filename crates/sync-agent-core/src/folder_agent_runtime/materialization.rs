@@ -1,6 +1,8 @@
 use super::*;
 use crate::sync_work::{ContentAvailability, PlannedWork, WorkResult, WorkStore, now_ms};
 use serde::{Deserialize, Serialize};
+mod resolution;
+pub(crate) use resolution::authorize_queued_conflict;
 
 const SCOPE: &str = "folder-materialization";
 const BATCH_LIMIT: usize = 64;
@@ -25,6 +27,10 @@ struct FolderWork {
     subtree: BTreeMap<String, (LocalEntryState, Option<String>)>,
     #[serde(default)]
     baseline_conflict: bool,
+    #[serde(default)]
+    resolution: Option<crate::ConflictResolutionStrategy>,
+    #[serde(default)]
+    delete_conflict_copies: bool,
 }
 
 #[cfg(test)]
@@ -38,7 +44,7 @@ fn journal(state: Option<&StartupStateStore>) -> Result<WorkStore> {
 
 pub(super) fn open(state: &StartupStateStore) -> Result<WorkStore> {
     let journal = WorkStore::open(state.path.with_file_name("sync-work.sqlite"))?;
-    journal.prune(now_ms(), 7 * 24 * 60 * 60 * 1000)?;
+    journal.maintain(now_ms())?;
     Ok(journal)
 }
 
@@ -64,6 +70,34 @@ pub(super) fn status_message(journal: &WorkStore, fallback: String) -> Result<St
     } else {
         fallback
     })
+}
+
+pub(super) fn blocked_local_paths(journal: &WorkStore) -> Result<BTreeSet<String>> {
+    Ok(journal.active_resources(SCOPE)?.into_iter().collect())
+}
+pub(super) fn publish_conflicts(journal: &WorkStore, state: &StartupStateStore) -> Result<()> {
+    for job in journal.conflicts(SCOPE)? {
+        resolution::publish_conflict(state, &job)?;
+    }
+    Ok(())
+}
+
+pub(super) fn resolution_paths(journal: &WorkStore) -> Result<BTreeSet<String>> {
+    Ok(journal
+        .all_work(SCOPE)?
+        .into_iter()
+        .filter(|job| {
+            job.payload
+                .get("resolution")
+                .is_some_and(|value| !value.is_null())
+        })
+        .filter_map(|job| {
+            job.payload
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .collect())
 }
 
 pub(super) fn folder_materialization_plan(
@@ -131,6 +165,8 @@ pub(super) fn folder_materialization_plan(
             initial_fingerprint: None,
             subtree: BTreeMap::new(),
             baseline_conflict: false,
+            resolution: None,
+            delete_conflict_copies: false,
         };
         work_by_path.insert(
             path.clone(),
@@ -289,9 +325,9 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
     for item in &mut work {
         let mut payload: FolderWork = serde_json::from_value(item.payload.clone())?;
         if let Some(previous) = previous.get(&item.key) {
-            let previous: FolderWork = serde_json::from_value(previous.clone())?;
-            if previous.entry == payload.entry {
-                item.payload = serde_json::to_value(previous)?;
+            let previous_work: FolderWork = serde_json::from_value(previous.clone())?;
+            if previous_work.entry == payload.entry {
+                item.payload = previous.clone();
                 continue;
             }
         }
@@ -386,6 +422,11 @@ fn schedule_remote_snapshot<B: FolderAgentLocalBackend>(
         item.payload = serde_json::to_value(payload)?;
     }
     journal.reconcile(SCOPE, &work)?;
+    if let Some(state) = state_store {
+        for job in journal.conflicts(SCOPE)? {
+            resolution::publish_conflict(state, &job)?;
+        }
+    }
     Ok(())
 }
 
@@ -415,7 +456,7 @@ pub(super) fn drain_remote_work<B: FolderAgentLocalBackend>(
         let Some(lease) = journal.claim_next(SCOPE, now_ms(), 120_000)? else {
             break;
         };
-        let work: FolderWork = serde_json::from_value(lease.work.payload.clone())?;
+        let mut work: FolderWork = serde_json::from_value(lease.work.payload.clone())?;
         let mut item_outcome = RemoteApplyOutcome::default();
         let (result, applied) = journal.execute(&lease, || {
             let mut conflict = false;
@@ -423,10 +464,29 @@ pub(super) fn drain_remote_work<B: FolderAgentLocalBackend>(
                 if work.availability != ContentAvailability::Complete {
                     anyhow::bail!("folder backend requires complete contents");
                 }
+                if matches!(
+                    work.resolution,
+                    Some(crate::ConflictResolutionStrategy::KeepLocal)
+                ) {
+                    resolution::keep_local(
+                        backend,
+                        options,
+                        client,
+                        &work,
+                        local_state.as_deref_mut(),
+                        state_store,
+                        scope,
+                        suppressed_uploads,
+                        remote_index,
+                        modification_log,
+                        modification_context,
+                    )?;
+                    return Ok(());
+                }
                 if work.preserve {
                     return Ok(());
                 }
-                let current = backend.local_entry_state(options, &work.path)?;
+                let mut current = backend.local_entry_state(options, &work.path)?;
                 if let Some(entry) = work
                     .entry
                     .as_ref()
@@ -455,6 +515,33 @@ pub(super) fn drain_remote_work<B: FolderAgentLocalBackend>(
                         suppressed_uploads.insert(work.path.clone(), matching);
                         return Ok(());
                     }
+                }
+                if matches!(
+                    work.resolution,
+                    Some(crate::ConflictResolutionStrategy::KeepRemote)
+                ) {
+                    backend.preserve_local_conflict(options, &work.path)?;
+                    if let Some(state) = local_state.as_deref_mut() {
+                        remove_local_state_path_and_descendants(state, &work.path);
+                    }
+                    if let Some(state) = state_store {
+                        state.remove_baseline_subtree(&work.path)?;
+                    }
+                    current = backend.local_entry_state(options, &work.path)?;
+                    work.initial_local = current.clone();
+                    work.initial_fingerprint = if current
+                        .as_ref()
+                        .is_some_and(|entry| entry.kind == LocalEntryKind::File)
+                    {
+                        Some(backend.file_content_fingerprint(options, &work.path)?)
+                    } else {
+                        None
+                    };
+                    work.subtree.clear();
+                    work.baseline_conflict = false;
+                    work.startup = false;
+                    work.remote_known = true;
+                    current_tree = None;
                 }
                 let expected = work.initial_local.as_ref();
                 if work.baseline_conflict {
@@ -603,6 +690,12 @@ pub(super) fn drain_remote_work<B: FolderAgentLocalBackend>(
             continue;
         }
         if matches!(result, WorkResult::Complete) {
+            if let Some(state) = state_store {
+                resolution::clear_resolved_conflict(state, &work.path)?;
+            }
+            if work.delete_conflict_copies {
+                let _ = crate::delete_conflict_copies(&options.root_dir, &work.path)?;
+            }
             item_outcome.completed_work_count = 1;
             outcome.accumulate(item_outcome);
             if let Some(tree) = current_tree.as_mut() {
@@ -617,6 +710,11 @@ pub(super) fn drain_remote_work<B: FolderAgentLocalBackend>(
                     tree.insert(work.path.clone(), entry);
                 }
             }
+        }
+        if matches!(result, WorkResult::Conflict(_))
+            && let Some(state) = state_store
+        {
+            resolution::publish_conflict(state, &lease.work)?;
         }
     }
     if options.run_once
