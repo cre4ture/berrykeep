@@ -25,12 +25,11 @@ use crate::live::ServerNodeHydrator;
 use crate::local_state::local_appdata_desktop_status_path;
 use crate::monitor::SyncRootMonitor;
 use crate::placeholder_metadata::{
-    RemoteObjectReconcileReport, reconcile_existing_placeholders_with_resolver,
-    reconcile_remote_object_state_best_effort,
+    RemoteObjectReconcileReport, reconcile_remote_object_state_with_protected_ids,
 };
 use crate::runtime::{
-    CfapiRuntime, SyncRootRegistration, apply_action_plan_with_observed_placeholder_paths,
-    connect_sync_root, reconcile_sync_states, register_sync_root, unregister_sync_root,
+    CfapiRuntime, SyncRootRegistration, connect_sync_root, reconcile_sync_states,
+    register_sync_root, unregister_sync_root,
 };
 use crate::windows_status::{
     WindowsStatusOptions, WindowsStatusPublisher, WindowsTrayIconHandle, spawn_remote_status_thread,
@@ -51,6 +50,40 @@ const LONG_VERSION: &str = git_version::git_version!(
 
 fn windows_connection_name(role: &str, display_name: &str) -> String {
     format!("windows-cfapi/{role}/{display_name}")
+}
+
+fn publish_work_status(
+    publisher: Option<&WindowsStatusPublisher>,
+    work: &crate::monitor::CfapiWork,
+) -> anyhow::Result<()> {
+    let status = work.status()?;
+    if let Some(publisher) = publisher {
+        let remaining = status.pending + status.running;
+        let state = if remaining > 0 || status.conflicts > 0 {
+            "syncing"
+        } else {
+            "running"
+        };
+        let headline = if remaining > 0 {
+            "Syncing files"
+        } else if status.conflicts > 0 {
+            "Sync needs attention"
+        } else {
+            "Watching for local changes"
+        };
+        let detail = if status.conflicts > 0 {
+            format!(
+                "{} item(s) remaining; {} conflict(s)",
+                remaining, status.conflicts
+            )
+        } else if remaining > 0 {
+            format!("{remaining} item(s) remaining")
+        } else {
+            "Local and remote state are aligned".to_owned()
+        };
+        publisher.update_sync_state(state, headline, detail, "folder-saved-search-symbolic")?;
+    }
+    Ok(())
 }
 
 fn log_action_plan_summary(label: &str, plan: &CfapiActionPlan) {
@@ -507,21 +540,31 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             )),
             download_stage_root.clone(),
         );
-        let startup_reconcile_report = match reconcile_existing_placeholders_with_resolver(
+        let uploader = Arc::new(ServerNodeHydrator::with_client(
+            client.clone().with_connection_name(windows_connection_name(
+                "uploader",
+                &registration.display_name,
+            )),
+            download_stage_root.clone(),
+        ));
+        let mut monitor = SyncRootMonitor::open(
+            "monitor",
+            registration.root_path.clone(),
+            sync_root_identity.provider_instance_id,
+            uploader.clone(),
+            &format!("{}:{:?}", connection.connection_target, prefix),
+        )?;
+        monitor.prepare_startup()?;
+        let work = monitor.work();
+        let startup_reconcile_report = reconcile_remote_object_state_with_protected_ids(
             &registration.root_path,
             &initial_snapshot,
+            &[],
             sync_root_identity.provider_instance_id,
-            &startup_resolver,
-        ) {
-            Ok(report) => {
-                log_remote_object_reconcile_summary("startup", &report);
-                report
-            }
-            Err(err) => {
-                tracing::warn!("startup remote-object reconciliation failed: {err:#}");
-                RemoteObjectReconcileReport::default()
-            }
-        };
+            Some(&startup_resolver),
+            &work.protected_snapshot_ids(&initial_snapshot)?,
+        );
+        log_remote_object_reconcile_summary("startup", &startup_reconcile_report);
         let has_unresolved_remote_objects = Arc::new(AtomicBool::new(
             !startup_reconcile_report
                 .unresolved_remote_object_ids
@@ -550,28 +593,19 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             )),
             download_stage_root.clone(),
         ));
-        let uploader = Arc::new(ServerNodeHydrator::with_client(
-            client.clone().with_connection_name(windows_connection_name(
-                "uploader",
-                &registration.display_name,
-            )),
-            download_stage_root,
-        ));
         let connection_guard = connect_sync_root(
             &registration,
             sync_root_identity.provider_instance_id,
             runtime.clone(),
             hydrator,
-            uploader.clone(),
+            monitor.uploader(),
         )?;
 
-        apply_action_plan_with_observed_placeholder_paths(
-            &registration.root_path,
+        work.schedule(
             &action_plan,
-            sync_root_identity.provider_instance_id,
-            true,
-            Some(&startup_reconcile_report.observed_placeholder_paths_by_object_id),
+            &startup_reconcile_report.observed_placeholder_paths_by_object_id,
         )?;
+        work.drain_materialization()?;
         let _ = runtime.sync_from_action_plan(&action_plan);
         let sync_state_stats = reconcile_sync_states(&registration.root_path, &action_plan);
         tracing::info!(
@@ -579,7 +613,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             sync_state_stats
         );
         tracing::info!(
-            "materialized {} planned entries under sync root",
+            "scheduled {} planned entries under sync root",
             action_plan.actions.len()
         );
 
@@ -587,31 +621,49 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
             "startup-scan: scanning {} for pre-existing files",
             registration.root_path.display()
         );
-        let mut monitor = SyncRootMonitor::new(
-            "monitor",
-            registration.root_path.clone(),
-            sync_root_identity.provider_instance_id,
-            uploader.clone(),
-        );
         let remote_applied_tracker = monitor.remote_applied_tracker();
+        remote_applied_tracker.record_reconcile_report(&startup_reconcile_report);
         let refresh_gate = monitor.refresh_gate();
-        monitor.seed_remote_entries_with_suppressed_paths(
-            &action_plan,
-            &startup_reconcile_report.suppressed_startup_paths,
-        );
+        let monitor = Arc::new(std::sync::Mutex::new(monitor));
+        let monitor_thread = monitor.clone();
+        let monitor_running = running.clone();
+        let monitor_gate = refresh_gate.clone();
+        let monitor_work = work.clone();
+        let worker_status = status_publisher.clone();
         std::thread::spawn(move || {
-            monitor.run();
+            let mut previous_status = None;
+            let mut next_scan = std::time::Instant::now();
+            while monitor_running.load(Ordering::SeqCst) {
+                if std::time::Instant::now() >= next_scan {
+                    monitor_thread
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .walk();
+                    next_scan = std::time::Instant::now() + Duration::from_secs(5);
+                }
+                {
+                    let _gate = monitor_gate.lock().unwrap_or_else(|err| err.into_inner());
+                    if let Err(error) = monitor_work.drain_upload_receipts() {
+                        tracing::error!("CFAPI accepted upload receipt worker: {error:#}");
+                    }
+                    if let Err(error) = monitor_work.drain_materialization() {
+                        tracing::error!("CFAPI materialization worker: {error:#}");
+                    }
+                }
+                match monitor_work.status() {
+                    Ok(status) if previous_status != Some(status) => {
+                        let _ = publish_work_status(worker_status.as_deref(), &monitor_work);
+                        previous_status = Some(status);
+                    }
+                    Err(error) => tracing::error!("CFAPI work status: {error:#}"),
+                    _ => {}
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         });
 
         tracing::info!("connected to CFAPI callbacks; serving hydration requests");
-        if let Some(publisher) = status_publisher.as_ref() {
-            let _ = publisher.update_sync_state(
-                "running",
-                "Watching for local changes",
-                format!("Serving sync root {}", registration.root_path.display()),
-                "folder-saved-search-symbolic",
-            );
-        }
+        publish_work_status(status_publisher.as_deref(), &work)?;
 
         {
             let r = running.clone();
@@ -628,6 +680,8 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let refresh_provider_instance_id = sync_root_identity.provider_instance_id;
         let refresh_remote_applied_tracker = remote_applied_tracker.clone();
         let refresh_monitor_gate = refresh_gate.clone();
+        let refresh_monitor = monitor.clone();
+        let refresh_work = work.clone();
         let refresh_status_publisher = status_publisher.clone();
         let refresh_has_unresolved_remote_objects = has_unresolved_remote_objects.clone();
         let refresh_needs_unchanged_snapshot = has_unresolved_remote_objects.clone();
@@ -649,31 +703,27 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                 let summary_label = format!("remote-refresh changed_paths={}", update.changed_paths.len());
                 log_action_plan_summary(&summary_label, &plan);
                 let remote_object_report = {
+                    let mut monitor=refresh_monitor.lock().unwrap_or_else(|err|err.into_inner());
                     let _monitor_gate = refresh_monitor_gate
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let report = reconcile_remote_object_state_best_effort(
+                    if let Err(error)=monitor.prepare_startup() {tracing::error!("remote-refresh: local intent reconciliation failed: {error:#}");return;}
+                    let protected=match refresh_work.protected_snapshot_ids(&update.snapshot) {Ok(ids)=>ids,Err(error)=>{tracing::error!("remote-refresh: reading protected IDs failed: {error:#}");return;}};
+                    let report = reconcile_remote_object_state_with_protected_ids(
                         &refresh_registration.root_path,
                         &update.snapshot,
                         &update.object_changes,
                         refresh_provider_instance_id,
                         Some(uploader.as_ref()),
+                        &protected,
                     );
                     refresh_has_unresolved_remote_objects.store(
                         !report.unresolved_remote_object_ids.is_empty(),
                         Ordering::SeqCst,
                     );
-                    if let Err(err) = apply_action_plan_with_observed_placeholder_paths(
-                        &refresh_registration.root_path,
-                        &plan,
-                        refresh_provider_instance_id,
-                        false,
-                        Some(&report.observed_placeholder_paths_by_object_id),
-                    ) {
-                        tracing::info!("remote-refresh: apply_action_plan error: {err}");
-                        return;
+                    if let Err(error)=refresh_work.schedule(&plan,&report.observed_placeholder_paths_by_object_id) {
+                        tracing::error!("remote-refresh: scheduling materialization failed: {error:#}");return;
                     }
-                    refresh_remote_applied_tracker.record_plan(&plan);
                     refresh_remote_applied_tracker.record_reconcile_report(&report);
                     report
                 };
@@ -699,14 +749,7 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
                         remote_object_report.suppressed_startup_paths.len()
                     );
                 }
-                if let Some(publisher) = refresh_status_publisher.as_ref() {
-                    let _ = publisher.update_sync_state(
-                        "running",
-                        "Watching for local changes",
-                        format!("Serving sync root {}", refresh_registration.root_path.display()),
-                        "folder-saved-search-symbolic",
-                    );
-                }
+                let _=publish_work_status(refresh_status_publisher.as_deref(),&refresh_work);
             },
             move || refresh_needs_unchanged_snapshot.load(Ordering::SeqCst),
         );

@@ -29,3 +29,31 @@ preservation decisions and local file/subtree fingerprints survive restart;
 changed local bytes become conflicts instead of being overwritten on retry.
 Folder uploads and remote mutations still use their existing path-based runtime;
 this integration does not change that protocol to object-ID mutations.
+
+CFAPI uses the same journal under its local application-data sync-root state,
+scoped by provider instance, connection target, and remote prefix. Startup first
+compares actual placeholders with persisted observations and records local
+deletions/moves. Existing roots with no journal are seeded from the filesystem;
+there is no legacy scheduler switch or compatibility runtime.
+
+Remote materialization is grouped by parent into batches of at most 64 entries.
+The worker executes at most eight batches per turn, between five-second local
+topology scans. Missing previously observed paths wait for a topology scan so
+background population cannot recreate an unobserved user deletion or rename.
+Partial batch success is recorded per path before acknowledgement; a failed
+first entry does not prevent independent siblings from being attempted.
+
+Deletes and moves retain object ID and expected revision. Accepted mutations
+leave revision fences so a snapshot fetched before replay cannot recreate or
+revert the old revision. Newer remote restores remain eligible. Upload bytes
+still use the guarded CFAPI transfer executor; its shared uploader boundary
+journals upload intent and accepted receipts before returning success. Receipt
+repair is separate durable work and advances only the upload's own source
+identity, preserving local bytes that changed during transfer. Newly accepted
+object identity is retained even when the file disappears before the first scan.
+
+CFAPI persists observation deltas rather than rewriting the whole tree. Negative
+directory attribute hints are verified with metadata-only placeholder inspection;
+a cold placeholder is never treated as an ordinary upload merely because cached
+enumeration attributes omit its placeholder flag. Existing status surfaces show
+pending work and conflicts instead of announcing completion after scheduling.

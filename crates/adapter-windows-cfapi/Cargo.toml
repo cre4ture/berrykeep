@@ -9,6 +9,7 @@ authors.workspace = true
 # Only build this crate on Windows
 [target.'cfg(windows)'.dependencies]
 sync-core = { path = "../sync-core" }
+sync-agent-core = { path = "../sync-agent-core" }
 client-sdk = { path = "../client-sdk" }
 common = { path = "../common" }
 desktop-status = { path = "../desktop-status" }

@@ -90,7 +90,9 @@ impl WorkStore {
                 resource TEXT PRIMARY KEY, scope TEXT NOT NULL, key TEXT NOT NULL,
                 generation INTEGER NOT NULL, token INTEGER NOT NULL, lease_until INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS sync_observations (
-                scope TEXT PRIMARY KEY, payload TEXT NOT NULL);",
+                scope TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sync_path_observations (
+                scope TEXT NOT NULL,path TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(scope,path));",
         )?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -151,6 +153,44 @@ impl WorkStore {
     }
 
     pub fn claim_next(&self, scope: &str, now: i64, lease_ms: i64) -> Result<Option<WorkLease>> {
+        self.claim_matching(scope, None, now, lease_ms)
+    }
+
+    pub fn claim_key(
+        &self,
+        scope: &str,
+        key: &str,
+        now: i64,
+        lease_ms: i64,
+    ) -> Result<Option<WorkLease>> {
+        self.claim_matching(scope, Some(key), now, lease_ms)
+    }
+
+    pub fn rearm_completed(&self, scope: &str, key: &str) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sync work connection poisoned"))?;
+        connection.execute("UPDATE sync_work SET state='pending',generation=generation+1,token=token+1,attempts=0,available_at=0 WHERE scope=?1 AND key=?2 AND state='complete'",params![scope,key])?;
+        Ok(())
+    }
+
+    pub fn cancel(&self, scope: &str, key: &str) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sync work connection poisoned"))?;
+        connection.execute("UPDATE sync_work SET state='cancelled',token=token+1 WHERE scope=?1 AND key=?2 AND state IN ('pending','running','conflict')",params![scope,key])?;
+        Ok(())
+    }
+
+    fn claim_matching(
+        &self,
+        scope: &str,
+        key: Option<&str>,
+        now: i64,
+        lease_ms: i64,
+    ) -> Result<Option<WorkLease>> {
         if lease_ms <= 0 {
             bail!("sync work lease must be positive");
         }
@@ -160,12 +200,12 @@ impl WorkStore {
             .map_err(|_| anyhow::anyhow!("sync work connection poisoned"))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidate = tx.query_row("SELECT key,resource,payload,dependencies,generation,token,attempts FROM sync_work w
-            WHERE scope=?1 AND ((state='pending' AND available_at<=?2) OR (state='running' AND lease_until<=?2))
+            WHERE scope=?1 AND (?3 IS NULL OR key=?3) AND ((state='pending' AND available_at<=?2) OR (state='running' AND lease_until<=?2))
             AND NOT EXISTS(SELECT 1 FROM json_each(w.dependencies) d LEFT JOIN sync_work p ON p.scope=w.scope AND p.key=d.value
                 WHERE p.state IS NULL OR p.state<>'complete')
             AND NOT EXISTS(SELECT 1 FROM sync_work_resources active WHERE active.resource=w.resource
                 AND active.lease_until>?2)
-            ORDER BY key LIMIT 1", params![scope,now], |row| {
+            ORDER BY key LIMIT 1", params![scope,now,key], |row| {
                 Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,i64>(5)?,row.get::<_,u32>(6)?))
             }).optional()?;
         let Some((key, resource, payload, dependencies, generation, token, attempts)) = candidate
@@ -344,6 +384,55 @@ impl WorkStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("sync work connection poisoned"))?;
         connection.execute("INSERT INTO sync_observations(scope,payload) VALUES(?1,?2) ON CONFLICT(scope) DO UPDATE SET payload=excluded.payload",params![scope,serde_json::to_string(value)?])?;
+        Ok(())
+    }
+
+    pub fn path_observations<T: serde::de::DeserializeOwned>(
+        &self,
+        scope: &str,
+    ) -> Result<std::collections::HashMap<String, T>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sync work connection poisoned"))?;
+        let mut query =
+            connection.prepare("SELECT path,payload FROM sync_path_observations WHERE scope=?1")?;
+        query
+            .query_map([scope], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (path, payload) = row?;
+                Ok((path, serde_json::from_str(&payload)?))
+            })
+            .collect()
+    }
+
+    /// Persist only changed paths in one transaction, instead of rewriting a tree.
+    pub fn observe_paths<T: Serialize>(
+        &self,
+        scope: &str,
+        changed: &[(String, T)],
+        removed: &[String],
+    ) -> Result<()> {
+        if changed.is_empty() && removed.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sync work connection poisoned"))?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (path, value) in changed {
+            tx.execute("INSERT INTO sync_path_observations(scope,path,payload) VALUES(?1,?2,?3) ON CONFLICT(scope,path) DO UPDATE SET payload=excluded.payload WHERE payload<>excluded.payload",params![scope,path,serde_json::to_string(value)?])?;
+        }
+        for path in removed {
+            tx.execute(
+                "DELETE FROM sync_path_observations WHERE scope=?1 AND path=?2",
+                params![scope, path],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 }

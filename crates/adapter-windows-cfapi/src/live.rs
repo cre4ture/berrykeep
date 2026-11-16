@@ -323,6 +323,10 @@ impl Uploader for ServerNodeHydrator {
         Ok(())
     }
 
+    fn resolve_remote_object(&self, object_id: &str) -> Result<RemoteObjectResolution> {
+        RemoteObjectResolver::resolve_object(self, object_id)
+    }
+
     fn rename_object(
         &self,
         object_id: &str,
