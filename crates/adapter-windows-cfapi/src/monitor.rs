@@ -2627,8 +2627,10 @@ mod tests {
             .copied()
             .unwrap_or(0);
         assert_eq!(
-            attempts, 2,
-            "local file should be retried after an upload failure"
+            attempts,
+            2,
+            "local file should be retried after an upload failure; observations={:?}",
+            monitor.snapshot_entries()
         );
         assert_eq!(
             uploader
@@ -2741,7 +2743,8 @@ mod tests {
                 .expect("uploads lock poisoned")
                 .as_slice(),
             ["docs/entry/"],
-            "a directory replacing a file must not be hidden by the prior file topology"
+            "a directory replacing a file must not be hidden by the prior file topology; observations={:?}",
+            monitor.snapshot_entries()
         );
 
         let _ = std::fs::remove_dir_all(sync_root);
