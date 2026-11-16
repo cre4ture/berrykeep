@@ -982,10 +982,16 @@ impl SyncRootMonitor {
         {
             return;
         }
+        let path_gate = crate::path_operations::gate(path);
+        let _path_operation = path_gate.lock().unwrap_or_else(|e| e.into_inner());
         let entry = match current.get(&rel_path).cloned() {
+            Some(entry) if path.exists() => {
+                snapshot_entry(&self.sync_root, &rel_path, path, entry.is_dir)
+            }
             Some(entry) => entry,
             None => return,
         };
+        current.insert(rel_path.clone(), entry.clone());
         let previous_path = self.prior_paths.get(&rel_path).cloned();
         if entry.placeholder_inspection_error.is_some() {
             if update_cfapi_inspection_failure_state(

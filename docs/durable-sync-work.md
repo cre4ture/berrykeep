@@ -76,9 +76,19 @@ journals upload intent and accepted receipts before returning success. Receipt
 repair is separate durable work and advances only the upload's own source
 identity, preserving local bytes that changed during transfer. Newly accepted
 object identity is retained even when the file disappears before the first scan.
+Provider threads serialize each path through the entire close-upload finalizer,
+including its receipt, snapshot and USN checks. Receipt repair waits for that
+boundary and re-inspects identity before writing; it cannot invalidate a USN
+captured by the callback. These gates do not block user writes, which remain
+protected by the snapshot/USN checks.
 
 CFAPI persists observation deltas rather than rewriting the whole tree. Negative
 directory attribute hints are verified with metadata-only placeholder inspection;
 a cold placeholder is never treated as an ordinary upload merely because cached
 enumeration attributes omit its placeholder flag. Existing status surfaces show
 pending work and conflicts instead of announcing completion after scheduling.
+This adds a metadata probe per visited entry intentionally: file size, timestamps
+and previous classification cannot prove that a zero-length file has not become
+a placeholder. Probe failures defer that entry with an observable diagnostic;
+only known ordinary-file errors, or INVALID_FUNCTION with an independently
+proven unregistered root and negative attribute hint, permit ordinary-file work.

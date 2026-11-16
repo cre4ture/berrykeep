@@ -297,6 +297,8 @@ impl CfapiWork {
             let path = &lease.work.key;
             let (result, applied) = self.store.execute(&lease, || {
                 let full = self.root.join(path.replace('/', "\\"));
+                let gate = crate::path_operations::gate(&full);
+                let _path_operation = gate.lock().unwrap_or_else(|e| e.into_inner());
                 if !full.exists() {
                     return WorkResult::Complete;
                 }
@@ -346,7 +348,11 @@ impl CfapiWork {
                 }
             })?;
             if !applied {
-                anyhow::bail!("upload receipt superseded while applying {path}");
+                tracing::debug!(
+                    path,
+                    "upload receipt superseded while applying; newer work retained"
+                );
+                continue;
             }
             if !matches!(result, WorkResult::Complete) {
                 tracing::warn!(
@@ -503,10 +509,11 @@ impl CfapiWork {
                 .store
                 .execute(&lease, || self.apply_mutation(uploader, &intent))?;
             if !applied {
-                anyhow::bail!(
-                    "CFAPI local intent superseded while executing {}",
-                    lease.work.key
+                tracing::debug!(
+                    work = lease.work.key,
+                    "CFAPI local intent superseded; newer work retained"
                 );
+                continue;
             }
             if matches!(result, WorkResult::Conflict(_))
                 && let LocalMutation::Rename { to, .. } = &intent
@@ -522,6 +529,17 @@ impl CfapiWork {
 
     fn apply_mutation(&self, uploader: &dyn Uploader, intent: &LocalMutation) -> WorkResult {
         use crate::placeholder_metadata::RemoteObjectResolution;
+        let gates = intent
+            .paths()
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| crate::path_operations::gate(&self.root.join(path.replace('/', "\\"))))
+            .collect::<Vec<_>>();
+        let _path_operations = gates
+            .iter()
+            .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect::<Vec<_>>();
         match intent {
             LocalMutation::Delete {
                 path,
@@ -673,10 +691,11 @@ impl CfapiWork {
                         Err(error) => WorkResult::Retry(format!("{error:#}")),
                     })?;
             if !applied {
-                anyhow::bail!(
-                    "CFAPI materialization superseded while executing {}",
-                    lease.work.key
+                tracing::debug!(
+                    work = lease.work.key,
+                    "CFAPI materialization superseded; newer work retained"
                 );
+                continue;
             }
             if !matches!(result, WorkResult::Complete) {
                 tracing::warn!(
@@ -697,6 +716,18 @@ impl CfapiWork {
         if work.availability != ContentAvailability::MetadataOnly {
             anyhow::bail!("CFAPI namespace executor requires metadata availability");
         }
+        let gates = work
+            .actions
+            .iter()
+            .map(action_path)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| crate::path_operations::gate(&self.root.join(path.replace('/', "\\"))))
+            .collect::<Vec<_>>();
+        let _path_operations = gates
+            .iter()
+            .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect::<Vec<_>>();
         let protected = self.protected_paths()?;
         let mut conflict = None;
         let mut waiting = None;
@@ -1370,6 +1401,101 @@ mod tests {
             *inner.uploads.lock().unwrap(),
             1,
             "own accepted revision must not permanently reject later local uploads"
+        );
+    }
+
+    #[test]
+    fn accepted_receipt_repair_waits_through_close_upload_finalization() {
+        use crate::close_upload::{
+            UploadConcurrencyGate, UploadWorkerContext, process_close_upload_for_test,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct UploadWithConcurrentRepair {
+            work: CfapiWork,
+            start: mpsc::Sender<()>,
+            finished: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Uploader for UploadWithConcurrentRepair {
+            fn upload_reader(
+                &self,
+                path: &str,
+                _reader: &mut dyn std::io::Read,
+                _length: u64,
+            ) -> Result<crate::runtime::UploadReceipt> {
+                let receipt = crate::runtime::UploadReceipt {
+                    object_id: Some("test-object".into()),
+                    remote_version: Some("accepted-r2".into()),
+                    in_sync_content_fingerprint: None,
+                };
+                // Simulate the accepted receipt boundary while the close callback
+                // still owns its pre-finalization snapshot and USN.
+                self.work
+                    .record_accepted_receipt(path, None, None, &receipt)?;
+                self.start.send(()).unwrap();
+                assert!(
+                    matches!(
+                        self.finished
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_millis(100)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "receipt repair ran inside the close-upload finalization window"
+                );
+                Ok(receipt)
+            }
+        }
+
+        let (sync_root, provider) =
+            super::super::tests::registered_monitor_test_sync_root("serialized-receipt");
+        std::fs::write(sync_root.root_path.join("a.txt"), b"local upload").unwrap();
+        let work = CfapiWork::new(
+            sync_root.root_path.clone(),
+            provider,
+            WorkStore::open(root().join("work.sqlite")).unwrap(),
+            RemoteAppliedTracker::default(),
+        )
+        .unwrap();
+        let (start, started) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let inner = Arc::new(UploadWithConcurrentRepair {
+            work: work.clone(),
+            start,
+            finished: Mutex::new(finished),
+        });
+        let repair_work = work.clone();
+        let repair = std::thread::spawn(move || {
+            started.recv().unwrap();
+            repair_work.drain_upload_receipts().unwrap();
+            done.send(()).unwrap();
+        });
+        let worker = UploadWorkerContext {
+            sync_root: sync_root.root_path.clone(),
+            provider_instance_id: provider,
+            runtime: Arc::new(crate::runtime::CfapiRuntime::default()),
+            uploader: Arc::new(JournaledUploader {
+                inner: inner.clone(),
+                work,
+            }),
+            upload_gate: Arc::new(UploadConcurrencyGate::new(1)),
+        };
+        assert!(process_close_upload_for_test(&worker, "a.txt"));
+        inner
+            .finished
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        repair.join().unwrap();
+        let info = crate::cfapi::cf_get_placeholder_standard_info(
+            &std::fs::File::open(sync_root.root_path.join("a.txt")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            info.InSyncState,
+            windows::Win32::Storage::CloudFilters::CF_IN_SYNC_STATE_IN_SYNC.0
         );
     }
 

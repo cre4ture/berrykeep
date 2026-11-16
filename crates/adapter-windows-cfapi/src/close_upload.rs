@@ -491,11 +491,21 @@ fn close_upload_trace_event(message: String) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn process_close_upload_for_test(worker: &UploadWorkerContext, path: &str) -> bool {
+    matches!(
+        process_debounced_close_upload(worker, path),
+        UploadAttemptOutcome::Settled
+    )
+}
+
 fn process_debounced_close_upload(
     worker: &UploadWorkerContext,
     relative_path: &str,
 ) -> UploadAttemptOutcome {
     let full_path = worker.sync_root.join(relative_path);
+    let path_gate = crate::path_operations::gate(&full_path);
+    let _path_operation = path_gate.lock().unwrap_or_else(|e| e.into_inner());
 
     tracing::info!(
         "close-completion: checking upload for {} state_before={}",
