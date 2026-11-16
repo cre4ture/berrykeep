@@ -449,6 +449,18 @@ impl RemoteAppliedTracker {
     }
 }
 
+pub(crate) fn journal_path(
+    sync_root: &std::path::Path,
+    identity: &crate::sync_root_identity::SyncRootIdentity,
+) -> PathBuf {
+    let prefix = crate::sync_root_identity::normalize_prefix(Some(&identity.prefix));
+    let profile = blake3::hash(format!("{}:{prefix}", identity.cluster_id).as_bytes()).to_hex();
+    crate::local_state::local_appdata_sync_root_state_dir(sync_root).join(format!(
+        "sync-work-{}-{profile}.sqlite",
+        identity.provider_instance_id
+    ))
+}
+
 impl SyncRootMonitor {
     #[cfg(test)]
     pub fn new(
@@ -470,17 +482,14 @@ impl SyncRootMonitor {
     pub(crate) fn open(
         name: &str,
         sync_root: PathBuf,
-        provider_instance_id: uuid::Uuid,
+        identity: &crate::sync_root_identity::SyncRootIdentity,
         uploader: Arc<dyn Uploader>,
-        profile: &str,
     ) -> anyhow::Result<Self> {
-        let profile = blake3::hash(profile.as_bytes()).to_hex().to_string();
-        let path = crate::local_state::local_appdata_sync_root_state_dir(&sync_root)
-            .join(format!("sync-work-{provider_instance_id}-{profile}.sqlite"));
+        let path = journal_path(&sync_root, identity);
         let mut monitor = Self::from_store(
             name,
             sync_root,
-            provider_instance_id,
+            identity.provider_instance_id,
             uploader.clone(),
             sync_agent_core::sync_work::WorkStore::open(path)?,
         )?;
@@ -1960,6 +1969,46 @@ fn parent_directories_for_path(path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_profile_uses_registered_cluster_and_prefix_instead_of_endpoint_labels() {
+        let provider = uuid::Uuid::new_v4();
+        let cluster = uuid::Uuid::new_v4();
+        let root = Path::new("C:/sync/profile");
+        let first = crate::sync_root_identity::SyncRootIdentity::new(
+            provider,
+            cluster,
+            "https://first",
+            "docs/",
+        );
+        let alternate = crate::sync_root_identity::SyncRootIdentity::new(
+            provider,
+            cluster,
+            "https://failover",
+            "docs",
+        );
+        assert_eq!(journal_path(root, &first), journal_path(root, &alternate));
+        let other_cluster = crate::sync_root_identity::SyncRootIdentity::new(
+            provider,
+            uuid::Uuid::new_v4(),
+            "https://first",
+            "docs",
+        );
+        let other_prefix = crate::sync_root_identity::SyncRootIdentity::new(
+            provider,
+            cluster,
+            "https://first",
+            "other",
+        );
+        assert_ne!(
+            journal_path(root, &first),
+            journal_path(root, &other_cluster)
+        );
+        assert_ne!(
+            journal_path(root, &first),
+            journal_path(root, &other_prefix)
+        );
+    }
     use crate::placeholder_metadata::reconcile_existing_placeholders;
     use crate::runtime::{
         SyncRootRegistration, apply_action_plan, register_sync_root, unregister_sync_root,

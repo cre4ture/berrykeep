@@ -550,9 +550,8 @@ fn serve_sync_root(args: ServeArgs) -> anyhow::Result<()> {
         let mut monitor = SyncRootMonitor::open(
             "monitor",
             registration.root_path.clone(),
-            sync_root_identity.provider_instance_id,
+            &sync_root_identity,
             uploader.clone(),
-            &format!("{}:{:?}", connection.connection_target, prefix),
         )?;
         monitor.prepare_startup()?;
         let work = monitor.work();

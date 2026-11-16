@@ -56,7 +56,8 @@ retention at most once per day and retains seven days of historical terminal job
 in addition to current desired completions and active prerequisites.
 
 CFAPI uses the same journal under its local application-data sync-root state,
-scoped by provider instance, connection target, and remote prefix. Startup first
+scoped by provider instance, registered cluster identity, and normalized remote
+prefix. Endpoint labels and same-cluster failover do not select another journal. Startup first
 compares actual placeholders with persisted observations and records local
 deletions/moves. Existing roots with no journal are seeded from the filesystem;
 there is no legacy scheduler switch or compatibility runtime.
