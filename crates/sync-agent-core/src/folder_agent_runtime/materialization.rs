@@ -23,6 +23,8 @@ struct FolderWork {
     initial_fingerprint: Option<String>,
     #[serde(default)]
     subtree: BTreeMap<String, (LocalEntryState, Option<String>)>,
+    #[serde(default)]
+    baseline_conflict: bool,
 }
 
 fn journal(state: Option<&StartupStateStore>) -> Result<WorkStore> {
@@ -36,6 +38,19 @@ fn journal(state: Option<&StartupStateStore>) -> Result<WorkStore> {
 pub(super) fn pending(state: &StartupStateStore) -> Result<bool> {
     let status = journal(Some(state))?.status(SCOPE)?;
     Ok(status.pending != 0 || status.running != 0)
+}
+
+pub(super) fn status_message(state: &StartupStateStore, fallback: String) -> Result<String> {
+    let status = journal(Some(state))?.status(SCOPE)?;
+    let remaining = status.pending + status.running;
+    Ok(if remaining > 0 || status.conflicts > 0 {
+        format!(
+            "Sync has {remaining} item(s) remaining and {} conflict(s)",
+            status.conflicts
+        )
+    } else {
+        fallback
+    })
 }
 
 pub(super) fn folder_materialization_plan(
@@ -111,6 +126,7 @@ pub(super) fn folder_materialization_plan(
             remote_known: remote_index_contains_path_or_descendants(previous_index, &path),
             initial_fingerprint: None,
             subtree: BTreeMap::new(),
+            baseline_conflict: false,
         };
         work_by_path.insert(
             path.clone(),
@@ -198,6 +214,13 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
         .into_iter()
         .map(|item| (item.key, item.payload))
         .collect::<BTreeMap<_, _>>();
+    let baseline = state_store
+        .map(StartupStateStore::load_local_baseline)
+        .transpose()?;
+    let baseline_hashes = state_store
+        .map(StartupStateStore::load_local_baseline_hashes)
+        .transpose()?
+        .unwrap_or_default();
     for item in &mut work {
         let mut payload: FolderWork = serde_json::from_value(item.payload.clone())?;
         if let Some(previous) = previous.get(&item.key) {
@@ -209,6 +232,7 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
                 payload.remote_known |= previous.remote_known;
                 payload.initial_fingerprint = previous.initial_fingerprint;
                 payload.subtree = previous.subtree;
+                payload.baseline_conflict = previous.baseline_conflict;
             }
         }
         if !payload.precondition_recorded {
@@ -245,6 +269,22 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
                 }
             }
             payload.precondition_recorded = true;
+            if let Some(baseline) = baseline.as_ref()
+                && let Some(current) = payload.initial_local.as_ref()
+            {
+                let metadata_changed = baseline.get(&payload.path) != Some(current);
+                let content_changed = payload
+                    .initial_fingerprint
+                    .as_ref()
+                    .is_some_and(|hash| baseline_hashes.get(&payload.path) != Some(hash));
+                let subtree_changed = payload.subtree.iter().any(|(path, (state, hash))| {
+                    baseline.get(path) != Some(state)
+                        || hash
+                            .as_ref()
+                            .is_some_and(|hash| baseline_hashes.get(path) != Some(hash))
+                });
+                payload.baseline_conflict = metadata_changed || content_changed || subtree_changed;
+            }
         }
         payload.preserve |= preserve_local_files.is_some_and(|paths| paths.contains(&payload.path));
         item.payload = serde_json::to_value(payload)?;
@@ -303,6 +343,13 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
                     }
                 }
                 let expected = work.initial_local.as_ref();
+                if work.baseline_conflict {
+                    conflict = true;
+                    anyhow::bail!(
+                        "local content diverged from the synced baseline before scheduling {}",
+                        work.path
+                    );
+                }
                 let file_changed = if current
                     .as_ref()
                     .is_some_and(|entry| entry.kind == LocalEntryKind::File)
@@ -441,6 +488,14 @@ pub(super) fn apply_remote_snapshot_with_journal<B: FolderAgentLocalBackend>(
         .filter(|path| !path.is_empty())
         .collect();
     let status = journal.status(SCOPE)?;
+    if options.run_once && (status.pending != 0 || status.running != 0 || status.conflicts != 0) {
+        anyhow::bail!(
+            "one-shot sync is incomplete: {} pending, {} running, {} conflicts; unfinished work is retained for retry",
+            status.pending,
+            status.running,
+            status.conflicts
+        );
+    }
     if status.pending != 0 || status.conflicts != 0 {
         tracing::info!(
             pending = status.pending,
